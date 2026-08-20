@@ -35,27 +35,40 @@ function opType(id: string): string {
   return id.replace(/-\d+$/, '');
 }
 
-/** input_binding 解析：ref 引用上游输出（path 取字段路径）、const 常量、数组 fan-in 合并、其他裸常量 */
-function resolveInputs(op: OperatorSpec, outputs: Map<string, unknown>): Record<string, unknown> {
+/**
+ * input_binding 解析：ref 引用上游输出（path 取字段路径）、const 常量、数组 fan-in 合并、其他裸常量。
+ * 图上下文输入引用（T4.3-loop 接缝）：ref 未命中任何算子输出时回退到 ctx.inputs（ProcessDef '$.x'
+ * 图输入引用经适配器转为 {ref}，执行期在此解析）；仍无 → E_UNRESOLVED_BINDING（fail-loud）。
+ */
+function resolveInputs(op: OperatorSpec, outputs: Map<string, unknown>, ctxInputs: Record<string, unknown>): Record<string, unknown> {
   const inputs: Record<string, unknown> = {};
   for (const [name, binding] of Object.entries(op.input_binding ?? {})) {
-    inputs[name] = resolveBinding(binding, outputs, op.id);
+    inputs[name] = resolveBinding(binding, outputs, ctxInputs, op.id);
   }
   return inputs;
 }
 
-function resolveBinding(binding: OperatorBinding, outputs: Map<string, unknown>, opId: string): unknown {
+function resolveBinding(
+  binding: OperatorBinding,
+  outputs: Map<string, unknown>,
+  ctxInputs: Record<string, unknown>,
+  opId: string,
+): unknown {
   if (Array.isArray(binding)) {
-    return binding.map((b) => resolveBinding(b as OperatorBinding, outputs, opId));
+    return binding.map((b) => resolveBinding(b as OperatorBinding, outputs, ctxInputs, opId));
   }
   if (binding !== null && typeof binding === 'object') {
     const obj = binding as Record<string, unknown>;
     if (typeof obj.ref === 'string') {
-      if (!outputs.has(obj.ref)) {
-        throw new OperatorError('E_UNRESOLVED_BINDING', `算子 ${opId} 的 input_binding 引用未完成输出: ${obj.ref}`, false);
+      if (outputs.has(obj.ref)) {
+        const out = outputs.get(obj.ref);
+        return typeof obj.path === 'string' ? getPath(out, obj.path) : out;
       }
-      const out = outputs.get(obj.ref);
-      return typeof obj.path === 'string' ? getPath(out, obj.path) : out;
+      if (Object.prototype.hasOwnProperty.call(ctxInputs, obj.ref)) {
+        const out = ctxInputs[obj.ref];
+        return typeof obj.path === 'string' ? getPath(out, obj.path) : out;
+      }
+      throw new OperatorError('E_UNRESOLVED_BINDING', `算子 ${opId} 的 input_binding 引用未完成输出: ${obj.ref}`, false);
     }
     if ('const' in obj) {
       return obj.const;
@@ -177,7 +190,7 @@ async function runOne(
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
     emit({ type: 'process/operator/start', operator_id: op.id, operator_type: opType(op.id), attempt, ts: Date.now() });
     try {
-      const inputs = resolveInputs(op, outputs);
+      const inputs = resolveInputs(op, outputs, ctx.inputs);
       const opCtx: OperatorContext = {
         inputs,
         budget: ctx.budget,
