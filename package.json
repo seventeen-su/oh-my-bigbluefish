@@ -17,6 +17,7 @@
     "vitest": "^3.2.7"
   },
   "dependencies": {
-    "koffi": "^3.1.5"
+    "koffi": "^3.1.5",
+    "zod": "^4.4.3"
   }
 }
