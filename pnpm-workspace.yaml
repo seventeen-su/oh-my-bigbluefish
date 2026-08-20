@@ -1,0 +1,5 @@
+# pnpm 11 构建脚本策略（settings 已从 package.json 的 "pnpm" 字段迁移至 pnpm-workspace.yaml，见 https://pnpm.io/settings）
+# 批准 esbuild 的构建脚本（vitest/vite 工具链的传递依赖，install.js 仅校验平台二进制）
+allowBuilds:
+  esbuild: true
+
