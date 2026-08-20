@@ -3,7 +3,10 @@
 # 语义（架构 §5.1 / brief）：
 #   - 候选已现且缺口空 → Stop；缺口非空 → 最小充分验证（Verify）
 #   - Applicability OOD → GenerateProcess；Failed/Contradictory → ExpandSearch/RetrieveMemory
-#   - Strong → RunProcess；预算不足（budget_ok: false）→ Delegate（降级/慢路径）
+#   - Strong → RunProcess；预算耗尽（budget_ok: false）→ Delegate（降级/切换）——
+#     预算耗尽不是 Stop（任务未完成不能停），一律降级/Delegate（架构：预算耗尽/边际收益趋零 → 切换过程/降级）
+#   - task_done（success_criteria 全覆盖，verifier 硬信号）是表外短路位（架构级维度，非策略数据维度），
+#     不入本表三维（applicability/evidence_gaps/budget_ok）；全覆盖由 runtime 在查表前短路 Stop（主会话裁决 2026-08-21 归一）
 # 表为精确匹配：rules 覆盖 applicability × evidence_gaps × budget_ok 全 20 组合（防漂移测试锚定），
 # 未命中任何规则（理论不可达，防未来字段扩展漂移）→ default 规则 → Stop 保守停止（不执行未授权动作）。
 # 初值，待冻结基准标定（架构 §17）
@@ -39,7 +42,9 @@ rules:
   - id: ood-some-ok
     when: { applicability: OOD, evidence_gaps: some, budget_ok: true }
     decision: GenerateProcess     # OOD → GenerateProcess
-  # ---- budget_ok: false：预算不足 → Delegate（Fast Governor 无法廉价决策时移交） ----
+  # ---- budget_ok: false：预算耗尽 → 全部 10 格 Delegate（降级/切换） ----
+  # 主会话裁决 2026-08-21：任务未完成（task_done=false）时预算耗尽 ≠ Stop——任务未完成不能停；
+  # 架构"预算耗尽/边际收益趋零 → 切换过程/降级"→ 降级/Delegate（钉死"无预算仍继续执行"的洞，行为测试锚定）
   - id: strong-none-no-budget
     when: { applicability: Strong, evidence_gaps: none, budget_ok: false }
     decision: Delegate

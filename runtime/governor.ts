@@ -78,7 +78,8 @@ export interface GovernorBudget {
   remaining: RemainingBudget;
 }
 
-/** GovernorInput（§5.1 字段级转录；task_done 为主会话裁决 2026-08-21 新增输入位） */
+/** GovernorInput（§5.1 字段级转录；task_done 为表外短路位——架构级维度，非策略数据维度，不入输入位：
+ *  由 isSuccessCriteriaCovered(task_contract, evidence_sufficiency) 在 decide 内计算，主会话裁决 2026-08-21 归一） */
 export interface GovernorInput {
   task_contract: { goal: string; success_criteria: string[] }; // S1 最小视图
   state_snapshot: { snapshot_hash: string }; // S2 最小视图
@@ -91,8 +92,6 @@ export interface GovernorInput {
   uncertainty_vector: Record<string, number>;
   maintenance_state: { debt: number }; // M8 最小视图（§12.3）
   evidence_sufficiency: EvidenceSufficiency;
-  /** 任务完成度判定：true → Stop（完成语境，架构 Stop 语义）；缺省 false（未完成语境走决策表） */
-  task_done?: boolean;
 }
 
 /** 六维分配（§5.1 计算分配器输出） */
@@ -114,22 +113,42 @@ export interface GovernorDecision {
   snapshot: string;
 }
 
+// ---- isSuccessCriteriaCovered：task_done 唯一判定源（主会话裁决 2026-08-21 归一） ----
+
+/**
+ * task_done 的**唯一**判定源（防漂移：调用方不得自行拼 task_done——decide 内部经此函数计算，
+ * 输入不再含 task_done 位，彻底归一）。语义：task_done = TaskContract.success_criteria 全覆盖
+ * （由 verifier 判定硬信号，与架构 §5.1 evidence_sufficiency"关键缺口为空"同一语义）——
+ * success_criteria 每项 ∈ covered_success_conditions → true。空 success_criteria → 空洞真（无未覆盖项）。
+ * task_done 是**表外短路位**（架构级维度，非策略数据维度）：决策表三维
+ * applicability/evidence_gaps/budget_ok 不含它；全覆盖在查表前短路 → Stop。
+ */
+export function isSuccessCriteriaCovered(
+  task: { success_criteria: string[] },
+  evidence: EvidenceSufficiency,
+): boolean {
+  return task.success_criteria.every((c) => evidence.covered_success_conditions.includes(c));
+}
+
 // ---- decide：Fast path 决策（表驱动，代码不硬编码决策） ----
 
 /**
- * 决策核心。task_done=true → Stop（主会话裁决：架构 §5.1 "候选已现且缺口空 → Stop"
- * 在完成语境成立，reason 含"任务完成/证据充分"）；task_done=false → 查 T2.1 决策表
- * （Strong+缺口空→RunProcess、缺口非空→Verify、OOD→GenerateProcess、Failed→ExpandSearch、
- * Contradictory→RetrieveMemory、预算不足→Delegate、未命中→默认规则→Stop）。
+ * 决策核心。task_done（= isSuccessCriteriaCovered(task_contract, evidence_sufficiency)，
+ * 主会话裁决 2026-08-21 归一：success_criteria 全覆盖，表外短路位——架构级维度，非策略数据维度，
+ * 决策表三维 applicability/evidence_gaps/budget_ok 不含它）= true → Stop，不查决策表
+ * （架构 §5.1 "候选已现且缺口空 → Stop"在完成语境成立，reason 含"任务完成/证据充分"）；
+ * 未全覆盖 → 查 T2.1 决策表（Strong+缺口空→RunProcess、缺口非空→Verify、OOD→GenerateProcess、
+ * Failed→ExpandSearch、Contradictory→RetrieveMemory、预算耗尽→Delegate、未命中→默认规则→Stop）。
  */
 export function decide(input: GovernorInput, policy: GovernorPolicy): GovernorDecision {
   const allocation = allocate(input.budget.envelope, input);
   const snapshot = input.state_snapshot.snapshot_hash;
 
-  if (input.task_done) {
+  // 表外短路：success_criteria 全覆盖（唯一判定源，无第二个输入位）→ Stop
+  if (isSuccessCriteriaCovered(input.task_contract, input.evidence_sufficiency)) {
     return {
       decision: 'Stop',
-      reason: '任务完成且证据充分：目标成功条件已覆盖、无关键缺口，候选已现，停止',
+      reason: '任务完成且证据充分：目标成功条件已全覆盖（verifier 判定硬信号），候选已现，停止',
       budget_allocation: allocation,
       expected_gain: utilityEstimate(input.progress_vector, allocatedCost(allocation)),
       snapshot,
