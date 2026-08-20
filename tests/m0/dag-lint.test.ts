@@ -38,8 +38,15 @@ describe('no-cross-layer-import（层 DAG lint）', () => {
     expect(msgs).toHaveLength(0);
   });
 
-  it('supervisor(1) 内 import kernel(2)（T1.2 brief：I/O 层可依赖纯领域层）→ 无错', async () => {
+  it('supervisor(1) 内 import kernel(2)（非 schemas 路径）→ 报错', async () => {
     const msgs = await lintRuleMessages("import '../kernel/x.js';", layerPath('supervisor'));
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toContain('layer 1');
+    expect(msgs[0]).toContain('layer 2');
+  });
+
+  it('supervisor(1) 内 import kernel/schemas（IR 契约例外）→ 无错', async () => {
+    const msgs = await lintRuleMessages("import '../kernel/schemas/index.js';", layerPath('supervisor'));
     expect(msgs).toHaveLength(0);
   });
 

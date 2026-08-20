@@ -5,13 +5,13 @@
 // put 门禁：A1 schema 校验（缺 provenance / 非法 id 均拒绝）→ id 必须等于内容哈希（内容寻址）→
 //   同 id 重复 put：内容相同 no-op 成功（幂等），内容不同拒绝。
 // restore 范围越界抛错；get 幂等（重复调用结果一致）。
-// layer 1（supervisor/）：可 import kernel/（CONVENTIONS §4）。
+// layer 1（supervisor/）：仅可 import kernel/schemas/（IR 契约例外，主会话裁决 2026-08-21；
+//   supervisor → kernel 其他路径与 kernel → supervisor 仍禁止）。
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ArtifactSchema, type Artifact } from '../kernel/schemas/a.js';
-import { isValidId } from '../kernel/schemas/base.js';
-import { computeContentId } from '../kernel/artifact.js';
+import { isValidId, makeImmutableId } from '../kernel/schemas/base.js';
 
 /** 索引条目：id → {type, scope, size, created}（size = 内容字节数） */
 export interface ArtifactMeta {
@@ -46,7 +46,7 @@ export class ArtifactStore {
       throw new Error(`ArtifactStore.put: A1 schema 校验失败 — ${parsed.error.message}`);
     }
     const a = parsed.data;
-    if (a.id !== computeContentId(a.content)) {
+    if (a.id !== makeImmutableId(a.content)) {
       throw new Error(`ArtifactStore.put: id 与内容哈希不一致（内容寻址）: ${a.id}`);
     }
     if (this.meta.has(a.id)) {

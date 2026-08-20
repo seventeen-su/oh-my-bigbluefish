@@ -69,11 +69,11 @@ const noCrossLayerImport = {
         return; // 目标不在任何层（如 import 到 preset 外）→ 豁免
       }
       if (toLayer > fromLayer) {
-        // T1.2 brief 例外（CONVENTIONS §1：任务 brief 优先于本文件）：supervisor(1) 可 import kernel(2)
-        // ——kernel 为纯领域层（IR 类型/schema/纯函数，无 I/O），supervisor 为其 I/O 外壳；
-        //   kernel(2) 仍不得 import supervisor(1)（反向依赖仍禁止）。
-        const briefException = fromLayer === 1 && toLayer === 2;
-        if (!briefException) {
+        // 例外（主会话裁决 2026-08-21）：IR 契约层——仅 supervisor(1) → kernel/schemas/ 放行
+        //（IR 为跨层机器契约；supervisor → kernel 其他路径与 kernel → supervisor 仍禁止）
+        const schemasContract = toPosix(targetAbs).includes('/kernel/schemas/');
+        const contractException = fromLayer === 1 && toLayer === 2 && schemasContract;
+        if (!contractException) {
           context.report({
             node,
             messageId: 'crossLayer',
