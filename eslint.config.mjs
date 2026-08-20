@@ -69,11 +69,17 @@ const noCrossLayerImport = {
         return; // 目标不在任何层（如 import 到 preset 外）→ 豁免
       }
       if (toLayer > fromLayer) {
-        context.report({
-          node,
-          messageId: 'crossLayer',
-          data: { fromLayer: String(fromLayer), toLayer: String(toLayer), source },
-        });
+        // T1.2 brief 例外（CONVENTIONS §1：任务 brief 优先于本文件）：supervisor(1) 可 import kernel(2)
+        // ——kernel 为纯领域层（IR 类型/schema/纯函数，无 I/O），supervisor 为其 I/O 外壳；
+        //   kernel(2) 仍不得 import supervisor(1)（反向依赖仍禁止）。
+        const briefException = fromLayer === 1 && toLayer === 2;
+        if (!briefException) {
+          context.report({
+            node,
+            messageId: 'crossLayer',
+            data: { fromLayer: String(fromLayer), toLayer: String(toLayer), source },
+          });
+        }
       }
     }
     return {

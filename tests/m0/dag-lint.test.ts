@@ -38,9 +38,9 @@ describe('no-cross-layer-import（层 DAG lint）', () => {
     expect(msgs).toHaveLength(0);
   });
 
-  it('supervisor(1) 内 import kernel(2) → 报错', async () => {
+  it('supervisor(1) 内 import kernel(2)（T1.2 brief：I/O 层可依赖纯领域层）→ 无错', async () => {
     const msgs = await lintRuleMessages("import '../kernel/x.js';", layerPath('supervisor'));
-    expect(msgs).toHaveLength(1);
+    expect(msgs).toHaveLength(0);
   });
 
   it('supervisor(1) 内 import substrate(0)（反向依赖，合法）→ 无错', async () => {
