@@ -72,7 +72,7 @@ const GEN_PRODUCT = mkProcessDef('generated-canonical', 'RETRIEVE', 'STOP', [
   { id: 'execute', op: 'EXECUTE', output: 'tool_results', input_binding: { plan: '$.experiment_plan' }, cost: { tokens: 2000, time_ms: 100 }, verification: '能力执行' },
   { id: 'observe', op: 'OBSERVE', output: 'observations', input_binding: { results: '$.tool_results', plan: '$.experiment_plan' }, cost: { tokens: 500, time_ms: 100 }, verification: '观测转换' },
   { id: 'update', op: 'UPDATE', output: 'state_patch', input_binding: { state: '$.working', obs: '$.observations' }, cost: { tokens: 500, time_ms: 100 }, verification: '状态更新' },
-  { id: 'stop', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', patch: '$.state_patch' }, cost: { tokens: 100, time_ms: 50 }, verification: '停止报告', error: { retryable: false, timeout_ms: 50, cancelable: false, rollback: '无' } },
+  { id: 'stop', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', reason: '$.state_patch' }, cost: { tokens: 100, time_ms: 50 }, verification: '停止报告', error: { retryable: false, timeout_ms: 50, cancelable: false, rollback: '无' } },
 ]);
 
 /** fake retrieveFn（M4 注入；生产由 boot 装配 M3 backend） */
@@ -220,13 +220,17 @@ describe('② 生成产物可执行（核心断言：generate 产物 → toOpera
     const ends = sink.filter((e) => e.type === 'process/operator/end').map((e) => e.operator_id);
     expect(starts).toEqual(res.completed);
     expect(ends).toEqual(res.completed);
-    // STOP 输出（末算子完成；stop.state 绑定图输入 working → 摘要为其快照）
-    const stop = res.outputs['STOP'] as { reason: string; summary: { confirmed_facts: number; gaps: number } };
-    expect(stop.reason).toBe('completed');
-    expect(stop.summary).toEqual({ confirmed_facts: 2, gaps: 1 });
     // UPDATE 端到端生效：观测（obs 键契约）应用 → state_patch 增补 evidence:capability:default
     const patch = res.outputs['UPDATE'] as { confirmed_facts: string[]; evidence_gaps: string[] };
     expect(patch.confirmed_facts).toContain('evidence:capability:default');
+    // STOP 输出（末算子完成；stop.state 绑定图输入 working → 摘要为其快照；
+    // reason 键契约：绑定 state_patch → 真实数据流入报告，不再走 'completed' 兜底）
+    const stop = res.outputs['STOP'] as {
+      reason: { confirmed_facts: string[]; evidence_gaps: string[] };
+      summary: { confirmed_facts: number; gaps: number };
+    };
+    expect(stop.reason).toEqual(patch);
+    expect(stop.summary).toEqual({ confirmed_facts: 2, gaps: 1 });
     // 无挂起：墙钟有界（成功路径无定时器）
     expect(elapsed).toBeLessThan(2000);
     // M4 最小验证契约：verification 谓词未注册 → warning 不阻断
@@ -255,11 +259,21 @@ describe('③ 已知过程 Reuse → 执行成功（端到端）', () => {
     expect(exec.ok).toBe(true);
     expect(exec.completed[0]).toBe('HYPOTHESIZE');
     expect(exec.completed[exec.completed.length - 1]).toBe('STOP');
-    // 全链 6 算子（含 EXECUTE）全部完成：接缝跑通完整链（注：T2.1 YAML 以 'hypotheses' 键绑定
-    // 而内置 DISCRIMINATE 读 'h' 键 → plan 为空 → handle 未被调用；见报告关注点，数据/ABI 键名契约待裁决）
+    // 全链 6 算子（含 EXECUTE）全部完成：接缝跑通完整链
     expect(exec.completed).toHaveLength(6);
     expect(exec.completed).toContain('EXECUTE');
-    const stop = exec.outputs['STOP'] as { summary: { confirmed_facts: number; gaps: number } };
+    // 键名契约统一（YAML input_binding → 内置算子输入契约键 q/h/obs）：
+    // DISCRIMINATE 收到真实假设（h 键）→ 判别实验非空 → EXECUTE 经 fake CapabilityHandle 真实调用 3 次（YAML n=3）
+    expect(calls).toHaveLength(3);
+    // UPDATE 应用观测（obs 键契约）：observations 流入 → state_patch 增补 evidence:capability:default
+    const patch = exec.outputs['UPDATE'] as { confirmed_facts: string[]; evidence_gaps: string[] };
+    expect(patch.confirmed_facts).toContain('evidence:capability:default');
+    const stop = exec.outputs['STOP'] as {
+      reason: { confirmed_facts: string[]; evidence_gaps: string[] };
+      summary: { confirmed_facts: number; gaps: number };
+    };
+    // STOP reason 键契约：绑定 state_patch → 报告携带真实更新结果（非兜底 'completed'）
+    expect(stop.reason).toEqual(patch);
     expect(stop.summary).toEqual({ confirmed_facts: 1, gaps: 0 });
   });
 
@@ -280,12 +294,13 @@ describe('③ 已知过程 Reuse → 执行成功（端到端）', () => {
     );
     expect(exec.ok).toBe(true);
     expect(exec.completed).toEqual(['RETRIEVE', 'VERIFY', 'STOP']);
-    // 检索 fake → 验证 → STOP：verdict 判定 confirmed（items 非空）
+    // 检索 fake → 验证 → STOP：verdict 判定 confirmed（items 非空）；
+    // STOP reason 键契约：绑定 verdict 输出 → 报告携带真实判定（非兜底 'completed'）
     const verdict = exec.outputs['VERIFY'] as { verdict: string; evidence_count: number };
     expect(verdict.verdict).toBe('confirmed');
     expect(verdict.evidence_count).toBe(1);
-    const stop = exec.outputs['STOP'] as { reason: string; summary: { confirmed_facts: number; gaps: number } };
-    expect(stop.reason).toBe('completed');
+    const stop = exec.outputs['STOP'] as { reason: { verdict: string; evidence_count: number }; summary: { confirmed_facts: number; gaps: number } };
+    expect(stop.reason).toEqual(verdict);
     expect(stop.summary).toEqual({ confirmed_facts: 1, gaps: 0 });
   });
 });

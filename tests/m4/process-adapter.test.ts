@@ -52,11 +52,11 @@ function asDef(v: unknown): ProcessDef {
   return v as ProcessDef;
 }
 
-/** T2.1 retrieve-verify 过程（真实 YAML 形状：'$.x' 引用 + 裸常量） */
+/** T2.1 retrieve-verify 过程（真实 YAML 形状：'$.x' 引用 + 裸常量；键名 = 内置算子输入契约键） */
 const PROC_RV = mkDef('retrieve-verify', 'RETRIEVE', 'STOP', [
-  { id: 'retrieve', op: 'RETRIEVE', output: 'memory_pack', input_binding: { query: '$.goal', scope: 'Project', kind: 'Semantic' } },
+  { id: 'retrieve', op: 'RETRIEVE', output: 'memory_pack', input_binding: { q: '$.goal', scope: 'Project', kind: 'Semantic' } },
   { id: 'verify', op: 'VERIFY', output: 'verdict', input_binding: { pack: '$.memory_pack' } },
-  { id: 'stop', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', verdict: '$.verdict' } },
+  { id: 'stop', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', reason: '$.verdict' } },
 ]);
 
 /** 规范链（含 EXECUTE 与图输入路径引用 '$.working.evidence_gaps'） */
@@ -66,8 +66,8 @@ const PROC_CANON = mkDef('canonical', 'RETRIEVE', 'STOP', [
   { id: 'd', op: 'DISCRIMINATE', output: 'experiment_plan', input_binding: { h: '$.hypotheses', s: '$.working', gaps: '$.working.evidence_gaps' } },
   { id: 'x', op: 'EXECUTE', output: 'tool_results', input_binding: { plan: '$.experiment_plan' } },
   { id: 'o', op: 'OBSERVE', output: 'observations', input_binding: { results: '$.tool_results', plan: '$.experiment_plan' } },
-  { id: 'u', op: 'UPDATE', output: 'state_patch', input_binding: { state: '$.working', observations: '$.observations' } },
-  { id: 's', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', patch: '$.state_patch' } },
+  { id: 'u', op: 'UPDATE', output: 'state_patch', input_binding: { state: '$.working', obs: '$.observations' } },
+  { id: 's', op: 'STOP', output: 'stop_report', input_binding: { state: '$.working', reason: '$.state_patch' } },
 ]);
 
 /** 全常量绑定（无任何 ref → 顺序链 fallback 路径） */
@@ -125,10 +125,10 @@ describe('① 字段收窄映射（ProcessDef Operator → OperatorSpec）', () 
 describe('② 绑定转换（ProcessDef unknown → OperatorBinding）', () => {
   it('$.输出名 → {ref: 生产者 id}；$.图输入 → {ref: 输入名}；$.图输入.路径 → {ref, path}', () => {
     const g = toOperatorGraph(PROC_RV);
-    expect(bindingOf(g, 'RETRIEVE', 'query')).toEqual({ ref: 'goal' }); // 图输入（无生产者）
+    expect(bindingOf(g, 'RETRIEVE', 'q')).toEqual({ ref: 'goal' }); // 图输入（无生产者）
     expect(bindingOf(g, 'VERIFY', 'pack')).toEqual({ ref: 'RETRIEVE' }); // 输出 memory_pack 的生产者
     expect(bindingOf(g, 'STOP', 'state')).toEqual({ ref: 'working' });
-    expect(bindingOf(g, 'STOP', 'verdict')).toEqual({ ref: 'VERIFY' });
+    expect(bindingOf(g, 'STOP', 'reason')).toEqual({ ref: 'VERIFY' });
   });
 
   it('裸常量（字符串/数字）→ {const}；已收窄 {const}/{ref} 原样透传', () => {

@@ -1,6 +1,7 @@
 # 认知过程 2：HYPOTHESIZE → DISCRIMINATE → EXECUTE → OBSERVE → UPDATE → STOP（假设-检验闭环）
 # 过程 = 数据化程序（架构 §4.2 P1 / §5.3 Operator ABI）。
 # M2 阶段只做数据与校验，不执行（执行在 M4）；改本文件即改行为，代码不感知内容。
+# input_binding 键名 = 内置算子输入契约键（§5.3 签名：DISCRIMINATE h / UPDATE obs / STOP state+reason；执行端权威）。
 id: hypothesize-test
 version: 1.0.0
 entry: HYPOTHESIZE
@@ -18,7 +19,7 @@ operators:
     error: { retryable: false, timeout_ms: 20000, cancelable: true, rollback: "无副作用" }
   - id: discriminate
     op: DISCRIMINATE
-    input_binding: { hypotheses: "$.hypotheses", gaps: "$.working.evidence_gaps" }
+    input_binding: { h: "$.hypotheses", gaps: "$.working.evidence_gaps" }
     output: experiment_plan
     cost: { tokens: 2000, time_ms: 8000 }
     verification: "experiment_plan 覆盖全部活跃假设的判别观测"
@@ -39,14 +40,14 @@ operators:
     error: { retryable: false, timeout_ms: 5000, cancelable: true, rollback: "无副作用" }
   - id: update
     op: UPDATE
-    input_binding: { state: "$.working", observations: "$.observations" }
+    input_binding: { state: "$.working", obs: "$.observations" }
     output: state_patch
     cost: { tokens: 1500, time_ms: 5000 }
     verification: "state_patch 使假设状态机合法迁移（活动→判别/拒绝/确认）"
     error: { retryable: false, timeout_ms: 5000, cancelable: true, rollback: "无副作用" }
   - id: stop
     op: STOP
-    input_binding: { state: "$.working", patch: "$.state_patch" }
+    input_binding: { state: "$.working", reason: "$.state_patch" }
     output: stop_report
     cost: { tokens: 200, time_ms: 1000 }
     verification: "stop_report 含最终结论、证据引用与下一步"
