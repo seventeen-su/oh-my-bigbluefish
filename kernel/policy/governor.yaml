@@ -1,0 +1,75 @@
+# Governor 决策表（架构 §5.1 Fast Governor：常态结构化 policy 廉价决策，代码不感知内容——改本表即改行为）
+#
+# 语义（架构 §5.1 / brief）：
+#   - 候选已现且缺口空 → Stop；缺口非空 → 最小充分验证（Verify）
+#   - Applicability OOD → GenerateProcess；Failed/Contradictory → ExpandSearch/RetrieveMemory
+#   - Strong → RunProcess；预算不足（budget_ok: false）→ Delegate（降级/慢路径）
+# 表为精确匹配：rules 覆盖 applicability × evidence_gaps × budget_ok 全 20 组合（防漂移测试锚定），
+# 未命中任何规则（理论不可达，防未来字段扩展漂移）→ default 规则 → Stop 保守停止（不执行未授权动作）。
+# 初值，待冻结基准标定（架构 §17）
+rules:
+  # ---- budget_ok: true：常规 Fast path ----
+  - id: strong-none-ok
+    when: { applicability: Strong, evidence_gaps: none, budget_ok: true }
+    decision: RunProcess          # Strong → RunProcess：强适用候选 + 证据充分 → 直接执行
+  - id: strong-some-ok
+    when: { applicability: Strong, evidence_gaps: some, budget_ok: true }
+    decision: Verify              # 缺口非空 → 最小充分验证（非阈值，结构化比对）
+  - id: partial-none-ok
+    when: { applicability: Partial, evidence_gaps: none, budget_ok: true }
+    decision: Stop                # 候选已现（部分适用）且缺口空 → Stop：目标已被证据覆盖，无缺口可验证 → 停止
+  - id: partial-some-ok
+    when: { applicability: Partial, evidence_gaps: some, budget_ok: true }
+    decision: Verify              # 缺口非空 → 最小充分验证
+  - id: failed-none-ok
+    when: { applicability: Failed, evidence_gaps: none, budget_ok: true }
+    decision: ExpandSearch        # Failed → 扩宽搜索
+  - id: failed-some-ok
+    when: { applicability: Failed, evidence_gaps: some, budget_ok: true }
+    decision: ExpandSearch        # Failed → 扩宽搜索（候选失败优先于缺口验证）
+  - id: contradictory-none-ok
+    when: { applicability: Contradictory, evidence_gaps: none, budget_ok: true }
+    decision: RetrieveMemory      # Contradictory → 检索记忆补充上下文（§5.2 矛盾 → 扩宽搜索系）
+  - id: contradictory-some-ok
+    when: { applicability: Contradictory, evidence_gaps: some, budget_ok: true }
+    decision: RetrieveMemory      # Contradictory → 检索记忆
+  - id: ood-none-ok
+    when: { applicability: OOD, evidence_gaps: none, budget_ok: true }
+    decision: GenerateProcess     # OOD → GenerateProcess：陌生才生成（§5.3 阶梯 Reuse→…→Generate 最后手段）
+  - id: ood-some-ok
+    when: { applicability: OOD, evidence_gaps: some, budget_ok: true }
+    decision: GenerateProcess     # OOD → GenerateProcess
+  # ---- budget_ok: false：预算不足 → Delegate（Fast Governor 无法廉价决策时移交） ----
+  - id: strong-none-no-budget
+    when: { applicability: Strong, evidence_gaps: none, budget_ok: false }
+    decision: Delegate
+  - id: strong-some-no-budget
+    when: { applicability: Strong, evidence_gaps: some, budget_ok: false }
+    decision: Delegate
+  - id: partial-none-no-budget
+    when: { applicability: Partial, evidence_gaps: none, budget_ok: false }
+    decision: Delegate
+  - id: partial-some-no-budget
+    when: { applicability: Partial, evidence_gaps: some, budget_ok: false }
+    decision: Delegate
+  - id: failed-none-no-budget
+    when: { applicability: Failed, evidence_gaps: none, budget_ok: false }
+    decision: Delegate
+  - id: failed-some-no-budget
+    when: { applicability: Failed, evidence_gaps: some, budget_ok: false }
+    decision: Delegate
+  - id: contradictory-none-no-budget
+    when: { applicability: Contradictory, evidence_gaps: none, budget_ok: false }
+    decision: Delegate
+  - id: contradictory-some-no-budget
+    when: { applicability: Contradictory, evidence_gaps: some, budget_ok: false }
+    decision: Delegate
+  - id: ood-none-no-budget
+    when: { applicability: OOD, evidence_gaps: none, budget_ok: false }
+    decision: Delegate
+  - id: ood-some-no-budget
+    when: { applicability: OOD, evidence_gaps: some, budget_ok: false }
+    decision: Delegate
+  # 默认规则（无 when → 匹配任何未命中状态）：候选已现且缺口空等边界 → Stop 保守停止（§5.1 Stop 一等认知动作）
+  - id: default
+    decision: Stop

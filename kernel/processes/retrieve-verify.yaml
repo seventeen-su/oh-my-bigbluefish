@@ -1,0 +1,35 @@
+# 认知过程 1：RETRIEVE → VERIFY → STOP（最小验证过程）
+# 过程 = 数据化程序（架构 §4.2 P1 / §5.3 Operator ABI）。
+# M2 阶段只做数据与校验，不执行（执行在 M4）；改本文件即改行为，代码不感知内容。
+id: retrieve-verify
+version: 1.0.0
+entry: RETRIEVE
+exit: STOP
+budget:
+  tokens: 8000
+  time_ms: 30000
+operators:
+  - id: retrieve
+    op: RETRIEVE
+    input_binding:
+      query: "$.goal"
+      scope: "Project"
+      kind: "Semantic"
+    output: memory_pack
+    cost: { tokens: 2000, time_ms: 5000 }
+    verification: "memory_pack 非空且命中查询"
+    error: { retryable: true, timeout_ms: 10000, cancelable: true, rollback: "无副作用，可重试" }
+  - id: verify
+    op: VERIFY
+    input_binding: { pack: "$.memory_pack" }
+    output: verdict
+    cost: { tokens: 1000, time_ms: 3000 }
+    verification: "verdict ∈ {confirmed, refuted}"
+    error: { retryable: true, timeout_ms: 5000, cancelable: true, rollback: "无副作用" }
+  - id: stop
+    op: STOP
+    input_binding: { state: "$.working", verdict: "$.verdict" }
+    output: stop_report
+    cost: { tokens: 100, time_ms: 500 }
+    verification: "stop_report 含最终结论与证据引用"
+    error: { retryable: false, timeout_ms: 1000, cancelable: false, rollback: "无" }

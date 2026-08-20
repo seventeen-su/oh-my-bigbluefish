@@ -1,0 +1,9 @@
+# 计算分配器六维预算（架构 §5.1）+ Context Compiler 投影预算（§6.1）
+# 初值，待冻结基准标定（架构 §17）——冻结基准集产出后修正本文件即可，代码不感知内容。
+depth: 8            # 推理深度（层数上限）
+breadth: 4          # 单层并行分支宽度上限
+tools: 12           # 单请求工具调用上限
+retrieval: 6        # 单请求检索调用上限
+branches: 8         # 全请求分支总数上限
+context: 16000      # 上下文 token 总量预算
+context_budget_tokens: 4000   # Context Compiler 投影预算（初值 4000，§17 参数标定）

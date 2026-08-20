@@ -1,0 +1,9 @@
+# Context Compiler 参数（架构 §6.1：marginal = ΔInfoValue − token − reacquisition − attention_pollution − regression_risk）
+# 初值（§17 开放项，启发式初值，冻结基准产出后修正）；working_state_never_compress 为架构硬约束（§6.1 绝不盲压缩）。
+marginal_weights:
+  info_value: 1.0           # Δ信息价值权重
+  token_cost: 0.5           # token 成本权重
+  reacquisition: 0.8        # 重获取成本权重
+  attention_pollution: 0.4  # 注意力污染权重
+  regression_risk: 0.6      # 回归风险权重
+working_state_never_compress: true  # Working State 绝不盲压缩
