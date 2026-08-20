@@ -4,7 +4,7 @@
 //       ③ 序列化往返（vector/signal JSON.stringify → parse → zod 校验 → 深度相等；非法 JSON 拒绝）
 //       ④ 区间表达（confidence_interval low ≤ high；low > high 拒绝）
 //       ⑤ 三层信号（L1/L2/L3 各构造一例校验通过；kind 枚举非法拒绝；window from ≤ to）
-//       ⑥ fromUtilityCounts（M1 Memory.utility_counts 六计数器 → L1 信号数组，计数映射）
+//       ⑥ fromUtilityCounts（M1 Memory.utility_counts 六反馈键 → L1 信号数组，诚实部分映射）
 //       ⑦ 无数据维（value null 合法，Unknown 依据）
 import { describe, expect, it } from 'vitest';
 import {
@@ -252,26 +252,23 @@ describe('⑤ 三层信号（L1 机械 / L2 统计 / L3 语义）', () => {
   });
 });
 
-describe('⑥ fromUtilityCounts（M1 Memory.utility_counts 六计数器 → L1 信号，计数映射）', () => {
+describe('⑥ fromUtilityCounts（M1 Memory.utility_counts 六反馈键 → L1 信号，诚实部分映射）', () => {
   const WINDOW = { from: 0, to: 100 };
 
-  it('六计数器 → L1 信号数组（corrections→correction、hits→memory_hit，计数透传）', () => {
+  it('六反馈键 → L1 信号数组（仅 hit→memory_hit，计数透传）', () => {
     const signals = fromUtilityCounts(
-      { tool_calls: 3, retrieval_calls: 1, memory_ops: 2, corrections: 4, reads: 5, hits: 2 },
+      { retrieval: 3, hit: 2, miss: 1, inject: 4, decay: 5, promote: 0 },
       TARGET,
       WINDOW,
     );
-    expect(signals).toEqual([
-      { layer: 'L1', kind: 'correction', target: TARGET, count: 4, window: WINDOW },
-      { layer: 'L1', kind: 'memory_hit', target: TARGET, count: 2, window: WINDOW },
-    ]);
+    expect(signals).toEqual([{ layer: 'L1', kind: 'memory_hit', target: TARGET, count: 2, window: WINDOW }]);
   });
 
-  it('零计数与未映射计数器不产生信号', () => {
-    expect(fromUtilityCounts({ tool_calls: 3, corrections: 0, hits: 0 }, TARGET, WINDOW)).toEqual([]);
-    expect(fromUtilityCounts({ tool_calls: 5, retrieval_calls: 2, memory_ops: 1, reads: 9 }, TARGET, WINDOW)).toEqual(
-      [],
-    );
+  it('零计数与未映射反馈键不产生信号（retrieval/miss/inject/decay/promote 无 L1 对应）', () => {
+    expect(
+      fromUtilityCounts({ retrieval: 3, hit: 0, miss: 1, inject: 4, decay: 5, promote: 6 }, TARGET, WINDOW),
+    ).toEqual([]);
+    expect(fromUtilityCounts({ retrieval: 5, miss: 2, inject: 1, decay: 9, promote: 3 }, TARGET, WINDOW)).toEqual([]);
   });
 
   it('空计数输入 → 空数组', () => {

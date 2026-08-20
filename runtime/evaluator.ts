@@ -177,18 +177,20 @@ export function signalFromJSON(json: string): EvaluationSignal {
   return EvaluationSignalSchema.parse(JSON.parse(json) as unknown);
 }
 
-// ---- 六计数器衔接（M1 Memory.utility_counts → L1 信号；M5 会用） ----
-// 六计数器（T1.4 定名）：tool_calls / retrieval_calls / memory_ops / corrections / reads / hits。
-// L1 信号 kind 为六种机械观察；聚合计数器中仅 corrections / hits 有直接语义对应
-// （tool_success / tool_failure / retry / memory_miss 需事件级数据，由 M5 采集器产生，不做无依据映射）。
+// ---- 六反馈键衔接（M1 Memory.utility_counts → L1 信号；M5 会用） ----
+// 记忆级 utility_counts 键 = T3.4 定型六反馈键：retrieval / hit / miss / inject / decay / promote
+// （state-reducer 的 tool_calls/retrieval_calls/memory_ops/corrections/reads/hits 是系统级 reduce 投影键，
+// 不写入 memory 表，此处不可得）。
+// L1 信号 kind 为六种机械观察；六反馈键中仅 hit 有直接语义对应（hit → memory_hit）；
+// retrieval / miss / inject / decay / promote 无 L1 对应（不映射——诚实部分映射：
+// tool_success / tool_failure / retry / memory_miss 需事件级数据，由 M5 采集器产生，不做无依据映射）。
 // 未映射计数器与零计数不产生信号（避免噪声信号污染评估）。
 
 const COUNTER_TO_L1_KIND: Readonly<Record<string, L1Signal['kind']>> = {
-  corrections: 'correction',
-  hits: 'memory_hit',
+  hit: 'memory_hit',
 };
 
-/** 六计数器 → L1 信号数组（纯转换；计数透传，零计数跳过） */
+/** 六反馈键 → L1 信号数组（纯转换；计数透传，零计数跳过；仅 hit 映射） */
 export function fromUtilityCounts(
   counts: Readonly<Record<string, number>>,
   target: string,

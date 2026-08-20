@@ -154,6 +154,15 @@ describe('admit（metadata admission，§7.2）', () => {
     expect(page.total).toBe(1);
     expect(page.items[0]?.payload).toBe('准入新内容');
     expect(page.items[0]?.provenance.event).toBe(e.provenance.event);
+    // 记忆级 utility_counts 默认 = T3.4 定型六反馈键全 0（staging-policy 默认形状）
+    expect(page.items[0]?.utility_counts).toEqual({
+      retrieval: 0,
+      hit: 0,
+      miss: 0,
+      inject: 0,
+      decay: 0,
+      promote: 0,
+    });
   });
 
   it('admission 重复拒绝：同一内容两事件 → 第二个 rejected duplicate（防重复记忆）', async () => {

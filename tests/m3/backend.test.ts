@@ -54,7 +54,7 @@ function makeMemory(over: Record<string, unknown> = {}): Memory {
     prov_class: 'Observation',
     payload: '默认记忆内容',
     value_score: 0.5,
-    utility_counts: { read: 0, hit: 0 },
+    utility_counts: { retrieval: 0, hit: 0, miss: 0, inject: 0, decay: 0, promote: 0 },
     ...over,
   } as unknown as Memory;
 }
@@ -96,7 +96,7 @@ describe('ingest + query（§4.3 A4 / 四维过滤）', () => {
     const m = makeMemory({
       payload: '{"text":"往返一致性检查","n":42}',
       value_score: 0.8,
-      utility_counts: { read: 3, hit: 2, miss: 1 },
+      utility_counts: { retrieval: 3, hit: 2, miss: 1 },
       belief_ref: 'belief:1',
       lineage_ref: 'lineage:1',
     });

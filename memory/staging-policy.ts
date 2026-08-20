@@ -158,7 +158,9 @@ export function memoryCandidate(event: Event): MemoryCandidate | null {
     prov_class: provClass,
     payload: m.payload as string,
     value_score: typeof m.value_score === 'number' ? (m.value_score as number) : 0.5,
-    utility_counts: isRecord(m.utility_counts) ? (m.utility_counts as Record<string, number>) : { read: 0, hit: 0 },
+    utility_counts: isRecord(m.utility_counts)
+      ? (m.utility_counts as Record<string, number>)
+      : { retrieval: 0, hit: 0, miss: 0, inject: 0, decay: 0, promote: 0 }, // 记忆级默认 = T3.4 定型六反馈键全 0
     belief_ref: typeof m.belief_ref === 'string' ? (m.belief_ref as string) : undefined,
     lineage_ref: typeof m.lineage_ref === 'string' ? (m.lineage_ref as string) : undefined,
   };

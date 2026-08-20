@@ -40,7 +40,8 @@ export interface DecisionLineageEntry {
   evidence_used: string[];
   supersedes?: string;
 }
-/** Utility 六计数器（投影；与 M1.1 的 M1 Memory.utility_counts 对接；reads/hits 占位） */
+/** Utility 六计数器（reduce 系统级投影键：tool_calls/retrieval_calls/memory_ops/corrections/reads/hits；
+ *  系统级派生数据，不写入 memory 表——非记忆级 utility_counts 键；记忆级 utility_counts 键 = T3.4 定型六反馈键） */
 export interface UtilityCounts {
   tool_calls: number;
   retrieval_calls: number;

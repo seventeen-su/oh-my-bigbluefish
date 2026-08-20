@@ -1,5 +1,5 @@
 // OMB v2 记忆效用反馈（架构 §7.4 Utility Feedback / Retrieval Episode / 统一价值模型 的 utility 分量）：
-// 六计数器（retrieval/hit/miss/inject/decay/promote，M1 utility_counts 六字段）→ utility_score 派生
+// 六计数器（retrieval/hit/miss/inject/decay/promote；记忆级 utility_counts 正式键，T3.4 定型）→ utility_score 派生
 // （初值公式：加权计数，权重常量表待标定 §17）；bumpUtility 更新 M1 utility_counts（权威存储）并同步
 // memory_stats（retrievals/hits/misses 三列——T3.1 表无 inject/decay/promote 列，此三计数器仅存
 // utility_counts，记录在案）；Retrieval Episode 记录（T3.1 retrieval_episode 表，§7.4 归因与
@@ -9,9 +9,9 @@
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { RetrievalBackend, EpisodeRow } from './backend-retrieval.js';
 
-// ---- 六计数器（§7.4：六计数器 → utility_score；M1 utility_counts 六字段） ----
+// ---- 六计数器（§7.4：六计数器 → utility_score；记忆级 utility_counts 正式键，T3.4 定型） ----
 
-/** 六计数器枚举（bumpUtility counter 参数；M1 utility_counts 六字段键） */
+/** 六计数器枚举（bumpUtility counter 参数；记忆级 utility_counts 正式键，T3.4 定型） */
 export const UTILITY_COUNTERS = ['retrieval', 'hit', 'miss', 'inject', 'decay', 'promote'] as const;
 export type UtilityCounter = (typeof UTILITY_COUNTERS)[number];
 
@@ -34,7 +34,7 @@ export function deriveUtilityScore(counts: Record<string, number>): number {
   return Math.round(Math.min(1, Math.max(0, s)) * 10_000) / 10_000;
 }
 
-/** bumpUtility：计数器 +1（M1 utility_counts 六字段权威存储）→ memory_stats 对应列同步
+/** bumpUtility：计数器 +1（记忆级 utility_counts 正式键权威存储，T3.4 定型）→ memory_stats 对应列同步
  *  （retrieval→retrievals、hit→hits、miss→misses + last_retrieved；inject/decay/promote 无列）。
  *  非法 counter / 未知 id → fail-loud。 */
 export async function bumpUtility(backend: RetrievalBackend, id: string, counter: UtilityCounter): Promise<void> {

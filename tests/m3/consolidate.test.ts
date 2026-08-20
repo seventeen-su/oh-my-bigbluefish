@@ -67,7 +67,7 @@ function makeMemory(over: {
     prov_class: over.prov_class ?? 'Observation',
     payload: over.payload,
     value_score: 0.5,
-    utility_counts: { read: 0, hit: 0 },
+    utility_counts: { retrieval: 0, hit: 0, miss: 0, inject: 0, decay: 0, promote: 0 },
   } as unknown as Memory;
 }
 

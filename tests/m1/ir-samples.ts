@@ -260,7 +260,7 @@ const M1_VALID: Rec = {
   prov_class: 'Observation',
   payload: 'art:1',
   value_score: 0.6,
-  utility_counts: { read: 3, hit: 2 },
+  utility_counts: { retrieval: 3, hit: 2 },
 };
 
 const M3_VALID: Rec = {
