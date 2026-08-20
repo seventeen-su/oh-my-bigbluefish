@@ -1,11 +1,12 @@
 // T4.1 行为测试：Operator ABI 与内置算子（runtime/operator.ts + runtime/operator-builtins.ts，架构 §5.3）。
 // 严格 TDD：本文件先于实现编写并确认失败（功能缺失）。
-// 十一组：① 拓扑执行顺序（Kahn + 事件序列）② fan-out 并行（并发上限 2）
+// 十二组：① 拓扑执行顺序（Kahn + 事件序列）② fan-out 并行（并发上限 2）
 //         ③ 数据流绑定（input_binding ref/const/数组 fan-in）④ EXECUTE 经 CapabilityHandle
 //         ⑤ 错误契约-重试（≤2 次指数退避）⑥ 错误契约-非重试 + rollback 补偿
 //         ⑦ 超时（AbortSignal.timeout）⑧ 预算（cost 总和超 budget 执行前拒绝）
 //         ⑨ 每算子 Event（eventSink 注入）⑩ Micro Certificate（结构完整/确定性）
 //         ⑪ 验证谓词（verification 字段；无谓词 → warning）。
+//         ⑫ 取消/超时终态语义（CANCELLED 终态不重试；TIMEOUT 按 spec.error.retryable 取舍）。
 // 依赖注入（brief 明示）：RETRIEVE 用 fake retrieveFn；EXECUTE 用 fake CapabilityProvider；
 // 自定义算子经 ctx.registry 注入（测试仅用计数器/记录数组，无 mock 框架）。
 import { describe, expect, it } from 'vitest';
@@ -575,5 +576,91 @@ describe('⑪ 验证谓词（verification 字段：存在即执行谓词；无�
     );
     expect(res.ok).toBe(true);
     expect(warns.some((w) => w.includes('pred-missing'))).toBe(true);
+  });
+});
+
+// ---- ⑫ 取消/超时终态语义（T4.1 评审 Important：取消是终态，不进入重试路径） ----
+
+describe('⑫ 取消/超时终态语义（CANCELLED 终态不重试；TIMEOUT 按 spec.error.retryable 取舍）', () => {
+  it('cancelable 算子运行中被图级信号中止 → 单次尝试立即失败：start 仅 1 次、无 retry、无退避、错误码 CANCELLED', async () => {
+    let runCalls = 0;
+    let enteredRun: (() => void) | undefined;
+    const entered = new Promise<void>((r) => {
+      enteredRun = r;
+    });
+    let releaseGate: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const cancelable: OperatorFn = {
+      async run() {
+        runCalls++;
+        enteredRun?.();
+        await gate; // 挂起：中止由 abort 事件驱动（算子自身不感知取消）
+        return 'never';
+      },
+    };
+    const controller = new AbortController();
+    const events: OperatorEvent[] = [];
+    const pending = executeGraph(
+      graph([op('c1', { error: { retryable: true, timeout_ms: 0, cancelable: true, rollback: '' } })], [], 'c1', 'c1'),
+      { inputs: {}, budget: 100, registry: { c1: cancelable }, signal: controller.signal, eventSink: (e) => events.push(e) },
+    );
+    await entered; // 等算子进入 run（start 事件已发出）后再中止 → 命中运行中取消路径
+    controller.abort();
+    releaseGate?.(); // 释放挂起（外层已因 abort 拒绝，此处仅清理悬空 promise）
+    const res = await pending;
+    expect(res.failed).toBe(true);
+    expect(res.error?.code).toBe('CANCELLED'); // 结果码明确
+    expect(res.error?.operator_id).toBe('c1');
+    expect(runCalls).toBe(1); // 不重试：算子仅被调用 1 次
+    // 事件序列即证据：start 仅 1 次、无 retry 事件（退避只在 retry 前发生）→ 取消未走重试路径
+    expect(events.map((e) => e.type)).toEqual(['process/operator/start', 'process/operator/failed']);
+    expect(events.filter((e) => e.type === 'process/operator/retry')).toHaveLength(0);
+  });
+
+  it('执行前图级信号已中止 → 直接 CANCELLED，无算子运行', async () => {
+    let runCalls = 0;
+    const controller = new AbortController();
+    controller.abort();
+    const res = await executeGraph(
+      graph([op('c0', { error: { retryable: true, timeout_ms: 0, cancelable: true, rollback: '' } })], [], 'c0', 'c0'),
+      {
+        inputs: {},
+        budget: 100,
+        registry: {
+          c0: {
+            run: async () => {
+              runCalls++;
+              return 'x';
+            },
+          },
+        },
+        signal: controller.signal,
+      },
+    );
+    expect(res.failed).toBe(true);
+    expect(res.code).toBe('CANCELLED');
+    expect(runCalls).toBe(0);
+    expect(res.events).toEqual([]);
+  });
+
+  it('TIMEOUT 取舍：spec.error.retryable=true 时超时重试（≤2 次），错误码仍为 TIMEOUT', async () => {
+    const slow: OperatorFn = {
+      async run() {
+        await delay(500);
+        return 'late';
+      },
+    };
+    const events: OperatorEvent[] = [];
+    const res = await executeGraph(
+      graph([op('slow2', { error: { retryable: true, timeout_ms: 30, cancelable: false, rollback: '' } })], [], 'slow2', 'slow2'),
+      { inputs: {}, budget: 100, registry: { slow2: slow }, eventSink: (e) => events.push(e) },
+    );
+    expect(res.failed).toBe(true);
+    expect(res.error?.code).toBe('TIMEOUT');
+    expect(res.error?.operator_id).toBe('slow2');
+    expect(events.filter((e) => e.type === 'process/operator/start')).toHaveLength(3); // 重试 ≤ 2 次
+    expect(events.filter((e) => e.type === 'process/operator/retry')).toHaveLength(2);
   });
 });

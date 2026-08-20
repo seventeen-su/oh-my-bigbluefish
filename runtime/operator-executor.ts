@@ -75,13 +75,19 @@ function getPath(value: unknown, path: string): unknown {
   return cur;
 }
 
-/** 中止原因分类：AbortSignal.timeout 的 reason 为 TimeoutError；图级取消为 CANCELLED */
+/**
+ * 中止原因分类：AbortSignal.timeout 的 reason 为 TimeoutError；图级取消为 CANCELLED。
+ * 取舍（T4.1 评审 Important）：CANCELLED 是终态——图级取消 = 整图放弃，重试只会
+ * 在已中止的信号下空转（每次预检立即抛 CANCELLED 再叠加退避），故固定 retryable:false，
+ * 取消绝不进入重试路径；TIMEOUT 可能为瞬态（慢依赖偶发），保留 spec.error.retryable
+ * 的可重试语义，由算子声明决定。
+ */
 function abortError(op: OperatorSpec, signal: AbortSignal): OperatorError {
   const timeout = signal.reason instanceof Error && signal.reason.name === 'TimeoutError';
   return new OperatorError(
     timeout ? 'TIMEOUT' : 'CANCELLED',
     timeout ? `算子 ${op.id} 超时（${op.error.timeout_ms}ms）` : `算子 ${op.id} 被取消`,
-    op.error.retryable,
+    timeout ? op.error.retryable : false,
   );
 }
 
@@ -154,7 +160,8 @@ function operatorCost(op: OperatorSpec): number {
 
 type RunOutcome = { ok: true; output: OperatorOutput } | { ok: false; error: GraphError };
 
-/** 单算子执行：错误契约（重试 ≤ 2 次指数退避；超时/取消按 error 契约；成功前 verification） */
+/** 单算子执行：错误契约（重试 ≤ 2 次指数退避；TIMEOUT 按 spec.error.retryable 取舍，
+ *  CANCELLED 终态固定不重试；成功前 verification） */
 async function runOne(
   op: OperatorSpec,
   registry: Record<string, OperatorFn>,
