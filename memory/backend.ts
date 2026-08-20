@@ -64,7 +64,9 @@ const MemoryPatchSchema = z.object({
 });
 
 export class SqliteMemoryBackend implements MemoryBackend {
-  private readonly db: DatabaseSync;
+  /** db 句柄 protected：T3.4 检索域存储操作（episode/stats/getById）经子类 RetrievalBackend
+   *  （backend-retrieval.ts）承载——控本模块 LOC ≤ 400（CONVENTIONS §9，拆分记录见 T3.4 报告） */
+  protected readonly db: DatabaseSync;
   private readonly insertMemory: StatementSync;
   private readonly insertStats: StatementSync;
 
