@@ -122,6 +122,23 @@ describe('save + restore 往返', () => {
     const b = await restore(cp.id, { dir });
     expect(a).toEqual(b);
   });
+
+  // T1.5 评审缺陷 1（Important）：hash 往返不稳定——live 对象含显式 undefined 可选键
+  // （如 Fingerprint 的 gpu/cuda）时 canonicalJson 保留该键，而落盘 JSON.stringify 丢弃；
+  // save 对 live 对象哈希、restore 对 parsed 对象重算 → canonical 串不同 → 合法保存 restore 抛错。
+  it('state 含显式 undefined 可选键（working.environment.gpu/cuda）→ restore 成功且深度相等', async () => {
+    const dir = await tmpDir();
+    const state = makeState();
+    // zod 接受显式 undefined 的可选键（Fingerprint.gpu/cuda optional）——合法 state
+    state.working.environment = { ...state.working.environment, gpu: undefined, cuda: undefined };
+
+    const cp = await save(state, { dir });
+    const restored = await restore(cp.id, { dir });
+
+    expect(restored).toEqual(state);
+    expect(restored.working.environment.gpu).toBeUndefined();
+    expect('gpu' in restored.working.environment).toBe(false); // 落盘已丢弃 undefined 键，恢复不虚构
+  });
 });
 
 describe('latest / list（按时间倒序）', () => {
@@ -207,6 +224,36 @@ describe('损坏拒绝（§11.3）', () => {
     const last = await latest({ dir });
     expect(last!.id).toBe(c1.id);
     await expect(restore(c2.id, { dir })).rejects.toThrow();
+  });
+});
+
+// T1.5 评审缺陷 2（Important）：restore 不校验存储 id——hash 不含 id 与文件名，
+// parseStored 也不要求 id 字段 → 改名/复制文件（内容 id B 存为 <A-uuid>.json，或无 id）
+// 可静默恢复，且与 list 按内容 id 返回不一致。
+describe('restore id 绑定校验（文件名 uuid ↔ 内容 id）', () => {
+  it('内容 id ≠ 文件名 uuid（文件被改名/复制）→ restore 抛错', async () => {
+    const dir = await tmpDir();
+    const cp = await save(makeState(), { dir });
+
+    // 模拟改名/复制：内容 id 换成另一个 uuid，文件名保持 <cp.uuid>.json（hash 不含 id，仍自洽）
+    const file = fileOf(dir, cp.id);
+    const obj = JSON.parse(readFileSync(file, 'utf8')) as { id: string };
+    obj.id = 'checkpoint:22222222-2222-4222-8222-222222222222';
+    writeFileSync(file, JSON.stringify(obj), 'utf8');
+
+    await expect(restore(cp.id, { dir })).rejects.toThrow(/不一致/);
+  });
+
+  it('落盘文件缺 id 字段 → restore 抛错', async () => {
+    const dir = await tmpDir();
+    const cp = await save(makeState(), { dir });
+
+    const file = fileOf(dir, cp.id);
+    const obj = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    delete obj.id;
+    writeFileSync(file, JSON.stringify(obj), 'utf8');
+
+    await expect(restore(cp.id, { dir })).rejects.toThrow(/缺失|不一致/);
   });
 });
 

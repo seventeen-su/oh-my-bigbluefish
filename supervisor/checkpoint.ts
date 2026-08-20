@@ -4,7 +4,11 @@
 //   （与 ArtifactStore 目录命名同风格，§4.3 已注）。
 // 完整性（§11.3 Checkpoint 事务 = 单文件写 + hash）：hash = sha256(canonical JSON of
 //   {working_state: 完整 state, timestamp, runtime_snapshot})——覆盖全部可变内容；restore 重算比对，
-//   不一致 → 拒绝（损坏检测）。working_state 引用（= state.id）与 state 自洽校验兜底引用篡改。
+//   不一致 → 拒绝（损坏检测）。hash 输入为 round-trip 后的 state（JSON.parse(JSON.stringify())），
+//   与 restore 从落盘 JSON 重算的 canonical 形式恒一致——显式 undefined 可选键（如 Fingerprint gpu/cuda）
+//   在落盘时被 stringify 丢弃，live 对象直接哈希会与 parsed 对象不一致（T1.5 评审缺陷 1）。
+//   working_state 引用（= state.id）与 state 自洽校验兜底引用篡改。
+// restore 额外校验内容 id 与请求 id 绑定（hash 不含 id/文件名，改名/复制文件不得静默恢复，T1.5 评审缺陷 2）。
 // 原子写：先写 <uuid>.json.tmp 再 rename（防半写）+ 单文件 fsync。
 // list/latest：只认正式文件（uuid 形状的 *.json，忽略 .tmp 残留与无关文件）；损坏文件跳过
 //   （§11.3 恢复 = 上次完好 checkpoint）；按 timestamp 倒序。
@@ -104,7 +108,9 @@ export async function save(
     provenance,
     refs: [],
     working_state: state.id,
-    hash: contentHash(state, ts, runtimeSnapshot),
+    // 缺陷 1 修复：hash 对象必须是 round-trip 后的 state——落盘 JSON.stringify 会丢弃显式 undefined
+    // 可选键，live 对象哈希与 restore 对 parsed 对象重算的 canonical 形式不一致 → 合法保存 restore 抛错
+    hash: contentHash(JSON.parse(JSON.stringify(state)) as State, ts, runtimeSnapshot),
     timestamp: ts,
     runtime_snapshot: runtimeSnapshot,
   };
@@ -138,6 +144,11 @@ export async function restore(id: string, opts: { dir: string }): Promise<State>
     throw new Error(`checkpoint.restore: checkpoint 不存在: ${id}`);
   }
   const stored = parseStored(raw, id);
+  // 缺陷 2 修复：hash 不含 id 与文件名，内容 id 必须与请求 id（= 文件名 uuid 派生）绑定，
+  // 否则改名/复制文件（内容 id B 存为 <A-uuid>.json，或无 id）会被静默恢复，与 list 按内容 id 返回不一致
+  if (stored.id !== id) {
+    throw new Error(`checkpoint.restore: checkpoint 内容 id 缺失或与请求 id 不一致（文件被改名/复制）: ${id}`);
+  }
   if (stored.working_state !== stored.state.id) {
     throw new Error(`checkpoint.restore: checkpoint 自洽失败（working_state 与 state.id 不一致）: ${id}`);
   }
