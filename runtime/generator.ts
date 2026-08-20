@@ -1,78 +1,43 @@
 // OMB v2 Process Generator 阶梯（架构 §5.3：Reuse → Compose → Mutate → Generate）。
 // 防 token 黑洞：LLM 生成是最后手段；Compose/Mutate 为 M4 规则版（M5 接 LLM/优化）。
+// 门面模块：ProcessGenerator 阶梯类 + 产物校验 + 阶梯契约类型；纯算法（assessApplicability/Compose/
+// Mutate/编辑距离/检索）在 ./generator-ops.ts（CONVENTIONS §9 LOC ≤ 400 拆分，仿 T4.1 operator 拆分模式）。
+// 对外 API 不变：runtime/generator.* 为统一出口，re-export generator-ops 全部公开符号，调用方无感。
 // layer 2（runtime/）：仅 import node: 内置 + kernel/（同层）+ runtime/ 内文件（CONVENTIONS §4）。
-// 模块约定：顶层无副作用；纯函数优先；预算每步检查；产物必须过 ProcessDef schema + 算子名 ∈ 内置集合。
+import { BUILTIN_OPERATORS, ProcessDefSchema, type ProcessDef } from '../kernel/policy-loader.js';
 import {
-  APPLICABILITY,
-  BUILTIN_OPERATORS,
-  ProcessDefSchema,
-  type OperatorDef,
-  type ProcessDef,
-} from '../kernel/policy-loader.js';
+  CANONICAL_CHAIN,
+  INPUT_TYPES,
+  OUTPUT_TYPES,
+  assessApplicability,
+  composeProcesses,
+  editDistance,
+  findComposePair,
+  keywordRetrieve,
+  mutateProcess,
+  type Applicability,
+  type WorkingState,
+} from './generator-ops.js';
 
-// ---- 值域（类型从 T2.1 policy-loader 派生，防漂移） ----
+// ---- 门面 re-export（统一出口：runtime/generator.*） ----
 
-/** Process Applicability（架构 §5.1：Strong/Partial/Failed/Contradictory/OOD） */
-export type Applicability = (typeof APPLICABILITY)[number];
-/** 内置算子名（§5.3 七算子 + 预留 VERIFY；与 T2.1 同一常量） */
-type BuiltinOp = (typeof BUILTIN_OPERATORS)[number];
+export {
+  CANONICAL_CHAIN,
+  INPUT_TYPES,
+  MUTATE_OP_COST,
+  OUTPUT_TYPES,
+  assessApplicability,
+  budgetFor,
+  composeProcesses,
+  editDistance,
+  findComposePair,
+  keywordRetrieve,
+  mutateProcess,
+  type Applicability,
+  type WorkingState,
+} from './generator-ops.js';
 
-// ---- 常量（初值规则，§17 参数标定项） ----
-
-/** 目标算子序列（§5.3 内置链 archetype；Mutate 的对齐目标） */
-const CANONICAL_CHAIN: readonly BuiltinOp[] = [
-  'RETRIEVE',
-  'HYPOTHESIZE',
-  'DISCRIMINATE',
-  'EXECUTE',
-  'OBSERVE',
-  'UPDATE',
-  'STOP',
-];
-
-/** 算子输出类型键（§5.3：memory_pack/hypotheses/experiment_plan/tool_results/observations/state_patch/stop_report；VERIFY→verdict） */
-const OUTPUT_TYPES: Record<string, string> = {
-  RETRIEVE: 'memory_pack',
-  HYPOTHESIZE: 'hypotheses',
-  DISCRIMINATE: 'experiment_plan',
-  EXECUTE: 'tool_results',
-  OBSERVE: 'observations',
-  UPDATE: 'state_patch',
-  STOP: 'stop_report',
-  VERIFY: 'verdict',
-};
-
-/** 算子主输入类型键（Compose 兼容判定：输出类型 ⊇ 输入类型——原子键等值即兼容；RETRIEVE 无上游输入） */
-const INPUT_TYPES: Record<string, string> = {
-  HYPOTHESIZE: 'memory_pack',
-  DISCRIMINATE: 'hypotheses',
-  EXECUTE: 'experiment_plan',
-  OBSERVE: 'tool_results',
-  UPDATE: 'observations',
-  STOP: 'state_patch',
-  VERIFY: 'memory_pack',
-};
-
-/** assessApplicability 关键词覆盖阈值（初值 0.8/0.4，架构 §17 参数标定项，冻结基准产出后修正） */
-const STRONG_THRESHOLD = 0.8;
-const PARTIAL_THRESHOLD = 0.4;
-
-/** 变异单算子成本（M4 规则版模板值） */
-const MUTATE_OP_COST = { tokens: 500, time_ms: 2000 };
-
-// ---- 类型（brief §实现设计 转录） ----
-
-/** S3 WorkingState 最小视图（架构 §4.2；generator 仅消费 contradictions 等字段） */
-export interface WorkingState {
-  goal?: string;
-  confirmed_facts?: string[];
-  active_hypotheses?: string[];
-  contradictions?: string[];
-  open_questions?: string[];
-  evidence_gaps?: string[];
-  next_best_action?: string;
-  environment?: string;
-}
+// ---- 契约类型（brief §实现设计 转录） ----
 
 /** retrieveProcess 检索查询 */
 export interface GeneratorQuery {
@@ -123,45 +88,6 @@ export function processCost(p: ProcessDef): number {
   return p.operators.reduce((s, o) => s + (o.cost.cost ?? o.cost.tokens ?? 0), 0);
 }
 
-// ---- assessApplicability（供 Governor；初值规则标注待标定 §17） ----
-
-/**
- * 五分类判定（架构 §5.1；初值规则，§17 待标定）：
- * 1) 与已知约束矛盾：task.state.contradictions 非空且过程无判别/观测能力 → Contradictory
- * 2) 算子需求不满足：task.requires 有过程缺失的算子 → Failed
- * 3) goal 关键词覆盖 ≥0.8 → Strong；≥0.4 → Partial
- * 4) 其余（检索无匹配/覆盖不足）→ OOD
- */
-export function assessApplicability(
-  process: ProcessDef,
-  task: { goal: string; state?: WorkingState; requires?: string[] },
-): Applicability {
-  const contradictions = task.state?.contradictions;
-  const hasDiscriminating = process.operators.some((o) => o.op === 'DISCRIMINATE' || o.op === 'OBSERVE');
-  if (contradictions !== undefined && contradictions.length > 0 && !hasDiscriminating) {
-    return 'Contradictory';
-  }
-  const ops = new Set<string>(process.operators.map((o) => o.op));
-  const requires = task.requires ?? [];
-  if (requires.some((r) => !ops.has(r))) {
-    return 'Failed';
-  }
-  const keywords = extractKeywords(task.goal);
-  if (keywords.length === 0) {
-    return 'OOD';
-  }
-  const text = processText(process);
-  const matched = keywords.filter((k) => text.includes(k)).length;
-  const coverage = matched / keywords.length;
-  if (coverage >= STRONG_THRESHOLD) {
-    return 'Strong';
-  }
-  if (coverage >= PARTIAL_THRESHOLD) {
-    return 'Partial';
-  }
-  return 'OOD';
-}
-
 // ---- ProcessGenerator（阶梯） ----
 
 export class ProcessGenerator {
@@ -182,7 +108,7 @@ export class ProcessGenerator {
    * 已知过程（applicability=Strong/Partial）直接复用，绝不进入生成路径（本任务核心验收）。
    */
   async generate(task: GeneratorTask): Promise<GenerateResult> {
-    // 预算预检：预算 < 库中最小过程图成本 → 任何阶梯产物都不可负担
+    // 预算预检：预算 < 库中最小过程图成本 → 任何阶梯产物都不可负担（库空 minCost===null 跳过，逐阶梯守卫兜底）
     const minCost = this.minLibraryCost();
     if (minCost !== null && this.budget < minCost) {
       return {
@@ -226,11 +152,18 @@ export class ProcessGenerator {
       }
     }
 
-    // ④ Generate（LLM 最后手段；M4 默认不注入）
+    // ④ Generate（LLM 最后手段；M4 默认不注入）——校验后仍须过预算守卫（库空时 precheck 无最小成本可依）
     if (this.llmGenerate) {
       try {
         const p = await this.llmGenerate(task);
         if (validateProcess(p)) {
+          if (processCost(p) > this.budget) {
+            return {
+              process: null,
+              method: 'none',
+              reason: `budget: LLM 生成产物成本 ${processCost(p)} 超预算 ${this.budget}`,
+            };
+          }
           return { process: p, method: 'generate', reason: 'generate: LLM 生成（最后手段，全部规则阶梯失败后）' };
         }
         return { process: null, method: 'none', reason: 'validation: LLM 生成产物未通过 ProcessDef schema 校验' };
@@ -317,7 +250,7 @@ export class ProcessGenerator {
     }
     const product = mutateProcess(best);
     if (product === null) {
-      return null; // 无可变异位（差异只在 entry/exit 或超出目标链）→ 降级
+      return null; // 无可变异位（差异只在 entry/exit、短链越界或超出目标链）→ 降级
     }
     if (!validateProcess(product)) {
       return { invalid: true };
@@ -346,127 +279,3 @@ export class ProcessGenerator {
 
 /** 阶梯步骤结果：{result} 命中（直接返回）；{invalid} 产物校验失败（降级并记录）；null 无可做（继续下一步） */
 type StepResult = { result: GenerateResult } | { invalid: true } | null;
-
-/** 目标关键词提取（初值：按分隔符切词、长度 ≥2；§17 待标定） */
-function extractKeywords(goal: string): string[] {
-  return goal
-    .split(/[\s,，。.!！?？;；:：、'"“”‘’()（）[\]{}<>《》]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length >= 2);
-}
-
-/** 过程文本（关键词覆盖匹配面：id + entry/exit + 每算子 op/output/verification） */
-function processText(p: ProcessDef): string {
-  return [p.id, p.entry, p.exit, ...p.operators.map((o) => `${o.op} ${o.output} ${o.verification}`)].join(' ');
-}
-
-/** 默认检索：goal 关键词任一命中过程文本即返回（初值；生产可注入 retrieveProcess 覆盖） */
-function keywordRetrieve(processes: readonly ProcessDef[], goal: string): ProcessDef[] {
-  const keywords = extractKeywords(goal);
-  if (keywords.length === 0) {
-    return [];
-  }
-  return processes.filter((p) => keywords.some((k) => processText(p).includes(k)));
-}
-
-/** 编辑距离（Levenshtein；Mutate 相似度 = 算子序列编辑距离最小） */
-function editDistance(a: readonly string[], b: readonly string[]): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) {
-    dp[i]![0] = i;
-  }
-  for (let j = 0; j <= n; j++) {
-    dp[0]![j] = j;
-  }
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i]![j] = Math.min(dp[i - 1]![j]! + 1, dp[i]![j - 1]! + 1, dp[i - 1]![j - 1]! + cost);
-    }
-  }
-  return dp[m]![n]!;
-}
-
-/** 首个差异位（按对齐位置；越界视为差异；全同 → -1） */
-function firstDiffIndex(seq: readonly string[], target: readonly string[]): number {
-  const len = Math.max(seq.length, target.length);
-  for (let i = 0; i < len; i++) {
-    if (seq[i] !== target[i]) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-/** 首对首尾兼容过程（输出类型 ⊇ 输入类型；i≠j，库序确定性） */
-function findComposePair(processes: readonly ProcessDef[]): readonly [ProcessDef, ProcessDef] | null {
-  for (let i = 0; i < processes.length; i++) {
-    for (let j = 0; j < processes.length; j++) {
-      if (i === j) {
-        continue;
-      }
-      const a = processes[i]!;
-      const b = processes[j]!;
-      const outA = OUTPUT_TYPES[a.exit];
-      const inB = INPUT_TYPES[b.entry];
-      if (outA !== undefined && outA === inB) {
-        return [a, b];
-      }
-    }
-  }
-  return null;
-}
-
-/** 组合：a 算子图 + b 算子图（id 冲突则 b 侧加前缀）；entry=a.entry，exit=b.exit */
-function composeProcesses(a: ProcessDef, b: ProcessDef): ProcessDef {
-  const collide = a.operators.some((oa) => b.operators.some((ob) => ob.id === oa.id));
-  const bOps = collide ? b.operators.map((o) => ({ ...o, id: `b-${o.id}` })) : b.operators;
-  const operators = [...a.operators, ...bOps];
-  return {
-    id: `composed-${a.id}-${b.id}`,
-    version: '1.0.0',
-    entry: a.entry,
-    exit: b.exit,
-    budget: budgetFor(operators),
-    operators,
-  };
-}
-
-/** 变异：最相似过程在首个差异位（非 entry/exit、非目标链外）单算子替换 → 新过程；不可变 → null */
-function mutateProcess(p: ProcessDef): ProcessDef | null {
-  const seq = p.operators.map((o) => o.op);
-  const idx = firstDiffIndex(seq, CANONICAL_CHAIN);
-  // ProcessDef schema：operators[0].op===entry 且末算子===exit → entry/exit 位不可替换
-  if (idx < 0 || idx === 0 || idx === p.operators.length - 1 || idx >= CANONICAL_CHAIN.length) {
-    return null;
-  }
-  const targetOp = CANONICAL_CHAIN[idx]!;
-  const replacement: OperatorDef = {
-    id: `mut-${idx}`,
-    op: targetOp,
-    input_binding: {},
-    output: OUTPUT_TYPES[targetOp] ?? 'output',
-    cost: MUTATE_OP_COST,
-    verification: '规则变异算子（T4.2 Mutate 单算子替换）',
-    error: { retryable: false, timeout_ms: 0, cancelable: false, rollback: '无副作用' },
-  };
-  const operators = p.operators.map((o, i) => (i === idx ? replacement : o));
-  return {
-    id: `mutated-${p.id}`,
-    version: '1.0.0',
-    entry: p.entry,
-    exit: p.exit,
-    budget: budgetFor(operators),
-    operators,
-  };
-}
-
-/** 图预算（tokens/time_ms 求和；cost 维不计入——与执行器 cost 语义区分） */
-function budgetFor(operators: readonly OperatorDef[]): { tokens: number; time_ms: number } {
-  return {
-    tokens: operators.reduce((s, o) => s + (o.cost.tokens ?? 0), 0),
-    time_ms: operators.reduce((s, o) => s + (o.cost.time_ms ?? 0), 0),
-  };
-}

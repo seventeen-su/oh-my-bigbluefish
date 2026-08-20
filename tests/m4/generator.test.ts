@@ -3,8 +3,8 @@
 // 九组：① Reuse（检索命中 → 直接复用；fake llm 断言未调用）
 //       ② 已知过程不走 Generator（applicability=Strong 核心验收；Strong 无匹配也不生成）
 //       ③ Compose（首尾算子兼容：输出类型 ⊇ 输入类型；图含两过程全部算子）
-//       ④ Mutate（最相似过程单算子替换；算子序列变化 ≤1）
-//       ⑤ Generate 最后手段（注入 → generate；未注入 → none；非法产物拒绝）
+//       ④ Mutate（最相似过程单算子替换；算子序列变化 ≤1；短于 canonical 链的 2-op 进程无变异位 → 降级非 no-op）
+//       ⑤ Generate 最后手段（注入 → generate；未注入 → none；非法产物拒绝；产物超预算 → none/budget）
 //       ⑥ OOD 才生成（OOD 走完整阶梯；Strong 只复用不生成）
 //       ⑦ 预算约束（预算 < 最小图成本 → none reason:budget；组合产物超预算 → none reason:budget）
 //       ⑧ 产物校验（validateProcess 合法/非法；非法 compose/mutate 产物拒绝并降级）
@@ -226,6 +226,28 @@ describe('④ Mutate（最相似过程单算子替换，序列变化 ≤1）', (
     expect(validateProcess(p)).toBe(true);
     expect(llmCalls).toBe(0);
   });
+
+  it('短于 canonical 链的 2-op 进程（无可变异位）→ 降级下一阶梯，不产生 no-op mutate', async () => {
+    let llmCalls = 0;
+    const llm2 = mkProcess('llm-2op', 'RETRIEVE', 'STOP', [
+      { id: 'r', op: 'RETRIEVE', output: 'memory_pack', verification: 'LLM 产物' },
+      { id: 's', op: 'STOP', output: 'stop_report', verification: 'LLM 产物' },
+    ]);
+    const gen = new ProcessGenerator({
+      processes: [PROC_A], // [RETRIEVE, HYPOTHESIZE] 是 canonical 链前缀 → firstDiff at idx 2（=进程长度，越界）
+      budget: 20000,
+      llmGenerate: async () => {
+        llmCalls++;
+        return llm2;
+      },
+    });
+    const res = await gen.generate(oodTask());
+    // 无变异位 → 降级 Generate（llm 产物成本 200 ≤ budget）；禁止把"与源相同"的产物报为 mutate
+    expect(res.method).not.toBe('mutate');
+    expect(res.method).toBe('generate');
+    expect(res.process?.id).toBe('llm-2op');
+    expect(llmCalls).toBe(1);
+  });
 });
 
 // ---- ⑤ Generate 最后手段 ----
@@ -273,6 +295,23 @@ describe('⑤ Generate 最后手段（全部规则阶梯失败后）', () => {
     const res = await gen.generate(oodTask());
     expect(res.method).toBe('none');
     expect(res.reason).toContain('validation');
+    expect(llmCalls).toBe(1);
+  });
+
+  it('LLM 产物成本超预算（库空跳过 precheck，仍须守卫）→ 拒绝：method: none（reason budget）', async () => {
+    let llmCalls = 0;
+    const gen = new ProcessGenerator({
+      processes: [], // 库空 → minCost===null → 预算 precheck 跳过，唯一防线在 Generate 步
+      budget: 1, // llmProc 成本 200 > 1
+      llmGenerate: async () => {
+        llmCalls++;
+        return llmProc;
+      },
+    });
+    const res = await gen.generate(oodTask());
+    expect(res.method).toBe('none');
+    expect(res.process).toBeNull();
+    expect(res.reason).toContain('budget');
     expect(llmCalls).toBe(1);
   });
 });
