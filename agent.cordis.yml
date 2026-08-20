@@ -1,0 +1,6 @@
+# OMB v2 preset 组合文件（DSH agent-presets 加载，顶层为插件行列表）。
+# 插件行用相对路径直指编译产物 JS（DSH 不 honor package.json exports，须指向具体文件，
+# 见 research-dsh.md §1.4）；编译：`pnpm build`（tsconfig.build.json → lib/）。
+# 本任务只注册 /mode 命令，不 publish 服务 → 无需 isolate 组（research-dsh.md §1.3）。
+- id: omb-v2
+  name: './lib/runtime/plugin.js'
