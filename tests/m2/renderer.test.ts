@@ -1,19 +1,21 @@
 // T2.3 行为测试：Context Compiler 与三视图投影（架构 §6.1）。
 // 五步：ContentRouter 分型 → 边际价值排序 → 贪心选择 → 投影决策 → 输出 ContextProjection（确定性纯函数）。
-// 九类：① 确定性（同输入同输出） ② 分型路由（含 logs 去重） ③ 边际贪心（高入选低被裁 + 公式钉死）
+// 十三类：① 确定性（同输入同输出） ② 分型路由（含 logs 去重） ③ 边际贪心（高入选低被裁 + 公式钉死）
 //       ④ 预算耗尽停止 ⑤ marginal≤0 停止 ⑥ working_state 绝不盲压缩（逐字节一致）
-//       ⑦ 三视图分组与 type 映射 ⑧ A3 schema 校验（T1.1） ⑨ 空候选。
-// fixture：真实 kernel/policy（loadPolicy，不动真实目录）——边际权重取 context.yaml 初值（T2.1）。
-import { beforeAll, describe, expect, it } from 'vitest';
+//       ⑦ 三视图分组与 type 映射 ⑧ A3 schema 校验（T1.1） ⑨ 空候选
+//       ⑩ 空 content 守卫（A3 契约：content 非空，入口过滤） ⑪ kind 成本参数数据化（机制即数据）
+//       ⑫ ws 超预算语义（绝不压缩，允许超预算） ⑬ 同边际 tie-break（id 升序确定性）。
+// fixture：真实 kernel/policy（loadPolicy，不动真实目录）+ mkdtemp 副本覆盖（改 YAML 即生效，零代码改动）。
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadPolicy, type PolicyBundle } from '../../kernel/policy-loader.js';
 import { ContextProjectionSchema } from '../../kernel/schemas/a.js';
 import {
-  ATTENTION_POLLUTION_COST,
   compile,
   marginal,
-  REACQUISITION_COST,
-  REGRESSION_RISK_COST,
   route,
   type CandidateItem,
   type CompileInput,
@@ -49,6 +51,23 @@ function input(over: Partial<CompileInput> = {}): CompileInput {
     policy: policy.context,
     ...over,
   };
+}
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true })));
+});
+
+/** mkdtemp fixture：复制真实 kernel/policy 目录；overrides: 文件名 → 覆盖内容（不动真实目录，CONVENTIONS §6） */
+async function policyFixture(overrides: Record<string, string> = {}): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'omb-renderer-policy-'));
+  roots.push(root);
+  await cp(POLICY_DIR, join(root, 'policy'), { recursive: true });
+  for (const [file, content] of Object.entries(overrides)) {
+    await writeFile(join(root, 'policy', file), content, 'utf8');
+  }
+  return join(root, 'policy');
 }
 
 describe('① 确定性（同输入同输出，无随机/无时间依赖）', () => {
@@ -135,15 +154,16 @@ describe('③ 边际价值贪心（marginal 降序选择，权重取 context.yam
     expect(marginal(item({ id: 'low', kind: 'logs', info_value: 10, tokens: 100 }), policy.context)).toBeLessThanOrEqual(0);
   });
 
-  it('marginal 公式钉死：w·info − w·token − w·reacq − w·poll − w·regr（真实权重 × 导出 kind 成本表）', () => {
+  it('marginal 公式钉死：w·info − w·token − w·reacq − w·poll − w·regr（权重与 kind 成本表均取 context.yaml 数据）', () => {
     const cand = item({ kind: 'memory', info_value: 120, tokens: 30 });
     const w = policy.context.marginal_weights;
+    const costs = policy.context.kind_costs;
     const expected =
       w.info_value * cand.info_value -
       w.token_cost * cand.tokens -
-      w.reacquisition * REACQUISITION_COST[cand.kind] -
-      w.attention_pollution * ATTENTION_POLLUTION_COST[cand.kind] -
-      w.regression_risk * REGRESSION_RISK_COST[cand.kind];
+      w.reacquisition * costs.reacquisition[cand.kind] -
+      w.attention_pollution * costs.attention_pollution[cand.kind] -
+      w.regression_risk * costs.regression_risk[cand.kind];
     expect(marginal(cand, policy.context)).toBeCloseTo(expected, 10);
   });
 });
@@ -328,5 +348,128 @@ describe('⑨ 空候选', () => {
     expect(proj.restore_capable).toBe(false);
     expect(proj.original_artifact_ids).toEqual([]);
     expect(ContextProjectionSchema.safeParse(proj).success).toBe(true);
+  });
+});
+
+describe('⑩ 空 content 守卫（A3 契约：section content 非空，compile 入口过滤）', () => {
+  it('空 content 候选（空日志行）→ 被过滤：输出不含该候选、其余候选照常、schema 合规', () => {
+    const proj = compile(
+      input({
+        candidates: [
+          item({ id: 'empty', kind: 'logs', content: '', source_ref: 'src:empty' }),
+          item({ id: 'ok', kind: 'retrieval', content: '正常行', source_ref: 'src:ok' }),
+        ],
+      }),
+    );
+    const refs = proj.sections.map((s) => s.source_ref);
+    expect(refs).not.toContain('src:empty');
+    expect(refs).toContain('src:ok');
+    expect(ContextProjectionSchema.safeParse(proj).success).toBe(true);
+  });
+
+  it('仅空 content 候选 → 空投影且 schema 合规', () => {
+    const proj = compile(input({ candidates: [item({ id: 'e1', kind: 'memory', content: '', source_ref: 'src:e1' })] }));
+    expect(proj.sections).toEqual([]);
+    expect(ContextProjectionSchema.safeParse(proj).success).toBe(true);
+  });
+});
+
+describe('⑪ kind 成本参数数据化（机制即数据：改 context.yaml 即生效，零代码改动）', () => {
+  it('fixture context.yaml 将 reacquisition.code 改为 999 → marginal 随之变化且 compile 选择翻转', async () => {
+    const dir = await policyFixture({
+      'context.yaml': [
+        'marginal_weights:',
+        '  info_value: 1.0',
+        '  token_cost: 0.5',
+        '  reacquisition: 0.8',
+        '  attention_pollution: 0.4',
+        '  regression_risk: 0.6',
+        'working_state_never_compress: true',
+        'kind_costs:',
+        '  reacquisition:',
+        '    code: 999',
+        '    json: 25',
+        '    logs: 15',
+        '    retrieval: 40',
+        '    memory: 20',
+        '    working_state: 0',
+        '    artifact: 35',
+        '  attention_pollution:',
+        '    code: 15',
+        '    json: 10',
+        '    logs: 30',
+        '    retrieval: 8',
+        '    memory: 5',
+        '    working_state: 5',
+        '    artifact: 10',
+        '  regression_risk:',
+        '    code: 10',
+        '    json: 8',
+        '    logs: 12',
+        '    retrieval: 5',
+        '    memory: 8',
+        '    working_state: 5',
+        '    artifact: 6',
+      ].join('\n'),
+    });
+    const p = await loadPolicy(dir);
+    const cand = item({ id: 'code', kind: 'code', info_value: 200, tokens: 10, source_ref: 'src:code' });
+    // 数据驱动：同公式、同代码，仅 YAML 不同 → marginal 不同
+    expect(marginal(cand, p.context)).not.toBe(marginal(cand, policy.context));
+    expect(p.context.kind_costs.reacquisition.code).toBe(999);
+    // compile 行为随之翻转：真实策略下 code 候选入选，fixture（reacquisition=999）下被裁
+    const real = compile(input({ candidates: [cand] }));
+    const flips = compile(input({ policy: p.context, candidates: [cand] }));
+    expect(real.sections.map((s) => s.source_ref)).toContain('src:code');
+    expect(flips.sections.map((s) => s.source_ref)).not.toContain('src:code');
+    // 公式按 fixture 数据复算一致（公式在代码、参数在数据）
+    const w = p.context.marginal_weights;
+    const costs = p.context.kind_costs;
+    const expected =
+      w.info_value * cand.info_value -
+      w.token_cost * cand.tokens -
+      w.reacquisition * costs.reacquisition[cand.kind] -
+      w.attention_pollution * costs.attention_pollution[cand.kind] -
+      w.regression_risk * costs.regression_risk[cand.kind];
+    expect(marginal(cand, p.context)).toBeCloseTo(expected, 10);
+  });
+});
+
+describe('⑫ ws 超预算语义（钉死有意语义：ws 绝不压缩，允许超预算）', () => {
+  it('ws 单独超预算 → total_tokens > budget 且 ws 原文仍在、无候选入选', () => {
+    const budget = 4000;
+    const ws = {
+      goal: 'g',
+      confirmed_facts: ['x'.repeat(20000)],
+      active_hypotheses: [],
+      contradictions: [],
+      open_questions: [],
+      evidence_gaps: [],
+      next_best_action: 'a',
+      environment: 'win32',
+    };
+    const proj = compile(
+      input({
+        budget_tokens: budget,
+        working_state: ws,
+        candidates: [item({ id: 'c1', kind: 'retrieval', info_value: 200, tokens: 10, source_ref: 'src:c1' })],
+      }),
+    );
+    const wsSection = proj.sections.find((s) => s.source_ref === 'working_state');
+    expect(wsSection).toBeDefined();
+    expect(wsSection!.content).toBe(JSON.stringify(ws)); // 原文逐字节一致
+    expect(proj.total_tokens).toBeGreaterThan(budget); // ws 绝不压缩 → 允许超预算
+    expect(proj.sections.filter((s) => s.source_ref !== 'working_state')).toHaveLength(0); // 候选预算 = max(0, budget − ws) = 0
+    expect(ContextProjectionSchema.safeParse(proj).success).toBe(true);
+  });
+});
+
+describe('⑬ 同边际 tie-break（确定性：id 升序）', () => {
+  it('两候选 marginal 相同 → 按 id 升序入选', () => {
+    const a = item({ id: 'b', kind: 'retrieval', info_value: 100, tokens: 10, view: 'planning', source_ref: 'src:b' });
+    const b = item({ id: 'a', kind: 'retrieval', info_value: 100, tokens: 10, view: 'planning', source_ref: 'src:a' });
+    expect(marginal(a, policy.context)).toBe(marginal(b, policy.context));
+    const proj = compile(input({ candidates: [a, b] }));
+    expect(proj.sections.map((s) => s.source_ref)).toEqual(['src:a', 'src:b']);
   });
 });

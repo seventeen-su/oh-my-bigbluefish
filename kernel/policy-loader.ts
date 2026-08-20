@@ -36,6 +36,18 @@ export const BUILTIN_OPERATORS = [
   'VERIFY',
 ] as const;
 
+/** 候选 kind 值域（§6.1 ContentRouter 分型；策略 schema 与 runtime/renderer 共享同一常量，防枚举漂移） */
+export const CANDIDATE_KINDS = [
+  'code',
+  'json',
+  'logs',
+  'retrieval',
+  'memory',
+  'working_state',
+  'artifact',
+] as const;
+export type CandidateKind = (typeof CANDIDATE_KINDS)[number];
+
 // ---- Schema（zod；与类型同源，z.infer 导出） ----
 
 /** Governor 决策表规则（默认规则无 when：匹配任何未命中组合） */
@@ -91,7 +103,16 @@ export const BudgetPolicySchema = z.object({
 });
 export type BudgetPolicy = z.infer<typeof BudgetPolicySchema>;
 
-/** ContextPolicy：Context Compiler 参数（§6.1 边际价值权重；§17 开放项初值） */
+/** kind 成本表（§6.1 reacquisition/attention_pollution/regression_risk；每 kind 一非负数值，§17 参数标定初值） */
+export const KindCostTableSchema = z.object(
+  CANDIDATE_KINDS.reduce(
+    (shape, k) => ({ ...shape, [k]: z.number().nonnegative() }),
+    {} as Record<CandidateKind, z.ZodNumber>,
+  ),
+);
+export type KindCostTable = z.infer<typeof KindCostTableSchema>;
+
+/** ContextPolicy：Context Compiler 参数（§6.1 边际价值权重 + kind 成本表；§17 开放项初值） */
 export const ContextPolicySchema = z.object({
   marginal_weights: z.object({
     info_value: z.number().nonnegative(),
@@ -101,6 +122,11 @@ export const ContextPolicySchema = z.object({
     regression_risk: z.number().nonnegative(),
   }),
   working_state_never_compress: z.literal(true),
+  kind_costs: z.object({
+    reacquisition: KindCostTableSchema,
+    attention_pollution: KindCostTableSchema,
+    regression_risk: KindCostTableSchema,
+  }),
 });
 export type ContextPolicy = z.infer<typeof ContextPolicySchema>;
 

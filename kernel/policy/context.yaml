@@ -1,5 +1,6 @@
 # Context Compiler 参数（架构 §6.1：marginal = ΔInfoValue − token − reacquisition − attention_pollution − regression_risk）
-# 初值（§17 开放项，启发式初值，冻结基准产出后修正）；working_state_never_compress 为架构硬约束（§6.1 绝不盲压缩）。
+# 初值（§17 开放项，启发式初值，冻结基准产出后修正）；working_state_never_compress 为架构硬约束（§6.1 绝不盲压缩）；
+# marginal_weights 与 kind_costs 均为数据：改本文件即生效，代码不感知内容。
 marginal_weights:
   info_value: 1.0           # Δ信息价值权重
   token_cost: 0.5           # token 成本权重
@@ -7,3 +8,30 @@ marginal_weights:
   attention_pollution: 0.4  # 注意力污染权重
   regression_risk: 0.6      # 回归风险权重
 working_state_never_compress: true  # Working State 绝不盲压缩
+# kind 成本表（§6.1 reacquisition/attention_pollution/regression_risk）
+# 初值，待冻结基准标定（§17）——改本表即改边际，代码不感知内容（机制即数据）
+kind_costs:
+  reacquisition:            # 按 kind 恢复该内容的代价（working_state 每请求自带 → 0）
+    code: 30
+    json: 25
+    logs: 15
+    retrieval: 40
+    memory: 20
+    working_state: 0
+    artifact: 35
+  attention_pollution:      # 噪音/无关内容对注意力的干扰（日志噪音最高）
+    code: 15
+    json: 10
+    logs: 30
+    retrieval: 8
+    memory: 5
+    working_state: 5
+    artifact: 10
+  regression_risk:          # 投影干扰任务执行的风险
+    code: 10
+    json: 8
+    logs: 12
+    retrieval: 5
+    memory: 8
+    working_state: 5
+    artifact: 6

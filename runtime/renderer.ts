@@ -8,25 +8,17 @@
 // 三视图：planning（永不被执行痕迹污染）/ execution_scratch（默认隔离）/ evidence_artifact（可 restore）——
 //   功能分层投影是 A3 ContextProjection.type 的来源（单一视图 → 对应类型；多视图 → mixed）。
 // 确定性纯函数：不读时钟/随机/IO——IRBase 时间戳为固定纪元值（由调用层/未来 runtime 包装负责覆写真实时间）；
-//   同输入同输出（测试钉死）。权重取 kernel/policy/context.yaml 初值（T2.1）；kind 成本表为 §17 参数标定项。
+//   同输入同输出（测试钉死）。权重与 kind 成本表取 kernel/policy/context.yaml 数据（T2.1/§17 参数标定，
+//   机制即数据：改 YAML 即生效，公式在代码、参数在数据）。
 // layer 2（runtime/）：仅 import 同层 kernel/（CONVENTIONS §4）；模块顶层无副作用。
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { canonicalJson, makeImmutableId } from '../kernel/schemas/base.js';
-import type { ContextPolicy } from '../kernel/policy-loader.js';
+import { type CandidateKind, type ContextPolicy } from '../kernel/policy-loader.js';
+
+// 共享候选 kind 枚举（策略 schema 与实现同一来源，防漂移；定义在 kernel/policy-loader.ts，此处再导出保持 renderer API）
+export { CANDIDATE_KINDS, type CandidateKind } from '../kernel/policy-loader.js';
 
 // ---- 值域 ----
-
-/** 候选分型（§6.1 ContentRouter 输入分型） */
-export const CANDIDATE_KINDS = [
-  'code',
-  'json',
-  'logs',
-  'retrieval',
-  'memory',
-  'working_state',
-  'artifact',
-] as const;
-export type CandidateKind = (typeof CANDIDATE_KINDS)[number];
 
 /** 候选声明的功能视图（输入侧三视图；输出映射为 A3 view 名） */
 export const CANDIDATE_VIEWS = ['planning', 'scratch', 'evidence'] as const;
@@ -83,41 +75,6 @@ export interface CompileInput {
   policy: ContextPolicy;
 }
 
-// ---- kind 成本表（§6.1 reacquisition/attention_pollution/regression_risk；§17 参数标定初值，冻结基准产出后修正） ----
-
-/** 重获取成本初值：按 kind 恢复该内容的代价（working_state 每请求自带 → 0） */
-export const REACQUISITION_COST: Record<CandidateKind, number> = {
-  code: 30,
-  json: 25,
-  logs: 15,
-  retrieval: 40,
-  memory: 20,
-  working_state: 0,
-  artifact: 35,
-};
-
-/** 注意力污染初值：噪音/无关内容对注意力的干扰（日志噪音最高） */
-export const ATTENTION_POLLUTION_COST: Record<CandidateKind, number> = {
-  code: 15,
-  json: 10,
-  logs: 30,
-  retrieval: 8,
-  memory: 5,
-  working_state: 5,
-  artifact: 10,
-};
-
-/** 回归风险初值：投影干扰任务执行的风险 */
-export const REGRESSION_RISK_COST: Record<CandidateKind, number> = {
-  code: 10,
-  json: 8,
-  logs: 12,
-  retrieval: 5,
-  memory: 8,
-  working_state: 5,
-  artifact: 6,
-};
-
 // ---- ① ContentRouter 分型 ----
 
 /**
@@ -147,17 +104,19 @@ export function route(item: Pick<CandidateItem, 'kind'>): RouteStrategy {
 
 /**
  * 边际价值（§6.1）：marginal = w_info·ΔInfoValue − w_token·token − w_reacq·reacquisition
- *   − w_poll·attention_pollution − w_regr·regression_risk；权重取 context.yaml 初值（T2.1）。
+ *   − w_poll·attention_pollution − w_regr·regression_risk；权重与 kind 成本表均取 context.yaml 数据
+ *   （公式在代码、参数在数据：改 YAML 即生效）。
  * 纯函数；预算交互（剩余预算裁剪）由 compile 贪心循环处理。
  */
 export function marginal(item: CandidateItem, policy: ContextPolicy): number {
   const w = policy.marginal_weights;
+  const costs = policy.kind_costs;
   return (
     w.info_value * item.info_value -
     w.token_cost * item.tokens -
-    w.reacquisition * REACQUISITION_COST[item.kind] -
-    w.attention_pollution * ATTENTION_POLLUTION_COST[item.kind] -
-    w.regression_risk * REGRESSION_RISK_COST[item.kind]
+    w.reacquisition * costs.reacquisition[item.kind] -
+    w.attention_pollution * costs.attention_pollution[item.kind] -
+    w.regression_risk * costs.regression_risk[item.kind]
   );
 }
 
@@ -167,7 +126,8 @@ export function marginal(item: CandidateItem, policy: ContextPolicy): number {
  * Context Compiler 入口（§6.1 五步，确定性纯函数：同输入同输出）。
  * working_state（可选）verbatim 原文进入 planning 视图（绝不盲压缩，token 计入 total_tokens）；
  * 其余预算（budget − working_state tokens）用于候选贪心：marginal 降序，预算耗尽（放不下）或
- * marginal ≤ 0 即停止（不跳过继续）；logs 重复内容只保留输入序首个。
+ * marginal ≤ 0 即停止（不跳过继续）；logs 重复内容只保留输入序首个；空 content 候选入口过滤
+ * （A3 契约：section content 非空）。
  * 输出 A3 ContextProjection（immutable：id = sha256 内容哈希，改内容 → 新 id）。
  */
 export function compile(input: CompileInput): ContextProjection {
@@ -175,7 +135,10 @@ export function compile(input: CompileInput): ContextProjection {
   const wsSection = input.working_state === undefined ? [] : [projectWorkingState(input.working_state)];
   const candidateBudget = Math.max(0, input.budget_tokens - sectionTokens(wsSection));
 
-  const ranked = dedupLogs(input.candidates)
+  // 空 content 守卫（A3 契约：section content 非空 z.string().min(1)）：空内容候选无投影价值，入口过滤（其余候选照常）
+  const candidates = input.candidates.filter((c) => c.content.length > 0);
+
+  const ranked = dedupLogs(candidates)
     .map((item) => ({ item, marginal: marginal(item, policy) }))
     .sort(byMarginalDesc);
 
