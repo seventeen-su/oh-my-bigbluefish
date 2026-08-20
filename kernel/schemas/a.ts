@@ -75,9 +75,22 @@ export interface MemoryPage {
   total?: number;
 }
 
+/** RelationWalk（T3.1 brief 定型）：relationTraverse BFS 结果——seed 起点、nodes 每节点深度与出边、truncated 深度截断标志 */
+export interface RelationWalkEdge {
+  type: string;
+  to_id: string;
+}
+
+export interface RelationWalkNode {
+  id: string;
+  depth: number;
+  relations: RelationWalkEdge[];
+}
+
 export interface RelationWalk {
-  nodes: unknown[];
-  edges: unknown[];
+  seed: string;
+  nodes: RelationWalkNode[];
+  truncated: boolean;
 }
 
 /** MemoryBackend 接口（§4.3；M3 实现本接口——本任务仅签名） */
