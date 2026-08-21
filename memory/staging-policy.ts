@@ -25,6 +25,7 @@ export const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_PRIORITY_BY_TYPE: Record<string, number> = {
   'session/start': 1,
   'session/end': 1,
+  'context/injected': 1,
   'tool/call': 2,
   'tool/result': 3,
   'claim/update': 5,

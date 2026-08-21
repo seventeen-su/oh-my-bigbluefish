@@ -285,12 +285,18 @@ function applySessionEnd(a: Accum): void {
   a.lifecycle = 'retired';
 }
 
+/** context/injected：上下文投影注入记录（Model-visible ⟺ logged）；不改 State（已注册防漂移——同 tool/result） */
+function applyContextInjected(): void {
+  /* no-op：投影注入是模型可见事实，State 不因注入变化 */
+}
+
 type ApplyFn = (a: Accum, e: Event) => void;
 
 /** 派发表 = EVENTS_HANDLED 注册表（单一事实源：键集即已注册事件类型） */
 const APPLY: Record<string, ApplyFn> = {
   'session/start': applySessionStart,
   'session/end': applySessionEnd,
+  'context/injected': applyContextInjected,
   'claim/update': applyClaimUpdate,
   'hypothesis/transition': applyHypothesisTransition,
   'observation/contradictory': (a, e) => applyObservationContradictoryEvent(a, e.payload as Record<string, unknown>),

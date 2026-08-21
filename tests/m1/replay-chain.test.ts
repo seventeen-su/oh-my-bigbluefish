@@ -85,14 +85,16 @@ function chainEvents(): (Event & { seq: number })[] {
     evt('process/operator/retrieve', { operator_id: 'op:1' }, 10),
     evt('memory/admitted', { memory_id: 'm:1' }, 11),
     evt('memory/consolidated', { memory_id: 'm:1' }, 12),
+    // context/injected（T8.26.2 新增固定类型；投影注入为 no-op 不改 State）
+    evt('context/injected', { projection_id: 'p:1', total_tokens: 12 }, 13),
     // 宪法②链（§14.1）：活动假设 + contradictory 观测 → 降级（active→discriminated）
-    evt('hypothesis/transition', { hypothesis_id: 'h:2', claim_id: 'c:2', status: 'active' }, 13),
+    evt('hypothesis/transition', { hypothesis_id: 'h:2', claim_id: 'c:2', status: 'active' }, 14),
     evt(
       'observation/contradictory',
       { observation_id: 'o:1', claim_id: 'c:2', hypothesis_id: 'h:2', status: 'discriminated' },
-      14,
+      15,
     ),
-    evt('session/end', {}, 15),
+    evt('session/end', {}, 16),
   ];
 }
 

@@ -1,8 +1,8 @@
 // layer 2：认知系统装配（组合根，架构 §12.2 运行形态 / T8.3 装配进插件生命周期）。
-// 把 governor（runtime/governor.ts）、memory（memory/backend-retrieval.ts）、event-store
-// （supervisor/event-store.ts）、过程库（kernel/processes）实例化为可用依赖图并注入插件；
-// 最小请求处理链：事件入链（session/start）→ Governor 决策 → 记忆检索 → prompt 组装 →
-// 决策结果入链（decision/made）。
+// T8.26.2：三能力拆分（Loop Integration 专项 §3）——prepareTurn（turn 开始：快照/工作状态/决策/检索/
+// 投影编译/注入）+ observeEvent（运行中：事件入链 + 归约）+ finalizeTurn（收尾：decision/made +
+// Experience 候选 + 信号聚合 + checkpoint + maintenance）；handleRequest = 三者组合（行为不变）。
+// 纯函数助手在 runtime/turn-helpers.ts（LOC 预算拆分，本文件 ≤400）。
 //
 // 层 DAG（CONVENTIONS §4）：runtime(2) → supervisor(1)/memory(2)/kernel(2) 均满足
 // "import 目标层 ≤ 源层"（eslint no-cross-layer-import 同款语义，tests/m0/dag-lint.test.ts 钉住）。
@@ -10,15 +10,22 @@
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { makeMutableId } from '../kernel/schemas/base.js';
+import type { ContextProjection } from '../kernel/schemas/a.js';
+import { EventSchema, type Event, type Checkpoint } from '../kernel/schemas/m.js';
+import type { State } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
-import type { Event } from '../kernel/schemas/m.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
+import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
+import { MaintenanceScheduler, type MaintenanceDebt } from '../supervisor/maintenance.js';
+import { reduce, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
+import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState } from './turn-helpers.js';
+import type { Experience } from '../kernel/schemas/c.js';
 
 /** 仓库根（本文件在 <preset>/runtime/ → 上一级即 preset 根） */
 const HERE = fileURLToPath(new URL('..', import.meta.url));
@@ -32,9 +39,12 @@ export interface CognitiveAssemblyOptions {
   processesDir?: string;
   /** Governor 输入 state_snapshot（缺省 'rs:assembly'） */
   snapshotHash?: string;
-  /** T8.12：ModelAdapter（DSH 模型调用适配器）——组合根经 deps 注入；下游 Generator/基准可消费；
-   *  未注入（无真实 DSH 会话）→ 缺省受限（LLM 路径不装配，纯规则阶梯）。 */
+  /** T8.12：ModelAdapter（DSH 模型调用适配器）——组合根经 deps 注入；未注入 → 缺省受限（纯规则阶梯） */
   modelAdapter?: ModelAdapter;
+  /** T8.26.2：checkpoint 目录（finalizeTurn 保存 / prepareTurn 恢复；缺省不接） */
+  checkpointDir?: string;
+  /** T8.26.2：维护调度器（finalizeTurn 信号聚合入队；缺省不接） */
+  maintenance?: MaintenanceScheduler;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -45,7 +55,7 @@ export interface CognitiveRequest {
   constraints?: string[];
   working_state: PromptWorkingState;
   environment?: string;
-  /** 证据充分性覆盖（缺省：缺口=[goal]——未覆盖 → 查决策表而非短路 Stop） */
+  /** 证据充分性覆盖（缺省：缺口=[goal] → 查决策表而非短路 Stop） */
   evidence_sufficiency?: { covered_success_conditions: string[]; critical_gaps: string[]; score: number };
 }
 
@@ -54,6 +64,50 @@ export interface CognitiveResponse {
   decision: GovernorDecision;
   retrieval: { items: RankedMemory[]; channel_used: string };
   prompt: BuiltPrompt;
+  events_appended: number;
+}
+
+/** prepareTurn 结果（T8.26.2 §3.1）：快照 + 工作状态 + 决策 + 检索 + 投影 + 入链事件数 */
+export interface PreparedTurn {
+  snapshot: string;
+  working_state: PromptWorkingState;
+  decision: GovernorDecision;
+  retrieval: { items: RankedMemory[]; channel_used: string };
+  projection: ContextProjection;
+  events_appended: number;
+}
+
+/** prepareTurn 选项：上下文注入接收器（T8.26.3：DSH systemPrompt.context 钩子；提供 → 注入并记 context/injected） */
+export interface PrepareTurnOptions {
+  inject?: (projection: ContextProjection) => void | Promise<void>;
+}
+
+/** observeEvent 结果（T8.26.2 §3.2）：事件 + 追加状态 + 归约 State/投影 + 降级原因 */
+export interface ObserveEventResult {
+  event: Event;
+  appended: boolean;
+  state: ReducedState | null;
+  projections: Projections | null;
+  degraded: string | null;
+}
+
+/** finalizeTurn 输入（T8.26.2 §3.3） */
+export interface FinalizeTurnInput {
+  session_id: string;
+  decision: GovernorDecision;
+  working_state: PromptWorkingState;
+  /** 供 checkpoint 保存的 schema 合规 State（T1.5 契约；缺省不保存） */
+  state?: State;
+}
+
+/** finalizeTurn 结果（T8.26.2 §3.3）：decision/made + Experience 候选 + 信号 + checkpoint + maintenance */
+export interface FinalizeTurnResult {
+  decision_event_id: string;
+  experience: Experience | null;
+  signals: UtilityCounts;
+  signals_degraded: string | null;
+  maintenance: { enqueued: boolean; debt: MaintenanceDebt[] };
+  checkpoint: Checkpoint | null;
   events_appended: number;
 }
 
@@ -66,6 +120,8 @@ export class CognitiveRuntime {
   readonly modelAdapter: ModelAdapter | null;
   private readonly policyDir: string;
   private readonly processesDir: string;
+  private readonly checkpointDir: string | undefined;
+  private readonly maintenance: MaintenanceScheduler | null;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
 
@@ -77,6 +133,8 @@ export class CognitiveRuntime {
     this.processesDir = opts.processesDir ?? join(HERE, 'kernel', 'processes');
     this.snapshotHash = opts.snapshotHash ?? 'rs:assembly';
     this.modelAdapter = opts.modelAdapter ?? null;
+    this.checkpointDir = opts.checkpointDir;
+    this.maintenance = opts.maintenance ?? null;
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效）；幂等 */
@@ -87,26 +145,136 @@ export class CognitiveRuntime {
   }
 
   /**
-   * 最小请求处理链（T8.3 验收核心）：
-   * ① 事件入链（session/start，payload=goal）→ ② Governor 决策（表驱动，表外短路 Stop）
-   * → ③ 记忆检索（lexical FTS，goal 文本）→ ④ prompt 组装（任务语义静态区 + 工作状态动态尾部）
-   * → ⑤ 决策结果入链（decision/made）。
+   * prepareTurn（§3.1）：turn 开始认知准备——快照/工作状态/Governor 决策（准备级）/分层检索/
+   * ContextCompiler 投影编译；（提供注入接收器时）注入 + context/injected 入链（Model-visible ⟺ logged）。
    */
-  async handleRequest(req: CognitiveRequest): Promise<CognitiveResponse> {
+  async prepareTurn(req: CognitiveRequest, opts: PrepareTurnOptions = {}): Promise<PreparedTurn> {
     const { policy, processes } = await this.ready();
-
-    const start = this.makeEvent('session/start', req, { goal: req.goal });
-    await this.eventStore.append(start);
-
-    const input = this.buildGovernorInput(req, processes, policy);
-    const decision = decide(input, policy.governor);
-
+    const snapshot = this.resolveRuntimeSnapshot();
+    const working_state = await this.loadWorkingState(req);
+    const decision = decide(this.buildGovernorInput(req, processes, policy), policy.governor);
     const retrieved = await retrieve(
       this.memory,
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
       { episode: false },
     );
+    const projection = buildContextProjection(policy, req, working_state, retrieved.items);
 
+    let events_appended = 0;
+    if (opts.inject !== undefined) {
+      await opts.inject(projection);
+      await this.eventStore.append(
+        makeRuntimeEvent('context/injected', req.session_id, this.snapshotHash, {
+          projection_id: projection.id,
+          total_tokens: projection.total_tokens,
+          views: [...new Set(projection.sections.map((s) => s.view))],
+        }, ['prepareTurn']),
+      );
+      events_appended = 1;
+    }
+
+    return {
+      snapshot,
+      working_state,
+      decision,
+      retrieval: { items: retrieved.items, channel_used: retrieved.channel_used },
+      projection,
+      events_appended,
+    };
+  }
+
+  /**
+   * observeEvent（§3.2）：运行中事实入链——EventSchema 校验 → append（幂等）→ reducer 归约（
+   * Observation → State；Contradiction 检测）→ 零成本信号。守卫：非法/重复/未注册类型 → 明确降级（不抛）。
+   */
+  async observeEvent(event: Event): Promise<ObserveEventResult> {
+    const parsed = EventSchema.safeParse(event);
+    if (!parsed.success) {
+      return { event, appended: false, state: null, projections: null, degraded: `EventSchema: ${parsed.error.message}` };
+    }
+    const ev = parsed.data;
+    let appended = true;
+    try {
+      await this.eventStore.append(ev);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('重复 id')) {
+        appended = false; // 幂等：同一事件重复观测 → 不重复追加（§11.3 event_id 幂等键）
+      } else {
+        throw err; // 非重复类存储错误 fail-loud（非接口漂移场景）
+      }
+    }
+    try {
+      const sessionEvents = (await this.eventStore.query({ session_id: ev.session_id })).events;
+      const { state, projections } = reduce(sessionEvents);
+      return { event: ev, appended, state, projections, degraded: null };
+    } catch (err) {
+      // reducer 未注册类型/负载问题 → 事件已入链（事实源），归约明确降级
+      return {
+        event: ev,
+        appended,
+        state: null,
+        projections: null,
+        degraded: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * finalizeTurn（§3.3）：turn 收尾——decision/made 入链（reducer 兼容 payload）→ Experience 候选（PCR）→
+   * 信号聚合（零成本 utility_counts）→ maintenance 入队（注入时）→ checkpoint 保存（dir + state 齐备时）。
+   */
+  async finalizeTurn(input: FinalizeTurnInput): Promise<FinalizeTurnResult> {
+    const made = makeRuntimeEvent('decision/made', input.session_id, this.snapshotHash, {
+      decision_id: makeMutableId('decision'),
+      question: input.working_state.goal,
+      chosen: input.decision.decision,
+      reason: input.decision.reason,
+    }, ['finalizeTurn']);
+    await this.eventStore.append(made);
+
+    const experience = buildExperienceCandidate(input.session_id, input.decision, input.working_state);
+
+    const { signals, degraded } = await this.aggregateSignals(input.session_id);
+
+    let maintenance: { enqueued: boolean; debt: MaintenanceDebt[] } = { enqueued: false, debt: [] };
+    if (this.maintenance !== null) {
+      await this.maintenance.enqueue({
+        id: `turn-finalize:${input.session_id}`,
+        value: 1,
+        estimated_cost: 1,
+        run: async () => {
+          await this.eventStore.compact(Date.now());
+        },
+      });
+      maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
+    }
+
+    let checkpoint: Checkpoint | null = null;
+    if (this.checkpointDir !== undefined && input.state !== undefined) {
+      checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: this.snapshotHash });
+    }
+
+    return {
+      decision_event_id: made.id,
+      experience,
+      signals,
+      signals_degraded: degraded,
+      maintenance,
+      checkpoint,
+      events_appended: 1,
+    };
+  }
+
+  /**
+   * 最小请求处理链（T8.3 验收核心；T8.26.2 改为三能力组合，行为不变）：
+   * prepareTurn（决策/检索/投影，无注入 → 0 事件）→ observeEvent(session/start 入链 + 归约) →
+   * 单轮模拟（模型可见 prompt 组装）→ finalizeTurn（decision/made 入链）。
+   */
+  async handleRequest(req: CognitiveRequest): Promise<CognitiveResponse> {
+    const prepared = await this.prepareTurn(req);
+    await this.observeEvent(
+      makeRuntimeEvent('session/start', req.session_id, this.snapshotHash, { goal: req.goal }, ['handleRequest']),
+    );
     const prompt = buildPrompt({
       session_id: req.session_id,
       task_contract: {
@@ -114,20 +282,20 @@ export class CognitiveRuntime {
         constraints: req.constraints ?? [],
         success_criteria: req.success_criteria,
       },
-      working_state: req.working_state,
+      working_state: prepared.working_state,
     });
 
-    const made = this.makeEvent('decision/made', req, {
-      decision: decision.decision,
-      reason: decision.reason,
+    const finalized = await this.finalizeTurn({
+      session_id: req.session_id,
+      decision: prepared.decision,
+      working_state: prepared.working_state,
     });
-    await this.eventStore.append(made);
 
     return {
-      decision,
-      retrieval: { items: retrieved.items, channel_used: retrieved.channel_used },
+      decision: prepared.decision,
+      retrieval: prepared.retrieval,
       prompt,
-      events_appended: 2,
+      events_appended: 1 + finalized.events_appended,
     };
   }
 
@@ -138,6 +306,42 @@ export class CognitiveRuntime {
   }
 
   // ---- 内部 ----
+
+  /** 请求级快照身份（T8.26.2 §3.1 step 1） */
+  private resolveRuntimeSnapshot(): string {
+    return this.snapshotHash;
+  }
+
+  /** 工作状态加载（§3.1 step 2）：checkpointDir 配置且存在 checkpoint → 恢复；否则请求携带的当前状态 */
+  private async loadWorkingState(req: CognitiveRequest): Promise<PromptWorkingState> {
+    if (this.checkpointDir === undefined) {
+      return req.working_state;
+    }
+    try {
+      const cp = await latestCheckpoint({ dir: this.checkpointDir });
+      if (cp === null) {
+        return req.working_state;
+      }
+      const state = await restoreCheckpoint(cp.id, { dir: this.checkpointDir });
+      return toPromptWorkingState(state);
+    } catch {
+      return req.working_state; // checkpoint 不可用 → 降级到请求态
+    }
+  }
+
+  /** 信号聚合（零成本）：会话事件 → reducer utility_counts；归约失败 → 全零 + 降级原因 */
+  private async aggregateSignals(session_id: string): Promise<{ signals: UtilityCounts; degraded: string | null }> {
+    try {
+      const sessionEvents = (await this.eventStore.query({ session_id })).events;
+      const { projections } = reduce(sessionEvents);
+      return { signals: projections.utility_counts, degraded: null };
+    } catch (err) {
+      return {
+        signals: { tool_calls: 0, retrieval_calls: 0, memory_ops: 0, corrections: 0, reads: 0, hits: 0 },
+        degraded: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
 
   private buildGovernorInput(
     req: CognitiveRequest,
@@ -183,39 +387,6 @@ export class CognitiveRuntime {
       uncertainty_vector: {},
       maintenance_state: { debt: 0 },
       evidence_sufficiency: es,
-    };
-  }
-
-  /** M3 事件构造（可变对象 uuid id；时间戳实时——事件为运行时事实） */
-  private makeEvent(type: Event['type'], req: CognitiveRequest, payload: Record<string, unknown>): Event {
-    const ts = new Date().toISOString();
-    return {
-      ir_version: '2.0',
-      id: makeMutableId('evt'),
-      schema: 'omb/M3',
-      scope: 'Session',
-      lifecycle: 'active',
-      immutable: false,
-      owner: 'kernel',
-      created: ts,
-      updated: ts,
-      provenance: {
-        source: 'runtime/assembly',
-        event: type,
-        actor: 'omb-v2',
-        environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
-        runtime_snapshot: this.snapshotHash,
-        timestamp: ts,
-        transformation_chain: ['handleRequest'],
-        verification: 'assembly-chain',
-      },
-      refs: [],
-      type,
-      session_id: req.session_id,
-      runtime_snapshot: this.snapshotHash,
-      parent_event: null,
-      payload,
-      timestamp: ts,
     };
   }
 }

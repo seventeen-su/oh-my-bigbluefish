@@ -38,6 +38,7 @@ export type Memory = z.infer<typeof MemorySchema>;
 export const FIXED_EVENT_TYPES = [
   'session/start',
   'session/end',
+  'context/injected',
   'tool/call',
   'tool/result',
   'claim/update',

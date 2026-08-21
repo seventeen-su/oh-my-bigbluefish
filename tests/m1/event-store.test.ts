@@ -127,6 +127,7 @@ describe('类型枚举（M3 schema 校验）', () => {
     const legal = [
       'session/start',
       'session/end',
+      'context/injected',
       'tool/call',
       'tool/result',
       'claim/update',
