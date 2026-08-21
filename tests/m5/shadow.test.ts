@@ -9,12 +9,17 @@
 //   ④ evaluateCanary 三态：n<min_n → hold（优先于失败率）；失败率超限 → rollback；达标 → promote；
 //      边界 rate == max → promote；buildCertificate 派生 valid
 //   ⑤ 触发自动回滚：超限证书 → evaluateCanary rollback → runCanary 自动调 rollbackCanary
-//      （restore fake 被调）+ RollbackContract 结构完整 + exposure log 有记录；restore 抛错 → 拒绝
+//      （restore fake 被调）+ RollbackContract 结构完整 + exposure log 有记录（decision='canary_rollback'、
+//      outcome='ok'——T5.3 评审契约修订：回滚触发为独立审计条目，审计先行）；restore 抛错 → 拒绝
+//   ⑤c 修复回归（评审 Important）：restore 抛错 → runCanary 拒绝（fail-loud 保持）且 exposure log
+//      仍有 canary 决策条目（decision='canary_rollback', outcome='restore_failed'）——回滚触发审计不丢失
+//   ⑤d 修复回归（评审 Important）：restore 成功 + exposure log 写入失败（坏 logPath）→ 调用方得到
+//      明确信号（result.warnings，非可重试 restore 形态）且 restore 不重复执行（无双回滚）
 //   ⑥ 未触发：达标证书 → 无回滚调用（restore 未被调、contract === null）
 //   ⑦ Certificate 结构：stat 非法（n 负数 / failures 负数 / 统计不自洽）→ 校验拒绝；阈值非法 → 拒绝；
 //      扩展：cert.valid 与派生值不一致 → evaluateCanary fail-loud
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -221,12 +226,13 @@ describe('⑤ 触发自动回滚（evaluateCanary rollback → runCanary 自动 
     expect(Array.isArray(contract.affected_sessions)).toBe(true);
     expect(contract.restore_plan.length).toBeGreaterThan(0);
     expect(contract.restore_plan.join(' ')).toContain('c:bad');
-    // exposure log 有记录
+    // exposure log 有记录（审计先行：回滚触发条目 decision='canary_rollback', outcome='ok'）
     const lines = (await readFile(logPath, 'utf8')).split('\n').filter((l) => l.length > 0);
     expect(lines.length).toBeGreaterThanOrEqual(1);
     const rec = JSON.parse(lines[0]!) as ExposureEntry;
     expect(rec.candidate_id).toBe('c:bad');
-    expect(rec.decision).toBe('canary');
+    expect(rec.decision).toBe('canary_rollback');
+    expect(rec.outcome).toBe('ok');
     expect(rec.layer).toBe('tier1');
     expect(rec.seed).toBe('seed-x');
   });
@@ -242,6 +248,59 @@ describe('⑤ 触发自动回滚（evaluateCanary rollback → runCanary 自动 
         },
       }),
     ).rejects.toThrow(/restore failed/);
+  });
+
+  it('⑤c 修复回归：restore 抛错 → runCanary 拒绝（fail-loud 保持）且 exposure log 仍有 canary 决策条目（outcome=restore_failed）', async () => {
+    const cert = buildCertificate('c:bad', { n: 10, successes: 8, failures: 2 }, { min_n: 10, max_failure_rate: 0.1 });
+    const logPath = join(evo, 'exposure.log');
+    await expect(
+      runCanary({
+        certificate: cert,
+        exposure: { seed: 'seed-z', bucket: bucketFor('seed-z'), layer: 'tier1' },
+        logPath,
+        snapshot: 'sha256:abc',
+        scope: 'Project',
+        restore: async () => {
+          throw new Error('restore failed');
+        },
+      }),
+    ).rejects.toThrow(/restore failed/);
+    // 审计先行：回滚触发条目已落盘（outcome 标注 restore 失败）
+    const lines = (await readFile(logPath, 'utf8')).split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    const rec = JSON.parse(lines[0]!) as ExposureEntry;
+    expect(rec.candidate_id).toBe('c:bad');
+    expect(rec.decision).toBe('canary_rollback');
+    expect(rec.outcome).toBe('restore_failed');
+  });
+
+  it('⑤d 修复回归：restore 成功 + exposure log 写入失败 → 明确信号（warnings 含"回滚已执行、日志未写入"）且 restore 不重复执行', async () => {
+    const cert = buildCertificate('c:bad', { n: 10, successes: 8, failures: 2 }, { min_n: 10, max_failure_rate: 0.1 });
+    // 坏 logPath：父路径位置被普通文件占据 → logExposure 的 mkdir 必然失败
+    const blocker = join(evo, 'blocked');
+    await writeFile(blocker, 'not a directory');
+    const logPath = join(blocker, 'exposure.log');
+    let restored = 0;
+    const result = await runCanary({
+      certificate: cert,
+      exposure: { seed: 'seed-w', bucket: bucketFor('seed-w'), layer: 'tier1' },
+      logPath,
+      snapshot: 'sha256:xyz',
+      scope: 'Project',
+      restore: async () => {
+        restored++;
+      },
+    });
+    // 回滚已提交（contract 非空）→ 调用方拿到的是"已执行"形态，非可重试 restore 的拒绝形态
+    expect(result.verdict).toBe('rollback');
+    expect(result.contract).not.toBeNull();
+    expect(result.contract!.target_snapshot).toBe('sha256:xyz');
+    // 明确信号：warnings 非空且言明回滚已执行、日志未写入
+    expect(result.warnings.length).toBeGreaterThanOrEqual(1);
+    expect(result.warnings.join(' ')).toMatch(/回滚已执行/);
+    expect(result.warnings.join(' ')).toMatch(/日志未写入|exposure log/);
+    // restore 仅执行一次（调用方不会因 reject 而重试 → 无二次 restore）
+    expect(restored).toBe(1);
   });
 });
 

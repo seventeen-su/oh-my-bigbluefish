@@ -7,7 +7,8 @@
 //       layer 'all'（全量桶 0-99）/ 'tier1'（0-4）/ 'tier2'（5-19）/ 'off'（不曝光）。
 //       cfg.bucket_range 与常量表不一致 → fail-loud（配置漂移拒绝）；未知 layer → fail-loud。
 //   - logExposure(logPath, entry)：独立 JSONL exposure log（.evolution/exposure.log，追加写），
-//       供 M5 复盘/审计。entry 经 zod 校验（非法 fail-loud）。
+//       供 M5 复盘/审计。entry 经 zod 校验（非法 fail-loud）。decision 含 'canary_rollback'
+//       （回滚触发条目，可带 outcome='ok'|'restore_failed'，仅该 decision 允许——自洽性校验）。
 //   - Certificate / buildCertificate / evaluateCanary：金丝雀统计判定（接口先定，§10.3）——
 //       valid = n ≥ min_n && failure_rate ≤ max_failure_rate（初值 min_n=10、max_failure_rate=0.1，
 //       常量标注待标定，§17）；e-process/confidence sequence 引擎后接（本任务以初值规则判定）。
@@ -17,7 +18,10 @@
 //       restore_plan } 并执行 restore（测试注入 fake；真实实现 = substrate rollback，T0.2 rollback.ts）。
 //       affected_sessions 为空数组——Runtime Snapshot 会话注册表未接入（T5.5 前），接口先定。
 //   - runCanary(opts)：自动金丝雀检查——evaluateCanary 判 rollback → 自动调用 rollbackCanary
-//       （全自动回滚），全程记录 exposure log（decision='canary'）。
+//       （全自动回滚），全程记录 exposure log，审计先行（T5.3 评审修复）：promote/hold →
+//       decision='canary'；rollback → decision='canary_rollback'（outcome 标记 restore 成败；
+//       restore 失败仍 fail-loud 且审计不丢失；回滚已提交后 log 失败非致命 → warnings 显式告知，
+//       防调用方重试 restore 造成双回滚）。
 //
 // 层规则：仅 import node: 内置 + zod（依赖）；无 kernel 运行时依赖（层 DAG，CONVENTIONS §4）。
 // 模块顶层无副作用；单函数圈复杂度 ≤ 15（CONVENTIONS §9 预算）。
@@ -98,15 +102,23 @@ export function isExposed(seed: string, cfg: { bucket_range: [number, number]; l
 
 // ---- Exposure log（§9.2 G4：独立 JSONL，.evolution/exposure.log，追加写） ----
 
-/** exposure entry（brief 契约：{ ts, candidate_id, seed, bucket, layer, decision }） */
-export const ExposureEntrySchema = z.object({
-  ts: z.number().int().nonnegative(),
-  candidate_id: z.string().min(1),
-  seed: z.string().min(1),
-  bucket: z.number().int().min(0),
-  layer: z.string().min(1),
-  decision: z.enum(['shadow', 'canary', 'control', 'skip']),
-});
+/** exposure entry（brief 契约：{ ts, candidate_id, seed, bucket, layer, decision }；T5.3 评审修订：
+ *  decision 增 'canary_rollback'（回滚触发条目，审计先行）；可选 outcome 标记回滚尝试结果
+ *  （'ok' / 'restore_failed'），仅 canary_rollback 条目允许携带（自洽性 refine）） */
+export const ExposureEntrySchema = z
+  .object({
+    ts: z.number().int().nonnegative(),
+    candidate_id: z.string().min(1),
+    seed: z.string().min(1),
+    bucket: z.number().int().min(0),
+    layer: z.string().min(1),
+    decision: z.enum(['shadow', 'canary', 'control', 'skip', 'canary_rollback']),
+    outcome: z.enum(['ok', 'restore_failed']).optional(),
+  })
+  .refine((e) => e.decision === 'canary_rollback' || e.outcome === undefined, {
+    message: 'outcome 仅用于 canary_rollback 条目',
+    path: ['outcome'],
+  });
 export type ExposureEntry = z.infer<typeof ExposureEntrySchema>;
 
 /**
@@ -280,33 +292,68 @@ export interface CanaryRunResult {
   reason: string;
   /** rollback 时 = 执行后的 RollbackContract；否则 null */
   contract: RollbackContract | null;
+  /** 非致命警告（空数组 = 无）。如"回滚已执行但 exposure log 写入失败"——调用方不得据此重试 restore（双回滚风险） */
+  warnings: string[];
 }
 
-/**
- * 自动金丝雀检查（全自动，brief 验收核心）：
- * evaluateCanary 判 rollback → 自动调用 rollbackCanary（执行 restore）；所有结果（含 promote/hold）
- * 记入 exposure log（decision='canary'——本通道即金丝雀曝光）。
- */
-export async function runCanary(opts: CanaryRunOptions): Promise<CanaryRunResult> {
-  const { verdict, reason } = evaluateCanary(opts.certificate);
-  let contract: RollbackContract | null = null;
-  if (verdict === 'rollback') {
-    contract = await rollbackCanary({
-      candidate_id: opts.certificate.candidate_id,
-      snapshot: opts.snapshot,
-      scope: opts.scope,
-      restore: opts.restore,
-    });
-  }
-  await logExposure(opts.logPath, {
+/** 构造 runCanary 的 exposure 条目（rollback 触发 = decision 'canary_rollback'，可带 outcome 标记 restore 结果） */
+function canaryEntry(opts: CanaryRunOptions, decision: ExposureEntry['decision'], outcome?: ExposureEntry['outcome']): ExposureEntry {
+  return {
     ts: Date.now(),
     candidate_id: opts.certificate.candidate_id,
     seed: opts.exposure.seed,
     bucket: opts.exposure.bucket,
     layer: opts.exposure.layer,
-    decision: 'canary',
-  });
-  return { verdict, reason, contract };
+    decision,
+    ...(outcome === undefined ? {} : { outcome }),
+  };
+}
+
+/**
+ * 自动金丝雀检查（全自动，brief 验收核心）：
+ * evaluateCanary 判 rollback → 自动调用 rollbackCanary（执行 restore）。审计先行（T5.3 评审修复）：
+ *   - promote/hold → exposure log 记 decision='canary'；
+ *   - rollback → exposure log 记 decision='canary_rollback'（回滚触发条目必被记录）：
+ *       restore 成功 → outcome='ok'；restore 抛错 → 先落盘 outcome='restore_failed' 再 fail-loud
+ *       （restore 自身失败仍拒绝，审计不丢失）；
+ *   - restore 已提交后 exposure log 写入失败 → 非致命（回滚不可重试）：resolve 并在 warnings
+ *       显式给出"回滚已执行、日志未写入"，防止调用方重试 restore 造成双回滚。
+ */
+export async function runCanary(opts: CanaryRunOptions): Promise<CanaryRunResult> {
+  const { verdict, reason } = evaluateCanary(opts.certificate);
+  const warnings: string[] = [];
+  let contract: RollbackContract | null = null;
+  if (verdict === 'rollback') {
+    try {
+      contract = await rollbackCanary({
+        candidate_id: opts.certificate.candidate_id,
+        snapshot: opts.snapshot,
+        scope: opts.scope,
+        restore: opts.restore,
+      });
+    } catch (err) {
+      // 审计先行：restore 失败也先落盘回滚触发条目（outcome='restore_failed'），再 fail-loud
+      try {
+        await logExposure(opts.logPath, canaryEntry(opts, 'canary_rollback', 'restore_failed'));
+      } catch {
+        // 审计写入亦失败：不掩盖 restore 原始错误（fail-loud 优先级：restore 错误优先）
+      }
+      throw err;
+    }
+    // restore 已成功提交 → 记 outcome='ok'；log 失败非致命（回滚已执行，不得让调用方重试 restore）
+    try {
+      await logExposure(opts.logPath, canaryEntry(opts, 'canary_rollback', 'ok'));
+    } catch (err) {
+      warnings.push(
+        `回滚已执行（target_snapshot=${opts.snapshot}）但 exposure log 写入失败：${
+          err instanceof Error ? err.message : String(err)
+        }——日志未写入，禁止重试 restore（双回滚风险）`,
+      );
+    }
+  } else {
+    await logExposure(opts.logPath, canaryEntry(opts, 'canary'));
+  }
+  return { verdict, reason, contract, warnings };
 }
 
 // ---- 便捷常量（日志路径约定：workspace/.omb/.evolution/exposure.log） ----
