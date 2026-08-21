@@ -1,6 +1,8 @@
 // layer 2：Cordis function plugin 入口（DSH preset 挂载；agent.cordis.yml 指向编译产物 lib/runtime/plugin.js）。
 // 不 import '@deepseek-ai/cordis'（harness 依赖，preset 内 tsc/vitest 无此包）：
 // 用结构化最小接口类型化 ctx，运行时以 ctx.commands?.register?.(...) 守卫。
+// 无双 Loop（专项 §1 硬约束）：本插件仅观察/注入/命令注册——不替换、不包装、不重启 DSH Agent Loop；
+// 模型调用归 DSH（ctx.llm 只读装配 ModelAdapter 供 /bench 用，不拦截对话模型路径）。
 // M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
