@@ -4,8 +4,9 @@
 // - Debt：失败/未执行（中断、hard 限跳过）→ 累计（value 累加 + accumulated_at 更新）；成功 → 清除；
 //   持久化 .evolution/debt.json（原子写 tmp+rename）。soft 限 → quantum 频率提升（tick 间隔减半）；
 //   hard 限 → 非必要（normal）任务跳过；critical → 下一 quantum/tick 优先。
-// - Quantum：requestQuantum 每次执行 1 个任务（可中断：外部 AbortSignal + 协作式让出——run 收到
-//   signal，abort 抛 AbortError 即让出，任务留队可重试）；tick 批量（定时器驱动，start() 启动）。
+// - Quantum：requestQuantum 每次执行 1 个任务（可中断：外部 AbortSignal 与 stop() 的 inFlight
+//   signal 经 AbortSignal.any 合并后传入 run——abort 抛 AbortError 即让出，任务留队可重试）；
+//   tick 批量（定时器驱动，start() 启动）。
 // - Predictive Invalidation：Fingerprint diff → 受影响对象 markSuspicious（deps 注入）+ 最小回归
 //   子集 → CapabilityDecayRecord（能力衰减 = 每变化字段 × CAPABILITY_DECAY_FACTOR，待标定 §17）。
 // - 退出即停：stop() 清定时器/队列并中断在飞任务；stop 后 tick/requestQuantum 无动作。
@@ -149,10 +150,12 @@ export class MaintenanceScheduler {
     this.resetTimer();
   }
 
-  /** 请求间隙小量子：执行 1 个可执行任务（可中断）；hard 限跳过者记录 skipped + 债务累计 */
+  /** 请求间隙小量子：执行 1 个可执行任务（可中断：调用方 signal ∪ stop() 的 inFlight）；
+   *  hard 限跳过者记录 skipped + 债务累计 */
   async requestQuantum(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
     if (this.stopped || this.queue.length === 0) return { ran: [], skipped: [] };
-    if (opts.signal?.aborted) {
+    const signal = this.execSignal(opts.signal);
+    if (signal.aborted) {
       // 中断（未执行）→ 债务累计，任务留队
       const top = this.sortedQueue()[0]!;
       this.accumulateDebt(top);
@@ -166,7 +169,7 @@ export class MaintenanceScheduler {
         this.accumulateDebt(t);
         continue;
       }
-      const r = await this.runOne(t, opts.signal);
+      const r = await this.runOne(t, signal);
       report.ran.push(...r.ran);
       report.skipped.push(...r.skipped);
       await this.persistDebt();
@@ -177,24 +180,25 @@ export class MaintenanceScheduler {
     return report;
   }
 
-  /** tick：批量处理队列（进程内定时器驱动；可手动调用）；signal.aborted 时停止取新任务 */
+  /** tick：批量处理队列（进程内定时器驱动；可手动调用）；执行 signal（调用方 ∪ inFlight）中断时停止取新任务 */
   async tick(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
     this.tickCountValue++;
     if (this.stopped || this.running || this.queue.length === 0) return { ran: [], skipped: [] };
     this.running = true;
     try {
+      const signal = this.execSignal(opts.signal);
       const report: QuantumReport = { ran: [], skipped: [] };
       for (const t of this.sortedQueue()) {
-        if (opts.signal?.aborted) break;
+        if (signal.aborted) break;
         if (this.hardBlocked(t)) {
           report.skipped.push(t.id);
           this.accumulateDebt(t);
           continue;
         }
-        const r = await this.runOne(t, opts.signal);
+        const r = await this.runOne(t, signal);
         report.ran.push(...r.ran);
         report.skipped.push(...r.skipped);
-        if (opts.signal?.aborted) break;
+        if (signal.aborted) break;
       }
       await this.persistDebt();
       return report;
@@ -291,6 +295,12 @@ export class MaintenanceScheduler {
   /** hard 限：债务合计 ≥ hardLimit 时非必要（normal）任务跳过（限制非必要演化） */
   private hardBlocked(t: MaintenanceTask): boolean {
     return this.debtTotal() >= this.hardLimit && t.urgency === 'normal';
+  }
+
+  /** 任务执行 signal：stop() 的 inFlight 与调用方 signal 合并（stop 中断在飞任务） */
+  private execSignal(optsSignal?: AbortSignal): AbortSignal {
+    if (!optsSignal) return this.inFlight.signal;
+    return AbortSignal.any([this.inFlight.signal, optsSignal]);
   }
 
   /** 执行单个任务：成功 → 出队 + 清债；失败 → 出队 + 债务累计；中断 → 留队 + 债务累计（可重试） */

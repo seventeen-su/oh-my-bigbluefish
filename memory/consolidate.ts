@@ -7,8 +7,9 @@
 // 查重——重跑无新增变更。
 // 影响域：每步按 scope+kind 记录受影响查询路由（更新局部化 Contract 四问，§7.1；
 // 隔离单位 = 作用域 + 检索路由，T3.4 路由未实现前以 `${scope}/${kind}` 近似）。
-// 调度：仅依赖 MaintenanceScheduler 最小接口（enqueue/requestQuantum）；createDirectScheduler() =
-// M3 最小实现（enqueue 直接执行 run），完整 Queue+Debt+Priority+ROI+Critical 由 M5 升级（无循环依赖）。
+// 调度：仅依赖 MaintenanceScheduler 最小接口（enqueue——consolidate 只入队，不请求 quantum）；
+// createDirectScheduler() = M3 最小实现（enqueue 直接执行 run），完整 Queue+Debt+Priority+ROI+
+// Critical 由 M5 升级（无循环依赖）。接口收窄为实际使用形状：完整调度器无需 cast 即可直传。
 // layer 2（memory/）：仅 node: 内置 + kernel/schemas/（同层契约）+ memory/ 内文件。
 import { createHash } from 'node:crypto';
 import { makeMutableId, type Scope } from '../kernel/schemas/base.js';
@@ -16,20 +17,18 @@ import type { Memory, MemoryKind, MemoryLifecycle } from '../kernel/schemas/m.js
 import type { SqliteMemoryBackend } from './backend.js';
 import { contentHash, normalizeText } from './staging-policy.js';
 
-// ---- 最小 MaintenanceScheduler 接口（M5 升级完整实现） ----
+// ---- 最小 MaintenanceScheduler 接口（M5 升级完整实现；收窄为 consolidate 实际使用的形状） ----
 
 export interface MaintenanceScheduler {
   enqueue(task: { id: string; run: () => Promise<void> }): Promise<void>;
-  requestQuantum(): Promise<void>;
 }
 
-/** M3 最小实现：enqueue 直接执行 run；requestQuantum no-op（M5 替换为完整 Queue+Debt 调度） */
+/** M3 最小实现：enqueue 直接执行 run（M5 替换为完整 Queue+Debt 调度） */
 export function createDirectScheduler(): MaintenanceScheduler {
   return {
     async enqueue(task) {
       await task.run();
     },
-    async requestQuantum() {},
   };
 }
 

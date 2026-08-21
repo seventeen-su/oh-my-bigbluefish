@@ -221,7 +221,6 @@ describe('consolidate（§7.2 空闲期批处理）', () => {
         enqueued.push(task.id);
         await task.run();
       },
-      async requestQuantum() {},
     };
     const report = await consolidate(b, { now: NOW, scheduler });
     expect(enqueued).toEqual(['memory-consolidation']);

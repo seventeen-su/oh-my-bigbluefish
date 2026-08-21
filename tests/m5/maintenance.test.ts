@@ -10,7 +10,8 @@
 //   ⑤ 维护量子可中断：run 中 abort → 任务让出（skipped 记录，不挂起）
 //   ⑥ Predictive Invalidation：fingerprint 变化（node 版本字段不同）→ markSuspicious 被调 +
 //      CapabilityDecayRecord 结构完整（含 regression_set）
-//   ⑦ 退出即停：stop() 后 tick/requestQuantum 无动作（无遗留任务）
+//   ⑦ 退出即停：stop() 清定时器/队列 → tick/requestQuantum 无动作（无遗留任务）；
+//      挂起中的任务被中断（skipped/aborted 路径，不挂起）
 //   ⑧ 经调度跑 consolidation：M3 consolidate 经 scheduler.enqueue 执行成功（升级兼容验证）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
@@ -25,7 +26,7 @@ import {
   type MaintenanceTaskInput,
 } from '../../supervisor/maintenance.js';
 import { SqliteMemoryBackend } from '../../memory/backend.js';
-import { consolidate, type MaintenanceScheduler as M3SchedulerShape } from '../../memory/consolidate.js';
+import { consolidate } from '../../memory/consolidate.js';
 import { PROV, TS, base } from '../m1/ir-samples.js';
 
 // ---- 测试工具 ----
@@ -274,6 +275,39 @@ describe('维护调度（§12.3）', () => {
     s.stop(); // 幂等
   });
 
+  it('退出即停：stop() 中断在飞任务（run 挂起中 stop → 任务让出 skipped/aborted，不挂起）', async () => {
+    const s = mkScheduler();
+    s.enqueue(task({
+      id: 'hang',
+      value: 1,
+      estimated_cost: 1,
+      run: async (signal) => {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            clearTimeout(timer);
+            resolve();
+          }, 200);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+        if (signal?.aborted) {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          throw err; // 协作式中断：让出（skipped/aborted 路径）
+        }
+      },
+    }));
+    const q = s.requestQuantum(); // requestQuantum 同步推进到 run 挂起（listener 已注册）
+    s.stop(); // 退出即停：inFlight abort → 在飞任务被中断
+    const r = await q;
+    expect(r.ran).toEqual([]); // 未自然跑完
+    expect(r.skipped).toContain('hang'); // 中断路径：skipped/aborted 记录
+    // 不挂起：q 已正常返回。若 inFlight 未接入执行 signal，此处会等 200ms 任务自然跑完
+    // → ran 含 'hang'、skipped 不含 → 本断言失败（RED）。
+  });
+
   // ---- ⑧ 经调度跑 consolidation（M3 升级兼容） ----
 
   it('经调度跑 consolidation：M3 consolidate 经 scheduler.enqueue 入队 → requestQuantum 执行成功', async () => {
@@ -286,9 +320,9 @@ describe('维护调度（§12.3）', () => {
       await b.ingest(m1);
       await b.ingest(m2);
       const s = mkScheduler();
-      // 完整调度器是 M3 最小接口的超集：enqueue 已同形（Promise<void>）；requestQuantum 返回
-      // 报告（Promise<QuantumReport>）→ 结构上不等同 Promise<void>，测试侧做一次形状适配。
-      const p = consolidate(b, { now: Date.parse(TS), scheduler: s as unknown as M3SchedulerShape });
+      // 完整调度器直接满足 M3 最小接口：接口已收窄为 consolidate 实际使用的 enqueue 形状
+      // （requestQuantum 报告形状不再被 M3 接口声明）→ 无 cast 接缝，直接传参。
+      const p = consolidate(b, { now: Date.parse(TS), scheduler: s });
       const q = await s.requestQuantum();
       expect(q.ran).toEqual(['memory-consolidation']); // M3 形状任务 {id, run} 经完整调度器执行
       await p;
