@@ -214,10 +214,13 @@ describe('M3 记忆闭环整体连通（Event → stage → admit → consolidat
     expect(report.related).toBe(2); // 两条 Decision → Episodic informs 边
     expect(report.affected_scopes.sort()).toEqual(['Global', 'Project']);
 
-    // dedup 落位：dupId Frozen、mem2 保持 Active
+    // dedup 落位：dupId Frozen、mem2（admit 的 Global 记忆）保持 Active
     expect((await backend.getById(dupId))?.lifecycle).toBe('Frozen');
     const glob = await backend.query({ scope: 'Global', limit: 10, budget: 100 });
-    expect(glob.items.find((m) => m.payload === '闭环测试验证通过')?.lifecycle).toBe('Active');
+    // 不依赖 updated 排序：freeze 走 backend.update 会把 dup.updated 刷成真实时钟（可能晚于
+    // mem2 注入的 NOW+5000）→ DESC 排序下 dup 可能排前；按幂等键身份找 Active 的 mem2 而非位置。
+    const mem2row = glob.items.find((m) => m.payload === '闭环测试验证通过' && m.lifecycle === 'Active');
+    expect(mem2row?.provenance.event).toBe(mem2Evt.provenance.event);
 
     // relation 落位：seedDecision --informs--> mem1（Episodic）
     const walk = await backend.relationTraverse(seedId, ['informs'], 1);

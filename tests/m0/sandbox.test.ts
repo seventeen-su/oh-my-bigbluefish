@@ -28,9 +28,36 @@ function buildFixture(): { root: string; candidates: string; writable: string } 
   return { root, candidates, writable };
 }
 
-/** 清理 fixture（host 侧不受限制，rmSync 即可） */
-function teardownFixture(root: string): void {
-  fs.rmSync(root, { recursive: true, force: true });
+/** 删除目录树并对 EPERM/EBUSY 短退避重试（teardown 竞态硬化）。
+ * 背景：受限子进程被 TerminateJobObject 杀死后，其 cwd 目录句柄释放存在 OS 级时序竞态
+ * （task-5.2-flake-report.md 关注点 2）——kill 返回后立刻 rmSync 偶发 EPERM。此处重试
+ * 至多 attempts 次（线性退避 delayMs×n），非 EPERM/EBUSY 错误 fail-loud 不重试。
+ * 仿 git.ts teardownLayoutFixture 的 "rmSync → catch → 处理 → retry" 模式。 */
+async function removeDirRetry(
+  target: string,
+  opts: { attempts?: number; delayMs?: number; remove?: (p: string) => void } = {},
+): Promise<void> {
+  const { attempts = 5, delayMs = 100, remove = (p) => fs.rmSync(p, { recursive: true, force: true }) } = opts;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      remove(target);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'EPERM' && code !== 'EBUSY') throw err;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/** 清理 fixture（host 侧不受限制；rmSync 对 EPERM/EBUSY 短退避重试，见 removeDirRetry） */
+function teardownFixture(root: string): Promise<void> {
+  return removeDirRetry(root);
 }
 
 /** 把路径安全嵌入生成的 JS 脚本源码（Windows 反斜杠 → JSON 字符串字面量） */
@@ -105,9 +132,9 @@ describe('createCandidateDir 候选临时目录（mkdtemp fixture）', () => {
     expect(() => createCandidateDir('a/b', { root: fx.candidates })).toThrow();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (fx) {
-      teardownFixture(fx.root);
+      await teardownFixture(fx.root);
     }
   });
 });
@@ -115,9 +142,9 @@ describe('createCandidateDir 候选临时目录（mkdtemp fixture）', () => {
 describe('runRestricted 受限子进程（WRITE_RESTRICTED 令牌，koffi FFI）', () => {
   let fx: { root: string; candidates: string; writable: string };
 
-  afterEach(() => {
+  afterEach(async () => {
     if (fx) {
-      teardownFixture(fx.root);
+      await teardownFixture(fx.root);
     }
   });
 
@@ -272,6 +299,61 @@ console.log('DIR=' + h.dir);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('removeDirRetry（teardown EPERM/EBUSY 竞态硬化：短退避重试）', () => {
+  it('EPERM 瞬态：前两次删除失败（EPERM）第三次成功 → 最终成功，共调用 3 次', async () => {
+    const calls: string[] = [];
+    const fake = (p: string): void => {
+      calls.push(p);
+      if (calls.length < 3) {
+        const e = new Error('EPERM') as NodeJS.ErrnoException;
+        e.code = 'EPERM';
+        throw e;
+      }
+    };
+    await removeDirRetry('C:\\fake\\dir', { attempts: 5, delayMs: 0, remove: fake });
+    expect(calls).toHaveLength(3);
+  });
+
+  it('EBUSY 同样被重试（句柄占用常见 EBUSY）', async () => {
+    const calls: string[] = [];
+    const fake = (p: string): void => {
+      calls.push(p);
+      if (calls.length === 1) {
+        const e = new Error('EBUSY') as NodeJS.ErrnoException;
+        e.code = 'EBUSY';
+        throw e;
+      }
+    };
+    await removeDirRetry('C:\\fake\\dir', { attempts: 5, delayMs: 0, remove: fake });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('非 EPERM/EBUSY 错误 fail-loud 立即抛（不重试、不吞错）', async () => {
+    const fake = (): void => {
+      const e = new Error('EACCES') as NodeJS.ErrnoException;
+      e.code = 'EACCES';
+      throw e;
+    };
+    await expect(removeDirRetry('C:\\fake\\dir', { attempts: 5, delayMs: 0, remove: fake })).rejects.toThrow('EACCES');
+  });
+
+  it('重试耗尽仍失败 → 抛出最后一次错误', async () => {
+    const fake = (): void => {
+      const e = new Error('EPERM') as NodeJS.ErrnoException;
+      e.code = 'EPERM';
+      throw e;
+    };
+    await expect(removeDirRetry('C:\\fake\\dir', { attempts: 3, delayMs: 0, remove: fake })).rejects.toThrow('EPERM');
+  });
+
+  it('默认 remove=rmSync：真实临时目录树删除成功', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-sandbox-'));
+    fs.mkdirSync(path.join(root, 'sub'));
+    await removeDirRetry(root);
+    expect(fs.existsSync(root)).toBe(false);
   });
 });
 
