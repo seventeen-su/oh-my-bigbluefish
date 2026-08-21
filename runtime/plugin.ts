@@ -13,6 +13,7 @@ import { makeRealExecutor } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
+import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './loop-hooks.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { BenchLine } from '../kernel/schemas/bench.js';
@@ -109,6 +110,8 @@ export interface ContextLike {
   modelAdapter?: ModelAdapter;
   /** T8.26.3：DSH systemPrompt 服务（context 贡献注册面；真实类型 @deepseek-ai/dsh-system-prompt） */
   systemPrompt?: SystemPromptLike;
+  /** T8.26.4：DSH 事件注册面（session/event 会话事实 + tools/result 工具结果 live；真实类型 Cordis Context.on） */
+  on?(event: string, handler: (...args: unknown[]) => void): unknown;
 }
 
 /**
@@ -209,6 +212,56 @@ export function apply(ctx: ContextLike): void {
     }
   } else {
     recordDegradation('systemPrompt.context', '接口缺失（ctx.systemPrompt.context 不存在）——无认知投影注入（命令仍可用）');
+  }
+
+  // T8.26.4：事件监听——session/event（turn 生命周期 + 工具事实）与 tools/result（live 工具结果）→ observeEvent
+  // （EventSchema 校验 → append（幂等）→ state-reducer 增量归约，P7：Event 唯一事实源）。
+  // 守卫（计划 §2 应对策略 2）：ctx.on 缺失 → 记录降级（事件不采集，其余功能不受影响）；认知运行时未装配 → 不注册。
+  // 双路径幂等：tools/result live 与 session/event tool/result 对同一 callId 产出同一确定性事件 id → observeEvent
+  // 重复 id 幂等（只入链一次；live 零延迟信号 + session 耐久事实，先到者胜）。
+  // 异步观察 fire-and-forget（append 为同步写，不阻塞 DSH 事件派发；失败记录降级不抛）。
+  if (typeof ctx.on === 'function') {
+    if (ctx.cognitive !== undefined) {
+      const traces = new Map<string, ReturnType<typeof initialTraceState>>();
+      ctx.on('session/event', (session, dshEvent) => {
+        const runtime = ctx.cognitive;
+        if (runtime === undefined) {
+          return; // 防御：注册时已守卫；并发装配变化时静默降级
+        }
+        const sessionId = (session as { id?: unknown } | undefined)?.id;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return; // 无会话身份 → 无可入链
+        }
+        const prev = traces.get(sessionId) ?? initialTraceState();
+        const mapped = mapSessionEvent(sessionId, dshEvent as never, runtime.snapshotHash, prev);
+        traces.set(sessionId, mapped.state);
+        for (const ev of mapped.events) {
+          void runtime.observeEvent(ev).catch((err) => {
+            const detail = err instanceof Error ? err.message : String(err);
+            recordDegradation('session/event', `observeEvent 失败（${detail}）——事件已记录降级`);
+          });
+        }
+      });
+      ctx.on('tools/result', (exec, result) => {
+        const runtime = ctx.cognitive;
+        if (runtime === undefined) {
+          return;
+        }
+        const sessionId = (exec as { agent?: { session?: { id?: unknown } } } | undefined)?.agent?.session?.id;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return;
+        }
+        const ev = mapLiveToolResult(sessionId, exec, result, runtime.snapshotHash);
+        void runtime.observeEvent(ev).catch((err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('tools/result', `observeEvent 失败（${detail}）——工具结果 live 信号降级`);
+        });
+      });
+    } else {
+      recordDegradation('cognitive-runtime', '认知运行时未装配——事件不采集（命令仍可用）');
+    }
+  } else {
+    recordDegradation('ctx.on', '接口缺失（ctx.on 不存在）——事件不采集（其余功能不受影响）');
   }
 
   ctx.commands?.register?.({
