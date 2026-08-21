@@ -9,6 +9,7 @@
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
+import { makeRealExecutor } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
@@ -148,20 +149,24 @@ export function apply(ctx: ContextLike): void {
     },
   });
 
-  // T8.2：/bench 命令——触发冻结基准集运行（supervisor/bench.ts runBench；当前版本线 + 回放执行器）
+  // T8.2：/bench 命令——触发冻结基准集运行（supervisor/bench.ts runBench；当前版本线）。
+  // T8.18：真实执行器接线——ctx.modelAdapter（T8.12 装配，需真实 DSH 会话）存在 → 真实 DSH 执行
+  //（三线真实分化）；无真实会话 → 降级回放执行器（数字可复现，平台限制文档化）。
   ctx.commands?.register?.({
     name: 'bench',
-    description: '运行冻结基准集（当前版本线；回放执行器，数字可复现）',
+    description: '运行冻结基准集（当前版本线；真实 DSH 执行或回放降级）',
     recordInput: true,
     handler: async () => {
       try {
         const tasks = await loadBenchTasks();
         const line = current as BenchLine;
-        const report = await runBench({ tasks, line, executor: makeReplayExecutor() });
+        const executor = ctx.modelAdapter !== undefined ? makeRealExecutor(ctx.modelAdapter) : makeReplayExecutor();
+        const report = await runBench({ tasks, line, executor });
         const passed = report.results.filter((r) => r.passed).length;
+        const mode = ctx.modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
         return {
           kind: 'success',
-          text: `基准完成：${report.line} ${passed}/${report.results.length} 通过（${report.results.length} 任务，回放执行器）`,
+          text: `基准完成：${report.line} ${passed}/${report.results.length} 通过（${report.results.length} 任务，${mode}）`,
         };
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
