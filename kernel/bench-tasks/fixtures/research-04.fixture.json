@@ -1,0 +1,5 @@
+{
+  "output": "该方案主要风险包括：性能瓶颈、安全边界与维护成本。",
+  "cost": { "model_tokens": 1640, "tool_calls": 4, "retrieval_calls": 2, "reacquisition": 1, "latency_ms": 5490, "branch_count": 1, "memory_pollution": 1, "corrections": 1 },
+  "rubric": { "required_terms": ["性能", "安全", "维护"] }
+}

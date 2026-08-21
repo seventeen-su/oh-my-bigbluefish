@@ -1,0 +1,9 @@
+{
+  "output": {
+    "by_category": { "food": 35, "other": 10, "travel": 120 }
+  },
+  "cost": { "model_tokens": 990, "tool_calls": 6, "retrieval_calls": 1, "reacquisition": 0, "latency_ms": 3150, "branch_count": 2, "memory_pollution": 0, "corrections": 1 },
+  "expected": {
+    "by_category": { "food": 35, "other": 10, "travel": 120 }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "bench:code-01",
+  "category": "code",
+  "prompt": "实现函数 fib(n)：返回第 n 个斐波那契数（n ≥ 0，fib(0)=0，fib(1)=1；n ≤ 40，禁止递归爆栈）。",
+  "fixture_ref": "code-01.fixture.json",
+  "verifier": { "kind": "tests", "ref": "code-01.fixture.json", "expected_pass": 5 }
+}

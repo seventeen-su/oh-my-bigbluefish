@@ -1,0 +1,7 @@
+{
+  "id": "bench:web-04",
+  "category": "web",
+  "prompt": "登录成功（离线 fixture 模拟）：必须跳转到 '/dashboard'（redirect 字段）。",
+  "fixture_ref": "web-04.fixture.json",
+  "verifier": { "kind": "predicate", "ref": "web-04.fixture.json" }
+}

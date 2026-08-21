@@ -1,0 +1,9 @@
+{
+  "output": {
+    "before": { "config.ini": null },
+    "after": { "config.ini": "[settings]\nenabled=true" }
+  },
+  "cost": { "model_tokens": 720, "tool_calls": 5, "retrieval_calls": 0, "reacquisition": 0, "latency_ms": 2140, "branch_count": 1, "memory_pollution": 0, "corrections": 0 },
+  "before": { "config.ini": null },
+  "after": { "config.ini": "[settings]\nenabled=true" }
+}

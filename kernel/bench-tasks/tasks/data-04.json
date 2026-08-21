@@ -1,0 +1,7 @@
+{
+  "id": "bench:data-04",
+  "category": "data",
+  "prompt": "过滤并排序产品列表：保留 price < 50 的产品，按 price 升序（同价按 id 升序）输出 { products: [...] }。",
+  "fixture_ref": "data-04.fixture.json",
+  "verifier": { "kind": "exact", "ref": "data-04.fixture.json" }
+}

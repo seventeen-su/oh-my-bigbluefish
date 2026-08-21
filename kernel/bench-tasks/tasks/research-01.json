@@ -1,0 +1,7 @@
+{
+  "id": "bench:research-01",
+  "category": "research",
+  "prompt": "总结给定文档（固定语料）：回答必须覆盖 动机、方法、结论 三要素（离线规则化 judge 判定）。",
+  "fixture_ref": "research-01.fixture.json",
+  "verifier": { "kind": "blind_judge", "ref": "research-01.fixture.json" }
+}

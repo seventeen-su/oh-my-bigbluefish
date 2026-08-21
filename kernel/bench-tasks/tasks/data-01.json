@@ -1,0 +1,7 @@
+{
+  "id": "bench:data-01",
+  "category": "data",
+  "prompt": "将用户记录数组规范化为 { id, name, email } 输出：去除缺 id 或 email 的无效行，字段顺序固定。",
+  "fixture_ref": "data-01.fixture.json",
+  "verifier": { "kind": "exact", "ref": "data-01.fixture.json" }
+}

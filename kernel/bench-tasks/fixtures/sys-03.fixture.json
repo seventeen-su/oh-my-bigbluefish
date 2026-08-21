@@ -1,0 +1,9 @@
+{
+  "output": {
+    "before": { "tmp/x.log": "exists" },
+    "after": { "tmp/x.log": "absent" }
+  },
+  "cost": { "model_tokens": 690, "tool_calls": 4, "retrieval_calls": 0, "reacquisition": 0, "latency_ms": 1980, "branch_count": 1, "memory_pollution": 0, "corrections": 0 },
+  "before": { "tmp/x.log": "exists" },
+  "after": { "tmp/x.log": "absent" }
+}

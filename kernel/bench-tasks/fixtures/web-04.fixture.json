@@ -1,0 +1,7 @@
+{
+  "output": { "redirect": "/dashboard", "session": "ok" },
+  "cost": { "model_tokens": 1320, "tool_calls": 6, "retrieval_calls": 1, "reacquisition": 0, "latency_ms": 3950, "branch_count": 2, "memory_pollution": 0, "corrections": 0 },
+  "predicates": [
+    { "path": "redirect", "equals": "/dashboard" }
+  ]
+}

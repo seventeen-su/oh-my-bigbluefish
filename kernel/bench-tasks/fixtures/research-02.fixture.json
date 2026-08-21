@@ -1,0 +1,5 @@
+{
+  "output": "方案A 与方案B 对比后，从成本与可靠性角度给出取舍：优先方案A。",
+  "cost": { "model_tokens": 1980, "tool_calls": 5, "retrieval_calls": 2, "reacquisition": 1, "latency_ms": 6890, "branch_count": 2, "memory_pollution": 1, "corrections": 1 },
+  "rubric": { "required_terms": ["方案A", "方案B", "取舍"] }
+}

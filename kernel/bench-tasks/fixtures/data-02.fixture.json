@@ -1,0 +1,15 @@
+{
+  "output": {
+    "rows": [
+      { "id": "1", "name": "A", "price": "9.9" },
+      { "id": "2", "name": "B", "price": "19.9" }
+    ]
+  },
+  "cost": { "model_tokens": 740, "tool_calls": 4, "retrieval_calls": 0, "reacquisition": 0, "latency_ms": 2330, "branch_count": 1, "memory_pollution": 0, "corrections": 0 },
+  "expected": {
+    "rows": [
+      { "id": "1", "name": "A", "price": "9.9" },
+      { "id": "2", "name": "B", "price": "19.9" }
+    ]
+  }
+}

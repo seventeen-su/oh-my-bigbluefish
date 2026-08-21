@@ -1,0 +1,15 @@
+{
+  "output": {
+    "products": [
+      { "id": "p2", "price": 9.9 },
+      { "id": "p1", "price": 19.9 }
+    ]
+  },
+  "cost": { "model_tokens": 810, "tool_calls": 5, "retrieval_calls": 0, "reacquisition": 0, "latency_ms": 2680, "branch_count": 2, "memory_pollution": 0, "corrections": 0 },
+  "expected": {
+    "products": [
+      { "id": "p2", "price": 9.9 },
+      { "id": "p1", "price": 19.9 }
+    ]
+  }
+}

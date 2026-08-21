@@ -1,0 +1,7 @@
+{
+  "id": "bench:data-02",
+  "category": "data",
+  "prompt": "解析 CSV 文本为对象数组：首行为表头，字段 id/name/price 均为字符串，空行忽略。",
+  "fixture_ref": "data-02.fixture.json",
+  "verifier": { "kind": "exact", "ref": "data-02.fixture.json" }
+}

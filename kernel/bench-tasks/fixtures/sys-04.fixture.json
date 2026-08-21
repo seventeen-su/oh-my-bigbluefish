@@ -1,0 +1,9 @@
+{
+  "output": {
+    "before": { "src/a.txt": "exists", "src/b.txt": "exists", "dst": "empty" },
+    "after": { "dst/a.txt": "exists", "dst/b.txt": "exists" }
+  },
+  "cost": { "model_tokens": 940, "tool_calls": 7, "retrieval_calls": 1, "reacquisition": 0, "latency_ms": 3120, "branch_count": 2, "memory_pollution": 0, "corrections": 0 },
+  "before": { "src/a.txt": "exists", "src/b.txt": "exists", "dst": "empty" },
+  "after": { "dst/a.txt": "exists", "dst/b.txt": "exists" }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "bench:sys-02",
+  "category": "sys",
+  "prompt": "启动服务 svc（离线模拟）：状态断言——svc.status 从 'stopped' 变为 'running'。",
+  "fixture_ref": "sys-02.fixture.json",
+  "verifier": { "kind": "state_assert", "ref": "sys-02.fixture.json" }
+}

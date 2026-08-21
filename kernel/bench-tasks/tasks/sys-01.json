@@ -1,0 +1,7 @@
+{
+  "id": "bench:sys-01",
+  "category": "sys",
+  "prompt": "创建配置文件 config.ini（内容 '[settings]\\nenabled=true'）：执行前后状态断言（文件从不存在 → 存在且内容正确）。",
+  "fixture_ref": "sys-01.fixture.json",
+  "verifier": { "kind": "state_assert", "ref": "sys-01.fixture.json" }
+}

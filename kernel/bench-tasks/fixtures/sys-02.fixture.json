@@ -1,0 +1,9 @@
+{
+  "output": {
+    "before": { "svc.status": "stopped" },
+    "after": { "svc.status": "running" }
+  },
+  "cost": { "model_tokens": 810, "tool_calls": 6, "retrieval_calls": 0, "reacquisition": 0, "latency_ms": 2480, "branch_count": 1, "memory_pollution": 0, "corrections": 1 },
+  "before": { "svc.status": "stopped" },
+  "after": { "svc.status": "running" }
+}

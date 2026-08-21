@@ -1,0 +1,7 @@
+{
+  "id": "bench:code-02",
+  "category": "code",
+  "prompt": "实现函数 isPalindrome(s)：判断字符串是否为回文（忽略大小写与非字母数字字符）。",
+  "fixture_ref": "code-02.fixture.json",
+  "verifier": { "kind": "tests", "ref": "code-02.fixture.json", "expected_pass": 6 }
+}
