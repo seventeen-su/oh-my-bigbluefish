@@ -12,6 +12,7 @@
 //      root realm 服务 → 违规清单含全部项；良性操作不误报
 //   ⑨ 降级链衔接：首选 provider 失败 → 分级内 fallback（T6a.1 语义）
 //   ⑩ CapabilityDiscovery（补充）：discovery 只返回某 provider → 仅其可路由
+//   ⑥+ 软接管同名校验拒绝（fail-loud）；⑫ execute ok:false resolution → no_resolution（评审补分支覆盖）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -344,6 +345,13 @@ describe('⑥ 软接管（takeover 四件套）', () => {
     const broker = new CapabilityBroker({ providers: new Map(), policy: policy([]) });
     await expect(broker.takeover('capability:missing', {})).rejects.toThrow(BrokerError);
   });
+
+  it('takeover shadow 不同名 → 拒绝（fail-loud，patch 改名禁止）', async () => {
+    const x = makeProvider({ id: 'capability:third-party', name: 'read-file' });
+    const y = makeProvider({ id: 'capability:platform', name: 'write-file' }); // 不同名 → 同名校验拒绝
+    const broker = new CapabilityBroker({ providers: new Map([[x.manifest.id, x]]), policy: policy([]) });
+    await expect(broker.takeover('capability:third-party', { shadow: y })).rejects.toThrow(BrokerError);
+  });
 });
 
 // ---- ⑦ 软接管回滚 ----
@@ -545,5 +553,20 @@ describe('⑪ 策略级 patch（BrokerPolicy levels 数据驱动）', () => {
     expect(res.providers).toEqual(['capability:pp-a']); // pp-b 被禁用
     expect(res.disabled).toEqual(['capability:pp-b']); // 禁用清单
     expect(res.chain[0]!.contract.reliability).toBe('high'); // override 生效于契约面
+  });
+});
+
+// ---- ⑫ execute 拒绝路径 ----
+
+describe('⑫ execute 对无效 resolution 的拒绝路径', () => {
+  it('ok:false resolution → no_resolution 拒绝（shadow 空，不进入执行链）', async () => {
+    const broker = new CapabilityBroker({ providers: new Map(), policy: policy([]) });
+    const res: Resolution = { ok: false, error: { code: 'invalid_intent', reason: 'intent 校验失败' } };
+    const exec = await broker.execute(res, {});
+    expect(exec).toEqual({
+      ok: false,
+      error: { code: 'no_resolution', node: '', reason: 'resolution 无效', negative_pattern: '' },
+      shadow: [],
+    });
   });
 });

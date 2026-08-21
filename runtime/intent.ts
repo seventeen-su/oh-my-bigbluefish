@@ -58,8 +58,8 @@ const DEFAULT_AUTHORITY_RANK = AUTHORITY_RANK.user ?? 1;
 
 const RELIABILITY_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
 
-/** 绑定 createHandle 的默认预算 */
-const DEFAULT_BUDGET = 1000;
+/** 绑定 createHandle 的默认预算（broker.ts 复用——重复定义合并至此处） */
+export const DEFAULT_BUDGET = 1000;
 
 /** 提取 zod schema 的对象键（v4：_def.type === 'object' 时取 _def.shape 键；非对象 → 空） */
 function schemaObjectKeys(schema: ZodType): string[] {

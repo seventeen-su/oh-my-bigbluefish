@@ -1,20 +1,9 @@
-// OMB v2 Capability Broker：第三方兼容分级与软接管（架构 §8.2）。
-// layer 2（runtime/）：仅 import node: 内置 + kernel/（同层）+ runtime/ 内文件（CONVENTIONS §4）。
-//
-// 分级阶梯（§8.2）：共存 → 优先路由（隐式偏好学习）→ 包装增强 → 降权 → shadow → 软接管（末级）。
-//   coexist  ：多 provider 共存，注册序执行（默认级）。
-//   prefer   ：命中次数计数（隐式偏好学习）→ 排序提升；学习数据 = 内存偏好表（M6a 最小，可扩展 retrieval_episode）。
-//   wrap     ：AdapterAPI 包装（before 前置 / after 后置转换）。
-//   deweight ：权重降低 → 同能力权重低者排后。
-//   shadow   ：执行但结果不入主链（exposure log——复用 T5.3 logExposure，经构造注入避免跨层 import）。
-//   takeover ：末级软接管四件套——patch 禁用/覆盖 + restrict 隐藏 + 同名 shadow + post-execute 拦截；可回滚。
-//
-// 平台硬边界（契约测试 assertHardBoundaries，违反即记录/拒绝）：pre-execute 参数改写、
-//   同层同名注册、restrict 全局化/own 层外/run_code、patch 改名/删行、preset root realm 服务。
-//
-// 复用 T6a.1 IntentSynthesizer（契约匹配 + Provider Selection + 降级链）；分级路由通过
-// fallback_order 数据驱动注入合成器，分级语义在 broker 层实现（无循环依赖）。
+// OMB v2 Capability Broker：第三方兼容分级与软接管（架构 §8.2；layer 2：仅 import node: 内置 + kernel/ + runtime/）。
+// 分级阶梯：coexist → prefer（隐式偏好学习）→ wrap（AdapterAPI）→ deweight → shadow（exposure log，T5.3 注入复用）→ takeover（末级四件套，可回滚）。
+// 平台硬边界（assertHardBoundaries）：pre-execute 参数改写 / 同层同名注册 / restrict 越界 / patch 改名删行 / root realm 服务。
+// 复用 T6a.1 IntentSynthesizer：fallback_order 数据驱动注入，分级语义在 broker 层实现（无循环依赖）。
 import {
+  DEFAULT_BUDGET,
   defaultGraphPlan,
   executeChain,
   IntentSchema,
@@ -30,33 +19,11 @@ import type {
   CapabilityProvider,
   CapabilityResult,
 } from '../kernel/capability-abi.js';
+import { levelOf, rankCandidates, type AdapterAPI, type BrokerPolicy, type TakeoverLevel } from './broker-policy.js';
 
-// ---- 分级类型与策略（机制即数据） ----
+// ---- 分级类型与策略（机制即数据；策略/排序纯逻辑见 broker-policy.ts） ----
 
-export type TakeoverLevel = 'coexist' | 'prefer' | 'wrap' | 'deweight' | 'shadow' | 'takeover';
-
-/** AdapterAPI（§8.2）：wrap 级前置/后置转换 */
-export interface AdapterAPI {
-  before?: (input: unknown) => unknown;
-  after?: (result: CapabilityResult) => CapabilityResult;
-}
-
-export interface BrokerPolicyLevel {
-  provider_id: string;
-  level: TakeoverLevel;
-  /** deweight：权重（低者排后）；默认 1 */
-  weight?: number;
-  /** shadow：被 shadow 的目标 provider_id（M6a 最小：登记元数据，行为同普通 shadow 级） */
-  shadow_of?: string;
-  /** wrap：AdapterAPI 包装 */
-  adapter?: AdapterAPI;
-  /** patch：数据驱动禁用/覆盖（软接管同款机制，策略级复用） */
-  patch?: { disable?: string[]; override?: Record<string, unknown> };
-}
-
-export interface BrokerPolicy {
-  levels: BrokerPolicyLevel[];
-}
+export type { AdapterAPI, BrokerPolicy, BrokerPolicyLevel, TakeoverLevel } from './broker-policy.js';
 
 /** CapabilityDiscovery（§8.2）：按 intent 发现可用 provider（缺省 = 全注册表） */
 export interface CapabilityDiscovery {
@@ -143,19 +110,6 @@ export type BrokerExecutionResult =
       error: { code: string; node: string; reason: string; negative_pattern: string };
       shadow: ShadowRun[];
     };
-
-// ---- 分级路由优先级（机制即数据；同级稳定排序保注册序） ----
-
-const LEVEL_PRIORITY: Record<TakeoverLevel, number> = {
-  takeover: 0, // 软接管替代者最优先
-  prefer: 1, // 优先路由
-  wrap: 2, // 包装增强
-  coexist: 2, // 共存（与 wrap 同级，注册序）
-  deweight: 3, // 降权
-  shadow: 4, // shadow 不入主链
-};
-
-const DEFAULT_BUDGET = 1000;
 
 interface TakeoverState {
   target: string;
@@ -247,10 +201,7 @@ export class CapabilityBroker {
 
   // ---- 分级路由（resolve） ----
 
-  /**
-   * 分级路由：候选收集（排除隐藏/禁用 + 并入接管 shadow）→ discovery 过滤 →
-   * shadow 级分离 → 分级排序（fallback_order 注入合成器）→ T6a.1 合成（契约匹配 + 绑定 + 降级候选）。
-   */
+  /** 分级路由：候选收集（排除隐藏/禁用 + 并入接管 shadow）→ discovery 过滤 → shadow 分离 → 分级排序（fallback_order 注入合成器）→ T6a.1 合成 */
   async resolve(intent: unknown): Promise<Resolution> {
     const parsed = IntentSchema.safeParse(intent);
     if (!parsed.success) {
@@ -298,14 +249,14 @@ export class CapabilityBroker {
       candidates = candidates.filter((c) => discovered.has(c.manifest.id));
     }
 
-    const shadowProviders = candidates.filter((c) => this.levelOf(c.manifest.id) === 'shadow');
-    const mainCandidates = candidates.filter((c) => this.levelOf(c.manifest.id) !== 'shadow');
+    const shadowProviders = candidates.filter((c) => levelOf(c.manifest.id, this.policy, this.takeoverShadowIds) === 'shadow');
+    const mainCandidates = candidates.filter((c) => levelOf(c.manifest.id, this.policy, this.takeoverShadowIds) !== 'shadow');
 
     if (mainCandidates.length === 0) {
       return { ok: false, error: { code: 'no_capability', reason: `节点 ${node}: 无可用 provider（全为 shadow/隐藏/禁用）` } };
     }
 
-    const ordered = this.rankCandidates(mainCandidates);
+    const ordered = rankCandidates(mainCandidates, this.policy, this.hits, this.takeoverShadowIds);
     const synth = new IntentSynthesizer({
       providers: new Map(ordered.map((p) => [p.manifest.id, p])),
       policy: { fallback_order: ordered.map((p) => p.manifest.id) },
@@ -319,7 +270,7 @@ export class CapabilityBroker {
       ok: true,
       intent: it,
       providers: ordered.map((p) => p.manifest.id),
-      route: ordered.map((p) => ({ provider_id: p.manifest.id, level: this.levelOf(p.manifest.id) })),
+      route: ordered.map((p) => ({ provider_id: p.manifest.id, level: levelOf(p.manifest.id, this.policy, this.takeoverShadowIds) })),
       chain: result.chain,
       graph: result.graph,
       bindings: result.bindings,
@@ -343,44 +294,9 @@ export class CapabilityBroker {
     return out;
   }
 
-  /** 生效分级：接管 shadow → 'takeover'；策略声明 → 该级；缺省 → coexist */
-  private levelOf(providerId: string): TakeoverLevel {
-    if (this.takeoverShadowIds.has(providerId)) {
-      return 'takeover';
-    }
-    return this.policy.levels.find((l) => l.provider_id === providerId)?.level ?? 'coexist';
-  }
-
-  private weightOf(providerId: string): number {
-    return this.policy.levels.find((l) => l.provider_id === providerId)?.weight ?? 1;
-  }
-
-  /** 分级排序：优先级升序；prefer 内命中降序；deweight 内权重降序；同级稳定（注册序） */
-  private rankCandidates(cands: CapabilityProvider[]): CapabilityProvider[] {
-    return [...cands].sort((a, b) => {
-      const la = this.levelOf(a.manifest.id);
-      const lb = this.levelOf(b.manifest.id);
-      const pa = LEVEL_PRIORITY[la]!;
-      const pb = LEVEL_PRIORITY[lb]!;
-      if (pa !== pb) {
-        return pa - pb;
-      }
-      if (la === 'prefer') {
-        return (this.hits.get(b.manifest.id) ?? 0) - (this.hits.get(a.manifest.id) ?? 0);
-      }
-      if (la === 'deweight') {
-        return this.weightOf(b.manifest.id) - this.weightOf(a.manifest.id);
-      }
-      return 0; // 稳定排序 → 注册序
-    });
-  }
-
   // ---- 执行 + 降级链 + shadow + 偏好学习 ----
 
-  /**
-   * 执行：① shadow 级 provider 执行（结果不入主链）+ exposure log（T5.3 复用）；
-   * ② 主链执行（T6a.1 降级链）；③ 接管 shadow 的 exposure 记录；④ prefer 命中学习。
-   */
+  /** 执行：① shadow 级执行（结果不入主链）+ exposure log（T5.3 注入）② 主链降级链（T6a.1）③ 接管 shadow exposure 记录 ④ prefer 命中学习 */
   async execute(resolution: Resolution, input: unknown): Promise<BrokerExecutionResult> {
     if (!resolution.ok) {
       return {
@@ -455,11 +371,7 @@ export class CapabilityBroker {
 
   // ---- 软接管（末级）与回滚 ----
 
-  /**
-   * 软接管四件套：patch 禁用目标 + restrict 隐藏 + 同名 shadow（接管路由）+ post-execute 拦截。
-   * 目标 provider 被隐藏/禁用；同名 shadow 成为该能力的主链路由。
-   * 可回滚：rollbackTakeover 恢复原注册与行为。
-   */
+  /** 软接管四件套：patch 禁用目标 + restrict 隐藏 + 同名 shadow（接管路由）+ post-execute 拦截；rollbackTakeover 恢复原注册与行为 */
   async takeover(provider_id: string, opts: TakeoverOpts = {}): Promise<void> {
     const target = this.providers.get(provider_id);
     if (!target) {
@@ -490,11 +402,7 @@ export class CapabilityBroker {
 
   // ---- 平台硬边界断言（契约测试） ----
 
-  /**
-   * 平台硬边界断言：每个断言函数对注入的违规动作做检测 → 记录违规项。
-   * 检测项：pre-execute 参数改写（hook 改变 input 结构）、同层同名注册、
-   * restrict 全局化/own 层外/run_code、patch 改名/删行、preset root realm 服务。
-   */
+  /** 平台硬边界断言：断言函数对注入的违规动作检测 → 违规清单（pre-execute 参数改写 / 同层同名注册 / restrict 越界 / patch 改名删行 / root realm 服务） */
   assertHardBoundaries(ctx: HardBoundaryCtx): string[] {
     const violations: string[] = [];
 
