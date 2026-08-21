@@ -9,6 +9,7 @@
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
+import { createCognitiveRuntime } from './assembly.js';
 import type { BenchLine } from '../kernel/schemas/bench.js';
 
 export const name = 'omb-v2';
@@ -40,10 +41,29 @@ export interface AgentPresetsLike {
   recompose?(agentCtx: unknown, id: string): Promise<unknown>;
 }
 
+/** 认知运行时最小结构（T8.3 装配；runtime/assembly.ts 的 CognitiveRuntime 结构上满足） */
+export interface CognitiveRuntimeLike {
+  eventStore: { append(e: unknown): Promise<void> };
+  memory: { ingest(m: unknown): Promise<string> };
+  handleRequest(req: unknown): Promise<{
+    decision: { decision: string };
+    retrieval: { items: unknown[]; channel_used: string };
+    prompt: { system: string; total_tokens: number };
+    events_appended: number;
+  }>;
+  close(): Promise<void>;
+}
+
 export interface ContextLike {
   commands?: CommandsLike;
   /** T8.2：preset recompose 服务（平台提供时 /mode 真实接线；缺失 → 降级会话内状态） */
   agentPresets?: AgentPresetsLike;
+  /** T8.3：注入的认知运行时（装配经 deps 注入，组合根模式）；未注入且提供装配根 → 组合根缺省装配 */
+  cognitive?: CognitiveRuntimeLike;
+  /** T8.3：认知装配根（用户态目录，架构 §3 workspace/.omb；缺省装配路径） */
+  cognitiveRoot?: string;
+  /** DSH 插件配置面（agent.cordis.yml config；生产装配经 config.cognitiveRoot） */
+  config?: { cognitiveRoot?: string };
 }
 
 /**
@@ -61,6 +81,16 @@ export function presetIdForLine(line: VersionLine): string {
 }
 
 export function apply(ctx: ContextLike): void {
+  // T8.3：认知系统装配进插件生命周期——经 deps 注入（ctx.cognitive，组合根模式）或
+  // 组合根缺省装配（runtime/assembly.ts；装配根 = ctx.cognitiveRoot ?? ctx.config.cognitiveRoot）。
+  // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
+  if (ctx.cognitive === undefined) {
+    const root = ctx.cognitiveRoot ?? ctx.config?.cognitiveRoot;
+    if (root !== undefined) {
+      ctx.cognitive = createCognitiveRuntime({ root });
+    }
+  }
+
   // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
   let current: VersionLine = 'stable';
 
