@@ -20,8 +20,6 @@
 // - 事务顺序（brief 已定）：switch → write EvolutionObject → promote。失败恢复走 rollback_snapshot/分支回退。
 // - 激活门禁 = ACTIVATION_GATE：Regressed（brief 硬性：回归拒晋升）+ Unknown（§10.1 样本不足→延后/降级）。
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（IR 契约例外）+ supervisor/ 内文件。
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 import { canonicalJson, makeImmutableId, makeMutableId } from '../kernel/schemas/base.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
 import {
@@ -34,6 +32,14 @@ import {
 } from '../kernel/schemas/m.js';
 import type { CandidateRecord } from './candidates.js';
 import type { SnapshotRegistry } from './versioning.js';
+import {
+  clearPending,
+  loadCompleted,
+  loadPending,
+  writeCompleted,
+  writePending,
+  type PendingMarker,
+} from './activation-log.js';
 
 // ---- 注入形状（supervisor 不 import runtime——层 DAG；runtime 侧 CapabilityVector 结构上满足） ----
 
@@ -122,62 +128,6 @@ const completed = new Map<string, ActivationContract>();
 /** 清空进程内幂等注册表（测试隔离；logDir 磁盘记录不受影响） */
 export function resetActivationLog(): void {
   completed.clear();
-}
-
-// ---- T8.7 持久化（tmp+rename 原子写；completed/pending 双目录） ----
-
-interface PendingMarker {
-  activation_id: string;
-  candidate: string;
-  predecessor: string;
-  rollback_snapshot: string;
-  started_at: number;
-}
-
-function completedFile(logDir: string, id: string): string {
-  return join(logDir, 'completed', `${id}.json`);
-}
-
-function pendingFile(logDir: string, id: string): string {
-  return join(logDir, 'pending', `${id}.json`);
-}
-
-/** 原子写 JSON（tmp + rename，§11.3 crash consistency 同款语义） */
-function atomicWriteJson(file: string, value: unknown): void {
-  mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
-  renameSync(tmp, file);
-}
-
-function loadCompleted(logDir: string, id: string): ActivationContract | null {
-  try {
-    const raw = readFileSync(completedFile(logDir, id), 'utf8');
-    return JSON.parse(raw) as ActivationContract;
-  } catch {
-    return null;
-  }
-}
-
-function writeCompleted(logDir: string, id: string, contract: ActivationContract): void {
-  atomicWriteJson(completedFile(logDir, id), contract);
-}
-
-function loadPending(logDir: string, id: string): PendingMarker | null {
-  try {
-    const raw = readFileSync(pendingFile(logDir, id), 'utf8');
-    return JSON.parse(raw) as PendingMarker;
-  } catch {
-    return null;
-  }
-}
-
-function writePending(logDir: string, marker: PendingMarker): void {
-  atomicWriteJson(pendingFile(logDir, marker.activation_id), marker);
-}
-
-function clearPending(logDir: string, id: string): void {
-  rmSync(pendingFile(logDir, id), { force: true });
 }
 
 // ---- activation/committed 事件（T8.7 事件入链；M3 schema） ----
