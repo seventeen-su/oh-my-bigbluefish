@@ -208,6 +208,25 @@ export class CandidatePool {
     return found.rec;
   }
 
+  /** 信任池计数快照（T8.21 contamination_risk 采集源；只读，消费方零副作用——读路径不建目录）。
+   *  untrusted = untrusted 区记录；rejected = rejected 区记录（均非 trusted → 污染风险侧）。 */
+  async counts(): Promise<{ trusted: number; untrusted: number; rejected: number }> {
+    const all = await this.scanRecords(ZONES);
+    let trusted = 0;
+    let untrusted = 0;
+    let rejected = 0;
+    for (const r of all) {
+      if (r.status === 'trusted') {
+        trusted++;
+      } else if (r.status === 'rejected') {
+        rejected++;
+      } else {
+        untrusted++;
+      }
+    }
+    return { trusted, untrusted, rejected };
+  }
+
   // ---- 内部工具 ----
 
   /** 谱系派生：父记录 lineage + [self] */

@@ -91,6 +91,9 @@ export interface MaintenanceSchedulerOptions {
 
 export const DEFAULT_SOFT_LIMIT = 10;
 export const DEFAULT_HARD_LIMIT = 50;
+/** tick 基准间隔（ms）；start() 启动定时器。§17 标定验证（T8.20，2026-08-21，主会话裁决「仅记录不写回」）：
+ *  约束「维护量子 ≥ 典型任务耗时」由 latency_ms 均值 3973ms（workspace/.omb/bench/bench-*.json，数据来源标注
+ *  于 task-m8d-report.md）验证：60000 ≥ 3973 满足 → 数值保持初值。 */
 export const DEFAULT_TICK_INTERVAL_MS = 60_000;
 /** 每个环境字段变化的归一化能力衰减系数（能力衰减曲线，待标定） */
 export const CAPABILITY_DECAY_FACTOR = 0.8;

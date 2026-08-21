@@ -108,6 +108,13 @@ export const L1_SIGNAL_KINDS = [
   'correction',
   'memory_hit',
   'memory_miss',
+  // T8.21 能力向量三维真实化（信号 kind 从 L3 占位改为真实采集路径）：
+  'scope_hit', //         generalization：检索 episode 跨 scope 命中（§7.4 归因；来源 retrieval_episode 表）
+  'scope_miss', //        generalization：检索 episode 未命中（§7.4 归因）
+  'oracle_pass', //       interpretability：reproduction oracle 判定通过（§9.2，T8.14 执行产物）
+  'oracle_fail', //       interpretability：reproduction oracle 判定失败（不可信/复现失败）
+  'trusted_object', //    contamination_risk：信任池 trusted 对象（§9.3，T5.1 CandidatePool）
+  'untrusted_object', //  contamination_risk：信任池 untrusted+rejected 对象（污染风险来源审计）
 ] as const;
 
 export const L1SignalSchema = z.object({

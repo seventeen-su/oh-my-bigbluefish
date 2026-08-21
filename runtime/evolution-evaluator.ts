@@ -6,12 +6,15 @@
 //     correctness      L2 bench_score（统计优先）或 L1 tool_success/(success+failure)
 //     cost             L2 token_cost；缺省回退 L2 latency
 //     robustness       L1 不稳定率：1 − (retry+correction)/(success+failure+retry+correction)
-//     generalization   L3 blinded_judge（verdict supported=1/contradicted=0；unresolved 不计）
-//     interpretability L3 blinded_judge
+//     generalization   L1 scope_hit/(scope_hit+scope_miss)（T8.21：跨 scope 检索 episode 命中率，
+//                      来源 retrieval_episode 表归因——采集器 runtime/signal-collectors.ts）
+//     interpretability L1 oracle_pass/(oracle_pass+oracle_fail)（T8.21：reproduction oracle 可复现率，
+//                      来源 T8.14 oracle 执行产物）
 //     regression       L2 regression_delta（越高越好：正 delta = 无回归/改善）
 //     transferability  L1 memory_hit/(hit+miss)（schema 无 scope 字段——用命中率近似跨 scope 覆盖，待标定）
 //     maintenance_cost L2 latency 代理（无专用 L2 kind；与 cost 共用底层信号但为独立事实，待标定）
-//     contamination_risk L3 blinded_judge（provenance 检查分支在激活层由谱系守卫承担——见 supervisor/activation.ts）
+//     contamination_risk L1 untrusted/(trusted+untrusted)（T8.21：信任池来源审计，来源 T5.1 CandidatePool
+//                      trusted/untrusted+rejected 计数；越低越好——谱系守卫仍由激活层承担，见 supervisor/activation.ts）
 //   缺信号维 → 不出事实（getFact 返回 null = value null 语义）。
 // - evaluate 产出未对照基线的向量（classification='Unknown' 占位）；classify(v, baseline) 产出正式分类。
 // - classify：规则化，无魔法数字——阈值在 EVOLUTION_THRESHOLDS 常量表（§17 待标定：冻结基准集产出后校准）。
@@ -29,7 +32,6 @@ import {
   type EvaluationSignal,
   type L1Signal,
   type L2Signal,
-  type L3Signal,
   type SignalSource,
 } from './evaluator.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
@@ -96,17 +98,20 @@ function firstInterval(
   return undefined;
 }
 
-/** L3 盲化 judge 聚合（supported=1 / contradicted=0；unresolved 不计为信号） */
-function judgeValue(signals: readonly EvaluationSignal[], dim: CapabilityDimension): Aggregated | null {
-  const judges = signals.filter(
-    (s): s is L3Signal =>
-      s.layer === 'L3' && s.kind === 'blinded_judge' && s.dimension === dim && s.verdict !== 'unresolved',
-  );
-  if (judges.length === 0) {
+/** L1 计数对比例（T8.21 三维真实采集：pos/(pos+neg)；无计数 → null——缺数据不出事实） */
+function l1Ratio(
+  signals: readonly EvaluationSignal[],
+  pos: L1Signal['kind'],
+  neg: L1Signal['kind'],
+): Aggregated | null {
+  const l1 = signals.filter((s): s is L1Signal => s.layer === 'L1');
+  const p = sumCounts(l1, pos);
+  const n = sumCounts(l1, neg);
+  const total = p + n;
+  if (total === 0) {
     return null;
   }
-  const mean = judges.reduce((acc, j) => acc + (j.verdict === 'supported' ? 1 : 0), 0) / judges.length;
-  return { value: mean, sample: judges.length, sources: ['L3_semantic'], refs: [] };
+  return { value: p / total, sample: total, sources: ['L1_mechanical'], refs: [] };
 }
 
 /** 逐维信号聚合：无任何可用信号 → null（缺信号维不出事实） */
@@ -177,9 +182,14 @@ function aggregate(dim: CapabilityDimension, signals: readonly EvaluationSignal[
       return { value: 1 - (retry + corr) / total, sample: total, sources: ['L1_mechanical'], refs: [] };
     }
     case 'generalization':
+      // T8.21：跨 scope 检索 episode 命中率（scope_hit/(scope_hit+scope_miss)，真实采集）
+      return l1Ratio(signals, 'scope_hit', 'scope_miss');
     case 'interpretability':
+      // T8.21：reproduction oracle 可复现率（oracle_pass/(oracle_pass+oracle_fail)，T8.14 执行产物）
+      return l1Ratio(signals, 'oracle_pass', 'oracle_fail');
     case 'contamination_risk':
-      return judgeValue(signals, dim);
+      // T8.21：信任池污染风险 = untrusted/(trusted+untrusted)（T5.1 来源审计；值越高风险越大——越低越好维）
+      return l1Ratio(signals, 'untrusted_object', 'trusted_object');
     case 'regression': {
       const deltas = signals.filter((s): s is L2Signal => s.layer === 'L2' && s.kind === 'regression_delta');
       if (deltas.length === 0) {

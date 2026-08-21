@@ -106,4 +106,24 @@ export class RetrievalBackend extends SqliteMemoryBackend {
       .prepare('SELECT id, retrievals, hits, misses, last_retrieved FROM memory_stats WHERE id = ?')
       .get(id) as StatsRow | undefined;
   }
+
+  /** listEpisodes：全量 retrieval_episode 行（T8.21 generalization 采集源——跨 scope episode 归因统计；
+   *  数组列 JSON 解析；created ASC, id ASC 确定性排序） */
+  async listEpisodes(): Promise<EpisodeRow[]> {
+    const rows = this.db
+      .prepare(
+        'SELECT id, query, scope, candidate_ids, ranked_ids, injected_ids, outcome, created FROM retrieval_episode ORDER BY created ASC, id ASC',
+      )
+      .all() as unknown as EpisodeRowRaw[];
+    return rows.map((r) => ({
+      id: r.id,
+      query: r.query,
+      scope: r.scope,
+      candidate_ids: JSON.parse(r.candidate_ids) as string[],
+      ranked_ids: JSON.parse(r.ranked_ids) as string[],
+      injected_ids: JSON.parse(r.injected_ids) as string[],
+      outcome: r.outcome,
+      created: r.created,
+    }));
+  }
 }
