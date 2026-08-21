@@ -10,6 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { makeMutableId } from '../kernel/schemas/base.js';
+import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { Event } from '../kernel/schemas/m.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
@@ -31,6 +32,9 @@ export interface CognitiveAssemblyOptions {
   processesDir?: string;
   /** Governor 输入 state_snapshot（缺省 'rs:assembly'） */
   snapshotHash?: string;
+  /** T8.12：ModelAdapter（DSH 模型调用适配器）——组合根经 deps 注入；下游 Generator/基准可消费；
+   *  未注入（无真实 DSH 会话）→ 缺省受限（LLM 路径不装配，纯规则阶梯）。 */
+  modelAdapter?: ModelAdapter;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -58,6 +62,8 @@ export class CognitiveRuntime {
   readonly eventStore: EventStore;
   readonly memory: RetrievalBackend;
   readonly snapshotHash: string;
+  /** T8.12：注入的 ModelAdapter（无真实 DSH 会话 → null，LLM 路径缺省受限） */
+  readonly modelAdapter: ModelAdapter | null;
   private readonly policyDir: string;
   private readonly processesDir: string;
   private policyPromise: Promise<PolicyBundle> | null = null;
@@ -70,6 +76,7 @@ export class CognitiveRuntime {
     this.policyDir = opts.policyDir ?? join(HERE, 'kernel', 'policy');
     this.processesDir = opts.processesDir ?? join(HERE, 'kernel', 'processes');
     this.snapshotHash = opts.snapshotHash ?? 'rs:assembly';
+    this.modelAdapter = opts.modelAdapter ?? null;
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效）；幂等 */

@@ -5,6 +5,7 @@
 // 对外 API 不变：runtime/generator.* 为统一出口，re-export generator-ops 全部公开符号，调用方无感。
 // layer 2（runtime/）：仅 import node: 内置 + kernel/（同层）+ runtime/ 内文件（CONVENTIONS §4）。
 import { BUILTIN_OPERATORS, ProcessDefSchema, type ProcessDef } from '../kernel/policy-loader.js';
+import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import {
   CANONICAL_CHAIN,
   INPUT_TYPES,
@@ -66,8 +67,12 @@ export interface GeneratorOptions {
   processes: readonly ProcessDef[];
   budget: number;
   retrieveProcess?: (q: GeneratorQuery) => readonly ProcessDef[];
-  /** M4 不注入（记录：LLM 生成器 M5 或后续接入） */
+  /** M4 不注入（记录：LLM 生成器 M5 或后续接入）；与 modelAdapter 并存时本注入优先（显式产物生产者） */
   llmGenerate?: (task: GeneratorTask) => Promise<ProcessDef>;
+  /** T8.12：ModelAdapter（DSH 模型调用适配器，契约 kernel/schemas/model-adapter.ts）——注入时
+   *  generator 构造 HYPOTHESIZE 提示 → 模型生成候选 → 产物解析 → ProcessDef schema + 预算守卫
+   *  （与 llmGenerate 同守卫路径）；无真实 DSH 会话 → 不注入（缺省受限，纯规则阶梯）。 */
+  modelAdapter?: ModelAdapter;
 }
 
 // ---- 产物校验（ProcessDef schema + 算子名 ∈ 内置集合；非法 → 拒绝走下一阶梯） ----
@@ -88,6 +93,46 @@ export function processCost(p: ProcessDef): number {
   return p.operators.reduce((s, o) => s + (o.cost.cost ?? o.cost.tokens ?? 0), 0);
 }
 
+// ---- LLM 路径（T8.12：HYPOTHESIZE 提示构造 + 产物解析；纯函数） ----
+
+/** HYPOTHESIZE 系统提示（模型以 JSON 输出 ProcessDef；成本预算由 generator 守卫） */
+const HYPOTHESIZE_SYSTEM =
+  '你是 OMB v2 过程生成器。根据目标与过程库，生成一个 ProcessDef JSON（entry/exit/operators 算子图，算子名 ∈ 内置集合），仅输出 JSON。';
+
+/**
+ * HYPOTHESIZE 提示构造（LLM 生成路径输入）：goal + working_state + applicability + 过程库摘要
+ * （库中过程仅带算子轮廓，防 token 黑洞；过程库过大时由调用方截断——生成是最后手段）。
+ */
+export function buildHypothesizePrompt(task: GeneratorTask, processes: readonly ProcessDef[]): string {
+  return JSON.stringify({
+    goal: task.goal,
+    working_state: task.state,
+    applicability: task.applicability,
+    process_library: processes.map((p) => ({
+      id: p.id,
+      entry: p.entry,
+      exit: p.exit,
+      operators: p.operators.map((o) => ({ op: o.op, output: o.output })),
+    })),
+    instruction: '生成一个 ProcessDef JSON（仅输出 JSON，无解释）：含 id/version/entry/exit/budget/operators。',
+  });
+}
+
+/** 模型产物解析：容忍 ```json 代码围栏 → JSON.parse → ProcessDef schema 校验；任何失败 → null */
+export function parseProcessJson(text: string): ProcessDef | null {
+  const trimmed = text.trim();
+  const cleaned = /^```/i.test(trimmed)
+    ? trimmed.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '')
+    : trimmed;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  return validateProcess(parsed) ? parsed : null;
+}
+
 // ---- ProcessGenerator（阶梯） ----
 
 export class ProcessGenerator {
@@ -95,12 +140,14 @@ export class ProcessGenerator {
   private readonly budget: number;
   private readonly retrieveProcess: ((q: GeneratorQuery) => readonly ProcessDef[]) | undefined;
   private readonly llmGenerate: ((task: GeneratorTask) => Promise<ProcessDef>) | undefined;
+  private readonly modelAdapter: ModelAdapter | undefined;
 
   constructor(opts: GeneratorOptions) {
     this.processes = opts.processes;
     this.budget = opts.budget;
     this.retrieveProcess = opts.retrieveProcess;
     this.llmGenerate = opts.llmGenerate;
+    this.modelAdapter = opts.modelAdapter;
   }
 
   /**
@@ -165,6 +212,30 @@ export class ProcessGenerator {
             };
           }
           return { process: p, method: 'generate', reason: 'generate: LLM 生成（最后手段，全部规则阶梯失败后）' };
+        }
+        return { process: null, method: 'none', reason: 'validation: LLM 生成产物未通过 ProcessDef schema 校验' };
+      } catch (e) {
+        return {
+          process: null,
+          method: 'none',
+          reason: `none: LLM 生成器执行失败: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+    }
+
+    // T8.12：ModelAdapter 路径（与 llmGenerate 同守卫路径：schema 校验 → 预算守卫；产物解析失败降级）
+    if (this.modelAdapter) {
+      try {
+        const p = await this.generateViaModelAdapter(task);
+        if (p !== null) {
+          if (processCost(p) > this.budget) {
+            return {
+              process: null,
+              method: 'none',
+              reason: `budget: LLM 生成产物成本 ${processCost(p)} 超预算 ${this.budget}`,
+            };
+          }
+          return { process: p, method: 'generate', reason: 'generate: LLM 生成（经 ModelAdapter，全部规则阶梯失败后）' };
         }
         return { process: null, method: 'none', reason: 'validation: LLM 生成产物未通过 ProcessDef schema 校验' };
       } catch (e) {
@@ -272,6 +343,16 @@ export class ProcessGenerator {
       return null;
     }
     return Math.min(...this.processes.map((p) => processCost(p)));
+  }
+
+  /** ModelAdapter 生成路径：HYPOTHESIZE 提示构造 → 模型生成 → 产物解析（非法 → null 降级） */
+  private async generateViaModelAdapter(task: GeneratorTask): Promise<ProcessDef | null> {
+    const prompt = buildHypothesizePrompt(task, this.processes);
+    const res = await this.modelAdapter!.generate(prompt, {
+      system: HYPOTHESIZE_SYSTEM,
+      maxTokens: 4000,
+    });
+    return parseProcessJson(res.text);
   }
 }
 

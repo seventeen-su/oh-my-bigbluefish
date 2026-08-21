@@ -10,6 +10,8 @@ import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
 import { createCognitiveRuntime } from './assembly.js';
+import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
+import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { BenchLine } from '../kernel/schemas/bench.js';
 
 export const name = 'omb-v2';
@@ -63,7 +65,12 @@ export interface ContextLike {
   /** T8.3：认知装配根（用户态目录，架构 §3 workspace/.omb；缺省装配路径） */
   cognitiveRoot?: string;
   /** DSH 插件配置面（agent.cordis.yml config；生产装配经 config.cognitiveRoot） */
-  config?: { cognitiveRoot?: string };
+  config?: { cognitiveRoot?: string; model?: { provider?: string; model?: string } };
+  /** T8.12：DSH llm 服务（LlmRuntime.stream 的结构最小接口；真实类型 @deepseek-ai/dsh-llm）。
+   *  存在 + config.model 齐备 → 组合根装配 ModelAdapter 注入认知运行时；缺失 → 缺省受限（LLM 路径不装配）。 */
+  llm?: LlmStreamLike;
+  /** T8.12：注入的 ModelAdapter（组合根显式注入优先；未注入且 llm+config.model 齐备 → 自动装配） */
+  modelAdapter?: ModelAdapter;
 }
 
 /**
@@ -87,7 +94,16 @@ export function apply(ctx: ContextLike): void {
   if (ctx.cognitive === undefined) {
     const root = ctx.cognitiveRoot ?? ctx.config?.cognitiveRoot;
     if (root !== undefined) {
-      ctx.cognitive = createCognitiveRuntime({ root });
+      // T8.12：组合根装配 ModelAdapter——显式注入优先；否则 llm 服务 + config.model 齐备时自动装配
+      //（真实 DSH 会话经 ctx.llm 提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
+      if (ctx.modelAdapter === undefined && ctx.llm !== undefined) {
+        const provider = ctx.config?.model?.provider;
+        const model = ctx.config?.model?.model;
+        if (provider !== undefined && provider.length > 0 && model !== undefined && model.length > 0) {
+          ctx.modelAdapter = createDshModelAdapter(ctx.llm, { provider, model });
+        }
+      }
+      ctx.cognitive = createCognitiveRuntime({ root, modelAdapter: ctx.modelAdapter });
     }
   }
 

@@ -6,6 +6,7 @@ export * from './c.js';
 export * from './p.js';
 export * from './m.js';
 export * from './a.js';
+export * from './model-adapter.js';
 
 import { ProvenanceSchema } from './base.js';
 import { S4Schema, StateSchema, TaskContractSchema, WorkingStateSchema } from './s.js';
