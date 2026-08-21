@@ -29,6 +29,7 @@ export {
   BudgetPolicySchema,
   ContextPolicySchema,
   GovernorPolicySchema,
+  GovernorRuleSchema,
   KindCostTableSchema,
   OperatorDefSchema,
   ProcessDefSchema,

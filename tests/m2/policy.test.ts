@@ -1,6 +1,6 @@
 // T2.1 行为测试：策略与过程数据层（P3 机制即数据，架构 §5.1 Fast Governor / §5.3 过程数据化 / §4.2 P1 / §17 参数标定）。
-// 六类：① 默认策略加载 ② 默认过程加载 ③ 策略改动即生效（无硬编码） ④ 非法策略拒绝（fail-loud）
-//       ⑤ 决策表完整性（防漂移） ⑥ 预算初值合理性。
+// 七类：① 默认策略加载 ② 默认过程加载 ③ 策略改动即生效（无硬编码） ④ 非法策略拒绝（fail-loud）
+//       ⑤ 决策表完整性（防漂移） ⑥ 预算初值合理性 ⑦ 公共 API 导出面（re-export 完整，防漂移）。
 // fixture：mkdtemp 临时目录 + 复制真实 kernel/policy（不动真实目录，CONVENTIONS §6）。
 import { afterEach, describe, expect, it } from 'vitest';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -276,5 +276,42 @@ describe('⑥ 预算初值合理性', () => {
       expect(budget[dim]).toBeGreaterThan(0);
     }
     expect(budget.context_budget_tokens).toBeGreaterThan(0);
+  });
+});
+
+describe('⑦ 公共 API 导出面（防漂移：policy-loader re-export 完整）', () => {
+  it('re-export GovernorRuleSchema（值导出，非 undefined）且与契约层同一绑定', async () => {
+    const loader = await import('../../kernel/policy-loader.js');
+    const contract = await import('../../kernel/schemas/policy.js');
+    // T7.2 迁移后 re-export 曾遗漏 GovernorRuleSchema：编译 JS 消费者 import 它得到 undefined → 运行时 TypeError。
+    // 测试锁死该导出面：值必须存在，且与契约层为同一绑定（re-export 原样透传，防改名/重定义漂移）。
+    expect(loader.GovernorRuleSchema).toBeDefined();
+    expect(loader.GovernorRuleSchema).toBe(contract.GovernorRuleSchema);
+  });
+
+  it('re-export 的 GovernorRuleSchema 与契约层 GovernorPolicySchema 语义一致（同合法/非法样例同结果）', async () => {
+    const loader = await import('../../kernel/policy-loader.js');
+    const contract = await import('../../kernel/schemas/policy.js');
+    const defaultRule = { id: 'default', decision: 'Stop' };
+    const validRule = {
+      id: 'semantic-ok',
+      when: { applicability: 'Strong', evidence_gaps: 'none', budget_ok: true },
+      decision: 'RunProcess',
+    };
+    const invalidRule = {
+      id: 'semantic-bad',
+      when: { applicability: 'Strong', evidence_gaps: 'none', budget_ok: true },
+      decision: 'NoSuchDecision',
+    };
+    // 同一合法样例：GovernorRuleSchema 与 GovernorPolicySchema（内嵌规则 schema）均接受
+    expect(loader.GovernorRuleSchema.safeParse(validRule).success).toBe(true);
+    expect(
+      contract.GovernorPolicySchema.safeParse({ rules: [validRule, defaultRule] }).success,
+    ).toBe(true);
+    // 同一非法样例（decision 越界）：两者均拒绝
+    expect(loader.GovernorRuleSchema.safeParse(invalidRule).success).toBe(false);
+    expect(
+      contract.GovernorPolicySchema.safeParse({ rules: [invalidRule, defaultRule] }).success,
+    ).toBe(false);
   });
 });
