@@ -3,9 +3,12 @@
 //   bootStable()：loadVersion('stable')（引用可解析 + 内容可读校验）失败 → 自动沿 stable 历史
 //   （git rev-list --first-parent）找最后一个完好 revision（git 对象级校验 <rev>:manifest.json 可读，
 //   与 worktree 状态无关——ref 完好但 worktree 损坏时同样检出并回退到该 revision 触发 worktree 恢复）
-//   → rollbackTo 自动回退（update-ref 原子切换 + worktree checkout 尽力恢复）→ 告警记录
+//   → rollbackTo 自动回退（update-ref 原子切换 + worktree checkout 恢复）→ 告警记录
 //   （内存 warnings + 可选 warningLog 文件追加，§11.4"stable 损坏 → 回退上一快照"）。
 //   全历史均损坏 / initial（tag 无分支可回退）→ ok:false + no_recovery 告警（不抛错，调用方决策）。
+// T8.23 决策（明确降级语义）：worktree 同步用 worktreePolicy:'best-effort'——真实布局 stable/latest
+//   有 ACL 只读，checkout 同步失败是常态而非异常；ref 切换成功即回退生效，worktree 降级状态
+//   （worktree_status/worktree_error）进入 rollback_performed 告警供调用方决策（不静默）。
 // 只 import node: 内置与 substrate 内文件（CONVENTIONS §4：substrate 不得 import 任何上层）。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -143,11 +146,18 @@ export async function bootStable(opts: BootOptions = {}): Promise<BootResult> {
     branch,
     worktree,
     gitBin: opts.gitBin,
+    // T8.23 决策：真实布局 stable/latest ACL 只读 → 明确降级语义（ref 切换成功即回退生效，
+    // worktree 未同步进入告警；strict 会导致真实布局回退永远失败，不采用）
+    worktreePolicy: 'best-effort',
   });
   warn({
     kind: 'rollback_performed',
     detail: `版本线 ${line} 已自动回退 ${rollback.previous_head.slice(0, 8)} → ${rollback.new_head.slice(0, 8)}（worktree 同步${
-      rollback.worktree_synced ? '成功' : '失败：尽力而为（ref 已切换）'
+      rollback.worktree_status === 'synced'
+        ? '成功'
+        : rollback.worktree_status === 'skipped'
+          ? '未提供（无需同步）'
+          : `降级：${rollback.worktree_error ?? '未知原因'}`
     }）`,
   });
 

@@ -151,6 +151,72 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(result.new_head).toBe(fx.initialHash);
     expect(headOf(fx, 'main')).toBe(fx.initialHash);
   });
+
+  it('T8.23-明确降级：worktree 同步失败 → worktree_status:"degraded" + worktree_error 非空 + ref 已切换（best-effort 缺省）', () => {
+    fx = buildLayoutFixture();
+    makeStableWritable(fx);
+    const revA = advanceStable(fx, 'stable-advanced');
+    runGit(['checkout', '--force', revA], { cwd: fx.stable });
+    applyReadOnlyAcl(fx.stable);
+
+    const result = rollbackTo({ bareRepo: fx.bare, revision: fx.initialHash, worktree: fx.stable });
+
+    expect(result.worktree_synced).toBe(false);
+    expect(result.worktree_status).toBe('degraded');
+    expect(result.worktree_error).toBeTruthy(); // 机器可读失败原因，非静默告警
+    expect(result.new_head).toBe(fx.initialHash);
+    expect(headOf(fx)).toBe(fx.initialHash);
+  });
+
+  it('T8.23-strict 策略：worktree 同步失败 → 抛错 + ref 补偿恢复到切换前（无半切换态）', () => {
+    fx = buildLayoutFixture();
+    makeStableWritable(fx);
+    const revA = advanceStable(fx, 'stable-advanced');
+    runGit(['checkout', '--force', revA], { cwd: fx.stable });
+    applyReadOnlyAcl(fx.stable);
+
+    expect(() =>
+      rollbackTo({
+        bareRepo: fx.bare,
+        revision: fx.initialHash,
+        worktree: fx.stable,
+        worktreePolicy: 'strict',
+      }),
+    ).toThrow(/worktree/);
+    // ref 已补偿恢复：仍指向 rev-A，未停留在目标 revision（无半切换态）
+    expect(headOf(fx)).toBe(revA);
+  });
+
+  it('T8.23-strict 策略：worktree 同步成功 → 正常返回 worktree_status:"synced"', () => {
+    fx = buildLayoutFixture();
+    makeStableWritable(fx);
+    const revA = advanceStable(fx, 'stable-advanced');
+    runGit(['checkout', '--force', revA], { cwd: fx.stable });
+
+    const result = rollbackTo({
+      bareRepo: fx.bare,
+      revision: fx.initialHash,
+      worktree: fx.stable,
+      worktreePolicy: 'strict',
+    });
+
+    expect(result.worktree_status).toBe('synced');
+    expect(result.worktree_synced).toBe(true);
+    expect(result.new_head).toBe(fx.initialHash);
+    expect(headOf(fx)).toBe(fx.initialHash);
+  });
+
+  it('T8.23-未提供 worktree → worktree_status:"skipped"（无需同步）', () => {
+    fx = buildLayoutFixture();
+    const revA = advanceStable(fx, 'stable-advanced');
+
+    const result = rollbackTo({ bareRepo: fx.bare, revision: fx.initialHash });
+
+    expect(result.worktree_status).toBe('skipped');
+    expect(result.worktree_synced).toBe(true);
+    expect(headOf(fx)).toBe(fx.initialHash);
+    expect(result.previous_head).toBe(revA);
+  });
 });
 
 describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () => {
