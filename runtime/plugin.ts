@@ -1,20 +1,20 @@
 // layer 2：Cordis function plugin 入口（DSH preset 挂载；agent.cordis.yml 指向编译产物 lib/runtime/plugin.js）。
 // 不 import '@deepseek-ai/cordis'（harness 依赖，preset 内 tsc/vitest 无此包）：
 // 用结构化最小接口类型化 ctx，运行时以 ctx.commands?.register?.(...) 守卫。
-// M0：注册 /mode 命令（handler 纯逻辑在 substrate/mode-command.ts）。
-// T8.2：/mode 真实 recompose 接线——ctx.agentPresets.recompose 存在时 handler 真实调用
-// （目标 preset id = omb-v2-<line>，版本线 → 子 preset 命名约定）；调用失败 → 明确受限
-// （mode-command 返回 error 文本文档化平台限制），降级为会话内当前线状态。
-//      注册 /bench 命令（supervisor/bench.ts runBench 真实冻结基准集，回放执行器）。
+// M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
+//（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
 import { makeRealExecutor } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
-import { buildRequestFromSession, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
-import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './loop-hooks.js';
+import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
+import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
+import { reduce } from '../supervisor/state-reducer.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
+import type { Event } from '../kernel/schemas/m.js';
+import type { State } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { BenchLine } from '../kernel/schemas/bench.js';
 import type { GovernorDecision } from './governor.js';
@@ -51,7 +51,10 @@ export interface AgentPresetsLike {
 
 /** 认知运行时最小结构（T8.3 装配；T8.26.2 三能力拆分后含 prepareTurn/observeEvent/finalizeTurn/snapshotHash） */
 export interface CognitiveRuntimeLike {
-  eventStore: { append(e: unknown): Promise<void> };
+  eventStore: {
+    append(e: unknown): Promise<void>;
+    query(opts: { session_id?: string }): Promise<{ events: Event[] }>;
+  };
   memory: { ingest(m: unknown): Promise<string> };
   snapshotHash: string;
   /** T8.26.3：turn 开始认知准备（prepareTurn §3.1）；inject 提供时注入投影并记 context/injected（Model-visible ⟺ logged） */
@@ -151,6 +154,49 @@ export function apply(ctx: ContextLike): void {
   // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
   let current: VersionLine = 'stable';
 
+  // T8.26.5：turn 收尾共享状态——prepareTurn 决策/工作状态缓存（finalize 输入）与待收尾标记。
+  // 收尾触发面（§3.3/§4）：session/flush（耐久检查点）→ finalizeTurn；turn/end（turn 事实关闭）→ 标记待收尾；
+  // 无 flush 时退化：下一次 prepareTurn 前惰性收尾（计划 §4 finalizeTurn 守卫行，记录降级路径）。
+  const preparedTurns = new Map<string, { decision: GovernorDecision; working_state: PromptWorkingState }>();
+  const pendingFinalize = new Set<string>();
+  // T8.26.4：会话事件追踪（mapper 状态：turn/同 turn 指令 claim/最近 goal——goal 供 prepare 与收尾使用）
+  const traces = new Map<string, ReturnType<typeof initialTraceState>>();
+
+  /**
+   * turn 收尾（finalizeTurn §3.3）：decision/made 入链（优先最近 prepareTurn 决策，无 → 明确降级决策）+
+   * 信号聚合（reducer utility_counts）→ maintenance 入队（注入时）+ checkpoint 保存（dir + 可归约 State 齐备时）。
+   * 守卫：无收尾状态（无 prepare 且无待收尾标记）→ 无副作用；finalizeTurn 失败 → 记录降级，保留待收尾状态。
+   */
+  const finalizePendingTurn = async (sessionId: string, fallbackGoal: string): Promise<void> => {
+    const runtime = ctx.cognitive;
+    if (runtime === undefined) {
+      return;
+    }
+    if (!pendingFinalize.has(sessionId) && !preparedTurns.has(sessionId)) {
+      return; // 无收尾状态（无 prepare/无 turn 结束）→ 不虚构收尾
+    }
+    const prepared = preparedTurns.get(sessionId);
+    const decision = prepared?.decision ?? fallbackFinalizeDecision(runtime.snapshotHash);
+    const working = prepared?.working_state ?? fallbackWorkingState(fallbackGoal);
+    let state: State | undefined;
+    try {
+      const sessionEvents = (await runtime.eventStore.query({ session_id: sessionId })).events;
+      const reduced = reduce(sessionEvents).state as unknown as State;
+      // 空流退化：无任何事件 → provenance.event 为空 → checkpoint M7 schema 校验失败 → 不传 state（checkpoint 跳过）
+      state = reduced.provenance.event.length > 0 ? reduced : undefined;
+    } catch {
+      state = undefined; // 不可归约 → 不传 state（checkpoint 跳过，收尾其余照常）
+    }
+    try {
+      await runtime.finalizeTurn({ session_id: sessionId, decision, working_state: working, state });
+      pendingFinalize.delete(sessionId);
+      preparedTurns.delete(sessionId); // 收尾后清除：双 flush/turn/end 幂等
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('finalizeTurn', `收尾失败（${detail}）——保留待收尾状态`);
+    }
+  };
+
   // T8.26.3：systemPrompt.context 钩子——按请求求值 → prepareTurn → 投影注入（Model-visible ⟺ logged）。
   // 守卫（计划 §2 应对策略 2）：systemPrompt.context 缺失 → 记录降级（无认知注入，命令仍可用）；
   // 认知运行时未装配 → 记录降级、不注册（无注入面）。
@@ -176,24 +222,28 @@ export function apply(ctx: ContextLike): void {
           return; // 防重入：同一会话的并发 assembly 只跑一次 prepare
         }
         preparing.add(sessionId);
-        const goal = lastUserMessageText(agent?.session?.events);
+        // goal 来源：插件自身会话追踪（session/event 已观察到的最近人类指令）优先，assembleCtx 事件兜底
+        const goal = traces.get(sessionId)?.lastGoal ?? lastUserMessageText(agent?.session?.events);
         const request = buildRequestFromSession(sessionId, goal);
-        runtime
-          .prepareTurn(request, {
+        void (async () => {
+          // T8.26.5 惰性收尾（无 flush 触发时的退化路径）：先收尾上一 turn，再准备本 turn
+          if (pendingFinalize.has(sessionId)) {
+            await finalizePendingTurn(sessionId, goal);
+            recordDegradation('finalize/lazy', `turn 收尾经 prepareTurn 惰性路径（无 flush 触发）——session ${sessionId}`);
+          }
+          const result = await runtime.prepareTurn(request, {
             inject: (projection) => {
               projectionTexts.set(sessionId, projectionToText(projection));
             },
-          })
-          .then((result) => {
-            projectionTexts.set(sessionId, projectionToText(result.projection));
-          })
-          .catch((err) => {
-            const detail = err instanceof Error ? err.message : String(err);
-            recordDegradation('context-provider', `prepareTurn 失败（${detail}）——本轮无投影注入`);
-          })
-          .finally(() => {
-            preparing.delete(sessionId);
           });
+          preparedTurns.set(sessionId, { decision: result.decision, working_state: result.working_state });
+          projectionTexts.set(sessionId, projectionToText(result.projection));
+        })().catch((err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('context-provider', `prepareTurn 失败（${detail}）——本轮无投影注入`);
+        }).finally(() => {
+          preparing.delete(sessionId);
+        });
       };
       ctx.systemPrompt.context({
         name: 'cognitive:projection',
@@ -222,7 +272,6 @@ export function apply(ctx: ContextLike): void {
   // 异步观察 fire-and-forget（append 为同步写，不阻塞 DSH 事件派发；失败记录降级不抛）。
   if (typeof ctx.on === 'function') {
     if (ctx.cognitive !== undefined) {
-      const traces = new Map<string, ReturnType<typeof initialTraceState>>();
       ctx.on('session/event', (session, dshEvent) => {
         const runtime = ctx.cognitive;
         if (runtime === undefined) {
@@ -241,6 +290,23 @@ export function apply(ctx: ContextLike): void {
             recordDegradation('session/event', `observeEvent 失败（${detail}）——事件已记录降级`);
           });
         }
+        // T8.26.5：turn/end = turn 事实关闭 → 标记待收尾（flush 或下一次 prepareTurn 触发 finalizeTurn）
+        if ((dshEvent as { type?: unknown } | undefined)?.type === 'turn/end') {
+          pendingFinalize.add(sessionId);
+        }
+      });
+      // T8.26.5：session/flush（耐久检查点）→ finalizeTurn（decision/made + checkpoint + 信号 → MaintenanceQueue）。
+      // 守卫：flush 事件缺失时由 prepareTurn 惰性收尾路径承接（见 finalizePendingTurn 调用面）。
+      ctx.on('session/flush', (session) => {
+        const sessionId = (session as { id?: unknown } | undefined)?.id;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return;
+        }
+        const goal = traces.get(sessionId)?.lastGoal ?? '';
+        void finalizePendingTurn(sessionId, goal).catch((err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('session/flush', `收尾触发失败（${detail}）`);
+        });
       });
       ctx.on('tools/result', (exec, result) => {
         const runtime = ctx.cognitive;
