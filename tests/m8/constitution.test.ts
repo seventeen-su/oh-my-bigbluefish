@@ -1,5 +1,6 @@
 // T8.11 行为测试：宪法转换不变量可执行检查（架构 §14.1/§14.2，直接作用于 Semantic IR 事件流）。
-// 证据门①：Claim 目标 evidence_status=verified 需要证据在场（Evidence 引用非空或对应 observation 事件在场）→ 违规 fail-loud。
+// 证据门①：Claim 目标 evidence_status=verified 需要非矛盾证据在场（Evidence 引用非空；矛盾观测是反证——被 contradictory
+//   观测过的 claim 不得转 verified，违规 fail-loud）。
 // 降级门②：Observation=contradictory → 活动假设必须降级（active→discriminated/rejected）→ 违规 fail-loud。
 // 事件：observation/contradictory {observation_id, claim_id, hypothesis_id, status}（§12.1 事件类型，EVENTS_HANDLED 注册）。
 import { describe, expect, it } from 'vitest';
@@ -59,18 +60,25 @@ describe('宪法不变量①：verified 需要证据在场（§14.1：Claim=infe
     );
   });
 
-  it('合法：inferred + Evidence 引用（evidence 非空）→ verified', () => {
+  it('合法：非矛盾观测引用（Evidence 引用非空）→ verified 可转', () => {
     const { projections } = reduce([claimUpdate('c:1', { evidence_status: 'verified', evidence: ['e:1'] })]);
     expect(projections.claims.get('c:1')?.evidence_status).toBe('verified');
   });
 
-  it('合法：对应 observation 事件在场 → verified（证据门 observation 分支）', () => {
+  it('违规：矛盾观测后 claim 转 verified → fail-loud（矛盾观测是反证非证据）', () => {
     const events = [
       ...activeHypChain([obsContradictory('o:1', 'c:1', 'h:1', { status: 'discriminated' })]),
       claimUpdate('c:1', { evidence_status: 'verified' }),
     ];
-    const { projections } = reduce(events);
-    expect(projections.claims.get('c:1')?.evidence_status).toBe('verified');
+    expect(() => reduce(events)).toThrow(/宪法不变量违规/);
+  });
+
+  it('违规：矛盾观测后 claim 带 Evidence 引用转 verified → 仍 fail-loud（反证阻断）', () => {
+    const events = [
+      ...activeHypChain([obsContradictory('o:1', 'c:1', 'h:1', { status: 'discriminated' })]),
+      claimUpdate('c:1', { evidence_status: 'verified', evidence: ['e:1'] }),
+    ];
+    expect(() => reduce(events)).toThrow(/宪法不变量违规/);
   });
 
   it('非法 evidence_status 值 fail-loud', () => {
