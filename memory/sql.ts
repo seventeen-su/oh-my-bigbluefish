@@ -5,7 +5,8 @@
 // 故 UPDATE/DELETE 同步改用 DELETE FROM memory_fts WHERE rowid = old.rowid（实测可用）。
 // layer 2（memory/）：仅 node: 内置与同层模块——本模块无任何 import。
 /** 建表 SQL：memory / memory_relation / memory_stats / retrieval_episode / staging / checkpoint
- *  + memory_fts（fts5 独立表）+ 触发器同步（INSERT 直插、UPDATE/DELETE 按 rowid 删后重插）。 */
+ *  / negative_pattern（T8.8 失败样本表）+ memory_fts（fts5 独立表）+ 触发器同步
+ * （INSERT 直插、UPDATE/DELETE 按 rowid 删后重插）。 */
 export const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS memory (
     id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, lifecycle TEXT NOT NULL,
@@ -36,6 +37,14 @@ export const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS checkpoint (
     id TEXT PRIMARY KEY, working_state TEXT, hash TEXT, created INTEGER
   );
+  CREATE TABLE IF NOT EXISTS negative_pattern (
+    id TEXT PRIMARY KEY, graph_hash TEXT NOT NULL, failed_operator TEXT NOT NULL,
+    code TEXT NOT NULL, message TEXT NOT NULL, environment TEXT NOT NULL,
+    created INTEGER NOT NULL, provenance TEXT NOT NULL, body TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_negative_pattern_graph ON negative_pattern(graph_hash);
+  CREATE INDEX IF NOT EXISTS idx_negative_pattern_operator ON negative_pattern(failed_operator);
+  CREATE INDEX IF NOT EXISTS idx_negative_pattern_created ON negative_pattern(created);
   CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     id UNINDEXED, scope, kind, lifecycle, prov_class, payload_text
   );

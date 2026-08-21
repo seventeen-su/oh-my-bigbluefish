@@ -3,6 +3,7 @@
 // 对 ./operator-builtins.js 取 OperatorError/BUILTIN_OPERATORS（仅函数体内引用，无顶层求值依赖）。
 // executeGraph 由 operator.ts 门面 re-export。
 // 模块拆分（CONVENTIONS §9 LOC ≤ 400）：执行器与 ABI 契约层、内置算子分文件。
+import { createHash } from 'node:crypto';
 import { OperatorError, BUILTIN_OPERATORS } from './operator-builtins.js';
 import type {
   GraphError,
@@ -16,6 +17,8 @@ import type {
   OperatorOutput,
   OperatorSpec,
 } from './operator.js';
+import type { NegativePatternRecord } from '../memory/negative-pattern.js';
+import { canonicalJson, makeImmutableId } from '../kernel/schemas/base.js';
 
 // ---- 常量 ----
 
@@ -157,6 +160,59 @@ function toGraphError(err: unknown, operatorId: string, attempt: number): GraphE
   return { code: 'E_OPERATOR', message, operator_id: operatorId, attempt };
 }
 
+// ---- T8.8 Negative Pattern 落库（整图失败 → 失败样本记录，供演化信号 CapabilityGap） ----
+
+/** 图 hash：sha256(canonicalJson(graph))（确定性——同图同 hash） */
+function graphHash(graph: OperatorGraph): string {
+  return `sha256:${createHash('sha256').update(canonicalJson(graph), 'utf8').digest('hex')}`;
+}
+
+/**
+ * 失败样本构造（整图失败 → 表记录：graph hash/失败算子/错误/环境/时间 + provenance 链
+ * 表行 → 事件/过程引用）。id 内容寻址（graph_hash+operator+code+message）——同失败幂等去重。
+ */
+function buildNegativePatternRecord(
+  graph: OperatorGraph,
+  ctx: GraphExecutionContext,
+  result: GraphResult,
+): NegativePatternRecord {
+  const hash = graphHash(graph);
+  const operator = result.error?.operator_id ?? 'graph';
+  const code = result.error?.code ?? result.code ?? 'E_GRAPH'; // 精确算子错误码优先（TIMEOUT/E_NO_CAPABILITY…）
+  const message = result.error?.message ?? '整图失败';
+  const ts = Date.now();
+  return {
+    id: makeImmutableId(canonicalJson({ graph_hash: hash, failed_operator: operator, code, message })),
+    graph_hash: hash,
+    failed_operator: operator,
+    code,
+    message,
+    environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+    created: ts,
+    provenance: {
+      source: 'operator-executor',
+      event: `process/operator/failed:${operator}`,
+      process_ref: ctx.graphId ?? `graph:${graph.entry}→${graph.exit}`,
+      graph_hash: hash,
+      timestamp: new Date(ts).toISOString(),
+      transformation_chain: ['executeGraph'],
+      verification: 'negative-pattern',
+    },
+  };
+}
+
+/** 整图失败 → 注入 sink 写失败样本（sink 未注入 → no-op，不改变执行结果） */
+async function emitNegativePattern(
+  graph: OperatorGraph,
+  ctx: GraphExecutionContext,
+  result: GraphResult,
+): Promise<void> {
+  if (ctx.negativePatternSink === undefined) {
+    return;
+  }
+  await ctx.negativePatternSink(buildNegativePatternRecord(graph, ctx, result));
+}
+
 /** 错误可重试性：OperatorError.retryable=false 显式阻断重试；其他错误交给 spec.error.retryable */
 function errRetryable(err: unknown): boolean | undefined {
   return err instanceof OperatorError ? err.retryable : undefined;
@@ -229,36 +285,45 @@ export async function executeGraph(graph: OperatorGraph, ctx: GraphExecutionCont
     result.events.push(evt);
     ctx.eventSink?.(evt);
   };
-  const fail = (code: string, message: string, operatorId?: string, attempt?: number): GraphResult => {
+  // 整图失败统一出口：标记失败（result.code = 失败类）+ 失败样本落库（T8.8；sink 未注入则仅标记）。
+  // preciseError 提供时 result.error 保留精确算子错误（code 如 TIMEOUT/E_NO_CAPABILITY——m4 错误契约钉住）。
+  const fail = async (
+    code: string,
+    message: string,
+    operatorId?: string,
+    attempt?: number,
+    preciseError?: GraphError,
+  ): Promise<GraphResult> => {
     result.ok = false;
     result.failed = true;
     result.code = code;
-    result.error = {
+    result.error = preciseError ?? {
       code,
       message,
       ...(operatorId !== undefined ? { operator_id: operatorId } : {}),
       ...(attempt !== undefined ? { attempt } : {}),
     };
+    await emitNegativePattern(graph, ctx, result);
     return result;
   };
 
   // 预算：执行前总成本校验
   const totalCost = graph.operators.reduce((sum, op) => sum + operatorCost(op), 0);
   if (totalCost > ctx.budget) {
-    return fail('BUDGET_EXCEEDED', `算子总成本 ${totalCost} 超出预算 ${ctx.budget}`);
+    return await fail('BUDGET_EXCEEDED', `算子总成本 ${totalCost} 超出预算 ${ctx.budget}`);
   }
 
   // 图结构校验：重复 id / 边引用未知算子
   const opById = new Map<string, OperatorSpec>();
   for (const op of graph.operators) {
     if (opById.has(op.id)) {
-      return fail('E_GRAPH', `重复算子 id: ${op.id}`);
+      return await fail('E_GRAPH', `重复算子 id: ${op.id}`);
     }
     opById.set(op.id, op);
   }
   for (const edge of graph.edges) {
     if (!opById.has(edge.from) || !opById.has(edge.to)) {
-      return fail('E_GRAPH', `边引用未知算子: ${edge.from}→${edge.to}`);
+      return await fail('E_GRAPH', `边引用未知算子: ${edge.from}→${edge.to}`);
     }
   }
 
@@ -281,10 +346,10 @@ export async function executeGraph(graph: OperatorGraph, ctx: GraphExecutionCont
   // 拓扑执行：批内并发（上限 FAN_OUT_CONCURRENCY），批间依赖等待（fan-in）
   while (pending.size > 0) {
     if (ctx.signal?.aborted) {
-      return fail('CANCELLED', '图级信号取消');
+      return await fail('CANCELLED', '图级信号取消');
     }
     if (ready.length === 0) {
-      return fail('CYCLE', '算子图存在环（Kahn 无法推进）');
+      return await fail('CYCLE', '算子图存在环（Kahn 无法推进）');
     }
     const batch = ready.splice(0, FAN_OUT_CONCURRENCY);
     const settled = await Promise.all(batch.map((id) => runOne(opById.get(id)!, registry, ctx, outputs, emit)));
@@ -303,12 +368,8 @@ export async function executeGraph(graph: OperatorGraph, ctx: GraphExecutionCont
             // rollback 失败不阻断整图失败结论（M4 记录；补偿链留 M5）
           }
         }
-        result.negative_pattern = outcome.error; // Negative Pattern 记录占位（M5 落库）
-        result.ok = false;
-        result.failed = true;
-        result.code = 'OPERATOR_FAILED';
-        result.error = outcome.error; // 精确算子错误（code 如 E_NO_CAPABILITY/TIMEOUT/VERIFICATION_FAILED）
-        return result;
+        result.negative_pattern = outcome.error; // Negative Pattern 记录（T8.8 落库由 emitNegativePattern 处理）
+        return await fail('OPERATOR_FAILED', outcome.error.message, undefined, undefined, outcome.error);
       }
       outputs.set(id, outcome.output);
       result.completed.push(id);

@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 import type { CapabilityProvider } from '../kernel/capability-abi.js';
 import { canonicalJson } from '../kernel/schemas/base.js';
+import type { NegativePatternRecord } from '../memory/negative-pattern.js';
 
 // ---- 门面 re-export（统一出口：runtime/operator.*） ----
 
@@ -25,6 +26,7 @@ export {
   type ToolResult,
 } from './operator-builtins.js';
 export { executeGraph, FAN_OUT_CONCURRENCY, MAX_RETRIES, RETRY_BACKOFF_BASE_MS } from './operator-executor.js';
+export type { NegativePatternRecord } from '../memory/negative-pattern.js';
 
 // ---- 常量 ----
 
@@ -172,6 +174,10 @@ export interface GraphExecutionContext {
   rollbacks?: Record<string, RollbackFn>;
   /** 自定义算子（按 op.id 覆盖/扩展内置） */
   registry?: Record<string, OperatorFn>;
+  /** T8.8：整图失败 → 失败样本 sink（Negative Pattern 落库；未注入则仅标记失败） */
+  negativePatternSink?: (record: NegativePatternRecord) => void | Promise<void>;
+  /** T8.8：图 id（失败样本 provenance 过程引用；缺省 graph:<entry>→<exit>） */
+  graphId?: string;
 }
 
 // ---- Micro Certificate（§5.3：Ephemeral →（证书）→ Behavioral Candidate；M5 入库） ----
