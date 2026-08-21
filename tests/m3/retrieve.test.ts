@@ -411,8 +411,8 @@ describe('Utility 计数（§7.4：六计数器 + utility_score 派生）', () =
   });
 });
 
-describe('中文检索实测（§17 开放项：默认分词器 unicode61，配合 T3.1 结论）', () => {
-  it('整串中文查询命中（lexical channel；整串为单 token）', async () => {
+describe('中文检索实测（T8.16 中文分词接入后：bigram 双侧分词，子串命中）', () => {
+  it('整串中文查询命中（lexical channel；bigram 分词后整串命中）', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: '记忆系统设计文档' }));
     const r = await retrieve(b, q({ text: '记忆系统设计文档' }));
@@ -421,12 +421,13 @@ describe('中文检索实测（§17 开放项：默认分词器 unicode61，配�
     expect(r.items[0]?.memory.payload).toBe('记忆系统设计文档');
   });
 
-  it('中文子串不命中（unicode61 不按字符切分，T3.1 结论一致）', async () => {
+  it('中文子串命中（T8.16："记忆"命中"记忆系统设计文档"）', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: '记忆系统设计文档' }));
     for (const kw of ['记忆', '记忆系统', '设计文档']) {
       const r = await retrieve(b, q({ text: kw }));
-      expect(r.items).toHaveLength(0);
+      expect(r.items, kw).toHaveLength(1);
+      expect(r.items[0]?.memory.payload).toBe('记忆系统设计文档');
     }
   });
 

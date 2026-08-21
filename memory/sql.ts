@@ -3,14 +3,18 @@
 // FTS5 触发器说明（实测结论，见 task-3.1-report）：FTS5 的 'delete' 特殊 INSERT 命令在本构建
 // （SQLite 3.50.4 / Node 24.12）的普通 fts5 表上报 SQL logic error（external content 表可用）；
 // 故 UPDATE/DELETE 同步改用 DELETE FROM memory_fts WHERE rowid = old.rowid（实测可用）。
+// T8.16 双侧分词（中文分词接入）：memory 表新增 payload_fts 列（JS 侧分词结果）——FTS 虚拟表
+// payload_text 改由 new.payload_fts 同步（触发器无法调用 JS 分词器；ingest/update 在 JS 侧
+// tokenizeForFts 后写入 payload_fts，查询侧同分词再 MATCH——unicode61 中文子串不命中的修复）。
 // layer 2（memory/）：仅 node: 内置与同层模块——本模块无任何 import。
 /** 建表 SQL：memory / memory_relation / memory_stats / retrieval_episode / staging / checkpoint
  *  / negative_pattern（T8.8 失败样本表）+ memory_fts（fts5 独立表）+ 触发器同步
- * （INSERT 直插、UPDATE/DELETE 按 rowid 删后重插）。 */
+ * （INSERT 直插、UPDATE/DELETE 按 rowid 删后重插；payload_text = new.payload_fts 分词列）。 */
 export const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS memory (
     id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, lifecycle TEXT NOT NULL,
-    prov_class TEXT NOT NULL, payload TEXT NOT NULL, value_score REAL NOT NULL,
+    prov_class TEXT NOT NULL, payload TEXT NOT NULL, payload_fts TEXT NOT NULL DEFAULT '',
+    value_score REAL NOT NULL,
     utility_counts TEXT NOT NULL, belief_ref TEXT, lineage_ref TEXT,
     created INTEGER NOT NULL, updated INTEGER NOT NULL, event_id TEXT UNIQUE, body TEXT NOT NULL
   );
@@ -50,7 +54,7 @@ export const SCHEMA_SQL = `
   );
   CREATE TRIGGER IF NOT EXISTS trg_memory_fts_ai AFTER INSERT ON memory BEGIN
     INSERT INTO memory_fts(rowid, id, scope, kind, lifecycle, prov_class, payload_text)
-    VALUES (new.rowid, new.id, new.scope, new.kind, new.lifecycle, new.prov_class, new.payload);
+    VALUES (new.rowid, new.id, new.scope, new.kind, new.lifecycle, new.prov_class, new.payload_fts);
   END;
   CREATE TRIGGER IF NOT EXISTS trg_memory_fts_ad AFTER DELETE ON memory BEGIN
     DELETE FROM memory_fts WHERE rowid = old.rowid;
@@ -58,7 +62,7 @@ export const SCHEMA_SQL = `
   CREATE TRIGGER IF NOT EXISTS trg_memory_fts_au AFTER UPDATE ON memory BEGIN
     DELETE FROM memory_fts WHERE rowid = old.rowid;
     INSERT INTO memory_fts(rowid, id, scope, kind, lifecycle, prov_class, payload_text)
-    VALUES (new.rowid, new.id, new.scope, new.kind, new.lifecycle, new.prov_class, new.payload);
+    VALUES (new.rowid, new.id, new.scope, new.kind, new.lifecycle, new.prov_class, new.payload_fts);
   END;
 `;
 

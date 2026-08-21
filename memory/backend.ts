@@ -27,6 +27,7 @@ import {
   type Memory,
 } from '../kernel/schemas/m.js';
 import { SCHEMA_SQL, ftsMatchExpr, parseCursor } from './sql.js';
+import { tokenizeForFts } from './cjk-ngram.js';
 
 /** 默认 DB 文件（用户态目录，CONVENTIONS §7：workspace/.omb/） */
 export const DEFAULT_MEMORY_DB = 'workspace/.omb/memory.db';
@@ -76,9 +77,9 @@ export class SqliteMemoryBackend implements MemoryBackend {
     this.db.exec('PRAGMA journal_mode=WAL');
     this.db.exec(SCHEMA_SQL);
     this.insertMemory = this.db.prepare(
-      `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, value_score,
-                           utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
+                           value_score, utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO NOTHING`,
     );
     this.insertStats = this.db.prepare('INSERT INTO memory_stats (id) VALUES (?)');
@@ -96,8 +97,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
     const outer = this.beginIfNeeded();
     try {
       const r = this.insertMemory.run(
-        v.id, v.scope, v.kind, v.lifecycle, v.prov_class, v.payload, v.value_score,
-        JSON.stringify(v.utility_counts), v.belief_ref ?? null, v.lineage_ref ?? null,
+        v.id, v.scope, v.kind, v.lifecycle, v.prov_class, v.payload, tokenizeForFts(v.payload),
+        v.value_score, JSON.stringify(v.utility_counts), v.belief_ref ?? null, v.lineage_ref ?? null,
         created, updated, v.provenance.event, JSON.stringify(v),
       );
       let id: string;
@@ -162,7 +163,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
 
     const trimmedText = text?.trim() ?? '';
     if (trimmedText.length > 0) {
-      const ftsArgs: SQLInputValue[] = [ftsMatchExpr(trimmedText), ...args];
+      // T8.16 双侧分词：查询串同分词器处理（CJK → bigram 空格连接）再 MATCH（与 ingest 侧一致）
+      const ftsArgs: SQLInputValue[] = [ftsMatchExpr(tokenizeForFts(trimmedText)), ...args];
       const ftsWhere = `memory_fts MATCH ? AND ${condSql}`;
       const offset = page !== undefined ? (page - 1) * limit : 0;
       const rows = this.db.prepare(
@@ -242,13 +244,14 @@ export class SqliteMemoryBackend implements MemoryBackend {
       }
       const merged = this.validateMemory({ ...(JSON.parse(row.body) as Memory), ...clean, updated: new Date().toISOString() });
       this.db.prepare(
-        `UPDATE memory SET scope = ?, kind = ?, lifecycle = ?, prov_class = ?, payload = ?, value_score = ?,
-                           utility_counts = ?, belief_ref = ?, lineage_ref = ?, updated = ?, body = ?
+        `UPDATE memory SET scope = ?, kind = ?, lifecycle = ?, prov_class = ?, payload = ?, payload_fts = ?,
+                           value_score = ?, utility_counts = ?, belief_ref = ?, lineage_ref = ?, updated = ?, body = ?
          WHERE id = ?`,
       ).run(
-        merged.scope, merged.kind, merged.lifecycle, merged.prov_class, merged.payload, merged.value_score,
-        JSON.stringify(merged.utility_counts), merged.belief_ref ?? null, merged.lineage_ref ?? null,
-        Date.parse(merged.updated), JSON.stringify(merged), id,
+        merged.scope, merged.kind, merged.lifecycle, merged.prov_class, merged.payload,
+        tokenizeForFts(merged.payload),
+        merged.value_score, JSON.stringify(merged.utility_counts), merged.belief_ref ?? null,
+        merged.lineage_ref ?? null, Date.parse(merged.updated), JSON.stringify(merged), id,
       );
       this.endIfNeeded(outer);
     } catch (err) {

@@ -413,28 +413,28 @@ describe('health', () => {
   });
 });
 
-describe('中文检索实测（默认分词器 unicode61）', () => {
-  it('整 token 中文 MATCH 命中', async () => {
+describe('中文检索实测（T8.16 中文分词接入后：bigram 双侧分词，子串命中）', () => {
+  it('整串中文 MATCH 命中', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: '记忆系统设计文档' }));
     const page = await b.query({ scope: 'Project', text: '记忆系统设计文档', limit: 10, budget: 100 });
     expect(page.total).toBe(1);
   });
 
-  it('中文子串/前缀不命中——默认分词器按整串单 token、不按字符切分（实测记录，§17 开放项）', async () => {
+  it('中文子串命中（T8.16：bigram 分词——"记忆"命中"记忆系统设计文档"）', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: '记忆系统设计文档' }));
-    for (const kw of ['记忆', '记忆系统', '设计文档']) {
+    for (const kw of ['记忆', '记忆系统', '设计文档', '系统', '文档']) {
       const page = await b.query({ scope: 'Project', text: kw, limit: 10, budget: 100 });
-      expect(page.total).toBe(0);
+      expect(page.total, kw).toBe(1);
     }
   });
 
-  it('中英混合无空格串为单一 token：内嵌英文不可单独命中', async () => {
+  it('中英混合无空格串：内嵌英文可单独命中（分词拆出独立 token）；整串亦命中', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: '记忆后端采用SQLite进行存储' }));
     const embedded = await b.query({ scope: 'Project', text: 'SQLite', limit: 10, budget: 100 });
-    expect(embedded.total).toBe(0);
+    expect(embedded.total).toBe(1);
     const whole = await b.query({
       scope: 'Project',
       text: '记忆后端采用SQLite进行存储',
