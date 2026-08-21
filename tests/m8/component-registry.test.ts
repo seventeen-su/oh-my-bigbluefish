@@ -9,15 +9,33 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
     const txn = new ComponentRegistrationTransaction();
     const disposed: string[] = [];
     const activated: string[] = [];
-    txn.register({ manifest_id: 'm-A', activate: () => activated.push('A'), disposer: () => disposed.push('A') });
-    txn.register({ manifest_id: 'm-B', activate: () => activated.push('B'), disposer: () => disposed.push('B') });
+    txn.register({
+      manifest_id: 'm-A',
+      activate: () => {
+        activated.push('A');
+      },
+      disposer: () => {
+        disposed.push('A');
+      },
+    });
+    txn.register({
+      manifest_id: 'm-B',
+      activate: () => {
+        activated.push('B');
+      },
+      disposer: () => {
+        disposed.push('B');
+      },
+    });
     txn.register({
       manifest_id: 'm-C',
       activate: () => {
         activated.push('C');
         throw new Error('C 激活失败');
       },
-      disposer: () => disposed.push('C'),
+      disposer: () => {
+        disposed.push('C');
+      },
     });
 
     await expect(txn.commit()).rejects.toThrow(/C 激活失败/);
@@ -47,7 +65,7 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
     // 成功路径事务 disposeAll 幂等
     const ok = new ComponentRegistrationTransaction();
     let bDispose = 0;
-    ok.register({ manifest_id: 'm-B', disposer: () => (bDispose += 1) });
+    ok.register({ manifest_id: 'm-B', disposer: () => { bDispose += 1; } });
     await ok.commit();
     await ok.disposeAll();
     await ok.disposeAll();
@@ -58,7 +76,7 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
     const txn = new ComponentRegistrationTransaction();
     let cFail = true;
     const disposed: string[] = [];
-    txn.register({ manifest_id: 'm-A', activate: () => undefined, disposer: () => disposed.push('A') });
+    txn.register({ manifest_id: 'm-A', activate: () => { return undefined; }, disposer: () => { disposed.push('A'); } });
     txn.register({
       manifest_id: 'm-B',
       activate: () => {
@@ -67,7 +85,7 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
           throw new Error('B 首次激活失败');
         }
       },
-      disposer: () => disposed.push('B'),
+      disposer: () => { disposed.push('B'); },
     });
 
     await expect(txn.commit()).rejects.toThrow();
@@ -86,7 +104,7 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
   it('commit 成功后重复 commit → no-op（激活器不再被调）；disposeAll 后 commit → fail-loud', async () => {
     const txn = new ComponentRegistrationTransaction();
     let activations = 0;
-    txn.register({ manifest_id: 'm-A', activate: () => (activations += 1) });
+    txn.register({ manifest_id: 'm-A', activate: () => { activations += 1; } });
 
     await txn.commit();
     await txn.commit(); // 幂等 no-op
@@ -99,8 +117,8 @@ describe('T8.6 组件注册事务（注册集原子性 + 批量 dispose 回滚�
   it('未 commit 直接 disposeAll → 已注册全部 dispose（open 态释放安全）', async () => {
     const txn = new ComponentRegistrationTransaction();
     const disposed: string[] = [];
-    txn.register({ manifest_id: 'm-A', disposer: () => disposed.push('A') });
-    txn.register({ manifest_id: 'm-B', disposer: () => disposed.push('B') });
+    txn.register({ manifest_id: 'm-A', disposer: () => { disposed.push('A'); } });
+    txn.register({ manifest_id: 'm-B', disposer: () => { disposed.push('B'); } });
 
     await txn.disposeAll();
     expect(disposed.sort()).toEqual(['A', 'B']);

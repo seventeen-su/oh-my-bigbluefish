@@ -14,7 +14,7 @@ import type { Event } from '../kernel/schemas/m.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
-import { retrieve } from '../memory/retrieve.js';
+import { retrieve, type RankedMemory } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
@@ -48,7 +48,7 @@ export interface CognitiveRequest {
 /** 请求处理结果（决策 + 检索 + prompt + 入链事件数） */
 export interface CognitiveResponse {
   decision: GovernorDecision;
-  retrieval: { items: unknown[]; channel_used: string };
+  retrieval: { items: RankedMemory[]; channel_used: string };
   prompt: BuiltPrompt;
   events_appended: number;
 }

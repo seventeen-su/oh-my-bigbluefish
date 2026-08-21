@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { canonicalJson, makeImmutableId } from '../../kernel/schemas/base.js';
+import { canonicalJson } from '../../kernel/schemas/base.js';
 import { NegativePatternBackend, type NegativePatternRecord } from '../../memory/negative-pattern.js';
 import { executeGraph, type OperatorGraph } from '../../runtime/operator.js';
 
@@ -54,7 +54,7 @@ describe('T8.8 Negative Pattern 落库（operator-executor → negative_pattern 
       inputs: {},
       budget: 1000,
       graphId: 'process/bench-001',
-      negativePatternSink: async (r) => written.push(r),
+      negativePatternSink: async (r) => { written.push(r); },
       registry: { STOP: { run: () => Promise.reject(new Error('算子执行崩溃')) } },
     });
 
@@ -85,7 +85,7 @@ describe('T8.8 Negative Pattern 落库（operator-executor → negative_pattern 
     const res = await executeGraph(graph, {
       inputs: {},
       budget: 1000,
-      negativePatternSink: async (r) => backend.write(r),
+      negativePatternSink: async (r) => { await backend.write(r); },
       registry: { STOP: { run: () => Promise.reject(new Error('boom')) } },
     });
     expect(res.failed).toBe(true);
@@ -108,7 +108,7 @@ describe('T8.8 Negative Pattern 落库（operator-executor → negative_pattern 
     const res = await executeGraph(graph, {
       inputs: {},
       budget: 1,
-      negativePatternSink: async (r) => written.push(r),
+      negativePatternSink: async (r) => { written.push(r); },
     });
 
     expect(res.failed).toBe(true);
@@ -122,12 +122,12 @@ describe('T8.8 Negative Pattern 落库（operator-executor → negative_pattern 
     const graph = failingGraph();
     const res1 = await executeGraph(graph, {
       inputs: {}, budget: 1000, graphId: 'p1',
-      negativePatternSink: async (r) => backend.write(r),
+      negativePatternSink: async (r) => { await backend.write(r); },
       registry: { STOP: { run: () => Promise.reject(new Error('boom')) } },
     });
     const res2 = await executeGraph(graph, {
       inputs: {}, budget: 1000, graphId: 'p1',
-      negativePatternSink: async (r) => backend.write(r),
+      negativePatternSink: async (r) => { await backend.write(r); },
       registry: { STOP: { run: () => Promise.reject(new Error('boom')) } },
     });
     expect(res1.failed).toBe(true);

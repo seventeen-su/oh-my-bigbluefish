@@ -13,7 +13,7 @@ import { type EvolutionObject, type RuntimeSnapshot } from '../../kernel/schemas
 import type { Fingerprint } from '../../kernel/schemas/base.js';
 import type { CapabilityVector } from '../../runtime/evaluator.js';
 import { activate, resetActivationLog, rollback, type ActivationDeps } from '../../supervisor/activation.js';
-import { CandidatePool, type CandidateRecord } from '../../supervisor/candidates.js';
+import type { CandidateRecord } from '../../supervisor/candidates.js';
 import { SnapshotRegistry, createSnapshot, type ComponentHashes } from '../../supervisor/versioning.js';
 
 const ENV: Fingerprint = { os: 'test', node: 'v24', dsh_version: '0.8.0', project: 'omb-v2' };
@@ -66,14 +66,20 @@ function mkDeps(over: Partial<ActivationDeps> = {}): Harness {
       h.currentHead = candidateHash;
       return { previous, new: candidateHash };
     },
-    writeEvolutionObject: async (o: EvolutionObject) => h.written.push(o),
+    writeEvolutionObject: async (o: EvolutionObject) => {
+      h.written.push(o);
+    },
     snapshotRegistry: new SnapshotRegistry(mkSnapshot('rev-initial')),
     nextSnapshot: () => mkSnapshot('rev-activated'),
     evaluate: () => OK_VECTOR,
     classify: (v: CapabilityVector) => v.classification,
     checkLineage: () => ({ ok: true }),
     currentStableHead: () => h.currentHead,
-    eventStore: { append: async (e: unknown) => h.events.push(e) },
+    eventStore: {
+      append: async (e: unknown) => {
+        h.events.push(e);
+      },
+    },
     ...over,
   };
   return h;
