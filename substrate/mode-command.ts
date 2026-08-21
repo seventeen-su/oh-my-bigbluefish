@@ -19,6 +19,12 @@ export interface ModeCommandDeps {
   isBlankSession?: () => Promise<boolean>;
   /** 切换钩子（真实 recompose 接线留 M0 后集成；M0 内用于记录新线） */
   onSwitch?: (line: VersionLine) => Promise<void>;
+  /**
+   * 平台级 recompose（可选；T8.2 接线）：DSH preset recompose（ctx.agentPresets.recompose）。
+   * 提供时：切换前先调用——ok → 继续 onSwitch；!ok → error（明确受限，平台限制文档化），onSwitch 不被调。
+   * 未提供（平台无 recompose 面）→ 降级为会话内当前线状态（onSwitch 本地记录）。
+   */
+  recompose?: (line: VersionLine) => Promise<{ ok: boolean; detail: string }>;
 }
 
 export interface ModeCommandResult {
@@ -33,7 +39,8 @@ const HELP = `合法值：${VALID_LINES.join(' | ')}`;
  * - 空输入 → 返回当前模式（currentLine）+ 帮助；
  * - 未知模式 → error（消息含合法值），不触发 load；
  * - 合法模式 → load 校验（失败返回 error 文本）→ 空白会话检查（若提供且非空白 → error）
- *   → onSwitch（若提供）→ success（新模式 + git_revision 前 8 位 + tree_root）。
+ *   → recompose（若提供：ok 才继续，!ok → error 明确受限）→ onSwitch（若提供）→ success
+ *   （新模式 + git_revision 前 8 位 + tree_root）。
  */
 export async function modeCommandHandler(
   rawInput: string,
@@ -57,6 +64,15 @@ export async function modeCommandHandler(
     const blank = await deps.isBlankSession();
     if (!blank) {
       return { kind: 'error', text: `切换到 ${line} 需要空白会话（当前会话已有产出，不能切换）` };
+    }
+  }
+  if (deps.recompose !== undefined) {
+    const r = await deps.recompose(line);
+    if (!r.ok) {
+      return {
+        kind: 'error',
+        text: `切换到 ${line} 失败（平台受限）：${r.detail}；当前仍为 ${deps.currentLine()}（会话内状态）`,
+      };
     }
   }
   if (deps.onSwitch !== undefined) {

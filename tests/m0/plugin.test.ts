@@ -50,12 +50,13 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
   it('注册 /mode 命令：name=mode、description 非空、input hint 含合法值、recordInput=true；fake ctx 无 agentPresets 不抛错', () => {
     const { captured, ctx } = makeFakeCtx();
     expect(() => apply(ctx)).not.toThrow();
-    expect(captured).toHaveLength(1);
-    const def = captured[0]!;
-    expect(def.name).toBe('mode');
-    expect(def.description.length).toBeGreaterThan(0);
-    expect(def.input?.hint).toContain('initial|stable|latest');
-    expect(def.recordInput).toBe(true);
+    const mode = captured.find((c) => c.name === 'mode')!;
+    expect(mode.name).toBe('mode');
+    expect(mode.description.length).toBeGreaterThan(0);
+    expect(mode.input?.hint).toContain('initial|stable|latest');
+    expect(mode.recordInput).toBe(true);
+    // T8.2：同时注册 /bench
+    expect(captured.some((c) => c.name === 'bench')).toBe(true);
   });
 
   it('handler 无参数：返回 CommandResult 结构（success + text），当前线为默认 stable', async () => {
