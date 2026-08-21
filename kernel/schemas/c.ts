@@ -2,10 +2,15 @@
 import { z } from 'zod';
 import { FingerprintSchema, ProvenanceSchema, irBase } from './base.js';
 
-/** C1 Claim { text, epistemic, supported_by[], contradicted_by[], confidence } */
+/** §14.1 证据态原语（evidence plane：claim 如何被知晓；与 §5.2 三值裁决态正交，分层协调见 M8b 报告） */
+export const EvidenceStatusEnum = z.enum(['inferred', 'observed', 'verified']);
+export type EvidenceStatus = z.infer<typeof EvidenceStatusEnum>;
+
+/** C1 Claim { text, epistemic, evidence_status, supported_by[], contradicted_by[], confidence } */
 export const ClaimSchema = irBase({
   text: z.string().min(1),
   epistemic: z.enum(['supported', 'contradicted', 'unresolved']),
+  evidence_status: EvidenceStatusEnum.default('inferred'),
   supported_by: z.array(z.string()),
   contradicted_by: z.array(z.string()),
   confidence: z.number().min(0).max(1),

@@ -107,6 +107,7 @@ export const C1_VALID: Rec = {
   ...base({ id: `claim:${UUID}`, schema: 'omb/C1' }),
   text: 'IR 定义完整',
   epistemic: 'supported',
+  evidence_status: 'verified',
   supported_by: ['e:1'],
   contradicted_by: [],
   confidence: 0.8,

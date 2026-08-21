@@ -117,6 +117,24 @@ describe('IRBase 统一基座（§4.1）', () => {
   });
 });
 
+describe('C1 证据态全集（§14.1 原语：inferred/observed/verified）', () => {
+  it('evidence_status 全集可解析（inferred/observed/verified）', () => {
+    for (const v of ['inferred', 'observed', 'verified'] as const) {
+      const r = ClaimSchema.parse({ ...C1_VALID, evidence_status: v });
+      expect(r.evidence_status).toBe(v);
+    }
+  });
+
+  it('evidence_status 缺省 → inferred（§14.1 默认证据态）', () => {
+    const r = ClaimSchema.parse(omit(C1_VALID, 'evidence_status'));
+    expect(r.evidence_status).toBe('inferred');
+  });
+
+  it('evidence_status 非法值拒绝', () => {
+    expect(ClaimSchema.safeParse({ ...C1_VALID, evidence_status: 'proven' }).success).toBe(false);
+  });
+});
+
 describe('⑤ OMB_OBJECTS 防漂移清单（编号固定）', () => {
   const EXPECTED = [
     'A1', 'A2', 'A3', 'A4',

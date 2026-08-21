@@ -118,6 +118,7 @@ export const INVALID: Array<[string, ZodLike, unknown]> = [
   ['S4 WorldModel 缺 capabilities', S4Schema, omit(WM_VALID, 'capabilities')],
   ['C1 缺 text', ClaimSchema, omit(C1_VALID, 'text')],
   ['C1 epistemic 非法值', ClaimSchema, { ...C1_VALID, epistemic: 'yes' }],
+  ['C1 evidence_status 非法值', ClaimSchema, { ...C1_VALID, evidence_status: 'proven' }],
   ['C1 confidence 越界', ClaimSchema, { ...C1_VALID, confidence: 1.5 }],
   ['C2 status 非法值', HypothesisSchema, { ...C2_VALID, status: 'banned' }],
   ['C3 缺 left_claim', ContradictionSchema, omit(C3_VALID, 'left_claim')],
