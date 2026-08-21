@@ -55,8 +55,18 @@ describe('事件序列 → 精确状态（§5.2）', () => {
     expect(state.working.confirmed_facts).toEqual(['c:1', 'c:2']);
     expect(state.working.active_hypotheses).toEqual(['h:1']);
     expect(state.working.contradictions).toEqual(['x:1']);
-    expect(projections.claims.get('c:1')).toEqual({ text: 'IR 定义完整', epistemic: 'supported', confidence: 0.8 });
-    expect(projections.claims.get('c:2')).toEqual({ text: 'Zod 选型合理', epistemic: 'supported', confidence: 0.7 });
+    expect(projections.claims.get('c:1')).toEqual({
+      text: 'IR 定义完整',
+      epistemic: 'supported',
+      evidence_status: 'inferred',
+      confidence: 0.8,
+    });
+    expect(projections.claims.get('c:2')).toEqual({
+      text: 'Zod 选型合理',
+      epistemic: 'supported',
+      evidence_status: 'inferred',
+      confidence: 0.7,
+    });
     expect(state.snapshot_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 });

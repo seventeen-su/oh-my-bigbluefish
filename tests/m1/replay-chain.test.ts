@@ -70,7 +70,7 @@ function evt(type: string, payload: Record<string, unknown>, seq: number): Event
   };
 }
 
-/** 重建链事件序列：覆盖 EVENTS_HANDLED 全部 11 个已注册类型（session/start → … → session/end，单一会话） */
+/** 重建链事件序列：覆盖 EVENTS_HANDLED 全部已注册类型（session/start → … → session/end，单一会话；新增类型须同步进链） */
 function chainEvents(): (Event & { seq: number })[] {
   return [
     evt('session/start', { goal: '端到端重建链验证' }, 1),
@@ -85,7 +85,14 @@ function chainEvents(): (Event & { seq: number })[] {
     evt('process/operator/retrieve', { operator_id: 'op:1' }, 10),
     evt('memory/admitted', { memory_id: 'm:1' }, 11),
     evt('memory/consolidated', { memory_id: 'm:1' }, 12),
-    evt('session/end', {}, 13),
+    // 宪法②链（§14.1）：活动假设 + contradictory 观测 → 降级（active→discriminated）
+    evt('hypothesis/transition', { hypothesis_id: 'h:2', claim_id: 'c:2', status: 'active' }, 13),
+    evt(
+      'observation/contradictory',
+      { observation_id: 'o:1', claim_id: 'c:2', hypothesis_id: 'h:2', status: 'discriminated' },
+      14,
+    ),
+    evt('session/end', {}, 15),
   ];
 }
 

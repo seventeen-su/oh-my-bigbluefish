@@ -31,6 +31,7 @@ export const DEFAULT_PRIORITY_BY_TYPE: Record<string, number> = {
   'hypothesis/transition': 6,
   'decision/made': 7,
   'contradiction/found': 9,
+  'observation/contradictory': 9,
   'memory/admitted': 4,
   'memory/consolidated': 4,
   'checkpoint/saved': 2,

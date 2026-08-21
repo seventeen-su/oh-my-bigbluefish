@@ -133,6 +133,7 @@ describe('类型枚举（M3 schema 校验）', () => {
       'hypothesis/transition',
       'decision/made',
       'contradiction/found',
+      'observation/contradictory',
       'memory/admitted',
       'memory/consolidated',
       'checkpoint/saved',

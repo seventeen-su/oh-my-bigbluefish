@@ -3,7 +3,9 @@
 // 防漂移：EVENTS_HANDLED 注册表 = APPLY 键集，未注册事件类型 fail-loud（新类型须先注册并实现映射）。
 // 乱序：含 seq → 必须严格递增否则 fail-loud；无 seq → timestamp 稳定排序（同 timestamp 保持数组序）。
 // 缺事件：hypothesis/transition 与 contradiction/found 引用流中未出现的 claim → fail-loud。
-// payload 约定（最小集；M3 校验由 EventStore 负责）：claim/update {claim_id,text?,epistemic?,confidence?}
+// payload 约定（最小集；M3 校验由 EventStore 负责）：claim/update {claim_id,text?,epistemic?,evidence_status?,evidence?,confidence?}
+//   （§14.1 宪法①：目标 evidence_status=verified 需证据在场——evidence 引用或对应 observation 事件，违规 fail-loud）
+//   observation/contradictory {observation_id,claim_id,hypothesis_id,status}（§14.1 宪法②：Observation=contradictory → 活动假设必须降级）
 //   hypothesis/transition {hypothesis_id,claim_id?,status}  contradiction/found {contradiction_id,left_claim,right_claim}
 //   decision/made {decision_id,question,chosen,evidence_used?,supersedes?}  tool/call|result {tool_id?}
 //   process/operator/retrieve {operator_id?}  memory/admitted|consolidated {memory_id?}  session/start {goal?}  session/end {}
@@ -13,6 +15,13 @@ import { createHash } from 'node:crypto';
 import type { Fingerprint, Lifecycle, Owner, Provenance, Ref, Scope } from '../kernel/schemas/base.js';
 import type { State, WorkingState } from '../kernel/schemas/s.js';
 import type { Event } from '../kernel/schemas/m.js';
+import {
+  EVIDENCE_STATUSES,
+  applyContradictoryObservation,
+  assertVerifiedEvidence,
+  parseObservationPayload,
+  type EvidenceStatus,
+} from './constitution.js';
 const IR_VERSION = '2.0';
 /** 空事件流时的确定性环境指纹（不依赖运行时，保证重建确定性） */
 const DEFAULT_FP: Fingerprint = { os: 'unknown', node: 'unknown', dsh_version: '0.1.0', project: 'omb-v2' };
@@ -21,10 +30,11 @@ const DEFAULT_FP: Fingerprint = { os: 'unknown', node: 'unknown', dsh_version: '
 export type Epistemic = 'supported' | 'contradicted' | 'unresolved';
 export type HypothesisStatus = 'active' | 'discriminated' | 'rejected' | 'confirmed';
 
-/** Claim 三值认识论视图（投影：id → 视图，§5.2） */
+/** Claim 三值认识论视图（投影：id → 视图，§5.2 + §14.1 证据态） */
 export interface ClaimView {
   text: string;
   epistemic: Epistemic;
+  evidence_status: EvidenceStatus;
   confidence: number;
 }
 /** Hypothesis 状态视图（投影；扩展：brief 最小集 + 假设状态，供 T3.4） */
@@ -118,6 +128,7 @@ interface Accum {
   confirmed: string[];
   actives: string[];
   contradictions: string[];
+  observedClaims: Set<string>; // §14.1 宪法①：有 observation 事件在场的 claim（转 verified 的证据来源之一）
   goal: string;
   nextBestAction: string;
   environment: Fingerprint;
@@ -143,9 +154,17 @@ const EPISTEMICS = new Set<string>(['supported', 'contradicted', 'unresolved']);
 const STATUSES = new Set<string>(['active', 'discriminated', 'rejected', 'confirmed']);
 // ---- 事件 → 状态更新映射（最小集；新类型须注册于 APPLY 并实现映射） ----
 
-/** claim/update：Claim 三值表 + confirmed_facts；三值翻转计 corrections（§7.4 Belief Revision） */
+/** claim/update：Claim 三值表 + confirmed_facts；三值翻转计 corrections（§7.4 Belief Revision）；
+ *  证据态（evidence_status）经宪法①证据门（§14.1：verified 需证据在场，违规 fail-loud） */
 function applyClaimUpdate(a: Accum, e: Event): void {
-  const p = e.payload as { claim_id?: unknown; text?: unknown; epistemic?: unknown; confidence?: unknown };
+  const p = e.payload as {
+    claim_id?: unknown;
+    text?: unknown;
+    epistemic?: unknown;
+    evidence_status?: unknown;
+    evidence?: unknown;
+    confidence?: unknown;
+  };
   const id = str(p.claim_id);
   if (!id) {
     throw new Error('reduce: claim/update 缺少 claim_id');
@@ -155,9 +174,18 @@ function applyClaimUpdate(a: Accum, e: Event): void {
   if (!EPISTEMICS.has(epRaw)) {
     throw new Error(`reduce: claim/update 非法 epistemic: ${epRaw}`);
   }
+  const esRaw = str(p.evidence_status) ?? prev?.evidence_status ?? 'inferred';
+  if (!(EVIDENCE_STATUSES as readonly string[]).includes(esRaw)) {
+    throw new Error(`reduce: claim/update 非法 evidence_status: ${esRaw}`);
+  }
+  const evidenceStatus = esRaw as EvidenceStatus;
+  if (evidenceStatus === 'verified' && prev?.evidence_status !== 'verified') {
+    assertVerifiedEvidence(id, p.evidence, a.observedClaims); // 宪法①：进入 verified 需证据（已 verified 不再重复触发）
+  }
   const view: ClaimView = {
     text: str(p.text) ?? prev?.text ?? id,
     epistemic: epRaw as Epistemic,
+    evidence_status: evidenceStatus,
     confidence: typeof p.confidence === 'number' && Number.isFinite(p.confidence) ? p.confidence : (prev?.confidence ?? 0),
   };
   a.claims.set(id, view);
@@ -198,6 +226,21 @@ function applyHypothesisTransition(a: Accum, e: Event): void {
     a.claims.set(claimId, { ...claim, epistemic: 'contradicted' });
     removeId(a.confirmed, claimId);
   }
+}
+
+/** observation/contradictory：宪法②（§14.1）——Observation=contradictory → 活动假设必须降级（违规 fail-loud）；
+ *  应用 active→discriminated/rejected + claim 三值同步 contradicted；claim 记入 observedClaims（宪法①证据在场） */
+function applyObservationContradictory(a: Accum, e: Event): void {
+  const p = e.payload as Record<string, unknown>;
+  const { claimId, hypothesisId } = parseObservationPayload(p);
+  if (!a.claims.has(claimId)) {
+    throw new Error(`reduce: observation/contradictory 引用未知 claim: ${claimId}（缺事件）`);
+  }
+  const claim = a.claims.get(claimId) as ClaimView;
+  applyContradictoryObservation(a.hypotheses, a.actives, claimId, hypothesisId, p.status);
+  a.claims.set(claimId, { ...claim, epistemic: 'contradicted' });
+  removeId(a.confirmed, claimId);
+  a.observedClaims.add(claimId);
 }
 
 /** contradiction/found：WorkingState.contradictions 追加（unresolved=true 语义；§5.2 矛盾不迫使判 false） */
@@ -277,6 +320,7 @@ const APPLY: Record<string, ApplyFn> = {
   'session/end': applySessionEnd,
   'claim/update': applyClaimUpdate,
   'hypothesis/transition': applyHypothesisTransition,
+  'observation/contradictory': applyObservationContradictory,
   'contradiction/found': applyContradictionFound,
   'decision/made': applyDecisionMade,
   'tool/call': applyToolCall,
@@ -326,6 +370,7 @@ export function reduce(events: ReducibleEvent[], opts: { initial?: State } = {})
     confirmed: init ? [...init.working.confirmed_facts] : [],
     actives: init ? [...init.working.active_hypotheses] : [],
     contradictions: init ? [...init.working.contradictions] : [],
+    observedClaims: new Set(),
     goal: init?.working.goal ?? '',
     nextBestAction: init?.working.next_best_action ?? '',
     environment: init?.working.environment ?? DEFAULT_FP,
