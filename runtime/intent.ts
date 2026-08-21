@@ -13,17 +13,22 @@ import {
   type CapabilityProvider,
   type CapabilityResult,
 } from '../kernel/capability-abi.js';
+import { IntentSchema as P4IntentSchema } from '../kernel/schemas/p.js';
 
 // ---- Intent ABI（P4 语义字段，zod 校验；§4.2 P4 + §8.1） ----
 
-/** P4 Intent 运行时校验：verb/object/scope/effects 枚举 + constraints/required_verification */
+/**
+ * P4 Intent 运行时校验：从 canonical P4（kernel/schemas/p.ts，契约层单一来源）派生 §4.2 的六个
+ * 语义字段（剥离 IR 信封字段），语义与 canonical 一致——required_verification 为 min(1) 必填、
+ * constraints 必填，无缺省放宽（同一 intent 载荷在 IR 层与 ABI 层判定一致）。
+ */
 export const IntentSchema = z.object({
-  verb: z.string().min(1),
-  object: z.string().min(1),
-  scope: z.string().min(1),
-  effects: z.enum(['read_only', 'mutate', 'external']),
-  constraints: z.array(z.string()).default([]),
-  required_verification: z.string().default(''),
+  verb: P4IntentSchema.shape.verb,
+  object: P4IntentSchema.shape.object,
+  scope: P4IntentSchema.shape.scope,
+  effects: P4IntentSchema.shape.effects,
+  constraints: P4IntentSchema.shape.constraints,
+  required_verification: P4IntentSchema.shape.required_verification,
 });
 export type Intent = z.infer<typeof IntentSchema>;
 
@@ -275,22 +280,26 @@ export class IntentSynthesizer {
       }
 
       const ordered = orderProviders(candidates, this.policy?.fallback_order);
-      const handles: CapabilityHandle[] = [];
+      // 逐候选 createHandle 收集 {provider, handle} 成功对，bindings/selectedByNode 从实际成功
+      // 句柄反推——避免首位 createHandle 抛错、次位成功时绑定到无法绑定的 provider（评审 Important）。
+      const bound: { provider: CapabilityProvider; handle: CapabilityHandle }[] = [];
       for (const p of ordered) {
         try {
-          handles.push(await p.createHandle({ scope: it.scope, budget: this.policy?.budget ?? DEFAULT_BUDGET }));
+          const handle = await p.createHandle({ scope: it.scope, budget: this.policy?.budget ?? DEFAULT_BUDGET });
+          bound.push({ provider: p, handle });
         } catch {
           // 绑定失败候选跳过（binding_failed 兜底在下方）
         }
       }
-      if (handles.length === 0) {
+      if (bound.length === 0) {
         return { error: { code: 'binding_failed', reason: `节点 ${node}: createHandle 全部失败` } };
       }
 
-      chain.push(handles[0]!);
-      bindings.push({ node, provider: ordered[0]!.manifest.id });
-      fallbacks.push({ node, handles });
-      selectedByNode.set(node, ordered[0]!);
+      const primary = bound[0]!;
+      chain.push(primary.handle);
+      bindings.push({ node, provider: primary.provider.manifest.id });
+      fallbacks.push({ node, handles: bound.map((b) => b.handle) });
+      selectedByNode.set(node, primary.provider);
     }
 
     return { chain, graph, bindings, fallbacks };

@@ -7,6 +7,9 @@
 // ⑥ 多节点图（分解 intent：链顺序执行、数据传递）
 // ⑦ fixed plan 默认（无自定义 graphPlan → 默认单节点匹配）
 // ⑧ 执行成功（outputs 正确返回）＋ ⑨ registerManifest。
+// 评审修复（T6a.1 review，2 项 Important）：⑩ createHandle 部分失败 → bindings/selectedByNode
+// 与实际绑定 provider 一致（首位抛错、次位成功；下节点兼容基于实际绑定 output）；
+// ② 补充 required_verification:'' / 缺 constraints → invalid_intent（与 canonical P4 一致）。
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
@@ -108,6 +111,33 @@ describe('② 非法 intent → error.invalid_intent', () => {
   it('缺 verb', async () => {
     const synth = new IntentSynthesizer({ providers: new Map() });
     const bad = { object: 'file', scope: 'user', effects: 'read_only', constraints: [], required_verification: 'v:1' };
+    const result = await synth.synthesize(bad);
+
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error.code).toBe('invalid_intent');
+    }
+  });
+
+  // 评审修复（Important）：runtime IntentSchema 不得放宽 canonical P4（kernel/schemas/p.ts）——
+  // required_verification 为 min(1) 必填、constraints 必填，与 IR 层一致。
+  it('required_verification 为空字符串 → invalid_intent（与 canonical P4 一致）', async () => {
+    const provider = makeProvider({ id: 'capability:rv-1', name: 'read-file' });
+    const synth = new IntentSynthesizer({ providers: new Map([[provider.manifest.id, provider]]) });
+
+    const result = await synth.synthesize({ ...makeIntent(), required_verification: '' });
+
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error.code).toBe('invalid_intent');
+    }
+  });
+
+  it('缺 constraints → invalid_intent（与 canonical P4 一致）', async () => {
+    const provider = makeProvider({ id: 'capability:ct-1', name: 'read-file' });
+    const synth = new IntentSynthesizer({ providers: new Map([[provider.manifest.id, provider]]) });
+
+    const bad = { verb: 'read', object: 'file', scope: 'user', effects: 'read_only', required_verification: 'v:1' };
     const result = await synth.synthesize(bad);
 
     expect('error' in result).toBe(true);
@@ -404,6 +434,81 @@ describe('⑨ manifest 注册（registerManifest）', () => {
     delete (bad.manifest as Partial<CapabilityContract>).input;
 
     expect(() => synth.registerManifest(bad)).toThrow();
+  });
+});
+
+// ---- ⑩ createHandle 部分失败：bindings/selectedByNode 与实际绑定 provider 一致 ----
+
+describe('⑩ createHandle 部分失败 → bindings/selectedByNode 与实际绑定 provider 一致', () => {
+  it('首位 provider createHandle 抛错、次位成功 → 合成成功且 bindings[0].provider 为次位 id', async () => {
+    const failing = makeProvider({ id: 'capability:bind-fail', name: 'read-file', reliability: 'high' });
+    failing.createHandle = async () => {
+      throw new Error('createHandle failed');
+    };
+    const okP = makeProvider({ id: 'capability:bind-ok', name: 'read-file', reliability: 'medium' });
+    const synth = new IntentSynthesizer({
+      providers: new Map([
+        [failing.manifest.id, failing],
+        [okP.manifest.id, okP],
+      ]),
+    });
+
+    const result = await synth.synthesize(makeIntent());
+
+    const ok = expectSuccess(result);
+    expect(ok.chain).toHaveLength(1);
+    expect(ok.chain[0]!.contract.id).toBe('capability:bind-ok');
+    expect(ok.bindings).toEqual([{ node: 'read-file', provider: 'capability:bind-ok' }]);
+    expect(ok.fallbacks[0]!.handles.map((h) => h.contract.id)).toEqual(['capability:bind-ok']);
+  });
+
+  it('createHandle 部分失败 → 下节点兼容检查基于实际绑定 provider 的 output', async () => {
+    const graphPlan = (): CapabilityGraph => ({
+      nodes: ['read', 'summarize'],
+      edges: [['read', 'summarize']],
+      entry: 'read',
+      exit: 'summarize',
+    });
+    // 'read' 节点：首位（high）createHandle 抛错且 output 与 summarize 不兼容；次位（medium）成功且 output {text}
+    const readFail = makeProvider({
+      id: 'capability:read-fail',
+      name: 'read',
+      reliability: 'high',
+      input: z.object({ path: z.string() }),
+      output: z.object({ raw: z.string() }),
+    });
+    readFail.createHandle = async () => {
+      throw new Error('createHandle failed');
+    };
+    const readOk = makeProvider({
+      id: 'capability:read-ok',
+      name: 'read',
+      reliability: 'medium',
+      input: z.object({ path: z.string() }),
+      output: z.object({ text: z.string() }),
+    });
+    const sumP = makeProvider({
+      id: 'capability:sum',
+      name: 'summarize',
+      input: z.object({ text: z.string() }),
+      output: z.object({ summary: z.string() }),
+    });
+    const synth = new IntentSynthesizer({
+      providers: new Map([
+        [readFail.manifest.id, readFail],
+        [readOk.manifest.id, readOk],
+        [sumP.manifest.id, sumP],
+      ]),
+      graphPlan,
+    });
+
+    const result = await synth.synthesize(makeIntent({ verb: 'analyze', object: 'doc' }));
+
+    const ok = expectSuccess(result);
+    expect(ok.bindings).toEqual([
+      { node: 'read', provider: 'capability:read-ok' },
+      { node: 'summarize', provider: 'capability:sum' },
+    ]);
   });
 });
 
