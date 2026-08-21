@@ -286,14 +286,16 @@ export function assertFrozenSetComplete(tasks: readonly BenchTask[]): void {
 // ---- 回放执行器（M7 离线；复用 T5.2 ReplayRunner 的 canned 确定性模式） ----
 
 /**
- * 回放执行器：读取 task.verifier.ref fixture → canned output 过 verifier → passed；cost 从 fixture
- * 统计采集（录制成本）。无真实 I/O、无随机 → 同 fixture 同 executor → 同 passed + 同 cost（数字可复现）。
- * 三线对照用同一 executor（M7 无真实插件变体）；真实 DSH 运行由用户裁定后接真实 executor。
+ * 回放执行器：读取 task.verifier.ref fixture → 先过 assertFixtureMatchesVerifier（fixture 载荷与
+ * verifier kind 不匹配 → fail-loud，冻结集数据完整性守卫）→ canned output 过 verifier → passed；
+ * cost 从 fixture 统计采集（录制成本）。无真实 I/O、无随机 → 同 fixture 同 executor → 同 passed + 同 cost
+ * （数字可复现）。三线对照用同一 executor（M7 无真实插件变体）；真实 DSH 运行由用户裁定后接真实 executor。
  */
 export function makeReplayExecutor(opts: { fixturesDir?: string } = {}): BenchExecutor {
   const dir = opts.fixturesDir ?? BENCH_FIXTURES_DIR;
   return async (task: BenchTask) => {
     const fixture = await loadBenchFixture(task.verifier.ref, dir);
+    assertFixtureMatchesVerifier(task, fixture);
     const passed = runVerifier(task, fixture.output, fixture);
     return { passed, cost: fixture.cost };
   };

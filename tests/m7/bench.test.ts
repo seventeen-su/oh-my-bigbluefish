@@ -9,6 +9,11 @@
 //   ⑤ CognitiveCost 八字段：结构校验；全零合法（无信号时）
 //   ⑥ 失败任务：verifier 不过 → passed false 记录
 //   ⑦ blind_judge：离线规则化 judge 对固定语料给出确定判定（无 LLM 依赖）
+//   ⑧ 数据完整性守卫：assertFixtureMatchesVerifier 每种 kind 缺载荷 fail-loud；接线后回放 executor
+//      在 loadBenchFixture 后调用（fixture 与 verifier 不匹配 → runBench 抛错，而非静默 passed=false）
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   BENCH_CATEGORIES,
@@ -22,8 +27,10 @@ import {
   type BenchLine,
   type BenchTask,
   type CognitiveCost,
+  type VerifierKind,
 } from '../../kernel/schemas/bench.js';
 import {
+  assertFixtureMatchesVerifier,
   assertFrozenSetComplete,
   loadBenchFixture,
   loadBenchTasks,
@@ -350,5 +357,62 @@ describe('⑦ blind_judge 离线规则化（无 LLM 依赖，固定语料确定�
   it('空 rubric（无术语）→ false（不误判通过）', () => {
     const empty: BenchFixture = { output: 'x', cost: cost(), rubric: { required_terms: [] } };
     expect(runVerifier(t, 'anything', empty)).toBe(false);
+  });
+});
+
+describe('⑧ 数据完整性守卫（assertFixtureMatchesVerifier：fail-loud 接线）', () => {
+  /** 全载荷 fixture：五类 verifier 所需载荷齐备（守卫不抛的基准） */
+  const fullFixture = (): BenchFixture => ({
+    output: { ok: 1 },
+    cost: cost(),
+    expected: { ok: 1 },
+    predicates: [{ path: 'ok', equals: 1 }],
+    before: null,
+    after: null,
+    total: 1,
+    rubric: { required_terms: ['ok'] },
+  });
+
+  /** 每种 kind 缺其必需载荷的 fixture（守卫应 fail-loud） */
+  const missingPayloadByKind: Readonly<Record<VerifierKind, { fixture: BenchFixture; token: string }>> = {
+    tests: { fixture: { output: { passed: 1, failed: 0, total: 1 }, cost: cost() }, token: 'total' },
+    exact: { fixture: { output: { ok: 1 }, cost: cost() }, token: 'expected' },
+    predicate: { fixture: { output: { ok: 1 }, cost: cost() }, token: 'predicates' },
+    state_assert: { fixture: { output: { before: null, after: null }, cost: cost() }, token: 'before' },
+    blind_judge: { fixture: { output: 'x', cost: cost() }, token: 'required_terms' },
+  };
+
+  it('每种 kind：缺必需载荷 → 抛错（fail-loud，报不匹配 + 缺载荷名）；载荷齐备 → 不抛', () => {
+    for (const kind of VERIFIER_KINDS) {
+      const t = task({ id: `bench:guard-${kind}`, verifier: { kind, ref: 'x.json' } });
+      const { fixture, token } = missingPayloadByKind[kind];
+      let caught: unknown;
+      try {
+        assertFixtureMatchesVerifier(t, fixture);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught, kind).toBeInstanceOf(Error);
+      expect((caught as Error).message, kind).toMatch(/不匹配/);
+      expect((caught as Error).message, kind).toContain(token);
+      expect(() => assertFixtureMatchesVerifier(t, fullFixture()), kind).not.toThrow();
+    }
+  });
+
+  it('接线：exact kind + fixture 缺 expected → 回放 executor fail-loud，runBench 抛错（而非静默 passed=false）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omb-bench-guard-'));
+    try {
+      const ref = 'guard.mismatch.json';
+      await writeFile(join(dir, ref), JSON.stringify({ output: { ok: 1 }, cost: cost() }), 'utf8');
+      const t = task({
+        id: 'bench:guard-exact',
+        category: 'data',
+        verifier: { kind: 'exact', ref },
+      });
+      const executor = makeReplayExecutor({ fixturesDir: dir });
+      await expect(runBench({ tasks: [t], line: 'stable', executor })).rejects.toThrow(/不匹配/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
