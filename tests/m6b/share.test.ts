@@ -34,6 +34,12 @@ import {
 
 // ---- 测试工具 ----
 
+/** 合法格式签名工厂（T8.9 签名格式门：git:<signer>:<keyid-hex>:<base64>；旧占位符 'sig-xxx' 不再合法） */
+function mkSig(seed: string): string {
+  const keyid = seed.replace(/[^0-9a-f]/gi, '').padEnd(16, '0').slice(0, 16);
+  return `git:omb:${keyid}:${Buffer.from(seed, 'utf8').toString('base64')}`;
+}
+
 /** 测试环境指纹（§4.4） */
 const ENV: Fingerprint = { os: 'win32', node: 'v24', dsh_version: '0.6.0', project: 'omb-v2' };
 
@@ -129,14 +135,14 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const reg = new GitRegistry(root);
     const obj = mkEvo();
 
-    const res = await reg.publish(obj, 'sig-git-001');
+    const res = await reg.publish(obj, mkSig('sig-git-001'));
     expect(res.ok).toBe(true);
 
     // manifest 有记录（id/name/version/signature/parent/verified_by[]）
     const entry = (await reg.list()).find((e) => e.id === obj.id);
     expect(entry).toBeDefined();
     expect(entry!.id).toBe(obj.id);
-    expect(entry!.signature).toBe('sig-git-001');
+    expect(entry!.signature).toBe(mkSig('sig-git-001'));
     expect(entry!.parent).toBe(obj.parent);
     expect(entry!.verified_by).toEqual([]);
     expect(entry!.name.length).toBeGreaterThan(0);
@@ -148,7 +154,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     expect(onDisk).toEqual(obj);
 
     // 重复发布（同内容哈希）→ 拒绝
-    const dup = await reg.publish(obj, 'sig-git-002');
+    const dup = await reg.publish(obj, mkSig('sig-git-002'));
     expect(dup.ok).toBe(false);
     expect(dup.error).toMatch(/重复|已存在|duplicate/i);
     expect((await reg.list()).filter((e) => e.id === obj.id)).toHaveLength(1);
@@ -157,14 +163,14 @@ describe('集体演化协议（§13 / §10.2）', () => {
   it('③ 打包/解包往返：packObject → unpackObject → 对象与签名一致；篡改内容 → unpack 校验失败 fail-loud', () => {
     const obj = mkEvo();
 
-    const packed = packObject(obj, 'sig-abc');
+    const packed = packObject(obj, mkSig('sig-abc'));
     expect(packed).toBeInstanceOf(Buffer);
     expect(packed.length).toBeGreaterThan(0);
 
     // 往返一致
     const { obj: unpacked, signature } = unpackObject(packed);
     expect(unpacked).toEqual(obj);
-    expect(signature).toBe('sig-abc');
+    expect(signature).toBe(mkSig('sig-abc'));
 
     // 篡改内容 → unpack fail-loud（内容哈希不匹配；canonical JSON 转义换行，篡改字面子串）
     const tampered = Buffer.from(packed.toString('utf8').replace('kernel/x.ts', 'kernel/tampered.ts'));
@@ -182,8 +188,8 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const reg = new GitRegistry(root);
     const obj = mkEvo();
     const obj2 = mkEvo();
-    await reg.publish(obj, 'sig-ok');
-    await reg.publish(obj2, 'sig-ok-2');
+    await reg.publish(obj, mkSig('sig-ok'));
+    await reg.publish(obj2, mkSig('sig-ok-2'));
 
     // 合法对象 → 校验通过
     expect((await reg.verify(obj.id)).ok).toBe(true);
@@ -230,7 +236,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
       },
     });
     const obj = mkEvo();
-    const report = await absorb(reg, obj, 'sig-absorb', deps);
+    const report = await absorb(reg, obj, mkSig('sig-absorb'), deps);
     expect(report.ok).toBe(true);
     expect(report.failed_at).toBeNull();
     expect(calls).toEqual(['verifyChain', 'replayBench', 'contractTests']);
@@ -242,7 +248,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const r2 = await absorb(
       reg2,
       mkEvo(),
-      'sig-x',
+      mkSig('sig-x'),
       okDeps({
         verifyChain: async () => {
           calls2.push('verifyChain');
@@ -264,7 +270,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const r3 = await absorb(
       reg3,
       mkEvo(),
-      'sig-y',
+      mkSig('sig-y'),
       okDeps({
         verifyChain: async () => {
           calls3.push('verifyChain');
@@ -290,7 +296,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const r4 = await absorb(
       reg4,
       obj4,
-      'sig-z',
+      mkSig('sig-z'),
       okDeps({ contractTests: async () => ({ ok: false, detail: '契约测试未通过' }) }),
     );
     expect(r4.ok).toBe(false);
@@ -304,7 +310,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const r5 = await absorb(
       reg5,
       tampered,
-      'sig-t',
+      mkSig('sig-t'),
       okDeps({
         verifyChain: async () => {
           calls5.push('verifyChain');
@@ -319,7 +325,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     // 短路 5：schema 非法 → 任一 dep 不被调，失败步 schema（id 由含非法字段的 body 计算，哈希通过、schema 拒绝）
     const reg6 = new GitRegistry(root);
     const badSchema = mkEvo({ spdx: '' });
-    const r6 = await absorb(reg6, badSchema, 'sig-u', okDeps());
+    const r6 = await absorb(reg6, badSchema, mkSig('sig-u'), okDeps());
     expect(r6.ok).toBe(false);
     expect(r6.failed_at).toBe('schema');
   });
@@ -328,7 +334,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const reg = new GitRegistry(root);
     const obj = mkEvo();
 
-    const report = await absorb(reg, obj, 'sig-consensus', {
+    const report = await absorb(reg, obj, mkSig('sig-consensus'), {
       ...okDeps(),
       instance: 'instance-A',
       diversity: 2,
@@ -340,7 +346,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     expect(entry?.verified_by).toContainEqual({ instance: 'instance-A', diversity: 2 });
 
     // 去重命中仍走共识：同对象再次吸收（第二实例，缺省 'local-instance'）→ publish 去重视为 ok，consensus 累积
-    const again = await absorb(reg, obj, 'sig-consensus', okDeps());
+    const again = await absorb(reg, obj, mkSig('sig-consensus'), okDeps());
     expect(again.ok).toBe(true);
     expect(again.failed_at).toBeNull();
     expect(again.stages.find((s) => s.name === 'consensus')?.ok).toBe(true);
@@ -405,7 +411,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
   it('⑨ revoke：撤销后 get 返回标记 + 本地黑名单生效（fail-loud）', async () => {
     const reg = new GitRegistry(root);
     const obj = mkEvo();
-    await reg.publish(obj, 'sig-revoke');
+    await reg.publish(obj, mkSig('sig-revoke'));
 
     await reg.revoke(obj.id, 'bench 数据污染');
 
@@ -434,7 +440,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     expect((await reg2.verify(obj.id)).ok).toBe(false);
 
     // 撤销对象重新发布 → 拒绝（黑名单）
-    expect((await reg.publish(obj, 'sig-new')).ok).toBe(false);
+    expect((await reg.publish(obj, mkSig('sig-new'))).ok).toBe(false);
   });
 
   it('⑩ Registry transport 实测（§17）：Git 清单 transport（本地目录 registry）发布→吸收→本地验证→共识回传 全链路闭环', async () => {
@@ -447,7 +453,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
 
     // ① 发布（Git 清单 transport：本地目录；absorb 管线内入库即发布）
     const obj = mkEvo({ diff: 'diff --git a/supervisor/share.ts b/supervisor/share.ts\n+collective evolution protocol' });
-    const sig = `git-sig:${hexOf(obj.id).slice(0, 12)}`;
+    const sig = mkSig(`git-sig:${hexOf(obj.id).slice(0, 12)}`);
 
     // ② 吸收（全纯代码：无网络；含发布/入库阶段）
     const report = await absorb(reg, obj, sig, {
@@ -479,7 +485,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const reg = new GitRegistry(root);
     const objA = mkEvo();
     const objB = mkEvo(); // 另一自洽合法对象（内容哈希与 B.id 一致——可绕过内容自洽校验，但 id 与 A 不同）
-    await reg.publish(objA, 'sig-a');
+    await reg.publish(objA, mkSig('sig-a'));
 
     // swap 篡改：A 地址 objects/<hexA>.json 被替换为对象 B 的内容（B 自身完全合法）
     await writeFile(join(root, 'objects', `${hexOf(objA.id)}.json`), JSON.stringify(objB), 'utf8');
@@ -498,7 +504,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const obj = mkEvo();
 
     // 实例 A 首次吸收（入库 + 共识回传）
-    const r1 = await absorb(reg, obj, 'sig-consensus', {
+    const r1 = await absorb(reg, obj, mkSig('sig-consensus'), {
       ...okDeps(),
       instance: 'instance-A',
       diversity: 2,
@@ -506,7 +512,7 @@ describe('集体演化协议（§13 / §10.2）', () => {
     expect(r1.ok).toBe(true);
 
     // 实例 B 二次吸收（模拟第二实例）：publish 去重命中（内容哈希相同）→ 仍视为 ok 继续 consensus
-    const r2 = await absorb(reg, obj, 'sig-consensus', {
+    const r2 = await absorb(reg, obj, mkSig('sig-consensus'), {
       ...okDeps(),
       instance: 'instance-B',
       diversity: 2,

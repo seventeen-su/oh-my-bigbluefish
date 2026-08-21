@@ -38,6 +38,12 @@ import {
 
 // ---- 共享 fixture（m3/m4/m5 milestone-loop 同款：beforeAll 建一次共享根，跨 it 状态流动） ----
 
+/** 合法格式签名工厂（T8.9 签名格式门：git:<signer>:<keyid-hex>:<base64>） */
+function mkSig(seed: string): string {
+  const keyid = seed.replace(/[^0-9a-f]/gi, '').padEnd(16, '0').slice(0, 16);
+  return `git:omb:${keyid}:${Buffer.from(seed, 'utf8').toString('base64')}`;
+}
+
 let tmpRoot: string;
 /** 共享临时 registry 根（.evolution/registry 用户态目录约定，架构 §3；④⑤⑥⑦ 共用） */
 let regRoot: string;
@@ -239,7 +245,7 @@ describe('④ 共享协议闭环（publish → pack/unpack 往返 → absorb →
   it('合法 M4 对象经 registry.publish → packObject/unpackObject 往返 → absorb（真实 deps 全过）→ verified_by 含本实例 → reputation ≥ locally-verified', async () => {
     const reg = new GitRegistry(regRoot);
     const obj = mkEvo();
-    const sig = `git-sig:${hexOf(obj.id).slice(0, 12)}`;
+    const sig = mkSig(`git-sig:${hexOf(obj.id).slice(0, 12)}`);
 
     // ① 发布（临时目录 registry；Git 清单 transport，§17）
     const pub = await reg.publish(obj, sig);
@@ -247,9 +253,9 @@ describe('④ 共享协议闭环（publish → pack/unpack 往返 → absorb →
     expect((await reg.list()).find((e) => e.id === obj.id)).toBeDefined();
 
     // ② 打包/解包往返：对象与签名一致（协议 envelope 契约）
-    const { obj: unpacked, signature } = unpackObject(packObject(obj, 'sig-pack'));
+    const { obj: unpacked, signature } = unpackObject(packObject(obj, mkSig('sig-pack')));
     expect(unpacked).toEqual(obj);
-    expect(signature).toBe('sig-pack');
+    expect(signature).toBe(mkSig('sig-pack'));
 
     // ③ 吸收（真实验证链 G1 / 真实回放 bench / 真实 pack-unpack 契约测试，全过）
     const report = await absorb(reg, obj, sig, realDeps(tmpRoot, { instance: 'loop-instance', diversity: 3 }));
@@ -294,7 +300,7 @@ describe('⑤ 跨里程碑连通：M5 已晋升候选 → 验证链 G1 → absor
 
     // 经吸收管线入共享 registry（验证"晋升产物可发布共享"；absorb 内 verifyChain = 真实 G1 schema:M4）
     const reg = new GitRegistry(regRoot);
-    const report = await absorb(reg, evoObj, 'sig-m5', realDeps(tmpRoot, { instance: 'm5-loop', diversity: 1 }));
+    const report = await absorb(reg, evoObj, mkSig('sig-m5'), realDeps(tmpRoot, { instance: 'm5-loop', diversity: 1 }));
     expect(report.ok).toBe(true);
     const entry = (await reg.list()).find((e) => e.id === evoObj.id);
     expect(entry?.verified_by).toContainEqual({ instance: 'm5-loop', diversity: 1 });
@@ -329,8 +335,8 @@ describe('⑥ 确定性/幂等（同 intent 两次合成同结果；同对象两
     const reg = new GitRegistry(regRoot);
     const obj = mkEvo();
 
-    const first = await absorb(reg, obj, 'sig-idem', realDeps(tmpRoot, { instance: 'loop-idem' }));
-    const second = await absorb(reg, obj, 'sig-idem', realDeps(tmpRoot, { instance: 'loop-idem' }));
+    const first = await absorb(reg, obj, mkSig('sig-idem'), realDeps(tmpRoot, { instance: 'loop-idem' }));
+    const second = await absorb(reg, obj, mkSig('sig-idem'), realDeps(tmpRoot, { instance: 'loop-idem' }));
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     expect(second.failed_at).toBeNull();
@@ -356,7 +362,7 @@ describe('⑦ schema 合规抽查（M4/M6 schema 经 share 管线往返后仍合
     expect(EvolutionObjectSchema.safeParse(stored).success).toBe(true);
 
     // pack/unpack 往返后仍合规（协议 envelope 契约）
-    const { obj: back } = unpackObject(packObject(loopEvo!, 'sig-schema'));
+    const { obj: back } = unpackObject(packObject(loopEvo!, mkSig('sig-schema')));
     expect(EvolutionObjectSchema.safeParse(back).success).toBe(true);
   });
 });

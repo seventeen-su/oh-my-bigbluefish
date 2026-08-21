@@ -2,14 +2,20 @@
 // 设计（brief 已定 + 实现选择）：protocol.json = 协议/schema 版本单一权威源（§13.1）；Registry 最小实现 = Git 清单
 //   transport（本地目录 registry：protocol.json + manifest.json + objects/<hex>.json + blacklist.json，生产约定
 //   workspace/.omb/.evolution/registry/）；RegistryAPI = brief 五方法 + addVerification（共识回传写路径，brief 管线要求）。
+// T8.9 升级：① manifest/blacklist/objects 原子写（tmp+rename，T6b.1 缓办项——中断不半文件）；
+//   ② §13.2 冲突（同逻辑身份 name+version 双候选 Pareto branch——registry 允许双候选共存 + conflict_with 标记）；
+//   ③ 签名从空串升级为格式校验（git:<signer>:<keyid-hex>:<base64> / ssh:<base64>）+ 真实 Git 签名校验
+//     （verifyGitSignature：git verify-tag 真实验签；环境无 GPG/SSH 密钥 → 格式校验 + 文档化限制，如实记录）。
 // 吸收管线（全纯代码）：signature_hash → schema（M4 + 协议注册表门禁）→ verify_chain → replay_bench → contract_tests
 //   → publish（入库已验证）→ consensus（共识回传），任一失败短路 + AbsorbReport 记录失败步。
 // layer 1：仅 import node: 内置 + kernel/schemas/（IR 契约例外）+ supervisor/ 内文件。
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalJson, isValidId, makeImmutableId } from '../kernel/schemas/base.js';
 import { EvolutionObjectSchema, type EvolutionObject } from '../kernel/schemas/m.js';
+import { GIT_BIN } from '../substrate/snapshot.js';
 
 // ---- 协议层（§13.1：protocol.json = 协议/schema 版本单一权威源） ----
 
@@ -36,6 +42,74 @@ export function validateProtocol(value: unknown): { ok: boolean; detail: string 
   return r.success ? { ok: true, detail: 'protocol.json schema 校验通过' } : { ok: false, detail: r.error.message };
 }
 
+// ---- 签名（T8.9：格式校验 + 真实 Git 签名校验） ----
+
+/** 签名描述符格式（Git 签名初期选型，文档化）：
+ *  `git:<signer>:<keyid-hex(16-64)>:<base64>` —— git 签名描述符（signer 名 + 密钥 id + base64 签名体）
+ *  `ssh:<base64>` —— SSH 签名描述符
+ */
+const GIT_SIG_RE = /^git:[A-Za-z0-9][A-Za-z0-9._-]*:[0-9a-f]{16,64}:[A-Za-z0-9+/=]+$/;
+const SSH_SIG_RE = /^ssh:[A-Za-z0-9+/=]+$/;
+
+/** 签名格式校验（T8.9 格式门：伪造/空串/乱码 → 拒绝；publish/verify/absorb 共用） */
+export function validateSignatureFormat(signature: string): { ok: boolean; detail: string } {
+  if (typeof signature !== 'string' || signature.length === 0) {
+    return { ok: false, detail: '签名为空' };
+  }
+  if (GIT_SIG_RE.test(signature)) {
+    return { ok: true, detail: 'git 签名描述符格式通过' };
+  }
+  if (SSH_SIG_RE.test(signature)) {
+    return { ok: true, detail: 'ssh 签名描述符格式通过' };
+  }
+  return { ok: false, detail: '签名格式非法（应为 git:<signer>:<keyid-hex>:<base64> 或 ssh:<base64>）' };
+}
+
+export interface GitSignatureVerifyOptions {
+  /** 签名描述符（先过格式门） */
+  signature: string;
+  /** 含签名 tag 的仓库目录 */
+  repoDir: string;
+  /** 被验证的签名 tag 名 */
+  tag: string;
+  /** git 可执行文件完整路径（缺省 GIT_BIN） */
+  gitBin?: string;
+}
+
+/**
+ * 真实 Git 签名校验（T8.9；git verify-tag 真实验签）。
+ * 环境无 GPG/SSH 签名密钥 → { ok:false, limitation:true, detail: 文档化限制 }（格式已通过，真实验签不可用，
+ * 如实记录）；未签名 tag / 签名无效 → ok:false（真实失败路径）。
+ */
+export async function verifyGitSignature(
+  opts: GitSignatureVerifyOptions,
+): Promise<{ ok: boolean; detail: string; limitation?: boolean }> {
+  const fmt = validateSignatureFormat(opts.signature);
+  if (!fmt.ok) {
+    return { ok: false, detail: fmt.detail };
+  }
+  try {
+    execFileSync(opts.gitBin ?? GIT_BIN, ['verify-tag', opts.tag], {
+      cwd: opts.repoDir,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    return { ok: true, detail: `git verify-tag <${opts.tag}> 通过（真实签名校验）` };
+  } catch (err) {
+    const e = err as { status?: number; stderr?: Buffer | string };
+    const detail = e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
+    // 环境无 GPG/SSH 密钥 → 文档化限制（gpg/ssh 进程级失败，非签名内容失败）
+    if (/(gpg|ssh)/i.test(detail)) {
+      return {
+        ok: false,
+        limitation: true,
+        detail: `真实 git 验签不可用（环境无 GPG/SSH 签名密钥，文档化限制；格式校验已通过）：${detail}`,
+      };
+    }
+    return { ok: false, detail: `git verify-tag <${opts.tag}> 失败（签名无效/未签名）：${detail}` };
+  }
+}
+
 // ---- Registry 数据与 API（§13.2：manifest / Registry API / 去重 / 撤销） ----
 
 /** 共识回传记录（verified_by[] 元素：实例 + 其有效多样性，§10.2） */
@@ -57,6 +131,8 @@ export interface ManifestEntry {
   parent: string | null;
   verified_by: VerificationRecord[];
   revoked?: RevokeMarker;
+  /** T8.9 §13.2 冲突（双候选 Pareto branch）：同逻辑身份（name+version）的其它候选 id 列表 */
+  conflict_with?: string[];
   published_at: string;
 }
 /** Registry API（Git 清单 transport 最小实现；addVerification = 共识回传写路径） */
@@ -68,7 +144,7 @@ export interface RegistryAPI {
     signature: string,
     meta?: { name?: string; version?: string },
   ): Promise<{ ok: boolean; error?: string; duplicate?: boolean }>;
-  verify(id: string): Promise<{ ok: boolean; detail: string }>;
+  verify(id: string, opts?: { gitRepo?: string; signatureTag?: string }): Promise<{ ok: boolean; detail: string; limitation?: boolean }>;
   revoke(id: string, reason: string): Promise<void>;
   addVerification(id: string, record: VerificationRecord): Promise<{ ok: boolean; detail: string }>;
 }
@@ -130,7 +206,9 @@ export class GitRegistry implements RegistryAPI {
     }
   }
 
-  /** publish：schema → 内容哈希 → 签名 → 黑名单 → 去重（内容哈希已存在 → 拒绝并标 duplicate——absorb 视为已入库继续共识）→ 落盘 + manifest 记录 */
+  /** publish：schema → 内容哈希 → 签名（T8.9 格式门）→ 黑名单 → 去重（内容哈希已存在 → 拒绝并标
+   * duplicate——absorb 视为已入库继续共识）→ 冲突标记（§13.2 双候选 Pareto branch：显式 name 时
+   * 同 name+version 既有条目双向 conflict_with 标记，双候选共存）→ 落盘（原子写）+ manifest 记录 */
   async publish(
     obj: EvolutionObject,
     signature: string,
@@ -143,13 +221,27 @@ export class GitRegistry implements RegistryAPI {
     if (makeImmutableId(canonicalJson(stripId(o))) !== o.id) {
       return { ok: false, error: '内容哈希与 id 不一致' };
     }
-    if (signature.length === 0) return { ok: false, error: '签名为空' };
+    const sig = validateSignatureFormat(signature);
+    if (!sig.ok) return { ok: false, error: `签名格式非法（${sig.detail}）` };
     if (this.blacklist.has(o.id)) return { ok: false, error: `对象已被撤销（本地黑名单）: ${o.id}` };
     if (this.manifest.some((e) => e.id === o.id)) {
       return { ok: false, error: `重复发布（内容哈希已存在）: ${o.id}`, duplicate: true };
     }
-    await writeFile(this.objectFile(o.id), JSON.stringify(o, null, 2), 'utf8');
-    this.manifest.push({
+    // §13.2 冲突（双候选 Pareto branch）：显式 name 时，同 name+version 的既有条目 → 双向标记（共存不互斥）
+    const conflictWith: string[] = [];
+    if (meta?.name !== undefined) {
+      const version = meta.version ?? o.protocol_version;
+      for (const e of this.manifest) {
+        if (e.revoked) {
+          continue;
+        }
+        if (e.name === meta.name && e.version === version) {
+          conflictWith.push(e.id);
+        }
+      }
+    }
+    await this.atomicWrite(this.objectFile(o.id), JSON.stringify(o, null, 2));
+    const entry: ManifestEntry = {
       id: o.id,
       name: meta?.name ?? 'evolution-object',
       version: meta?.version ?? o.protocol_version,
@@ -157,13 +249,26 @@ export class GitRegistry implements RegistryAPI {
       parent: o.parent ?? null,
       verified_by: [],
       published_at: new Date().toISOString(),
-    });
+      ...(conflictWith.length > 0 ? { conflict_with: conflictWith } : {}),
+    };
+    if (conflictWith.length > 0) {
+      // 反向标记：既有候选 conflict_with += 新 id（Pareto branch 双方可见）
+      for (const e of this.manifest) {
+        if (conflictWith.includes(e.id)) {
+          e.conflict_with = [...new Set([...(e.conflict_with ?? []), o.id])];
+        }
+      }
+    }
+    this.manifest.push(entry);
     await this.writeJson(this.manifestFile, this.manifest);
     return { ok: true };
   }
 
   /** verify：签名/哈希/schema 校验（任一非法 → ok:false + detail；含撤销/黑名单 fail-loud） */
-  async verify(id: string): Promise<{ ok: boolean; detail: string }> {
+  async verify(
+    id: string,
+    opts?: { gitRepo?: string; signatureTag?: string },
+  ): Promise<{ ok: boolean; detail: string; limitation?: boolean }> {
     await this.init();
     if (!isValidId(id)) return { ok: false, detail: `非法 id: ${id}` };
     const revoked = this.blacklist.get(id);
@@ -184,7 +289,18 @@ export class GitRegistry implements RegistryAPI {
     if (obj.id !== id) {
       return { ok: false, detail: `对象文件内容地址与请求 id 不一致（swap 篡改）: ${obj.id} ≠ ${id}` };
     }
-    if (!entry.signature || entry.signature.length === 0) return { ok: false, detail: '签名缺失' };
+    const sig = validateSignatureFormat(entry.signature);
+    if (!sig.ok) return { ok: false, detail: `签名格式非法（${sig.detail}）` };
+    if (opts?.gitRepo !== undefined && opts?.signatureTag !== undefined) {
+      const real = await verifyGitSignature({
+        signature: entry.signature,
+        repoDir: opts.gitRepo,
+        tag: opts.signatureTag,
+      });
+      if (!real.ok) {
+        return { ok: false, detail: real.detail, ...(real.limitation === true ? { limitation: true as const } : {}) };
+      }
+    }
     return { ok: true, detail: '签名/哈希/schema 校验通过' };
   }
 
@@ -226,9 +342,16 @@ export class GitRegistry implements RegistryAPI {
       return fallback;
     }
   }
-  /** 写 JSON（manifest/blacklist；最小实现直写，原子化留 M7 机制演进） */
+  /** 写 JSON（manifest/blacklist/对象文件；T8.9 原子写：tmp + rename——中断不半文件） */
   private async writeJson(file: string, value: unknown): Promise<void> {
-    await writeFile(file, JSON.stringify(value, null, 2), 'utf8');
+    await this.atomicWrite(file, JSON.stringify(value, null, 2));
+  }
+
+  /** 原子写（tmp+rename）：写临时文件后 rename 覆盖（§11.3 crash consistency 同款语义） */
+  private async atomicWrite(file: string, content: string): Promise<void> {
+    const tmp = `${file}.tmp-${process.pid}`;
+    await writeFile(tmp, content, 'utf8');
+    await rename(tmp, file);
   }
   /** 文件已存在则跳过（防覆盖已有协议/清单） */
   private async ensureFile(file: string, content: string): Promise<void> {
@@ -323,9 +446,10 @@ export async function absorb(
     return { ok: false, id: obj.id, stages, failed_at: name };
   };
 
-  // ① 签名/哈希（本地纯校验，fail-loud）
+  // ① 签名/哈希（本地纯校验，T8.9 格式门 + fail-loud）
   if (makeImmutableId(canonicalJson(stripId(obj))) !== obj.id) return fail('signature_hash', '内容哈希与 id 不一致');
-  if (signature.length === 0) return fail('signature_hash', '签名为空');
+  const sigFmt = validateSignatureFormat(signature);
+  if (!sigFmt.ok) return fail('signature_hash', `签名格式非法（${sigFmt.detail}）`);
   stages.push({ name: 'signature_hash', ok: true, detail: '签名/哈希校验通过' });
 
   // ② schema（M4 schema + 协议注册表门禁——不合格对象进不了共享池，§13.1）
