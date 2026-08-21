@@ -11,5 +11,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["substrate", "supervisor", "kernel", "runtime", "memory", "components", "tests"]
+  "include": ["substrate", "supervisor", "kernel", "runtime", "memory", "components", "scripts", "tests"]
 }
