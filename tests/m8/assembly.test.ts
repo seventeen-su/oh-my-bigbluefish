@@ -138,32 +138,30 @@ describe('T8.3 请求路径经 Governor（最小请求处理链：事件 → 决
 });
 
 describe('T8.3 插件激活即装配（plugin.ts apply）', () => {
-  it('apply(fakeCtx)：激活即装配 → ctx.cognitive 实例化（缺省装配经组合根，用户态目录由 cognitiveRoot 指定）', async () => {
+  it('apply(ctx, config)：激活即装配 → 认知运行时实例化（缺省装配经组合根，用户态目录由 config.cognitiveRoot 指定）', async () => {
     const captured: unknown[] = [];
     const ctx: ContextLike = {
       commands: { register: (def: unknown) => captured.push(def) },
-      cognitiveRoot: root,
     };
-    apply(ctx);
-    expect(ctx.cognitive).toBeDefined();
-    expect(ctx.cognitive!.eventStore).toBeDefined();
-    expect(ctx.cognitive!.memory).toBeDefined();
+    const handle = apply(ctx, { cognitiveRoot: root });
+    expect(handle.cognitive).toBeDefined();
+    expect(handle.cognitive!.eventStore).toBeDefined();
+    expect(handle.cognitive!.memory).toBeDefined();
     // 装配的认知运行时可用（事件/检索经真实存储）
     const fs = await import('node:fs');
     expect(fs.existsSync(join(root, 'memory.db'))).toBe(true);
-    await (ctx.cognitive as CognitiveRuntime).close();
+    await (handle.cognitive as CognitiveRuntime).close();
   });
 
-  it('apply 经 deps 注入：ctx.cognitive 已提供 → 使用注入实例（不重复装配、不写用户态目录）', async () => {
+  it('apply 经 deps 注入：get("cognitive") 已提供 → 使用注入实例（不重复装配、不写用户态目录）', async () => {
     const injected = track(createCognitiveRuntime({ root }));
     const captured: unknown[] = [];
     const ctx: ContextLike = {
       commands: { register: (def: unknown) => captured.push(def) },
-      cognitive: injected,
-      cognitiveRoot: join(base, 'should-not-be-used'),
+      get: (name: string) => (name === 'cognitive' ? injected : undefined),
     };
-    apply(ctx);
-    expect(ctx.cognitive).toBe(injected); // 注入实例原样使用
+    const handle = apply(ctx, { cognitiveRoot: join(base, 'should-not-be-used') });
+    expect(handle.cognitive).toBe(injected); // 注入实例原样使用
     const fs = await import('node:fs');
     expect(fs.existsSync(join(base, 'should-not-be-used'))).toBe(false); // 未按缺省路径装配
     await injected.close();

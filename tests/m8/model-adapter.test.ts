@@ -287,11 +287,10 @@ describe('⑪ 装配：ModelAdapter 经组合根注入认知运行时（T8.12 de
       const ctx: ContextLike = {
         commands: { register: (d: unknown) => captured.push(d as { name: string; handler: (i: unknown) => unknown }) },
         llm,
-        config: { cognitiveRoot: base, model: { provider: 'deepseek', model: 'deepseek-chat' } },
       };
-      apply(ctx);
+      const handle = apply(ctx, { cognitiveRoot: base, model: { provider: 'deepseek', model: 'deepseek-chat' } });
       expect(captured.map((c) => c.name)).toEqual(expect.arrayContaining(['mode', 'bench']));
-      const runtime = ctx.cognitive as unknown as { modelAdapter: ModelAdapter | null; close(): Promise<void> };
+      const runtime = handle.cognitive as unknown as { modelAdapter: ModelAdapter | null; close(): Promise<void> };
       expect(runtime.modelAdapter).not.toBeNull();
       expect(runtime.modelAdapter!.provider).toBe('deepseek');
       expect(runtime.modelAdapter!.model).toBe('deepseek-chat');
@@ -302,10 +301,9 @@ describe('⑪ 装配：ModelAdapter 经组合根注入认知运行时（T8.12 de
       // 无 llm → 缺省受限（modelAdapter null）
       const ctxNoLlm: ContextLike = {
         commands: { register: () => undefined },
-        config: { cognitiveRoot: base },
       };
-      apply(ctxNoLlm);
-      const runtimeNoLlm = ctxNoLlm.cognitive as unknown as {
+      const handleNoLlm = apply(ctxNoLlm, { cognitiveRoot: base });
+      const runtimeNoLlm = handleNoLlm.cognitive as unknown as {
         modelAdapter: ModelAdapter | null;
         close(): Promise<void>;
       };

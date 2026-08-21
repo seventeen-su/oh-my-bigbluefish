@@ -1,10 +1,16 @@
 // layer 2：Cordis function plugin 入口（DSH preset 挂载；agent.cordis.yml 指向编译产物 lib/runtime/plugin.js）。
 // 不 import '@deepseek-ai/cordis'（harness 依赖，preset 内 tsc/vitest 无此包）：
 // 用结构化最小接口类型化 ctx，运行时以 ctx.commands?.register?.(...) 守卫。
+// 真实 DSH 运行时 Guard（vendor/cordis reflect.ts）：未声明的 ctx 属性读取/写入都会抛错
+//（cannot get property "x" without inject / cannot set property "x" without provide）。
+// 本插件遵守该契约：宿主服务一律经 ctx.get(name)（免 inject 读取，缺失 → undefined），
+// 插件自身状态（认知运行时/ModelAdapter）存 apply 闭包，不写 ctx；测试 fakeCtx 无 get 时
+// readService 退化到普通属性读取（行为不变，测试面兼容）。
 // 无双 Loop（专项 §1 硬约束）：本插件仅观察/注入/命令注册——不替换、不包装、不重启 DSH Agent Loop；
-// 模型调用归 DSH（ctx.llm 只读装配 ModelAdapter 供 /bench 用，不拦截对话模型路径）。
+// 模型调用归 DSH（llm 服务只读装配 ModelAdapter 供 /bench 用，不拦截对话模型路径）。
 // M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
+// 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
@@ -24,6 +30,14 @@ import type { PromptWorkingState } from './prompt.js';
 
 export const name = 'omb-v2';
 export const inject = ['commands'];
+
+/** DSH 插件配置面（agent.cordis.yml 行 config；Cordis 函数插件第二参传入 apply） */
+export interface PluginConfig {
+  /** 认知装配根（用户态目录，架构 §3 workspace/.omb；缺省装配路径） */
+  cognitiveRoot?: string;
+  /** T8.12：ModelAdapter 装配的模型路由（provider/model 齐备且 llm 服务存在 → 自动装配） */
+  model?: { provider?: string; model?: string };
+}
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
 export interface CommandsLike {
@@ -99,24 +113,33 @@ export interface SystemPromptLike {
 }
 
 export interface ContextLike {
+  /** Guard 契约：免 inject 服务读取（真实 DSH 上下文恒有；测试 fakeCtx 可缺省，readService 退化到普通属性） */
+  get?(name: string): unknown;
   commands?: CommandsLike;
-  /** T8.2：preset recompose 服务（平台提供时 /mode 真实接线；缺失 → 降级会话内状态） */
+  /** T8.2：preset recompose 服务（平台提供时 /mode 真实接线；缺失 → 降级会话内状态）——经 get('agentPresets') 读取 */
   agentPresets?: AgentPresetsLike;
-  /** T8.3：注入的认知运行时（装配经 deps 注入，组合根模式）；未注入且提供装配根 → 组合根缺省装配 */
+  /** T8.3：注入的认知运行时（deps 注入，组合根模式）——经 get('cognitive') 读取；未注入且提供装配根 → 组合根缺省装配 */
   cognitive?: CognitiveRuntimeLike;
-  /** T8.3：认知装配根（用户态目录，架构 §3 workspace/.omb；缺省装配路径） */
-  cognitiveRoot?: string;
-  /** DSH 插件配置面（agent.cordis.yml config；生产装配经 config.cognitiveRoot） */
-  config?: { cognitiveRoot?: string; model?: { provider?: string; model?: string } };
-  /** T8.12：DSH llm 服务（LlmRuntime.stream 的结构最小接口；真实类型 @deepseek-ai/dsh-llm）。
+  /** T8.12：DSH llm 服务（LlmRuntime.stream 的结构最小接口；真实类型 @deepseek-ai/dsh-llm）——经 get('llm') 读取。
    *  存在 + config.model 齐备 → 组合根装配 ModelAdapter 注入认知运行时；缺失 → 缺省受限（LLM 路径不装配）。 */
   llm?: LlmStreamLike;
-  /** T8.12：注入的 ModelAdapter（组合根显式注入优先；未注入且 llm+config.model 齐备 → 自动装配） */
+  /** T8.12：注入的 ModelAdapter（组合根显式注入优先；未注入且 llm+config.model 齐备 → 自动装配）——经 get('modelAdapter') 读取 */
   modelAdapter?: ModelAdapter;
-  /** T8.26.3：DSH systemPrompt 服务（context 贡献注册面；真实类型 @deepseek-ai/dsh-system-prompt） */
+  /** T8.26.3：DSH systemPrompt 服务（context 贡献注册面；真实类型 @deepseek-ai/dsh-system-prompt）——经 get('systemPrompt') 读取 */
   systemPrompt?: SystemPromptLike;
-  /** T8.26.4：DSH 事件注册面（session/event 会话事实 + tools/result 工具结果 live；真实类型 Cordis Context.on） */
+  /** T8.26.4：DSH 事件注册面（session/event 会话事实 + tools/result 工具结果 live；真实类型 Cordis Context.on，mixin accessor） */
   on?(event: string, handler: (...args: unknown[]) => void): unknown;
+}
+
+/**
+ * 读服务/注入项：真实 DSH 上下文（Guard）经 ctx.get 免 inject 读取；测试 fakeCtx 无 get 时
+ * 退化到普通属性读取。未提供 → undefined（不抛）。
+ */
+function readService<T>(ctx: ContextLike, name: string): T | undefined {
+  if (typeof ctx.get === 'function') {
+    return ctx.get(name) as T | undefined;
+  }
+  return (ctx as unknown as Record<string, T | undefined>)[name];
 }
 
 /**
@@ -133,23 +156,35 @@ export function presetIdForLine(line: VersionLine): string {
   return `omb-v2-${line}`;
 }
 
-export function apply(ctx: ContextLike): void {
-  // T8.3：认知系统装配进插件生命周期——经 deps 注入（ctx.cognitive，组合根模式）或
-  // 组合根缺省装配（runtime/assembly.ts；装配根 = ctx.cognitiveRoot ?? ctx.config.cognitiveRoot）。
+/** apply 返回句柄（Cordis 忽略函数插件返回值；装配断言/测试句柄用） */
+export interface ApplyResult {
+  /** 装配出的认知运行时（未提供装配根 → undefined；仅注册命令） */
+  cognitive?: CognitiveRuntimeLike;
+}
+
+export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  // T8.3：认知系统装配进插件生命周期——经 deps 注入（get('cognitive')，组合根模式）或
+  // 组合根缺省装配（runtime/assembly.ts；装配根 = config.cognitiveRoot）。
   // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
-  if (ctx.cognitive === undefined) {
-    const root = ctx.cognitiveRoot ?? ctx.config?.cognitiveRoot;
+  // 状态存闭包（真实运行时 Guard 禁止写未 provide 的 ctx 属性）。
+  let cognitive = readService<CognitiveRuntimeLike>(ctx, 'cognitive');
+  let modelAdapter = readService<ModelAdapter>(ctx, 'modelAdapter');
+  const systemPrompt = readService<SystemPromptLike>(ctx, 'systemPrompt');
+  const agentPresets = readService<AgentPresetsLike>(ctx, 'agentPresets');
+  if (cognitive === undefined) {
+    const root = config.cognitiveRoot;
     if (root !== undefined) {
       // T8.12：组合根装配 ModelAdapter——显式注入优先；否则 llm 服务 + config.model 齐备时自动装配
-      //（真实 DSH 会话经 ctx.llm 提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
-      if (ctx.modelAdapter === undefined && ctx.llm !== undefined) {
-        const provider = ctx.config?.model?.provider;
-        const model = ctx.config?.model?.model;
-        if (provider !== undefined && provider.length > 0 && model !== undefined && model.length > 0) {
-          ctx.modelAdapter = createDshModelAdapter(ctx.llm, { provider, model });
+      //（真实 DSH 会话经 llm 服务提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
+      if (modelAdapter === undefined) {
+        const llm = readService<LlmStreamLike>(ctx, 'llm');
+        const provider = config.model?.provider;
+        const model = config.model?.model;
+        if (llm !== undefined && provider !== undefined && provider.length > 0 && model !== undefined && model.length > 0) {
+          modelAdapter = createDshModelAdapter(llm, { provider, model });
         }
       }
-      ctx.cognitive = createCognitiveRuntime({ root, modelAdapter: ctx.modelAdapter });
+      cognitive = createCognitiveRuntime({ root, modelAdapter });
     }
   }
 
@@ -170,7 +205,7 @@ export function apply(ctx: ContextLike): void {
    * 守卫：无收尾状态（无 prepare 且无待收尾标记）→ 无副作用；finalizeTurn 失败 → 记录降级，保留待收尾状态。
    */
   const finalizePendingTurn = async (sessionId: string, fallbackGoal: string): Promise<void> => {
-    const runtime = ctx.cognitive;
+    const runtime = cognitive;
     if (runtime === undefined) {
       return;
     }
@@ -206,12 +241,12 @@ export function apply(ctx: ContextLike): void {
   //   首请求触发 prepareTurn（fire-and-forget，防重入），返回空串（空文本不贡献）；prepareTurn 的 inject
   //   回调把投影文本写入缓存并触发 context/injected 事件入链（投影摘要：id/total_tokens/views）；后续请求
   //   同步返回缓存投影文本——每次注入的文本都有对应 context/injected 事件（Model-visible ⟺ logged）。
-  if (ctx.systemPrompt?.context !== undefined) {
-    if (ctx.cognitive !== undefined) {
+  if (systemPrompt?.context !== undefined) {
+    if (cognitive !== undefined) {
       const projectionTexts = new Map<string, string>();
       const preparing = new Set<string>();
       const kickPrepare = (assembleCtx: AssembleContextLike): void => {
-        const runtime = ctx.cognitive;
+        const runtime = cognitive;
         if (runtime === undefined) {
           return; // 防御：注册时已守卫运行时存在；并发装配变化时静默降级
         }
@@ -247,7 +282,7 @@ export function apply(ctx: ContextLike): void {
           preparing.delete(sessionId);
         });
       };
-      ctx.systemPrompt.context({
+      systemPrompt.context({
         name: 'cognitive:projection',
         order: 90,
         text: (assembleCtx) => {
@@ -263,7 +298,7 @@ export function apply(ctx: ContextLike): void {
       recordDegradation('cognitive-runtime', '认知运行时未装配——无认知投影注入（命令仍可用）');
     }
   } else {
-    recordDegradation('systemPrompt.context', '接口缺失（ctx.systemPrompt.context 不存在）——无认知投影注入（命令仍可用）');
+    recordDegradation('systemPrompt.context', '接口缺失（systemPrompt.context 不存在）——无认知投影注入（命令仍可用）');
   }
 
   // T8.26.4：事件监听——session/event（turn 生命周期 + 工具事实）与 tools/result（live 工具结果）→ observeEvent
@@ -273,9 +308,9 @@ export function apply(ctx: ContextLike): void {
   // 重复 id 幂等（只入链一次；live 零延迟信号 + session 耐久事实，先到者胜）。
   // 异步观察 fire-and-forget（append 为同步写，不阻塞 DSH 事件派发；失败记录降级不抛）。
   if (typeof ctx.on === 'function') {
-    if (ctx.cognitive !== undefined) {
+    if (cognitive !== undefined) {
       ctx.on('session/event', (session, dshEvent) => {
-        const runtime = ctx.cognitive;
+        const runtime = cognitive;
         if (runtime === undefined) {
           return; // 防御：注册时已守卫；并发装配变化时静默降级
         }
@@ -311,7 +346,7 @@ export function apply(ctx: ContextLike): void {
         });
       });
       ctx.on('tools/result', (exec, result) => {
-        const runtime = ctx.cognitive;
+        const runtime = cognitive;
         if (runtime === undefined) {
           return;
         }
@@ -344,10 +379,10 @@ export function apply(ctx: ContextLike): void {
         currentLine: () => current,
         isBlankSession: async () => isBlankSession(events),
         // T8.2 真实 recompose 接线：平台提供 agentPresets.recompose 才尝试；目标 preset id 按线映射
-        recompose: ctx.agentPresets?.recompose
+        recompose: agentPresets?.recompose
           ? async (line) => {
               try {
-                const r = await ctx.agentPresets!.recompose!(invocation.agent, presetIdForLine(line));
+                const r = await agentPresets!.recompose!(invocation.agent, presetIdForLine(line));
                 // 平台返回 {ok:false} 形状（如目标 preset 未安装）→ 明确受限
                 if (r !== null && typeof r === 'object' && (r as { ok?: unknown }).ok === false) {
                   const detail = (r as { detail?: unknown }).detail;
@@ -371,7 +406,7 @@ export function apply(ctx: ContextLike): void {
   });
 
   // T8.2：/bench 命令——触发冻结基准集运行（supervisor/bench.ts runBench；当前版本线）。
-  // T8.18：真实执行器接线——ctx.modelAdapter（T8.12 装配，需真实 DSH 会话）存在 → 真实 DSH 执行
+  // T8.18：真实执行器接线——modelAdapter（T8.12 装配，需真实 DSH 会话）存在 → 真实 DSH 执行
   //（三线真实分化）；无真实会话 → 降级回放执行器（数字可复现，平台限制文档化）。
   ctx.commands?.register?.({
     name: 'bench',
@@ -381,10 +416,10 @@ export function apply(ctx: ContextLike): void {
       try {
         const tasks = await loadBenchTasks();
         const line = current as BenchLine;
-        const executor = ctx.modelAdapter !== undefined ? makeRealExecutor(ctx.modelAdapter) : makeReplayExecutor();
+        const executor = modelAdapter !== undefined ? makeRealExecutor(modelAdapter) : makeReplayExecutor();
         const report = await runBench({ tasks, line, executor });
         const passed = report.results.filter((r) => r.passed).length;
-        const mode = ctx.modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
+        const mode = modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
         return {
           kind: 'success',
           text: `基准完成：${report.line} ${passed}/${report.results.length} 通过（${report.results.length} 任务，${mode}）`,
@@ -395,4 +430,6 @@ export function apply(ctx: ContextLike): void {
       }
     },
   });
+
+  return { cognitive };
 }

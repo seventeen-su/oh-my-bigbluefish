@@ -51,9 +51,10 @@ export const LINE_REFS: Record<VersionLine, string> = {
 /** 进程内 initial 物化目录缓存（每 bare 一次；避免重复 worktree add 与内容漂移） */
 const materializedInitial = new Map<string, string>();
 
-/** preset 根（本文件在 <preset>/substrate/ → 上一级即 preset 根） */
+/** preset 根（src 布局本文件在 <preset>/substrate/ → 上一级即 preset 根；编译布局 <preset>/lib/substrate/ 多一层 → 存在性回退） */
 function presetRoot(): string {
-  return fileURLToPath(new URL('..', import.meta.url));
+  const candidate = fileURLToPath(new URL('..', import.meta.url));
+  return fs.existsSync(path.join(candidate, 'kernel', 'policy')) ? candidate : path.dirname(candidate);
 }
 
 /** 默认布局：相对本模块位置解析真实三线布局 */

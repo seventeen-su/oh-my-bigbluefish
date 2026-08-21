@@ -8,7 +8,8 @@
 // "import 目标层 ≤ 源层"（eslint no-cross-layer-import 同款语义，tests/m0/dag-lint.test.ts 钉住）。
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint } from '../kernel/schemas/m.js';
@@ -27,8 +28,10 @@ import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt
 import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState } from './turn-helpers.js';
 import type { Experience } from '../kernel/schemas/c.js';
 
-/** 仓库根（本文件在 <preset>/runtime/ → 上一级即 preset 根） */
-const HERE = fileURLToPath(new URL('..', import.meta.url));
+/** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
+const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
+/** 仓库根：存在性回退（src 布局 HERE_CANDIDATE 即根；编译布局其下无 kernel/policy → 取上级） */
+const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
 
 export interface CognitiveAssemblyOptions {
   /** 用户态目录（缺省 workspace/.omb，架构 §3；memory.db/events.db 落此） */

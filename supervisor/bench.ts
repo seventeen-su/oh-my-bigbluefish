@@ -8,7 +8,8 @@
 //   - executor 注入：M7 无真实 DSH 时用回放执行器——复用 T5.2 ReplayRunner 的 canned 确定性模式
 //     （fixture 内录制 output/cost，无真实 I/O）→ 同 fixture 同 executor → 同 passed + 同 cost（数字可复现）。
 import { readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import {
@@ -32,8 +33,10 @@ import { judgeBlind } from './judge.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 
 // ---- 数据目录（相对本模块解析，与 cwd 无关） ----
+// src 布局本文件在 <preset>/supervisor/ → 上一级即 preset 根；编译布局 <preset>/lib/supervisor/ 多一层 → 存在性回退
 
-const HERE = fileURLToPath(new URL('..', import.meta.url)); // 仓库根/
+const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
+const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
 
 export const BENCH_TASKS_DIR = join(HERE, 'kernel', 'bench-tasks', 'tasks');
 export const BENCH_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'fixtures');
