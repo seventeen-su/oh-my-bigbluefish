@@ -12,8 +12,12 @@ import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/benc
 import { makeRealExecutor } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
+import { buildRequestFromSession, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
+import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { BenchLine } from '../kernel/schemas/bench.js';
+import type { GovernorDecision } from './governor.js';
+import type { PromptWorkingState } from './prompt.js';
 
 export const name = 'omb-v2';
 export const inject = ['commands'];
@@ -44,10 +48,25 @@ export interface AgentPresetsLike {
   recompose?(agentCtx: unknown, id: string): Promise<unknown>;
 }
 
-/** 认知运行时最小结构（T8.3 装配；runtime/assembly.ts 的 CognitiveRuntime 结构上满足） */
+/** 认知运行时最小结构（T8.3 装配；T8.26.2 三能力拆分后含 prepareTurn/observeEvent/finalizeTurn/snapshotHash） */
 export interface CognitiveRuntimeLike {
   eventStore: { append(e: unknown): Promise<void> };
   memory: { ingest(m: unknown): Promise<string> };
+  snapshotHash: string;
+  /** T8.26.3：turn 开始认知准备（prepareTurn §3.1）；inject 提供时注入投影并记 context/injected（Model-visible ⟺ logged） */
+  prepareTurn(
+    req: unknown,
+    opts?: { inject?(projection: ContextProjection): void | Promise<void> },
+  ): Promise<{
+    decision: GovernorDecision;
+    working_state: PromptWorkingState;
+    projection: ContextProjection;
+    events_appended: number;
+  }>;
+  /** T8.26.4：运行中事实入链（observeEvent §3.2） */
+  observeEvent(e: unknown): Promise<{ appended: boolean; degraded: string | null }>;
+  /** T8.26.5：turn 收尾（finalizeTurn §3.3） */
+  finalizeTurn(input: unknown): Promise<{ decision_event_id: string; events_appended: number }>;
   handleRequest(req: unknown): Promise<{
     decision: { decision: string };
     retrieval: { items: unknown[]; channel_used: string };
@@ -55,6 +74,22 @@ export interface CognitiveRuntimeLike {
     events_appended: number;
   }>;
   close(): Promise<void>;
+}
+
+/** DSH assembleContextFor 的结构最小面（真实类型见 @deepseek-ai/dsh-system-prompt AssembleContext：{ agent, scope, signal }） */
+export interface AssembleContextLike {
+  agent?: { session?: { id?: string; events?: ReadonlyArray<{ type?: string; data?: unknown }> } };
+  scope?: unknown;
+  signal?: unknown;
+}
+
+/** DSH systemPrompt 服务的最小结构（真实类型见 @deepseek-ai/dsh-system-prompt SystemPrompt.context；text 支持按请求求值） */
+export interface SystemPromptLike {
+  context?(def: {
+    name: string;
+    order: number;
+    text: string | ((assembleCtx: AssembleContextLike) => string);
+  }): unknown;
 }
 
 export interface ContextLike {
@@ -72,6 +107,8 @@ export interface ContextLike {
   llm?: LlmStreamLike;
   /** T8.12：注入的 ModelAdapter（组合根显式注入优先；未注入且 llm+config.model 齐备 → 自动装配） */
   modelAdapter?: ModelAdapter;
+  /** T8.26.3：DSH systemPrompt 服务（context 贡献注册面；真实类型 @deepseek-ai/dsh-system-prompt） */
+  systemPrompt?: SystemPromptLike;
 }
 
 /**
@@ -110,6 +147,69 @@ export function apply(ctx: ContextLike): void {
 
   // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
   let current: VersionLine = 'stable';
+
+  // T8.26.3：systemPrompt.context 钩子——按请求求值 → prepareTurn → 投影注入（Model-visible ⟺ logged）。
+  // 守卫（计划 §2 应对策略 2）：systemPrompt.context 缺失 → 记录降级（无认知注入，命令仍可用）；
+  // 认知运行时未装配 → 记录降级、不注册（无注入面）。
+  // 求值语义：DSH 的 context text 提供器为同步求值，而 prepareTurn 为异步——故采用「缓存 + 异步预热」：
+  //   首请求触发 prepareTurn（fire-and-forget，防重入），返回空串（空文本不贡献）；prepareTurn 的 inject
+  //   回调把投影文本写入缓存并触发 context/injected 事件入链（投影摘要：id/total_tokens/views）；后续请求
+  //   同步返回缓存投影文本——每次注入的文本都有对应 context/injected 事件（Model-visible ⟺ logged）。
+  if (ctx.systemPrompt?.context !== undefined) {
+    if (ctx.cognitive !== undefined) {
+      const projectionTexts = new Map<string, string>();
+      const preparing = new Set<string>();
+      const kickPrepare = (assembleCtx: AssembleContextLike): void => {
+        const runtime = ctx.cognitive;
+        if (runtime === undefined) {
+          return; // 防御：注册时已守卫运行时存在；并发装配变化时静默降级
+        }
+        const agent = assembleCtx?.agent;
+        const sessionId = agent?.session?.id;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return; // 无会话身份 → 无可注入
+        }
+        if (preparing.has(sessionId)) {
+          return; // 防重入：同一会话的并发 assembly 只跑一次 prepare
+        }
+        preparing.add(sessionId);
+        const goal = lastUserMessageText(agent?.session?.events);
+        const request = buildRequestFromSession(sessionId, goal);
+        runtime
+          .prepareTurn(request, {
+            inject: (projection) => {
+              projectionTexts.set(sessionId, projectionToText(projection));
+            },
+          })
+          .then((result) => {
+            projectionTexts.set(sessionId, projectionToText(result.projection));
+          })
+          .catch((err) => {
+            const detail = err instanceof Error ? err.message : String(err);
+            recordDegradation('context-provider', `prepareTurn 失败（${detail}）——本轮无投影注入`);
+          })
+          .finally(() => {
+            preparing.delete(sessionId);
+          });
+      };
+      ctx.systemPrompt.context({
+        name: 'cognitive:projection',
+        order: 90,
+        text: (assembleCtx) => {
+          const sessionId = assembleCtx?.agent?.session?.id;
+          if (typeof sessionId !== 'string' || sessionId.length === 0) {
+            return '';
+          }
+          kickPrepare(assembleCtx);
+          return projectionTexts.get(sessionId) ?? '';
+        },
+      });
+    } else {
+      recordDegradation('cognitive-runtime', '认知运行时未装配——无认知投影注入（命令仍可用）');
+    }
+  } else {
+    recordDegradation('systemPrompt.context', '接口缺失（ctx.systemPrompt.context 不存在）——无认知投影注入（命令仍可用）');
+  }
 
   ctx.commands?.register?.({
     name: 'mode',
