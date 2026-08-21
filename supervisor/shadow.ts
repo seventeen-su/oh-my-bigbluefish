@@ -29,6 +29,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { z, type ZodIssue } from 'zod';
+import { evaluateEProcess } from './e-process.js';
 
 // ---- 常量（待标定，§17 开放项：各层桶范围 / min_n / max_failure_rate 随冻结基准修正） ----
 
@@ -296,6 +297,9 @@ export interface CanaryRunResult {
   warnings: string[];
 }
 
+/** 金丝雀判定器注入（缺省 evaluateCanary 初值规则；T8.15 可注入 e-process 判定 evaluateEProcess） */
+export type CanaryEvaluator = (cert: Certificate) => { verdict: CanaryVerdict; reason: string };
+
 /** 构造 runCanary 的 exposure 条目（rollback 触发 = decision 'canary_rollback'，可带 outcome 标记 restore 结果） */
 function canaryEntry(opts: CanaryRunOptions, decision: ExposureEntry['decision'], outcome?: ExposureEntry['outcome']): ExposureEntry {
   return {
@@ -319,8 +323,11 @@ function canaryEntry(opts: CanaryRunOptions, decision: ExposureEntry['decision']
  *   - restore 已提交后 exposure log 写入失败 → 非致命（回滚不可重试）：resolve 并在 warnings
  *       显式给出"回滚已执行、日志未写入"，防止调用方重试 restore 造成双回滚。
  */
-export async function runCanary(opts: CanaryRunOptions): Promise<CanaryRunResult> {
-  const { verdict, reason } = evaluateCanary(opts.certificate);
+export async function runCanary(opts: CanaryRunOptions & { evaluator?: CanaryEvaluator }): Promise<CanaryRunResult> {
+  // T8.15：判定器可注入（缺省 evaluateCanary 初值公式；e-process 引擎经 evaluateEProcess 注入——
+  // runCanaryEProcess 便捷入口见下）。判定 → rollback 触发全自动回滚 + 审计（与初值路径同语义）。
+  const evaluate = opts.evaluator ?? evaluateCanary;
+  const { verdict, reason } = evaluate(opts.certificate);
   const warnings: string[] = [];
   let contract: RollbackContract | null = null;
   if (verdict === 'rollback') {
@@ -354,6 +361,26 @@ export async function runCanary(opts: CanaryRunOptions): Promise<CanaryRunResult
     await logExposure(opts.logPath, canaryEntry(opts, 'canary'));
   }
   return { verdict, reason, contract, warnings };
+}
+
+// ---- e-process 金丝雀（T8.15：初值公式 → anytime-valid 引擎；判定经 evaluateEProcess 注入） ----
+
+/**
+ * e-process 金丝雀自动检查：evaluateEProcess 判定（e ≥ 1/α → rollback，任意时刻拒绝零假设）→
+ * 自动回滚 + exposure log 审计（与 runCanary 全自动语义一致）。判定器注入保持 runCanary 契约，
+ * 本入口为 e-process 引擎的便捷接线（选型记录见 supervisor/e-process.ts）。
+ */
+export function runCanaryEProcess(opts: CanaryRunOptions): Promise<CanaryRunResult> {
+  return runCanary({
+    ...opts,
+    evaluator: (cert) =>
+      evaluateEProcess({
+        n: cert.stat.n,
+        failures: cert.stat.failures,
+        min_n: cert.threshold.min_n,
+        max_failure_rate: cert.threshold.max_failure_rate,
+      }),
+  });
 }
 
 // ---- 便捷常量（日志路径约定：workspace/.omb/.evolution/exposure.log） ----
