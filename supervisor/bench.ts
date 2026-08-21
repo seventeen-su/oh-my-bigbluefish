@@ -17,6 +17,7 @@ import {
   BenchTaskSchema,
   CognitiveCostSchema,
   FROZEN_BENCH_COUNTS,
+  JudgeComparisonReportSchema,
   type BenchCategory,
   type BenchFixture,
   type BenchLine,
@@ -24,7 +25,11 @@ import {
   type BenchResult,
   type BenchTask,
   type CognitiveCost,
+  type JudgeComparisonReport,
+  type JudgeComparisonResult,
 } from '../kernel/schemas/bench.js';
+import { judgeBlind } from './judge.js';
+import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 
 // ---- 数据目录（相对本模块解析，与 cwd 无关） ----
 
@@ -33,9 +38,15 @@ const HERE = fileURLToPath(new URL('..', import.meta.url)); // 仓库根/
 export const BENCH_TASKS_DIR = join(HERE, 'kernel', 'bench-tasks', 'tasks');
 export const BENCH_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'fixtures');
 
-// ---- executor 注入（M7 离线用回放 executor；真实 DSH 运行留用户裁定后接真实 executor） ----
+// ---- executor 注入（M7 离线用回放 executor；T8.18 真实 executor 经 ModelAdapter 注入） ----
 
-export type BenchExecutor = (task: BenchTask) => Promise<{ passed: boolean; cost: CognitiveCost }>;
+/** BenchExecutor：任务 → 判定 + 成本；output 为执行产物（T8.13 双 judge 对照需要——
+ *  LLM judge 对执行产物评分；回放 executor 输出 fixture.output） */
+export type BenchExecutor = (task: BenchTask) => Promise<{
+  passed: boolean;
+  cost: CognitiveCost;
+  output?: unknown;
+}>;
 
 // ---- CognitiveCost 八字段（§15：最低 token ≠ 最低成本；全零 = 无信号合法） ----
 
@@ -297,7 +308,7 @@ export function makeReplayExecutor(opts: { fixturesDir?: string } = {}): BenchEx
     const fixture = await loadBenchFixture(task.verifier.ref, dir);
     assertFixtureMatchesVerifier(task, fixture);
     const passed = runVerifier(task, fixture.output, fixture);
-    return { passed, cost: fixture.cost };
+    return { passed, cost: fixture.cost, output: fixture.output };
   };
 }
 
@@ -326,4 +337,41 @@ export async function runBench(opts: {
     results.push({ task_id: task.id, line, passed, cost: parsedCost });
   }
   return { line, results };
+}
+
+// ---- 双 judge 对照运行（T8.13：规则占位 + 离线 LLM judge 并存记录） ----
+
+/**
+ * 基准运行 + LLM judge 对照（仅基准用）：每任务 executor 执行（passed/cost/output）→
+ * blind_judge 任务再跑离线 LLM judge（对执行产物评分，schema 校验）→ 两路结果都记录
+ * （rule_passed 与 llm.verdict/score 并存可对照）；非 blind_judge 任务 llm=null。
+ * judge 未注入 → llm 恒 null（离线规则化占位仍是默认路径）。
+ */
+export async function runBenchWithJudges(opts: {
+  tasks: readonly BenchTask[];
+  line: BenchLine;
+  executor: BenchExecutor;
+  judge?: ModelAdapter;
+  fixturesDir?: string;
+}): Promise<JudgeComparisonReport> {
+  const line = BenchLineSchema.parse(opts.line);
+  const dir = opts.fixturesDir ?? BENCH_FIXTURES_DIR;
+  const results: JudgeComparisonResult[] = [];
+  for (const task of opts.tasks) {
+    const { passed, cost, output } = await opts.executor(task);
+    const parsedCost = CognitiveCostSchema.parse(cost);
+    let llm: { verdict: boolean; score: number } | null = null;
+    if (opts.judge !== undefined && task.verifier.kind === 'blind_judge') {
+      const fixture = await loadBenchFixture(task.verifier.ref, dir);
+      const score = await judgeBlind(opts.judge, task, output ?? fixture.output, fixture);
+      llm = { verdict: score.verdict, score: score.score };
+    }
+    results.push({ task_id: task.id, rule_passed: passed, llm, cost: parsedCost });
+  }
+  const report: JudgeComparisonReport = { line, results };
+  const checked = JudgeComparisonReportSchema.safeParse(report);
+  if (!checked.success) {
+    throw new Error(`runBenchWithJudges: 对照报告校验失败 — ${checked.error.message}`);
+  }
+  return report;
 }

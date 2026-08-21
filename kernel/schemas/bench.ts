@@ -101,6 +101,28 @@ export const BenchReportSchema = z.object({
 });
 export type BenchReport = z.infer<typeof BenchReportSchema>;
 
+// ---- 双 judge 对照报告（T8.13：规则占位 + 离线 LLM judge 结果并存记录） ----
+
+/** 单任务双 judge 记录：rule_passed = 规则化占位判定（executor 产物）；llm = LLM judge 结果（仅 blind_judge 任务） */
+export const JudgeComparisonResultSchema = z.object({
+  task_id: z.string().min(1),
+  rule_passed: z.boolean(),
+  llm: z
+    .object({
+      verdict: z.boolean(),
+      score: z.number().min(0).max(1),
+    })
+    .nullable(),
+  cost: CognitiveCostSchema,
+});
+export type JudgeComparisonResult = z.infer<typeof JudgeComparisonResultSchema>;
+
+export const JudgeComparisonReportSchema = z.object({
+  line: BenchLineSchema,
+  results: z.array(JudgeComparisonResultSchema),
+});
+export type JudgeComparisonReport = z.infer<typeof JudgeComparisonReportSchema>;
+
 // ---- 目标谓词（web：path + equals/matches/contains 至少其一） ----
 
 export const PredicateSpecSchema = z
