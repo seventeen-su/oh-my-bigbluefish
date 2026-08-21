@@ -67,7 +67,7 @@ export interface RegistryAPI {
     obj: EvolutionObject,
     signature: string,
     meta?: { name?: string; version?: string },
-  ): Promise<{ ok: boolean; error?: string }>;
+  ): Promise<{ ok: boolean; error?: string; duplicate?: boolean }>;
   verify(id: string): Promise<{ ok: boolean; detail: string }>;
   revoke(id: string, reason: string): Promise<void>;
   addVerification(id: string, record: VerificationRecord): Promise<{ ok: boolean; detail: string }>;
@@ -121,18 +121,21 @@ export class GitRegistry implements RegistryAPI {
     if (!entry || entry.revoked) return null;
     try {
       const raw = await readFile(this.objectFile(id), 'utf8');
-      return EvolutionObjectSchema.parse(JSON.parse(raw));
+      const obj = EvolutionObjectSchema.parse(JSON.parse(raw));
+      // CAS 绑定：文件名 = 内容地址（obj.id 必须等于请求 id；A 地址被替换为自洽对象 B 时此处检出 swap 篡改）
+      if (obj.id !== id) return null;
+      return obj;
     } catch {
       return null;
     }
   }
 
-  /** publish：schema → 内容哈希 → 签名 → 黑名单 → 去重（内容哈希已存在 → 拒绝）→ 落盘 + manifest 记录 */
+  /** publish：schema → 内容哈希 → 签名 → 黑名单 → 去重（内容哈希已存在 → 拒绝并标 duplicate——absorb 视为已入库继续共识）→ 落盘 + manifest 记录 */
   async publish(
     obj: EvolutionObject,
     signature: string,
     meta?: { name?: string; version?: string },
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; error?: string; duplicate?: boolean }> {
     await this.init();
     const parsed = EvolutionObjectSchema.safeParse(obj);
     if (!parsed.success) return { ok: false, error: `schema 校验失败: ${parsed.error.message}` };
@@ -143,7 +146,7 @@ export class GitRegistry implements RegistryAPI {
     if (signature.length === 0) return { ok: false, error: '签名为空' };
     if (this.blacklist.has(o.id)) return { ok: false, error: `对象已被撤销（本地黑名单）: ${o.id}` };
     if (this.manifest.some((e) => e.id === o.id)) {
-      return { ok: false, error: `重复发布（内容哈希已存在）: ${o.id}` };
+      return { ok: false, error: `重复发布（内容哈希已存在）: ${o.id}`, duplicate: true };
     }
     await writeFile(this.objectFile(o.id), JSON.stringify(o, null, 2), 'utf8');
     this.manifest.push({
@@ -176,6 +179,10 @@ export class GitRegistry implements RegistryAPI {
     }
     if (makeImmutableId(canonicalJson(stripId(obj))) !== obj.id) {
       return { ok: false, detail: '内容哈希与 id 不一致（对象被篡改）' };
+    }
+    // CAS 绑定：对象文件内容地址必须等于请求 id（A 地址被替换为自洽对象 B 时内容自洽校验可绕过，此处检出 swap 篡改）
+    if (obj.id !== id) {
+      return { ok: false, detail: `对象文件内容地址与请求 id 不一致（swap 篡改）: ${obj.id} ≠ ${id}` };
     }
     if (!entry.signature || entry.signature.length === 0) return { ok: false, detail: '签名缺失' };
     return { ok: true, detail: '签名/哈希/schema 校验通过' };
@@ -344,10 +351,14 @@ export async function absorb(
   if (!contract.ok) return fail('contract_tests', contract.detail);
   stages.push({ name: 'contract_tests', ok: true, detail: contract.detail });
 
-  // ⑥ 入库已验证（registry.publish；去重/黑名单由 registry 保证）
+  // ⑥ 入库已验证（registry.publish；去重命中（内容哈希已存在，duplicate）视为已入库，继续 consensus——多实例共识累积，§10.2）
   const pub = await registry.publish(parsed.data, signature);
-  if (!pub.ok) return fail('publish', pub.error ?? '发布失败');
-  stages.push({ name: 'publish', ok: true, detail: '对象入库（内容寻址）' });
+  if (!pub.ok && !pub.duplicate) return fail('publish', pub.error ?? '发布失败');
+  stages.push({
+    name: 'publish',
+    ok: true,
+    detail: pub.ok ? '对象入库（内容寻址）' : '去重命中（内容哈希已存在，继续共识累积）',
+  });
 
   // ⑦ 共识回传（verified_by += 本实例，写回 registry）
   const consensus = await registry.addVerification(parsed.data.id, {

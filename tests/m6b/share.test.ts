@@ -6,11 +6,13 @@
 //   ③ 打包/解包往返：packObject → unpackObject → 对象与签名一致；篡改内容 → unpack 校验失败 fail-loud
 //   ④ verify：签名/哈希非法 → 校验失败
 //   ⑤ 吸收管线：合法对象 → 吸收成功（verifyChain/replayBench/contractTests 依序被调）；任一步失败 → 短路 + AbsorbReport 记录失败步
-//   ⑥ 共识回传：吸收成功后 registry 中该对象 verified_by 含本实例（全纯代码——无网络）
+//   ⑥ 共识回传：吸收成功后 registry 中该对象 verified_by 含本实例；同对象再次吸收（publish 去重命中）仍视为 ok 继续 consensus 累积（全纯代码——无网络）
 //   ⑦ effective_diversity：同实例 3 条 → 1；异模型家族 3 条 → ≥2（加权正确）
 //   ⑧ 信誉等级：0 验证 → unverified；1 → locally-verified；多样性达标 → community-verified；跨环境多实例 → high-trust
 //   ⑨ revoke：撤销后 get 返回标记 + 本地黑名单生效（fail-loud）
 //   ⑩ Registry transport 实测（§17 开放项）：Git 清单 transport（本地目录 registry）全链路闭环可用
+//   ⑪ CAS 绑定（T6b.1 评审 Important 缺陷 1）：get/verify 校验文件名=内容地址——A 地址被替换为自洽对象 B → swap 篡改检出
+//   ⑫ 多实例共识累积（T6b.1 评审 Important 缺陷 2）：同对象两次 absorb（两实例）→ 去重命中仍走 consensus → verified_by 两实例 → 信誉可升 community-verified
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -337,11 +339,15 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const entry = (await reg.list()).find((e) => e.id === obj.id);
     expect(entry?.verified_by).toContainEqual({ instance: 'instance-A', diversity: 2 });
 
-    // 幂等：重复吸收（同对象已入库）→ publish 去重拒绝，失败步记录（不改动已入库状态）
+    // 去重命中仍走共识：同对象再次吸收（第二实例，缺省 'local-instance'）→ publish 去重视为 ok，consensus 累积
     const again = await absorb(reg, obj, 'sig-consensus', okDeps());
-    expect(again.ok).toBe(false);
-    expect(again.failed_at).toBe('publish');
-    expect((await reg.list()).find((e) => e.id === obj.id)?.verified_by).toHaveLength(1);
+    expect(again.ok).toBe(true);
+    expect(again.failed_at).toBeNull();
+    expect(again.stages.find((s) => s.name === 'consensus')?.ok).toBe(true);
+    const entry2 = (await reg.list()).find((e) => e.id === obj.id);
+    expect(entry2?.verified_by).toContainEqual({ instance: 'instance-A', diversity: 2 });
+    expect(entry2?.verified_by).toContainEqual({ instance: 'local-instance', diversity: 1 });
+    expect(entry2?.verified_by).toHaveLength(2);
   });
 
   it('⑦ effective_diversity：同实例 3 条 → 1；异模型家族 3 条 → ≥2（加权正确）', () => {
@@ -467,5 +473,63 @@ describe('集体演化协议（§13 / §10.2）', () => {
     const reg2 = new GitRegistry(root);
     const entry = (await reg2.list()).find((e) => e.id === obj.id);
     expect(entry?.verified_by).toContainEqual({ instance: 'transport-probe', diversity: 2 });
+  });
+
+  it('⑪ CAS 绑定：get/verify 校验文件名=内容地址（A 地址被替换为自洽对象 B → swap 篡改检出）', async () => {
+    const reg = new GitRegistry(root);
+    const objA = mkEvo();
+    const objB = mkEvo(); // 另一自洽合法对象（内容哈希与 B.id 一致——可绕过内容自洽校验，但 id 与 A 不同）
+    await reg.publish(objA, 'sig-a');
+
+    // swap 篡改：A 地址 objects/<hexA>.json 被替换为对象 B 的内容（B 自身完全合法）
+    await writeFile(join(root, 'objects', `${hexOf(objA.id)}.json`), JSON.stringify(objB), 'utf8');
+
+    // get(A) → null（请求 id ≠ 文件内容地址，CAS 核心不变量：文件名=内容地址）
+    expect(await reg.get(objA.id)).toBeNull();
+
+    // verify(A) → ok:false（swap 篡改检出）
+    const v = await reg.verify(objA.id);
+    expect(v.ok).toBe(false);
+    expect(v.detail).toMatch(/id|地址|不一致/i);
+  });
+
+  it('⑫ 多实例共识累积：同对象两次 absorb（两实例）→ 去重命中仍走 consensus → verified_by 两实例 → 信誉可升 community-verified', async () => {
+    const reg = new GitRegistry(root);
+    const obj = mkEvo();
+
+    // 实例 A 首次吸收（入库 + 共识回传）
+    const r1 = await absorb(reg, obj, 'sig-consensus', {
+      ...okDeps(),
+      instance: 'instance-A',
+      diversity: 2,
+    });
+    expect(r1.ok).toBe(true);
+
+    // 实例 B 二次吸收（模拟第二实例）：publish 去重命中（内容哈希相同）→ 仍视为 ok 继续 consensus
+    const r2 = await absorb(reg, obj, 'sig-consensus', {
+      ...okDeps(),
+      instance: 'instance-B',
+      diversity: 2,
+    });
+    expect(r2.ok).toBe(true);
+    expect(r2.failed_at).toBeNull();
+    expect(r2.stages.map((s) => s.name)).toEqual([
+      'signature_hash',
+      'schema',
+      'verify_chain',
+      'replay_bench',
+      'contract_tests',
+      'publish',
+      'consensus',
+    ]);
+
+    // 多实例共识累积：verified_by 含两实例（addVerification 按实例幂等）
+    const entry = (await reg.list()).find((e) => e.id === obj.id);
+    expect(entry?.verified_by).toContainEqual({ instance: 'instance-A', diversity: 2 });
+    expect(entry?.verified_by).toContainEqual({ instance: 'instance-B', diversity: 2 });
+    expect(entry?.verified_by).toHaveLength(2);
+
+    // 信誉经管线可达 community-verified（多样性合计 4 ≥ 门槛 3；实例数 2 < 3 故非 high-trust）
+    expect(reputation(entry!.verified_by)).toBe('community-verified');
   });
 });
