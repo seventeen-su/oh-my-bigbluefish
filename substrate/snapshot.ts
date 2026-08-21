@@ -41,8 +41,8 @@ export interface VersionLayout {
   gitBin?: string;
 }
 
-/** 三线 → 引用 */
-const LINE_REFS: Record<VersionLine, string> = {
+/** 三线 → 引用（boot.ts 等 substrate 内文件复用；refs/tags/initial、refs/heads/stable、refs/heads/main） */
+export const LINE_REFS: Record<VersionLine, string> = {
   initial: 'refs/tags/initial',
   stable: 'refs/heads/stable',
   latest: 'refs/heads/main',
