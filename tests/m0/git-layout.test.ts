@@ -1,7 +1,7 @@
 // T0.2 行为测试：三线 git 布局（bare repo + 正式只读 worktree + 候选临时可写 worktree）。
 // 真实 git/icacls 操作（禁 mock）：
 //   - 独立临时目录（mkdtemp）完整复现布局并断言（不动真实布局）；
-//   - 真实 preset/omb-v2 布局只读冒烟（读成功 + 写被拒，真实观察到拒绝，不许 mock）。
+//   - 真实布局只读冒烟（读成功 + 写被拒，真实观察到拒绝，不许 mock）。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -101,7 +101,7 @@ describe('三线 git 布局（独立临时 fixture 完整复现）', () => {
   });
 });
 
-describe('真实布局只读冒烟（preset/omb-v2）', () => {
+describe('真实布局只读冒烟', () => {
   it('真实 stable/manifest.json 可读且为 initial 基线', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(REAL_STABLE, 'manifest.json'), 'utf8')) as {
       name: string;

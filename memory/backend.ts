@@ -28,7 +28,7 @@ import {
 } from '../kernel/schemas/m.js';
 import { SCHEMA_SQL, ftsMatchExpr, parseCursor } from './sql.js';
 
-/** 默认 DB 文件（用户态目录，CONVENTIONS §7：preset/omb-v2/workspace/.omb/） */
+/** 默认 DB 文件（用户态目录，CONVENTIONS §7：workspace/.omb/） */
 export const DEFAULT_MEMORY_DB = 'workspace/.omb/memory.db';
 
 const BUSY_TIMEOUT_MS = 5000;

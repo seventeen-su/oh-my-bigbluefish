@@ -109,7 +109,7 @@ export interface LayoutFixture {
  *   3. main 再推进一版（与 stable 分叉）
  *   4. stable/ latest/ 正式 worktree（先 add 后加只读 ACL denyWriteRecursive）
  *   5. workspace/.omb/.evolution/candidates/<id>/ 候选临时可写 worktree（--detach @ initial）
- * 不触碰真实 preset/omb-v2 布局（测试安全）。
+ * 不触碰真实布局（测试安全）。
  */
 export function buildLayoutFixture(): LayoutFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-git-layout-'));

@@ -24,7 +24,7 @@ import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/benc
 
 // ---- 常量（目录相对本模块解析，与 cwd 无关） ----
 
-const HERE = fileURLToPath(new URL('..', import.meta.url)); // preset/omb-v2/
+const HERE = fileURLToPath(new URL('..', import.meta.url)); // 仓库根/
 export const DEFAULT_BENCH_DIR = join(HERE, 'workspace', '.omb', 'bench');
 export const DEFAULT_EVOLUTION_ROOT = join(HERE, 'workspace', '.omb', '.evolution');
 const BENCH_PREFIX = 'bench-';

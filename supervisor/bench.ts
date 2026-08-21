@@ -28,7 +28,7 @@ import {
 
 // ---- 数据目录（相对本模块解析，与 cwd 无关） ----
 
-const HERE = fileURLToPath(new URL('..', import.meta.url)); // preset/omb-v2/
+const HERE = fileURLToPath(new URL('..', import.meta.url)); // 仓库根/
 
 export const BENCH_TASKS_DIR = join(HERE, 'kernel', 'bench-tasks', 'tasks');
 export const BENCH_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'fixtures');

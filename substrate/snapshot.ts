@@ -56,7 +56,7 @@ function presetRoot(): string {
   return fileURLToPath(new URL('..', import.meta.url));
 }
 
-/** 默认布局：相对本模块位置解析真实 preset/omb-v2 三线布局 */
+/** 默认布局：相对本模块位置解析真实三线布局 */
 export function defaultLayout(): VersionLayout {
   const root = presetRoot();
   return {

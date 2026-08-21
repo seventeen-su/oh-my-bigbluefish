@@ -1,7 +1,7 @@
 // T0.5 行为测试：候选临时目录创建/清理 + Windows WRITE_RESTRICTED 受限子进程（koffi FFI）。
 // 真实 Windows 令牌/ACL/进程操作（禁 mock）：
 //   - 独立 mkdtemp fixture（workspace 根 + candidates 子目录）上做破坏性操作（受限写拒绝/允许、超时 kill）；
-//   - 真实 preset/omb-v2 workspace/.omb/.evolution/candidates 只做冒烟（建→清，零残留，不触碰真实候选 worktree 内容）。
+//   - 真实 workspace/.omb/.evolution/candidates 只做冒烟（建→清，零残留，不触碰真实候选 worktree 内容）。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -357,7 +357,7 @@ describe('removeDirRetry（teardown EPERM/EBUSY 竞态硬化：短退避重试�
   });
 });
 
-describe('真实布局冒烟（preset/omb-v2 workspace/.omb/.evolution/candidates，零残留）', () => {
+describe('真实布局冒烟（workspace/.omb/.evolution/candidates，零残留）', () => {
   it('createCandidateDir + runRestricted 在真实 candidates 根上可用：受限进程写结果文件成功，cleanup 后零残留', async () => {
     expect(fs.existsSync(REAL_CANDIDATES)).toBe(true);
     const h = createCandidateDir('m0-smoke');

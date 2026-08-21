@@ -1,7 +1,7 @@
 // T0.4 行为测试：版本回滚原语 rollbackTo（基于 Git revision 的原子切换 + fsync + worktree 尽力同步）。
 // 真实 git/icacls 操作（禁 mock）：
 //   - 独立临时 fixture（mkdtemp 完整复现三线布局）上做破坏性操作（回退/删文件）；
-//   - 真实 preset/omb-v2 布局只做只读冒烟（绝不切换真实 stable 引用）。
+//   - 真实布局只做只读冒烟（绝不切换真实 stable 引用）。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -153,7 +153,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
   });
 });
 
-describe('真实布局只读冒烟（preset/omb-v2，绝不切换真实 stable 引用）', () => {
+describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () => {
   it('真实 versions.git 的 refs/heads/stable 存在且可解析为 commit（只读）', () => {
     const refs = runGit(['for-each-ref', '--format=%(refname)'], { cwd: REAL_BARE });
     expect(refs).toContain('refs/heads/stable');

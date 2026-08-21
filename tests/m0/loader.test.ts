@@ -1,6 +1,6 @@
 // T0.3 行为测试：版本加载器 loadVersion（三线版本：initial/stable/latest）。
 // 真实 git 操作（禁 mock）：独立临时 fixture（mkdtemp 完整复现三线布局）上做破坏性断言，
-// 对真实 preset/omb-v2 布局只做只读冒烟。
+// 对真实布局只做只读冒烟。
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
