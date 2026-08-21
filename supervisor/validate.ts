@@ -19,12 +19,18 @@
 // Verification Synthesis（§9.2：AI 生成的 verifier 只能是 candidate verifier，防自证）：
 // 本模块实现验证链执行接口；合成 verifier 的 independent anchor / adversarial validation /
 // non-circularity 机制留 M7 或后续（brief 注明）。
+// T8.14：Verification Synthesis 落地——reproduction oracle（生成 → 沙箱验证 → anti-circularity）
+// 在 ./oracle.ts（LOC ≤ 400 拆分，validate.ts 统一出口 re-export，同 generator.ts 拆 generator-ops 先例）。
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z, type ZodIssue } from 'zod';
 import { OMB_OBJECTS, type ObjectNumber } from '../kernel/schemas/index.js';
 import { ReplayProcessSchema, ReplayRunner, type ReplayFixture } from './replay.js';
+
+// ---- Verification Synthesis 出口（T8.14：reproduction oracle，§9.2 防自证） ----
+
+export * from './oracle.js';
 
 // ---- 常量 ----
 
