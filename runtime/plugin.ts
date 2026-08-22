@@ -22,7 +22,9 @@ import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
 import { reduce } from '../supervisor/state-reducer.js';
 import { MaintenanceScheduler } from '../supervisor/maintenance.js';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { Event } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
@@ -155,6 +157,18 @@ function readService<T>(ctx: ContextLike, name: string): T | undefined {
   return (ctx as unknown as Record<string, T | undefined>)[name];
 }
 
+/** 插件 preset 根（src 布局 <preset>/runtime/ → 上一级；编译布局 <preset>/lib/runtime/ → 存在性回退取上级） */
+const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
+const PLUGIN_ROOT = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+
+/** 配置路径解析：绝对路径原样；相对路径相对 preset 根（迁移可移植——避免组合配置指向旧机器绝对路径） */
+function resolveConfigPath(p: string | undefined): string | undefined {
+  if (p === undefined || p.length === 0) {
+    return p;
+  }
+  return isAbsolute(p) ? p : join(PLUGIN_ROOT, p);
+}
+
 /**
  * 空白会话检查：会话事件流中尚无 turn/start。
  * 与 DSH api-proxy 的 sessionBlank 同款语义（api-proxy.ts:476：turn = 一次模型循环执行，
@@ -208,7 +222,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   const systemPrompt = readService<SystemPromptLike>(ctx, 'systemPrompt');
   const agentPresets = readService<AgentPresetsLike>(ctx, 'agentPresets');
   if (cognitive === undefined) {
-    const root = config.cognitiveRoot;
+    // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
+    const root = resolveConfigPath(config.cognitiveRoot);
     if (root !== undefined) {
       // T8.12：组合根装配 ModelAdapter——显式注入优先；否则 llm 服务 + config.model 齐备时自动装配
       //（真实 DSH 会话经 llm 服务提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
@@ -505,7 +520,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           line,
           executor,
           mode: modelAdapter !== undefined ? 'real' : 'replay',
-          persistDir: config.benchPersistDir ?? BENCH_REPORTS_DIR,
+          persistDir: resolveConfigPath(config.benchPersistDir) ?? BENCH_REPORTS_DIR,
         });
         const passed = report.results.filter((r) => r.passed).length;
         const mode = modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
