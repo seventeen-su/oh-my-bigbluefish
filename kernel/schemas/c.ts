@@ -2,8 +2,9 @@
 import { z } from 'zod';
 import { FingerprintSchema, ProvenanceSchema, irBase } from './base.js';
 
-/** §14.1 证据态原语（evidence plane：claim 如何被知晓；与 §5.2 三值裁决态正交，分层协调见 M8b 报告） */
-export const EvidenceStatusEnum = z.enum(['inferred', 'observed', 'verified']);
+/** §14.1 证据态原语（evidence plane：claim 如何被知晓；与 §5.2 三值裁决态正交，分层协调见 M8b 报告；
+ *  revoked = 证据效力被撤销（evidence/revoked 事件，历史不删除）） */
+export const EvidenceStatusEnum = z.enum(['inferred', 'observed', 'verified', 'revoked']);
 export type EvidenceStatus = z.infer<typeof EvidenceStatusEnum>;
 
 /** C1 Claim { text, epistemic, evidence_status, supported_by[], contradicted_by[], confidence } */

@@ -46,6 +46,7 @@ export const FIXED_EVENT_TYPES = [
   'decision/made',
   'contradiction/found',
   'observation/contradictory',
+  'evidence/revoked',
   'memory/admitted',
   'memory/consolidated',
   'checkpoint/saved',

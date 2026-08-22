@@ -114,11 +114,11 @@ describe('T8.26.4 事件监听（plugin.ts apply）', () => {
       { timeout: 5000, interval: 10 },
     );
 
-    // ① Event Store 可查：类型面完整（session/start ×2、claim/update ×2、tool/call、tool/result、contradiction/found）
+    // ① Event Store 可查：类型面完整（session/start ×2、claim/update ×3（两条用户指令 + 工具结果证据 claim）、tool/call、tool/result、contradiction/found）
     const events = (await runtime.eventStore.query({ session_id: SESSION })).events;
     const types = events.map((e) => e.type);
     expect(types.filter((t) => t === 'session/start')).toHaveLength(2);
-    expect(types.filter((t) => t === 'claim/update')).toHaveLength(2);
+    expect(types.filter((t) => t === 'claim/update')).toHaveLength(3);
     expect(types).toContain('tool/call');
     expect(types).toContain('tool/result');
     expect(types).toContain('contradiction/found');
@@ -170,6 +170,45 @@ describe('T8.26.4 事件监听（plugin.ts apply）', () => {
     const payload = tr.payload as Record<string, unknown>;
     expect(payload.call_id).toBe('c1');
     expect(payload.is_error).toBe(true);
+  });
+
+  it('反证解除：同 callId 不同结果签名（工具结果被修正）→ evidence/revoked 入链，历史保留，claim 证据态撤销', async () => {
+    const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
+    apply(ctx);
+
+    bus.emit('session/event', { id: SESSION }, dshEvent('tool/result', {
+      turn: 1,
+      step: 1,
+      message: { source: { callId: 'c1' }, content: [{ type: 'text', text: '答案 A', isError: false }] },
+    }, 1001));
+
+    bus.emit('session/event', { id: SESSION }, dshEvent('tool/result', {
+      turn: 1,
+      step: 2,
+      message: { source: { callId: 'c1' }, content: [{ type: 'text', text: '答案 B（修正）', isError: false }] },
+    }, 1002));
+
+    await vi.waitFor(
+      async () => {
+        const evs = (await runtime.eventStore.query({ session_id: SESSION })).events;
+        expect(evs.some((e) => e.type === 'evidence/revoked')).toBe(true);
+      },
+      { timeout: 5000, interval: 10 },
+    );
+
+    const evs = (await runtime.eventStore.query({ session_id: SESSION })).events;
+    const revoked = evs.filter((e) => e.type === 'evidence/revoked');
+    expect(revoked).toHaveLength(1);
+    const rp = revoked[0]!.payload as Record<string, unknown>;
+    expect(rp.claim_id).toBe('ev:tool:c1');
+    // 历史保留：两条 tool/result 都在（修正结果用新确定性 id，不覆盖旧事件）
+    const trs = evs.filter((e) => e.type === 'tool/result');
+    expect(trs).toHaveLength(2);
+    expect(new Set(trs.map((e) => e.id)).size).toBe(2);
+    // State：claim 证据态 revoked；修正计数 +1
+    const { projections } = reduce(evs);
+    expect(projections.claims.get('ev:tool:c1')?.evidence_status).toBe('revoked');
+    expect(projections.utility_counts.corrections).toBe(1);
   });
 
   it('守卫降级：无 ctx.on（接口缺失）→ apply 不抛、不注册监听、记录降级（命令仍可用）', () => {

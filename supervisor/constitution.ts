@@ -7,9 +7,10 @@
 // M8b 修正（主会话裁决 2026-08-21）：矛盾观测是反证而非证实——verified 的证据须为非矛盾观测引用
 //   （Evidence 引用非空且对应 observation 事件非 contradictory）；observation/contradictory 整体处理迁入本模块。
 
-/** §14.1 证据态（evidence plane 原语全集：inferred/observed/verified） */
-export type EvidenceStatus = 'inferred' | 'observed' | 'verified';
-export const EVIDENCE_STATUSES: readonly EvidenceStatus[] = ['inferred', 'observed', 'verified'];
+/** §14.1 证据态（evidence plane 原语全集：inferred/observed/verified；revoked = 证据效力被撤销
+ *  （evidence/revoked 事件，历史不删除——撤销只改派生视图，见 state-reducer）） */
+export type EvidenceStatus = 'inferred' | 'observed' | 'verified' | 'revoked';
+export const EVIDENCE_STATUSES: readonly EvidenceStatus[] = ['inferred', 'observed', 'verified', 'revoked'];
 
 /** fail-loud 错误前缀（宪法 = 允许的状态转换约束，§14.1） */
 export const CONSTITUTION_VIOLATION = '宪法不变量违规';

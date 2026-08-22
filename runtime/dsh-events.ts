@@ -10,6 +10,7 @@
 // 未识别/缺关键字段 → 空（不抛，事件不采集，事实源以 DSH 日志为权威）。
 // 层 DAG（CONVENTIONS §4）：runtime(2) → kernel(2)/runtime(2) 满足"import 目标层 ≤ 源层"。
 import type { Event } from '../kernel/schemas/m.js';
+import { createHash } from 'node:crypto';
 import { dshEventId, makeDshEvent } from './loop-hooks.js';
 
 /** DSH session 事件的最小形状（真实类型见 @deepseek-ai/dsh-session SessionEvent：{ type, data, seq, time }） */
@@ -20,7 +21,7 @@ export interface DshSessionEventLike {
   time?: number;
 }
 
-/** 会话追踪状态（mapper 的纯状态：turn/同 turn 用户指令 claim/最近 goal） */
+/** 会话追踪状态（mapper 的纯状态：turn/同 turn 用户指令 claim/最近 goal/工具结果签名表） */
 export interface SessionTraceState {
   /** 最近观察到的 DSH turn（-1 = 未开始） */
   turn: number;
@@ -28,10 +29,12 @@ export interface SessionTraceState {
   turnClaims: Array<{ id: string; text: string }>;
   /** 最近人类 user/message 文本（goal 携带，供 T8.26.3 请求合成） */
   lastGoal: string;
+  /** 工具结果签名表：callId → 结果签名（反证解除：同 callId 不同签名 = 修正 → evidence/revoked + 新结果） */
+  toolResults: Map<string, string>;
 }
 
 export function initialTraceState(): SessionTraceState {
-  return { turn: -1, turnClaims: [], lastGoal: '' };
+  return { turn: -1, turnClaims: [], lastGoal: '', toolResults: new Map() };
 }
 
 export interface MapSessionEventResult {
@@ -163,29 +166,80 @@ export function mapSessionEvent(
     if (callId.length === 0) {
       return { events: [], state };
     }
-    const blocks = Array.isArray(message?.content) ? (message?.content as Array<{ isError?: unknown }>) : [];
+    const blocks = Array.isArray(message?.content) ? (message?.content as Array<{ isError?: unknown; text?: unknown }>) : [];
     const blockError = blocks.some((b) => b?.isError === true);
     const isError = blockError || data.error !== undefined;
-    return {
-      events: [
+    // 结果签名（修正检测：同 callId 不同签名 = 工具结果被修正——反证解除，不删历史）
+    const textBlocks = blocks
+      .map((b) => (typeof b?.text === 'string' ? b.text : ''))
+      .join('\n')
+      .slice(0, 4096);
+    const signature = createHash('sha256')
+      .update(`${String(isError)}|${JSON.stringify(data.error ?? null)}|${textBlocks}`, 'utf8')
+      .digest('hex');
+    const prevSig = state.toolResults.get(callId);
+    const corrected = prevSig !== undefined && prevSig !== signature;
+    const events: Event[] = [];
+    const claimId = `ev:tool:${callId}`;
+    // 工具证据 claim（observed；确定性 id → 幂等，重复观察不重复入链）
+    events.push(
+      makeDshEvent(
+        'claim/update',
+        sessionId,
+        snapshotHash,
+        {
+          claim_id: claimId,
+          text: `工具结果: ${callId}`,
+          epistemic: 'unresolved',
+          evidence_status: 'observed',
+        },
+        type,
+        time,
+        dshEventId([sessionId, 'claim/update', claimId]),
+      ),
+    );
+    if (corrected) {
+      // 反证解除：旧工具结果证据失效（事件 id 保留在链上，不删除）——证据撤销 + 新结果（新确定性 id）
+      events.push(
         makeDshEvent(
-          'tool/result',
+          'evidence/revoked',
           sessionId,
           snapshotHash,
           {
-            call_id: callId,
-            turn: typeof data.turn === 'number' ? data.turn : 0,
-            step: typeof data.step === 'number' ? data.step : 0,
-            is_error: isError,
-            error: data.error ?? null,
+            evidence_id: dshEventId([sessionId, 'tool/result', callId]),
+            claim_id: claimId,
+            reason: '工具结果被修正（同 callId 不同输出签名）',
           },
           type,
           time,
-          dshEventId([sessionId, 'tool/result', callId]),
+          dshEventId([sessionId, 'evidence/revoked', callId, signature.slice(0, 8)]),
         ),
-      ],
-      state,
-    };
+      );
+    }
+    const resultId = corrected
+      ? dshEventId([sessionId, 'tool/result', callId, signature.slice(0, 8)])
+      : dshEventId([sessionId, 'tool/result', callId]);
+    events.push(
+      makeDshEvent(
+        'tool/result',
+        sessionId,
+        snapshotHash,
+        {
+          call_id: callId,
+          turn: typeof data.turn === 'number' ? data.turn : 0,
+          step: typeof data.step === 'number' ? data.step : 0,
+          is_error: isError,
+          error: data.error ?? null,
+          result_signature: signature.slice(0, 16),
+        },
+        type,
+        time,
+        resultId,
+      ),
+    );
+    const toolResults = new Map(state.toolResults);
+    toolResults.set(callId, signature);
+    return { events, state: { ...state, toolResults } };
   }
 
   return { events: [], state };

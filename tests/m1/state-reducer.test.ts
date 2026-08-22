@@ -338,3 +338,43 @@ describe('initial 状态种子（opts.initial）', () => {
     expect(state.self).toBe('sm:1');
   });
 });
+
+describe('反证解除（evidence/revoked，§14.1）', () => {
+  it('tool/result → 工具证据 claim 入表（ev:tool:<call_id>，证据态 observed）', () => {
+    const { projections } = reduce([evt('tool/result', { call_id: 't:1', name: 'read' })]);
+    const claim = projections.claims.get('ev:tool:t:1');
+    expect(claim).toBeDefined();
+    expect(claim?.evidence_status).toBe('observed');
+    expect(claim?.epistemic).toBe('unresolved');
+    expect(projections.utility_counts.corrections).toBe(0);
+  });
+
+  it('evidence/revoked：supported claim + confirmed 假设 → 证据态 revoked、三值 unresolved、假设回 active（待重新评估，不直接恢复为成立）', () => {
+    const events = [
+      claimUpdate('c:1', { epistemic: 'supported', evidence_status: 'verified', evidence: ['e:1'] }),
+      hypTransition('h:1', { claim_id: 'c:1', status: 'confirmed' }),
+      evt('evidence/revoked', { evidence_id: 'e:1', claim_id: 'c:1', reason: '反证失效' }),
+    ];
+    const { state, projections } = reduce(events);
+    expect(projections.claims.get('c:1')?.evidence_status).toBe('revoked');
+    expect(projections.claims.get('c:1')?.epistemic).toBe('unresolved'); // 不直接恢复为 supported
+    expect(projections.hypotheses.get('h:1')?.status).toBe('active'); // 待重新评估
+    expect(state.working.confirmed_facts).not.toContain('c:1');
+    expect(state.working.active_hypotheses).toContain('h:1');
+    expect(projections.utility_counts.corrections).toBe(1);
+  });
+
+  it('evidence/revoked：未注册 claim 引用 → fail-loud（缺事件，宪法同款守卫）', () => {
+    expect(() => reduce([evt('evidence/revoked', { evidence_id: 'e:9', claim_id: 'c:missing' })])).toThrow(
+      /引用未知 claim/,
+    );
+  });
+
+  it('evidence/revoked：缺 evidence_id/claim_id → fail-loud', () => {
+    expect(() => reduce([evt('evidence/revoked', { claim_id: 'c:1' })])).toThrow(/缺少 evidence_id\/claim_id/);
+  });
+
+  it('EVENTS_HANDLED 注册表含 evidence/revoked（防漂移）', () => {
+    expect(EVENTS_HANDLED).toContain('evidence/revoked');
+  });
+});

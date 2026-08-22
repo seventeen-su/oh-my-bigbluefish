@@ -260,9 +260,23 @@ function applyDecisionMade(a: Accum, e: Event): void {
 function applyToolCall(a: Accum): void {
   a.utility.tool_calls += 1;
 }
-/** tool/result：工具证据（证据计数基础）；tool_calls 由 tool/call 计数，其余证据计数器归 M1.1 对接 */
-function applyToolResult(): void {
-  /* no-op：已注册防漂移 */
+/** tool/result：工具证据入 claim 表（claim_id = ev:tool:<call_id|tool_id>，证据态 observed）。
+ *  工具结果是 Observation 事实（T8.26.4）——入链后撤销/修正经 evidence/revoked 事件表达（不删历史）。 */
+function applyToolResult(a: Accum, e: Event): void {
+  const p = e.payload as { call_id?: unknown; tool_id?: unknown; name?: unknown };
+  const callId = str(p.call_id) ?? str(p.tool_id);
+  if (!callId) {
+    return; // 无标识的工具结果（缺关键字段）→ 仅计数语义，不建 claim（防御）
+  }
+  const claimId = `ev:tool:${callId}`;
+  const prev = a.claims.get(claimId);
+  const view: ClaimView = {
+    text: `工具结果: ${str(p.name) ?? callId}`,
+    epistemic: prev?.epistemic ?? 'unresolved',
+    evidence_status: prev?.evidence_status === 'revoked' ? 'revoked' : 'observed',
+    confidence: prev?.confidence ?? 0,
+  };
+  a.claims.set(claimId, view);
 }
 function applyRetrieve(a: Accum): void {
   a.utility.retrieval_calls += 1;
@@ -290,6 +304,48 @@ function applyContextInjected(): void {
   /* no-op：投影注入是模型可见事实，State 不因注入变化 */
 }
 
+/**
+ * evidence/revoked（§14.1 反证解除闭合）：记录证据失效，不删除历史证据。
+ * payload {evidence_id, claim_id, reason?}：evidence_id = 被撤销证据事件 id；claim_id = 该证据支撑的 claim。
+ * 语义（不直接恢复为成立）：
+ *  - claim 证据态 → revoked（verified/observed 均撤销；历史事件保留，仅派生视图变化）；
+ *  - claim 三值：supported → unresolved（撤销不是证实也不是恢复）；confirmed 移除；
+ *  - 依赖该 claim 的假设 → active（待重新评估——不是直接恢复为 confirmed）；
+ *  - corrections 计数 +1（修正留痕）。
+ * 守卫：claim_id 引用未知 claim → fail-loud（缺事件，同宪法其余引用校验）。
+ */
+function applyEvidenceRevoked(a: Accum, e: Event): void {
+  const p = e.payload as { evidence_id?: unknown; claim_id?: unknown; reason?: unknown };
+  const evidenceId = str(p.evidence_id);
+  const claimId = str(p.claim_id);
+  if (!evidenceId || !claimId) {
+    throw new Error('reduce: evidence/revoked 缺少 evidence_id/claim_id');
+  }
+  const claim = a.claims.get(claimId);
+  if (claim === undefined) {
+    throw new Error(`reduce: evidence/revoked 引用未知 claim: ${claimId}（缺事件：claim 未在事件流中出现）`);
+  }
+  if (claim.evidence_status !== 'revoked') {
+    a.claims.set(claimId, {
+      ...claim,
+      evidence_status: 'revoked',
+      epistemic: claim.epistemic === 'supported' ? 'unresolved' : claim.epistemic,
+    });
+  }
+  removeId(a.confirmed, claimId);
+  // 依赖假设 → active（待重新评估）
+  for (const [hid, hv] of a.hypotheses) {
+    if (hv.claim_id !== claimId) {
+      continue;
+    }
+    if (hv.status !== 'active') {
+      a.hypotheses.set(hid, { ...hv, status: 'active' });
+      pushUnique(a.actives, hid);
+    }
+  }
+  a.utility.corrections += 1;
+}
+
 type ApplyFn = (a: Accum, e: Event) => void;
 
 /** 派发表 = EVENTS_HANDLED 注册表（单一事实源：键集即已注册事件类型） */
@@ -301,6 +357,7 @@ const APPLY: Record<string, ApplyFn> = {
   'hypothesis/transition': applyHypothesisTransition,
   'observation/contradictory': (a, e) => applyObservationContradictoryEvent(a, e.payload as Record<string, unknown>),
   'contradiction/found': applyContradictionFound,
+  'evidence/revoked': applyEvidenceRevoked,
   'decision/made': applyDecisionMade,
   'tool/call': applyToolCall,
   'tool/result': applyToolResult,

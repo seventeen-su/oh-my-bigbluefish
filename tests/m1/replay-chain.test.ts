@@ -94,7 +94,10 @@ function chainEvents(): (Event & { seq: number })[] {
       { observation_id: 'o:1', claim_id: 'c:2', hypothesis_id: 'h:2', status: 'discriminated' },
       15,
     ),
-    evt('session/end', {}, 16),
+    // 反证解除（§14.1）：evidence/revoked——工具证据撤销（历史保留；c:3 由工具结果 claim 提供）
+    evt('tool/result', { tool_id: 't:2', name: 'read' }, 16),
+    evt('evidence/revoked', { evidence_id: 'e:rev', claim_id: 'ev:tool:t:2', reason: '反证失效' }, 17),
+    evt('session/end', {}, 18),
   ];
 }
 
