@@ -22,9 +22,10 @@ describe('中文技术检索基准脚手架（§17 分词选型）', () => {
     const a = runRetrievalBench(docs, queries, 'ngram');
     const b = runRetrievalBench(docs, queries, 'ngram');
     // 确定性：除 tokenizer_ms（计时抖动）外逐字段一致
-    expect({ ...a, metrics: a.metrics.map((m) => ({ ...m, tokenizer_ms: 0 })) }).toEqual({
+    expect({ ...a, metrics: a.metrics.map((m) => ({ ...m, tokenizer_ms: 0 })), summary: { ...a.summary, mean_tokenizer_ms: 0 } }).toEqual({
       ...b,
       metrics: b.metrics.map((m) => ({ ...m, tokenizer_ms: 0 })),
+      summary: { ...b.summary, mean_tokenizer_ms: 0 },
     });
     expect(a.summary.queries).toBe(queries.length);
     for (const m of a.metrics) {
