@@ -10,11 +10,14 @@
 // layer 2（runtime/）：仅 import node: 内置 + kernel/schemas/（同层契约）+ runtime/ 内文件。
 import type { ModelAdapter, ModelGenerateResult, ModelUsage } from '../kernel/schemas/model-adapter.js';
 
-/** DSH LlmRuntime.stream 的 GenerateOptions 最小结构（真实类型 @deepseek-ai/dsh-llm，不引包） */
+/** DSH LlmRuntime.stream 的 GenerateOptions 最小结构（真实类型 @deepseek-ai/dsh-llm，不引包）。
+ *  消息 content 为内容块数组（ContentBlock[]：{type:'text',text} 等）——DSH 全链路
+ *  （image 策略/序列化）按数组处理，字符串 content 会在 contentHasImage 处抛
+ *  "content.some is not a function"（真实 /bench 实测暴露）。 */
 export interface LlmStreamOptionsLike {
   provider: string;
   model: string;
-  messages: ReadonlyArray<{ role: string; content: string }>;
+  messages: ReadonlyArray<{ role: string; content: ReadonlyArray<{ type: string; text: string }> }>;
   system?: string;
   temperature?: number;
   maxTokens?: number;
@@ -43,7 +46,7 @@ export function createDshModelAdapter(llm: LlmStreamLike, opts: DshModelAdapterO
       const stream = llm.stream({
         provider: opts.provider,
         model: opts.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
         ...(genOpts.system === undefined ? {} : { system: genOpts.system }),
         ...(genOpts.temperature === undefined ? {} : { temperature: genOpts.temperature }),
         ...(genOpts.maxTokens === undefined ? {} : { maxTokens: genOpts.maxTokens }),
