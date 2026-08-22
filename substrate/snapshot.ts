@@ -14,8 +14,30 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** git 可执行文件完整路径（沙箱拦截 PATH 解析，CONVENTIONS §2） */
-export const GIT_BIN = 'D:\\Git\\cmd\\git.exe';
+/** git 可执行文件解析（迁移可移植；优先级：GIT_BIN 环境变量 → 常见安装位置 → PATH 'git'）。
+ *  DSH 沙箱可能拦截 PATH 解析（CONVENTIONS §2）→ 部署可设 GIT_BIN 指向完整路径。 */
+function resolveGitBin(): string {
+  const env = process.env.GIT_BIN;
+  if (env !== undefined && env.length > 0) {
+    return env;
+  }
+  for (const candidate of [
+    'C:\\Program Files\\Git\\cmd\\git.exe',
+    'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
+  ]) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // 探测失败忽略，继续下一个候选
+    }
+  }
+  return 'git';
+}
+
+/** git 可执行文件完整路径（解析结果缓存；缺失时回退 PATH 'git'） */
+export const GIT_BIN = resolveGitBin();
 
 export type VersionLine = 'initial' | 'stable' | 'latest';
 

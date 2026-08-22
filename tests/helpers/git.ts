@@ -5,8 +5,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-/** git 完整路径（沙箱拦截 PATH 解析，必须用完整路径） */
-export const GIT = 'D:\\Git\\cmd\\git.exe';
+/** git 完整路径（沙箱拦截 PATH 解析，必须用完整路径；GIT_BIN 环境变量优先，回退常见安装位置/PATH） */
+export const GIT = ((): string => {
+  const env = process.env.GIT_BIN;
+  if (env !== undefined && env.length > 0) {
+    return env;
+  }
+  for (const candidate of [
+    'C:\\Program Files\\Git\\cmd\\git.exe',
+    'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
+  ]) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // 忽略探测失败
+    }
+  }
+  return 'git';
+})();
 
 function icaclsPath(): string {
   return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe');
