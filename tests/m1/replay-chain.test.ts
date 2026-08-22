@@ -129,7 +129,7 @@ describe('Event → State → Checkpoint → Replay 重建链（M1 出口「回�
       tool_calls: 1,
       retrieval_calls: 1,
       memory_ops: 2,
-      corrections: 0,
+      corrections: 1, // evidence/revoked 反证解除 +1（§14.1 修正留痕）
       reads: 0,
       hits: 0,
     });
