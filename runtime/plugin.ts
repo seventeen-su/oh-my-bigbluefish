@@ -12,6 +12,7 @@
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
+import { bootStable } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 import { makeRealExecutor } from '../supervisor/real-executor.js';
@@ -165,6 +166,19 @@ export interface ApplyResult {
 }
 
 export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  // 恢复根启动完整性校验（架构 §3/§11.4；T8.1 生产接线补全）：stable 引用/内容损坏 →
+  // bootStable 自动沿历史回退到上一完好快照。apply 为同步契约，bootStable 异步 fire-and-forget
+  //（先于认知装配发起；回退成功/失败均记录降级，命令仍可用——不阻塞挂载）。
+  void bootStable().then((r) => {
+    if (r.ok === false) {
+      recordDegradation('boot/stable', `启动校验失败：版本线 ${r.line} 无恢复路径（${r.warnings.map((w) => w.kind).join(',')}）`);
+    } else if (r.rollback !== undefined) {
+      recordDegradation('boot/stable', `启动自动回退：${r.rollback.previous_head.slice(0, 8)} → ${r.rollback.new_head.slice(0, 8)}（worktree ${r.rollback.worktree_status}）`);
+    }
+  }).catch((err) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    recordDegradation('boot/stable', `启动校验异常（${detail}）——跳过自动回退`);
+  });
   // T8.3：认知系统装配进插件生命周期——经 deps 注入（get('cognitive')，组合根模式）或
   // 组合根缺省装配（runtime/assembly.ts；装配根 = config.cognitiveRoot）。
   // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
