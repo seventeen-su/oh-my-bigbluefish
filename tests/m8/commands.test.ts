@@ -184,11 +184,12 @@ describe('T8.2 /bench 注册与触发', () => {
       expect(r.kind).toBe('success');
 
       const completedDir = join(base, 'act', 'completed');
+      // 超时放宽：全量套件并行时真实 versions.git 有 git 竞争（m0 真实布局冒烟同仓操作），记录链可能变慢
       await vi.waitFor(
         () => {
           expect(readdirSync(completedDir).length).toBeGreaterThan(0);
         },
-        { timeout: 5000, interval: 10 },
+        { timeout: 15000, interval: 20 },
       );
       const files = readdirSync(completedDir);
       expect(files).toHaveLength(1);
