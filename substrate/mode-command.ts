@@ -21,7 +21,10 @@ export interface ModeCommandDeps {
   onSwitch?: (line: VersionLine) => Promise<void>;
   /**
    * 平台级 recompose（可选；T8.2 接线）：DSH preset recompose（ctx.agentPresets.recompose）。
-   * 提供时：切换前先调用——ok → 继续 onSwitch；!ok → error（明确受限，平台限制文档化），onSwitch 不被调。
+   * 提供时：切换前先调用——ok → 继续 onSwitch；!ok → **降级为会话内版本线状态**：
+   * onSwitch 仍执行（本地线状态切换生效），结果文本明示 recompose 受限
+   *（2026-08-22 修正：原实现 !ok 直接 error 不切换，与插件文案"降级为会话内版本线状态"不一致；
+   *   纯错误路径保留：load 失败 / 非空白会话）。
    * 未提供（平台无 recompose 面）→ 降级为会话内当前线状态（onSwitch 本地记录）。
    */
   recompose?: (line: VersionLine) => Promise<{ ok: boolean; detail: string }>;
@@ -69,9 +72,14 @@ export async function modeCommandHandler(
   if (deps.recompose !== undefined) {
     const r = await deps.recompose(line);
     if (!r.ok) {
+      // T8.2 降级语义（2026-08-22）：recompose 平台受限（如 per-line 预设缺失）→
+      // 会话内版本线状态切换仍生效（onSwitch 本地记录），成功文本明示受限。
+      if (deps.onSwitch !== undefined) {
+        await deps.onSwitch(line);
+      }
       return {
-        kind: 'error',
-        text: `切换到 ${line} 失败（平台受限）：${r.detail}；当前仍为 ${deps.currentLine()}（会话内状态）`,
+        kind: 'success',
+        text: `已切换到版本线 ${line}（会话内状态；recompose 受限：${r.detail}）`,
       };
     }
   }

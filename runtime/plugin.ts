@@ -62,10 +62,12 @@ export interface CommandsLike {
   }): unknown;
 }
 
-/** DSH CommandInvocation 的最小结构（真实类型含 commandId/agent/rawInput/signal） */
+/** DSH CommandInvocation 的最小结构（真实类型含 commandId/agent/rawInput/signal；
+ *  agent.ctx = 会话作用域上下文，recompose 需要它——传 agent 对象本身会被拒（unscoped context）） */
 export interface CommandInvocationLike {
   readonly commandId: unknown;
   readonly agent: {
+    readonly ctx?: unknown;
     readonly session?: { readonly events?: ReadonlyArray<{ readonly type?: string }> };
   };
   readonly rawInput: string;
@@ -563,7 +565,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         recompose: agentPresets?.recompose
           ? async (line) => {
               try {
-                const r = await agentPresets!.recompose!(invocation.agent, presetIdForLine(line));
+                // recompose 需要 agent 的作用域上下文（agent.ctx）；传 agent 对象 → unscoped context 拒绝
+                const r = await agentPresets!.recompose!((invocation.agent as { ctx?: unknown }).ctx, presetIdForLine(line));
                 // 平台返回 {ok:false} 形状（如目标 preset 未安装）→ 明确受限
                 if (r !== null && typeof r === 'object' && (r as { ok?: unknown }).ok === false) {
                   const detail = (r as { detail?: unknown }).detail;

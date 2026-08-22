@@ -93,27 +93,31 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
     expect(current.text).toContain('latest');
   });
 
-  it('recompose 调用抛错 → 明确受限：error + 平台限制文档化，本地线状态不变', async () => {
+  it('recompose 调用抛错 → 降级切换：success（会话内状态）+ 受限说明，本地线状态已更新', async () => {
     const c = makeFakeCtx({ recompose: () => Promise.reject(new Error('preset omb-v2-latest 不存在')) });
     apply(c.ctx);
 
     const r = await mode(c).handler(makeInvocation('latest'));
-    expect(r.kind).toBe('error');
-    expect(r.text).toMatch(/平台|受限|失败/);
+    expect(r.kind).toBe('success');
+    expect(r.text).toMatch(/受限/);
     expect(r.text).toContain('omb-v2-latest');
-    // 本地线状态未切换
+    expect(r.text).toContain('latest');
+    // 降级语义：recompose 受限 → 会话内版本线状态切换仍生效
     const current = await mode(c).handler(makeInvocation(''));
-    expect(current.text).toContain('stable');
+    expect(current.text).toContain('latest');
   });
 
-  it('recompose 返回 {ok:false} → 明确受限（error + detail）', async () => {
+  it('recompose 返回 {ok:false} → 降级切换：success（会话内状态）+ detail 明示', async () => {
     const c = makeFakeCtx({ recompose: () => ({ ok: false, detail: '目标 preset 未安装' }) });
     apply(c.ctx);
 
     const r = await mode(c).handler(makeInvocation('initial'));
-    expect(r.kind).toBe('error');
+    expect(r.kind).toBe('success');
     expect(r.text).toContain('目标 preset 未安装');
+    expect(r.text).toContain('initial');
     expect(c.recomposed).toEqual(['omb-v2-initial']);
+    const current = await mode(c).handler(makeInvocation(''));
+    expect(current.text).toContain('initial');
   });
 
   it('ctx 无 agentPresets → 降级为会话内当前线状态（recompose 不被调，切换仍成功——既有 m0 行为保持）', async () => {
