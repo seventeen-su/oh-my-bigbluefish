@@ -1,0 +1,12 @@
+[
+  { "id": "q-01", "text": "全息对偶 量子引力 黑洞熵", "relevant": ["d-holography"] },
+  { "id": "q-02", "text": "SQLite 全文检索 分词器", "relevant": ["d-sqlite-fts", "d-ngram"] },
+  { "id": "q-03", "text": "git 工作树 只读 发布", "relevant": ["d-git-worktree"] },
+  { "id": "q-04", "text": "模型 量化 压缩 推理", "relevant": ["d-quantization"] },
+  { "id": "q-05", "text": "Governor 决策 预算", "relevant": ["d-governor"] },
+  { "id": "q-06", "text": "中文 分词 bigram", "relevant": ["d-ngram"] },
+  { "id": "q-07", "text": "记忆 检索 投影 命中", "relevant": ["d-retrieval"] },
+  { "id": "q-08", "text": "回滚 恢复 引用切换", "relevant": ["d-rollback"] },
+  { "id": "q-09", "text": "维护 调度 债务", "relevant": ["d-maintenance"] },
+  { "id": "q-10", "text": "沙盒 权限 拒绝 写入", "relevant": ["d-sandbox-acl"] }
+]
