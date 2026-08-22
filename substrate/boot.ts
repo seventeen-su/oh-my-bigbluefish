@@ -46,20 +46,42 @@ export interface BootResult {
   rollback?: RollbackResult;
 }
 
+/** 瞬态锁错误（Windows 文件锁/杀软竞态）：短退避有限次重试；非锁错误/超次 → 直接抛错 */
+const LOCK_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const LOCK_RETRY_COUNT = 3;
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /** 在 bare 上运行 git（cwd=bare）；非 0 退出抛错并带 stderr（与 snapshot.ts 同款） */
 function runGit(layout: VersionLayout, args: string[], gitBin?: string): string {
-  try {
-    const stdout = execFileSync(gitBin ?? GIT_BIN, args, {
-      cwd: layout.bareRepo,
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    return stdout.trimEnd();
-  } catch (err) {
-    const e = err as { status?: number; stderr?: Buffer | string };
-    const detail = e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
-    throw new Error(`git ${args.join(' ')} 失败 (exit=${e.status ?? '?'}): ${detail}`);
+  let last: unknown;
+  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
+    try {
+      const stdout = execFileSync(gitBin ?? GIT_BIN, args, {
+        cwd: layout.bareRepo,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      return stdout.trimEnd();
+    } catch (err) {
+      last = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
+        break; // 非文件锁错误 → 不重试
+      }
+      if (attempt < LOCK_RETRY_COUNT - 1) {
+        sleepMs(50 * (attempt + 1));
+      }
+    }
   }
+  const e = last as { status?: number; stderr?: Buffer | string };
+  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
+  const code = (last as NodeJS.ErrnoException).code;
+  throw new Error(
+    `git ${args.join(' ')} 失败 (exit=${(e as { status?: number }).status ?? '?'}${code === undefined ? '' : ` code=${code}`}): ${detail}`,
+  );
 }
 
 /** 对象级完整性校验：<rev>:manifest.json 在 git 树中可读（与 worktree 状态无关） */

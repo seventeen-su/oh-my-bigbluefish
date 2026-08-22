@@ -38,6 +38,14 @@ export interface GitRunOptions {
   workTree?: string;
 }
 
+/** 瞬态锁错误（Windows 文件锁/杀软竞态）：短退避有限次重试；非锁错误/超次 → 直接抛错 */
+const LOCK_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const LOCK_RETRY_COUNT = 3;
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /** 运行 git（完整路径），返回 stdout（去尾空白）；非 0 退出抛错并带 stderr。 */
 export function runGit(args: string[], opts: GitRunOptions = {}): string {
   const fullArgs: string[] = [];
@@ -48,33 +56,58 @@ export function runGit(args: string[], opts: GitRunOptions = {}): string {
     fullArgs.push(`--work-tree=${opts.workTree}`);
   }
   fullArgs.push(...args);
-  try {
-    const stdout = execFileSync(GIT, fullArgs, {
-      cwd: opts.cwd,
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    return stdout.trimEnd();
-  } catch (err) {
-    const e = err as { status?: number; stderr?: Buffer | string };
-    const detail = e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
-    throw new Error(`git ${args.join(' ')} 失败 (exit=${e.status ?? '?'}): ${detail}`);
+  let last: unknown;
+  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
+    try {
+      const stdout = execFileSync(GIT, fullArgs, {
+        cwd: opts.cwd,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      return stdout.trimEnd();
+    } catch (err) {
+      last = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
+        break;
+      }
+      if (attempt < LOCK_RETRY_COUNT - 1) {
+        sleepMs(50 * (attempt + 1));
+      }
+    }
   }
+  const e = last as { status?: number; stderr?: Buffer | string };
+  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
+  const code = (last as NodeJS.ErrnoException).code;
+  throw new Error(
+    `git ${args.join(' ')} 失败 (exit=${(e as { status?: number }).status ?? '?'}${code === undefined ? '' : ` code=${code}`}): ${detail}`,
+  );
 }
 
-/** 运行 icacls（完整路径），返回 stdout（去尾空白）；非 0 退出抛错。 */
+/** 运行 icacls（完整路径），返回 stdout（去尾空白）；非 0 退出抛错。瞬态锁错误短退避重试（同 runGit）。 */
 export function runIcacls(args: string[]): string {
-  try {
-    const stdout = execFileSync(icaclsPath(), args, {
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    return stdout.trimEnd();
-  } catch (err) {
-    const e = err as { status?: number; stderr?: Buffer | string };
-    const detail = e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
-    throw new Error(`icacls ${args.join(' ')} 失败 (exit=${e.status ?? '?'}): ${detail}`);
+  let last: unknown;
+  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
+    try {
+      const stdout = execFileSync(icaclsPath(), args, {
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      return stdout.trimEnd();
+    } catch (err) {
+      last = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
+        break;
+      }
+      if (attempt < LOCK_RETRY_COUNT - 1) {
+        sleepMs(50 * (attempt + 1));
+      }
+    }
   }
+  const e = last as { status?: number; stderr?: Buffer | string };
+  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
+  throw new Error(`icacls ${args.join(' ')} 失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
 }
 
 /**
