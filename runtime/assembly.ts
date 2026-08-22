@@ -8,8 +8,11 @@
 // "import 目标层 ≤ 源层"（eslint no-cross-layer-import 同款语义，tests/m0/dag-lint.test.ts 钉住）。
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
+import { GIT_BIN, defaultLayout } from '../substrate/snapshot.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint } from '../kernel/schemas/m.js';
@@ -32,6 +35,32 @@ import type { Experience } from '../kernel/schemas/c.js';
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
 /** 仓库根：存在性回退（src 布局 HERE_CANDIDATE 即根；编译布局其下无 kernel/policy → 取上级） */
 const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+
+/** 真实快照哈希（§11.2 请求级快照身份；替代静态占位 'rs:assembly'）：
+ *  git HEAD（versions.git）+ 策略三 YAML + 过程 YAML 内容哈希（确定性；策略/过程改动 → 快照变化）。
+ *  任一步失败 → 降级 'rs:assembly'（不抛——装配不因快照计算失败中断）。 */
+function computeSnapshotHash(policyDir: string, processesDir: string): string {
+  try {
+    const head = execFileSync(GIT_BIN, ['rev-parse', 'HEAD'], {
+      cwd: defaultLayout().bareRepo,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim();
+    const h = createHash('sha256');
+    h.update(head);
+    h.update('\0');
+    for (const name of ['governor.yaml', 'budget.yaml', 'context.yaml']) {
+      h.update(readFileSync(join(policyDir, name)));
+    }
+    const processes = readdirSync(processesDir).filter((f) => f.endsWith('.yaml')).sort();
+    for (const f of processes) {
+      h.update(readFileSync(join(processesDir, f)));
+    }
+    return `rs:${h.digest('hex').slice(0, 16)}`;
+  } catch {
+    return 'rs:assembly';
+  }
+}
 
 export interface CognitiveAssemblyOptions {
   /** 用户态目录（缺省 workspace/.omb，架构 §3；memory.db/events.db 落此） */
@@ -135,7 +164,7 @@ export class CognitiveRuntime {
     this.memory = new RetrievalBackend(opts.memoryDb ?? join(root, 'memory.db'));
     this.policyDir = opts.policyDir ?? join(HERE, 'kernel', 'policy');
     this.processesDir = opts.processesDir ?? join(HERE, 'kernel', 'processes');
-    this.snapshotHash = opts.snapshotHash ?? 'rs:assembly';
+    this.snapshotHash = opts.snapshotHash ?? computeSnapshotHash(this.policyDir, this.processesDir);
     this.modelAdapter = opts.modelAdapter ?? null;
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
