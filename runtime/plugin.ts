@@ -11,7 +11,7 @@
 // M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
-import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
+import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { bootStable } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
@@ -189,6 +189,16 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     const detail = err instanceof Error ? err.message : String(err);
     recordDegradation('boot/stable', `启动校验异常（${detail}）——跳过自动回退`);
   });
+  // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）
+  try {
+    const removed = cleanupStaleInitialWorktrees();
+    if (removed > 0) {
+      recordDegradation('initial/cleanup', `清理跨进程残留 initial 物化 worktree ${removed} 个`);
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
+  }
   // T8.3：认知系统装配进插件生命周期——经 deps 注入（get('cognitive')，组合根模式）或
   // 组合根缺省装配（runtime/assembly.ts；装配根 = config.cognitiveRoot）。
   // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
@@ -238,6 +248,12 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           rt.maintenance?.stop?.();
         } catch {
           // 停表失败幂等忽略（无状态残留）
+        }
+        // 本进程 initial 物化 worktree 清理（防跨进程残留累积）
+        try {
+          disposeMaterializedInitial();
+        } catch {
+          // 清理失败 → 下次启动 cleanupStaleInitialWorktrees 兜底
         }
         void rt.close().catch((err) => {
           const detail = err instanceof Error ? err.message : String(err);

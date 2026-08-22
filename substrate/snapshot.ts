@@ -124,6 +124,95 @@ function materializeInitialTree(layout: VersionLayout, commit: string): string {
 }
 
 /**
+ * 清理跨进程残留的 initial 物化 worktree（%TEMP%\initial-*）。
+ * 每次进程启动调用（本进程 materializedInitial 尚为空 → 不会误删本进程物化）：
+ * 注册表（<bare>/worktrees/initial-*）的 gitdir 指向系统临时目录即视为上一进程残留 →
+ * 删除目录 + 注册项 + worktree prune。返回清理数量（0 = 无残留）。
+ */
+export function cleanupStaleInitialWorktrees(layout: VersionLayout = defaultLayout()): number {
+  const regDir = path.join(layout.bareRepo, 'worktrees');
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(regDir);
+  } catch {
+    return 0; // 注册表不存在 → 无残留
+  }
+  const tmpForms: string[] = [path.resolve(os.tmpdir()).toLowerCase()];
+  try {
+    tmpForms.push(path.resolve(fs.realpathSync(os.tmpdir())).toLowerCase());
+  } catch {
+    // tmpdir realpath 失败 → 仅原始形式比对
+  }
+  let removed = 0;
+  for (const name of entries) {
+    if (!name.startsWith('initial-')) {
+      continue;
+    }
+    const gitdirFile = path.join(regDir, name, 'gitdir');
+    let target = '';
+    try {
+      target = fs.readFileSync(gitdirFile, 'utf8').trim();
+    } catch {
+      continue; // 注册项不完整 → 留给 worktree prune
+    }
+    const targetNorm = path.resolve(path.dirname(target)).toLowerCase();
+    // 系统临时目录判定：git 存长路径、os.tmpdir() 可能报短路径（Windows 8.3）且 realpath 不归一 →
+    // 注册名 initial-* + 路径含 <temp>\initial- 即视为系统临时物化；自定义 initialBase 不匹配
+    const isTemp = tmpForms.some((t) => targetNorm.startsWith(t))
+      || targetNorm.includes('\\temp\\initial-');
+    if (!isTemp) {
+      continue; // 非系统临时目录物化（如自定义 initialBase）→ 不动
+    }
+    const wd = path.dirname(target); // <tmp>/initial-XXXX/.git → 物化目录
+    try {
+      if (fs.existsSync(wd)) {
+        fs.rmSync(wd, { recursive: true, force: true });
+      }
+    } catch {
+      // 删除失败（锁等）→ 保留注册项，留给后续 prune
+    }
+    try {
+      fs.rmSync(path.join(regDir, name), { recursive: true, force: true });
+    } catch {
+      // 注册项删除失败 → 保留（prune 兜底）
+    }
+    removed += 1;
+  }
+  if (removed > 0) {
+    try {
+      runGit(layout, ['worktree', 'prune']);
+    } catch {
+      // prune 失败不致命（目录/注册项已尽力清理）
+    }
+  }
+  return removed;
+}
+
+/** 本进程已物化的 initial 目录（插件退出清理用；避免跨进程残留累积） */
+export function materializedInitialPaths(): string[] {
+  return [...materializedInitial.values()];
+}
+
+/** 本进程物化清理：删目录 + prune + 清缓存（插件生命周期关闭时调用；幂等） */
+export function disposeMaterializedInitial(layout: VersionLayout = defaultLayout()): void {
+  for (const dir of materializedInitialPaths()) {
+    try {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // 删除失败 → 留给下次启动的 cleanupStaleInitialWorktrees
+    }
+  }
+  materializedInitial.clear();
+  try {
+    runGit(layout, ['worktree', 'prune']);
+  } catch {
+    // prune 失败不致命
+  }
+}
+
+/**
  * 加载指定版本线：返回 { tree_root, git_revision }。
  * 前置完整性校验：引用存在且可解析为 commit + tree_root/manifest.json 可读；任一失败 fail-loud。
  * @param line 版本线（initial | stable | latest）
