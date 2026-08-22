@@ -124,7 +124,8 @@ export class CognitiveRuntime {
   private readonly policyDir: string;
   private readonly processesDir: string;
   private readonly checkpointDir: string | undefined;
-  private readonly maintenance: MaintenanceScheduler | null;
+  /** 维护调度器（生产装配注入；插件经此在请求间隙驱动 requestQuantum/停表——公开面） */
+  readonly maintenance: MaintenanceScheduler | null;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
 

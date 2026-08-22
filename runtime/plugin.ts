@@ -21,6 +21,8 @@ import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
 import { reduce } from '../supervisor/state-reducer.js';
+import { MaintenanceScheduler } from '../supervisor/maintenance.js';
+import { join } from 'node:path';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { Event } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
@@ -90,6 +92,12 @@ export interface CognitiveRuntimeLike {
   observeEvent(e: unknown): Promise<{ appended: boolean; degraded: string | null }>;
   /** T8.26.5：turn 收尾（finalizeTurn §3.3） */
   finalizeTurn(input: unknown): Promise<{ decision_event_id: string; events_appended: number }>;
+  /** 维护调度器（生产装配：turn 收尾入队；请求间隙 requestQuantum 小量子；stop 退出停表） */
+  maintenance?: {
+    requestQuantum(opts?: { signal?: unknown }): Promise<unknown>;
+    debtSnapshot(): unknown;
+    stop?(): void;
+  } | null;
   handleRequest(req: unknown): Promise<{
     decision: { decision: string };
     retrieval: { items: unknown[]; channel_used: string };
@@ -132,6 +140,8 @@ export interface ContextLike {
   systemPrompt?: SystemPromptLike;
   /** T8.26.4：DSH 事件注册面（session/event 会话事实 + tools/result 工具结果 live；真实类型 Cordis Context.on，mixin accessor） */
   on?(event: string, handler: (...args: unknown[]) => void): unknown;
+  /** 生命周期效应注册面（Cordis ctx.effect：回调立即执行，返回值作为清理函数；测试 fakeCtx 可缺省） */
+  effect?(callback: () => unknown): unknown;
 }
 
 /**
@@ -200,12 +210,42 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           modelAdapter = createDshModelAdapter(llm, { provider, model });
         }
       }
-      cognitive = createCognitiveRuntime({ root, modelAdapter });
+      cognitive = createCognitiveRuntime({
+        root,
+        modelAdapter,
+        // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
+        //（turn 收尾入队 + 请求间隙小量子；debt 落盘到认知数据根 .evolution/）
+        checkpointDir: join(root, 'checkpoints'),
+        maintenance: new MaintenanceScheduler({ debtFile: join(root, '.evolution', 'debt.json') }),
+      });
     }
   }
 
   // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
   let current: VersionLine = 'stable';
+
+  // 生命周期安全关闭（插件停止/会话结束）：维护调度器停表 + 认知运行时关库
+  //（SQLite WAL 收尾先 close；幂等；失败记录降级不抛——生产装配补全）。
+  // 守卫：ctx.effect 缺失（测试 fakeCtx）→ 不注册关闭钩子（命令仍可用）。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => {
+      const rt = cognitive;
+      if (rt === undefined) {
+        return;
+      }
+      return () => {
+        try {
+          rt.maintenance?.stop?.();
+        } catch {
+          // 停表失败幂等忽略（无状态残留）
+        }
+        void rt.close().catch((err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('cognitive/close', `运行时关闭失败（${detail}）`);
+        });
+      };
+    });
+  }
 
   // T8.26.5：turn 收尾共享状态——prepareTurn 决策/工作状态缓存（finalize 输入）与待收尾标记。
   // 收尾触发面（§3.3/§4）：session/flush（耐久检查点）→ finalizeTurn；turn/end（turn 事实关闭）→ 标记待收尾；
@@ -275,6 +315,15 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           return; // 防重入：同一会话的并发 assembly 只跑一次 prepare
         }
         preparing.add(sessionId);
+        // 请求间隙维护小量子（生产装配）：下一请求开始前执行 1 个待维护任务
+        //（turn 收尾入队 → 本 turn 结束 → 下 turn 准备前按债务/优先级执行；无调度器 → 跳过）
+        const m = cognitive?.maintenance;
+        if (m !== undefined && m !== null) {
+          void m.requestQuantum().catch((err) => {
+            const detail = err instanceof Error ? err.message : String(err);
+            recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
+          });
+        }
         // goal 来源：插件自身会话追踪（session/event 已观察到的最近人类指令）优先，assembleCtx 事件兜底
         const goal = traces.get(sessionId)?.lastGoal ?? lastUserMessageText(agent?.session?.events);
         const request = buildRequestFromSession(sessionId, goal);
