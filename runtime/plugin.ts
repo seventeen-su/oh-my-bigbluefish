@@ -22,6 +22,9 @@ import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
 import { reduce } from '../supervisor/state-reducer.js';
 import { MaintenanceScheduler } from '../supervisor/maintenance.js';
+import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
+import { ActivationContractSchema, type ActivationContract } from '../kernel/schemas/m.js';
+import { dshEventId, makeDshEvent } from './loop-hooks.js';
 import { dirname, isAbsolute, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +47,8 @@ export interface PluginConfig {
   model?: { provider?: string; model?: string };
   /** 基准明细落盘目录（/bench 真实/回放逐任务 JSONL；缺省 BENCH_REPORTS_DIR = <preset>/workspace/.omb/bench） */
   benchPersistDir?: string;
+  /** 版本激活记录持久化目录（/mode 切换时写入 completed/<id>.json，T8.7 幂等持久化；缺省不落盘） */
+  activationLogDir?: string;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -248,6 +253,85 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
 
   // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
   let current: VersionLine = 'stable';
+
+  /**
+   * 版本线激活记录（T8.7 生产接线）：/mode 切换后调用。
+   * - activationLogDir 配置 → completed/<activation_id>.json 幂等落盘（pending 先写，完成清 pending；
+   *   M6 ActivationContract schema 校验 fail-loud 不落盘；重启后可恢复）；
+   * - 认知装配时 → activation/committed 事件入链（P7 事实源；确定性 id 幂等）。
+   * 字段全部来自真实切换数据（predecessor/candidate = 前后版本线 git revision）；
+   * 任一步失败 → 降级记录（切换已生效，仅记录缺失）。
+   */
+  const recordLineActivation = async (
+    sessionId: string | undefined,
+    previous: VersionLine,
+    line: VersionLine,
+  ): Promise<void> => {
+    try {
+      const snap = await loadVersion(line);
+      const prevSnap = previous === line ? snap : await loadVersion(previous);
+      const now = new Date().toISOString();
+      const activationId = dshEventId(['activation', sessionId ?? 'anon', line, snap.git_revision]);
+      const contract: ActivationContract = {
+        id: activationId,
+        ir_version: '2.0',
+        schema: 'omb/M6',
+        scope: 'Project',
+        lifecycle: 'active',
+        immutable: false,
+        owner: 'kernel',
+        created: now,
+        updated: now,
+        provenance: {
+          source: 'mode-command',
+          event: activationId,
+          actor: 'kernel',
+          environment: { os: 'windows', node: process.version, dsh_version: '0.1.1-rc.1', project: 'omb-v2' },
+          runtime_snapshot: cognitive?.snapshotHash ?? 'rs:assembly',
+          timestamp: now,
+          transformation_chain: ['mode/switch'],
+          verification: 'replay',
+        },
+        refs: [],
+        predecessor: prevSnap.git_revision,
+        candidate: snap.git_revision,
+        required_capabilities: [],
+        evidence_certificate: 'mode-command',
+        compatible_schema: 'omb/IR 2.0',
+        activation_scope: 'session',
+        rollback_snapshot: prevSnap.git_revision,
+      };
+      ActivationContractSchema.parse(contract); // M6 schema 校验 fail-loud（不合规不落盘）
+      const logDir = resolveConfigPath(config.activationLogDir);
+      if (logDir !== undefined) {
+        writePending(logDir, {
+          activation_id: activationId,
+          candidate: snap.git_revision,
+          predecessor: prevSnap.git_revision,
+          rollback_snapshot: prevSnap.git_revision,
+          started_at: Date.now(),
+        });
+      }
+      if (cognitive !== undefined && typeof sessionId === 'string' && sessionId.length > 0) {
+        await cognitive.eventStore.append(makeDshEvent(
+          'activation/committed',
+          sessionId,
+          cognitive.snapshotHash,
+          { activation_id: activationId, line, previous_line: previous, git_revision: snap.git_revision },
+          'mode',
+          undefined,
+          activationId,
+        ));
+      }
+      if (logDir !== undefined) {
+        writeCompleted(logDir, activationId, contract);
+        clearPending(logDir, activationId);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('activation', `版本线激活记录失败（${detail}）——切换已生效，记录缺失`);
+    }
+  };
 
   // 生命周期安全关闭（插件停止/会话结束）：维护调度器停表 + 认知运行时关库
   //（SQLite WAL 收尾先 close；幂等；失败记录降级不抛——生产装配补全）。
@@ -470,6 +554,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     recordInput: true,
     handler: async (invocation) => {
       const events = invocation.agent.session?.events;
+      const sessionId = (invocation.agent.session as { id?: string } | undefined)?.id;
       return modeCommandHandler(invocation.rawInput ?? '', {
         load: async (line) => loadVersion(line),
         currentLine: () => current,
@@ -495,7 +580,12 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
             }
           : undefined,
         onSwitch: async (line) => {
+          const previous = current;
           current = line;
+          // T8.7 生产接线：版本线激活记录——activation/committed 事件入链（认知装配时）+
+          // activationLogDir 幂等持久化（配置时；重启后恢复）。字段全部来自真实切换数据；
+          // 任一步失败 → 降级记录（切换已生效，仅记录缺失，不影响命令结果）。
+          await recordLineActivation(sessionId, previous, line);
         },
       });
     },

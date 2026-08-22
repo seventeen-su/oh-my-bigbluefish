@@ -4,8 +4,9 @@
 //   ctx 无 agentPresets → 降级为会话内当前线状态（既有 m0 行为不变）。
 // - /bench：注册 bench 命令；handler 经 supervisor/bench.ts 真实 runBench（冻结基准集 20 任务，
 //   回放执行器）产出报告文本。
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
@@ -30,10 +31,11 @@ interface CapturedCommand {
 function makeInvocation(
   rawInput: string,
   events?: ReadonlyArray<FakeSessionEvent>,
+  sessionId?: string,
 ): Parameters<CapturedCommand['handler']>[0] {
   return {
     commandId: 'test-cmd',
-    agent: { session: { events: events ?? [] } },
+    agent: { session: { id: sessionId, events: events ?? [] } },
     rawInput,
     signal: undefined,
   };
@@ -158,12 +160,53 @@ describe('T8.2 /bench 注册与触发', () => {
       expect(r.text).toMatch(/20/); // 冻结基准集 20 任务
       expect(r.text).toMatch(/通过/);
       // 明细已落盘（回放模式单文件 20 条）
-      const { readdirSync, readFileSync } = await import('node:fs');
       const files = readdirSync(join(base, 'bench'));
       expect(files.some((f: string) => f.startsWith('replay-stable-') && f.endsWith('.jsonl'))).toBe(true);
       const records = readFileSync(join(base, 'bench', files.find((f: string) => f.startsWith('replay-stable-'))!), 'utf8')
         .trim().split('\n');
       expect(records).toHaveLength(20);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('/mode 切换记录版本激活（activationLogDir 配置 → completed/<id>.json 幂等落盘，M6 契约字段来自真实 revision）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-act-'));
+    try {
+      const c = makeFakeCtx({ noAgentPresets: true });
+      apply(c.ctx, { activationLogDir: join(base, 'act') });
+
+      const r = await mode(c).handler(makeInvocation('stable', [], 'sess-act-1'));
+      expect(r.kind).toBe('success');
+
+      const completedDir = join(base, 'act', 'completed');
+      await vi.waitFor(
+        () => {
+          expect(readdirSync(completedDir).length).toBeGreaterThan(0);
+        },
+        { timeout: 5000, interval: 10 },
+      );
+      const files = readdirSync(completedDir);
+      expect(files).toHaveLength(1);
+      const contract = JSON.parse(readFileSync(join(completedDir, files[0]!), 'utf8')) as {
+        predecessor: string;
+        candidate: string;
+        activation_scope: string;
+        schema: string;
+      };
+      expect(contract.predecessor).toMatch(/^[0-9a-f]{40}$/); // 切换前 stable revision
+      expect(contract.candidate).toMatch(/^[0-9a-f]{40}$/); // 切换后 stable revision
+      expect(contract.activation_scope).toBe('session');
+      expect(contract.schema).toBe('omb/M6');
+      // pending 标记已清理（完成路径：目录为空或不存在）
+      const pendingDir = join(base, 'act', 'pending');
+      let pendingFiles: string[] = [];
+      try {
+        pendingFiles = readdirSync(pendingDir);
+      } catch {
+        pendingFiles = [];
+      }
+      expect(pendingFiles).toHaveLength(0);
     } finally {
       await rm(base, { recursive: true, force: true });
     }

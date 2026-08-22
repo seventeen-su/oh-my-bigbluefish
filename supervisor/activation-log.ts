@@ -16,12 +16,18 @@ export interface PendingMarker {
   started_at: number;
 }
 
+/** 文件名字符安全化（Windows 非法字符 \ / : * ? " < > | 与控制字符；激活 id 形如 dsh:evt:<sha256>）。
+ *  读/写经同一变换 → 对称；跨平台一致。 */
+function safeId(id: string): string {
+  return id.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_');
+}
+
 function completedFile(logDir: string, id: string): string {
-  return join(logDir, 'completed', `${id}.json`);
+  return join(logDir, 'completed', `${safeId(id)}.json`);
 }
 
 function pendingFile(logDir: string, id: string): string {
-  return join(logDir, 'pending', `${id}.json`);
+  return join(logDir, 'pending', `${safeId(id)}.json`);
 }
 
 /** 原子写 JSON（tmp + rename，§11.3 crash consistency 同款语义） */
