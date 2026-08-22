@@ -13,7 +13,7 @@
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
-import { loadBenchTasks, makeReplayExecutor, runBench } from '../supervisor/bench.js';
+import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 import { makeRealExecutor } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
@@ -37,6 +37,8 @@ export interface PluginConfig {
   cognitiveRoot?: string;
   /** T8.12：ModelAdapter 装配的模型路由（provider/model 齐备且 llm 服务存在 → 自动装配） */
   model?: { provider?: string; model?: string };
+  /** 基准明细落盘目录（/bench 真实/回放逐任务 JSONL；缺省 BENCH_REPORTS_DIR = <preset>/workspace/.omb/bench） */
+  benchPersistDir?: string;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -417,12 +419,20 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         const tasks = await loadBenchTasks();
         const line = current as BenchLine;
         const executor = modelAdapter !== undefined ? makeRealExecutor(modelAdapter) : makeReplayExecutor();
-        const report = await runBench({ tasks, line, executor });
+        // 明细落盘（workspace/.omb/bench/<mode>-<line>-<ts>.jsonl）：逐任务输入/输出/验证结果/
+        // 失败原因，真实与回放分开记录（T8.18 三线真实分化归因）；mode 仅标记不改变判定。
+        const report = await runBench({
+          tasks,
+          line,
+          executor,
+          mode: modelAdapter !== undefined ? 'real' : 'replay',
+          persistDir: config.benchPersistDir ?? BENCH_REPORTS_DIR,
+        });
         const passed = report.results.filter((r) => r.passed).length;
         const mode = modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
         return {
           kind: 'success',
-          text: `基准完成：${report.line} ${passed}/${report.results.length} 通过（${report.results.length} 任务，${mode}）`,
+          text: `基准完成：${report.line} ${passed}/${report.results.length} 通过（${report.results.length} 任务，${mode}；明细已落盘 workspace/.omb/bench）`,
         };
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);

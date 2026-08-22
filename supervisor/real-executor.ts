@@ -35,11 +35,12 @@ function buildExecPrompt(task: BenchTask): string {
   return task.prompt;
 }
 
-/** 输出解析：容忍 ```json 代码围栏 → JSON.parse；失败 → 原样文本（blind_judge 接受字符串） */
+/** 输出解析：容忍 ```json / ```js / ``` 等任意代码围栏 → JSON.parse；失败 → 原样文本
+ *  （blind_judge 接受字符串；rawText 由执行器原样带回供明细落盘） */
 export function parseExecOutput(text: string): unknown {
   const trimmed = text.trim();
   const cleaned = /^```/i.test(trimmed)
-    ? trimmed.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '')
+    ? trimmed.replace(/^```[a-zA-Z0-9_-]*\s*/i, '').replace(/```\s*$/i, '')
     : trimmed;
   try {
     return JSON.parse(cleaned) as unknown;
@@ -83,6 +84,6 @@ export function makeRealExecutor(adapter: ModelAdapter, opts: RealExecutorOption
       memory_pollution: 0,
       corrections: 0,
     };
-    return { passed, cost, output };
+    return { passed, cost, output, rawText: res.text, fixture };
   };
 }

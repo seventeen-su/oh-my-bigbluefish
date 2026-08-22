@@ -7,7 +7,7 @@
 //   - runBench：三线（initial/stable/latest）+ baseline 对照，CognitiveCost 八字段度量记录；
 //   - executor 注入：M7 无真实 DSH 时用回放执行器——复用 T5.2 ReplayRunner 的 canned 确定性模式
 //     （fixture 内录制 output/cost，无真实 I/O）→ 同 fixture 同 executor → 同 passed + 同 cost（数字可复现）。
-import { readFile, readdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,15 +40,20 @@ const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks')) ? HERE_CA
 
 export const BENCH_TASKS_DIR = join(HERE, 'kernel', 'bench-tasks', 'tasks');
 export const BENCH_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'fixtures');
+/** 基准明细落盘目录（真实/回放逐任务记录；与 bench-report 脚本共用 workspace/.omb/bench） */
+export const BENCH_REPORTS_DIR = join(HERE, 'workspace', '.omb', 'bench');
 
 // ---- executor 注入（M7 离线用回放 executor；T8.18 真实 executor 经 ModelAdapter 注入） ----
 
 /** BenchExecutor：任务 → 判定 + 成本；output 为执行产物（T8.13 双 judge 对照需要——
- *  LLM judge 对执行产物评分；回放 executor 输出 fixture.output） */
+ *  LLM judge 对执行产物评分；回放 executor 输出 fixture.output）；rawText 为真实执行原始模型文本；
+ *  fixture 回传执行器实际使用的载荷（失败归因免二次加载；自定义 fixturesDir 场景必需） */
 export type BenchExecutor = (task: BenchTask) => Promise<{
   passed: boolean;
   cost: CognitiveCost;
   output?: unknown;
+  rawText?: string;
+  fixture?: BenchFixture;
 }>;
 
 // ---- CognitiveCost 八字段（§15：最低 token ≠ 最低成本；全零 = 无信号合法） ----
@@ -197,6 +202,48 @@ export function runVerifier(task: BenchTask, output: unknown, fixture: BenchFixt
   }
 }
 
+/** 失败原因（逐任务明细用；passed → null）。与 runVerifier 同判据的并行说明层，
+ *  不改变判定本身——真实/回放明细落盘时给出可读的未通过原因。 */
+export function verifierFailureReason(task: BenchTask, output: unknown, fixture: BenchFixture): string | null {
+  const kind = task.verifier.kind;
+  const rawTextNote = typeof output === 'string' ? '（输出为原始文本，非结构化）' : '';
+  switch (kind) {
+    case 'tests': {
+      if (output === null || typeof output !== 'object') {
+        return `tests: 输出非 {passed,failed,total} 摘要${rawTextNote}`;
+      }
+      const o = output as Record<string, unknown>;
+      if (typeof o.passed !== 'number' || typeof o.failed !== 'number' || typeof o.total !== 'number') {
+        return 'tests: 摘要字段缺失（passed/failed/total）';
+      }
+      if (o.total !== fixture.total) {
+        return `tests: total ${String(o.total)} ≠ fixture ${String(fixture.total)}`;
+      }
+      if (o.failed !== 0) {
+        return `tests: failed ${String(o.failed)} ≠ 0`;
+      }
+      const expected = task.verifier.expected_pass ?? o.total;
+      if ((o.passed as number) < (expected as number)) {
+        return `tests: passed ${String(o.passed)} < expected_pass ${String(expected)}`;
+      }
+      return null;
+    }
+    case 'exact':
+      return output === undefined || output === null
+        ? `exact: 输出为空${rawTextNote}`
+        : `exact: 输出与 fixture.expected 不一致${rawTextNote}`;
+    case 'predicate':
+      return `predicate: 谓词未满足${rawTextNote}`;
+    case 'state_assert':
+      return output === null || typeof output !== 'object'
+        ? `state_assert: 输出非对象${rawTextNote}`
+        : 'state_assert: before/after 与 fixture 不一致';
+    case 'blind_judge':
+      return `blind_judge: 输出缺少 rubric 必需术语${rawTextNote}`;
+  }
+  return `${String(kind)}: 未通过`;
+}
+
 /** 数据完整性守卫：fixture 载荷与 task.verifier.kind 匹配（冻结集守卫；不匹配 → fail-loud） */
 export function assertFixtureMatchesVerifier(task: BenchTask, fixture: BenchFixture): void {
   const missing: string[] = [];
@@ -311,7 +358,7 @@ export function makeReplayExecutor(opts: { fixturesDir?: string } = {}): BenchEx
     const fixture = await loadBenchFixture(task.verifier.ref, dir);
     assertFixtureMatchesVerifier(task, fixture);
     const passed = runVerifier(task, fixture.output, fixture);
-    return { passed, cost: fixture.cost, output: fixture.output };
+    return { passed, cost: fixture.cost, output: fixture.output, fixture };
   };
 }
 
@@ -321,11 +368,17 @@ export function makeReplayExecutor(opts: { fixturesDir?: string } = {}): BenchEx
  * 冻结基准运行（单线）：tasks 逐个过 schema（fail-loud）→ executor 逐任务执行 → 结果按任务序记录
  * （CognitiveCost 八字段校验）→ BenchReport（线 + N 结果）。
  * 三线对照 + baseline：initial/stable/latest 各跑一次 + baseline（无插件基线 executor）→ 4 × N 结果。
+ * 明细落盘（opts.persistDir）：真实/回放逐任务 JSONL——task_id/mode/line/passed/verifier_kind/
+ * failure_reason/output/raw_text/cost/ts，供真实基准归因（任务设计问题 vs 模型能力限制 vs OMB 缺陷）。
  */
 export async function runBench(opts: {
   tasks: readonly BenchTask[];
   line: BenchLine;
   executor: BenchExecutor;
+  /** 执行模式标记：'real'（真实 DSH 执行）/ 'replay'（回放降级）；仅记录与落盘，不影响判定 */
+  mode?: 'real' | 'replay';
+  /** 明细落盘目录（可选）；缺省不落盘（行为与旧版一致） */
+  persistDir?: string;
 }): Promise<BenchReport> {
   const line = BenchLineSchema.parse(opts.line);
   const tasks = opts.tasks.map((t) => BenchTaskSchema.parse(t));
@@ -333,11 +386,39 @@ export async function runBench(opts: {
   if (ids.size !== tasks.length) {
     throw new Error('runBench: tasks id 重复');
   }
+  const mode = opts.mode ?? 'replay';
+  // 落盘文件名在循环外一次性确定（循环内按任务追加；跨秒不拆文件）
+  const persistFile = opts.persistDir === undefined
+    ? undefined
+    : join(opts.persistDir, `${mode}-${line}-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  if (persistFile !== undefined) {
+    await mkdir(opts.persistDir!, { recursive: true });
+  }
   const results: BenchResult[] = [];
   for (const task of tasks) {
-    const { passed, cost } = await opts.executor(task);
+    const execResult = await opts.executor(task);
+    const { passed, cost, output, rawText } = execResult;
     const parsedCost = CognitiveCostSchema.parse(cost);
+    // 失败原因：优先用执行器回传的 fixture（自定义 fixturesDir 场景）；缺省回退默认目录加载
+    const failure_reason = passed
+      ? null
+      : verifierFailureReason(task, output, execResult.fixture ?? await loadBenchFixture(task.verifier.ref));
     results.push({ task_id: task.id, line, passed, cost: parsedCost });
+    if (persistFile !== undefined) {
+      const record = {
+        ts: Date.now(),
+        task_id: task.id,
+        mode,
+        line,
+        passed,
+        verifier_kind: task.verifier.kind,
+        failure_reason,
+        output,
+        raw_text: rawText,
+        cost: parsedCost,
+      };
+      await appendFile(persistFile, `${JSON.stringify(record)}\n`, 'utf8');
+    }
   }
   return { line, results };
 }
