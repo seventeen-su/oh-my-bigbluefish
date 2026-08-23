@@ -36,7 +36,9 @@ import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 // src 布局本文件在 <preset>/supervisor/ → 上一级即 preset 根；编译布局 <preset>/lib/supervisor/ 多一层 → 存在性回退
 
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
-const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+// 探测标记目录必须精确到 JSON 数据目录本身（kernel/bench-tasks/tasks）——kernel/bench-tasks/reference/
+// 为 TS 源码会随 tsc 编译进 lib/，若只探测 kernel/bench-tasks 会在编译布局下误判 HERE=lib/（JSON 不随编译 → ENOENT）。
+const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks', 'tasks')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
 
 export const BENCH_TASKS_DIR = join(HERE, 'kernel', 'bench-tasks', 'tasks');
 export const BENCH_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'fixtures');
