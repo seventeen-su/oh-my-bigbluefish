@@ -13,6 +13,7 @@ import { type EvolutionObject, type RuntimeSnapshot } from '../../kernel/schemas
 import type { Fingerprint } from '../../kernel/schemas/base.js';
 import type { CapabilityVector } from '../../runtime/evaluator.js';
 import { activate, resetActivationLog, rollback, type ActivationDeps } from '../../supervisor/activation.js';
+import { loadCompleted } from '../../supervisor/activation-log.js';
 import type { CandidateRecord } from '../../supervisor/candidates.js';
 import { SnapshotRegistry, createSnapshot, type ComponentHashes } from '../../supervisor/versioning.js';
 
@@ -241,5 +242,25 @@ describe('T8.7 Activation 幂等持久化 + 事件入链', () => {
     const c2 = await activate(input);
     expect(c2).toEqual(c1);
     expect(h.switched).toHaveLength(1);
+  });
+
+  it('logDir 不存在 → 首次写入成功（目录递归自动创建：completed/ 与 pending/）', async () => {
+    // 本用例不用 describe 级 logDir（beforeEach 已预先 mkdir）——新建独立临时根，logDir 不预创建
+    const freshBase = await mkdtemp(join(tmpdir(), 'omb-t87-fresh-'));
+    try {
+      const freshLogDir = join(freshBase, 'nested', 'activations'); // 深层路径整体不存在
+      expect(existsSync(freshLogDir)).toBe(false);
+
+      const h = mkDeps();
+      const contract = await activate(activateInput('fresh-dir-1', freshLogDir, h));
+
+      // 完成记录落盘成功（目录被原子写递归创建）+ pending 已清空（完成路径）
+      expect(existsSync(join(freshLogDir, 'completed', 'fresh-dir-1.json'))).toBe(true);
+      expect(existsSync(join(freshLogDir, 'pending', 'fresh-dir-1.json'))).toBe(false);
+      // 磁盘恢复一致：重新加载返回同一契约（目录创建后的幂等权威）
+      expect(loadCompleted(freshLogDir, 'fresh-dir-1')?.id).toBe(contract.id);
+    } finally {
+      await rm(freshBase, { recursive: true, force: true });
+    }
   });
 });

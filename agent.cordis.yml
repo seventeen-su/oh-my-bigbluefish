@@ -197,6 +197,9 @@
   config:
     # 相对路径：相对 preset 根解析——迁移可移植，不绑定机器绝对路径
     cognitiveRoot: 'workspace/.omb'
+    # 版本激活记录幂等落盘目录（/mode 切换写 completed/<activation_id>.json；pending 先写、完成清 pending；
+    # 重启后同 activation_id 恢复 no-op；被 .gitignore 的 workspace/.omb/ 规则覆盖）
+    activationLogDir: 'workspace/.omb/activation'
     model:
       provider: deepseek-official
       model: deepseek-v4-flash

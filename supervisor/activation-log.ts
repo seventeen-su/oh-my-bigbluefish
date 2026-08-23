@@ -30,7 +30,8 @@ function pendingFile(logDir: string, id: string): string {
   return join(logDir, 'pending', `${safeId(id)}.json`);
 }
 
-/** 原子写 JSON（tmp + rename，§11.3 crash consistency 同款语义） */
+/** 原子写 JSON（tmp + rename，§11.3 crash consistency 同款语义）；目录不存在时递归创建
+ *  （completed/ 与 pending/ 首次写入即成功——logDir 无需预先 mkdir）。 */
 function atomicWriteJson(file: string, value: unknown): void {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;

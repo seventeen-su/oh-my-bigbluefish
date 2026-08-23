@@ -218,6 +218,52 @@ describe('T8.2 /bench 注册与触发', () => {
       await rm(base, { recursive: true, force: true });
     }
   });
+
+  it('/mode 切换到 latest 记录版本激活（activationLogDir → completed/<activation_id>.json 含 activation_id/candidate/predecessor；pending 已清空）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-act-latest-'));
+    try {
+      const c = makeFakeCtx({ noAgentPresets: true });
+      apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
+
+      // 空白会话前置条件（无 turn/start 事件）+ 会话 id → 确定性 activation_id
+      const r = await mode(c).handler(makeInvocation('latest', [], 'sess-act-2'));
+      expect(r.kind).toBe('success');
+
+      const completedDir = join(base, 'act', 'completed');
+      // 超时放宽：全量套件并行时真实 versions.git 有 git 竞争（m0 真实布局冒烟同仓操作），记录链可能变慢
+      await vi.waitFor(
+        () => {
+          expect(readdirSync(completedDir).length).toBeGreaterThan(0);
+        },
+        { timeout: 15000, interval: 20 },
+      );
+      const files = readdirSync(completedDir);
+      expect(files).toHaveLength(1);
+      const contract = JSON.parse(readFileSync(join(completedDir, files[0]!), 'utf8')) as {
+        id: string;
+        predecessor: string;
+        candidate: string;
+        activation_scope: string;
+        schema: string;
+      };
+      expect(contract.id).toMatch(/^dsh:evt:[0-9a-f]{64}$/); // activation_id（确定性派生）
+      expect(contract.candidate).toMatch(/^[0-9a-f]{40}$/); // 切换后 latest revision
+      expect(contract.predecessor).toMatch(/^[0-9a-f]{40}$/); // 切换前 stable revision
+      expect(contract.activation_scope).toBe('session');
+      expect(contract.schema).toBe('omb/M6');
+      // pending 标记已清理（完成路径：目录为空或不存在）
+      const pendingDir = join(base, 'act', 'pending');
+      let pendingFiles: string[] = [];
+      try {
+        pendingFiles = readdirSync(pendingDir);
+      } catch {
+        pendingFiles = [];
+      }
+      expect(pendingFiles).toHaveLength(0);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('T8.30 config.line 固定初始版本线（三线部署接线：per-line 预设 omb-v2-<line> 注入本配置）', () => {
