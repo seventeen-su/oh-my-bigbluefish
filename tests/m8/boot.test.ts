@@ -16,6 +16,10 @@ import {
   type LayoutFixture,
 } from '../helpers/git.js';
 
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——P7 flake 放宽 5s → 30s） */
+const FIXTURE_TIMEOUT = 30000;
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
+
 /** 解除 fixture stable worktree 的只读 ACL（checkout 同步需要可写） */
 function makeStableWritable(fx: LayoutFixture): void {
   runIcacls([fx.stable, '/reset', '/T', '/C']);
@@ -56,7 +60,7 @@ describe('bootStable 启动完整性校验（独立临时 fixture）', () => {
     }
   });
 
-  it('健康启动：stable 完好 → ok、无告警、git_revision 为当前 stable head、内容可读', async () => {
+  fixtureIt('健康启动：stable 完好 → ok、无告警、git_revision 为当前 stable head、内容可读', async () => {
     fx = buildLayoutFixture();
     const result = await bootStable({
       layout: { bareRepo: fx.bare, stableWorktree: fx.stable, latestWorktree: fx.latest },
@@ -69,7 +73,7 @@ describe('bootStable 启动完整性校验（独立临时 fixture）', () => {
     expect(fs.existsSync(path.join(result.tree_root, 'manifest.json'))).toBe(true);
   });
 
-  it('e2e 验收：启动时 stable 引用指向损坏提交（树无 manifest.json）→ 自动回退上一完好 revision 并告警', async () => {
+  fixtureIt('e2e 验收：启动时 stable 引用指向损坏提交（树无 manifest.json）→ 自动回退上一完好 revision 并告警', async () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const broken = advanceStableBroken(fx);
@@ -99,7 +103,7 @@ describe('bootStable 启动完整性校验（独立临时 fixture）', () => {
     expect(result.warnings.some((w) => w.kind === 'rollback_performed')).toBe(true);
   });
 
-  it('启动后 stable 内容可加载（loadVersion 恢复正常）', async () => {
+  fixtureIt('启动后 stable 内容可加载（loadVersion 恢复正常）', async () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     advanceStableBroken(fx);
@@ -117,7 +121,7 @@ describe('bootStable 启动完整性校验（独立临时 fixture）', () => {
     expect(snap.git_revision).toBe(fx.initialHash);
   });
 
-  it('warningLog 文件：提供路径 → 告警内容追加写入（文件存在且含回退信息）', async () => {
+  fixtureIt('warningLog 文件：提供路径 → 告警内容追加写入（文件存在且含回退信息）', async () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     advanceStableBroken(fx);
@@ -145,7 +149,7 @@ describe('bootStable 无恢复路径（独立构造损坏裸仓库）', () => {
     }
   });
 
-  it('全历史均损坏（唯一提交无 manifest.json）→ ok:false + no_recovery，不抛错', async () => {
+  fixtureIt('全历史均损坏（唯一提交无 manifest.json）→ ok:false + no_recovery，不抛错', async () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     // 构造一个"只有损坏提交"的裸仓库：新建 bare，单提交（README only），stable 指向它

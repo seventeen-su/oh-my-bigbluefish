@@ -260,6 +260,32 @@ export const DEFAULT_PROMOTION_GATE = {
 /** 债务阈值缺省（对齐 supervisor/maintenance.ts DEFAULT_SOFT_LIMIT=10 / DEFAULT_HARD_LIMIT=50；critical 待标定 §17） */
 export const DEFAULT_DEBT_THRESHOLDS = { soft: 10, hard: 50, critical: 100 } as const;
 
+// ---- P7：e-process 主判开关（架构 §10.3 Anytime-valid Certificate——anytime-valid 为主判，初值规则保留为降级/对照） ----
+
+/** e-process 主判模式（§10.3/§17 定案：自实现 Bernoulli 超鞅 anytime-valid 为主判；初值规则仅作 fallback 与对照） */
+export const E_PROCESS_MODES = ['e-process', 'rule'] as const;
+export type EProcessMode = (typeof E_PROCESS_MODES)[number];
+
+/** e-process 主判数据化开关（evolve.policy e_process 段；缺省 'e-process' 主判 + fallback 开） */
+export const EProcessPolicySchema = z.object({
+  /**
+   * 主判模式：
+   *   - 'e-process'：金丝雀连续监测判定用自实现 Bernoulli 超鞅（e ≥ 1/α → rollback，anytime-valid 主判）；
+   *   - 'rule'：初值规则（n ≥ min_n && failure_rate ≤ max）主判——降级/对照用。
+   * 缺省 'e-process'（架构 §10.3 anytime-valid 为主判，初值规则保留为降级/对照）。
+   */
+  mode: z.enum(E_PROCESS_MODES).default('e-process'),
+  /** e-process 判定失败（统计/参数非法等异常）→ 回退初值规则（fail-safe，不静默吞错；false → 异常上抛） */
+  fallback_to_rule: z.boolean().default(true),
+});
+export type EProcessPolicy = z.infer<typeof EProcessPolicySchema>;
+
+/** e-process 缺省开关（anytime-valid 主判 + fallback 开；数据即机制，改 evolve.yaml 即生效） */
+export const DEFAULT_E_PROCESS_POLICY: EProcessPolicy = {
+  mode: 'e-process',
+  fallback_to_rule: true,
+};
+
 /**
  * EvolvePolicy：演化规则（架构 §9.5 预算与元演化 + P1c §6.5.1/§6.5.7 数据化判定）——
  *   - Daily Evolution Budget：evolution_cost/day 上限（仅 DSH 运行期间累计）
@@ -286,5 +312,7 @@ export const EvolvePolicySchema = z.object({
   candidate_gate: CandidateGateSchema.default(DEFAULT_CANDIDATE_GATE),
   /** P1e：晋升门禁数据（stable ← trusted-latest 三层信号；可选——缺省回退 candidate_gate/DEFAULT） */
   promotion_gate: PromotionGateSchema.optional(),
+  /** P7：金丝雀判定主判开关（e-process anytime-valid 主判 / rule 初值规则降级对照；缺省 e-process + fallback） */
+  e_process: EProcessPolicySchema.default(DEFAULT_E_PROCESS_POLICY),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

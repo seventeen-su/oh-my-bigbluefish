@@ -16,6 +16,10 @@ import {
   type LayoutFixture,
 } from '../helpers/git.js';
 
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——P7 flake 放宽 5s → 30s） */
+const FIXTURE_TIMEOUT = 30000;
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
+
 /** preset 根（tests/m0/ → ../../） */
 const PRESET_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REAL_BARE = path.join(PRESET_ROOT, 'versions.git');
@@ -69,7 +73,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     }
   });
 
-  it('成功回退：stable 从 rev-A 切到 rev-B，返回 previous/new head 正确，引用指向 rev-B', () => {
+  fixtureIt('成功回退：stable 从 rev-A 切到 rev-B，返回 previous/new head 正确，引用指向 rev-B', () => {
     fx = buildLayoutFixture();
     const revA = advanceStable(fx, 'stable-advanced');
     const revB = fx.initialHash;
@@ -84,7 +88,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(revB);
   });
 
-  it('损坏恢复：stable worktree 的 manifest.json 被删 → 回退上一 revision → head 回退且 worktree 文件恢复、内容正确', () => {
+  fixtureIt('损坏恢复：stable worktree 的 manifest.json 被删 → 回退上一 revision → head 回退且 worktree 文件恢复、内容正确', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -103,7 +107,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(manifestLine(fx.stable)).toBe('initial');
   });
 
-  it('未知 revision fail-loud：抛错且 head 不变', () => {
+  fixtureIt('未知 revision fail-loud：抛错且 head 不变', () => {
     fx = buildLayoutFixture();
     const revA = advanceStable(fx, 'stable-advanced');
     const bogus = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
@@ -112,7 +116,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(revA);
   });
 
-  it('fsync：回退后引用文件（<bare>/refs/heads/stable）存在且内容 == revision', () => {
+  fixtureIt('fsync：回退后引用文件（<bare>/refs/heads/stable）存在且内容 == revision', () => {
     fx = buildLayoutFixture();
     advanceStable(fx, 'stable-advanced');
 
@@ -123,7 +127,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(fs.readFileSync(refFile, 'utf8').trim()).toBe(fx.initialHash);
   });
 
-  it('worktree 同步失败不抛错：只读 ACL worktree 返回 worktree_synced:false，ref 仍已切换', () => {
+  fixtureIt('worktree 同步失败不抛错：只读 ACL worktree 返回 worktree_synced:false，ref 仍已切换', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -140,7 +144,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(fx.initialHash);
   });
 
-  it('branch 参数：切换非默认分支（main）', () => {
+  fixtureIt('branch 参数：切换非默认分支（main）', () => {
     fx = buildLayoutFixture();
     const latestHash = headOf(fx, 'main');
     expect(latestHash).not.toBe(fx.initialHash); // fixture 中 main 已推进，与 initial 分叉
@@ -152,7 +156,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx, 'main')).toBe(fx.initialHash);
   });
 
-  it('T8.23-明确降级：worktree 同步失败 → worktree_status:"degraded" + worktree_error 非空 + ref 已切换（best-effort 缺省）', () => {
+  fixtureIt('T8.23-明确降级：worktree 同步失败 → worktree_status:"degraded" + worktree_error 非空 + ref 已切换（best-effort 缺省）', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -168,7 +172,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(fx.initialHash);
   });
 
-  it('T8.23-strict 策略：worktree 同步失败 → 抛错 + ref 补偿恢复到切换前（无半切换态）', () => {
+  fixtureIt('T8.23-strict 策略：worktree 同步失败 → 抛错 + ref 补偿恢复到切换前（无半切换态）', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -187,7 +191,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(revA);
   });
 
-  it('T8.23-strict 策略：worktree 同步成功 → 正常返回 worktree_status:"synced"', () => {
+  fixtureIt('T8.23-strict 策略：worktree 同步成功 → 正常返回 worktree_status:"synced"', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -206,7 +210,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx)).toBe(fx.initialHash);
   });
 
-  it('T8.23-未提供 worktree → worktree_status:"skipped"（无需同步）', () => {
+  fixtureIt('T8.23-未提供 worktree → worktree_status:"skipped"（无需同步）', () => {
     fx = buildLayoutFixture();
     const revA = advanceStable(fx, 'stable-advanced');
 

@@ -4,6 +4,14 @@
 //     ingest 时对文本中文分词、空格连接写入 FTS 列；查询时同分词器处理查询串再 MATCH。
 //   - 选型：ngram 自实现（bigram，无新依赖）——jieba 类（nodejieba 原生 / jieba-wasm）需新依赖
 //     → 用户边界④（新依赖需报告主会话）；ngram 为 brief 认可的备选，先落地并记录实测。
+// 定案（P7，2026-08-23）：**ngram bigram 为生产运行时分词（本文件为唯一实现）**。
+//   - 实测留档：`workspace/.omb/retrieval-bench/report-2026-08-23.md`——冻结数据（kernel/retrieval-bench/，
+//     K=5）上 ngram / jieba（jieba-wasm 2.4.0，devDependency 仅基准工具链）/ hybrid 三方案同分
+//     （命中率 80.0% / Recall@5 均值 75.0% / MRR 均值 0.8000），仅 miss 分布不同；
+//   - 成本：ngram 纯 JS 字符串扫描（0.00ms/查询）；jieba 稳态 0.01ms + 一次性初始化 ~135ms +
+//     ~16MB 预编译 WASM 二进制（新依赖边界）。
+//   - 结论：当前数据无 Recall/MRR 增益且成本持平 → 不引入 jieba 运行时（零新依赖约束保持）；
+//     jieba/hybrid 保留在基准工具链内，供数据扩充后复测（§17 后续方案）。
 // 分词规则（CJK 统一表意文字 \u3400-\u4dbf + \u4e00-\u9fff）：
 //   - CJK 段长度 ≥ 2 → 滑动窗口 bigram（'长期记忆系统' → 长期 期记 记忆 忆系 系统）；
 //   - CJK 段长度 = 1 → 单字 token（'系' → 系）；

@@ -19,10 +19,17 @@
 #     （n ≥ 此值才按失败率判定；n=0 → 无 shadow 数据不阻塞，以基准门禁为准）
 #   - promotion_gate.max_shadow_failure_rate：L2 shadow 失败率上限（n 足够时超此值拒晋升，后验不劣化）
 #   - promotion_gate.cost_degradation_tolerance：L1 成本劣化容忍（缺省回退 candidate_gate 同值——向后兼容）
+# P7 金丝雀判定主判开关（§10.3 Anytime-valid Certificate——anytime-valid 为主判，初值规则保留为降级/对照）：
+#   - e_process.mode：'e-process'（自实现 Bernoulli 超鞅主判）| 'rule'（初值规则主判，降级/对照）
+#   - e_process.fallback_to_rule：e-process 判定异常 → 回退初值规则（fail-safe 不静默吞错）
 # 初值待冻结基准标定（架构 §17）。
 daily_evolution_cost: 100
 roi_min: 1.0
 maintenance_rate: 0.5
+
+e_process:
+  mode: e-process
+  fallback_to_rule: true
 
 candidate_gate:
   max_candidates_per_run: 3

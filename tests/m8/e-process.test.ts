@@ -13,6 +13,8 @@
 //   ⑤ runCanaryEProcess：rollback → 自动回滚（restore 被调）+ exposure log 记录
 //   ⑥ 参数校验：p0/p1/alpha 非法 → fail-loud；e-process 值上限防溢出（clamp）
 //   ⑦ 与初值规则并存：同一 stat 两套判定（naive 初值公式 vs e-process）可对照
+//   P7 ⑧ 主判开关（evolve.policy e_process 数据化）：mode 切换生效（rule → 初值规则 / e-process → 超鞅）；
+//      fallback 路径（e-process 异常 → 回退初值规则 / 不上抛）；对照记录（两判定不一致 reason 附 rule 对照）
 import { describe, expect, it } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -24,7 +26,14 @@ import {
   evaluateEProcess,
   type EProcessOptions,
 } from '../../supervisor/e-process.js';
-import { buildCertificate, runCanaryEProcess, bucketFor } from '../../supervisor/shadow.js';
+import {
+  buildCanaryEvaluator,
+  buildCertificate,
+  bucketFor,
+  runCanaryConfigured,
+  runCanaryEProcess,
+  type EProcessPolicyConfig,
+} from '../../supervisor/shadow.js';
 
 // ---- 测试工具 ----
 
@@ -167,5 +176,98 @@ describe('⑦ 与初值规则并存（同 stat 两套判定可对照）', () => 
     const verdict = evaluateEProcess({ n: 10, failures: 2, min_n: 10, max_failure_rate: 0.1 }, BASE_OPTS);
     expect(verdict.verdict).toBe('promote');
     expect(verdict.e).toBeLessThan(1 / BASE_OPTS.alpha!);
+  });
+});
+
+// ---- P7 ⑧ 主判开关（evolve.policy e_process 数据化：anytime-valid 为主判，初值规则为降级/对照） ----
+
+describe('P7 ⑧ e-process 主判开关（buildCanaryEvaluator / runCanaryConfigured）', () => {
+  /** 判别性证书：n=2 全失败 → e-process（e=25 ≥ 20）判 rollback；初值规则（n < min_n=10）判 hold */
+  const DIVERGENT_CERT = buildCertificate('c:div', { n: 2, successes: 0, failures: 2 }, { min_n: 10, max_failure_rate: 0.1 });
+
+  it('开关切换生效：mode=rule → 初值规则主判（hold）；mode=e-process → 超鞅主判（rollback）', () => {
+    const rule = buildCanaryEvaluator({ mode: 'rule', fallback_to_rule: true });
+    expect(rule(DIVERGENT_CERT).verdict).toBe('hold'); // n < min_n → 初值规则 hold
+    const ep = buildCanaryEvaluator({ mode: 'e-process', fallback_to_rule: true });
+    expect(ep(DIVERGENT_CERT).verdict).toBe('rollback'); // e ≥ 1/α → anytime-valid 拒绝（不受 min_n 阻塞）
+  });
+
+  it('对照记录：e-process 主判与初值规则不一致 → reason 附 rule 对照（审计可见）', () => {
+    const ep = buildCanaryEvaluator({ mode: 'e-process', fallback_to_rule: true });
+    const r = ep(DIVERGENT_CERT);
+    expect(r.verdict).toBe('rollback');
+    expect(r.reason).toMatch(/rule 对照: hold/);
+    // 判定一致时不附对照注（reason 保持 e-process 纯文案）：达标证书两套都 promote
+    const okCert = buildCertificate('c:ok', { n: 10, successes: 10, failures: 0 }, { min_n: 10, max_failure_rate: 0.1 });
+    const r2 = ep(okCert);
+    expect(r2.verdict).toBe('promote');
+    expect(r2.reason).not.toContain('rule 对照');
+  });
+
+  it('fallback 路径：e-process 判定异常（alpha=0 非法）→ fallback_to_rule=true 回退初值规则（reason 标注）', () => {
+    const withFallback = buildCanaryEvaluator({ mode: 'e-process', fallback_to_rule: true }, { alpha: 0 });
+    const r = withFallback(DIVERGENT_CERT);
+    expect(r.verdict).toBe('hold'); // 回退初值规则（n < min_n）
+    expect(r.reason).toMatch(/e-process fallback/);
+    // fallback_to_rule=false → 异常上抛（fail-loud，不静默吞错）
+    const strict = buildCanaryEvaluator({ mode: 'e-process', fallback_to_rule: false }, { alpha: 0 });
+    expect(() => strict(DIVERGENT_CERT)).toThrow(/alpha/);
+  });
+
+  it('runCanaryConfigured：mode=rule → 初值规则 hold → 无回滚（restore 未被调、无 canary_rollback 审计）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-ep-cfg-'));
+    try {
+      const evo = join(base, '.evolution');
+      await mkdir(evo, { recursive: true });
+      const logPath = join(evo, 'exposure.log');
+      let restored = 0;
+      const cfg: EProcessPolicyConfig = { mode: 'rule', fallback_to_rule: true };
+      const result = await runCanaryConfigured(
+        {
+          certificate: DIVERGENT_CERT,
+          exposure: { seed: 'seed-rule', bucket: bucketFor('seed-rule'), layer: 'tier1' },
+          logPath,
+          snapshot: 'sha256:rule',
+          scope: 'Project',
+          restore: async () => {
+            restored++;
+          },
+        },
+        cfg,
+      );
+      expect(result.verdict).toBe('hold');
+      expect(restored).toBe(0);
+      expect(result.contract).toBeNull();
+      const lines = (await readFile(logPath, 'utf8')).split('\n').filter((l) => l.length > 0);
+      expect(JSON.parse(lines[0]!).decision).toBe('canary'); // 无回滚 → 普通 canary 审计
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('runCanaryConfigured：mode=e-process（缺省）→ 与 runCanaryEProcess 等价（判定一致）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-ep-cfg2-'));
+    try {
+      const evo = join(base, '.evolution');
+      await mkdir(evo, { recursive: true });
+      const logPath = join(evo, 'exposure.log');
+      let restored = 0;
+      // 缺省 cfg（e-process 主判）经 runCanaryConfigured —— 判别性证书 → rollback + 自动回滚
+      const result = await runCanaryConfigured({
+        certificate: DIVERGENT_CERT,
+        exposure: { seed: 'seed-cfg', bucket: bucketFor('seed-cfg'), layer: 'tier1' },
+        logPath,
+        snapshot: 'sha256:cfg',
+        scope: 'Project',
+        restore: async () => {
+          restored++;
+        },
+      });
+      expect(result.verdict).toBe('rollback');
+      expect(restored).toBe(1);
+      expect(result.contract).not.toBeNull();
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
   });
 });

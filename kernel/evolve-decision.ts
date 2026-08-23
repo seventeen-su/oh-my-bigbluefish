@@ -113,6 +113,21 @@ export function candidateValidationAccrual(): DebtAccrual {
   };
 }
 
+/** P7：环境变化 → 受影响对象重新验证入队（repair 债务；§14.5 Predictive Invalidation 触发面，
+ *  与 debtAccrualsFromSummary 的 corrections/oracle_fail → repair 同语义） */
+export function repairAccrual(): DebtAccrual {
+  const taskId: MaintenanceTaskId = 'repair';
+  const value = MAINTENANCE_WEIGHTS[taskId];
+  const cost = MAINTENANCE_COSTS[taskId];
+  return {
+    task_id: taskId,
+    value,
+    estimated_cost: cost,
+    priority: Math.round((value / cost) * value),
+    urgency: ACCRUAL_URGENCY[taskId],
+  };
+}
+
 // ---- 信号记录转换（纯函数；零 I/O） ----
 
 /** UtilityCounts 形状 → 信号记录（每 kind 一行；零计数不产出——避免噪声信号） */

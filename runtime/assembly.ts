@@ -9,6 +9,7 @@
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { GIT_BIN, defaultLayout, runGit } from '../substrate/snapshot.js';
@@ -21,6 +22,7 @@ import {
 } from '../supervisor/versioning.js';
 import { computeComponentHashes, computeDirContentHash } from './snapshot-hash.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
+import type { Fingerprint } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
@@ -47,9 +49,16 @@ import {
   debtAccrualsFromSummary,
   decideEvolution,
   evaluationSignalsToRecords,
+  repairAccrual,
   summarizeSignals,
 } from '../kernel/evolve-decision.js';
-import type { EvolutionDecision } from '../kernel/schemas/evolution.js';
+import type { EvolutionDecision, CapabilityDecayRecord } from '../kernel/schemas/evolution.js';
+// P7：Predictive Invalidation 环境指纹（§14.5/§15.4——指纹 diff 纯函数 + 采集 + 衰减记录构造）
+import {
+  buildCapabilityDecayRecord,
+  collectEnvironmentFingerprint,
+  diffFingerprints,
+} from '../kernel/environment-fingerprint.js';
 // P1d：候选生成（kernel 纯函数）→ 候选管线（supervisor 层 1；runtime(2) → supervisor(1) ✓）
 import { generatePolicyAdjustmentCandidates } from '../kernel/candidate-generator.js';
 import { runCandidatePipeline, latestObjectId, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
@@ -170,6 +179,8 @@ export interface CognitiveAssemblyOptions {
   signalsDir?: string;
   /** P1d：演化工作区根（CandidatePool 信任池；缺省 <root>/.evolution） */
   evolutionRoot?: string;
+  /** P7：环境指纹采集器注入（environment_check 任务用；缺省 collectEnvironmentFingerprint——测试注入可变序列） */
+  environmentFingerprint?: () => Fingerprint;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -404,6 +415,12 @@ export class CognitiveRuntime {
   private componentsReadyPromise: Promise<void> | null = null;
   /** P2：组件装配降级原因（激活失败/健康检查异常；无 → null）——kern_status 摘要 degraded 段 */
   private componentAssemblyDegraded: string | null = null;
+  /** P7：环境指纹采集器（environment_check 任务；测试注入可变序列） */
+  private readonly fingerprintCollector: () => Fingerprint;
+  /** P7：最近一次环境指纹（Predictive Invalidation 基线；进程内缓存，跨重启由 decay 落盘接续） */
+  private lastEnvironmentFingerprint: Fingerprint | null = null;
+  /** P7：能力衰减记录落盘目录（<evolutionRoot>/decay；<ts>.json） */
+  private readonly decayDir: string;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
@@ -444,6 +461,9 @@ export class CognitiveRuntime {
     this.maintenance = opts.maintenance ?? null;
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
     this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
+    // P7：环境指纹（Predictive Invalidation）装配——采集器注入（缺省运行时采集）+ 衰减记录落盘目录
+    this.fingerprintCollector = opts.environmentFingerprint ?? (() => collectEnvironmentFingerprint());
+    this.decayDir = join(this.evolutionRoot, 'decay');
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等 */
@@ -675,6 +695,17 @@ export class CognitiveRuntime {
         urgency: 'normal',
         run: this.maintenanceRun('promotion_check', input.session_id),
       });
+      // P7：环境指纹检查任务（§14.5 Predictive Invalidation：指纹 diff → CapabilityDecayRecord 落盘
+      // .evolution/decay/<ts>.json + 受影响对象重新验证入队（repair 债务）；低优先级 ROI 0.5——
+      // 与会话收尾（ROI 1）并列排序时靠后，既有调度顺序不破坏）
+      await this.maintenance.enqueue({
+        id: 'environment_check',
+        value: 1,
+        estimated_cost: 2,
+        priority: 0,
+        urgency: 'normal',
+        run: this.maintenanceRun('environment_check', input.session_id),
+      });
       maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
     }
 
@@ -901,6 +932,11 @@ export class CognitiveRuntime {
           }
           await this.runPromotionCheck(sessionId);
         };
+      case 'environment_check':
+        // P7：Predictive Invalidation——指纹 diff → 衰减记录落盘 + 重新验证入队（失败降级不抛：尽力而为）
+        return async () => {
+          await this.runEnvironmentCheck();
+        };
       case 'repair':
       case 'memory_consolidation':
         // P1d 范围外占位：任务执行 = 债务清偿生命周期闭环（完成 → 归零）
@@ -971,6 +1007,95 @@ export class CognitiveRuntime {
       throw err;
     }
     await this.performEvolutionDecision(sessionId);
+  }
+
+  // ---- P7：Predictive Invalidation（设计 §14.5 + 实现规格 §15.4 最小落地） ----
+
+  /**
+   * P7：环境指纹检查（维护任务 environment_check 执行体，可公开调用——测试/命令触发）。
+   * 指纹 diff → 有变化 → CapabilityDecayRecord 落盘 .evolution/decay/<ts>.json + 受影响对象重新验证
+   * 入队（repair 债务，§14.5 局部重验证）→ 更新基线；无变化 → 不动作（返回 null）。
+   * 基线：进程内首次检查建立（有 decay 落盘历史 → 取最近记录指纹接续——跨重启连续性）；
+   * 尽力而为：采集/落盘失败降级不抛（environment_check 不阻塞维护链）。
+   */
+  async runEnvironmentCheck(): Promise<CapabilityDecayRecord | null> {
+    try {
+      const current = this.fingerprintCollector();
+      let baseline = this.lastEnvironmentFingerprint;
+      if (baseline === null) {
+        baseline = await this.readLatestDecayFingerprint(); // 跨重启接续：最近落盘指纹
+        if (baseline !== null) {
+          this.lastEnvironmentFingerprint = baseline;
+        }
+      }
+      if (baseline === null) {
+        this.lastEnvironmentFingerprint = current; // 首次检查：建立基线，无历史可比 → 不动作
+        return null;
+      }
+      const delta = diffFingerprints(baseline, current);
+      if (Object.keys(delta).length === 0) {
+        return null; // 无变化不动作
+      }
+      // 最小实现：无环境声明索引（signals/记忆声明环境标记匹配未建）→ affected_objects 空；
+      // 记录 delta（§15.4 字段级）+ 触发受影响对象重新验证入队（repair 债务）
+      const record = buildCapabilityDecayRecord({
+        before: baseline,
+        after: current,
+        delta,
+        affected_objects: [],
+      });
+      if (record === null) {
+        return null;
+      }
+      await this.writeDecayRecord(record);
+      this.lastEnvironmentFingerprint = current;
+      if (this.maintenance !== null) {
+        const acc = repairAccrual();
+        await this.maintenance.enqueue(
+          {
+            id: acc.task_id,
+            value: acc.value,
+            estimated_cost: acc.estimated_cost,
+            priority: acc.priority,
+            urgency: acc.urgency,
+            run: this.maintenanceRun(acc.task_id),
+          },
+          { accrueDebt: true },
+        );
+      }
+      return record;
+    } catch {
+      // 尽力而为：采集/落盘/入队失败 → 降级不抛（environment_check 是低优先级检查，不阻塞维护链）
+      return null;
+    }
+  }
+
+  /** 读最近一条 decay 记录的环境指纹（跨重启基线接续；无历史/不可读 → null） */
+  private async readLatestDecayFingerprint(): Promise<Fingerprint | null> {
+    try {
+      const files = (await readdir(this.decayDir)).filter((f) => f.endsWith('.json')).sort().reverse();
+      if (files.length === 0) {
+        return null;
+      }
+      const raw = JSON.parse(await readFile(join(this.decayDir, files[0]!), 'utf8')) as {
+        fingerprint_after?: Fingerprint;
+      };
+      return raw.fingerprint_after ?? null;
+    } catch {
+      return null; // 无历史目录/不可读 → 视作无基线（尽力而为）
+    }
+  }
+
+  /** 能力衰减记录落盘（.evolution/decay/<ts>.json；同毫秒碰撞 → <ts>-<n>.json 后缀避覆写） */
+  private async writeDecayRecord(record: CapabilityDecayRecord): Promise<void> {
+    await mkdir(this.decayDir, { recursive: true });
+    let file = join(this.decayDir, `${record.ts}.json`);
+    let n = 0;
+    while (existsSync(file)) {
+      n++;
+      file = join(this.decayDir, `${record.ts}-${n}.json`);
+    }
+    await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
   }
 
   /**

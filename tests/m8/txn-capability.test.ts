@@ -9,6 +9,10 @@ import { EvolutionTransaction } from '../../supervisor/txn.js';
 import { CapabilityRegistry } from '../../supervisor/capability.js';
 import { buildLayoutFixture, runGit, teardownLayoutFixture, type LayoutFixture } from '../helpers/git.js';
 
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——P7 flake 放宽 5s → 30s） */
+const FIXTURE_TIMEOUT = 30000;
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
+
 function headOf(fx: LayoutFixture, branch = 'stable'): string {
   return runGit(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`], { cwd: fx.bare });
 }
@@ -29,7 +33,7 @@ describe('T8.5 演化事务（EvolutionTransaction：建分支 → 提交 → �
     runGit(['worktree', 'add', '--detach', txnWt, fx.initialHash], { cwd: fx.bare });
   }
 
-  it('成功路径：begin → 修改+提交 → verify ok → mergeTo(stable) → stable head 推进到事务提交', async () => {
+  fixtureIt('成功路径：begin → 修改+提交 → verify ok → mergeTo(stable) → stable head 推进到事务提交', async () => {
     fx = buildLayoutFixture();
     setupTxnWorktree();
     const txn = new EvolutionTransaction({ bareRepo: fx.bare, worktree: txnWt, branch: 'txn-ok' });
@@ -49,7 +53,7 @@ describe('T8.5 演化事务（EvolutionTransaction：建分支 → 提交 → �
     expect(headOf(fx)).toBe(commit_hash); // stable 已推进到事务提交
   });
 
-  it('分支回退：verify 失败 → rollback → 事务分支删除、worktree 回到基、stable 不变', async () => {
+  fixtureIt('分支回退：verify 失败 → rollback → 事务分支删除、worktree 回到基、stable 不变', async () => {
     fx = buildLayoutFixture();
     setupTxnWorktree();
     const before = headOf(fx);
@@ -75,7 +79,7 @@ describe('T8.5 演化事务（EvolutionTransaction：建分支 → 提交 → �
     expect(headOf(fx)).toBe(before);
   });
 
-  it('非快进合入 fail-loud：目标分支已分叉 → mergeTo 抛错，target 不变', async () => {
+  fixtureIt('非快进合入 fail-loud：目标分支已分叉 → mergeTo 抛错，target 不变', async () => {
     fx = buildLayoutFixture();
     setupTxnWorktree();
     // 让 stable 前进一版（与事务基分叉）
@@ -99,7 +103,7 @@ describe('T8.5 演化事务（EvolutionTransaction：建分支 → 提交 → �
     expect(headOf(fx)).toBe(stable2); // target 不变
   });
 
-  it('重复 begin / 未 begin 先 commit → fail-loud（事务状态机）', async () => {
+  fixtureIt('重复 begin / 未 begin 先 commit → fail-loud（事务状态机）', async () => {
     fx = buildLayoutFixture();
     setupTxnWorktree();
     const txn = new EvolutionTransaction({ bareRepo: fx.bare, worktree: txnWt, branch: 'txn-state' });

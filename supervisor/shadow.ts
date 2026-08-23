@@ -29,7 +29,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { z, type ZodIssue } from 'zod';
-import { evaluateEProcess } from './e-process.js';
+import { evaluateEProcess, type EProcessOptions } from './e-process.js';
 
 // ---- 常量（待标定，§17 开放项：各层桶范围 / min_n / max_failure_rate 随冻结基准修正） ----
 
@@ -376,21 +376,77 @@ export async function runCanary(opts: CanaryRunOptions & { evaluator?: CanaryEva
 // ---- e-process 金丝雀（T8.15：初值公式 → anytime-valid 引擎；判定经 evaluateEProcess 注入） ----
 
 /**
+ * e-process 主判开关（P7 数据化；结构与 kernel/schemas/policy.ts EProcessPolicy 一致——shadow 层不
+ * import 契约层（层声明仅 node: 内置 + zod），消费方直接传 policy.evolve.e_process（结构兼容）。
+ * 缺省 'e-process' 主判（架构 §10.3 anytime-valid 为主判），初值规则保留为降级/对照。
+ */
+export interface EProcessPolicyConfig {
+  /** 主判模式：'e-process'（Bernoulli 超鞅 anytime-valid 主判）/ 'rule'（初值规则主判，降级/对照） */
+  mode: 'e-process' | 'rule';
+  /** e-process 判定异常（统计/参数非法）→ 回退初值规则（fail-safe 不静默吞错；false → 异常上抛） */
+  fallback_to_rule: boolean;
+}
+
+/** 缺省主判开关（anytime-valid 主判 + fallback 开；对齐 policy 缺省 DEFAULT_E_PROCESS_POLICY） */
+export const DEFAULT_E_PROCESS_POLICY_CONFIG: EProcessPolicyConfig = { mode: 'e-process', fallback_to_rule: true };
+
+/**
+ * P7：数据化金丝雀判定器（主判开关）：
+ *   - mode 'rule' → 初值规则 evaluateCanary（主判 = 规则，对照语义由调用方选择）；
+ *   - mode 'e-process' → evaluateEProcess 主判 + 初值规则对照记录（两判定不一致时 reason 附 rule 对照）；
+ *     判定异常（统计/参数非法）→ fallback_to_rule 时回退初值规则（reason 标注 fallback），否则上抛。
+ * 测试/标定可注入 EProcessOptions（p0/p1/α）——结构保持 CanaryEvaluator 契约（可经 runCanary 注入）。
+ */
+export function buildCanaryEvaluator(cfg: EProcessPolicyConfig, opts: EProcessOptions = {}): CanaryEvaluator {
+  return (cert) => {
+    if (cfg.mode === 'rule') {
+      return evaluateCanary(cert);
+    }
+    // 对照记录：e-process 主判 + 初值规则旁证（判定不一致时附注，审计可见；一致时 reason 保持 e-process 纯文案）
+    const ruleVerdict = evaluateCanary(cert);
+    try {
+      const ep = evaluateEProcess(
+        {
+          n: cert.stat.n,
+          failures: cert.stat.failures,
+          min_n: cert.threshold.min_n,
+          max_failure_rate: cert.threshold.max_failure_rate,
+        },
+        opts,
+      );
+      if (ep.verdict !== ruleVerdict.verdict) {
+        return { verdict: ep.verdict, reason: `${ep.reason}（rule 对照: ${ruleVerdict.verdict}——${ruleVerdict.reason}）` };
+      }
+      return { verdict: ep.verdict, reason: ep.reason };
+    } catch (err) {
+      if (!cfg.fallback_to_rule) {
+        throw err;
+      }
+      const detail = err instanceof Error ? err.message : String(err);
+      return { verdict: ruleVerdict.verdict, reason: `${ruleVerdict.reason}（e-process fallback: ${detail}）` };
+    }
+  };
+}
+
+/**
+ * P7：按主判开关运行金丝雀自动检查（数据化主判：cfg 缺省 = e-process 主判 + fallback 开；
+ * 判定 → rollback 全自动回滚 + exposure log 审计，与 runCanary 语义一致）。
+ */
+export function runCanaryConfigured(
+  opts: CanaryRunOptions,
+  cfg: EProcessPolicyConfig = DEFAULT_E_PROCESS_POLICY_CONFIG,
+): Promise<CanaryRunResult> {
+  return runCanary({ ...opts, evaluator: buildCanaryEvaluator(cfg) });
+}
+
+/**
  * e-process 金丝雀自动检查：evaluateEProcess 判定（e ≥ 1/α → rollback，任意时刻拒绝零假设）→
  * 自动回滚 + exposure log 审计（与 runCanary 全自动语义一致）。判定器注入保持 runCanary 契约，
- * 本入口为 e-process 引擎的便捷接线（选型记录见 supervisor/e-process.ts）。
+ * 本入口为 e-process 引擎的便捷接线（选型记录见 supervisor/e-process.ts）；
+ * P7 定案：经主判开关接线（缺省 e-process 主判 + fallback，行为不变——判定不一致仅 reason 附对照注）。
  */
 export function runCanaryEProcess(opts: CanaryRunOptions): Promise<CanaryRunResult> {
-  return runCanary({
-    ...opts,
-    evaluator: (cert) =>
-      evaluateEProcess({
-        n: cert.stat.n,
-        failures: cert.stat.failures,
-        min_n: cert.threshold.min_n,
-        max_failure_rate: cert.threshold.max_failure_rate,
-      }),
-  });
+  return runCanaryConfigured(opts, DEFAULT_E_PROCESS_POLICY_CONFIG);
 }
 
 // ---- 便捷常量（日志路径约定：workspace/.omb/.evolution/exposure.log） ----

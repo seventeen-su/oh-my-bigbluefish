@@ -13,6 +13,8 @@
 //   ⑧ createDshModelAdapter：text-delta 流 → 拼装文本 + usage（token 计数）
 //   ⑨ createDshModelAdapter：finish error → generate rejects（受限降级路径文档化）
 //   ⑩ parseProcessJson 容忍代码围栏 / 非法 → null；buildHypothesizePrompt 结构断言
+//   P7 ⑫ 网络瞬时错误重试：fetch failed/ECONNRESET/ETIMEDOUT/5xx/429 → 短退避重试（2 次、间隔 1~2s，
+//      仿 LOCK_RETRY 模式）；逻辑错误（400/401/422）不重试直接抛；重试耗尽 → 抛原错误
 import { describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -23,7 +25,12 @@ import {
   ProcessGenerator,
   type WorkingState,
 } from '../../runtime/generator.js';
-import { createDshModelAdapter, type LlmStreamLike, type LlmStreamOptionsLike } from '../../runtime/model-adapter.js';
+import {
+  createDshModelAdapter,
+  isRetryableNetworkError,
+  type LlmStreamLike,
+  type LlmStreamOptionsLike,
+} from '../../runtime/model-adapter.js';
 import { createCognitiveRuntime } from '../../runtime/assembly.js';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
 import type { ModelAdapter, ModelGenerateResult } from '../../kernel/schemas/model-adapter.js';
@@ -277,6 +284,97 @@ describe('⑩ parseProcessJson / buildHypothesizePrompt 边界', () => {
     expect(parseProcessJson('```json\n' + validProcessJson() + '\n```')?.id).toBe('llm-hyp');
     expect(parseProcessJson('not json')).toBeNull();
     expect(parseProcessJson(JSON.stringify({ id: 'x' }))).toBeNull();
+  });
+});
+
+// ---- P7 ⑫ 网络瞬时错误重试（真实执行加固：瞬时错误短退避重试，仅网络层错误重试，逻辑错误不重试） ----
+
+describe('P7 ⑫ 网络瞬时错误重试（isRetryableNetworkError / generate 重试循环）', () => {
+  /** 快速重试配置（生产缺省 1s/2s 退避；测试注入 0ms 防慢） */
+  const FAST_RETRY = { retries: 2, backoffMs: () => 0 };
+
+  it('错误分类：fetch failed/ECONNRESET/ETIMEDOUT/5xx/429 → 可重试；400/401/422 → 不可重试', () => {
+    for (const msg of ['fetch failed', 'ECONNRESET', 'ETIMEDOUT', 'socket hang up', '429 Too Many Requests', '502 Bad Gateway', '503 Service Unavailable', '500 Internal Server Error']) {
+      expect(isRetryableNetworkError(new Error(msg)), msg).toBe(true);
+    }
+    for (const msg of ['400 Bad Request', '401 Unauthorized', '422 Unprocessable Entity', 'NO_ADAPTER', 'invalid schema']) {
+      expect(isRetryableNetworkError(new Error(msg)), msg).toBe(false);
+    }
+    expect(isRetryableNetworkError('fetch failed')).toBe(true); // 非 Error 兜底按字符串分类
+  });
+
+  it('fake llm 首抛网络错误（fetch failed）→ 重试后成功（stream 被调 2 次）', async () => {
+    let calls = 0;
+    const llm: LlmStreamLike = {
+      stream: async function* () {
+        calls++;
+        if (calls === 1) {
+          throw new Error('fetch failed');
+        }
+        yield { type: 'text-delta', index: 0, text: 'ok' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm', retry: FAST_RETRY });
+    const res = await adapter.generate('x');
+    expect(res.text).toBe('ok');
+    expect(calls).toBe(2); // 第 1 次失败 → 短退避 → 第 2 次成功
+  });
+
+  it('finish reason 网络错误（503）→ 重试后成功（重试分类覆盖 finish 显式化路径）', async () => {
+    let calls = 0;
+    const llm: LlmStreamLike = {
+      stream: async function* () {
+        calls++;
+        if (calls === 1) {
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: '503 Service Unavailable', code: 'HTTP_503' } } };
+          return;
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm', retry: FAST_RETRY });
+    expect((await adapter.generate('x')).text).toBe('');
+    expect(calls).toBe(2);
+  });
+
+  it('逻辑错误（400）→ 不重试直接抛（stream 仅被调 1 次）', async () => {
+    let calls = 0;
+    const llm: LlmStreamLike = {
+      stream: async function* () {
+        calls++;
+        throw new Error('400 Bad Request');
+      },
+    };
+    const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm', retry: FAST_RETRY });
+    await expect(adapter.generate('x')).rejects.toThrow(/400 Bad Request/);
+    expect(calls).toBe(1);
+  });
+
+  it('逻辑错误（finish 422）→ 不重试直接抛', async () => {
+    let calls = 0;
+    const llm: LlmStreamLike = {
+      stream: async function* () {
+        calls++;
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: '422 Unprocessable Entity', code: 'HTTP_422' } } };
+      },
+    };
+    const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm', retry: FAST_RETRY });
+    await expect(adapter.generate('x')).rejects.toThrow(/422/);
+    expect(calls).toBe(1);
+  });
+
+  it('重试耗尽 → 抛原错误（3 次尝试全失败，错误信息保留不包装）', async () => {
+    let calls = 0;
+    const llm: LlmStreamLike = {
+      stream: async function* () {
+        calls++;
+        throw new Error('ECONNRESET');
+      },
+    };
+    const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm', retry: FAST_RETRY });
+    await expect(adapter.generate('x')).rejects.toThrow('ECONNRESET');
+    expect(calls).toBe(3); // 初始 1 + 重试 2
   });
 });
 

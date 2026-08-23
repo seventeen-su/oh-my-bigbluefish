@@ -308,6 +308,25 @@ describe('维护调度（§12.3）', () => {
     // → ran 含 'hang'、skipped 不含 → 本断言失败（RED）。
   });
 
+  it('退出即停：stop 后 enqueue 被忽略（新任务不入队，tick 无动作）；start 不复活已停调度器', async () => {
+    const s = mkScheduler({ tickIntervalMs: 1000 });
+    const ran: string[] = [];
+    s.start();
+    s.stop();
+    // stop 后入队 → 静默忽略（不再产生定时器/队列任务）
+    await s.enqueue(task({ id: 'post-stop', value: 1, estimated_cost: 1, run: async () => { ran.push('post-stop'); } }));
+    const r = await s.tick();
+    expect(r).toEqual({ ran: [], skipped: [] });
+    const q = await s.requestQuantum();
+    expect(q).toEqual({ ran: [], skipped: [] });
+    expect(ran).toEqual([]); // 任务从未执行
+    // start 不复活已停调度器（stop 语义为终态；幂等）
+    s.start();
+    const r2 = await s.tick();
+    expect(r2).toEqual({ ran: [], skipped: [] });
+    expect(ran).toEqual([]);
+  });
+
   // ---- ⑧ 经调度跑 consolidation（M3 升级兼容） ----
 
   it('经调度跑 consolidation：M3 consolidate 经 scheduler.enqueue 入队 → requestQuantum 执行成功', async () => {

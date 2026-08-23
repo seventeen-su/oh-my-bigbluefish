@@ -13,6 +13,7 @@ import {
   BudgetPolicySchema,
   ContextPolicySchema,
   DEFAULT_CANDIDATE_GATE,
+  DEFAULT_E_PROCESS_POLICY,
   EvolvePolicySchema,
   GovernorPolicySchema,
   ProcessDefSchema,
@@ -37,6 +38,8 @@ export {
   DebtThresholdsSchema,
   DEFAULT_CANDIDATE_GATE,
   CandidateGateSchema,
+  DEFAULT_E_PROCESS_POLICY,
+  EProcessPolicySchema,
   DEFAULT_GENERATION_BUDGET,
   GenerationBudgetSchema,
   EvolvePolicySchema,
@@ -52,6 +55,8 @@ export {
   type CandidateKind,
   type ContextPolicy,
   type DebtThresholds,
+  type EProcessMode,
+  type EProcessPolicy,
   type EvolvePolicy,
   type GenerationBudget,
   type GovernorPolicy,
@@ -79,6 +84,7 @@ const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
   signal_triggers: {},
   debt_thresholds: { soft: 10, hard: 50, critical: 100 },
   candidate_gate: { ...DEFAULT_CANDIDATE_GATE },
+  e_process: { ...DEFAULT_E_PROCESS_POLICY },
 };
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */

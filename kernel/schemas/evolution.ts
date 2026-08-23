@@ -5,7 +5,9 @@
 //   - SignalSummary：判定输入（窗口 + 按 kind 聚合计数）
 //   - EvolutionDecision：判定输出（是否演化/强度/对象层/预算估计）
 //   - MaintenanceUrgency：维护债务紧迫度（与 supervisor/maintenance.ts Urgency 同值域，防枚举漂移）
+//   - CapabilityDecayRecord（P7）：§15.4 Predictive Invalidation 能力衰减记录（字段级契约）
 import { z } from 'zod';
+import type { Fingerprint } from './base.js';
 
 // ---- 信号记录（JSONL 行） ----
 
@@ -91,4 +93,44 @@ export interface CandidateDraft {
    * L1 代码候选未来复用）。
    */
   verify?: { script: string };
+}
+
+// ---- P7：Predictive Invalidation 能力衰减记录（设计 §14.5 + 实现规格 §15.4 字段级） ----
+
+/** 环境字段差异（Fingerprint diff：字段名 → from/to；undefined = 该侧缺失（可选键 gpu/cuda）） */
+export interface EnvironmentFieldDelta {
+  from: string | undefined;
+  to: string | undefined;
+}
+
+/** 受影响对象引用（经验/过程/技能；§15.4 ArtifactRef 最小形式） */
+export interface ArtifactRef {
+  id: string;
+  kind: 'experience' | 'process' | 'skill' | string;
+}
+
+/** 能力向量（§15.4 capability_vector_before/after 最小形式：维度 → 分数；0..1 归一） */
+export type CapabilityVector = Record<string, number>;
+
+/**
+ * P7：CapabilityDecayRecord（实现规格 §15.4 字段级：环境指纹变化 → 受影响对象 + 最小回归子集 +
+ * 能力衰减曲线 + 归因）。一次环境变化 = 曲线上一个点（§9.1）；落盘 .evolution/decay/<ts>.json。
+ * 字段按 §15.4：
+ *   - environment_delta：Fingerprint diff（os/node/dsh_version/project/gpu/cuda 变化字段）
+ *   - affected_objects：受影响经验/过程/技能（适用环境声明匹配；最小实现可空——见 environment_check）
+ *   - regression_set：最小回归子集（只跑受影响对象的冻结基准切片；最小形式 = 受影响对象 id 列表）
+ *   - capability_vector_before/after：环境变化前后能力向量（最小形式 = 维度→分数）
+ *   - attribution：{object_id → 维度 delta}（哪个对象贡献了哪个维度的变化）
+ * 附加：ts（记录时间戳）+ fingerprint_before/after（落盘审计用）。
+ */
+export interface CapabilityDecayRecord {
+  ts: number;
+  environment_delta: Record<string, EnvironmentFieldDelta>;
+  affected_objects: ArtifactRef[];
+  regression_set: string[];
+  capability_vector_before: CapabilityVector;
+  capability_vector_after: CapabilityVector;
+  attribution: Record<string, CapabilityVector>;
+  fingerprint_before: Fingerprint;
+  fingerprint_after: Fingerprint;
 }

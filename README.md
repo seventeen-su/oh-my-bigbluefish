@@ -33,6 +33,7 @@
    icacls stable /inheritance:r /grant:r "Everyone:RX" /T /C
    icacls latest /inheritance:r /grant:r "Everyone:RX" /T /C
    ```
+   ⚠️ **种子升级**（旧布局 → 新种子）：删除 `versions.git` 后重新执行 `pnpm init-three-line`（或重启宿主走启动自动初始化）即重建**新种子**——新种子含 `kernel/policy` + `kernel/processes` 快照与 `trusted-latest` 分支（P1a 种子升级语义：演化管线/晋升检查/按线加载依赖这些特征；旧种子会以「降级记录」运行，不报错）。
 3. **依赖安装**：项目根执行 `pnpm install`。⚠️ 项目经拷贝/移动后 pnpm 顶层符号链接可能会损坏（表现为空目录，运行时 `Cannot find package`），必须重新 install 修复（`pnpm install --offline --frozen-lockfile` 可全离线重建）。
 4. **构建**：`pnpm build`（tsc 输出 `lib/`；`lib/` 为编译产物，不入库）。修改源码后需重新 build。
 5. **组合配置要点**：
@@ -44,6 +45,8 @@
    - `/mode`：切换 **OMB 当前版本线**（`initial | stable | latest`）——OMB 内部版本线切换（**单模式**）：load 校验 + 空白会话守卫 + 版本激活记录；**不涉及 DSH 预设切换**（DSH 侧恒为「大肥鱼模式 v2」单一模式）。
    - per-line 预设（`omb-v2-initial/stable/latest`）由 `pnpm deploy-lines` 部署（覆盖式写入 `$DSH_HOME/.agent-presets/`；内容基于本组合**文本级**生成——保留全部注释与工具行，仅把 omb-v2 行 `name` 指向主预设编译产物（`../<主预设目录名>/lib/runtime/plugin.js?v=N`）并在 `config` 注入 `line: <line>` 固定本线初始版本线）。**后备/兼容机制（可选）**：供宿主兼容测试/开发调试/未来多预设场景；正常生产为单模式 + `/mode` 内部版本线切换，**无需部署**。
 6. **验证**：重启宿主后新建会话选择「大肥鱼模式 v2」；`/mode`、`/bench` 命令可用；系统提示含认知投影段；`workspace/.omb/` 出现 `events.db`/`memory.db`。`/bench` 默认运行 v2 契约基准（回放降级明细 `replay-v2-<line>-<ts>.jsonl`；配 `model` 且有 DSH llm 服务时真实执行，明细 `real-v2-<line>-<ts>.jsonl`）——真实执行预期通过率显著改善（契约化 prompt + output_schema 单一权威，修复 v1 实测的 prompt/输入/输出/verifier 四者漂移；v1 legacy 仍可用 `config.benchVersion: 'v1'` 切回对比）。也可用 `agentPresets.standingKeyFor('oh-my-bigbluefish')` 做挂载审计（需挂载探针）。
+   - **真实会话冒烟（投影注入可观测）**：认知投影经 DSH `systemPrompt.context` 钩子（名 `cognitive:projection`）注入系统提示——可观测点 = 系统提示中的认知投影段（Goal/事实/矛盾/进度等）+ `events.db` 的 `context/injected` 事件（投影 id/total_tokens/views；Model-visible ⟺ logged，注入必有对应事件）。
+   - **S4 world/self 模型接线（约定层，留下游）**：S4Schema（WorldModel/SelfModel 双变体）为已定契约（OMB_OBJECTS.S4）；运行时世界/自我模型**未接线**——checkpoint/事件流归约的 world/self 为 `null`（reducer 诚实"未知"，非缺陷）；S4 实体采集与接线留下游里程碑（约定：save 不机械校验内嵌 state，调用方保证 schema 合规）。
 
 ### 卸载
 
