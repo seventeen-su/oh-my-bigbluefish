@@ -1,7 +1,7 @@
 {
   "id": "sys-02",
   "category": "sys",
-  "requirement": "按变更规格启动服务：输出前后状态断言 { before, after }——服务状态从 from_status 变为 to_status（键形如 '<service>.status'）。",
+  "requirement": "按变更规格启动服务：输出前后状态断言 { before, after }——before/after 为 键→状态值 映射，状态值取 changes 工件中的字符串 from_status/to_status（键形如 '<service>.status'）。",
   "input_artifacts": [
     {
       "name": "changes",

@@ -369,6 +369,15 @@ describe('⑦ 契约质量不变量（防四要素漂移）', () => {
     expect(fileList.constraints).toEqual({ path: 'src', sorted: true, recursive: false });
   });
 
+  it('state_assert 契约：requirement 必须显式声明状态值编码（防真实执行编码漂移，2026-08-23 sys-03/04 实测教训）', async () => {
+    const contracts = (await loadBenchContractsV2()).filter((c) => c.verifier.kind === 'state_assert');
+    expect(contracts.length).toBeGreaterThanOrEqual(4);
+    for (const c of contracts) {
+      const req = c.requirement;
+      expect(req, `${c.id}: state_assert requirement 须含值域/映射声明`).toMatch(/值域|映射|null|'exists'|"exists"/);
+    }
+  });
+
   it('data-*：input 为真实数据工件且量级适中（3~8 条 / 非空文本）', async () => {
     const contracts = (await loadBenchContractsV2()).filter((c) => c.category === 'data');
     expect(contracts).toHaveLength(4);

@@ -1,7 +1,7 @@
 {
   "id": "sys-03",
   "category": "sys",
-  "requirement": "按变更规格删除文件：输出前后状态断言 { before, after }——目标路径从 exists 变为 absent。",
+  "requirement": "按变更规格删除文件：输出前后状态断言 { before, after }——before/after 为 路径→状态 映射，状态值域为字符串 'exists'（存在）或 'absent'（不存在）；目标路径从 'exists' 变为 'absent'。",
   "input_artifacts": [
     {
       "name": "changes",
