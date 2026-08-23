@@ -211,7 +211,7 @@ export function summarizeReports(reports: readonly BenchReport[]): BenchSummary 
 
 export function renderMarkdown(
   summary: BenchSummary,
-  opts: { date?: string; benchDir?: string } = {},
+  opts: { date?: string; benchDir?: string; v2?: BenchV2DetailSummary } = {},
 ): string {
   const date = opts.date ?? localDate();
   const benchDir = opts.benchDir ?? DEFAULT_BENCH_DIR;
@@ -294,6 +294,26 @@ export function renderMarkdown(
   );
   lines.push(`- 退出码：${computeExitCode(summary)}`);
   lines.push('');
+  // v2 契约基准段（T2.3）：明细 JSONL 聚合（replay-v2-<line>-<ts>.jsonl / real-v2-<line>-<ts>.jsonl）
+  if (opts.v2 !== undefined && opts.v2.present) {
+    lines.push('## 7. v2 契约基准（明细聚合：replay-v2-<line>-<ts>.jsonl / real-v2-<line>-<ts>.jsonl）');
+    lines.push('');
+    lines.push(`- 明细文件 ${opts.v2.files} 个 / 记录 ${opts.v2.records} 条（按线汇总：passed/total + 成本字段均值；real/replay = 真实/回放记录数）`);
+    lines.push('');
+    lines.push(
+      '| 线 | 通过/总数 | 通过率 | real/replay | model_tokens | tool_calls | retrieval_calls | reacquisition | latency_ms | branch_count | memory_pollution | corrections |',
+    );
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+    for (const line of BENCH_LINES) {
+      const s = opts.v2.byLine[line];
+      if (s.total === 0) {
+        continue;
+      }
+      const costs = COST_FIELDS.map((f) => fmt1(s.costMean[f])).join(' | ');
+      lines.push(`| ${line} | ${s.passed}/${s.total} | ${pct(s.rate)} | ${s.realCount}/${s.replayCount} | ${costs} |`);
+    }
+    lines.push('');
+  }
   return lines.join('\n');
 }
 
@@ -355,6 +375,139 @@ export async function ensureBenchReports(dir: string): Promise<BenchReport[]> {
   }
   await persistReports(dir, reports);
   return reports;
+}
+
+// ---- v2 契约基准明细聚合（T2.3：replay-v2-<line>-<ts>.jsonl / real-v2-<line>-<ts>.jsonl；
+// 复盘工具对 v2 明细只读聚合，v1 路径（bench-*.json）保持可用） ----
+
+/** v2 明细文件名匹配（<mode>-v2-<line>-<ts>.jsonl；line 限定四线） */
+const V2_DETAIL_FILE_RE = /^(replay|real)-v2-(initial|stable|latest|baseline)-.+\.jsonl$/;
+
+/** 单线 v2 汇总：passed/total/rate + real/replay 记录数 + 八字段成本均值 */
+export interface BenchV2LineStats {
+  passed: number;
+  total: number;
+  rate: number; // 0..1
+  realCount: number;
+  replayCount: number;
+  costMean: Record<CostField, number>;
+}
+
+/** v2 明细聚合结果（present=false → 目录无 v2 明细文件） */
+export interface BenchV2DetailSummary {
+  present: boolean;
+  files: number;
+  records: number;
+  byLine: Record<BenchLine, BenchV2LineStats>;
+}
+
+function emptyV2LineStats(): BenchV2LineStats {
+  return {
+    passed: 0,
+    total: 0,
+    rate: 0,
+    realCount: 0,
+    replayCount: 0,
+    costMean: Object.fromEntries(COST_FIELDS.map((f) => [f, 0])) as Record<CostField, number>,
+  };
+}
+
+function emptyV2DetailSummary(): BenchV2DetailSummary {
+  return {
+    present: false,
+    files: 0,
+    records: 0,
+    byLine: Object.fromEntries(BENCH_LINES.map((l) => [l, emptyV2LineStats()])) as Record<
+      BenchLine,
+      BenchV2LineStats
+    >,
+  };
+}
+
+/**
+ * 聚合 v2 明细 JSONL：按线汇总 passed/total + 成本字段均值（real/replay 记录数分列）。
+ * 非破坏性读取：文件/单条记录不可读 → 跳过（同 summarizeEvolution 容错风格，不中断复盘）。
+ */
+export async function summarizeV2Detail(dir: string): Promise<BenchV2DetailSummary> {
+  const empty = emptyV2DetailSummary();
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return empty; // 目录不存在 → 无 v2 明细
+  }
+  const v2Files = files.filter((f) => V2_DETAIL_FILE_RE.test(f)).sort();
+  const byLine = Object.fromEntries(BENCH_LINES.map((l) => [l, emptyV2LineStats()])) as Record<
+    BenchLine,
+    BenchV2LineStats
+  >;
+  const costSums = Object.fromEntries(
+    BENCH_LINES.map((l) => [l, Object.fromEntries(COST_FIELDS.map((f) => [f, 0]))]),
+  ) as Record<BenchLine, Record<CostField, number>>;
+  let records = 0;
+  for (const file of v2Files) {
+    const match = V2_DETAIL_FILE_RE.exec(file);
+    if (match === null) {
+      continue;
+    }
+    const mode = match[1] as 'replay' | 'real';
+    const line = match[2] as BenchLine;
+    let raw: string;
+    try {
+      raw = await readFile(join(dir, file), 'utf8');
+    } catch {
+      continue; // 文件不可读 → 跳过（非破坏性）
+    }
+    for (const rawLine of raw.split('\n')) {
+      const trimmed = rawLine.trim();
+      if (trimmed.length === 0) {
+        continue;
+      }
+      let record: unknown;
+      try {
+        record = JSON.parse(trimmed);
+      } catch {
+        continue; // 单条非法 → 跳过（不中断聚合）
+      }
+      if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+        continue;
+      }
+      const rec = record as Record<string, unknown>;
+      if (typeof rec.passed !== 'boolean' || rec.line !== line) {
+        continue; // 记录缺 passed / line 与文件名不符 → 跳过
+      }
+      const cost = rec.cost;
+      if (cost === null || typeof cost !== 'object' || Array.isArray(cost)) {
+        continue;
+      }
+      const stats = byLine[line]!;
+      stats.total++;
+      if (rec.passed) {
+        stats.passed++;
+      }
+      if (mode === 'real') {
+        stats.realCount++;
+      } else {
+        stats.replayCount++;
+      }
+      const costRecord = cost as Record<string, unknown>;
+      for (const field of COST_FIELDS) {
+        const value = costRecord[field];
+        if (typeof value === 'number') {
+          costSums[line]![field] += value;
+        }
+      }
+      records++;
+    }
+  }
+  for (const line of BENCH_LINES) {
+    const stats = byLine[line]!;
+    stats.rate = stats.total === 0 ? 0 : stats.passed / stats.total;
+    for (const field of COST_FIELDS) {
+      stats.costMean[field] = stats.total === 0 ? 0 : costSums[line]![field] / stats.total;
+    }
+  }
+  return { present: v2Files.length > 0, files: v2Files.length, records, byLine };
 }
 
 // ---- 演化活动（.evolution 候选记录；非破坏性读取） ----

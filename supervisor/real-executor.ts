@@ -10,7 +10,7 @@
 // 无真实会话时生产降级为回放 executor（plugin.ts /bench 命令：有 modelAdapter 用真实、否则回放，文档化）。
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（契约例外）+ 同层文件。
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
-import type { BenchTask, CognitiveCost } from '../kernel/schemas/bench.js';
+import type { BenchContractV2, BenchFixtureV2, BenchTask, CognitiveCost } from '../kernel/schemas/bench.js';
 import {
   BENCH_FIXTURES_DIR,
   assertFixtureMatchesVerifier,
@@ -18,6 +18,8 @@ import {
   runVerifier,
   type BenchExecutor,
 } from './bench.js';
+import { parseModelOutputV2 } from './bench-v2.js';
+import { renderPromptV2 } from './bench-prompt-v2.js';
 
 // ---- 常量 ----
 
@@ -91,5 +93,59 @@ export function makeRealExecutor(adapter: ModelAdapter, opts: RealExecutorOption
       corrections: 0,
     };
     return { passed, cost, output, rawText: res.text, fixture };
+  };
+}
+
+// ---- 真实执行器 v2（T2.3 接线：契约 + fixture → prompt → ModelAdapter.generate → parse → cost） ----
+// 与 v1 makeRealExecutor 的差异：签名 (task, fixture)（fixture 提供具体输入实例，renderPromptV2 注入点）；
+// prompt = renderPromptV2（契约 requirement + fixture.input + output_schema 唯一权威形状）；
+// 输出解析 = parseModelOutputV2（失败 → output=undefined，交由 runBenchV2 记 parse 失败：passed=false
+// 且 reason 含 parse 错误）；判定在 runBenchV2 统一经 verifyV2（本执行器不判 passed）。
+// cost 映射与 v1 一致（model_tokens = usage input+output；latency_ms 真实计时；其余字段 0）。
+
+/** 真实执行 v2 系统提示（v2 契约基准专属：输出必须符合 output_schema；含 v1 同款「不要长推理」） */
+const REAL_EXEC_SYSTEM_V2 =
+  '你是 OMB v2 契约基准执行器。严格按给定 output_schema 输出 JSON（唯一权威形状）；只输出 JSON，不要输出 JSON 以外的解释文字。不要长推理，直接给出答案。';
+
+export interface RealExecutorV2Options {
+  system?: string;
+  maxTokens?: number;
+  reasoningEffort?: 'off' | 'low' | 'high' | 'max';
+}
+
+/**
+ * 真实执行器 v2：makeRealExecutorV2(adapter, opts) → (task, fixture) => Promise<{output, cost, rawText?}>。
+ * maxTokens 默认 8000（与 v1 修复后一致，输出预算容纳推理+正文）；reasoningEffort 默认 'low'（显式传
+ * 推理档位，防推理独占输出预算——真实 /bench 4000 被 high 推理吃光的根因修复）。
+ * adapter 抛错 → fail-loud（不静默）；parse 失败不抛（output=undefined 交给 runBenchV2 归因）。
+ */
+export function makeRealExecutorV2(
+  adapter: ModelAdapter,
+  opts: RealExecutorV2Options = {},
+): (task: BenchContractV2, fixture: BenchFixtureV2) => Promise<{
+  output: unknown;
+  cost: CognitiveCost;
+  rawText?: string;
+}> {
+  return async (task, fixture) => {
+    const t0 = Date.now();
+    const prompt = renderPromptV2(task, fixture);
+    const res = await adapter.generate(prompt, {
+      system: opts.system ?? REAL_EXEC_SYSTEM_V2,
+      maxTokens: opts.maxTokens ?? REAL_EXEC_MAX_TOKENS,
+      reasoningEffort: opts.reasoningEffort ?? 'low',
+    });
+    const parsed = parseModelOutputV2(res.text);
+    const cost: CognitiveCost = {
+      model_tokens: (res.usage?.inputTokens ?? 0) + (res.usage?.outputTokens ?? 0),
+      tool_calls: 0,
+      retrieval_calls: 0,
+      reacquisition: 0,
+      latency_ms: Date.now() - t0,
+      branch_count: 0,
+      memory_pollution: 0,
+      corrections: 0,
+    };
+    return { output: parsed.ok ? parsed.value : undefined, cost, rawText: res.text };
   };
 }

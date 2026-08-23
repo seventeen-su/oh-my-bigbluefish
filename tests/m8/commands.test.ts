@@ -2,8 +2,9 @@
 // - /mode：ctx.agentPresets.recompose 存在 → handler 真实调用 recompose（目标 preset id 按线映射
 //   omb-v2-<line>）；失败 → 明确受限（error 文本文档化平台限制），本地线状态不切换；
 //   ctx 无 agentPresets → 降级为会话内当前线状态（既有 m0 行为不变）。
-// - /bench：注册 bench 命令；handler 经 supervisor/bench.ts 真实 runBench（冻结基准集 20 任务，
-//   回放执行器）产出报告文本。
+// - /bench（T2.3 起默认 v2 契约基准）：注册 bench 命令；handler 默认走 supervisor/bench-v2.ts runBenchV2
+//  （20 契约 + 回放执行器，明细 replay-v2-<line>-<ts>.jsonl）；`config.benchVersion: 'v1'` 切回 legacy
+//  （supervisor/bench.ts runBench，明细 replay-<line>-<ts>.jsonl——v1 语义原样保留）。
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -144,30 +145,56 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 });
 
 describe('T8.2 /bench 注册与触发', () => {
-  it('注册 bench 命令：name=bench、description 非空、recordInput=true', () => {
+  it('注册 bench 命令：name=bench、description 含默认 v2 说明、recordInput=true', () => {
     const c = makeFakeCtx({ noAgentPresets: true });
     apply(c.ctx, { bootstrap: false });
 
     expect(bench(c)).toBeDefined();
     expect(bench(c).name).toBe('bench');
     expect(bench(c).description.length).toBeGreaterThan(0);
+    expect(bench(c).description).toContain('v2'); // 默认 v2 契约基准（config.benchVersion 可切回 v1 legacy）
     expect(bench(c).recordInput).toBe(true);
   });
 
-  it('handler 触发基准：真实 runBench（冻结基准集 20 任务 + 回放执行器）→ success + 报告文本（含通过数）；明细落盘临时目录（测试隔离，不污染真实 bench 目录）', async () => {
-    const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-'));
+  it('handler 默认 v2 契约基准（无 DSH 会话 → 回放 v2）：文本含「v2 契约基准」标识与 20/20；明细 replay-v2-stable-*.jsonl', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-v2-'));
     try {
       const c = makeFakeCtx({ noAgentPresets: true });
       apply(c.ctx, { benchPersistDir: join(base, 'bench'), bootstrap: false });
 
       const r = await bench(c).handler(makeInvocation(''));
       expect(r.kind).toBe('success');
+      expect(r.text).toContain('v2 契约基准'); // v2 标识
       expect(r.text).toContain('基准完成');
-      expect(r.text).toMatch(/20/); // 冻结基准集 20 任务
+      expect(r.text).toMatch(/20\/20/); // 冻结基准集 20 任务全过（回放构造保证）
       expect(r.text).toMatch(/通过/);
-      // 明细已落盘（回放模式单文件 20 条）
+      // 明细已落盘（v2 回放模式单文件 20 条：replay-v2-<line>-<ts>.jsonl）
+      const files = readdirSync(join(base, 'bench'));
+      expect(files.some((f: string) => f.startsWith('replay-v2-stable-') && f.endsWith('.jsonl'))).toBe(true);
+      expect(files.some((f: string) => f.startsWith('replay-stable-'))).toBe(false); // 默认不落 v1 命名
+      const records = readFileSync(join(base, 'bench', files.find((f: string) => f.startsWith('replay-v2-stable-'))!), 'utf8')
+        .trim().split('\n');
+      expect(records).toHaveLength(20);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('config.benchVersion: "v1" → 走 v1 legacy 路径（runBench v1；明细 replay-stable-*.jsonl；文本无 v2 标识）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-v1-'));
+    try {
+      const c = makeFakeCtx({ noAgentPresets: true });
+      apply(c.ctx, { benchPersistDir: join(base, 'bench'), benchVersion: 'v1', bootstrap: false });
+
+      const r = await bench(c).handler(makeInvocation(''));
+      expect(r.kind).toBe('success');
+      expect(r.text).toContain('基准完成');
+      expect(r.text).not.toContain('v2 契约基准'); // v1 文本无 v2 标识
+      expect(r.text).toMatch(/20/); // 冻结基准集 20 任务
+      // 明细落盘沿用 v1 命名（replay-<line>-<ts>.jsonl），不产生 v2 文件
       const files = readdirSync(join(base, 'bench'));
       expect(files.some((f: string) => f.startsWith('replay-stable-') && f.endsWith('.jsonl'))).toBe(true);
+      expect(files.some((f: string) => f.startsWith('replay-v2-'))).toBe(false);
       const records = readFileSync(join(base, 'bench', files.find((f: string) => f.startsWith('replay-stable-'))!), 'utf8')
         .trim().split('\n');
       expect(records).toHaveLength(20);

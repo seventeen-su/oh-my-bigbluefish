@@ -21,6 +21,7 @@ import {
   renderMarkdown,
   summarizeEvolution,
   summarizeReports,
+  summarizeV2Detail,
 } from './bench-report-core.js';
 
 export * from './bench-report-core.js';
@@ -48,8 +49,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     ...summarizeReports(reports),
     evolution: await summarizeEvolution(DEFAULT_EVOLUTION_ROOT),
   };
+  // v2 契约基准明细聚合（T2.3：replay-v2-*/real-v2-*.jsonl；只读，不影响 v1 退出码语义）
+  const v2 = await summarizeV2Detail(benchDir);
   const date = localDate();
-  const md = renderMarkdown(summary, { date, benchDir });
+  const md = renderMarkdown(summary, { date, benchDir, v2 });
   const reportFile = join(benchDir, `${REPORT_PREFIX}${date}.md`);
   await mkdir(benchDir, { recursive: true });
   await writeFile(reportFile, md, 'utf8');
@@ -60,6 +63,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   for (const line of ['initial', 'stable', 'latest', 'baseline'] as const) {
     const s = summary.byLine[line];
     console.log(`  ${line}: ${s.passed}/${s.total} (${pct(s.rate)})`);
+  }
+  if (v2.present) {
+    console.log(`v2 契约基准明细：${v2.files} 文件 / ${v2.records} 条记录`);
+    for (const line of ['initial', 'stable', 'latest', 'baseline'] as const) {
+      const s = v2.byLine[line];
+      if (s.total > 0) {
+        console.log(`  v2 ${line}: ${s.passed}/${s.total} (${pct(s.rate)})`);
+      }
+    }
   }
   if (summary.calibration.length > 0) {
     console.log(

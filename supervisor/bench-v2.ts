@@ -23,9 +23,16 @@ import {
 import { zeroCost } from './bench.js';
 
 // ---- 数据目录（相对本模块解析，与 cwd 无关；布局同 v1 bench.ts） ----
+// HERE 探测以 v2 数据目录本身为准（比 bench.ts 的 kernel/bench-tasks 探测更精确）：src 布局
+// supervisor/bench-v2.ts → 上一级即 preset 根；编译布局 lib/supervisor/bench-v2.js 多一层。
+// ⚠️ 不能探测 kernel/bench-tasks 本身——T2.1/T2.2 把 reference/*.ts 编进 lib/kernel/bench-tasks/reference
+// 后该路径恒存在，会误判 HERE=lib/（数据 JSON 不随 tsc 编译，lib/ 下无 v2/contracts）。v1 bench.ts
+// 同款探测因此存在同类隐患（v1 冻结不动，记录在案）。
 
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
-const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'bench-tasks', 'v2', 'contracts'))
+  ? HERE_CANDIDATE
+  : dirname(HERE_CANDIDATE);
 
 export const BENCH_V2_CONTRACTS_DIR = join(HERE, 'kernel', 'bench-tasks', 'v2', 'contracts');
 export const BENCH_V2_FIXTURES_DIR = join(HERE, 'kernel', 'bench-tasks', 'v2', 'fixtures');
@@ -228,6 +235,34 @@ export function verifyV2(
   }
 }
 
+// ---- 模型输出解析（v2；T2.3 接线：runBenchV2 与 real-executor 共用） ----
+
+/** 解析失败时错误消息里携带的原始文本片段上限（截断防爆长；确定性） */
+const PARSE_SNIPPET_MAX = 120;
+
+/**
+ * 模型输出解析（容错）：剥 ```json / ```js / ``` 等任意代码围栏 + 首尾空白 → JSON.parse。
+ * 成功 → { ok: true, value }；失败 → { ok: false, error }（错误含 JSON 解析详情 + 片段截断的原文）。
+ * v2 契约输出形状一律为 output_schema 的 JSON 对象——解析失败即不可用（passed=false 且 reason 含 parse 错误），
+ * 与 v1 parseExecOutput 的「失败回退原样文本」不同（v1 blind_judge 接受字符串；v2 无此场景）。
+ */
+export function parseModelOutputV2(
+  rawText: string,
+): { ok: true; value: unknown } | { ok: false; error: string } {
+  const trimmed = rawText.trim();
+  const cleaned = /^```/i.test(trimmed)
+    ? trimmed.replace(/^```[a-zA-Z0-9_-]*\s*/i, '').replace(/```\s*$/i, '')
+    : trimmed;
+  try {
+    return { ok: true, value: JSON.parse(cleaned) as unknown };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const snippet =
+      cleaned.length > PARSE_SNIPPET_MAX ? `${cleaned.slice(0, PARSE_SNIPPET_MAX)}…（截断）` : cleaned;
+    return { ok: false, error: `模型输出解析失败（${detail}）：${snippet}` };
+  }
+}
+
 // ---- 执行器注入与运行（回放执行器按 fixture.output 直通；真实执行器 T2.3 接线） ----
 
 /** v2 执行器：契约 → 执行产物 + 成本（判定由 runBenchV2 统一经 verifyV2 完成） */
@@ -303,7 +338,21 @@ export async function runBenchV2(opts: {
     }
     const executed = await opts.executor(contract);
     const cost = CognitiveCostSchema.parse(executed.cost);
-    const verdict = verifyV2(contract, fixture, executed.output);
+    // 模型输出解析兜底（真实执行路径）：executor 输出解析失败（output=undefined）且带回 rawText 时，
+    // 复用 parseModelOutputV2 取 parse 错误归因（passed=false 且 reason 含 parse 错误）；rawText 缺失时
+    // 走 verifyV2 常规 schema 判定（回放 executor 恒有 output，不经此分支——行为与 T2.1/T2.2 一致）。
+    let output = executed.output;
+    let parseError: string | undefined;
+    if (output === undefined && executed.rawText !== undefined) {
+      const parsed = parseModelOutputV2(executed.rawText);
+      if (parsed.ok) {
+        output = parsed.value;
+      } else {
+        parseError = parsed.error;
+      }
+    }
+    const verdict =
+      parseError === undefined ? verifyV2(contract, fixture, output) : { passed: false, reason: `parse: ${parseError}` };
     results.push({ task_id: contract.id, line, passed: verdict.passed, cost });
     if (persistFile !== undefined) {
       const record = {

@@ -38,10 +38,11 @@
 5. **组合配置要点**：
    - `bootstrap`（默认 `true`）：启动时自动初始化三线布局与只读 ACL（见步骤 2）；设为 `false` 可关闭（测试/手动控制场景）。
    - `cognitiveRoot` 不提供时插件降级为仅命令模式（`/mode`、`/bench` 可用，无认知投影/事件采集）。
+   - `benchVersion`（默认 `'v2'`）：`/bench` 运行 **v2 契约基准**（benchmark-v2-contract——输入工件 + requirement + output_schema + verifier rules 四要素单一权威，fixture 由 reference 纯函数生成，prompt 直接序列化 output_schema 为唯一权威输出形状）；设为 `'v1'` 可切回 **legacy 录制基准**（benchmark-v1-legacy，`kernel/bench-tasks/{tasks,fixtures}/` 原位保留）。两版本并存，可对比「修复了基准契约」与「模型真的进步」两个因素。
    - 行名尾缀 `?v=N` 用于破除宿主进程的 ESM 模块缓存（进程内文件修改不热重载）：修改 `lib/` 下代码并重新 build 后**须递增 `?v=`（或重启宿主）**，新会话才会加载新代码。
    - 组合必须保留完整的模型工具行：只有 `omb-v2` 一行的预设是**无工具会话**（模型无工具可用，实测会幻觉出不存在的工具名，自检/日常都无法执行）。
    - per-line 预设（`omb-v2-initial/stable/latest`）由 `pnpm deploy-lines` 部署（覆盖式写入 `$DSH_HOME/.agent-presets/`；内容基于本组合**文本级**生成——保留全部注释与工具行，仅把 omb-v2 行 `name` 指向主预设编译产物（`../<主预设目录名>/lib/runtime/plugin.js?v=N`）并在 `config` 注入 `line: <line>` 固定本线初始版本线）。部署后 `/mode` 切换可**真实 recompose** 重链到对应线预设；未部署时 `/mode` 降级为会话内版本线状态（既有行为）。
-6. **验证**：重启宿主后新建会话选择「大肥鱼模式 v2」；`/mode`、`/bench` 命令可用；系统提示含认知投影段；`workspace/.omb/` 出现 `events.db`/`memory.db`。也可用 `agentPresets.standingKeyFor('oh-my-bigbluefish')` 做挂载审计（需挂载探针）。
+6. **验证**：重启宿主后新建会话选择「大肥鱼模式 v2」；`/mode`、`/bench` 命令可用；系统提示含认知投影段；`workspace/.omb/` 出现 `events.db`/`memory.db`。`/bench` 默认运行 v2 契约基准（回放降级明细 `replay-v2-<line>-<ts>.jsonl`；配 `model` 且有 DSH llm 服务时真实执行，明细 `real-v2-<line>-<ts>.jsonl`）——真实执行预期通过率显著改善（契约化 prompt + output_schema 单一权威，修复 v1 实测的 prompt/输入/输出/verifier 四者漂移；v1 legacy 仍可用 `config.benchVersion: 'v1'` 切回对比）。也可用 `agentPresets.standingKeyFor('oh-my-bigbluefish')` 做挂载审计（需挂载探针）。
 
 ### 卸载
 

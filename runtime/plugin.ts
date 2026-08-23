@@ -16,7 +16,8 @@ import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
 import { bootStable } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
-import { makeRealExecutor } from '../supervisor/real-executor.js';
+import { loadBenchContractsV2, loadBenchFixturesV2, makeReplayExecutorV2, runBenchV2, type BenchExecutorV2 } from '../supervisor/bench-v2.js';
+import { makeRealExecutor, makeRealExecutorV2 } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
@@ -33,7 +34,7 @@ import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { Event } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
-import type { BenchLine } from '../kernel/schemas/bench.js';
+import type { BenchFixtureV2, BenchLine } from '../kernel/schemas/bench.js';
 import type { GovernorDecision } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
 
@@ -48,6 +49,12 @@ export interface PluginConfig {
   model?: { provider?: string; model?: string };
   /** 基准明细落盘目录（/bench 真实/回放逐任务 JSONL；缺省 BENCH_REPORTS_DIR = <preset>/workspace/.omb/bench） */
   benchPersistDir?: string;
+  /**
+   * 基准版本选择：缺省 'v2'（契约基准 benchmark-v2-contract——输入工件 + requirement + output_schema +
+   * verifier rules 四要素单一权威，fixture 由 reference 生成）；'v1' 切回 legacy 录制基准
+   * （benchmark-v1-legacy，kernel/bench-tasks/{tasks,fixtures}/ 原位保留，两版本并存可对比）。
+   */
+  benchVersion?: 'v2' | 'v1';
   /** 版本激活记录持久化目录（/mode 切换时写入 completed/<id>.json，T8.7 幂等持久化；缺省不落盘） */
   activationLogDir?: string;
   /** 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」；缺省 true；测试与手动控制用 bootstrap: false 关闭） */
@@ -633,17 +640,48 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     },
   });
 
-  // T8.2：/bench 命令——触发冻结基准集运行（supervisor/bench.ts runBench；当前版本线）。
+  // T8.2：/bench 命令——触发冻结基准集运行（当前版本线）。
+  // T2.3：默认 v2 契约基准（benchmark-v2-contract：契约四要素单一权威；`config.benchVersion: 'v1'` 切回
+  // legacy 录制基准——v1 全链路原样保留，两版本并存可对比「修复了基准契约」与「模型真的进步」）。
   // T8.18：真实执行器接线——modelAdapter（T8.12 装配，需真实 DSH 会话）存在 → 真实 DSH 执行
   //（三线真实分化）；无真实会话 → 降级回放执行器（数字可复现，平台限制文档化）。
   ctx.commands?.register?.({
     name: 'bench',
-    description: '运行冻结基准集（当前版本线；真实 DSH 执行或回放降级）',
+    description: '运行基准集（默认 v2 契约基准；config.benchVersion 可切回 v1 legacy）',
     recordInput: true,
     handler: async () => {
       try {
-        const tasks = await loadBenchTasks();
         const line = current as BenchLine;
+        const version = config.benchVersion ?? 'v2';
+        if (version === 'v2') {
+          // v2 契约基准：契约 + fixture（reference 生成）→ 真实执行（renderPromptV2 + parseModelOutputV2）
+          // 或回放执行（fixture.output 直通）→ runBenchV2（schema 校验 + verifier rules 判定）。
+          const contracts = await loadBenchContractsV2();
+          const fixtures = await loadBenchFixturesV2();
+          const fixtureById = new Map(fixtures.map((f): [string, BenchFixtureV2] => [f.task_id, f]));
+          // makeRealExecutorV2 签名 (task, fixture)；runBenchV2 executor 单参 → 闭包绑定 fixture
+          //（runBenchV2 已先行校验契约↔fixture 配对，此处非空断言安全）。
+          const realV2 = modelAdapter !== undefined ? makeRealExecutorV2(modelAdapter) : undefined;
+          const executor: BenchExecutorV2 =
+            realV2 !== undefined ? (task) => realV2(task, fixtureById.get(task.id)!) : makeReplayExecutorV2(fixtures);
+          // 明细落盘（workspace/.omb/bench/<mode>-v2-<line>-<ts>.jsonl）：真实与回放分开记录（T8.18 归因）；
+          // mode 仅标记不改变判定。
+          const report = await runBenchV2({
+            contracts,
+            fixtures,
+            line,
+            executor,
+            mode: modelAdapter !== undefined ? 'real' : 'replay',
+            persistDir: resolveConfigPath(config.benchPersistDir) ?? BENCH_REPORTS_DIR,
+          });
+          const mode = modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
+          return {
+            kind: 'success',
+            text: `v2 契约基准完成：${report.line} ${report.passed}/${report.total} 通过（${report.total} 任务，${mode}；明细已落盘 workspace/.omb/bench）`,
+          };
+        }
+        // v1 legacy 分支（benchVersion === 'v1'；原样保留 v1 全链路：supervisor/bench.ts runBench）
+        const tasks = await loadBenchTasks();
         const executor = modelAdapter !== undefined ? makeRealExecutor(modelAdapter) : makeReplayExecutor();
         // 明细落盘（workspace/.omb/bench/<mode>-<line>-<ts>.jsonl）：逐任务输入/输出/验证结果/
         // 失败原因，真实与回放分开记录（T8.18 三线真实分化归因）；mode 仅标记不改变判定。
