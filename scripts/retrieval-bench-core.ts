@@ -1,9 +1,12 @@
 // OMB v2 中文技术检索基准核心（§17 开放项「中文 BM25 分词」测量脚手架；施工计划 T8.16 后续对比）。
 // 目标：对比 ngram（生产双侧 bigram）/ jieba / 混合方案在 Recall@K、MRR、任务成功率与成本上的差异，
-// 数据驱动决定最终分词方案。jieba/hybrid 未安装时如实返回空分词（度量全零 + note 标注未安装），不伪造分数。
+// 数据驱动决定最终分词方案。jieba 已接入（jieba-wasm 2.4.0，devDependency、仅基准工具链）；未安装/
+// 加载失败时如实返回空分词（度量全零 + note 标注未安装），不伪造分数。hybrid 暂定为 jieba 词级 ∪ ngram
+// bigram 并集（去重；FTS5 默认 AND 语义），方案定义待主会话/用户裁决。
 // 度量口径（确定性：同数据同参数 → 同数字；FTS5 排序 rank 稳定）：
 //   recall_at_5 = |命中∩相关| / |相关|（K=5）；mrr = 首个相关文档位置倒数（未命中 0）；hits = 首条即相关。
 // layer 2（memory/ 供 tokenize；scripts 引入）：核心逻辑可被测试直接调用（bench-report-core 同款先例）。
+import { createRequire } from 'node:module';
 import { tokenizeForFts } from '../memory/cjk-ngram.js';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -44,15 +47,93 @@ export interface BenchResult {
   summary: BenchSummary;
 }
 
-/** 分词器工厂（可插拔；jieba/hybrid 未安装 → 空分词占位 + 明示未安装，不伪造） */
+// --- jieba 适配层 ---
+// 选型：jieba-wasm@2.4.0（jieba-rs 引擎的预编译 WASM，无构建链/无 allowBuilds；同步 cut API）。
+// 弃用说明：npm 'jieba'@1.0.0 与 'jieba-js'@1.0.2 均为发布缺 main 入口的坏包（实测 require 即崩），故不采用。
+// 加载：createRequire 同步 require CJS glue（ESM 内兼容）；惰性 + try/catch → 未安装/坏包降级为空分词占位。
+interface JiebaLike {
+  cut: (text: string) => string[];
+}
+
+const nodeRequire = createRequire(import.meta.url);
+let jiebaModule: JiebaLike | null | undefined; // undefined=未尝试；null=加载失败/不可用
+
+function loadJieba(): JiebaLike | null {
+  if (jiebaModule === undefined) {
+    try {
+      const mod = nodeRequire('jieba-wasm') as unknown as JiebaLike;
+      if (typeof mod.cut !== 'function') {
+        throw new Error('jieba-wasm 缺少 cut API');
+      }
+      jiebaModule = mod;
+    } catch {
+      jiebaModule = null; // 未安装/坏包 → 降级占位（度量如实零）
+    }
+  }
+  return jiebaModule;
+}
+
+/** jieba 分词 → 空格连接 token 串（FTS5 列/查询双侧同用）；过滤纯标点 token；未安装 → '' */
+function tokenizeWithJieba(text: string): string {
+  const jieba = loadJieba();
+  if (!jieba) {
+    return '';
+  }
+  try {
+    return jieba
+      .cut(text)
+      .filter((t) => /[a-zA-Z0-9\u3400-\u4dbf\u4e00-\u9fff]/.test(t))
+      .join(' ');
+  } catch {
+    return ''; // 分词异常 → 空（如实）
+  }
+}
+
+/** 混合方案（暂定）：jieba 词级 ∪ ngram bigram 并集（保序去重）；jieba 不可用 → 空（如实全零） */
+function tokenizeHybrid(text: string): string {
+  const jiebaTokens = tokenizeWithJieba(text);
+  if (jiebaTokens === '') {
+    return '';
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of [...jiebaTokens.split(/\s+/), ...tokenizeForFts(text).split(/\s+/)]) {
+    if (token.length > 0 && !seen.has(token)) {
+      seen.add(token);
+      out.push(token);
+    }
+  }
+  return out.join(' ');
+}
+
+/** jieba 一次性初始化成本（wasm 实例化 + 词典加载，首次 cut 时产生）；未安装 → null */
+export function jiebaInitCostMs(): number | null {
+  const jieba = loadJieba();
+  if (!jieba) {
+    return null;
+  }
+  const t0 = performance.now();
+  try {
+    jieba.cut('分词初始化冒烟');
+  } catch {
+    return null;
+  }
+  return performance.now() - t0;
+}
+
+/** 分词器工厂（可插拔；jieba 未安装 → 空分词占位 + 明示未安装，不伪造） */
 export function makeTokenizer(kind: TokenizerKind): { tokenize: (text: string) => string; note: string } {
   switch (kind) {
     case 'ngram':
       return { tokenize: tokenizeForFts, note: '生产双侧 bigram（T8.16 落地；单字查询不命中为文档化限制）' };
     case 'jieba':
-      return { tokenize: () => '', note: 'jieba 未安装（新依赖边界，报告主会话后接入）' };
+      return loadJieba() !== null
+        ? { tokenize: tokenizeWithJieba, note: 'jieba（jieba-wasm 2.4.0，devDependency 仅基准工具链；cut 默认模式，过滤纯标点 token）' }
+        : { tokenize: () => '', note: 'jieba 未安装（新依赖边界，报告主会话后接入；度量如实为零）' };
     case 'hybrid':
-      return { tokenize: () => '', note: '混合方案未定型（基准对比数据产出后决定）' };
+      return loadJieba() !== null
+        ? { tokenize: tokenizeHybrid, note: '混合方案（暂定：jieba 词级 ∪ ngram bigram 并集去重；FTS5 默认 AND 语义；定义待主会话裁决）' }
+        : { tokenize: () => '', note: '混合方案未定型（jieba 未安装，度量如实为零；接入后重跑基准）' };
   }
 }
 

@@ -5,7 +5,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { runComparison, runRetrievalBench, type BenchResult, type TokenizerKind } from './retrieval-bench-core.js';
+import { jiebaInitCostMs, runComparison, runRetrievalBench, type BenchResult, type TokenizerKind } from './retrieval-bench-core.js';
 
 /** 仓库根（本文件在 <preset>/scripts/ → 上一级即 preset 根） */
 const HERE = fileURLToPath(new URL('..', import.meta.url));
@@ -62,7 +62,7 @@ function renderComparison(results: BenchResult[]): string {
     }),
     '',
     '> 决策标准（§17）：Recall@K、MRR、任务成功率与成本综合对比后定最终分词方案；',
-    '> jieba/hybrid 未安装时如实为零（不伪造分数），接入后重跑本基准即可对比。',
+    '> jieba 基于 jieba-wasm 2.4.0（devDependency 仅基准工具链）实测；未安装时如实为零（不伪造分数）。',
     '',
   ];
   return lines.join('\n');
@@ -71,6 +71,7 @@ function renderComparison(results: BenchResult[]): string {
 export async function main(argv: string[]): Promise<string> {
   const { docs, queries } = await loadData();
   const arg = argv[2];
+  const jiebaInitMs = jiebaInitCostMs(); // 顺带预热 wasm/词典，使逐查询分词耗时反映稳态成本
   const results = arg === undefined
     ? runComparison(docs, queries)
     : [runRetrievalBench(docs, queries, arg as TokenizerKind)];
@@ -78,6 +79,7 @@ export async function main(argv: string[]): Promise<string> {
     '# OMB v2 中文技术检索基准（§17 分词选型测量）',
     '',
     `> 生成时间：${new Date().toISOString()} ｜ 数据：kernel/retrieval-bench/ ｜ 参数：K=5`,
+    jiebaInitMs === null ? '' : `> jieba 一次性初始化（wasm 实例化 + 词典加载）：${jiebaInitMs.toFixed(1)}ms（不计入逐查询分词均值）`,
     '',
     ...results.flatMap((r) => [renderResult(r), '---', '']),
     renderComparison(results),

@@ -1,6 +1,7 @@
 // T8.16 后续：中文技术检索基准脚手架测试（§17「中文 BM25 分词」测量脚手架）。
-// 断言：ngram（生产双侧 bigram）在冻结数据上产出确定性指标（同数据两次 → 同数字）；
-// jieba/hybrid 未安装 → 如实全零 + note 明示未安装（不伪造分数）；Recall/MRR 值域合法。
+// 断言：ngram（生产双侧 bigram）与 jieba（jieba-wasm）在冻结数据上产出确定性指标（同数据两次 → 同数字）；
+// jieba/hybrid 已接入 → 真实数据（命中/Recall/MRR > 0）+ note 明示方案（不伪造分数）；
+// 未安装降级路径由核心 try/catch 兜底，不在此断言。Recall/MRR 值域合法；不对特定分数钉死断言（保持健壮）。
 import { describe, expect, it } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -40,23 +41,33 @@ describe('中文技术检索基准脚手架（§17 分词选型）', () => {
     expect(a.summary.mean_mrr).toBeGreaterThan(0);
   });
 
-  it('jieba/hybrid 未安装 → 如实全零 + note 明示（不伪造分数）', async () => {
+  it('jieba/hybrid（已接入 jieba-wasm）：真实数据而非占位零，note 明示方案；jieba 分词确定性（同数据两次除计时外一致）', async () => {
     const { docs, queries } = await loadData();
     for (const kind of ['jieba', 'hybrid'] as const) {
       const r = runRetrievalBench(docs, queries, kind);
-      expect(r.summary.hits).toBe(0);
-      expect(r.summary.mean_recall_at_5).toBe(0);
-      expect(r.summary.mean_mrr).toBe(0);
-      expect(r.note).toMatch(/未安装|未定型/);
+      expect(r.summary.hits).toBeGreaterThan(0);
+      expect(r.summary.mean_recall_at_5).toBeGreaterThan(0);
+      expect(r.summary.mean_mrr).toBeGreaterThan(0);
+      expect(r.summary.mean_tokenizer_ms).toBeGreaterThanOrEqual(0);
+      expect(r.note).not.toMatch(/未安装/);
+      if (kind === 'jieba') {
+        const again = runRetrievalBench(docs, queries, kind);
+        expect({ ...r, metrics: r.metrics.map((m) => ({ ...m, tokenizer_ms: 0 })), summary: { ...r.summary, mean_tokenizer_ms: 0 } }).toEqual({
+          ...again,
+          metrics: again.metrics.map((m) => ({ ...m, tokenizer_ms: 0 })),
+          summary: { ...again.summary, mean_tokenizer_ms: 0 },
+        });
+      }
     }
   });
 
-  it('对比运行：三方案齐备（ngram 有数据；jieba/hybrid 占位零）', async () => {
+  it('对比运行：三方案齐备（ngram/jieba/hybrid 均有真实数据）', async () => {
     const { docs, queries } = await loadData();
     const results = runComparison(docs, queries);
     expect(results.map((r) => r.kind)).toEqual(['ngram', 'jieba', 'hybrid']);
-    expect(results[0]!.summary.mean_mrr).toBeGreaterThan(0);
-    expect(results[1]!.summary.mean_mrr).toBe(0);
-    expect(results[2]!.summary.mean_mrr).toBe(0);
+    for (const r of results) {
+      expect(r.summary.mean_recall_at_5).toBeGreaterThan(0);
+      expect(r.summary.mean_mrr).toBeGreaterThan(0);
+    }
   });
 });

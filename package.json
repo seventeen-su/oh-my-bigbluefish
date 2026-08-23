@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json",
     "bench-report": "tsx scripts/bench-report.ts",
+    "retrieval-bench": "tsx scripts/retrieval-bench.ts",
     "init-three-line": "tsx scripts/init-three-line.ts",
     "deploy-lines": "tsx scripts/deploy-lines.ts"
   },
@@ -16,6 +17,7 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.20.1",
     "eslint": "^9.39.5",
+    "jieba-wasm": "2.4.0",
     "tsx": "^4.23.12",
     "typescript": "~5.5.4",
     "typescript-eslint": "^8.67.0",
