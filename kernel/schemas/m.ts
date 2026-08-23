@@ -51,6 +51,10 @@ export const FIXED_EVENT_TYPES = [
   'memory/consolidated',
   'checkpoint/saved',
   'activation/committed',
+  // §9 事件类型（P1c 一等化）：演化候选生命周期 + 维护量子（promoted/rolled_back 由 P1d/P1e 晋升/回滚复用）
+  'evolution/candidate',
+  'evolution/promoted',
+  'evolution/rolled_back',
   'maintenance/quantum',
 ] as const;
 

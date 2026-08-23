@@ -35,8 +35,9 @@ const MANIFEST_LATEST = JSON.stringify(
   2,
 );
 
-/** 出厂基线认知对象（P1a 种子升级）：repo 的 kernel/policy + kernel/processes 快照（三线承载版本化认知对象） */
-const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml'];
+/** 出厂基线认知对象（P1a 种子升级）：repo 的 kernel/policy + kernel/processes 快照（三线承载版本化认知对象；
+ *  P1c：evolve.yaml 加入种子——线快照承载演化判定策略数据） */
+const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml', 'evolve.yaml'];
 const PROCESS_FILES = ['hypothesize-test.yaml', 'retrieve-verify.yaml'];
 
 /** 把 repo kernel/policy + kernel/processes 快照复制进种子工作树（seed = 一次性种子目录；源 = presetRoot()） */

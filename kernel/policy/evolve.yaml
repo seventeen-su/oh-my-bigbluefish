@@ -1,0 +1,73 @@
+# Evolve 策略（架构 §6.5.1 触发链 / §6.5.6 Daily Evolution Budget / §6.5.7 维护债务 + 实现规格 §10.1；P1c）
+#
+# 数据即机制（P3）：改本文件即改演化判定与维护债务阈值（loadPolicy 深冻结；非法内容 fail-loud）。
+# 判定为纯函数（kernel/evolve-decision.ts decideEvolution）：输入信号摘要 + 本策略 → 确定性输出
+# {should_evolve, strength, object_layer, budget_estimate}。
+#
+# 语义（架构/实现规格）：
+#   - daily_evolution_cost：evolution_cost/day 上限（仅 DSH 运行期间累计；§6.5.6）
+#   - roi_min：Learning ROI 门槛（价值/成本 低于则不优先演化；§6.5.6）
+#   - maintenance_rate：LLM 维护率软预算（0..1，超预算降优先级，非硬禁止；§6.5.6）
+#   - debt_thresholds：soft → 提高 quantum 频率；hard → 限制非必要演化；critical → 请求边界强制插入 quantum（§6.5.7）
+#   - signal_triggers：触发信号种类 → 是否演化/强度/对象层（§6.5.1 判定表；evolve:false 的条目仅记账不演化）
+# 初值待冻结基准标定（架构 §17）。
+daily_evolution_cost: 100
+roi_min: 1.0
+maintenance_rate: 0.5
+
+debt_thresholds:
+  soft: 10        # 对齐 MaintenanceScheduler DEFAULT_SOFT_LIMIT（债务 ≥ → quantum 频率提升）
+  hard: 50        # 对齐 MaintenanceScheduler DEFAULT_HARD_LIMIT（债务 ≥ → 非必要演化受限）
+  critical: 100   # 待标定 §17（critical → 请求边界强制插入 quantum）
+
+signal_triggers:
+  # ---- 失败/缺口类（触发演化） ----
+  corrections:                  # 修正/失败模式 → repair（L1 代码修复；最高强度）
+    evolve: true
+    strength: 0.9
+    object_layer: L1
+  oracle_fail:                  # reproduction oracle 复现失败 → repair（L1）
+    evolve: true
+    strength: 0.8
+    object_layer: L1
+  scope_miss:                   # 检索泛化缺口 → candidate_validation（L0 数据候选）
+    evolve: true
+    strength: 0.5
+    object_layer: L0
+  untrusted_object:             # 信任池污染信号 → candidate_validation（L0 数据候选）
+    evolve: true
+    strength: 0.4
+    object_layer: L0
+  # ---- 活跃/正向类（仅记账 consolidation，不触发演化——防噪声演化） ----
+  tool_calls:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  retrieval_calls:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  memory_ops:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  reads:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  hits:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  scope_hit:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  oracle_pass:
+    evolve: false
+    strength: 0.0
+    object_layer: L0
+  trusted_object:
+    evolve: false
+    strength: 0.0
+    object_layer: L0

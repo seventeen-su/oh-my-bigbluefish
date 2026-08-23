@@ -124,6 +124,15 @@ export interface CognitiveRuntimeLike {
   rebuildSnapshotForLine?(line: string): { promoted: boolean; degraded: string | null };
   /** P1b/P1e：外部晋升接口（构建好新快照后 promote → 下一请求生效；进行中请求不受影响） */
   promoteSnapshot?(next: unknown): void;
+  /** P1c：/evolve now——立即执行一次演化判定 + 维护量子（返回摘要；失败降级不崩） */
+  runEvolutionNow?(input: { session_id: string }): Promise<{
+    decision: { should_evolve: boolean; strength: number; object_layer: string; budget_estimate: number; triggers: unknown[]; reason: string };
+    enqueued: string[];
+    quantum: { ran: string[]; skipped: string[] };
+    debt: unknown[];
+    degraded: string | null;
+    events_appended: number;
+  }>;
   handleRequest(req: unknown): Promise<{
     decision: { decision: string };
     retrieval: { items: unknown[]; channel_used: string };
@@ -698,6 +707,55 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         return { kind: 'error', text: `基准运行失败：${detail}` };
+      }
+    },
+  });
+
+  // P1c：/evolve 命令（设计 §6 命令表）——立即执行一次演化判定与维护量子。
+  // 语法：/evolve now（或空参数）；其余参数 → 明确 error 文本（不崩）。
+  // 行为：读 signals → evolve.policy 判定（数据化，纯函数）→ 应演化则入队 candidate_validation（债务入账）
+  //       + evolution/candidate 事件入链 → 执行一次维护量子 → maintenance/quantum 事件入链 →
+  //       返回摘要（判定结果/入队任务/quantum 执行/debt 快照）。
+  // 守卫：认知运行时未装配 → error 文本；任一步失败 → error 文本（不崩）。
+  ctx.commands?.register?.({
+    name: 'evolve',
+    description: '立即执行一次演化判定与维护量子（读 signals → evolve.policy 判定 → 入队/执行）',
+    input: { hint: '<now>' },
+    recordInput: true,
+    handler: async (invocation) => {
+      try {
+        const raw = (invocation.rawInput ?? '').trim();
+        if (raw !== '' && raw !== 'now') {
+          return { kind: 'error', text: `evolve 命令参数非法："${raw}"（支持空或 now）` };
+        }
+        const runtime = cognitive;
+        if (runtime === undefined) {
+          return { kind: 'error', text: '认知运行时未装配——/evolve now 不可用' };
+        }
+        if (typeof runtime.runEvolutionNow !== 'function') {
+          return { kind: 'error', text: '运行时未实现演化判定（runEvolutionNow 缺失）' };
+        }
+        const sessionId = (invocation.agent.session as { id?: string } | undefined)?.id ?? 'anon';
+        const r = await runtime.runEvolutionNow({ session_id: sessionId });
+        const d = r.decision;
+        const debtText =
+          (r.debt as Array<{ task_id: string; value: number }>)
+            .map((x) => `${x.task_id}=${x.value}`)
+            .join(', ') || '（空）';
+        const lines = [
+          `演化判定：should_evolve=${String(d.should_evolve)}（strength ${d.strength}，object_layer ${String(d.object_layer)}，budget_estimate ${d.budget_estimate}，${d.reason}）`,
+          `入队维护任务：[${r.enqueued.join(', ') || '无'}]`,
+          `quantum 执行：ran=[${r.quantum.ran.join(', ') || '无'}]，skipped=[${r.quantum.skipped.join(', ') || '无'}]`,
+          `维护债务快照：${debtText}`,
+          `事件入链：${r.events_appended}（evolution/candidate + maintenance/quantum）`,
+        ];
+        if (r.degraded !== null) {
+          lines.push(`降级：${r.degraded}`);
+        }
+        return { kind: 'success', text: lines.join('\n') };
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return { kind: 'error', text: `演化执行失败：${detail}` };
       }
     },
   });

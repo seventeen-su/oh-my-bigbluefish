@@ -43,9 +43,22 @@ export interface CandidateRecord {
 /** 谱系检查结论（brief 契约：{ ok: boolean; reason?: string }；ok:false 时必有 reason） */
 export type LineageVerdict = { ok: boolean; reason?: string };
 
+/** 候选 provenance 清单（§6.5.2：来源事件/动机/diff；写入 candidates/<id>/provenance.json，随记录移动） */
+export interface CandidateProvenance {
+  /** 来源事件 id（如 evolution/candidate 决策事件；触发本次候选的信号/事件链） */
+  source_events: string[];
+  /** 动机（触发信号摘要/判定理由/生成意图） */
+  motivation: string;
+  /** 变更 diff（P1d 填真实 diff；现为判定信息/占位） */
+  diff?: Record<string, unknown> | string;
+  /** 清单创建时间（epoch ms） */
+  created: number;
+}
+
 const KIND_SET = new Set<CandidateKind>(['memory', 'process', 'skill', 'policy', 'code']);
 const RECORD_FILE = 'record.json';
 const PAYLOAD_FILE = 'payload.txt';
+const PROVENANCE_FILE = 'provenance.json';
 /** 记录区（消费方可见区 = trusted；仅验证链可读写 untrusted；rejected 留痕） */
 const ZONES = ['trusted', 'untrusted', 'rejected'] as const;
 
@@ -101,8 +114,13 @@ export class CandidatePool {
 
   // ---- 候选生命周期 ----
 
-  /** 注册候选：一律落 untrusted/ 且 status 强制 untrusted；父版本谱系未过 → 拒绝（G1） */
-  async registerCandidate(rec: CandidateRecord, payload?: string): Promise<void> {
+  /** 注册候选：一律落 untrusted/ 且 status 强制 untrusted；父版本谱系未过 → 拒绝（G1）。
+   *  provenance（§6.5.2 清单：来源事件/动机/diff）可选——提供时写入 candidates/<id>/provenance.json。 */
+  async registerCandidate(
+    rec: CandidateRecord,
+    payload?: string,
+    provenance?: CandidateProvenance,
+  ): Promise<void> {
     this.assertRecShape(rec);
     if (rec.parent !== null) {
       const lc = await this.checkLineage(rec);
@@ -128,6 +146,9 @@ export class CandidatePool {
     await writeFile(join(dir, RECORD_FILE), JSON.stringify(stored, null, 2), 'utf8');
     if (payload !== undefined) {
       await writeFile(join(dir, PAYLOAD_FILE), payload, 'utf8');
+    }
+    if (provenance !== undefined) {
+      await writeFile(join(dir, PROVENANCE_FILE), JSON.stringify(provenance, null, 2), 'utf8');
     }
   }
 
@@ -167,6 +188,11 @@ export class CandidatePool {
     await mkdir(dstDir, { recursive: true });
     await writeFile(join(dstDir, RECORD_FILE), JSON.stringify({ ...found.rec, status: 'rejected' }, null, 2), 'utf8');
     await writeFile(join(dstDir, 'reason.txt'), reason, 'utf8');
+    await this.copyAuxFile(
+      join(this.evolutionRoot, 'untrusted', candidateDirName(rec.id)),
+      dstDir,
+      PROVENANCE_FILE,
+    );
     await rm(join(this.evolutionRoot, 'untrusted', candidateDirName(rec.id)), { recursive: true, force: true });
   }
 
@@ -251,7 +277,7 @@ export class CandidatePool {
     }
   }
 
-  /** 移动记录（含 payload）：写入目标区 record.json（经 transform）+ payload.txt，删除源区 */
+  /** 移动记录（含 payload/provenance 清单）：写入目标区 record.json（经 transform）+ payload.txt + provenance.json，删除源区 */
   private async moveRecord(
     fromZone: string,
     toZone: string,
@@ -263,15 +289,21 @@ export class CandidatePool {
     await this.ensureZone(toZone);
     await mkdir(dstDir, { recursive: true });
     await writeFile(join(dstDir, RECORD_FILE), JSON.stringify(transform(rec), null, 2), 'utf8');
+    await this.copyAuxFile(srcDir, dstDir, PAYLOAD_FILE);
+    await this.copyAuxFile(srcDir, dstDir, PROVENANCE_FILE);
+    await rm(srcDir, { recursive: true, force: true });
+  }
+
+  /** 复制候选目录中的辅助文件（payload/provenance 清单；源缺失 → 跳过） */
+  private async copyAuxFile(srcDir: string, dstDir: string, name: string): Promise<void> {
     try {
-      const payload = await readFile(join(srcDir, PAYLOAD_FILE), 'utf8');
-      await writeFile(join(dstDir, PAYLOAD_FILE), payload, 'utf8');
+      const content = await readFile(join(srcDir, name), 'utf8');
+      await writeFile(join(dstDir, name), content, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw err;
       }
     }
-    await rm(srcDir, { recursive: true, force: true });
   }
 
   /** 按 id 查找记录（含所在区）；跨 trusted/untrusted/rejected 扫描，损坏记录 fail-loud */

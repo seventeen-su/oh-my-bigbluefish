@@ -12,15 +12,19 @@
 // - 退出即停：stop() 清定时器/队列并中断在飞任务；stop 后 tick/requestQuantum 无动作。
 // - M3 兼容：enqueue 接受 {id, run} 形状（缺省 value=1/cost=1/priority=0/urgency='normal'）且返回
 //   Promise<void> 与 M3 最小接口同形；注意完整版 enqueue = 入队（M3 最小实现为直接执行），执行异步。
+// - P1c §10.1 债务语义：enqueue(input, { accrueDebt: true }) → 入队同时累计债务（事件入队累加 value，
+//   立即持久化）；任务成功 → 清偿（归零）；失败/中断/hard 跳过 → 已入账债务不再重复累计（防双计）。
+//   既有默认（accrueDebt: false）行为不变（仅失败/跳过/中断累计）。
 // layer 1（supervisor/）：仅 node: 内置 + kernel/schemas/（契约例外）+ supervisor/ 内文件。
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Fingerprint } from '../kernel/schemas/base.js';
+import type { MaintenanceUrgency } from '../kernel/schemas/evolution.js';
 
 // ---- 类型 ----
 
-export type Urgency = 'normal' | 'soft' | 'hard' | 'critical';
+export type Urgency = MaintenanceUrgency;
 
 export interface MaintenanceTask {
   id: string;
@@ -112,6 +116,8 @@ export class MaintenanceScheduler {
   private queue: MaintenanceTask[] = [];
   private debt = new Map<string, MaintenanceDebt>();
   private critical = new Set<string>();
+  /** P1c §10.1：入队即累计债务的任务 id（事件入队累加 value；防失败/跳过路径重复累计） */
+  private accruedAtEnqueue = new Set<string>();
   private stopped = false;
   private started = false;
   private running = false;
@@ -128,9 +134,13 @@ export class MaintenanceScheduler {
     this.nowFn = opts.now ?? (() => Date.now());
   }
 
-  /** 入队（M3 兼容形状：{id, run}，其余缺省；返回 Promise<void> 与 M3 最小接口同形，调用方可 await）；
-   *  同 id 重复入队 → 替换；urgency='critical' 自动强制优先 */
-  async enqueue(input: MaintenanceTaskInput): Promise<void> {
+  /**
+   * 入队（M3 兼容形状：{id, run}，其余缺省；返回 Promise<void> 与 M3 最小接口同形，调用方可 await）；
+   * 同 id 重复入队 → 替换；urgency='critical' 自动强制优先。
+   * P1c §10.1：opts.accrueDebt=true → 入队同时累计债务（value 累加 + 立即持久化）——事件入队累加语义；
+   * 任务成功清偿（归零）；失败/中断/跳过路径对已入账任务不再重复累计（防双计）。
+   */
+  async enqueue(input: MaintenanceTaskInput, opts: { accrueDebt?: boolean } = {}): Promise<void> {
     if (this.stopped) return;
     const task: MaintenanceTask = {
       id: input.id,
@@ -144,6 +154,11 @@ export class MaintenanceScheduler {
     if (idx >= 0) this.queue.splice(idx, 1);
     this.queue.push(task);
     if (task.urgency === 'critical') this.markCritical(task.id);
+    if (opts.accrueDebt === true) {
+      this.accruedAtEnqueue.add(task.id);
+      this.accumulateDebt(task);
+      await this.persistDebt();
+    }
     this.resetTimer(); // 紧急任务挂起可能改变 tick 频率
   }
 
@@ -161,7 +176,7 @@ export class MaintenanceScheduler {
     if (signal.aborted) {
       // 中断（未执行）→ 债务累计，任务留队
       const top = this.sortedQueue()[0]!;
-      this.accumulateDebt(top);
+      this.accrueOnNonRun(top);
       await this.persistDebt();
       return { ran: [], skipped: [top.id] };
     }
@@ -169,7 +184,7 @@ export class MaintenanceScheduler {
     for (const t of this.sortedQueue()) {
       if (this.hardBlocked(t)) {
         report.skipped.push(t.id);
-        this.accumulateDebt(t);
+        this.accrueOnNonRun(t);
         continue;
       }
       const r = await this.runOne(t, signal);
@@ -195,7 +210,7 @@ export class MaintenanceScheduler {
         if (signal.aborted) break;
         if (this.hardBlocked(t)) {
           report.skipped.push(t.id);
-          this.accumulateDebt(t);
+          this.accrueOnNonRun(t);
           continue;
         }
         const r = await this.runOne(t, signal);
@@ -313,11 +328,11 @@ export class MaintenanceScheduler {
     } catch (err) {
       const aborted = signal?.aborted === true || (err instanceof Error && err.name === 'AbortError');
       if (aborted) {
-        this.accumulateDebt(t); // 未执行 → 债务累计
+        this.accrueOnNonRun(t); // 未执行 → 债务累计
         return { ran: [], skipped: [t.id] };
       }
       this.removeFromQueue(t.id);
-      this.accumulateDebt(t); // 执行失败 → 债务累计
+      this.accrueOnNonRun(t); // 执行失败 → 债务累计
       return { ran: [t.id], skipped: [] };
     }
     this.removeFromQueue(t.id);
@@ -328,6 +343,7 @@ export class MaintenanceScheduler {
   private removeFromQueue(id: string): void {
     this.queue = this.queue.filter((t) => t.id !== id);
     this.critical.delete(id);
+    this.accruedAtEnqueue.delete(id);
   }
 
   // ---- 债务 ----
@@ -370,9 +386,22 @@ export class MaintenanceScheduler {
     });
   }
 
+  /**
+   * 非执行路径（中断/hard 跳过/失败）的债务累计（P1c §10.1）：
+   * 已入队即累计（accrueDebt）的任务 → 债务已在入队时入账，不重复累计（防双计）；
+   * 未入账任务（既有默认语义）→ 照常累计（失败/跳过惩罚）。
+   */
+  private accrueOnNonRun(t: MaintenanceTask): void {
+    if (this.accruedAtEnqueue.has(t.id)) {
+      return;
+    }
+    this.accumulateDebt(t);
+  }
+
   private clearDebt(taskId: string): void {
     this.ensureDebtLoaded();
     this.debt.delete(taskId);
+    this.accruedAtEnqueue.delete(taskId);
   }
 
   /** 原子写：tmp + rename（.evolution/debt.json）；无债务且无文件 → 不写 */

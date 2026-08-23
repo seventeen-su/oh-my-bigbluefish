@@ -166,11 +166,41 @@ export type ProcessDef = z.infer<typeof ProcessDefSchema>;
 
 // ---- EvolvePolicy（架构 §9.5 元演化规则；T7.2 新增契约，初值待冻结基准标定 §17） ----
 
+// ---- P1c：演化判定数据化（§6.5.1 触发链 / §6.5.7 债务阈值） ----
+
+/** 演化对象层（§6.5.2 对象分层：L0 数据 → L1 代码 → 宪法层人工门；数据即机制，可演化） */
+export const OBJECT_LAYERS = ['L0', 'L1', 'constitution'] as const;
+export type ObjectLayer = (typeof OBJECT_LAYERS)[number];
+
+/** 信号触发规则（§6.5.1 数据化判定：信号种类 → 是否演化 / 强度 / 对象层） */
+export const SignalTriggerSchema = z.object({
+  evolve: z.boolean(),
+  /** 演化强度（0..1；多个触发取最大） */
+  strength: z.number().min(0).max(1),
+  object_layer: z.enum(OBJECT_LAYERS),
+});
+export type SignalTrigger = z.infer<typeof SignalTriggerSchema>;
+
+/** 维护债务阈值（§6.5.7：soft → 提高 quantum 频率；hard → 限制非必要演化；critical → 请求边界强制） */
+export const DebtThresholdsSchema = z.object({
+  soft: z.number().nonnegative(),
+  hard: z.number().nonnegative(),
+  critical: z.number().nonnegative(),
+});
+export type DebtThresholds = z.infer<typeof DebtThresholdsSchema>;
+
+/** 债务阈值缺省（对齐 supervisor/maintenance.ts DEFAULT_SOFT_LIMIT=10 / DEFAULT_HARD_LIMIT=50；critical 待标定 §17） */
+export const DEFAULT_DEBT_THRESHOLDS = { soft: 10, hard: 50, critical: 100 } as const;
+
 /**
- * EvolvePolicy：演化规则（架构 §9.5 预算与元演化）——
+ * EvolvePolicy：演化规则（架构 §9.5 预算与元演化 + P1c §6.5.1/§6.5.7 数据化判定）——
  *   - Daily Evolution Budget：evolution_cost/day 上限（仅 DSH 运行期间累计）
  *   - Learning ROI：value gained / evolution cost → 自动调 evolution priority
  *   - LLM maintenance rate：可观测指标 + 自适应软预算（超预算降优先级，非硬禁止）
+ *   - signal_triggers：触发信号种类 → 是否演化/强度/对象层映射（§6.5.1 判定表；缺省空 = 不演化）
+ *   - debt_thresholds：soft/hard/critical 债务阈值（§6.5.7；缺省 DEFAULT_DEBT_THRESHOLDS）
+ * 旧形状（仅前三字段）经缺省仍合法（向后兼容，元演化门禁 T7.2 复用本 schema）；
+ * 字段存在但非法（strength>1、负阈值等）→ fail-loud 拒绝（对齐既有 policy 纪律）。
  * 元演化门禁（T7.2）diff 校验：evolve.policy 目标内容必须过本 schema（数据即机制）。
  */
 export const EvolvePolicySchema = z.object({
@@ -180,5 +210,9 @@ export const EvolvePolicySchema = z.object({
   roi_min: z.number().nonnegative(),
   /** §9.5 LLM maintenance rate：维护率软预算系数（0..1，超预算降优先级） */
   maintenance_rate: z.number().min(0).max(1),
+  /** P1c：触发信号种类 → 判定规则（缺省 {} = 无触发不演化） */
+  signal_triggers: z.record(z.string().min(1), SignalTriggerSchema).default({}),
+  /** P1c：soft/hard/critical 债务阈值（缺省 DEFAULT_DEBT_THRESHOLDS） */
+  debt_thresholds: DebtThresholdsSchema.default(DEFAULT_DEBT_THRESHOLDS),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

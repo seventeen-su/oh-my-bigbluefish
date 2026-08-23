@@ -146,7 +146,7 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
     expect((await runtime.eventStore.query({ session_id: SESSION })).events.some((e) => e.type === 'tool/result')).toBe(true);
   });
 
-  it('systemPrompt 为追加贡献而非替换；插件不再接触 recompose（装配/命令注册零触发）；命令仅注册 mode/bench（DSH 扩展点）', () => {
+  it('systemPrompt 为追加贡献而非替换；插件不再接触 recompose（装配/命令注册零触发）；命令仅注册 mode/bench/evolve（DSH 扩展点，无 loop 控制命令）', () => {
     const systemPromptCalls: string[] = [];
     const contexts: Array<{ name: string; order: number; text: unknown }> = [];
     const registered: Array<{ name: string }> = [];
@@ -178,7 +178,8 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
     // e. 插件不再接触 recompose：即使 ctx 提供 agentPresets.recompose，装配/命令注册也从未触发它
     //   （recompose 能力整体移除；/mode = OMB 内部版本线切换，单模式）
     expect(recompose).not.toHaveBeenCalled();
-    // f. 命令注册仅为 DSH 扩展点（mode/bench），无 loop 控制命令
-    expect(registered.map((r) => r.name).sort()).toEqual(['bench', 'mode']);
+    // f. 命令注册仅为 DSH 扩展点（mode/bench/evolve，P1c 新增 /evolve——演化触发命令，非 loop 控制），
+    //    无 loop 控制命令
+    expect(registered.map((r) => r.name).sort()).toEqual(['bench', 'evolve', 'mode']);
   });
 });

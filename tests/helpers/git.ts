@@ -151,8 +151,9 @@ export const MANIFEST_LATEST = JSON.stringify(
   2,
 );
 
-/** 出厂基线认知对象（P1a 种子升级，与 substrate/bootstrap.ts seedKernelObjects 等价）：repo kernel/policy + kernel/processes 快照 */
-const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml'];
+/** 出厂基线认知对象（P1a 种子升级，与 substrate/bootstrap.ts seedKernelObjects 等价）：repo kernel/policy + kernel/processes 快照
+ *  （P1c：evolve.yaml 加入——线快照承载演化判定策略） */
+const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml', 'evolve.yaml'];
 const PROCESS_FILES = ['hypothesize-test.yaml', 'retrieve-verify.yaml'];
 
 /** 真实 preset 根（tests/helpers/ → ../../）——种子源（repo kernel/policy + kernel/processes） */

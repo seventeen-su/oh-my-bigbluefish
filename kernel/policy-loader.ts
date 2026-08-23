@@ -12,10 +12,12 @@ import { z } from 'zod';
 import {
   BudgetPolicySchema,
   ContextPolicySchema,
+  EvolvePolicySchema,
   GovernorPolicySchema,
   ProcessDefSchema,
   type BudgetPolicy,
   type ContextPolicy,
+  type EvolvePolicy,
   type GovernorPolicy,
   type ProcessDef,
 } from './schemas/policy.js';
@@ -30,27 +32,46 @@ export {
   GOVERNOR_DECISIONS,
   BudgetPolicySchema,
   ContextPolicySchema,
+  DEFAULT_DEBT_THRESHOLDS,
+  DebtThresholdsSchema,
+  EvolvePolicySchema,
   GovernorPolicySchema,
   GovernorRuleSchema,
   KindCostTableSchema,
+  OBJECT_LAYERS,
   OperatorDefSchema,
   ProcessDefSchema,
+  SignalTriggerSchema,
   type BudgetPolicy,
   type CandidateKind,
   type ContextPolicy,
+  type DebtThresholds,
+  type EvolvePolicy,
   type GovernorPolicy,
   type GovernorRule,
   type KindCostTable,
+  type ObjectLayer,
   type OperatorDef,
   type ProcessDef,
+  type SignalTrigger,
 } from './schemas/policy.js';
 
-/** loadPolicy 返回的三策略捆绑 */
+/** loadPolicy 返回的四策略捆绑（P1c：evolve.policy 数据化判定加入） */
 export interface PolicyBundle {
   governor: GovernorPolicy;
   budget: BudgetPolicy;
   context: ContextPolicy;
+  evolve: EvolvePolicy;
 }
+
+/** evolve.yaml 缺省策略（旧布局线快照/临时目录无 evolve.yaml → 缺省；内容 = 出厂初值，与 kernel/policy/evolve.yaml 同源） */
+const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
+  daily_evolution_cost: 100,
+  roi_min: 1.0,
+  maintenance_rate: 0.5,
+  signal_triggers: {},
+  debt_thresholds: { soft: 10, hard: 50, critical: 100 },
+};
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -89,16 +110,33 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** 加载三策略（governor.yaml / budget.yaml / context.yaml）并深冻结。
+/**
+ * 加载 evolve.yaml（P1c）：存在 → zod 校验 fail-loud；缺失（旧布局线快照/临时目录未种子）→
+ * 缺省策略（向后兼容——loadPolicy 目录注入面不因新策略文件缺席而炸）。
+ */
+async function loadEvolvePolicy(policyDir: string): Promise<EvolvePolicy> {
+  const file = join(policyDir, 'evolve.yaml');
+  try {
+    return await parsePolicyFile(file, EvolvePolicySchema);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { ...DEFAULT_EVOLVE_POLICY };
+    }
+    throw err;
+  }
+}
+
+/** 加载四策略（governor.yaml / budget.yaml / context.yaml / evolve.yaml）并深冻结。
  *  @param dir 策略目录（缺省 <repo>/kernel/policy；P1a 线快照注入时传 lines/<line>/<commit>/kernel/policy） */
 export async function loadPolicy(dir?: string): Promise<PolicyBundle> {
   const policyDir = dir ?? DEFAULT_POLICY_DIR;
-  const [governor, budget, context] = await Promise.all([
+  const [governor, budget, context, evolve] = await Promise.all([
     parsePolicyFile(join(policyDir, 'governor.yaml'), GovernorPolicySchema),
     parsePolicyFile(join(policyDir, 'budget.yaml'), BudgetPolicySchema),
     parsePolicyFile(join(policyDir, 'context.yaml'), ContextPolicySchema),
+    loadEvolvePolicy(policyDir),
   ]);
-  return deepFreeze({ governor, budget, context });
+  return deepFreeze({ governor, budget, context, evolve });
 }
 
 /** 加载目录下全部 *.yaml 过程（文件名排序保证确定性）并深冻结。

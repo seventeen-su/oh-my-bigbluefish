@@ -28,7 +28,7 @@ import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
-import { MaintenanceScheduler, type MaintenanceDebt } from '../supervisor/maintenance.js';
+import { MaintenanceScheduler, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
 import { reduce, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory } from '../memory/retrieve.js';
@@ -37,6 +37,18 @@ import { decide, type GovernorDecision, type GovernorInput } from './governor.js
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
 import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState } from './turn-helpers.js';
 import type { Experience } from '../kernel/schemas/c.js';
+// P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
+import { appendSignals, readSignals, signalsDirOf } from './evolution-signals.js';
+import { collectGeneralizationSignals } from './signal-collectors.js';
+import {
+  candidateValidationAccrual,
+  countsToSignalRecords,
+  debtAccrualsFromSummary,
+  decideEvolution,
+  evaluationSignalsToRecords,
+  summarizeSignals,
+} from '../kernel/evolve-decision.js';
+import type { EvolutionDecision } from '../kernel/schemas/evolution.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -110,6 +122,8 @@ export interface CognitiveAssemblyOptions {
   checkpointDir?: string;
   /** T8.26.2：维护调度器（finalizeTurn 信号聚合入队；缺省不接） */
   maintenance?: MaintenanceScheduler;
+  /** P1c：演化信号落盘目录（缺省 <root>/.evolution/signals；finalizeTurn 收尾写入 + 演化判定读取） */
+  signalsDir?: string;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -171,8 +185,25 @@ export interface FinalizeTurnResult {
   experience: Experience | null;
   signals: UtilityCounts;
   signals_degraded: string | null;
+  /** P1c：演化信号落盘结果（.evolution/signals/<yyyy-mm-dd>.jsonl；尽力而为——失败降级不阻塞收尾） */
+  signals_log: { files: string[]; appended: number; degraded: string | null };
   maintenance: { enqueued: boolean; debt: MaintenanceDebt[] };
   checkpoint: Checkpoint | null;
+  events_appended: number;
+}
+
+/** P1c：/evolve now 与空闲期演化判定的摘要（判定结果/入队任务/debt 快照/quantum 执行） */
+export interface EvolutionNowResult {
+  decision: EvolutionDecision;
+  /** 判定后入队的维护任务 id（应演化 → candidate_validation） */
+  enqueued: string[];
+  /** 本次执行的维护量子报告 */
+  quantum: QuantumReport;
+  /** debt 快照（quantum 执行后） */
+  debt: MaintenanceDebt[];
+  /** 判定/执行降级原因（无 → null） */
+  degraded: string | null;
+  /** 入链事件数（evolution/candidate + maintenance/quantum） */
   events_appended: number;
 }
 
@@ -267,6 +298,8 @@ export class CognitiveRuntime {
   private readonly checkpointDir: string | undefined;
   /** 维护调度器（生产装配注入；插件经此在请求间隙驱动 requestQuantum/停表——公开面） */
   readonly maintenance: MaintenanceScheduler | null;
+  /** P1c：演化信号落盘目录（<root>/.evolution/signals；finalizeTurn 写入 / 演化判定读取） */
+  readonly signalsDir: string;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
   /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
@@ -307,6 +340,7 @@ export class CognitiveRuntime {
     this.modelAdapter = opts.modelAdapter ?? null;
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
+    this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效）；幂等 */
@@ -411,14 +445,50 @@ export class CognitiveRuntime {
 
     const { signals, degraded } = await this.aggregateSignals(input.session_id);
 
+    // P1c：演化信号落盘（.evolution/signals/<yyyy-mm-dd>.jsonl 追加；信号源① = finalizeTurn 聚合的
+    // utility_counts、信号源② = L1 generalization 采集器输出面；尽力而为——失败降级不阻塞收尾）
+    const signals_log = await this.persistTurnSignals(signals, input.session_id);
+
     let maintenance: { enqueued: boolean; debt: MaintenanceDebt[] } = { enqueued: false, debt: [] };
     if (this.maintenance !== null) {
+      // 既有：会话级收尾任务（事件库 GC/compact；债务语义不变——仅失败/中断/跳过累计）
       await this.maintenance.enqueue({
         id: `turn-finalize:${input.session_id}`,
         value: 1,
         estimated_cost: 1,
         run: async () => {
           await this.eventStore.compact(Date.now());
+        },
+      });
+      // P1c §10.1：信号 → 维护债务入账（权重 memory+2/candidate+8/repair+20/GC+1，按实际信号类型累计；
+      // accrueDebt → 入队即累计 + 落盘；任务完成清偿归零）
+      const turnTs = Date.now();
+      const summary = summarizeSignals(
+        countsToSignalRecords(signals as unknown as Record<string, number>, turnTs, input.session_id),
+      );
+      for (const acc of debtAccrualsFromSummary(summary)) {
+        await this.maintenance.enqueue(
+          {
+            id: acc.task_id,
+            value: acc.value,
+            estimated_cost: acc.estimated_cost,
+            priority: acc.priority,
+            urgency: acc.urgency,
+            run: this.maintenanceRun(acc.task_id),
+          },
+          { accrueDebt: true },
+        );
+      }
+      // P1c：演化判定任务（空闲期 quantum 执行；低优先级、可中断——读 signals → evolve.policy 判定 →
+      // 应演化则入队 candidate_validation + evolution/candidate 事件入链）
+      await this.maintenance.enqueue({
+        id: 'evolution_decision',
+        value: 1,
+        estimated_cost: 2,
+        priority: 0,
+        urgency: 'normal',
+        run: async (signal) => {
+          await this.runEvolutionDecision(signal, input.session_id);
         },
       });
       maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
@@ -437,6 +507,7 @@ export class CognitiveRuntime {
       experience,
       signals,
       signals_degraded: degraded,
+      signals_log,
       maintenance,
       checkpoint,
       events_appended: 1,
@@ -571,6 +642,162 @@ export class CognitiveRuntime {
         degraded: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+
+  // ---- P1c：演化信号落盘 + 判定（§6.5.1 触发链：信号 → signals/ JSONL → 判定 → 债务/候选） ----
+
+  /**
+   * 收尾信号落盘（尽力而为）：信号源① utility_counts（零成本聚合）→ 信号记录；信号源② L1 generalization
+   * 采集器（retrieval_episode 归因，T8.21）→ 信号记录；追加写 .evolution/signals/<yyyy-mm-dd>.jsonl。
+   * 失败 → 降级字段（不阻塞收尾）；oracle/contamination 采集器依赖 P1d 装配点（OracleVerdict/CandidatePool），
+   * 转换面 evaluationSignalsToRecords 已就绪。
+   */
+  private async persistTurnSignals(
+    signals: UtilityCounts,
+    sessionId: string,
+  ): Promise<FinalizeTurnResult['signals_log']> {
+    const now = Date.now();
+    const records = countsToSignalRecords(signals as unknown as Record<string, number>, now, sessionId);
+    try {
+      const l1 = await collectGeneralizationSignals(
+        this.memory,
+        `session:${sessionId}`,
+        { from: 0, to: now }, // 观察窗：本次收尾前全部归因 episode（P1d 引入逐 turn 窗口）
+      );
+      records.push(...evaluationSignalsToRecords(l1, now, sessionId));
+    } catch {
+      // L1 采集降级：信号日志不含采集器输出（不阻塞收尾）
+    }
+    try {
+      const r = await appendSignals(this.signalsDir, records);
+      return { files: r.files, appended: r.appended, degraded: null };
+    } catch (err) {
+      return { files: [], appended: 0, degraded: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d 接真实管线——repair/candidate/memory 现为占位） */
+  private maintenanceRun(taskId: string): (signal?: AbortSignal) => Promise<void> {
+    switch (taskId) {
+      case 'gc':
+        return async () => {
+          await this.eventStore.compact(Date.now());
+        };
+      case 'repair':
+      case 'candidate_validation':
+      case 'memory_consolidation':
+        // P1d 接线占位：任务执行 = 债务清偿生命周期闭环（完成 → 归零）；真实生成/验证/整理在 P1d 管线
+        return async () => {};
+      default:
+        return async () => {};
+    }
+  }
+
+  /**
+   * 一次演化判定（§6.5.1 数据化）：读 signals → evolve.policy → decideEvolution（纯函数）→
+   * 应演化 → 入队 candidate_validation（accrueDebt，债务入账）+ evolution/candidate 事件入链
+   * （本次 stage='decision' 判定入链；P1d 晋升/候选真实 id 复用同一事件类型）。
+   */
+  private async performEvolutionDecision(sessionId: string): Promise<{
+    decision: EvolutionDecision;
+    enqueued: string[];
+  }> {
+    const { records } = await readSignals(this.signalsDir);
+    const { policy } = await this.ready();
+    const summary = summarizeSignals(records);
+    const debtTotal =
+      this.maintenance?.debtSnapshot().reduce((acc, d) => acc + d.value, 0) ?? 0;
+    const decision = decideEvolution({ summary, policy: policy.evolve, debt: debtTotal });
+    const enqueued: string[] = [];
+    if (decision.should_evolve && this.maintenance !== null) {
+      const acc = candidateValidationAccrual();
+      await this.maintenance.enqueue(
+        {
+          id: acc.task_id,
+          value: acc.value,
+          estimated_cost: acc.estimated_cost,
+          priority: acc.priority,
+          urgency: acc.urgency,
+          run: this.maintenanceRun(acc.task_id),
+        },
+        { accrueDebt: true },
+      );
+      enqueued.push(acc.task_id);
+      await this.eventStore.append(
+        makeRuntimeEvent(
+          'evolution/candidate',
+          sessionId,
+          this.snapshotHash,
+          {
+            stage: 'decision',
+            should_evolve: decision.should_evolve,
+            strength: decision.strength,
+            object_layer: decision.object_layer,
+            budget_estimate: decision.budget_estimate,
+            triggers: decision.triggers,
+            reason: decision.reason,
+            candidate_id: null, // P1d 填充：候选生成/验证后的真实候选 id
+          },
+          ['evolution_decision', 'evolution/candidate'],
+        ),
+      );
+    }
+    return { decision, enqueued };
+  }
+
+  /** 空闲期演化判定任务执行体（维护量子内；低优先级、可中断——signal.aborted → AbortError 让出留队） */
+  private async runEvolutionDecision(signal: AbortSignal | undefined, sessionId: string): Promise<void> {
+    if (signal?.aborted === true) {
+      const err = new Error('evolution_decision aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    await this.performEvolutionDecision(sessionId);
+  }
+
+  /**
+   * P1c：/evolve now 支持——立即执行一次演化判定 + 维护量子 + 事件入链（摘要返回）。
+   * 失败不崩：判定失败 → degraded 字段；quantum 无调度器 → 跳过并注明。
+   */
+  async runEvolutionNow(input: { session_id: string }): Promise<EvolutionNowResult> {
+    const sessionId = input.session_id;
+    let decision: EvolutionDecision = {
+      should_evolve: false,
+      strength: 0,
+      object_layer: 'L0',
+      budget_estimate: 0,
+      triggers: [],
+      reason: 'no_runtime',
+    };
+    let enqueued: string[] = [];
+    let degraded: string | null = null;
+    let events_appended = 0;
+    try {
+      const r = await this.performEvolutionDecision(sessionId);
+      decision = r.decision;
+      enqueued = r.enqueued;
+      if (decision.should_evolve) {
+        events_appended += 1; // evolution/candidate
+      }
+    } catch (err) {
+      degraded = err instanceof Error ? err.message : String(err);
+    }
+    let quantum: QuantumReport = { ran: [], skipped: [] };
+    if (this.maintenance !== null) {
+      quantum = await this.maintenance.requestQuantum();
+      await this.eventStore.append(
+        makeRuntimeEvent(
+          'maintenance/quantum',
+          sessionId,
+          this.snapshotHash,
+          { trigger: '/evolve now', ran: quantum.ran, skipped: quantum.skipped },
+          ['evolve-now', 'maintenance/quantum'],
+        ),
+      );
+      events_appended += 1;
+    }
+    const debt = this.maintenance?.debtSnapshot() ?? [];
+    return { decision, enqueued, quantum, debt, degraded, events_appended };
   }
 
   private buildGovernorInput(
