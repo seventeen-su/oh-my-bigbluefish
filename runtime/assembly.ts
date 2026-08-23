@@ -65,6 +65,12 @@ import {
   makeReplayExecutorV2,
   runBenchV2,
 } from '../supervisor/bench-v2.js';
+// P2：组件注册表装配（实现落 supervisor 层 1——runtime(2) 持有注册表，层 DAG 禁 runtime → components，
+// tests/m0/dag-lint.test.ts 钉住；components/registry.ts 为 ABI 出口）+ 能力注册表衔接 + kern_status 数据源
+import { ComponentRegistry, type ComponentHealthResult, type ComponentManifest } from '../supervisor/component-registry.js';
+import { CapabilityRegistry } from '../supervisor/capability.js';
+import { memoryRetrievalComponent } from '../memory/memory-retrieval.js';
+import type { KernStatusSummary } from './kern-tools.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -88,6 +94,27 @@ const DEGRADED_COMPONENTS: ComponentHashes = {
 
 function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * P2：组件 manifest 声明的能力 → 能力注册表（supervisor/capability.ts 语义复用：重复 id fail-loud、
+ * 同层同名冲突 fail-loud；异层同名允许——分级基础，§8.1）。组件能力默认 authority_scope='kernel'
+ *（组件机制归内核底座）、reliability='high'；软接管/路由留既有 Broker（M6 库级）不动。返回登记数。
+ */
+export function registerComponentCapabilities(
+  capabilityRegistry: CapabilityRegistry,
+  manifest: Pick<ComponentManifest, 'manifest_id' | 'capabilities'>,
+): number {
+  const names = manifest.capabilities ?? [];
+  for (const name of names) {
+    capabilityRegistry.register({
+      id: `capability:${manifest.manifest_id}:${name}`,
+      name,
+      authority_scope: 'kernel',
+      reliability: 'high',
+    });
+  }
+  return names.length;
 }
 
 /** 回退路径 git HEAD（既有实现：defaultLayout().bareRepo rev-parse HEAD）；失败 → 抛错（调用方全降级） */
@@ -368,11 +395,28 @@ export class CognitiveRuntime {
   /** P1b：快照身份构建全降级（既有契约 'rs:assembly'；装配不因快照计算失败中断） */
   private degraded = false;
   private identityError: string | null = null;
+  /** P2：组件注册表（装配期注册 memory-retrieval；ready()/componentsReady() 激活 + health check；close() 批量 dispose 回滚） */
+  readonly components: ComponentRegistry;
+  /** P2：能力注册表（组件 manifest 声明的能力登记——注册/冲突 fail-loud，capability.ts 语义复用；软接管留 Broker） */
+  readonly capabilities: CapabilityRegistry;
+  /** P2：组件激活幂等（首次 componentsReady() 执行，后续复用） */
+  private componentsReadyPromise: Promise<void> | null = null;
+  /** P2：组件装配降级原因（激活失败/健康检查异常；无 → null）——kern_status 摘要 degraded 段 */
+  private componentAssemblyDegraded: string | null = null;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
     this.eventStore = new EventStore(opts.eventDb ?? join(root, 'events.db'));
     this.memory = new RetrievalBackend(opts.memoryDb ?? join(root, 'memory.db'));
+    // P2：组件注册表装配——注册首个机制组件 memory-retrieval（manifest/inject/effect/disposer/health 契约，
+    // ABI 出口 components/registry.ts，实现 supervisor/component-registry.ts）→ 组件能力登记进能力注册表
+    //（冲突 fail-loud——同层同名注册是真实装配冲突，最早点报错（平台约束 fails loud））。
+    this.components = new ComponentRegistry();
+    this.components.register(memoryRetrievalComponent, { memory: this.memory });
+    this.capabilities = new CapabilityRegistry();
+    for (const m of this.components.manifests()) {
+      registerComponentCapabilities(this.capabilities, m);
+    }
     const line = isVersionLine(opts.line) ? opts.line : 'stable';
     const dirs = resolveLineDirs(opts, line);
     this.policyDir = dirs.policyDir;
@@ -401,11 +445,66 @@ export class CognitiveRuntime {
     this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
   }
 
-  /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效）；幂等 */
+  /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等 */
   async ready(): Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] }> {
     this.policyPromise ??= loadPolicy(this.policyDir);
     this.processesPromise ??= loadProcesses(this.processesDir);
+    await this.componentsReady(); // P2：组件激活 + 健康检查（幂等；失败降级不阻塞请求路径）
     return { policy: await this.policyPromise, processes: await this.processesPromise };
+  }
+
+  /**
+   * P2：组件激活 + 健康检查（幂等——首次调用执行，后续复用结果）。
+   * 激活失败 → registry 已批量 dispose 回滚（T8.6：不暴露任何 effect）→ 记录降级（认知运行时其余功能照常）；
+   * health 失败 → registry 内打 suspicious（降级不卸载，§主14.6）。不抛。
+   */
+  async componentsReady(): Promise<void> {
+    this.componentsReadyPromise ??= this.activateComponents();
+    await this.componentsReadyPromise;
+  }
+
+  /** P2：周期心跳入口（设计 §8.2 health check 周期心跳）——返回逐组件健康报告；失败 → suspicious 降级不卸载 */
+  async healthCheckComponents(): Promise<Record<string, ComponentHealthResult>> {
+    await this.componentsReady();
+    return this.components.healthCheck();
+  }
+
+  /**
+   * P2：kern_status 数据源——认知运行时状态摘要（纯读取：从现有字段组装；任一段降级 → 降级字段非空不抛）。
+   * 字段：当前版本线/快照哈希/lineSnapshot/维护债务快照/最近信号数/组件健康（design §6 kern_status）。
+   */
+  async status(): Promise<KernStatusSummary> {
+    await this.componentsReady();
+    let recent_signals = 0;
+    let signals_degraded: string | null = null;
+    try {
+      const { records } = await readSignals(this.signalsDir);
+      recent_signals = records.length;
+    } catch (err) {
+      signals_degraded = errorDetail(err);
+    }
+    const entries = this.components.list();
+    return {
+      line: this.lineSnapshot?.line ?? 'stable',
+      snapshot_hash: this.snapshotHash,
+      line_snapshot: this.lineSnapshot
+        ? { line: this.lineSnapshot.line, commit: this.lineSnapshot.commit, dir: this.lineSnapshot.dir }
+        : null,
+      line_degraded: this.lineDegraded,
+      debt: this.maintenance?.debtSnapshot() ?? [],
+      recent_signals,
+      signals_degraded,
+      components: {
+        registered: entries.map((e) => e.manifest_id),
+        // suspicious 组件仍处于激活态（降级不卸载）→ 计入 active
+        active: entries.filter((e) => e.status === 'active' || e.status === 'suspicious').map((e) => e.manifest_id),
+        suspicious: entries.filter((e) => e.status === 'suspicious').map((e) => e.manifest_id),
+        health: entries.map((e) => ({ manifest_id: e.manifest_id, ok: e.healthy === true, detail: e.health_detail ?? '' })),
+      },
+      degraded: this.degraded
+        ? `快照机制降级（${this.identityError ?? 'rs:assembly'}）`
+        : this.componentAssemblyDegraded,
+    };
   }
 
   /**
@@ -616,8 +715,9 @@ export class CognitiveRuntime {
     };
   }
 
-  /** 关闭存储连接（Windows WAL 收尾先 close；幂等） */
+  /** 关闭存储连接（Windows WAL 收尾先 close；幂等）。P2：先组件批量 dispose 回滚（P8 注册皆效应）再关库。 */
   async close(): Promise<void> {
+    await this.components.disposeAll();
     await this.eventStore.close();
     await this.memory.close();
   }
@@ -667,6 +767,21 @@ export class CognitiveRuntime {
   }
 
   // ---- 内部 ----
+
+  /** P2：组件激活 + 健康检查执行体（componentsReady 单飞；任一步失败 → 记录降级不抛——registry 已内部回滚/标记） */
+  private async activateComponents(): Promise<void> {
+    try {
+      await this.components.activate();
+    } catch (err) {
+      // 激活失败 → registry 已批量 dispose 回滚（T8.6：不暴露任何 effect）；记录降级，认知运行时其余功能照常
+      this.componentAssemblyDegraded = `组件激活失败（${errorDetail(err)}）`;
+    }
+    try {
+      await this.components.healthCheck(); // health 失败 → registry 内打 suspicious（降级不卸载）
+    } catch (err) {
+      this.componentAssemblyDegraded = `组件健康检查异常（${errorDetail(err)}）`;
+    }
+  }
 
   /** 请求级快照解析（P1b §6.5.7）：未绑定 → 绑定当前快照并返回（整个请求锁定）；已绑定 → 原快照。
    *  全降级 / 覆盖注入 → 常量（无绑定语义，兼容既有 'rs:assembly' 契约）。 */

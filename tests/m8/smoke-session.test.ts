@@ -47,6 +47,8 @@ function makeFakeCtx(opts: { runtime: CognitiveRuntime }): {
   const ctx: ContextLike = {
     commands: { register: () => undefined },
     cognitive: opts.runtime,
+    // P2：真实 DSH ctx 恒有 tools 服务（kern_* 工具桥注册面）——happy path 无 tools 降级
+    tools: { register: () => undefined },
     systemPrompt: {
       context: (def: unknown) => {
         contexts.push(def as { name: string; order: number; text: unknown });

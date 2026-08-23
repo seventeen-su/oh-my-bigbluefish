@@ -19,6 +19,7 @@ import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from 
 import { loadBenchContractsV2, loadBenchFixturesV2, makeReplayExecutorV2, runBenchV2, type BenchExecutorV2 } from '../supervisor/bench-v2.js';
 import { makeRealExecutor, makeRealExecutorV2 } from '../supervisor/real-executor.js';
 import { createCognitiveRuntime } from './assembly.js';
+import { registerKernTools, type KernStatusSummary, type ToolsLike } from './kern-tools.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
@@ -163,6 +164,8 @@ export interface CognitiveRuntimeLike {
     prompt: { system: string; total_tokens: number };
     events_appended: number;
   }>;
+  /** P2：kern_status 数据源——认知运行时状态摘要（版本线/快照/lineSnapshot/债务/信号数/组件健康；纯读取） */
+  status?(): Promise<KernStatusSummary>;
   close(): Promise<void>;
 }
 
@@ -186,6 +189,8 @@ export interface ContextLike {
   /** Guard 契约：免 inject 服务读取（真实 DSH 上下文恒有；测试 fakeCtx 可缺省，readService 退化到普通属性） */
   get?(name: string): unknown;
   commands?: CommandsLike;
+  /** P2：DSH 工具注册面（kern_* 工具桥；真实类型 @deepseek-ai/dsh-tools ToolRuntime.register）——经 get('tools') 读取 */
+  tools?: ToolsLike;
   /** T8.3：注入的认知运行时（deps 注入，组合根模式）——经 get('cognitive') 读取；未注入且提供装配根 → 组合根缺省装配 */
   cognitive?: CognitiveRuntimeLike;
   /** T8.12：DSH llm 服务（LlmRuntime.stream 的结构最小接口；真实类型 @deepseek-ai/dsh-llm）——经 get('llm') 读取。
@@ -340,6 +345,37 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   }
 
   /**
+   * P2：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
+   * 本次仅注册 kern_status（桥机制验证；kern_bench/kern_evolve/kern_switch/kern_memory 留清单按需注册，
+   * 见 runtime/kern-tools.ts registerKernTools）。守卫：ctx.tools 缺失 → 记录降级不崩（对齐既有守卫风格）；
+   * 认知运行时未装配 → 不注册（记录——kern_status 依赖运行时状态）。
+   * P8（注册皆效应）：工具注册 disposer 集入 DSH 生命周期（ctx.effect）——插件关闭 → 批量注销回滚。
+   */
+  if (typeof ctx.tools?.register === 'function') {
+    if (cognitive !== undefined) {
+      const r = registerKernTools(ctx.tools, cognitive);
+      if (r.degraded !== null) {
+        recordDegradation('kern/tools', r.degraded);
+      }
+      if (typeof ctx.effect === 'function' && r.disposers.length > 0) {
+        ctx.effect(() => () => {
+          for (const d of r.disposers) {
+            try {
+              d(); // 真实 DSH register 返回的 disposer（注销幂等；失败忽略）
+            } catch {
+              // 注销失败幂等忽略（无状态残留）
+            }
+          }
+        });
+      }
+    } else {
+      recordDegradation('kern/tools', '认知运行时未装配——kern_* 工具未注册');
+    }
+  } else {
+    recordDegradation('ctx.tools', '接口缺失（ctx.tools 不存在）——kern_* 工具未注册（其余功能不受影响）');
+  }
+
+  /**
    * 版本线激活记录（T8.7 生产接线）：/mode 切换后调用。
    * - activationLogDir 配置 → completed/<activation_id>.json 幂等落盘（pending 先写，完成清 pending；
    *   M6 ActivationContract schema 校验 fail-loud 不落盘；重启后可恢复）；
@@ -418,9 +454,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   };
 
-  // 生命周期安全关闭（插件停止/会话结束）：维护调度器停表 + 认知运行时关库
-  //（SQLite WAL 收尾先 close；幂等；失败记录降级不抛——生产装配补全）。
+  // 生命周期安全关闭（插件停止/会话结束）：维护调度器停表 + 认知运行时关库（含组件批量 dispose 回滚——
+  // P8 注册皆效应；SQLite WAL 收尾先 close；幂等；失败记录降级不抛——生产装配补全）。
   // 守卫：ctx.effect 缺失（测试 fakeCtx）→ 不注册关闭钩子（命令仍可用）。
+  // 清理返回 close promise（Cordis 支持异步清理——测试可 await 确定性断言组件注销）。
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => {
       const rt = cognitive;
@@ -439,7 +476,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         } catch {
           // 清理失败 → 下次启动 cleanupStaleInitialWorktrees 兜底
         }
-        void rt.close().catch((err) => {
+        return rt.close().catch((err) => {
           const detail = err instanceof Error ? err.message : String(err);
           recordDegradation('cognitive/close', `运行时关闭失败（${detail}）`);
         });
