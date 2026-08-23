@@ -47,6 +47,31 @@ describe('三线 git 布局（独立临时 fixture 完整复现）', () => {
     expect(refs).toContain('refs/heads/main');
   });
 
+  it('P1a 种子升级：trusted-latest 分支存在（latest = trusted head 指针，D1 裁决）', () => {
+    fx = buildLayoutFixture();
+    const refs = runGit(['for-each-ref', '--format=%(refname)'], { cwd: fx.bare });
+    expect(refs).toContain('refs/heads/trusted-latest');
+    // trusted-latest = latest 基线提交（main head）
+    const trusted = runGit(['rev-parse', '--verify', 'refs/heads/trusted-latest^{commit}'], { cwd: fx.bare });
+    const main = runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: fx.bare });
+    expect(trusted).toBe(main);
+    expect(trusted).toBe(fx.latestHash);
+  });
+
+  it('P1a 种子升级：基线提交含 kernel/policy + kernel/processes（出厂基线 = repo 快照），正式 worktree 可读到', () => {
+    fx = buildLayoutFixture();
+    // 提交树含认知对象
+    const tree = runGit(['ls-tree', '-r', '--name-only', fx.initialHash], { cwd: fx.bare });
+    expect(tree).toContain('kernel/policy/budget.yaml');
+    expect(tree).toContain('kernel/policy/context.yaml');
+    expect(tree).toContain('kernel/policy/governor.yaml');
+    expect(tree).toContain('kernel/processes/hypothesize-test.yaml');
+    expect(tree).toContain('kernel/processes/retrieve-verify.yaml');
+    // 正式 worktree（stable = initial 基线 checkout）同样可读
+    expect(fs.existsSync(path.join(fx.stable, 'kernel', 'policy', 'budget.yaml'))).toBe(true);
+    expect(fs.existsSync(path.join(fx.stable, 'kernel', 'processes', 'hypothesize-test.yaml'))).toBe(true);
+  });
+
   it('正式 worktree（stable/）文件可读且内容正确', () => {
     fx = buildLayoutFixture();
     const manifest = JSON.parse(fs.readFileSync(path.join(fx.stable, 'manifest.json'), 'utf8')) as {

@@ -75,8 +75,9 @@ export const LINE_REFS: Record<VersionLine, string> = {
 /** 进程内 initial 物化目录缓存（每 bare 一次；避免重复 worktree add 与内容漂移） */
 const materializedInitial = new Map<string, string>();
 
-/** preset 根（src 布局本文件在 <preset>/substrate/ → 上一级即 preset 根；编译布局 <preset>/lib/substrate/ 多一层 → 存在性回退） */
-function presetRoot(): string {
+/** preset 根（src 布局本文件在 <preset>/substrate/ → 上一级即 preset 根；编译布局 <preset>/lib/substrate/ 多一层 → 存在性回退）。
+ *  导出供 substrate 内文件复用（bootstrap.ts 种子取 repo kernel/policy 源；P1a lines.ts 同款推导）。 */
+export function presetRoot(): string {
   const candidate = fileURLToPath(new URL('..', import.meta.url));
   return fs.existsSync(path.join(candidate, 'kernel', 'policy')) ? candidate : path.dirname(candidate);
 }
@@ -103,8 +104,9 @@ function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** 在 bare 上运行 git（cwd=bare）；非 0 退出抛错并带 stderr */
-function runGit(layout: VersionLayout, args: string[]): string {
+/** 在 bare 上运行 git（cwd=bare）；非 0 退出抛错并带 stderr。
+ *  导出供 substrate 内文件复用（lines.ts 解析线指针/枚举树，P1a 同款瞬态锁重试）。 */
+export function runGit(layout: VersionLayout, args: string[]): string {
   let last: unknown;
   for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
     try {

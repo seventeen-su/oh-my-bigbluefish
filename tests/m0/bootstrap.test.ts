@@ -80,7 +80,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     }
   });
 
-  it('缺失布局 → 完整初始化：bare+三引用+双 worktree manifest+候选 worktree+只读 ACL', () => {
+  it('缺失布局 → 完整初始化：bare+四引用+双 worktree manifest+候选 worktree+只读 ACL', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-init-'));
     const layout = makeLayout(root);
     const r = ensureThreeLineLayout(layout);
@@ -89,14 +89,21 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     expect(fs.existsSync(path.join(layout.bareRepo, 'HEAD'))).toBe(true);
     expect(fs.existsSync(path.join(layout.bareRepo, 'objects'))).toBe(true);
     expect(fs.existsSync(path.join(layout.bareRepo, 'refs'))).toBe(true);
-    // 三引用可解析（真实 git）
-    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main']) {
+    // 四引用可解析（真实 git；P1a 种子升级新增 trusted-latest = latest 基线）
+    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main', 'refs/heads/trusted-latest']) {
       const hash = runGit(['rev-parse', '--verify', `${ref}^{commit}`], { cwd: layout.bareRepo });
       expect(hash).toMatch(/^[0-9a-f]{40}$/);
     }
+    // trusted-latest 初始 = latest 基线（main head，D1 裁决）
+    const trusted = runGit(['rev-parse', '--verify', 'refs/heads/trusted-latest^{commit}'], { cwd: layout.bareRepo });
+    const main = runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: layout.bareRepo });
+    expect(trusted).toBe(main);
     // stable/latest manifest 内容与种子一致（JSON 归一化比较，git autocrlf 行尾无关）
     expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
     expect(readManifest(layout.latestWorktree)).toBe(MANIFEST_LATEST);
+    // P1a 种子升级：正式 worktree 含 kernel/policy + kernel/processes（出厂基线 = repo 快照）
+    expect(fs.existsSync(path.join(layout.stableWorktree, 'kernel', 'policy', 'budget.yaml'))).toBe(true);
+    expect(fs.existsSync(path.join(layout.stableWorktree, 'kernel', 'processes', 'hypothesize-test.yaml'))).toBe(true);
     // 候选 worktree（0000-bootstrap）存在且是 git worktree
     const candidate = path.join(root, 'workspace', '.omb', '.evolution', 'candidates', '0000-bootstrap');
     expect(fs.existsSync(path.join(candidate, '.git'))).toBe(true);
@@ -106,7 +113,9 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     // 两线已分叉（stable..main diff 非空）
     const diff = runGit(['diff', '--stat', 'stable..main'], { cwd: layout.bareRepo });
     expect(diff.length).toBeGreaterThan(0);
-  });
+    // 超时放宽（P1a 种子升级后初始化更重——worktree 含 kernel/policy+processes、icacls 递归更多条目；
+    // 全量套件并行时 git/fs 竞争，5s 缺省超时可能不足；与 tests/m8/share-upgrade.test.ts 同款模式）
+  }, 30_000);
 
   it('健康布局 → ok 且幂等（重复调用零副作用）', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-healthy-'));
@@ -119,7 +128,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     // 健康调用不产生新结构：候选 worktree 仍唯一
     const candidates = fs.readdirSync(path.join(root, 'workspace', '.omb', '.evolution', 'candidates'));
     expect(candidates).toEqual(['0000-bootstrap']);
-  });
+  }, 30_000);
 
   it('worktree 缺失 → 修复重建（stable 内容恢复为 initial 基线 + 只读 ACL 重新施加）', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-missing-'));
@@ -134,18 +143,19 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     expect(r.status).toBe('repaired');
     expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
     assertReadOnly(layout.stableWorktree);
-  });
+  }, 30_000);
 
   it('gitfile 指向不存在路径（旧机器路径残留）→ 修复后可 loadVersion', async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-gitfile-'));
     const layout = makeLayout(root);
     expect(ensureThreeLineLayout(layout).status).toBe('initialized');
-    // 构造旧机器残留：释放 ACL → 清空 stable 内容（保留 .git 指针）→ 删注册项 →
-    // gitfile 指向不存在 gitdir。注意：git 创建的 .git 带 Hidden 属性，Node writeFileSync
-    //（O_TRUNC）对其 EPERM（libuv 已知行为）→ 先删除再重建指针文件（rm 不受 Hidden 影响）。
+    // 构造旧机器残留：释放 ACL → 清空 stable 内容（含 kernel/，P1a 种子升级后 worktree 含 policy/processes；
+    // 保留 .git 指针）→ 删注册项 → gitfile 指向不存在 gitdir。注意：git 创建的 .git 带 Hidden 属性，
+    // Node writeFileSync（O_TRUNC）对其 EPERM（libuv 已知行为）→ 先删除再重建指针文件（rm 不受 Hidden 影响）。
     runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
     fs.rmSync(path.join(layout.stableWorktree, 'manifest.json'));
     fs.rmSync(path.join(layout.stableWorktree, 'README.md'));
+    fs.rmSync(path.join(layout.stableWorktree, 'kernel'), { recursive: true, force: true });
     fs.rmSync(path.join(layout.bareRepo, 'worktrees', 'stable'), { recursive: true, force: true });
     const gitfile = path.join(layout.stableWorktree, '.git');
     fs.rmSync(gitfile);
@@ -157,7 +167,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     const snap = await loadVersion('stable', layout);
     expect(readManifest(snap.tree_root)).toBe(MANIFEST_INITIAL);
     assertReadOnly(layout.stableWorktree);
-  });
+  }, 30_000);
 
   it('ACL 丢失（目录可写）→ 重新施加后写被拒', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-acl-'));
@@ -172,7 +182,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     expect(r.status).toBe('repaired');
     assertReadOnly(layout.stableWorktree);
     assertReadOnly(layout.latestWorktree);
-  });
+  }, 30_000);
 
   it('全空 bare（存在但无提交）→ 按种子流程补基线（repaired）', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-empty-'));
@@ -184,14 +194,14 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     // 补基线修复
     const r = ensureThreeLineLayout(layout);
     expect(r.status).toBe('repaired');
-    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main']) {
+    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main', 'refs/heads/trusted-latest']) {
       const hash = runGit(['rev-parse', '--verify', `${ref}^{commit}`], { cwd: layout.bareRepo });
       expect(hash).toMatch(/^[0-9a-f]{40}$/);
     }
     expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
     expect(readManifest(layout.latestWorktree)).toBe(MANIFEST_LATEST);
     assertReadOnly(layout.stableWorktree);
-  });
+  }, 30_000);
 
   it('git 不可用（layout.gitBin 指向不存在 exe）→ degraded 不 throw', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-nogit-'));
@@ -221,5 +231,5 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     // 用户数据未被删除
     expect(fs.readFileSync(path.join(layout.stableWorktree, 'user-data.txt'), 'utf8')).toBe('keep me');
     expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
-  });
+  }, 30_000);
 });

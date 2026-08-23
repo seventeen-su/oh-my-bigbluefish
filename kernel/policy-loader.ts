@@ -3,8 +3,10 @@
 // 改 YAML 即生效（加载器不感知内容）；非法数据 fail-loud。
 // layer 2（kernel/）：仅 import node: 内置 + js-yaml + kernel/schemas/（同层/契约层，CONVENTIONS §4）。
 // schema/枚举定义在 kernel/schemas/policy.ts（契约层，T7.2 起 supervisor 复用）；本文件 re-export 保持公共 API。
+import { existsSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { load as parseYaml } from 'js-yaml';
 import { z } from 'zod';
 import {
@@ -50,6 +52,16 @@ export interface PolicyBundle {
   context: ContextPolicy;
 }
 
+/** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */
+const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
+/** 仓库根：存在性回退（src 布局 HERE_CANDIDATE 即根；编译布局其下无 kernel/policy → 取上级） */
+const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+
+/** 仓库默认策略目录（loadPolicy 缺省目录；P1a：调用方可注入线快照目录覆盖） */
+const DEFAULT_POLICY_DIR = join(HERE, 'kernel', 'policy');
+/** 仓库默认过程目录（loadProcesses 缺省目录；P1a：调用方可注入线快照目录覆盖） */
+const DEFAULT_PROCESSES_DIR = join(HERE, 'kernel', 'processes');
+
 // ---- 加载器 ----
 
 /** 读文件 → YAML parse → zod 校验（fail-loud：路径 + 校验问题明细） */
@@ -77,19 +89,23 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** 加载三策略（governor.yaml / budget.yaml / context.yaml）并深冻结 */
-export async function loadPolicy(dir: string): Promise<PolicyBundle> {
+/** 加载三策略（governor.yaml / budget.yaml / context.yaml）并深冻结。
+ *  @param dir 策略目录（缺省 <repo>/kernel/policy；P1a 线快照注入时传 lines/<line>/<commit>/kernel/policy） */
+export async function loadPolicy(dir?: string): Promise<PolicyBundle> {
+  const policyDir = dir ?? DEFAULT_POLICY_DIR;
   const [governor, budget, context] = await Promise.all([
-    parsePolicyFile(join(dir, 'governor.yaml'), GovernorPolicySchema),
-    parsePolicyFile(join(dir, 'budget.yaml'), BudgetPolicySchema),
-    parsePolicyFile(join(dir, 'context.yaml'), ContextPolicySchema),
+    parsePolicyFile(join(policyDir, 'governor.yaml'), GovernorPolicySchema),
+    parsePolicyFile(join(policyDir, 'budget.yaml'), BudgetPolicySchema),
+    parsePolicyFile(join(policyDir, 'context.yaml'), ContextPolicySchema),
   ]);
   return deepFreeze({ governor, budget, context });
 }
 
-/** 加载目录下全部 *.yaml 过程（文件名排序保证确定性）并深冻结 */
-export async function loadProcesses(dir: string): Promise<readonly ProcessDef[]> {
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.yaml')).sort();
-  const processes = await Promise.all(files.map((f) => parsePolicyFile(join(dir, f), ProcessDefSchema)));
+/** 加载目录下全部 *.yaml 过程（文件名排序保证确定性）并深冻结。
+ *  @param dir 过程目录（缺省 <repo>/kernel/processes；P1a 线快照注入时传 lines/<line>/<commit>/kernel/processes） */
+export async function loadProcesses(dir?: string): Promise<readonly ProcessDef[]> {
+  const processesDir = dir ?? DEFAULT_PROCESSES_DIR;
+  const files = (await readdir(processesDir)).filter((f) => f.endsWith('.yaml')).sort();
+  const processes = await Promise.all(files.map((f) => parsePolicyFile(join(processesDir, f), ProcessDefSchema)));
   return deepFreeze(processes);
 }

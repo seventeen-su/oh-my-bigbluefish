@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { GIT_BIN, defaultLayout } from '../substrate/snapshot.js';
+import { ensureLineSnapshot, isVersionLine, type VersionLine, type VersionLayout } from '../substrate/lines.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint } from '../kernel/schemas/m.js';
@@ -69,6 +70,11 @@ export interface CognitiveAssemblyOptions {
   eventDb?: string;
   policyDir?: string;
   processesDir?: string;
+  /** P1a：当前版本线（缺省 stable，架构 §11.1）——按线加载 policy/processes（lines/ 物化快照注入）；
+   *  非法值 → 回退 stable；显式提供 policyDir/processesDir 时忽略（显式目录注入优先）。 */
+  line?: VersionLine;
+  /** P1a：lines 布局覆盖（测试注入 fixture；缺省真实 preset 布局 defaultLayout()） */
+  layout?: VersionLayout;
   /** Governor 输入 state_snapshot（缺省 'rs:assembly'） */
   snapshotHash?: string;
   /** T8.12：ModelAdapter（DSH 模型调用适配器）——组合根经 deps 注入；未注入 → 缺省受限（纯规则阶梯） */
@@ -143,6 +149,67 @@ export interface FinalizeTurnResult {
   events_appended: number;
 }
 
+/** P1a：已注入的线快照信息（lines 物化快照；未注入 → null） */
+export interface LineSnapshotInfo {
+  line: VersionLine;
+  commit: string;
+  dir: string;
+}
+
+/** 按线解析结果（policy/processes 目录 + 快照信息 + 降级原因） */
+interface LineDirResolution {
+  policyDir: string;
+  processesDir: string;
+  lineSnapshot: LineSnapshotInfo | null;
+  lineDegraded: string | null;
+}
+
+/**
+ * P1a：按线解析 policy/processes 目录（D1 裁决：运行时按当前版本线从 lines 物化快照加载）。
+ * 最佳努力（装配失败不崩）：线快照存在 kernel/policy + kernel/processes → 注入线快照路径；
+ * 缺失（旧布局种子无 policy）/ lines 不可用 → 回退仓库默认目录 + 降级原因（不抛）。
+ * 显式提供 policyDir/processesDir → 显式目录优先（测试/兼容注入，不走按线加载）。
+ */
+function resolveLineDirs(opts: CognitiveAssemblyOptions, line: VersionLine): LineDirResolution {
+  const defaultPolicyDir = join(HERE, 'kernel', 'policy');
+  const defaultProcessesDir = join(HERE, 'kernel', 'processes');
+  if (opts.policyDir !== undefined || opts.processesDir !== undefined) {
+    return {
+      policyDir: opts.policyDir ?? defaultPolicyDir,
+      processesDir: opts.processesDir ?? defaultProcessesDir,
+      lineSnapshot: null,
+      lineDegraded: null,
+    };
+  }
+  try {
+    const snap = ensureLineSnapshot(opts.layout ?? defaultLayout(), line);
+    const snapPolicyDir = join(snap.dir, 'kernel', 'policy');
+    const snapProcessesDir = join(snap.dir, 'kernel', 'processes');
+    if (existsSync(snapPolicyDir) && existsSync(snapProcessesDir)) {
+      return {
+        policyDir: snapPolicyDir,
+        processesDir: snapProcessesDir,
+        lineSnapshot: { line, commit: snap.commit, dir: snap.dir },
+        lineDegraded: null,
+      };
+    }
+    return {
+      policyDir: defaultPolicyDir,
+      processesDir: defaultProcessesDir,
+      lineSnapshot: null,
+      lineDegraded: `版本线 ${line} 快照缺少 kernel/policy 或 kernel/processes（${snap.dir}）——回退仓库默认策略/过程`,
+    };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      policyDir: defaultPolicyDir,
+      processesDir: defaultProcessesDir,
+      lineSnapshot: null,
+      lineDegraded: `lines 按线加载不可用（${detail}）——回退仓库默认策略/过程`,
+    };
+  }
+}
+
 /** 认知运行时（装配产物；plugin.ts 的 CognitiveRuntimeLike 结构上满足） */
 export class CognitiveRuntime {
   readonly eventStore: EventStore;
@@ -150,8 +217,13 @@ export class CognitiveRuntime {
   readonly snapshotHash: string;
   /** T8.12：注入的 ModelAdapter（无真实 DSH 会话 → null，LLM 路径缺省受限） */
   readonly modelAdapter: ModelAdapter | null;
-  private readonly policyDir: string;
-  private readonly processesDir: string;
+  /** P1a：生效 policy/processes 目录（线快照注入或仓库默认） */
+  readonly policyDir: string;
+  readonly processesDir: string;
+  /** P1a：已注入的线快照（按线加载成功 → 快照信息；否则 null） */
+  readonly lineSnapshot: LineSnapshotInfo | null;
+  /** P1a：lines 按线加载降级原因（线快照缺 policy / lines 不可用 → 回退仓库默认；无降级 → null） */
+  readonly lineDegraded: string | null;
   private readonly checkpointDir: string | undefined;
   /** 维护调度器（生产装配注入；插件经此在请求间隙驱动 requestQuantum/停表——公开面） */
   readonly maintenance: MaintenanceScheduler | null;
@@ -162,8 +234,12 @@ export class CognitiveRuntime {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
     this.eventStore = new EventStore(opts.eventDb ?? join(root, 'events.db'));
     this.memory = new RetrievalBackend(opts.memoryDb ?? join(root, 'memory.db'));
-    this.policyDir = opts.policyDir ?? join(HERE, 'kernel', 'policy');
-    this.processesDir = opts.processesDir ?? join(HERE, 'kernel', 'processes');
+    const line = isVersionLine(opts.line) ? opts.line : 'stable';
+    const dirs = resolveLineDirs(opts, line);
+    this.policyDir = dirs.policyDir;
+    this.processesDir = dirs.processesDir;
+    this.lineSnapshot = dirs.lineSnapshot;
+    this.lineDegraded = dirs.lineDegraded;
     this.snapshotHash = opts.snapshotHash ?? computeSnapshotHash(this.policyDir, this.processesDir);
     this.modelAdapter = opts.modelAdapter ?? null;
     this.checkpointDir = opts.checkpointDir;

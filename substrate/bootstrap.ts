@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { GIT_BIN, defaultLayout, type VersionLayout } from './snapshot.js';
+import { GIT_BIN, defaultLayout, presetRoot, type VersionLayout } from './snapshot.js';
 
 export { defaultLayout };
 
@@ -34,6 +34,27 @@ const MANIFEST_LATEST = JSON.stringify(
   null,
   2,
 );
+
+/** 出厂基线认知对象（P1a 种子升级）：repo 的 kernel/policy + kernel/processes 快照（三线承载版本化认知对象） */
+const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml'];
+const PROCESS_FILES = ['hypothesize-test.yaml', 'retrieve-verify.yaml'];
+
+/** 把 repo kernel/policy + kernel/processes 快照复制进种子工作树（seed = 一次性种子目录；源 = presetRoot()） */
+function seedKernelObjects(seedDir: string): void {
+  const root = presetRoot();
+  const policyDir = path.join(root, 'kernel', 'policy');
+  const processesDir = path.join(root, 'kernel', 'processes');
+  const policyOut = path.join(seedDir, 'kernel', 'policy');
+  const processesOut = path.join(seedDir, 'kernel', 'processes');
+  fs.mkdirSync(policyOut, { recursive: true });
+  fs.mkdirSync(processesOut, { recursive: true });
+  for (const f of POLICY_FILES) {
+    fs.copyFileSync(path.join(policyDir, f), path.join(policyOut, f));
+  }
+  for (const f of PROCESS_FILES) {
+    fs.copyFileSync(path.join(processesDir, f), path.join(processesOut, f));
+  }
+}
 
 /** 瞬态锁错误（Windows 文件锁/杀软竞态）：短退避有限次重试（与 snapshot.ts 同款模式）；非锁错误/超次 → 直接抛错 */
 const LOCK_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
@@ -270,8 +291,10 @@ function ensureEvolution(lay: VersionLayout, initialHash: string): void {
 /**
  * 种子基线（与 tests/helpers/git.ts buildLayoutFixture 步骤 1-5 完全等价）：
  * 1. git init --bare -b main <bareRepo>（initBare=false 时复用已有空 bare，规范 HEAD → main）
- * 2. 首个基线提交（manifest.json + README.md，inline 作者）→ tag initial + branch stable
+ * 2. 首个基线提交（manifest.json + README.md + kernel/policy/ + kernel/processes/，inline 作者）
+ *    → tag initial + branch stable（出厂基线 = repo kernel/policy + kernel/processes 快照，P1a）
  * 3. main 再推进一版（与 stable 分叉，保证 git diff stable..main 非空）
+ * 3.5. trusted-latest 分支 ← latest 基线提交（D1 裁决：latest = trusted head 指针，初始 = latest 基线）
  * 4. stable/ latest/ 正式 worktree（先 add 后加只读 ACL）
  * 5. workspace/.omb/.evolution/candidates/0000-bootstrap/ 候选临时可写 worktree（--detach @ initial）
  */
@@ -288,10 +311,11 @@ function seedBaseline(lay: VersionLayout, opts: { initBare: boolean }): void {
     }
   }
 
-  // 2. 首个基线提交 + tag initial + stable 分支
+  // 2. 首个基线提交 + tag initial + stable 分支（出厂基线 = manifest + README + kernel/policy + kernel/processes 快照）
   const seedInitial = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-seed-initial-'));
   fs.writeFileSync(path.join(seedInitial, 'manifest.json'), MANIFEST_INITIAL);
   fs.writeFileSync(path.join(seedInitial, 'README.md'), 'OMB v2 版本树引导基线（initial）。\n');
+  seedKernelObjects(seedInitial);
   runGit(lay, ['add', '.'], { workTree: seedInitial });
   runGit(
     lay,
@@ -306,10 +330,11 @@ function seedBaseline(lay: VersionLayout, opts: { initBare: boolean }): void {
     runGit(lay, ['branch', 'stable', initialHash], { cwd: lay.bareRepo });
   }
 
-  // 3. main 推进一版（与 stable 分叉）
+  // 3. main 推进一版（与 stable 分叉；同结构：manifest line=latest + README + kernel/policy + kernel/processes 快照）
   const seedLatest = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-seed-latest-'));
   fs.writeFileSync(path.join(seedLatest, 'manifest.json'), MANIFEST_LATEST);
   fs.writeFileSync(path.join(seedLatest, 'README.md'), 'OMB v2 latest 基线（main 分支）。\n');
+  seedKernelObjects(seedLatest);
   runGit(lay, ['add', '.'], { workTree: seedLatest });
   runGit(
     lay,
@@ -325,6 +350,13 @@ function seedBaseline(lay: VersionLayout, opts: { initBare: boolean }): void {
       head = initialHash;
     }
     runGit(lay, ['branch', 'main', head], { cwd: lay.bareRepo });
+  }
+
+  // 3.5. trusted-latest ← main head（D1 裁决：latest = trusted head 指针；初始 = latest 基线提交。
+  //      仅种子流程创建；修复分支不补（旧布局无 trusted-latest 可继续用，resolveLineCommit 回退 main））
+  if (!refExists(lay, 'refs/heads/trusted-latest')) {
+    const mainHead = runGit(lay, ['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: lay.bareRepo });
+    runGit(lay, ['branch', 'trusted-latest', mainHead], { cwd: lay.bareRepo });
   }
 
   // 4. 正式 worktree：先 add（需可写），后加只读 ACL

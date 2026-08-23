@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** git 完整路径（沙箱拦截 PATH 解析，优先完整路径；GIT_BIN 环境变量优先，其次 Windows where.exe 发现，最后 PATH 'git'） */
 export const GIT = ((): string => {
@@ -150,6 +151,27 @@ export const MANIFEST_LATEST = JSON.stringify(
   2,
 );
 
+/** 出厂基线认知对象（P1a 种子升级，与 substrate/bootstrap.ts seedKernelObjects 等价）：repo kernel/policy + kernel/processes 快照 */
+const POLICY_FILES = ['budget.yaml', 'context.yaml', 'governor.yaml'];
+const PROCESS_FILES = ['hypothesize-test.yaml', 'retrieve-verify.yaml'];
+
+/** 真实 preset 根（tests/helpers/ → ../../）——种子源（repo kernel/policy + kernel/processes） */
+const PRESET_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+
+/** 把真实 repo 的 kernel/policy + kernel/processes 快照复制进种子工作树（与生产种子 seedKernelObjects 等价） */
+function seedKernelFiles(seedDir: string): void {
+  const policyOut = path.join(seedDir, 'kernel', 'policy');
+  const processesOut = path.join(seedDir, 'kernel', 'processes');
+  fs.mkdirSync(policyOut, { recursive: true });
+  fs.mkdirSync(processesOut, { recursive: true });
+  for (const f of POLICY_FILES) {
+    fs.copyFileSync(path.join(PRESET_ROOT, 'kernel', 'policy', f), path.join(policyOut, f));
+  }
+  for (const f of PROCESS_FILES) {
+    fs.copyFileSync(path.join(PRESET_ROOT, 'kernel', 'processes', f), path.join(processesOut, f));
+  }
+}
+
 export interface LayoutFixture {
   root: string;
   bare: string;
@@ -157,13 +179,17 @@ export interface LayoutFixture {
   latest: string;
   candidate: string;
   initialHash: string;
+  /** latest 基线提交（main 分叉 / trusted-latest 分支指向；P1a 种子升级新增） */
+  latestHash: string;
 }
 
 /**
  * 在独立临时目录完整复现 T0.2 三线布局（步骤 1-5）：
  *   1. git init --bare -b main versions.git
- *   2. 首个基线提交（manifest.json + README.md，inline 作者）→ tag initial + branch stable
+ *   2. 首个基线提交（manifest.json + README.md + kernel/policy/ + kernel/processes/，inline 作者）
+ *      → tag initial + branch stable（出厂基线 = repo kernel/policy + kernel/processes 快照，P1a）
  *   3. main 再推进一版（与 stable 分叉）
+ *   3.5. trusted-latest 分支 ← latest 基线提交（D1 裁决：latest = trusted head 指针）
  *   4. stable/ latest/ 正式 worktree（先 add 后加只读 ACL denyWriteRecursive）
  *   5. workspace/.omb/.evolution/candidates/<id>/ 候选临时可写 worktree（--detach @ initial）
  * 不触碰真实布局（测试安全）。
@@ -184,6 +210,7 @@ export function buildLayoutFixture(): LayoutFixture {
   fs.mkdirSync(seedInitial);
   fs.writeFileSync(path.join(seedInitial, 'manifest.json'), MANIFEST_INITIAL);
   fs.writeFileSync(path.join(seedInitial, 'README.md'), 'OMB v2 版本树引导基线（initial）。\n');
+  seedKernelFiles(seedInitial);
   const initialOpts: GitRunOptions = { gitDir: bare, workTree: seedInitial };
   runGit(['add', '.'], initialOpts);
   runGit(
@@ -199,12 +226,17 @@ export function buildLayoutFixture(): LayoutFixture {
   fs.mkdirSync(seedLatest);
   fs.writeFileSync(path.join(seedLatest, 'manifest.json'), MANIFEST_LATEST);
   fs.writeFileSync(path.join(seedLatest, 'README.md'), 'OMB v2 latest 基线（main 分支）。\n');
+  seedKernelFiles(seedLatest);
   const latestOpts: GitRunOptions = { gitDir: bare, workTree: seedLatest };
   runGit(['add', '.'], latestOpts);
   runGit(
     ['-c', 'user.name=OMB', '-c', 'user.email=omb@local', 'commit', '-m', 'latest baseline'],
     latestOpts,
   );
+  const latestHash = runGit(['rev-parse', 'HEAD'], { cwd: bare });
+
+  // 3.5. trusted-latest ← latest 基线提交（D1 裁决：latest = trusted head 指针；初始 = latest 基线）
+  runGit(['branch', 'trusted-latest', latestHash], { cwd: bare });
 
   // 4. 正式 worktree：先 add（此时需可写），后加只读 ACL
   runGit(['worktree', 'add', stable, 'stable'], { cwd: bare });
@@ -220,7 +252,7 @@ export function buildLayoutFixture(): LayoutFixture {
   );
   runGit(['worktree', 'add', '--detach', candidate, initialHash], { cwd: bare });
 
-  return { root, bare, stable, latest, candidate, initialHash };
+  return { root, bare, stable, latest, candidate, initialHash, latestHash };
 }
 
 /** 清理 fixture：先 rmSync；若被 ACL 挡住，先 icacls /reset 还原默认 ACL 再删。 */

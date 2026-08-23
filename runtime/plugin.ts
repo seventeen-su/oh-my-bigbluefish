@@ -115,6 +115,10 @@ export interface CognitiveRuntimeLike {
     debtSnapshot(): unknown;
     stop?(): void;
   } | null;
+  /** P1a：已注入的线快照（按线加载成功 → 快照信息；否则 null/undefined） */
+  lineSnapshot?: { line: string; commit: string; dir: string } | null;
+  /** P1a：lines 按线加载降级原因（线快照缺 policy / lines 不可用 → 回退仓库默认；无降级 → null） */
+  lineDegraded?: string | null;
   handleRequest(req: unknown): Promise<{
     decision: { decision: string };
     retrieval: { items: unknown[]; channel_used: string };
@@ -246,6 +250,22 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   let cognitive = readService<CognitiveRuntimeLike>(ctx, 'cognitive');
   let modelAdapter = readService<ModelAdapter>(ctx, 'modelAdapter');
   const systemPrompt = readService<SystemPromptLike>(ctx, 'systemPrompt');
+
+  // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（后备/兼容机制
+  // deploy-lines 生成的 per-line 预设固定本线用；生产单模式下仅影响启动初值——/mode 运行时切换内部线状态）。
+  // 非法值 → 回退 stable 并记录降级（守卫式接入，不阻塞挂载）。
+  // 先于认知装配解析：装配按线加载 policy/processes（P1a，D1 裁决——createCognitiveRuntime 注入 line）。
+  const configuredLine: unknown = config.line;
+  let current: VersionLine;
+  if (isVersionLine(configuredLine)) {
+    current = configuredLine;
+  } else {
+    current = 'stable';
+    if (configuredLine !== undefined) {
+      recordDegradation('config/line', `非法 line 配置 "${String(configuredLine)}"（合法值 initial|stable|latest）——回退 stable`);
+    }
+  }
+
   if (cognitive === undefined) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
@@ -267,25 +287,17 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       cognitive = createCognitiveRuntime({
         root,
         modelAdapter,
+        // P1a：按当前版本线加载 policy/processes（lines 物化快照注入；缺失/失败 → 运行时回退仓库默认）
+        line: current,
         // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
         //（turn 收尾入队 + 请求间隙小量子；debt 落盘到认知数据根 .evolution/）
         checkpointDir: join(root, 'checkpoints'),
         maintenance: new MaintenanceScheduler({ debtFile: join(root, '.evolution', 'debt.json') }),
       });
-    }
-  }
-
-  // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（后备/兼容机制
-  // deploy-lines 生成的 per-line 预设固定本线用；生产单模式下仅影响启动初值——/mode 运行时切换内部线状态）。
-  // 非法值 → 回退 stable 并记录降级（守卫式接入，不阻塞挂载）。
-  const configuredLine: unknown = config.line;
-  let current: VersionLine;
-  if (isVersionLine(configuredLine)) {
-    current = configuredLine;
-  } else {
-    current = 'stable';
-    if (configuredLine !== undefined) {
-      recordDegradation('config/line', `非法 line 配置 "${String(configuredLine)}"（合法值 initial|stable|latest）——回退 stable`);
+      // P1a：lines 按线加载降级（线快照缺 policy / lines 不可用 → 已回退仓库默认）→ 记录降级（不抛，命令仍可用）
+      if (cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {
+        recordDegradation('lines/load', cognitive.lineDegraded);
+      }
     }
   }
 
