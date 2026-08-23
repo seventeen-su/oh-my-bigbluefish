@@ -50,3 +50,37 @@ export interface EvolutionDecision {
 
 export const MAINTENANCE_URGENCIES = ['normal', 'soft', 'hard', 'critical'] as const;
 export type MaintenanceUrgency = (typeof MAINTENANCE_URGENCIES)[number];
+
+// ---- P1d：候选草稿（§6.5.2 候选生成产物；纯类型契约——生成器在 kernel/，管线在 supervisor/，经契约层共享） ----
+
+/** 候选变更（结构化：参数点路径 + 旧值 → 新值；测试与 Evolution Object.diff 锚定） */
+export interface CandidateChange {
+  /** 点路径（如 'signal_triggers.corrections.strength'） */
+  path: string;
+  /** 变更前值（策略参数） */
+  old: number;
+  /** 变更后值（策略参数） */
+  new: number;
+}
+
+/**
+ * P1d 候选草稿（首个候选源 = 信号驱动的策略参数微调确定性生成器，无需 LLM）：
+ *  - id：内容寻址（sha256:<前缀>，同 target+content → 同 id → candidate_id 幂等键；前缀碰撞追加 -<seq>）
+ *  - target：policy 文件路径（相对线快照根，如 kernel/policy/evolve.yaml）
+ *  - content：新文件完整 YAML（覆盖式 diff 提交内容——不删除其余文件）
+ *  - diff：变更说明（Evolution Object.diff 用；path old→new + 依据）
+ */
+export interface CandidateDraft {
+  id: string;
+  /** 集合内序号（确定性排序；不参与幂等键） */
+  seq: number;
+  /** 候选类型（首个候选源恒为 'policy'；L0 数据候选） */
+  kind: 'policy';
+  target: string;
+  content: string;
+  diff: string;
+  motivation: string;
+  /** 来源信号 kind（corrections/oracle_fail/scope_miss/untrusted_object） */
+  signal: string;
+  change: CandidateChange;
+}

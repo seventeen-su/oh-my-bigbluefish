@@ -10,10 +10,19 @@
 #   - maintenance_rate：LLM 维护率软预算（0..1，超预算降优先级，非硬禁止；§6.5.6）
 #   - debt_thresholds：soft → 提高 quantum 频率；hard → 限制非必要演化；critical → 请求边界强制插入 quantum（§6.5.7）
 #   - signal_triggers：触发信号种类 → 是否演化/强度/对象层（§6.5.1 判定表；evolve:false 的条目仅记账不演化）
+# P1d 候选管线门禁（§6.5.3 验证链 G3 / §6.5.2 生成器步长，数据化防激进）：
+#   - candidate_gate.max_candidates_per_run：单次 /evolve（与空闲期量子）最多生成+验证候选数 K（预算守卫）
+#   - candidate_gate.max_step_ratio：参数单次调整相对步长上限（strength 绝对/ratio 相对均封顶）
+#   - candidate_gate.cost_degradation_tolerance：G3 成本劣化容忍（基准报告比较语义，超此值拒绝）
 # 初值待冻结基准标定（架构 §17）。
 daily_evolution_cost: 100
 roi_min: 1.0
 maintenance_rate: 0.5
+
+candidate_gate:
+  max_candidates_per_run: 3
+  max_step_ratio: 0.2
+  cost_degradation_tolerance: 0.1
 
 debt_thresholds:
   soft: 10        # 对齐 MaintenanceScheduler DEFAULT_SOFT_LIMIT（债务 ≥ → quantum 频率提升）

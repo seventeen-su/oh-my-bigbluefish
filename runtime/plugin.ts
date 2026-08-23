@@ -124,10 +124,21 @@ export interface CognitiveRuntimeLike {
   rebuildSnapshotForLine?(line: string): { promoted: boolean; degraded: string | null };
   /** P1b/P1e：外部晋升接口（构建好新快照后 promote → 下一请求生效；进行中请求不受影响） */
   promoteSnapshot?(next: unknown): void;
-  /** P1c：/evolve now——立即执行一次演化判定 + 维护量子（返回摘要；失败降级不崩） */
+  /** P1c/P1d：/evolve now——演化判定 + 候选管线（生成→验证→晋升）+ 维护量子（返回摘要；失败降级不崩） */
   runEvolutionNow?(input: { session_id: string }): Promise<{
     decision: { should_evolve: boolean; strength: number; object_layer: string; budget_estimate: number; triggers: unknown[]; reason: string };
     enqueued: string[];
+    candidates?: Array<{
+      candidate_id: string;
+      target: string;
+      signal: string;
+      validated: boolean;
+      promoted: boolean;
+      commit_hash?: string;
+      object_id?: string;
+      reason?: string;
+    }>;
+    promoted?: { candidate_id: string; object_id: string; commit_hash: string } | null;
     quantum: { ran: string[]; skipped: string[] };
     debt: unknown[];
     degraded: string | null;
@@ -747,8 +758,25 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           `入队维护任务：[${r.enqueued.join(', ') || '无'}]`,
           `quantum 执行：ran=[${r.quantum.ran.join(', ') || '无'}]，skipped=[${r.quantum.skipped.join(', ') || '无'}]`,
           `维护债务快照：${debtText}`,
-          `事件入链：${r.events_appended}（evolution/candidate + maintenance/quantum）`,
+          `事件入链：${r.events_appended}（evolution/candidate + evolution/promoted + maintenance/quantum）`,
         ];
+        // P1d：候选管线摘要（候选数/各门结果/晋升 id/commit）
+        const candidates = r.candidates ?? [];
+        if (candidates.length > 0) {
+          lines.push(
+            `候选管线：生成 ${candidates.length} 个候选 → ${candidates
+              .map((c) => {
+                const verdict = c.validated === true ? 'G1+G3 通过' : c.reason !== undefined ? c.reason : '未验证';
+                return `${String(c.candidate_id).slice(0, 16)}…(${verdict})${c.promoted === true ? '→晋升' : ''}`;
+              })
+              .join('，')}`,
+          );
+        }
+        if (r.promoted !== null && r.promoted !== undefined) {
+          lines.push(
+            `晋升：candidate=${String(r.promoted.candidate_id).slice(0, 16)}… object=${String(r.promoted.object_id).slice(0, 16)}… commit=${String(r.promoted.commit_hash).slice(0, 12)}…`,
+          );
+        }
         if (r.degraded !== null) {
           lines.push(`降级：${r.degraded}`);
         }

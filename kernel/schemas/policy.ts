@@ -189,6 +189,26 @@ export const DebtThresholdsSchema = z.object({
 });
 export type DebtThresholds = z.infer<typeof DebtThresholdsSchema>;
 
+// ---- P1d：候选管线门禁数据化（§6.5.3 验证链 G3 门禁判定 / §6.5.2 生成器步长上限，防激进） ----
+
+/** 候选门禁数据（P1d：生成器上限/步长 + G3 成本劣化容忍；全部入 evolve.policy，改 YAML 即生效） */
+export const CandidateGateSchema = z.object({
+  /** 单次 /evolve（与空闲期量子）最多生成+验证的候选数 K（预算守卫，§6.5.6 evolution_cost/day） */
+  max_candidates_per_run: z.number().int().positive(),
+  /** 参数单次调整相对步长上限（0..1；strength 绝对、ratio 相对——防激进，§6.5.2） */
+  max_step_ratio: z.number().min(0).max(1),
+  /** G3 成本劣化容忍（相对比例；基准报告比较语义——成本代理劣化超此值拒绝，§6.5.3 fitness 不降） */
+  cost_degradation_tolerance: z.number().nonnegative(),
+});
+export type CandidateGate = z.infer<typeof CandidateGateSchema>;
+
+/** 候选门禁缺省（初值待冻结基准标定 §17：K=3、步长 20%、成本劣化容忍 10%） */
+export const DEFAULT_CANDIDATE_GATE = {
+  max_candidates_per_run: 3,
+  max_step_ratio: 0.2,
+  cost_degradation_tolerance: 0.1,
+} as const;
+
 /** 债务阈值缺省（对齐 supervisor/maintenance.ts DEFAULT_SOFT_LIMIT=10 / DEFAULT_HARD_LIMIT=50；critical 待标定 §17） */
 export const DEFAULT_DEBT_THRESHOLDS = { soft: 10, hard: 50, critical: 100 } as const;
 
@@ -214,5 +234,7 @@ export const EvolvePolicySchema = z.object({
   signal_triggers: z.record(z.string().min(1), SignalTriggerSchema).default({}),
   /** P1c：soft/hard/critical 债务阈值（缺省 DEFAULT_DEBT_THRESHOLDS） */
   debt_thresholds: DebtThresholdsSchema.default(DEFAULT_DEBT_THRESHOLDS),
+  /** P1d：候选管线门禁数据（生成器上限/步长 + G3 成本容忍；缺省 DEFAULT_CANDIDATE_GATE） */
+  candidate_gate: CandidateGateSchema.default(DEFAULT_CANDIDATE_GATE),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

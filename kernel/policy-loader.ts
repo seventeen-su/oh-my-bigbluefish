@@ -12,6 +12,7 @@ import { z } from 'zod';
 import {
   BudgetPolicySchema,
   ContextPolicySchema,
+  DEFAULT_CANDIDATE_GATE,
   EvolvePolicySchema,
   GovernorPolicySchema,
   ProcessDefSchema,
@@ -34,6 +35,8 @@ export {
   ContextPolicySchema,
   DEFAULT_DEBT_THRESHOLDS,
   DebtThresholdsSchema,
+  DEFAULT_CANDIDATE_GATE,
+  CandidateGateSchema,
   EvolvePolicySchema,
   GovernorPolicySchema,
   GovernorRuleSchema,
@@ -43,6 +46,7 @@ export {
   ProcessDefSchema,
   SignalTriggerSchema,
   type BudgetPolicy,
+  type CandidateGate,
   type CandidateKind,
   type ContextPolicy,
   type DebtThresholds,
@@ -71,6 +75,7 @@ const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
   maintenance_rate: 0.5,
   signal_triggers: {},
   debt_thresholds: { soft: 10, hard: 50, critical: 100 },
+  candidate_gate: { ...DEFAULT_CANDIDATE_GATE },
 };
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */

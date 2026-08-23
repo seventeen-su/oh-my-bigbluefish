@@ -49,6 +49,9 @@ import {
   summarizeSignals,
 } from '../kernel/evolve-decision.js';
 import type { EvolutionDecision } from '../kernel/schemas/evolution.js';
+// P1d：候选生成（kernel 纯函数）→ 候选管线（supervisor 层 1；runtime(2) → supervisor(1) ✓）
+import { generatePolicyAdjustmentCandidates } from '../kernel/candidate-generator.js';
+import { runCandidatePipeline, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -124,6 +127,8 @@ export interface CognitiveAssemblyOptions {
   maintenance?: MaintenanceScheduler;
   /** P1c：演化信号落盘目录（缺省 <root>/.evolution/signals；finalizeTurn 收尾写入 + 演化判定读取） */
   signalsDir?: string;
+  /** P1d：演化工作区根（CandidatePool 信任池；缺省 <root>/.evolution） */
+  evolutionRoot?: string;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -192,18 +197,29 @@ export interface FinalizeTurnResult {
   events_appended: number;
 }
 
-/** P1c：/evolve now 与空闲期演化判定的摘要（判定结果/入队任务/debt 快照/quantum 执行） */
+/** P1d：晋升摘要（首个通过者晋升；object/commit 供 /evolve 文本与事件引用） */
+export interface PromotedInfo {
+  candidate_id: string;
+  object_id: string;
+  commit_hash: string;
+}
+
+/** P1c/P1d：/evolve now 与空闲期演化判定的摘要（判定结果/候选管线/入队任务/debt 快照/quantum 执行） */
 export interface EvolutionNowResult {
   decision: EvolutionDecision;
   /** 判定后入队的维护任务 id（应演化 → candidate_validation） */
   enqueued: string[];
+  /** P1d：本次候选管线产物（生成 → 验证 → 晋升逐候选 outcome；应演化且新布局时非空） */
+  candidates: CandidateOutcome[];
+  /** P1d：首个通过并晋升的候选（无晋升 → null） */
+  promoted: PromotedInfo | null;
   /** 本次执行的维护量子报告 */
   quantum: QuantumReport;
   /** debt 快照（quantum 执行后） */
   debt: MaintenanceDebt[];
   /** 判定/执行降级原因（无 → null） */
   degraded: string | null;
-  /** 入链事件数（evolution/candidate + maintenance/quantum） */
+  /** 入链事件数（evolution/candidate 判定+生成 + evolution/promoted + maintenance/quantum） */
   events_appended: number;
 }
 
@@ -300,6 +316,8 @@ export class CognitiveRuntime {
   readonly maintenance: MaintenanceScheduler | null;
   /** P1c：演化信号落盘目录（<root>/.evolution/signals；finalizeTurn 写入 / 演化判定读取） */
   readonly signalsDir: string;
+  /** P1d：演化工作区根（CandidatePool 信任池 <root>/.evolution；候选管线注册/晋升/拒绝） */
+  readonly evolutionRoot: string;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
   /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
@@ -341,6 +359,7 @@ export class CognitiveRuntime {
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
+    this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效）；幂等 */
@@ -474,7 +493,7 @@ export class CognitiveRuntime {
             estimated_cost: acc.estimated_cost,
             priority: acc.priority,
             urgency: acc.urgency,
-            run: this.maintenanceRun(acc.task_id),
+            run: this.maintenanceRun(acc.task_id, input.session_id),
           },
           { accrueDebt: true },
         );
@@ -676,17 +695,25 @@ export class CognitiveRuntime {
     }
   }
 
-  /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d 接真实管线——repair/candidate/memory 现为占位） */
-  private maintenanceRun(taskId: string): (signal?: AbortSignal) => Promise<void> {
+  /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d：candidate_validation 接真实管线——
+   *  生成 → 验证 → 晋升（runEvolutionChain）；repair/memory_consolidation 现为占位（P1d 范围外）） */
+  private maintenanceRun(taskId: string, sessionId?: string): (signal?: AbortSignal) => Promise<void> {
     switch (taskId) {
       case 'gc':
         return async () => {
           await this.eventStore.compact(Date.now());
         };
-      case 'repair':
       case 'candidate_validation':
+        return async () => {
+          // 旧布局（线快照无 policy 内容）→ 候选管线跳过（生产降级记录；不触碰真实 versions.git）
+          if (sessionId === undefined || this.lineSnapshot === null) {
+            return;
+          }
+          await this.runEvolutionChain(sessionId);
+        };
+      case 'repair':
       case 'memory_consolidation':
-        // P1d 接线占位：任务执行 = 债务清偿生命周期闭环（完成 → 归零）；真实生成/验证/整理在 P1d 管线
+        // P1d 范围外占位：任务执行 = 债务清偿生命周期闭环（完成 → 归零）
         return async () => {};
       default:
         return async () => {};
@@ -696,7 +723,8 @@ export class CognitiveRuntime {
   /**
    * 一次演化判定（§6.5.1 数据化）：读 signals → evolve.policy → decideEvolution（纯函数）→
    * 应演化 → 入队 candidate_validation（accrueDebt，债务入账）+ evolution/candidate 事件入链
-   * （本次 stage='decision' 判定入链；P1d 晋升/候选真实 id 复用同一事件类型）。
+   * （本次 stage='decision' 判定入链，candidate_id=null——候选尚未生成；P1d 生成/晋升的真实候选 id
+   * 由 runEvolutionChain 以 stage='generated' 事件与 evolution/promoted 事件携带）。
    */
   private async performEvolutionDecision(sessionId: string): Promise<{
     decision: EvolutionDecision;
@@ -718,7 +746,7 @@ export class CognitiveRuntime {
           estimated_cost: acc.estimated_cost,
           priority: acc.priority,
           urgency: acc.urgency,
-          run: this.maintenanceRun(acc.task_id),
+          run: this.maintenanceRun(acc.task_id, sessionId),
         },
         { accrueDebt: true },
       );
@@ -736,7 +764,7 @@ export class CognitiveRuntime {
             budget_estimate: decision.budget_estimate,
             triggers: decision.triggers,
             reason: decision.reason,
-            candidate_id: null, // P1d 填充：候选生成/验证后的真实候选 id
+            candidate_id: null, // 判定阶段候选未生成（真实 id 见 runEvolutionChain 的 stage='generated' 事件）
           },
           ['evolution_decision', 'evolution/candidate'],
         ),
@@ -756,8 +784,12 @@ export class CognitiveRuntime {
   }
 
   /**
-   * P1c：/evolve now 支持——立即执行一次演化判定 + 维护量子 + 事件入链（摘要返回）。
-   * 失败不崩：判定失败 → degraded 字段；quantum 无调度器 → 跳过并注明。
+   * P1c/P1d：/evolve now 支持——立即执行一次演化判定 + 候选管线（生成→验证→晋升）+ 维护量子 + 事件入链（摘要返回）。
+   * 全链（P1d）：判定应演化（且线快照为新布局——旧布局降级跳过，不触碰旧种子 versions.git）→ 信号摘要 →
+   * 确定性生成器产出候选（上限 = evolve.policy.candidate_gate.max_candidates_per_run）→ 逐候选验证
+   * （G1+G3；预算守卫 K 数据化）→ 首个通过者晋升（txn 提交 → trusted-latest 推进 → Evolution Object →
+   * evolution/promoted 事件）→ 摘要（候选数/各门结果/晋升 id/commit）。
+   * 失败不崩：任何阶段失败 → 摘要含失败原因（degraded），命令按结果返回 success/error 文本。
    */
   async runEvolutionNow(input: { session_id: string }): Promise<EvolutionNowResult> {
     const sessionId = input.session_id;
@@ -772,12 +804,23 @@ export class CognitiveRuntime {
     let enqueued: string[] = [];
     let degraded: string | null = null;
     let events_appended = 0;
+    const candidates: CandidateOutcome[] = [];
+    let promoted: PromotedInfo | null = null;
     try {
       const r = await this.performEvolutionDecision(sessionId);
       decision = r.decision;
       enqueued = r.enqueued;
       if (decision.should_evolve) {
-        events_appended += 1; // evolution/candidate
+        events_appended += 1; // evolution/candidate（判定入链）
+        if (this.lineSnapshot === null) {
+          // 生产降级：旧种子布局（版本线无 policy 内容）→ 候选管线跳过（记录，不写真实 versions.git）
+          degraded = '旧布局（版本线快照无 kernel/policy）——候选生成/验证/晋升跳过（P1d 生产降级记录）';
+        } else {
+          const chain = await this.runEvolutionChain(sessionId);
+          candidates.push(...chain.outcomes);
+          promoted = chain.promoted;
+          events_appended += chain.events_appended;
+        }
       }
     } catch (err) {
       degraded = err instanceof Error ? err.message : String(err);
@@ -797,7 +840,63 @@ export class CognitiveRuntime {
       events_appended += 1;
     }
     const debt = this.maintenance?.debtSnapshot() ?? [];
-    return { decision, enqueued, quantum, debt, degraded, events_appended };
+    return { decision, enqueued, candidates, promoted, quantum, debt, degraded, events_appended };
+  }
+
+  /**
+   * P1d：候选管线全链（空闲期量子与 /evolve 共用）——读信号 → 摘要 → 确定性生成候选（≤ K）→
+   * 逐候选 evolution/candidate 事件（stage=generated，真实候选 id）→ runCandidatePipeline（验证 →
+   * 注册 → 首个通过者晋升）→ 首个 promoted 即返回（后续候选不再处理）。
+   * 幂等：quantum 重复执行时候选内容已在 trusted-latest → duplicate 早退（不重复验证/晋升）。
+   */
+  private async runEvolutionChain(
+    sessionId: string,
+  ): Promise<{ outcomes: CandidateOutcome[]; promoted: PromotedInfo | null; events_appended: number }> {
+    const { records } = await readSignals(this.signalsDir);
+    const { policy } = await this.ready();
+    const summary = summarizeSignals(records);
+    const drafts = generatePolicyAdjustmentCandidates(summary, policy);
+    const budget = policy.evolve.candidate_gate.max_candidates_per_run;
+    const outcomes: CandidateOutcome[] = [];
+    let events = 0;
+    for (const draft of drafts.slice(0, budget)) {
+      await this.eventStore.append(
+        makeRuntimeEvent(
+          'evolution/candidate',
+          sessionId,
+          this.snapshotHash,
+          {
+            stage: 'generated',
+            candidate_id: draft.id,
+            target: draft.target,
+            signal: draft.signal,
+            motivation: draft.motivation,
+          },
+          ['evolve-now', 'evolution/candidate'],
+        ),
+      );
+      events += 1;
+      const outcome = await runCandidatePipeline(draft, {
+        layout: this.assemblyOpts.layout ?? defaultLayout(),
+        evolutionRoot: this.evolutionRoot,
+        baselinePolicyDir: this.policyDir,
+        eventStore: this.eventStore,
+        sessionId,
+        snapshotHash: this.snapshotHash,
+        shadowLogPath: join(this.evolutionRoot, 'shadows', 'exposure.log'),
+        sourceEvents: [`evolution/candidate:${draft.id}`],
+      });
+      outcomes.push(outcome);
+      if (outcome.promoted && outcome.commit_hash !== undefined && outcome.object_id !== undefined) {
+        events += 1; // evolution/promoted（pipeline 内入链）
+        return {
+          outcomes,
+          promoted: { candidate_id: outcome.candidate_id, object_id: outcome.object_id, commit_hash: outcome.commit_hash },
+          events_appended: events,
+        };
+      }
+    }
+    return { outcomes, promoted: null, events_appended: events };
   }
 
   private buildGovernorInput(
