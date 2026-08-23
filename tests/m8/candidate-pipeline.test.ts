@@ -87,7 +87,7 @@ async function evolveTweakContent(strength: number): Promise<string> {
   return dumpYaml(evolve);
 }
 
-/** 成本劣化候选：budget.yaml context_budget_tokens 翻倍（4000→8000） */
+/** 成本劣化候选：budget.yaml context_budget_tokens 翻倍（相对当前值，如 500→1000） */
 async function budgetInflateContent(): Promise<string> {
   const p = await loadPolicy();
   return dumpYaml({ ...p.budget, context_budget_tokens: p.budget.context_budget_tokens * 2 });

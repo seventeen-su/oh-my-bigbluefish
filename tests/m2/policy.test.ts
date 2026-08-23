@@ -57,7 +57,7 @@ describe('① 默认策略加载', () => {
     const p = await loadPolicy(POLICY_DIR);
     expect(p.governor.rules.length).toBeGreaterThan(0);
     expect(p.governor.rules.some((r) => r.id === 'default')).toBe(true);
-    expect(p.budget.context_budget_tokens).toBe(4000);
+    expect(p.budget.context_budget_tokens).toBe(500);
     expect(p.context.working_state_never_compress).toBe(true);
     for (const w of Object.values(p.context.marginal_weights)) {
       expect(w).toBeGreaterThanOrEqual(0);

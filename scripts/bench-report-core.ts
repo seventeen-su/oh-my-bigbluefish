@@ -131,11 +131,11 @@ function suggestCalibration(
   costMean: Record<CostField, number>,
 ): CalibrationSuggestion[] {
   const out: CalibrationSuggestion[] = [];
-  // 1) Context Compiler 投影预算（budget.yaml context_budget_tokens 初值 4000，§17 待标定）
+  // 1) Context Compiler 投影预算（budget.yaml context_budget_tokens §17 标定回写 2026-08-23：当前 500）
   if (byLine.baseline.total > 0 && costMean.model_tokens > 0) {
     const mean = costMean.model_tokens;
     out.push({
-      parameter: 'context_budget_tokens（Context Compiler 投影预算，budget.yaml 当前 4000）',
+      parameter: 'context_budget_tokens（Context Compiler 投影预算，budget.yaml 当前 500）',
       suggested: `建议 ≈ ${Math.ceil(mean * 1.2)}（= baseline model_tokens 均值 ${fmt1(mean)} × 1.2 余量）`,
       basis: `baseline 线 model_tokens 均值 = ${fmt1(mean)}（${byLine.baseline.total} 任务，冻结基准集产出）`,
     });

@@ -25,7 +25,10 @@ export type MaintenanceTaskId = keyof typeof MAINTENANCE_WEIGHTS;
 
 /** 维护任务成本估计（§10.1 estimated_cost，priority = EV/C × debt 的 C；待标定 §17）。
  *  取值 ≥ 权重 → 债务任务 ROI ≤ 1，低于会话级收尾任务（turn-finalize ROI 1）——
- *  会话收尾（事件库 GC）先执行、信号债务任务随后（既有调度顺序不破坏，既有测试锚定）。 */
+ *  会话收尾（事件库 GC）先执行、信号债务任务随后（既有调度顺序不破坏，既有测试锚定）。
+ *  §17 标定留档（2026-08-23，P6）：维护任务真实执行数据（real-v2-stable 基准 cost 中
+ *  tool_calls/retrieval_calls 全 0、无维护执行观测）尚未产出 → 常量保持初值不臆造，
+ *  待维护任务真实执行数据产出后按 ROI 观测标定（同一 EV/C×debt 机制，改本表即生效）。 */
 export const MAINTENANCE_COSTS: Record<MaintenanceTaskId, number> = {
   memory_consolidation: 4,
   candidate_validation: 10,
