@@ -1,0 +1,49 @@
+{
+  "task_id": "web-02",
+  "generated_by": {
+    "name": "web-02 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "page_spec",
+      "description": "注册表单页面规格：form.fields 含必填（required）与格式（format）校验字段及其错误文案；action=submit_empty 表示空提交",
+      "kind": "json",
+      "content": {
+        "page": "register",
+        "form": {
+          "id": "register",
+          "fields": [
+            {
+              "name": "username",
+              "label": "用户名",
+              "required": true,
+              "error_required": "请填写必填项"
+            },
+            {
+              "name": "email",
+              "label": "邮箱",
+              "format": "email",
+              "error_format": "邮箱格式不正确"
+            }
+          ]
+        },
+        "action": "submit_empty"
+      }
+    }
+  ],
+  "expected": {
+    "errors": [
+      "请填写必填项",
+      "邮箱格式不正确"
+    ],
+    "submitted": false
+  },
+  "output": {
+    "errors": [
+      "请填写必填项",
+      "邮箱格式不正确"
+    ],
+    "submitted": false
+  }
+}

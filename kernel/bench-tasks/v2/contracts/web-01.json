@@ -1,0 +1,42 @@
+{
+  "id": "web-01",
+  "category": "web",
+  "requirement": "按页面规格构建首页页面模型并输出：title（页面标题）、nav.items（导航项列表）、count（导航项总数）。",
+  "input_artifacts": [
+    {
+      "name": "page_spec",
+      "description": "首页页面规格：page（页面标识）、title（标题文本）、nav_items（导航项列表）",
+      "kind": "json",
+      "content": {
+        "page": "home",
+        "title": "OMB v2 文档中心",
+        "nav_items": ["首页", "文档", "关于"]
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "title": { "type": "string" },
+      "nav": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "count": { "type": "number" }
+    },
+    "required": ["title", "nav", "count"]
+  },
+  "verifier": {
+    "kind": "predicate",
+    "rules": {
+      "predicates": [
+        { "path": "title", "matches": "OMB" },
+        { "path": "nav.items", "contains": "文档" },
+        { "path": "count", "equals": 3 }
+      ]
+    }
+  },
+  "generator": { "name": "web-01 reference", "version": "1.0.0" }
+}

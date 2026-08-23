@@ -33,5 +33,5 @@
     "required": ["users"]
   },
   "verifier": { "kind": "exact" },
-  "generator": { "name": "gen-bench-fixtures", "version": "0.1.0" }
+  "generator": { "name": "data-01 reference", "version": "1.0.0" }
 }

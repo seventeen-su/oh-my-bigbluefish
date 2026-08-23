@@ -1,0 +1,59 @@
+{
+  "task_id": "sys-04",
+  "generated_by": {
+    "name": "sys-04 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "changes",
+      "description": "目录复制变更规格：operation=copy / source 源目录 / target 目标目录",
+      "kind": "json",
+      "content": {
+        "operation": "copy",
+        "source": "src",
+        "target": "dst"
+      }
+    },
+    {
+      "name": "src_files",
+      "description": "源目录文件清单（相对路径条目 { path }）；constraints 显式规定扫描根 path / 是否排序 / 是否递归（ChatGPT 意见 4 确定性说明位）",
+      "kind": "file-list",
+      "content": [
+        {
+          "path": "a.txt"
+        },
+        {
+          "path": "b.txt"
+        }
+      ],
+      "constraints": {
+        "path": "src",
+        "sorted": true,
+        "recursive": false
+      }
+    }
+  ],
+  "expected": {
+    "before": {
+      "src/a.txt": "exists",
+      "src/b.txt": "exists",
+      "dst": "empty"
+    },
+    "after": {
+      "dst/a.txt": "exists",
+      "dst/b.txt": "exists"
+    }
+  },
+  "output": {
+    "before": {
+      "src/a.txt": "exists",
+      "src/b.txt": "exists",
+      "dst": "empty"
+    },
+    "after": {
+      "dst/a.txt": "exists",
+      "dst/b.txt": "exists"
+    }
+  }
+}

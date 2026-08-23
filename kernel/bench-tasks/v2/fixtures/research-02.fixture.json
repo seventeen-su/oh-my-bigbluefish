@@ -1,0 +1,30 @@
+{
+  "task_id": "research-02",
+  "generated_by": {
+    "name": "research-02 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "task",
+      "description": "方案比较任务规格：topic 描述比较对象；rubric.required_terms 为答案必须覆盖的术语",
+      "kind": "json",
+      "content": {
+        "topic": "比较方案A 与方案B：必须提及两个方案并给出取舍结论",
+        "rubric": {
+          "required_terms": [
+            "方案A",
+            "方案B",
+            "取舍"
+          ]
+        }
+      }
+    }
+  ],
+  "expected": {
+    "answer": "方案A 与方案B 各有侧重：方案A 成本更低，方案B 可靠性更高；综合对比后给出取舍结论——优先选择方案A。"
+  },
+  "output": {
+    "answer": "方案A 与方案B 各有侧重：方案A 成本更低，方案B 可靠性更高；综合对比后给出取舍结论——优先选择方案A。"
+  }
+}

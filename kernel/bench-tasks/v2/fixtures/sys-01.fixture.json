@@ -1,8 +1,8 @@
 {
   "task_id": "sys-01",
   "generated_by": {
-    "name": "gen-bench-fixtures",
-    "version": "0.1.0"
+    "name": "sys-01 reference",
+    "version": "1.0.0"
   },
   "input": [
     {

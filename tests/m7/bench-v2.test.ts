@@ -39,6 +39,15 @@ import { getReference, references } from '../../kernel/bench-tasks/reference/ind
 import { generateFixtures, serializeFixtureV2 } from '../../scripts/gen-bench-fixtures-core.js';
 import { main as genFixturesMain } from '../../scripts/gen-bench-fixtures.js';
 
+/** 冻结集全量 20 任务 id（5 类 × 4；按字典序，与 Array.sort() 语义一致） */
+const BENCH_V2_ALL_IDS = [
+  'code-01', 'code-02', 'code-03', 'code-04',
+  'data-01', 'data-02', 'data-03', 'data-04',
+  'research-01', 'research-02', 'research-03', 'research-04',
+  'sys-01', 'sys-02', 'sys-03', 'sys-04',
+  'web-01', 'web-02', 'web-03', 'web-04',
+];
+
 // ---- 测试工具 ----
 
 /** 输入工件工厂 */
@@ -140,7 +149,7 @@ describe('① 契约 schema 校验（BenchContractV2Schema）', () => {
     for (const c of contracts) {
       expect(BenchContractV2Schema.safeParse(c).success, c.id).toBe(true);
     }
-    expect(contracts.map((c) => c.id).sort()).toEqual(['data-01', 'sys-01']);
+    expect(contracts.map((c) => c.id).sort()).toEqual(BENCH_V2_ALL_IDS);
   });
 });
 
@@ -266,7 +275,8 @@ describe('④ 生成器确定性（generateFixtures + serializeFixtureV2）', ()
   it('CLI 生成到临时目录 → 与已提交 fixture 逐字节一致（main 薄壳路径）', async () => {
     await withTempDir(async (dir) => {
       await genFixturesMain(['--fixtures', dir]);
-      for (const id of ['data-01', 'sys-01']) {
+      const contracts = await loadBenchContractsV2();
+      for (const id of contracts.map((c) => c.id)) {
         const generated = normalizeEol(await readFile(join(dir, `${id}.fixture.json`), 'utf8'));
         const committed = normalizeEol(
           await readFile(join(BENCH_V2_FIXTURES_DIR, `${id}.fixture.json`), 'utf8'),
@@ -364,8 +374,8 @@ describe('⑤ verifyV2（schema 校验 → kind 规则）', () => {
   });
 });
 
-describe('⑥ runBenchV2 回放（2 任务全过 + JSONL 落盘 + 确定性）', () => {
-  it('回放：contracts × replay executor → 2 任务全过，汇总 total/passed 正确', async () => {
+describe('⑥ runBenchV2 回放（全量契约全过 + JSONL 落盘 + 确定性）', () => {
+  it('回放：contracts × replay executor → 全部任务全过，汇总 total/passed 正确', async () => {
     const contracts = await loadBenchContractsV2();
     const fixtures = await loadBenchFixturesV2();
     const report = await runBenchV2({
@@ -375,11 +385,11 @@ describe('⑥ runBenchV2 回放（2 任务全过 + JSONL 落盘 + 确定性）',
       executor: makeReplayExecutorV2(fixtures),
     });
     expect(report.line).toBe('stable');
-    expect(report.total).toBe(2);
-    expect(report.passed).toBe(2);
-    expect(report.results).toHaveLength(2);
+    expect(report.total).toBe(contracts.length);
+    expect(report.passed).toBe(contracts.length);
+    expect(report.results).toHaveLength(contracts.length);
     expect(report.results.every((r) => r.passed)).toBe(true);
-    expect(report.results.map((r) => r.task_id).sort()).toEqual(['data-01', 'sys-01']);
+    expect(report.results.map((r) => r.task_id).sort()).toEqual(contracts.map((c) => c.id).sort());
   });
 
   it('JSONL 落盘字段齐全（文件名 replay-v2-<line>-<ts>.jsonl；逐条含全字段 + cost 八字段）', async () => {
@@ -398,7 +408,7 @@ describe('⑥ runBenchV2 回放（2 任务全过 + JSONL 落盘 + 确定性）',
       expect(files).toHaveLength(1);
       expect(files[0]).toMatch(/^replay-v2-stable-.*\.jsonl$/);
       const lines = (await readFile(join(dir, files[0]!), 'utf8')).trim().split('\n');
-      expect(lines).toHaveLength(2);
+      expect(lines).toHaveLength(contracts.length);
       for (const line of lines) {
         const record = JSON.parse(line) as Record<string, unknown>;
         expect(record.ts).toEqual(expect.any(Number));

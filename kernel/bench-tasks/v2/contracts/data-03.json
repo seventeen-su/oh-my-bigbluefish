@@ -1,0 +1,29 @@
+{
+  "id": "data-03",
+  "category": "data",
+  "requirement": "按类别聚合交易金额：输入交易数组 [{ category, amount }]，输出 { by_category: { 类别: 金额合计 } }，类别键按字典序排列。",
+  "input_artifacts": [
+    {
+      "name": "transactions",
+      "description": "交易数组：每笔含 category（字符串类别）与 amount（数字金额）",
+      "kind": "json",
+      "content": [
+        { "category": "food", "amount": 15 },
+        { "category": "travel", "amount": 120 },
+        { "category": "food", "amount": 20 },
+        { "category": "other", "amount": 10 },
+        { "category": "travel", "amount": 0 },
+        { "category": "food", "amount": 5 }
+      ]
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "by_category": { "type": "object" }
+    },
+    "required": ["by_category"]
+  },
+  "verifier": { "kind": "exact" },
+  "generator": { "name": "data-03 reference", "version": "1.0.0" }
+}

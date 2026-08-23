@@ -28,5 +28,5 @@
     "required": ["before", "after"]
   },
   "verifier": { "kind": "state_assert" },
-  "generator": { "name": "gen-bench-fixtures", "version": "0.1.0" }
+  "generator": { "name": "sys-01 reference", "version": "1.0.0" }
 }

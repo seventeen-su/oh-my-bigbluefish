@@ -1,0 +1,32 @@
+{
+  "id": "data-02",
+  "category": "data",
+  "requirement": "解析 CSV 文本为对象数组：首行为表头，字段 id/name/price 均为字符串，空行忽略。输出 { rows: [{ id, name, price }] }。",
+  "input_artifacts": [
+    {
+      "name": "csv",
+      "description": "CSV 文本：首行表头 id,name,price；数据行每行一个记录；空行忽略；字段值均为字符串",
+      "kind": "text",
+      "content": "id,name,price\n1,无糖可乐,9.9\n2,坚果燕麦,19.9\n3,速溶咖啡,29.9\n\n4,全麦面包,12.5\n5,保温杯,45.0\n"
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "rows": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "price": { "type": "string" }
+          }
+        }
+      }
+    },
+    "required": ["rows"]
+  },
+  "verifier": { "kind": "exact" },
+  "generator": { "name": "data-02 reference", "version": "1.0.0" }
+}

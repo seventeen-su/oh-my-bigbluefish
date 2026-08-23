@@ -1,8 +1,8 @@
 {
   "task_id": "data-01",
   "generated_by": {
-    "name": "gen-bench-fixtures",
-    "version": "0.1.0"
+    "name": "data-01 reference",
+    "version": "1.0.0"
   },
   "input": [
     {

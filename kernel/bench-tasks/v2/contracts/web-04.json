@@ -1,0 +1,40 @@
+{
+  "id": "web-04",
+  "category": "web",
+  "requirement": "模拟登录：按页面规格中的凭据与合法账号校验登录，输出 { redirect: string, session: string }。",
+  "input_artifacts": [
+    {
+      "name": "page_spec",
+      "description": "登录页页面规格：form（表单字段）、credentials（提交凭据）、valid_account（合法账号）、success_redirect/failure_redirect（成败跳转目标）",
+      "kind": "json",
+      "content": {
+        "page": "login",
+        "form": {
+          "id": "login",
+          "fields": [{ "name": "username" }, { "name": "password" }]
+        },
+        "credentials": { "username": "admin", "password": "s3cret" },
+        "valid_account": { "username": "admin", "password": "s3cret" },
+        "success_redirect": "/dashboard",
+        "failure_redirect": "/login?error=1"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "redirect": { "type": "string" },
+      "session": { "type": "string" }
+    },
+    "required": ["redirect", "session"]
+  },
+  "verifier": {
+    "kind": "predicate",
+    "rules": {
+      "predicates": [
+        { "path": "redirect", "equals": "/dashboard" }
+      ]
+    }
+  },
+  "generator": { "name": "web-04 reference", "version": "1.0.0" }
+}

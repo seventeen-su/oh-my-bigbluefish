@@ -1,0 +1,54 @@
+{
+  "task_id": "data-03",
+  "generated_by": {
+    "name": "data-03 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "transactions",
+      "description": "交易数组：每笔含 category（字符串类别）与 amount（数字金额）",
+      "kind": "json",
+      "content": [
+        {
+          "category": "food",
+          "amount": 15
+        },
+        {
+          "category": "travel",
+          "amount": 120
+        },
+        {
+          "category": "food",
+          "amount": 20
+        },
+        {
+          "category": "other",
+          "amount": 10
+        },
+        {
+          "category": "travel",
+          "amount": 0
+        },
+        {
+          "category": "food",
+          "amount": 5
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "by_category": {
+      "food": 40,
+      "other": 10,
+      "travel": 120
+    }
+  },
+  "output": {
+    "by_category": {
+      "food": 40,
+      "other": 10,
+      "travel": 120
+    }
+  }
+}

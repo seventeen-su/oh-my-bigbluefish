@@ -1,0 +1,62 @@
+{
+  "task_id": "code-02",
+  "generated_by": {
+    "name": "code-02 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "test-cases",
+      "description": "isPalindrome 的断言用例：{ name, input, expected }；input 为字符串 s，expected 为布尔判定",
+      "kind": "test-cases",
+      "content": [
+        {
+          "name": "回文基础",
+          "input": "racecar",
+          "expected": true
+        },
+        {
+          "name": "忽略大小写",
+          "input": "RaceCar",
+          "expected": true
+        },
+        {
+          "name": "忽略标点与空格",
+          "input": "A man, a plan, a canal: Panama",
+          "expected": true
+        },
+        {
+          "name": "非回文",
+          "input": "hello",
+          "expected": false
+        },
+        {
+          "name": "数字串",
+          "input": "12321",
+          "expected": true
+        },
+        {
+          "name": "空串",
+          "input": "",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "name": "language",
+      "description": "实现语言",
+      "kind": "text",
+      "content": "Python"
+    }
+  ],
+  "expected": {
+    "passed": 6,
+    "failed": 0,
+    "total": 6
+  },
+  "output": {
+    "passed": 6,
+    "failed": 0,
+    "total": 6
+  }
+}

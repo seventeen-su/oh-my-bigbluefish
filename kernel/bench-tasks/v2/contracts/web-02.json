@@ -1,0 +1,40 @@
+{
+  "id": "web-02",
+  "category": "web",
+  "requirement": "模拟空表单提交：按页面规格中的表单字段与校验规则推导校验错误，输出 { errors: string[], submitted: boolean }。",
+  "input_artifacts": [
+    {
+      "name": "page_spec",
+      "description": "注册表单页面规格：form.fields 含必填（required）与格式（format）校验字段及其错误文案；action=submit_empty 表示空提交",
+      "kind": "json",
+      "content": {
+        "page": "register",
+        "form": {
+          "id": "register",
+          "fields": [
+            { "name": "username", "label": "用户名", "required": true, "error_required": "请填写必填项" },
+            { "name": "email", "label": "邮箱", "format": "email", "error_format": "邮箱格式不正确" }
+          ]
+        },
+        "action": "submit_empty"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "submitted": { "type": "boolean" }
+    },
+    "required": ["errors", "submitted"]
+  },
+  "verifier": {
+    "kind": "predicate",
+    "rules": {
+      "predicates": [
+        { "path": "errors", "contains": "请填写必填项" }
+      ]
+    }
+  },
+  "generator": { "name": "web-02 reference", "version": "1.0.0" }
+}

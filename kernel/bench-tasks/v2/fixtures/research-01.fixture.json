@@ -1,0 +1,30 @@
+{
+  "task_id": "research-01",
+  "generated_by": {
+    "name": "research-01 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "task",
+      "description": "总结任务规格：topic 描述待总结文档；rubric.required_terms 为答案必须覆盖的术语",
+      "kind": "json",
+      "content": {
+        "topic": "总结给定文档：覆盖研究动机、方法设计与结论",
+        "rubric": {
+          "required_terms": [
+            "动机",
+            "方法",
+            "结论"
+          ]
+        }
+      }
+    }
+  ],
+  "expected": {
+    "answer": "该文档依次阐述了研究动机、方法设计与结论：动机源于现有方案覆盖不足，方法采用模块化架构与分层实现，结论通过基准验证了可行性。"
+  },
+  "output": {
+    "answer": "该文档依次阐述了研究动机、方法设计与结论：动机源于现有方案覆盖不足，方法采用模块化架构与分层实现，结论通过基准验证了可行性。"
+  }
+}

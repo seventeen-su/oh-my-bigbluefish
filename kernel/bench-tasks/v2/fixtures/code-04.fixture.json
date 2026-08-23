@@ -1,0 +1,95 @@
+{
+  "task_id": "code-04",
+  "generated_by": {
+    "name": "code-04 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "test-cases",
+      "description": "deepClone 的断言用例：{ name, input, expected }；expected 为与 input 深度相等的克隆值",
+      "kind": "test-cases",
+      "content": [
+        {
+          "name": "primitive number",
+          "input": 42,
+          "expected": 42
+        },
+        {
+          "name": "string",
+          "input": "hello",
+          "expected": "hello"
+        },
+        {
+          "name": "nested object",
+          "input": {
+            "a": 1,
+            "b": {
+              "c": [
+                1,
+                2,
+                {
+                  "d": 3
+                }
+              ]
+            }
+          },
+          "expected": {
+            "a": 1,
+            "b": {
+              "c": [
+                1,
+                2,
+                {
+                  "d": 3
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "array",
+          "input": [
+            1,
+            [
+              2,
+              [
+                3
+              ]
+            ]
+          ],
+          "expected": [
+            1,
+            [
+              2,
+              [
+                3
+              ]
+            ]
+          ]
+        },
+        {
+          "name": "null",
+          "input": null,
+          "expected": null
+        }
+      ]
+    },
+    {
+      "name": "language",
+      "description": "实现语言",
+      "kind": "text",
+      "content": "TypeScript"
+    }
+  ],
+  "expected": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5
+  },
+  "output": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5
+  }
+}

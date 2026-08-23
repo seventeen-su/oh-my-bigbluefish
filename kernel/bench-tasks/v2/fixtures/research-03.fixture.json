@@ -1,0 +1,29 @@
+{
+  "task_id": "research-03",
+  "generated_by": {
+    "name": "research-03 reference",
+    "version": "1.0.0"
+  },
+  "input": [
+    {
+      "name": "task",
+      "description": "架构问答任务规格：topic 描述提问；rubric.required_terms 为答案必须覆盖的术语",
+      "kind": "json",
+      "content": {
+        "topic": "从架构文档回答：OMB v2 记忆存储默认后端与全文检索方案",
+        "rubric": {
+          "required_terms": [
+            "SQLite",
+            "FTS5"
+          ]
+        }
+      }
+    }
+  ],
+  "expected": {
+    "answer": "OMB v2 的记忆存储默认后端采用 SQLite（WAL 模式单写者），全文检索方案采用 FTS5（BM25 相关性排序）。"
+  },
+  "output": {
+    "answer": "OMB v2 的记忆存储默认后端采用 SQLite（WAL 模式单写者），全文检索方案采用 FTS5（BM25 相关性排序）。"
+  }
+}
