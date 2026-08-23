@@ -1,0 +1,32 @@
+{
+  "id": "sys-01",
+  "category": "sys",
+  "requirement": "按文件系统变更规格执行操作并输出前后状态断言 { before, after }：operation=create 表示目标文件当前不存在（before 中对应路径为 null），创建并写入 content（after 中对应路径为文件内容）。",
+  "input_artifacts": [
+    {
+      "name": "changes",
+      "description": "文件系统变更规格：operation=create / path 目标文件路径 / content 待写入内容",
+      "kind": "json",
+      "content": {
+        "operation": "create",
+        "path": "config.ini",
+        "content": "[settings]\nenabled=true"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "before": { "type": "object" },
+      "after": {
+        "type": "object",
+        "properties": {
+          "config.ini": { "type": "string" }
+        }
+      }
+    },
+    "required": ["before", "after"]
+  },
+  "verifier": { "kind": "state_assert" },
+  "generator": { "name": "gen-bench-fixtures", "version": "0.1.0" }
+}

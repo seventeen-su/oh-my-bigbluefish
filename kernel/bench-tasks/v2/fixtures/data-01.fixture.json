@@ -1,0 +1,77 @@
+{
+  "task_id": "data-01",
+  "generated_by": {
+    "name": "gen-bench-fixtures",
+    "version": "0.1.0"
+  },
+  "input": [
+    {
+      "name": "users",
+      "description": "用户记录数组；每行含 id/name/email/age 等字段，缺 id 或 email 的行为无效行（规范化时去除）",
+      "kind": "json",
+      "content": [
+        {
+          "id": "u1",
+          "name": "Alice",
+          "email": "alice@example.com",
+          "age": 30
+        },
+        {
+          "id": "u2",
+          "name": "Bob",
+          "email": "bob@example.com",
+          "age": 25
+        },
+        {
+          "id": "u3",
+          "name": "Carol",
+          "email": "carol@example.com",
+          "age": 28
+        },
+        {
+          "id": "u4",
+          "name": "Dave",
+          "age": 22
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "users": [
+      {
+        "id": "u1",
+        "name": "Alice",
+        "email": "alice@example.com"
+      },
+      {
+        "id": "u2",
+        "name": "Bob",
+        "email": "bob@example.com"
+      },
+      {
+        "id": "u3",
+        "name": "Carol",
+        "email": "carol@example.com"
+      }
+    ]
+  },
+  "output": {
+    "users": [
+      {
+        "id": "u1",
+        "name": "Alice",
+        "email": "alice@example.com"
+      },
+      {
+        "id": "u2",
+        "name": "Bob",
+        "email": "bob@example.com"
+      },
+      {
+        "id": "u3",
+        "name": "Carol",
+        "email": "carol@example.com"
+      }
+    ]
+  }
+}

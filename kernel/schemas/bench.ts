@@ -160,3 +160,113 @@ export const BenchFixtureSchema = z.object({
     .optional(),
 });
 export type BenchFixture = z.infer<typeof BenchFixtureSchema>;
+
+// ================= v2 契约化基准（benchmark-v2-contract；施工计划 2026-08-23-bench-v2-contract.md T2.1） =================
+// 与 v1（上方类型）并存：v1 legacy 原位保留；v2 = 输入工件 + output_schema + verifier rules + reference 生成
+// expected（四要素单一权威，防 prompt/输入/输出/verifier 漂移）。本段为纯类型 + schema，无 I/O。
+
+// ---- 输入工件（ChatGPT 意见 3/4：测试用例等数据属 Input Artifact；file-list 须确定性说明位） ----
+
+export const INPUT_ARTIFACT_KINDS_V2 = ['text', 'json', 'file-list', 'test-cases'] as const;
+export const InputArtifactKindV2Schema = z.enum(INPUT_ARTIFACT_KINDS_V2);
+export type InputArtifactKindV2 = z.infer<typeof InputArtifactKindV2Schema>;
+
+/** file-list 确定性说明位（ChatGPT 意见 4：显式规定路径/排序/是否递归，保证跨平台确定性） */
+export const InputArtifactV2Schema = z
+  .object({
+    name: z.string().min(1),
+    description: z.string().min(1),
+    kind: InputArtifactKindV2Schema,
+    content: z.unknown(),
+    constraints: z.record(z.string(), z.unknown()).optional(),
+  })
+  .refine(
+    (v) =>
+      v.kind !== 'file-list' ||
+      (v.constraints !== undefined &&
+        typeof v.constraints.path === 'string' &&
+        typeof v.constraints.sorted === 'boolean' &&
+        typeof v.constraints.recursive === 'boolean'),
+    {
+      message: 'file-list 输入工件必须声明 constraints.path/sorted/recursive（确定性说明位，ChatGPT 意见 4）',
+      path: ['constraints'],
+    },
+  );
+export type InputArtifactV2 = z.infer<typeof InputArtifactV2Schema>;
+
+// ---- 输出 Schema（JSON Schema 子集：object/properties/required/items/enum/type；够用即可） ----
+
+export const OUTPUT_FIELD_TYPES_V2 = ['string', 'number', 'boolean', 'object', 'array'] as const;
+export const OutputFieldTypeV2Schema = z.enum(OUTPUT_FIELD_TYPES_V2);
+export type OutputFieldTypeV2 = z.infer<typeof OutputFieldTypeV2Schema>;
+
+export interface OutputFieldV2 {
+  type: OutputFieldTypeV2;
+  /** array 的元素类型 */
+  items?: OutputFieldV2;
+  /** object 的嵌套字段 */
+  properties?: Record<string, OutputFieldV2>;
+  /** 值枚举约束（任一字段可带） */
+  enum?: unknown[];
+}
+
+export const OutputFieldV2Schema: z.ZodType<OutputFieldV2> = z.lazy(() =>
+  z.object({
+    type: OutputFieldTypeV2Schema,
+    items: OutputFieldV2Schema.optional(),
+    properties: z.record(z.string(), OutputFieldV2Schema).optional(),
+    enum: z.array(z.unknown()).optional(),
+  }),
+);
+
+export interface OutputSchemaV2 {
+  type: 'object';
+  properties: Record<string, OutputFieldV2>;
+  required: string[];
+}
+
+export const OutputSchemaV2Schema: z.ZodType<OutputSchemaV2> = z.object({
+  type: z.literal('object'),
+  properties: z.record(z.string(), OutputFieldV2Schema),
+  required: z.array(z.string().min(1)),
+});
+
+// ---- v2 契约（任务定义四要素：输入工件 + requirement + output_schema + verifier rules + generator 元数据） ----
+
+export const BenchContractV2Schema = z
+  .object({
+    id: z.string().min(1),
+    category: BenchCategorySchema,
+    requirement: z.string().min(1),
+    input_artifacts: z.array(InputArtifactV2Schema),
+    output_schema: OutputSchemaV2Schema,
+    verifier: z.object({
+      kind: VerifierKindSchema,
+      /** kind 专属规则：predicate → rules.predicates；blind_judge → rules.rubric.required_terms */
+      rules: z.record(z.string(), z.unknown()).optional(),
+    }),
+    generator: z.object({
+      name: z.string().min(1),
+      version: z.string().min(1),
+    }),
+  })
+  .refine((v) => v.verifier.kind === CATEGORY_VERIFIER_KIND[v.category], {
+    message:
+      'v2 契约 verifier.kind 必须匹配类别（§15：code→tests / data→exact / web→predicate / sys→state_assert / research→blind_judge）',
+    path: ['verifier', 'kind'],
+  });
+export type BenchContractV2 = z.infer<typeof BenchContractV2Schema>;
+
+// ---- v2 夹具（input + expected + output；output 供回放执行器直通，生成时 = expected） ----
+
+export const BenchFixtureV2Schema = z.object({
+  task_id: z.string().min(1),
+  generated_by: z.object({
+    name: z.string().min(1),
+    version: z.string().min(1),
+  }),
+  input: z.array(InputArtifactV2Schema),
+  expected: z.unknown(),
+  output: z.unknown(),
+});
+export type BenchFixtureV2 = z.infer<typeof BenchFixtureV2Schema>;

@@ -1,0 +1,37 @@
+{
+  "id": "data-01",
+  "category": "data",
+  "requirement": "将用户记录数组规范化为 { users: [{ id, name, email }] }：去除缺 id 或 email 的无效行；保留行的字段顺序固定为 id/name/email。",
+  "input_artifacts": [
+    {
+      "name": "users",
+      "description": "用户记录数组；每行含 id/name/email/age 等字段，缺 id 或 email 的行为无效行（规范化时去除）",
+      "kind": "json",
+      "content": [
+        { "id": "u1", "name": "Alice", "email": "alice@example.com", "age": 30 },
+        { "id": "u2", "name": "Bob", "email": "bob@example.com", "age": 25 },
+        { "id": "u3", "name": "Carol", "email": "carol@example.com", "age": 28 },
+        { "id": "u4", "name": "Dave", "age": 22 }
+      ]
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "users": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "email": { "type": "string" }
+          }
+        }
+      }
+    },
+    "required": ["users"]
+  },
+  "verifier": { "kind": "exact" },
+  "generator": { "name": "gen-bench-fixtures", "version": "0.1.0" }
+}
