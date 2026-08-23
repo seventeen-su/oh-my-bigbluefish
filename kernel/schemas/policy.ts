@@ -209,6 +209,26 @@ export const DEFAULT_CANDIDATE_GATE = {
   cost_degradation_tolerance: 0.1,
 } as const;
 
+// ---- P1e：晋升门禁数据化（§6.5.3 防退化 / §7 三层信号；stable ← trusted-latest 显式门禁） ----
+
+/** 晋升门禁数据（P1e：L1 成本容忍 + L2 shadow 统计阈值；可选段——缺省按 resolvePromotionGate 回退） */
+export const PromotionGateSchema = z.object({
+  /** L2：shadow exposure 样本纳入判定的最低数（n ≥ 此值才按失败率判定；n=0 → 无 shadow 数据不阻塞） */
+  min_shadow_samples: z.number().int().nonnegative(),
+  /** L2：shadow 失败率上限（n ≥ min_shadow_samples 时，失败率 > 此值 → 拒晋升，§7.1 后验不劣化） */
+  max_shadow_failure_rate: z.number().min(0).max(1),
+  /** L1：冻结基准成本劣化容忍（相对比例；缺省回退 candidate_gate.cost_degradation_tolerance——向后兼容） */
+  cost_degradation_tolerance: z.number().nonnegative(),
+});
+export type PromotionGate = z.infer<typeof PromotionGateSchema>;
+
+/** 晋升门禁缺省（初值待冻结基准标定 §17；min_shadow_samples=0 → 有样本即纳入 L2，无样本不阻塞） */
+export const DEFAULT_PROMOTION_GATE = {
+  min_shadow_samples: 0,
+  max_shadow_failure_rate: 0.1,
+  cost_degradation_tolerance: 0.1,
+} as const;
+
 /** 债务阈值缺省（对齐 supervisor/maintenance.ts DEFAULT_SOFT_LIMIT=10 / DEFAULT_HARD_LIMIT=50；critical 待标定 §17） */
 export const DEFAULT_DEBT_THRESHOLDS = { soft: 10, hard: 50, critical: 100 } as const;
 
@@ -236,5 +256,7 @@ export const EvolvePolicySchema = z.object({
   debt_thresholds: DebtThresholdsSchema.default(DEFAULT_DEBT_THRESHOLDS),
   /** P1d：候选管线门禁数据（生成器上限/步长 + G3 成本容忍；缺省 DEFAULT_CANDIDATE_GATE） */
   candidate_gate: CandidateGateSchema.default(DEFAULT_CANDIDATE_GATE),
+  /** P1e：晋升门禁数据（stable ← trusted-latest 三层信号；可选——缺省回退 candidate_gate/DEFAULT） */
+  promotion_gate: PromotionGateSchema.optional(),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

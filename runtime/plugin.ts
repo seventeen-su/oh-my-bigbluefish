@@ -139,6 +139,19 @@ export interface CognitiveRuntimeLike {
       reason?: string;
     }>;
     promoted?: { candidate_id: string; object_id: string; commit_hash: string } | null;
+    /** P1e：晋升检查结果（stable ← trusted-latest 显式门禁；/evolve 摘要展示） */
+    promotion?: {
+      checked: boolean;
+      skipped_reason: string | null;
+      gate_ok: boolean;
+      reasons: string[];
+      promoted: boolean;
+      activation_id?: string;
+      stable_commit?: string;
+      error?: string;
+      warning?: string;
+      events_appended: number;
+    };
     quantum: { ran: string[]; skipped: string[] };
     debt: unknown[];
     degraded: string | null;
@@ -758,7 +771,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           `入队维护任务：[${r.enqueued.join(', ') || '无'}]`,
           `quantum 执行：ran=[${r.quantum.ran.join(', ') || '无'}]，skipped=[${r.quantum.skipped.join(', ') || '无'}]`,
           `维护债务快照：${debtText}`,
-          `事件入链：${r.events_appended}（evolution/candidate + evolution/promoted + maintenance/quantum）`,
+          `事件入链：${r.events_appended}（evolution/candidate + evolution/promoted + activation/committed + maintenance/quantum）`,
         ];
         // P1d：候选管线摘要（候选数/各门结果/晋升 id/commit）
         const candidates = r.candidates ?? [];
@@ -776,6 +789,21 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           lines.push(
             `晋升：candidate=${String(r.promoted.candidate_id).slice(0, 16)}… object=${String(r.promoted.object_id).slice(0, 16)}… commit=${String(r.promoted.commit_hash).slice(0, 12)}…`,
           );
+        }
+        // P1e：晋升检查摘要（stable ← trusted-latest 显式门禁；跳过/通过/失败逐态展示）
+        const promo = r.promotion;
+        if (promo !== undefined) {
+          if (!promo.checked) {
+            lines.push(`晋升检查：跳过（${promo.skipped_reason ?? '未知原因'}）`);
+          } else if (promo.promoted) {
+            lines.push(
+              `晋升检查：门禁通过（${promo.reasons.length} 条信号）→ 已晋升 stable=${String(promo.stable_commit ?? '').slice(0, 12)}…（activation=${String(promo.activation_id ?? '').slice(0, 20)}…${promo.warning !== undefined ? `；告警：${promo.warning}` : ''}）`,
+            );
+          } else if (!promo.gate_ok) {
+            lines.push(`晋升检查：门禁未通过——候选保持 trusted-latest（${(promo.reasons ?? []).slice(0, 3).join('；')}）`);
+          } else if (promo.error !== undefined) {
+            lines.push(`晋升检查：失败（${promo.error}）`);
+          }
         }
         if (r.degraded !== null) {
           lines.push(`降级：${r.degraded}`);

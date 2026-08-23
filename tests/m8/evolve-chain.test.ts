@@ -144,12 +144,13 @@ describe('/evolve 全链（判定 → 生成 → 验证 → 晋升 → 摘要）
     expect(objRaw).toContain('"evolution/promoted"');
   });
 
-  fixtureIt('无触发信号 → 摘要 should_evolve=false，不生成候选、不推进 trusted-latest、无 promoted 事件', async () => {
+  fixtureIt('无触发信号 → 摘要 should_evolve=false，不生成候选、不推进 trusted-latest；P1e 晋升检查仍判已有 trusted-latest（stable ← trusted-latest 显式门禁推进）', async () => {
     fx = buildLayoutFixture();
     const layout: VersionLayout = { bareRepo: fx.bare, stableWorktree: fx.stable, latestWorktree: fx.latest };
     const root = join(fx.root, 'workspace', '.omb');
     const evolutionRoot = join(root, '.evolution');
     const before = resolveLineCommit(layout, 'latest');
+    const stableBefore = resolveLineCommit(layout, 'stable');
     const runtime = track(
       createCognitiveRuntime({ root, layout, signalsDir: join(evolutionRoot, 'signals') }),
     );
@@ -161,8 +162,15 @@ describe('/evolve 全链（判定 → 生成 → 验证 → 晋升 → 摘要）
     expect(r.kind).toBe('success');
     expect(r.text).toContain('should_evolve=false');
 
-    expect(resolveLineCommit(layout, 'latest')).toBe(before); // 指针未动
+    // 候选管线未跑（无触发信号）→ trusted-latest 指针未动
+    expect(resolveLineCommit(layout, 'latest')).toBe(before);
     const { events } = await runtime.eventStore.query({ session_id: SESSION });
-    expect(events.some((e) => e.type === 'evolution/promoted')).toBe(false);
+    expect(events.some((e) => e.type === 'evolution/candidate')).toBe(false);
+    // P1e：晋升检查独立于演化判定——fixture 基线 trusted-latest 已领先 stable → 显式门禁推进（stable = latestHash）
+    const promoted = events.find((e) => e.type === 'evolution/promoted');
+    expect(promoted).toBeDefined();
+    expect((promoted!.payload as Record<string, unknown>).stage).toBe('stable');
+    expect(resolveLineCommit(layout, 'stable')).not.toBe(stableBefore);
+    expect(r.text).toContain('晋升检查');
   });
 });

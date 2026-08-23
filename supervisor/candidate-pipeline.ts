@@ -431,8 +431,12 @@ export async function validateDataCandidate(
 
 // ---- Evolution Object（§6.5.4：parent/diff/provenance/compat/bench/verifications → git） ----
 
-/** 当前线 .evolution-objects/ 链头（未引用为任何对象 parent 的对象 id）；无对象 → null */
-async function latestObjectId(layout: VersionLayout, commit: string): Promise<string | null> {
+/**
+ * 当前线 .evolution-objects/ 链头（未引用为任何对象 parent 的对象 id）；无对象 → null。
+ * 导出供 runtime 层晋升检查（P1e）复用——stable 晋升的 evolution/promoted 事件引用该链头
+ * （P1d 的 latest 晋升对象链 = trusted-latest 线内 Evolution Object 集合的链头）。
+ */
+export async function latestObjectId(layout: VersionLayout, commit: string): Promise<string | null> {
   let names: string[];
   try {
     names = git(layout.bareRepo, ['ls-tree', '-r', '--name-only', commit], layout.gitBin)

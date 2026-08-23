@@ -14,6 +14,11 @@
 #   - candidate_gate.max_candidates_per_run：单次 /evolve（与空闲期量子）最多生成+验证候选数 K（预算守卫）
 #   - candidate_gate.max_step_ratio：参数单次调整相对步长上限（strength 绝对/ratio 相对均封顶）
 #   - candidate_gate.cost_degradation_tolerance：G3 成本劣化容忍（基准报告比较语义，超此值拒绝）
+# P1e 晋升门禁（§6.5.3 防退化「只接受通过全部门 + fitness 不降」+ §7 三层信号；stable ← trusted-latest 显式门禁）：
+#   - promotion_gate.min_shadow_samples：L2 shadow exposure 样本纳入判定的最低数
+#     （n ≥ 此值才按失败率判定；n=0 → 无 shadow 数据不阻塞，以基准门禁为准）
+#   - promotion_gate.max_shadow_failure_rate：L2 shadow 失败率上限（n 足够时超此值拒晋升，后验不劣化）
+#   - promotion_gate.cost_degradation_tolerance：L1 成本劣化容忍（缺省回退 candidate_gate 同值——向后兼容）
 # 初值待冻结基准标定（架构 §17）。
 daily_evolution_cost: 100
 roi_min: 1.0
@@ -22,6 +27,11 @@ maintenance_rate: 0.5
 candidate_gate:
   max_candidates_per_run: 3
   max_step_ratio: 0.2
+  cost_degradation_tolerance: 0.1
+
+promotion_gate:
+  min_shadow_samples: 0
+  max_shadow_failure_rate: 0.1
   cost_degradation_tolerance: 0.1
 
 debt_thresholds:

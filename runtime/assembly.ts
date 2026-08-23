@@ -11,8 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { GIT_BIN, defaultLayout } from '../substrate/snapshot.js';
-import { ensureLineSnapshot, isVersionLine, type VersionLine, type VersionLayout } from '../substrate/lines.js';
+import { GIT_BIN, defaultLayout, runGit } from '../substrate/snapshot.js';
+import { ensureLineSnapshot, isVersionLine, resolveLineCommit, type VersionLine, type VersionLayout } from '../substrate/lines.js';
 import {
   createSnapshot,
   SnapshotRegistry,
@@ -51,7 +51,20 @@ import {
 import type { EvolutionDecision } from '../kernel/schemas/evolution.js';
 // P1d：候选生成（kernel 纯函数）→ 候选管线（supervisor 层 1；runtime(2) → supervisor(1) ✓）
 import { generatePolicyAdjustmentCandidates } from '../kernel/candidate-generator.js';
-import { runCandidatePipeline, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
+import { runCandidatePipeline, latestObjectId, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
+// P1e：晋升门禁判定（kernel 纯函数，layer 2 → 2 ✓）+ 晋升执行/回滚契约（supervisor 层 1）+ 基准回放对照
+import { resolvePromotionGate, shouldPromoteToStable } from '../kernel/promotion-gate.js';
+import {
+  promoteToStable,
+  readShadowSignals,
+  SHADOW_LOG_REL,
+} from '../supervisor/promotion.js';
+import {
+  loadBenchContractsV2,
+  loadBenchFixturesV2,
+  makeReplayExecutorV2,
+  runBenchV2,
+} from '../supervisor/bench-v2.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -204,6 +217,30 @@ export interface PromotedInfo {
   commit_hash: string;
 }
 
+/** P1e：晋升检查结果（promotion_check 维护任务与 /evolve 共用；stable ← trusted-latest 显式门禁） */
+export interface PromotionCheckInfo {
+  /** 是否执行了检查（false = 跳过——旧布局/线指针不可用/stable 已最新） */
+  checked: boolean;
+  /** 跳过原因（checked=false 时非空；记录——生产降级可审计） */
+  skipped_reason: string | null;
+  /** 门禁判定结果（kernel 纯函数 shouldPromoteToStable） */
+  gate_ok: boolean;
+  /** 三层信号 reasons（L1 硬门/L2 统计/L3 旁证占位；可审计） */
+  reasons: string[];
+  /** 是否已执行 promoteToStable 并成功推进 stable */
+  promoted: boolean;
+  /** 激活幂等键（promoted=true 时提供） */
+  activation_id?: string;
+  /** 切换后 stable commit（promoted=true 时提供） */
+  stable_commit?: string;
+  /** 失败/异常（门禁通过但执行失败；可读） */
+  error?: string;
+  /** 非致命告警（如事件入链失败——stable 切换与契约已生效） */
+  warning?: string;
+  /** 本次检查入链事件数（activation/committed + evolution/promoted；promoted=true 时 = 2） */
+  events_appended: number;
+}
+
 /** P1c/P1d：/evolve now 与空闲期演化判定的摘要（判定结果/候选管线/入队任务/debt 快照/quantum 执行） */
 export interface EvolutionNowResult {
   decision: EvolutionDecision;
@@ -213,13 +250,15 @@ export interface EvolutionNowResult {
   candidates: CandidateOutcome[];
   /** P1d：首个通过并晋升的候选（无晋升 → null） */
   promoted: PromotedInfo | null;
+  /** P1e：晋升检查结果（stable ← trusted-latest 显式门禁；独立于演化判定——待晋升即判） */
+  promotion: PromotionCheckInfo;
   /** 本次执行的维护量子报告 */
   quantum: QuantumReport;
   /** debt 快照（quantum 执行后） */
   debt: MaintenanceDebt[];
   /** 判定/执行降级原因（无 → null） */
   degraded: string | null;
-  /** 入链事件数（evolution/candidate 判定+生成 + evolution/promoted + maintenance/quantum） */
+  /** 入链事件数（evolution/candidate 判定+生成 + evolution/promoted + activation/committed + maintenance/quantum） */
   events_appended: number;
 }
 
@@ -510,6 +549,16 @@ export class CognitiveRuntime {
           await this.runEvolutionDecision(signal, input.session_id);
         },
       });
+      // P1e：晋升检查任务（低优先级：读 trusted-latest vs stable → 三层信号门禁 → 应晋升则
+      // promoteToStable（activation_scope='project' 显式传入）——空闲期 quantum 与 /evolve 共用）
+      await this.maintenance.enqueue({
+        id: 'promotion_check',
+        value: 1,
+        estimated_cost: 2,
+        priority: 0,
+        urgency: 'normal',
+        run: this.maintenanceRun('promotion_check', input.session_id),
+      });
       maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
     }
 
@@ -696,7 +745,8 @@ export class CognitiveRuntime {
   }
 
   /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d：candidate_validation 接真实管线——
-   *  生成 → 验证 → 晋升（runEvolutionChain）；repair/memory_consolidation 现为占位（P1d 范围外）） */
+   *  生成 → 验证 → 晋升（runEvolutionChain）；P1e：promotion_check 接晋升检查（stable ← trusted-latest
+   *  显式门禁）；repair/memory_consolidation 现为占位（P1d 范围外）） */
   private maintenanceRun(taskId: string, sessionId?: string): (signal?: AbortSignal) => Promise<void> {
     switch (taskId) {
       case 'gc':
@@ -710,6 +760,14 @@ export class CognitiveRuntime {
             return;
           }
           await this.runEvolutionChain(sessionId);
+        };
+      case 'promotion_check':
+        return async () => {
+          // 旧布局（无线快照）→ 晋升检查跳过（生产降级记录；不触碰真实 versions.git）
+          if (sessionId === undefined || this.lineSnapshot === null) {
+            return;
+          }
+          await this.runPromotionCheck(sessionId);
         };
       case 'repair':
       case 'memory_consolidation':
@@ -825,6 +883,10 @@ export class CognitiveRuntime {
     } catch (err) {
       degraded = err instanceof Error ? err.message : String(err);
     }
+    // P1e：晋升检查（在候选管线之后执行——新晋升的 trusted-latest 在同次运行内即可门禁推进到 stable；
+    // 独立于演化判定——已有 trusted-latest 待晋升也判；旧布局降级跳过记录）
+    const promotion = await this.runPromotionCheck(sessionId);
+    events_appended += promotion.events_appended;
     let quantum: QuantumReport = { ran: [], skipped: [] };
     if (this.maintenance !== null) {
       quantum = await this.maintenance.requestQuantum();
@@ -840,7 +902,7 @@ export class CognitiveRuntime {
       events_appended += 1;
     }
     const debt = this.maintenance?.debtSnapshot() ?? [];
-    return { decision, enqueued, candidates, promoted, quantum, debt, degraded, events_appended };
+    return { decision, enqueued, candidates, promoted, promotion, quantum, debt, degraded, events_appended };
   }
 
   /**
@@ -897,6 +959,142 @@ export class CognitiveRuntime {
       }
     }
     return { outcomes, promoted: null, events_appended: events };
+  }
+
+  /**
+   * P1e：晋升检查（维护任务 promotion_check 与 /evolve 共用）——读 trusted-latest vs stable
+   * （线指针 + 冻结基准回放 fitness（G3 同款：回放执行器 + 成本代理对照，策略无关回归护栏语义）+
+   * L2 shadow 统计）→ 三层信号门禁判定（kernel 纯函数 shouldPromoteToStable，阈值数据化
+   * resolvePromotionGate）→ 应晋升则 promoteToStable（activation_scope='project' 显式传入——D3 裁决不写死）。
+   * 旧布局（无线快照）/ stable == trusted-latest / 线指针不可用 → 跳过（记录 skipped_reason）；
+   * 门禁失败 → 不推进，返回 reasons（候选保持 trusted-latest，等待下次检查）；
+   * 任何异常 → info.error（失败不崩，摘要可读）。
+   */
+  private async runPromotionCheck(sessionId: string): Promise<PromotionCheckInfo> {
+    const skip = (skipped_reason: string): PromotionCheckInfo => ({
+      checked: false,
+      skipped_reason,
+      gate_ok: false,
+      reasons: [],
+      promoted: false,
+      events_appended: 0,
+    });
+    try {
+      // 旧布局（线快照无 kernel/policy）→ 降级跳过（不触碰真实 versions.git）
+      if (this.lineSnapshot === null) {
+        return skip('旧布局（无线快照 kernel/policy）——晋升检查降级跳过（记录）');
+      }
+      const layout = this.assemblyOpts.layout ?? defaultLayout();
+      // 旧布局检测（D1 裁决特征）：trusted-latest 分支缺失（P1d 候选晋升后才存在）→ 晋升检查降级跳过——
+      // 防在无 trusted-latest 的旧种子布局上对真实 versions.git 误判/误写（resolveLineCommit 会回退 main）
+      try {
+        runGit(layout, ['show-ref', '--verify', 'refs/heads/trusted-latest']);
+      } catch {
+        return skip('旧布局（refs/heads/trusted-latest 缺失——D1 新布局特征未就绪）——晋升检查降级跳过（记录）');
+      }
+      let latest: string;
+      let stable: string;
+      try {
+        latest = resolveLineCommit(layout, 'latest');
+        stable = resolveLineCommit(layout, 'stable');
+      } catch (err) {
+        return skip(`线指针解析失败（${errorDetail(err)}）——晋升检查跳过`);
+      }
+      if (latest === stable) {
+        return skip('stable 已是最新（trusted-latest == stable）——无待晋升内容，跳过');
+      }
+
+      // 冻结基准回放 fitness（与 P1d G3 同款：回放执行器 = fixture.output 直通，passed/成本对照为回归护栏语义；
+      // 策略敏感度经成本代理（context_budget_tokens 投影预算）体现）
+      const contracts = await loadBenchContractsV2();
+      const fixtures = await loadBenchFixturesV2();
+      const replay = makeReplayExecutorV2(fixtures);
+      const baseline = await runBenchV2({ contracts, fixtures, line: 'stable', executor: replay, mode: 'replay' });
+      const candidate = await runBenchV2({ contracts, fixtures, line: 'latest', executor: replay, mode: 'replay' });
+      // 成本代理：稳定线 vs 最新线策略捆绑（materialize 线快照 → loadPolicy）
+      const stableSnap = ensureLineSnapshot(layout, 'stable');
+      const latestSnap = ensureLineSnapshot(layout, 'latest');
+      const baseProxy = (await loadPolicy(join(stableSnap.dir, 'kernel', 'policy'))).budget.context_budget_tokens;
+      const candProxy = (await loadPolicy(join(latestSnap.dir, 'kernel', 'policy'))).budget.context_budget_tokens;
+      const ratio = baseProxy > 0 ? (candProxy - baseProxy) / baseProxy : 0;
+      const bench = {
+        baseline: { passed: baseline.passed, total: baseline.total },
+        candidate: { passed: candidate.passed, total: candidate.total },
+        cost_degradation_ratio: Math.round(ratio * 1000) / 1000,
+      };
+      // L2 统计（.evolution/shadows/exposure.log；无样本 → 记录不阻塞，以基准门禁为准）
+      const shadow = await readShadowSignals(join(this.evolutionRoot, SHADOW_LOG_REL));
+      // 三层信号门禁判定（kernel 纯函数；阈值数据化）
+      const { policy } = await this.ready();
+      const gate = shouldPromoteToStable({
+        baseline: { stable_commit: stable, stable_bench: bench.baseline },
+        candidate: { latest_commit: latest, latest_bench: bench.candidate },
+        cost_degradation_ratio: bench.cost_degradation_ratio,
+        shadow_signals: shadow,
+        policy: resolvePromotionGate(policy.evolve),
+      });
+      if (!gate.ok) {
+        return {
+          checked: true,
+          skipped_reason: null,
+          gate_ok: false,
+          reasons: gate.reasons,
+          promoted: false,
+          events_appended: 0,
+        };
+      }
+      // 应晋升 → promoteToStable（activation_scope='project' 显式传入；object_id = P1d Evolution Object 链头）
+      const objectId = await latestObjectId(layout, latest);
+      const pr = await promoteToStable(
+        {
+          gate,
+          candidate_commit: latest,
+          stable_commit: stable,
+          bench,
+          object_id: objectId ?? undefined,
+          activation_scope: 'project',
+        },
+        {
+          layout,
+          activationLogDir: join(this.evolutionRoot, 'activations'),
+          eventStore: this.eventStore,
+          sessionId,
+          snapshotHash: this.snapshotHash,
+        },
+      );
+      if (!pr.promoted) {
+        return {
+          checked: true,
+          skipped_reason: null,
+          gate_ok: true,
+          reasons: gate.reasons,
+          promoted: false,
+          error: pr.reason ?? 'promoteToStable 未推进（未知原因）',
+          events_appended: 0,
+        };
+      }
+      return {
+        checked: true,
+        skipped_reason: null,
+        gate_ok: true,
+        reasons: gate.reasons,
+        promoted: true,
+        activation_id: pr.activation_id,
+        stable_commit: pr.stable_commit,
+        warning: pr.reason, // 事件入链失败等非致命告警
+        events_appended: 2, // activation/committed + evolution/promoted
+      };
+    } catch (err) {
+      return {
+        checked: true,
+        skipped_reason: null,
+        gate_ok: false,
+        reasons: [],
+        promoted: false,
+        error: `晋升检查失败（${errorDetail(err)}）`,
+        events_appended: 0,
+      };
+    }
   }
 
   private buildGovernorInput(

@@ -5,6 +5,9 @@
 //   trusted/<id>/      信任池（晋升后对象物化；消费方只读语义——本模块仅 promote/revoke 写）
 //   untrusted/<id>/    未可信区（仅验证链可读/写；消费方禁止引用）
 //   rejected/<id>/     被拒候选（留痕：record.json + reason.txt）
+//   error/<id>/        P1e 错误分支池（§3.3 error/<组件>/<id> 最小落地：晋升后线上退化/回滚对象
+//                      归档于此——保留 record/payload/provenance + reason.txt；terminal 归档，
+//                      消费方/晋升/拒绝/撤销均不可见（findRecordWithZone/counts 不扫该区））
 //
 // 硬边界语义（§9.3）：
 // - registerCandidate 一律落 untrusted/ 且 status 强制 untrusted（调用方自称更高状态无效）；
@@ -16,14 +19,19 @@
 //   消费方应先 load(id) 取最新记录再 assertTrusted（守卫同步检查传入记录；盘上复核在 load 时发生）。
 // - revoke 撤销已晋升对象 → 后代（lineage 含被撤销 id 的已登记记录）re-suspect 回 untrusted。
 // - reject 仅作用于未晋升候选（留痕 reason）；已晋升对象撤销必须走 revoke（防静默绕过 trust 语义）。
+// - markError（P1e）：晋升后对象线上退化（rollbackPromotion 触发）→ 移入 error/ 归档（terminal）。
+//   组件级 error 分支语义（架构 §3.3）：自迭代内容在下次使用出错 → 该组件/对象版本移动至
+//   error/<组件>/<id>（保留完整 diff、provenance、出错信号），当前线自动回退上一稳定版本；error 分支
+//   保留分析价值——修复候选从 error 分支派生，验证通过后回主链，否则永久归档（负样本）。本池为
+//   §3.3 的最小落地（候选对象级 error/<id>/）；组件级独立走线（每组件独立状态机互不阻塞）留后续施工。
 // - 谱系字段：注册时自动派生（父记录 lineage + [self]；根候选 [self]），盘上记录为权威。
 //
 // layer 1（supervisor/）：仅 import node: 内置（CandidateRecord 为本模块自包含契约，无需 kernel/schemas）。
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-/** 候选状态：验证链中间态 structural/behavioral/semantic 与信任池判定态 */
-export type CandidateStatus = 'untrusted' | 'structural' | 'behavioral' | 'semantic' | 'trusted' | 'rejected';
+/** 候选状态：验证链中间态 structural/behavioral/semantic 与信任池判定态（P1e 增 error——§3.3 错误分支池） */
+export type CandidateStatus = 'untrusted' | 'structural' | 'behavioral' | 'semantic' | 'trusted' | 'rejected' | 'error';
 
 /** 候选对象类型（§9.3 对象分层：L0 数据 → L1 代码 → 哲学最高门） */
 export type CandidateKind = 'memory' | 'process' | 'skill' | 'policy' | 'code';
@@ -221,6 +229,42 @@ export class CandidatePool {
     }
     await this.moveRecord('trusted', 'untrusted', found.rec, (x) => ({ ...x, status: 'untrusted' }));
     return { affected };
+  }
+
+  /**
+   * P1e 错误分支池标记（架构 §3.3 error/<组件>/<id> 最小落地）：晋升后对象线上退化/回滚
+   * （rollbackPromotion 触发）→ 移入 error/<id>/ 归档（record.json status='error' + reason.txt +
+   * payload/provenance 保留——完整 diff/provenance/出错信号，负样本分析价值）。
+   * 语义：terminal 归档——error 区不参与 findRecordWithZone/counts（消费方/晋升/拒绝/撤销均不可见）；
+   * 修复候选从 error 分支派生（验证通过后回主链）留后续施工（组件级独立走线 §3.3）。
+   * 幂等：已归档（error/<id>/ 存在）→ no-op。
+   */
+  async markError(id: string, reason: string): Promise<void> {
+    const dstDir = join(this.evolutionRoot, 'error', candidateDirName(id));
+    // 幂等早退：已归档 → no-op
+    try {
+      await readFile(join(dstDir, RECORD_FILE), 'utf8');
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
+    }
+    const found = await this.findRecordWithZone(id);
+    if (found === null) {
+      throw new Error(`markError: 候选 ${id} 未注册（不存在于 trusted/untrusted/rejected 区）`);
+    }
+    await this.ensureZone('error');
+    await mkdir(dstDir, { recursive: true });
+    await writeFile(
+      join(dstDir, RECORD_FILE),
+      JSON.stringify({ ...found.rec, status: 'error' }, null, 2),
+      'utf8',
+    );
+    await writeFile(join(dstDir, 'reason.txt'), reason, 'utf8');
+    await this.copyAuxFile(join(this.evolutionRoot, found.zone, candidateDirName(id)), dstDir, PAYLOAD_FILE);
+    await this.copyAuxFile(join(this.evolutionRoot, found.zone, candidateDirName(id)), dstDir, PROVENANCE_FILE);
+    await rm(join(this.evolutionRoot, found.zone, candidateDirName(id)), { recursive: true, force: true });
   }
 
   // ---- 消费方读取 ----
