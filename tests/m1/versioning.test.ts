@@ -139,3 +139,55 @@ describe('输入校验（fail-loud）', () => {
     expect(() => createSnapshot({ components: hashes(), gitRevision: '' })).toThrow();
   });
 });
+
+describe('按线哈希（P1b：提交级运行时快照——线 commit + 目录内容哈希入哈希，§6.5.7/D1⑤）', () => {
+  /** 线快照哈希输入（缺省：stable 线 + 40-hex commit + 64-hex 内容哈希） */
+  function lineInput(over: Record<string, string> = {}): { line: string; commit: string; dirContentHash: string } {
+    return {
+      line: 'stable',
+      commit: 'a'.repeat(40),
+      dirContentHash: 'cc'.repeat(32),
+      ...over,
+    };
+  }
+
+  it('同线同 commit 同内容 → 同哈希（确定性）；不同 commit / 线名 / 目录内容 → 不同哈希', () => {
+    const h1 = computeRuntimeSnapshotHash(hashes(), REV7, lineInput());
+    expect(computeRuntimeSnapshotHash(hashes(), REV7, lineInput())).toBe(h1);
+    expect(h1).toMatch(/^[0-9a-f]{64}$/);
+    // 不同线 commit → 不同哈希（D1⑤：请求运行于「线 stable + commit a81f + 快照 rs:7c91」）
+    expect(computeRuntimeSnapshotHash(hashes(), REV7, lineInput({ commit: 'b'.repeat(40) }))).not.toBe(h1);
+    // 不同线名 → 不同哈希
+    expect(computeRuntimeSnapshotHash(hashes(), REV7, lineInput({ line: 'latest' }))).not.toBe(h1);
+    // 不同目录内容哈希（policy/processes 实际文件内容）→ 不同哈希
+    expect(computeRuntimeSnapshotHash(hashes(), REV7, lineInput({ dirContentHash: 'dd'.repeat(32) }))).not.toBe(h1);
+    // 组件 / gitRevision 变化 → 不同哈希（既有语义保持）
+    expect(computeRuntimeSnapshotHash(hashes({ memory: 'bb'.repeat(32) }), REV7, lineInput())).not.toBe(h1);
+    expect(computeRuntimeSnapshotHash(hashes(), REV8, lineInput())).not.toBe(h1);
+  });
+
+  it('未提供 line → 既有实现哈希（向后兼容：组件清单 + gitRevision）', () => {
+    expect(computeRuntimeSnapshotHash(hashes(), REV7)).toBe(computeRuntimeSnapshotHash(hashes(), REV7));
+    // 带 line 的哈希 ≠ 不带 line（线信息确实参与哈希）
+    expect(computeRuntimeSnapshotHash(hashes(), REV7)).not.toBe(computeRuntimeSnapshotHash(hashes(), REV7, lineInput()));
+  });
+
+  it('createSnapshot 带 line → id 与按线哈希一致（内容寻址纳入线 commit；改线 commit = 新 id）', () => {
+    const snap = createSnapshot({ components: hashes(), gitRevision: REV7, line: lineInput() });
+    expect(snap.id).toBe(`sha256:${computeRuntimeSnapshotHash(hashes(), REV7, lineInput())}`);
+    const other = createSnapshot({
+      components: hashes(),
+      gitRevision: REV7,
+      line: lineInput({ commit: 'b'.repeat(40) }),
+    });
+    expect(other.id).not.toBe(snap.id);
+  });
+
+  it('line 输入非法 → fail-loud（dirContentHash 非 sha256 / commit 空 / line 空）', () => {
+    expect(() => computeRuntimeSnapshotHash(hashes(), REV7, lineInput({ dirContentHash: 'zz' }))).toThrow(/sha256|64/);
+    expect(() => computeRuntimeSnapshotHash(hashes(), REV7, lineInput({ commit: '' }))).toThrow(/commit/);
+    expect(() => createSnapshot({ components: hashes(), gitRevision: REV7, line: lineInput({ line: '' }) })).toThrow(
+      /line/,
+    );
+  });
+});

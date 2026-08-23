@@ -243,13 +243,18 @@ export interface RollbackContract {
  * 执行金丝雀回滚：生成 RollbackContract 并执行 restore（测试注入 fake；真实实现 =
  * substrate rollback，T0.2 rollback.ts——shadow 层自动回滚不涉及 stable_head 切换，§11.3）。
  * restore 抛错 → 本函数拒绝（回滚失败不静默）。
- * affected_sessions 为空数组：Runtime Snapshot 会话注册表未接入（T5.5 前），接口先定。
+ * affected_sessions（P1b 接入）：受影响会话集——与 SnapshotRegistry（supervisor/versioning.ts）的关系：
+ * registry 的活跃请求绑定（请求级 session_id → 快照，§6.5.7）即「被回滚快照」的受影响会话；回滚方应收集
+ * 绑定到 target_snapshot 的 session_id 传入（shadow 层不感知 registry 内部——接口先定，最小实现记录集合）。
+ * 未提供（调用方未接入收集面）→ 空数组（既有语义，接口兼容）。
  */
 export async function rollbackCanary(opts: {
   candidate_id: string;
   snapshot: string;
   scope: string;
   restore: () => Promise<void>;
+  /** P1b：受影响会话（RollbackContract.affected_sessions；缺省 []）——见上方与快照 registry 的关系说明 */
+  affectedSessions?: string[];
 }): Promise<RollbackContract> {
   if (typeof opts.candidate_id !== 'string' || opts.candidate_id.length === 0) {
     throw new ShadowError('rollbackCanary: candidate_id 必填');
@@ -266,7 +271,9 @@ export async function rollbackCanary(opts: {
   const contract: RollbackContract = {
     target_snapshot: opts.snapshot,
     scope: opts.scope,
-    affected_sessions: [], // Runtime Snapshot 会话注册表未接入（T5.5 前）；接口先定
+    // P1b：受影响会话接口接入（最小实现：记录 session_id 集合；收集面 = 快照 registry 的活跃请求绑定，
+    // shadow 层不感知 registry 内部——由调用方收集传入，缺省 [] 保持既有语义）
+    affected_sessions: opts.affectedSessions ?? [],
     restore_plan: [`deactivate:${opts.candidate_id}`, `restore:${opts.snapshot}`],
   };
   await opts.restore();
@@ -286,6 +293,8 @@ export interface CanaryRunOptions {
   snapshot: string;
   scope: string;
   restore: () => Promise<void>;
+  /** P1b：受影响会话（透传 rollbackCanary；缺省 []——收集面 = 快照 registry 活跃请求绑定，见 rollbackCanary） */
+  affectedSessions?: string[];
 }
 
 export interface CanaryRunResult {
@@ -337,6 +346,7 @@ export async function runCanary(opts: CanaryRunOptions & { evaluator?: CanaryEva
         snapshot: opts.snapshot,
         scope: opts.scope,
         restore: opts.restore,
+        affectedSessions: opts.affectedSessions,
       });
     } catch (err) {
       // 审计先行：restore 失败也先落盘回滚触发条目（outcome='restore_failed'），再 fail-loud

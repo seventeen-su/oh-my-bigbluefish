@@ -6,6 +6,9 @@
 // - versioning.ts 只做哈希计算与注册表，不感知组件内部（解释器不拥有领域知识）；组件 sha256 清单
 //   由调用方提供（M1 阶段组件未全部实现——占位常量/文件内容哈希；M2+ 接入真实组件 hash）。
 // - 规范化：组件清单按固定键序 JSON.stringify 拼接 gitRevision 再 sha256（输入键序无关，确定性）。
+// - P1b（提交级运行时快照，D1⑤）：computeRuntimeSnapshotHash/createSnapshot 增可选 line 输入
+//   （线名 + 线指针 commit + 实际生效目录内容哈希）——请求身份 = 「线 + commit + 快照」；
+//   未提供 line → 既有实现语义（仅组件清单 + gitRevision），向后兼容。
 // - createSnapshot 输入校验：六键必须齐全且均为 64-hex sha256（架构 §11.2 components 各 sha256；
 //   比 T1.1 的 M5 schema 更严——schema 仅 philosophy 强制 64-hex，其余五键 min(1)）。
 // - createSnapshot 产出 immutable 对象：id = `sha256:<hash>`，改组件/git_revision = 新 id（§4.1）。
@@ -28,6 +31,20 @@ export interface ComponentHashes {
   renderer: string;
   capability: string;
   philosophy: string;
+}
+
+/**
+ * P1b：线快照哈希输入（提交级运行时快照，D1⑤：请求运行于「线 stable + commit a81f + 快照 rs:7c91」）。
+ * 哈希纳入：线名 + 线指针 commit（lines 物化 commit）+ 实际生效 policy/processes 目录内容哈希。
+ * 未提供 → 既有实现语义（仅组件清单 + gitRevision，向后兼容）。
+ */
+export interface LineHashInput {
+  /** 版本线名（initial | stable | latest） */
+  line: string;
+  /** 线指针 commit（lines/<line>/pointer 内容；40-hex） */
+  commit: string;
+  /** 实际生效 policy/processes 目录内容哈希（64-hex sha256；P1a 注入目录或回退 repo 默认目录） */
+  dirContentHash: string;
 }
 
 /** 固定键序（哈希规范化基准；ComponentHashes 声明序） */
@@ -62,6 +79,22 @@ function assertGitRevision(gitRevision: string): void {
   }
 }
 
+/** 线快照哈希输入校验：缺字段 / dirContentHash 非 64-hex sha256 → fail-loud（消息含字段名） */
+function assertLineHashInput(line: LineHashInput): void {
+  if (line === null || typeof line !== 'object') {
+    throw new Error('versioning: line 必须为线快照哈希输入对象');
+  }
+  if (typeof line.line !== 'string' || line.line.length === 0) {
+    throw new Error('versioning: line.line 缺失或为空');
+  }
+  if (typeof line.commit !== 'string' || line.commit.length === 0) {
+    throw new Error('versioning: line.commit 缺失或为空');
+  }
+  if (typeof line.dirContentHash !== 'string' || !SHA256_RE.test(line.dirContentHash)) {
+    throw new Error(`versioning: line.dirContentHash 非法 sha256 格式: ${line.dirContentHash}`);
+  }
+}
+
 /** 规范化：组件清单按固定键序 JSON.stringify（输入键序无关） */
 function canonicalComponents(components: ComponentHashes): string {
   return JSON.stringify({
@@ -74,11 +107,26 @@ function canonicalComponents(components: ComponentHashes): string {
   });
 }
 
-/** RuntimeSnapshotHash = sha256(规范化组件清单 JSON + gitRevision) */
-export function computeRuntimeSnapshotHash(components: ComponentHashes, gitRevision: string): string {
+/**
+ * RuntimeSnapshotHash = sha256(规范化组件清单 JSON + gitRevision [+ 线快照输入])。
+ * P1b：line 提供时纳入线名 + 线 commit + 目录内容哈希（提交级运行时快照）；未提供 → 既有语义（向后兼容）。
+ * 确定性：同输入同输出（固定键序规范化，输入键序无关）。
+ */
+export function computeRuntimeSnapshotHash(
+  components: ComponentHashes,
+  gitRevision: string,
+  line?: LineHashInput,
+): string {
   assertComponentHashes(components);
   assertGitRevision(gitRevision);
-  return sha256Hex(`${canonicalComponents(components)}${gitRevision}`);
+  if (line !== undefined) {
+    assertLineHashInput(line);
+  }
+  const lineSuffix =
+    line === undefined
+      ? ''
+      : `\nline:${line.line}\ncommit:${line.commit}\ncontent:${line.dirContentHash}`;
+  return sha256Hex(`${canonicalComponents(components)}${gitRevision}${lineSuffix}`);
 }
 
 /** 创建 RuntimeSnapshot：M5 schema 校验产出（id = sha256:<hash>，immutable，内容寻址） */
@@ -86,10 +134,15 @@ export function createSnapshot(input: {
   components: ComponentHashes;
   gitRevision: string;
   taskContractRef?: string;
+  /** P1b：线快照哈希输入（按线 commit + 目录内容；未提供 = 既有实现 gitRevision-only 语义） */
+  line?: LineHashInput;
 }): RuntimeSnapshot {
   assertComponentHashes(input.components);
   assertGitRevision(input.gitRevision);
-  const hash = computeRuntimeSnapshotHash(input.components, input.gitRevision);
+  if (input.line !== undefined) {
+    assertLineHashInput(input.line);
+  }
+  const hash = computeRuntimeSnapshotHash(input.components, input.gitRevision, input.line);
   const ts = new Date().toISOString();
   const snapshot: RuntimeSnapshot = {
     id: `sha256:${hash}`,

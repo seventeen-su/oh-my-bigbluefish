@@ -119,6 +119,11 @@ export interface CognitiveRuntimeLike {
   lineSnapshot?: { line: string; commit: string; dir: string } | null;
   /** P1a：lines 按线加载降级原因（线快照缺 policy / lines 不可用 → 回退仓库默认；无降级 → null） */
   lineDegraded?: string | null;
+  /** P1b：/mode 切换后重建运行时快照（新线物化 → 新快照 → promote → 下一请求生效；失败降级保持当前快照）。
+   *  返回 { promoted, degraded }——degraded 非空 = 快照未变（切换状态仍生效，快照不变）。 */
+  rebuildSnapshotForLine?(line: string): { promoted: boolean; degraded: string | null };
+  /** P1b/P1e：外部晋升接口（构建好新快照后 promote → 下一请求生效；进行中请求不受影响） */
+  promoteSnapshot?(next: unknown): void;
   handleRequest(req: unknown): Promise<{
     decision: { decision: string };
     retrieval: { items: unknown[]; channel_used: string };
@@ -609,6 +614,20 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         onSwitch: async (line) => {
           const previous = current;
           current = line;
+          // P1b：切换后重建运行时快照（新线物化 → 新快照 → registry.promote → 下一请求生效，D1⑤：
+          // 请求运行于「线 stable + commit a81f + 快照 rs:7c91」而非模糊的「我现在应该是 stable」）。
+          // 失败降级：物化失败 → 记录降级，当前快照保持（切换状态仍生效，快照不变）。
+          if (cognitive !== undefined && typeof cognitive.rebuildSnapshotForLine === 'function') {
+            try {
+              const r = cognitive.rebuildSnapshotForLine(line);
+              if (r.degraded !== null && r.degraded !== undefined) {
+                recordDegradation('lines/rebuild', r.degraded);
+              }
+            } catch (err) {
+              const detail = err instanceof Error ? err.message : String(err);
+              recordDegradation('lines/rebuild', `快照重建异常（${detail}）——当前快照保持`);
+            }
+          }
           // T8.7 生产接线：版本线激活记录——activation/committed 事件入链（认知装配时）+
           // activationLogDir 幂等持久化（配置时；重启后恢复）。字段全部来自真实切换数据；
           // 任一步失败 → 降级记录（切换已生效，仅记录缺失，不影响命令结果）。

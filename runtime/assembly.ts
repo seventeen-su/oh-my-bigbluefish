@@ -8,15 +8,21 @@
 // "import 目标层 ≤ 源层"（eslint no-cross-layer-import 同款语义，tests/m0/dag-lint.test.ts 钉住）。
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { GIT_BIN, defaultLayout } from '../substrate/snapshot.js';
 import { ensureLineSnapshot, isVersionLine, type VersionLine, type VersionLayout } from '../substrate/lines.js';
+import {
+  createSnapshot,
+  SnapshotRegistry,
+  type ComponentHashes,
+  type LineHashInput,
+} from '../supervisor/versioning.js';
+import { computeComponentHashes, computeDirContentHash } from './snapshot-hash.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
-import { EventSchema, type Event, type Checkpoint } from '../kernel/schemas/m.js';
+import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
@@ -37,30 +43,51 @@ const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
 /** 仓库根：存在性回退（src 布局 HERE_CANDIDATE 即根；编译布局其下无 kernel/policy → 取上级） */
 const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
 
-/** 真实快照哈希（§11.2 请求级快照身份；替代静态占位 'rs:assembly'）：
- *  git HEAD（versions.git）+ 策略三 YAML + 过程 YAML 内容哈希（确定性；策略/过程改动 → 快照变化）。
- *  任一步失败 → 降级 'rs:assembly'（不抛——装配不因快照计算失败中断）。 */
-function computeSnapshotHash(policyDir: string, processesDir: string): string {
-  try {
-    const head = execFileSync(GIT_BIN, ['rev-parse', 'HEAD'], {
-      cwd: defaultLayout().bareRepo,
-      encoding: 'utf8',
-      windowsHide: true,
-    }).trim();
-    const h = createHash('sha256');
-    h.update(head);
-    h.update('\0');
-    for (const name of ['governor.yaml', 'budget.yaml', 'context.yaml']) {
-      h.update(readFileSync(join(policyDir, name)));
-    }
-    const processes = readdirSync(processesDir).filter((f) => f.endsWith('.yaml')).sort();
-    for (const f of processes) {
-      h.update(readFileSync(join(processesDir, f)));
-    }
-    return `rs:${h.digest('hex').slice(0, 16)}`;
-  } catch {
-    return 'rs:assembly';
-  }
+/** RuntimeSnapshot.id（sha256:<64hex>）→ 运行时快照哈希字符串（rs:<前16hex>，D1⑤ 格式） */
+function runtimeHashOf(snapshot: RuntimeSnapshot): string {
+  return `rs:${snapshot.id.slice('sha256:'.length, 'sha256:'.length + 16)}`;
+}
+
+/** 全降级占位组件（64-hex 合法；仅结构完整供 registry 构造，不参与生效哈希） */
+const DEGRADED_COMPONENTS: ComponentHashes = {
+  scheduler: '00'.repeat(32),
+  memory: '00'.repeat(32),
+  verifier: '00'.repeat(32),
+  renderer: '00'.repeat(32),
+  capability: '00'.repeat(32),
+  philosophy: '00'.repeat(32),
+};
+
+function errorDetail(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** 回退路径 git HEAD（既有实现：defaultLayout().bareRepo rev-parse HEAD）；失败 → 抛错（调用方全降级） */
+function gitHeadOfDefaultLayout(): string {
+  return execFileSync(GIT_BIN, ['rev-parse', 'HEAD'], {
+    cwd: defaultLayout().bareRepo,
+    encoding: 'utf8',
+    windowsHide: true,
+  }).trim();
+}
+
+/**
+ * P1b：快照身份构建（提交级运行时快照，D1⑤：请求运行于「线 stable + commit a81f + 快照 rs:7c91」）。
+ * 哈希输入 = 当前版本线 commit（lines 指针 commit，P1a lineSnapshot.commit）+ 实际生效目录内容哈希
+ * （policy/processes 文件内容——P1a 注入目录；未注入（回退 repo 默认）则 repo 目录内容）+ 六组件内容哈希。
+ * 确定性：同线同 commit 同内容 → 同哈希；不同线 commit → 不同哈希（测试钉住）。
+ * 失败降级：lines 不可用时回退既有实现（git HEAD + 内容哈希）；任一步失败 → 抛错（调用方降级 'rs:assembly'，不崩）。
+ */
+function buildSnapshotIdentity(dirs: LineDirResolution, presetRoot: string): RuntimeSnapshot {
+  const dirContentHash = computeDirContentHash(dirs.policyDir, dirs.processesDir);
+  const components = computeComponentHashes(presetRoot);
+  // 线 commit（lines 指针；P1a 注入目录自然覆盖）→ 哈希 gitRevision；未注入（回退 repo 默认）→ 既有 git HEAD
+  const gitRevision = dirs.lineSnapshot !== null ? dirs.lineSnapshot.commit : gitHeadOfDefaultLayout();
+  const lineInput: LineHashInput | undefined =
+    dirs.lineSnapshot !== null
+      ? { line: dirs.lineSnapshot.line, commit: dirs.lineSnapshot.commit, dirContentHash }
+      : undefined;
+  return createSnapshot({ components, gitRevision, line: lineInput });
 }
 
 export interface CognitiveAssemblyOptions {
@@ -214,21 +241,43 @@ function resolveLineDirs(opts: CognitiveAssemblyOptions, line: VersionLine): Lin
 export class CognitiveRuntime {
   readonly eventStore: EventStore;
   readonly memory: RetrievalBackend;
-  readonly snapshotHash: string;
+  /**
+   * P1b：当前（最新）运行时快照哈希（rs:<16hex>；opts.snapshotHash 覆盖注入；全降级 → 'rs:assembly'）。
+   * getter 语义：promote（/mode 切换 / rebuildSnapshotForLine）后反映新快照——事件 provenance 用最新快照；
+   * 请求级锁定见 prepareTurn（§6.5.7：请求开始解析快照，整个请求只读该快照，晋升只影响后续请求）。
+   */
+  get snapshotHash(): string {
+    if (this.snapshotOverride !== null) {
+      return this.snapshotOverride;
+    }
+    if (this.degraded) {
+      return 'rs:assembly';
+    }
+    return runtimeHashOf(this.registry.currentSnapshot);
+  }
   /** T8.12：注入的 ModelAdapter（无真实 DSH 会话 → null，LLM 路径缺省受限） */
   readonly modelAdapter: ModelAdapter | null;
-  /** P1a：生效 policy/processes 目录（线快照注入或仓库默认） */
-  readonly policyDir: string;
-  readonly processesDir: string;
-  /** P1a：已注入的线快照（按线加载成功 → 快照信息；否则 null） */
-  readonly lineSnapshot: LineSnapshotInfo | null;
-  /** P1a：lines 按线加载降级原因（线快照缺 policy / lines 不可用 → 回退仓库默认；无降级 → null） */
-  readonly lineDegraded: string | null;
+  /** P1b：生效 policy/processes 目录（线快照注入或仓库默认）；rebuildSnapshotForLine 成功后切换（下一请求生效） */
+  policyDir: string;
+  processesDir: string;
+  /** P1b：已注入的线快照（按线加载成功 → 快照信息；否则 null）；rebuildSnapshotForLine 成功后切换 */
+  lineSnapshot: LineSnapshotInfo | null;
+  /** P1b：lines 按线加载降级原因（线快照缺 policy / lines 不可用 → 回退仓库默认；无降级 → null） */
+  lineDegraded: string | null;
   private readonly checkpointDir: string | undefined;
   /** 维护调度器（生产装配注入；插件经此在请求间隙驱动 requestQuantum/停表——公开面） */
   readonly maintenance: MaintenanceScheduler | null;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
+  /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
+  private readonly registry: SnapshotRegistry;
+  /** P1b：装配选项（rebuildSnapshotForLine 重新解析新线目录用） */
+  private readonly assemblyOpts: CognitiveAssemblyOptions;
+  /** P1b：snapshotHash 覆盖注入（opts.snapshotHash；兼容既有注入面——provenance 常量，registry 结构照常） */
+  private readonly snapshotOverride: string | null;
+  /** P1b：快照身份构建全降级（既有契约 'rs:assembly'；装配不因快照计算失败中断） */
+  private degraded = false;
+  private identityError: string | null = null;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
@@ -240,7 +289,21 @@ export class CognitiveRuntime {
     this.processesDir = dirs.processesDir;
     this.lineSnapshot = dirs.lineSnapshot;
     this.lineDegraded = dirs.lineDegraded;
-    this.snapshotHash = opts.snapshotHash ?? computeSnapshotHash(this.policyDir, this.processesDir);
+    // P1b：装配期初始快照 = 当前版本线 commit + 实际生效目录内容 + 组件哈希（lines 不可用 → 回退既有实现）；
+    // 快照计算失败 → 全降级 'rs:assembly'（registry 以确定性占位快照构造，结构完整不炸）
+    this.assemblyOpts = opts;
+    this.snapshotOverride = opts.snapshotHash ?? null;
+    try {
+      const identity = buildSnapshotIdentity(dirs, HERE);
+      this.registry = new SnapshotRegistry(identity);
+      this.degraded = false;
+    } catch (err) {
+      this.registry = new SnapshotRegistry(
+        createSnapshot({ components: DEGRADED_COMPONENTS, gitRevision: 'degraded' }),
+      );
+      this.degraded = true;
+      this.identityError = errorDetail(err);
+    }
     this.modelAdapter = opts.modelAdapter ?? null;
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
@@ -259,9 +322,10 @@ export class CognitiveRuntime {
    */
   async prepareTurn(req: CognitiveRequest, opts: PrepareTurnOptions = {}): Promise<PreparedTurn> {
     const { policy, processes } = await this.ready();
-    const snapshot = this.resolveRuntimeSnapshot();
+    // P1b：请求开始解析快照（未绑定 → 绑定当前快照，整个请求锁定 §6.5.7；晋升只影响后续请求）
+    const snapshot = this.resolveRuntimeSnapshot(req.session_id);
     const working_state = await this.loadWorkingState(req);
-    const decision = decide(this.buildGovernorInput(req, processes, policy), policy.governor);
+    const decision = decide(this.buildGovernorInput(req, processes, policy, snapshot), policy.governor);
     const retrieved = await retrieve(
       this.memory,
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
@@ -273,7 +337,7 @@ export class CognitiveRuntime {
     if (opts.inject !== undefined) {
       await opts.inject(projection);
       await this.eventStore.append(
-        makeRuntimeEvent('context/injected', req.session_id, this.snapshotHash, {
+        makeRuntimeEvent('context/injected', req.session_id, snapshot, {
           projection_id: projection.id,
           total_tokens: projection.total_tokens,
           views: [...new Set(projection.sections.map((s) => s.view))],
@@ -333,7 +397,9 @@ export class CognitiveRuntime {
    * 信号聚合（零成本 utility_counts）→ maintenance 入队（注入时）→ checkpoint 保存（dir + state 齐备时）。
    */
   async finalizeTurn(input: FinalizeTurnInput): Promise<FinalizeTurnResult> {
-    const made = makeRuntimeEvent('decision/made', input.session_id, this.snapshotHash, {
+    // P1b：请求级快照锁定——已绑定（prepareTurn）→ 返回绑定快照（进行中请求不受 promote 影响）；未绑定 → 绑定当前
+    const snapshot = this.resolveRuntimeSnapshot(input.session_id);
+    const made = makeRuntimeEvent('decision/made', input.session_id, snapshot, {
       decision_id: makeMutableId('decision'),
       question: input.working_state.goal,
       chosen: input.decision.decision,
@@ -360,8 +426,11 @@ export class CognitiveRuntime {
 
     let checkpoint: Checkpoint | null = null;
     if (this.checkpointDir !== undefined && input.state !== undefined) {
-      checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: this.snapshotHash });
+      checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: snapshot });
     }
+
+    // P1b：请求结束 → 释放快照绑定（未绑定请求 end 为空操作——cleanup 路径幂等安全）
+    this.registry.end(input.session_id);
 
     return {
       decision_event_id: made.id,
@@ -382,7 +451,7 @@ export class CognitiveRuntime {
   async handleRequest(req: CognitiveRequest): Promise<CognitiveResponse> {
     const prepared = await this.prepareTurn(req);
     await this.observeEvent(
-      makeRuntimeEvent('session/start', req.session_id, this.snapshotHash, { goal: req.goal }, ['handleRequest']),
+      makeRuntimeEvent('session/start', req.session_id, prepared.snapshot, { goal: req.goal }, ['handleRequest']),
     );
     const prompt = buildPrompt({
       session_id: req.session_id,
@@ -414,11 +483,63 @@ export class CognitiveRuntime {
     await this.memory.close();
   }
 
+  /**
+   * P1b：/mode 切换后重建运行时快照（D1⑤：下一请求生效）：
+   * 新线物化（ensureLineSnapshot）→ 新线 commit + 目录内容 + 组件 → registry.promote
+   * （进行中请求不受影响，§6.5.7）→ 切换 policy/processes 目录（线快照注入）+ 重置懒加载缓存（下一请求从新线加载）。
+   * 失败降级：物化/解析失败 → 当前快照与目录保持，返回降级原因（切换状态仍生效，快照不变）。
+   */
+  rebuildSnapshotForLine(line: VersionLine): { promoted: boolean; degraded: string | null } {
+    if (this.snapshotOverride !== null || this.degraded) {
+      return {
+        promoted: false,
+        degraded: this.degraded
+          ? `快照机制已降级（${this.identityError ?? 'rs:assembly'}）——切换后快照未重建`
+          : '快照哈希被覆盖注入（opts.snapshotHash）——切换后快照未重建',
+      };
+    }
+    let dirs: LineDirResolution;
+    try {
+      dirs = resolveLineDirs(this.assemblyOpts, line);
+    } catch (err) {
+      return { promoted: false, degraded: `新版本线 ${line} 解析失败（${errorDetail(err)}）——当前快照保持` };
+    }
+    if (dirs.lineSnapshot === null) {
+      return { promoted: false, degraded: dirs.lineDegraded ?? `版本线 ${line} 快照未就绪——当前快照保持` };
+    }
+    try {
+      this.registry.promote(buildSnapshotIdentity(dirs, HERE)); // promote 校验非法快照 fail-loud（registry 状态不被污染）
+      // 下一请求生效：切换 policy/processes 目录（线快照注入）+ 重置懒加载缓存（ready() 从新线重载）
+      this.policyDir = dirs.policyDir;
+      this.processesDir = dirs.processesDir;
+      this.lineSnapshot = dirs.lineSnapshot;
+      this.lineDegraded = dirs.lineDegraded;
+      this.policyPromise = null;
+      this.processesPromise = null;
+      return { promoted: true, degraded: null };
+    } catch (err) {
+      return { promoted: false, degraded: `快照重建失败（${errorDetail(err)}）——当前快照保持` };
+    }
+  }
+
+  /** P1b/P1e：外部晋升接口（构建好新快照后 promote → 下一请求生效；进行中请求不受影响，§6.5.7） */
+  promoteSnapshot(next: RuntimeSnapshot): void {
+    this.registry.promote(next);
+  }
+
   // ---- 内部 ----
 
-  /** 请求级快照身份（T8.26.2 §3.1 step 1） */
-  private resolveRuntimeSnapshot(): string {
-    return this.snapshotHash;
+  /** 请求级快照解析（P1b §6.5.7）：未绑定 → 绑定当前快照并返回（整个请求锁定）；已绑定 → 原快照。
+   *  全降级 / 覆盖注入 → 常量（无绑定语义，兼容既有 'rs:assembly' 契约）。 */
+  private resolveRuntimeSnapshot(reqId: string): string {
+    if (this.snapshotOverride !== null) {
+      return this.snapshotOverride;
+    }
+    if (this.degraded) {
+      return 'rs:assembly';
+    }
+    const bound = this.registry.resolveSnapshot({ id: reqId }, { current: this.registry.currentSnapshot });
+    return runtimeHashOf(bound);
   }
 
   /** 工作状态加载（§3.1 step 2）：checkpointDir 配置且存在 checkpoint → 恢复；否则请求携带的当前状态 */
@@ -456,6 +577,7 @@ export class CognitiveRuntime {
     req: CognitiveRequest,
     processes: readonly ProcessDef[],
     policy: PolicyBundle,
+    snapshot: string,
   ): GovernorInput {
     const envelope = policy.budget;
     const es = req.evidence_sufficiency ?? {
@@ -465,7 +587,7 @@ export class CognitiveRuntime {
     };
     return {
       task_contract: { goal: req.goal, success_criteria: req.success_criteria },
-      state_snapshot: { snapshot_hash: this.snapshotHash },
+      state_snapshot: { snapshot_hash: snapshot },
       environment: req.environment ?? 'default',
       candidate_processes: processes.map((p) => p.id),
       applicability_results: processes.map((p) => ({

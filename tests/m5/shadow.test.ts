@@ -15,6 +15,7 @@
 //      仍有 canary 决策条目（decision='canary_rollback', outcome='restore_failed'）——回滚触发审计不丢失
 //   ⑤d 修复回归（评审 Important）：restore 成功 + exposure log 写入失败（坏 logPath）→ 调用方得到
 //      明确信号（result.warnings，非可重试 restore 形态）且 restore 不重复执行（无双回滚）
+//   ⑤e P1b：受影响会话接口接入——rollbackCanary 记录 affectedSessions（缺省 []）；runCanary 透传
 //   ⑥ 未触发：达标证书 → 无回滚调用（restore 未被调、contract === null）
 //   ⑦ Certificate 结构：stat 非法（n 负数 / failures 负数 / 统计不自洽）→ 校验拒绝；阈值非法 → 拒绝；
 //      扩展：cert.valid 与派生值不一致 → evaluateCanary fail-loud
@@ -248,6 +249,36 @@ describe('⑤ 触发自动回滚（evaluateCanary rollback → runCanary 自动 
         },
       }),
     ).rejects.toThrow(/restore failed/);
+  });
+
+  it('⑤e P1b：受影响会话接口接入——rollbackCanary 记录 affectedSessions；runCanary 透传（缺省 []）', async () => {
+    const cert = buildCertificate('c:bad2', { n: 10, successes: 8, failures: 2 }, { min_n: 10, max_failure_rate: 0.1 });
+    const logPath = join(evo, 'exposure.log');
+    // 直接调用：受影响会话写入 RollbackContract（与快照 registry 活跃请求绑定的关系见 rollbackCanary 注释）
+    const direct = await rollbackCanary({
+      candidate_id: 'c:bad2',
+      snapshot: 'sha256:abc2',
+      scope: 'Project',
+      restore: async () => undefined,
+      affectedSessions: ['sess-1', 'sess-2'],
+    });
+    expect(direct.affected_sessions).toEqual(['sess-1', 'sess-2']);
+    // 未提供 → 空数组（既有语义保持）
+    expect(
+      (await rollbackCanary({ candidate_id: 'c:bad2', snapshot: 'sha256:abc2', scope: 'Project', restore: async () => undefined }))
+        .affected_sessions,
+    ).toEqual([]);
+    // runCanary 透传 affectedSessions（回滚触发时写入 RollbackContract）
+    const result = await runCanary({
+      certificate: cert,
+      exposure: { seed: 'seed-as', bucket: bucketFor('seed-as'), layer: 'tier1' },
+      logPath,
+      snapshot: 'sha256:abc3',
+      scope: 'Project',
+      restore: async () => undefined,
+      affectedSessions: ['sess-9'],
+    });
+    expect(result.contract?.affected_sessions).toEqual(['sess-9']);
   });
 
   it('⑤c 修复回归：restore 抛错 → runCanary 拒绝（fail-loud 保持）且 exposure log 仍有 canary 决策条目（outcome=restore_failed）', async () => {
