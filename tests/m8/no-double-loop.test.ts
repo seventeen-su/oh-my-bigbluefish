@@ -106,9 +106,9 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
         listeners.set(event, arr);
       },
       llm,
-      config: { model: { provider: 'test', model: 't1' } },
     };
-    apply(ctx, { bootstrap: false });
+    // config 为 apply 第二参（B3 契约）：model 路由配置经 apply config 传入（ctx 不再承载配置面）
+    apply(ctx, { bootstrap: false, model: { provider: 'test', model: 't1' } });
 
     // ① 装配后 ctx.llm 引用与方法身份不变（未包装/替换：adapter 为捕获 llm 的新对象，不修改原对象）
     expect(ctx.llm).toBe(llm);

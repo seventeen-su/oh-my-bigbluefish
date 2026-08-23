@@ -24,7 +24,7 @@ interface CapturedCommand {
   recordInput?: boolean;
   handler: (invocation: {
     commandId: unknown;
-    agent: { session?: { events?: ReadonlyArray<FakeSessionEvent> } };
+    agent: { session?: { id?: string; events?: ReadonlyArray<FakeSessionEvent> } };
     rawInput: string;
     signal: unknown;
   }) => Promise<{ kind: 'success' | 'error'; text: string }>;

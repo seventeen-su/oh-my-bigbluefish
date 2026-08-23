@@ -208,7 +208,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   // 进程内自动初始化或保守修复。锁安全性：git/icacls 均以短生命周期子进程（execFileSync）运行，
   // DSH 进程不持有 versions.git/stable/latest 的文件句柄（正式 worktree 运行只读）→ 无锁冲突；
   // 布局健康时纯 fs 检查、零 git 子进程（零开销）。degraded → 记录降级（不阻塞挂载，命令仍可用）。
-  // 顺序：ensureThreeLineLayout → 跨进程残留清理 → bootStable（回退校验依赖布局就绪）。
+  // 顺序：bootstrap 守卫（ensureThreeLineLayout → 跨进程残留清理）→ bootStable（回退校验依赖布局就绪）。
   if (config.bootstrap !== false) {
     const r = ensureThreeLineLayout();
     if (r.status === 'degraded') {
@@ -216,16 +216,20 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     } else if (r.status !== 'ok') {
       console.info(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
     }
-  }
-  // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）
-  try {
-    const removed = cleanupStaleInitialWorktrees();
-    if (removed > 0) {
-      recordDegradation('initial/cleanup', `清理跨进程残留 initial 物化 worktree ${removed} 个`);
+    // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）。
+    // 归属 bootstrap 守卫：bootstrap:false 表示「布局由调用方管理」（测试 fakeCtx 多 worker 并行
+    // 各自物化 initial worktree）——跳过清理，避免 worker A 物化后 worker B 清理误删 A 在用目录
+    // → loadVersion('initial') 瞬态失败（commands.test.ts 已知 flake，专项2/3 两次观测）。
+    // 生产默认 bootstrap=true → 清理照常（防跨进程残留累积）。
+    try {
+      const removed = cleanupStaleInitialWorktrees();
+      if (removed > 0) {
+        recordDegradation('initial/cleanup', `清理跨进程残留 initial 物化 worktree ${removed} 个`);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
     }
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
   }
   // 恢复根启动完整性校验（架构 §3/§11.4；T8.1 生产接线补全）：stable 引用/内容损坏 →
   // bootStable 自动沿历史回退到上一完好快照。apply 为同步契约，bootStable 异步 fire-and-forget
