@@ -8,8 +8,8 @@
 // readService 退化到普通属性读取（行为不变，测试面兼容）。
 // 无双 Loop（专项 §1 硬约束）：本插件仅观察/注入/命令注册——不替换、不包装、不重启 DSH Agent Loop；
 // 模型调用归 DSH（llm 服务只读装配 ModelAdapter 供 /bench 用，不拦截对话模型路径）。
-// M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
-//（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
+// M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；/mode = OMB 内部版本线切换
+//（单模式：load 校验 + 空白会话守卫 + onSwitch 记账；不涉及 DSH 预设切换）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, isVersionLine, loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
@@ -59,8 +59,8 @@ export interface PluginConfig {
   activationLogDir?: string;
   /** 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」；缺省 true；测试与手动控制用 bootstrap: false 关闭） */
   bootstrap?: boolean;
-  /** 固定初始版本线（缺省 stable；供 per-line 预设（omb-v2-<line>）固定本线——scripts/deploy-lines.ts
-   *  生成的三个 per-line 预设（omb-v2-initial/stable/latest）在 agent.cordis.yml 注入本配置） */
+  /** 固定初始版本线（缺省 stable；后备/兼容机制 scripts/deploy-lines.ts 生成的 per-line 预设
+   *  （omb-v2-initial/stable/latest）在 agent.cordis.yml 注入本配置固定本线初始版本线） */
   line?: VersionLine;
 }
 
@@ -76,7 +76,7 @@ export interface CommandsLike {
 }
 
 /** DSH CommandInvocation 的最小结构（真实类型含 commandId/agent/rawInput/signal；
- *  agent.ctx = 会话作用域上下文，recompose 需要它——传 agent 对象本身会被拒（unscoped context）） */
+ *  agent.ctx = 会话作用域上下文（本插件不再使用——/mode 为 OMB 内部版本线切换，保留以贴近真实结构）） */
 export interface CommandInvocationLike {
   readonly commandId: unknown;
   readonly agent: {
@@ -85,11 +85,6 @@ export interface CommandInvocationLike {
   };
   readonly rawInput: string;
   readonly signal: unknown;
-}
-
-/** DSH agentPresets 服务的最小结构（真实类型见 @deepseek-ai/dsh-agent-presets；recompose 空白会话重链） */
-export interface AgentPresetsLike {
-  recompose?(agentCtx: unknown, id: string): Promise<unknown>;
 }
 
 /** 认知运行时最小结构（T8.3 装配；T8.26.2 三能力拆分后含 prepareTurn/observeEvent/finalizeTurn/snapshotHash） */
@@ -149,8 +144,6 @@ export interface ContextLike {
   /** Guard 契约：免 inject 服务读取（真实 DSH 上下文恒有；测试 fakeCtx 可缺省，readService 退化到普通属性） */
   get?(name: string): unknown;
   commands?: CommandsLike;
-  /** T8.2：preset recompose 服务（平台提供时 /mode 真实接线；缺失 → 降级会话内状态）——经 get('agentPresets') 读取 */
-  agentPresets?: AgentPresetsLike;
   /** T8.3：注入的认知运行时（deps 注入，组合根模式）——经 get('cognitive') 读取；未注入且提供装配根 → 组合根缺省装配 */
   cognitive?: CognitiveRuntimeLike;
   /** T8.12：DSH llm 服务（LlmRuntime.stream 的结构最小接口；真实类型 @deepseek-ai/dsh-llm）——经 get('llm') 读取。
@@ -196,11 +189,6 @@ function resolveConfigPath(p: string | undefined): string | undefined {
  */
 function isBlankSession(events: ReadonlyArray<{ readonly type?: string }> | undefined): boolean {
   return !(events ?? []).some((event) => event.type === 'turn/start');
-}
-
-/** 版本线 → 子 preset id（recompose 目标命名约定：omb-v2-<line>；初始无对应 preset 时 recompose 明确受限） */
-export function presetIdForLine(line: VersionLine): string {
-  return `omb-v2-${line}`;
 }
 
 /** apply 返回句柄（Cordis 忽略函数插件返回值；装配断言/测试句柄用） */
@@ -258,7 +246,6 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   let cognitive = readService<CognitiveRuntimeLike>(ctx, 'cognitive');
   let modelAdapter = readService<ModelAdapter>(ctx, 'modelAdapter');
   const systemPrompt = readService<SystemPromptLike>(ctx, 'systemPrompt');
-  const agentPresets = readService<AgentPresetsLike>(ctx, 'agentPresets');
   if (cognitive === undefined) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
@@ -288,9 +275,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   }
 
-  // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（供 per-line 预设
-  // omb-v2-<line> 固定本线：/mode recompose 重链到该线预设后，本线初始版本线即生效）。
-  // 非法值 → 回退 stable 并记录降级（守卫式接入，不阻塞挂载）；recompose 失败/缺失时保持会话内状态。
+  // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（后备/兼容机制
+  // deploy-lines 生成的 per-line 预设固定本线用；生产单模式下仅影响启动初值——/mode 运行时切换内部线状态）。
+  // 非法值 → 回退 stable 并记录降级（守卫式接入，不阻塞挂载）。
   const configuredLine: unknown = config.line;
   let current: VersionLine;
   if (isVersionLine(configuredLine)) {
@@ -607,27 +594,6 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         load: async (line) => loadVersion(line),
         currentLine: () => current,
         isBlankSession: async () => isBlankSession(events),
-        // T8.2 真实 recompose 接线：平台提供 agentPresets.recompose 才尝试；目标 preset id 按线映射
-        recompose: agentPresets?.recompose
-          ? async (line) => {
-              try {
-                // recompose 需要 agent 的作用域上下文（agent.ctx）；传 agent 对象 → unscoped context 拒绝
-                const r = await agentPresets!.recompose!((invocation.agent as { ctx?: unknown }).ctx, presetIdForLine(line));
-                // 平台返回 {ok:false} 形状（如目标 preset 未安装）→ 明确受限
-                if (r !== null && typeof r === 'object' && (r as { ok?: unknown }).ok === false) {
-                  const detail = (r as { detail?: unknown }).detail;
-                  return { ok: false, detail: detail === undefined ? 'recompose 返回失败' : String(detail) };
-                }
-                return { ok: true, detail: `已重链到 preset ${presetIdForLine(line)}` };
-              } catch (err) {
-                const detail = err instanceof Error ? err.message : String(err);
-                return {
-                  ok: false,
-                  detail: `preset recompose 不可用（${detail}）——平台限制文档化：当前无 ${presetIdForLine(line)} 预设，降级为会话内版本线状态`,
-                };
-              }
-            }
-          : undefined,
         onSwitch: async (line) => {
           const previous = current;
           current = line;

@@ -21,7 +21,7 @@ interface CapturedCommand {
   }) => Promise<{ kind: 'success' | 'error'; text: string }>;
 }
 
-/** fake ctx：仅 commands 注册面（无 agentPresets —— 顺带断言守卫生效）；register 捕获 def */
+/** fake ctx：仅 commands 注册面（插件不再读取 agentPresets——recompose 能力已移除，无需注入）；register 捕获 def */
 function makeFakeCtx(): { captured: CapturedCommand[]; ctx: ContextLike } {
   const captured: CapturedCommand[] = [];
   const ctx: ContextLike = {
@@ -47,7 +47,7 @@ function makeInvocation(
 }
 
 describe('runtime/plugin.ts apply(fakeCtx)', () => {
-  it('注册 /mode 命令：name=mode、description 非空、input hint 含合法值、recordInput=true；fake ctx 无 agentPresets 不抛错', () => {
+  it('注册 /mode 命令：name=mode、description 非空、input hint 含合法值、recordInput=true；fake ctx 无 agentPresets 不抛错（插件已不再读取该服务面）', () => {
     const { captured, ctx } = makeFakeCtx();
     expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     const mode = captured.find((c) => c.name === 'mode')!;

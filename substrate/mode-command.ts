@@ -1,4 +1,5 @@
 // layer 0：/mode 命令的纯逻辑（不依赖 DSH，可独立测试）。
+// /mode = 切换 OMB 当前版本线（内部版本线状态 + 激活记账；单模式，不涉及 DSH 预设切换）。
 // 解析 → load 校验（fail-loud）→ 空白会话检查 → onSwitch 钩子 → 成功文本。
 import type { VersionLine } from './snapshot.js';
 import { VALID_LINES, isVersionLine } from './snapshot.js';
@@ -17,17 +18,8 @@ export interface ModeCommandDeps {
   currentLine: () => string;
   /** 空白会话检查（可选；提供且非空白时拒绝切换） */
   isBlankSession?: () => Promise<boolean>;
-  /** 切换钩子（真实 recompose 接线留 M0 后集成；M0 内用于记录新线） */
+  /** 切换钩子（更新当前版本线 + 激活记账；生产接线在 runtime/plugin.ts） */
   onSwitch?: (line: VersionLine) => Promise<void>;
-  /**
-   * 平台级 recompose（可选；T8.2 接线）：DSH preset recompose（ctx.agentPresets.recompose）。
-   * 提供时：切换前先调用——ok → 继续 onSwitch；!ok → **降级为会话内版本线状态**：
-   * onSwitch 仍执行（本地线状态切换生效），结果文本明示 recompose 受限
-   *（2026-08-22 修正：原实现 !ok 直接 error 不切换，与插件文案"降级为会话内版本线状态"不一致；
-   *   纯错误路径保留：load 失败 / 非空白会话）。
-   * 未提供（平台无 recompose 面）→ 降级为会话内当前线状态（onSwitch 本地记录）。
-   */
-  recompose?: (line: VersionLine) => Promise<{ ok: boolean; detail: string }>;
 }
 
 export interface ModeCommandResult {
@@ -38,12 +30,11 @@ export interface ModeCommandResult {
 const HELP = `合法值：${VALID_LINES.join(' | ')}`;
 
 /**
- * /mode 命令 handler 纯逻辑：
+ * /mode 命令 handler 纯逻辑（OMB 内部版本线切换，单模式）：
  * - 空输入 → 返回当前模式（currentLine）+ 帮助；
  * - 未知模式 → error（消息含合法值），不触发 load；
  * - 合法模式 → load 校验（失败返回 error 文本）→ 空白会话检查（若提供且非空白 → error）
- *   → recompose（若提供：ok 才继续，!ok → error 明确受限）→ onSwitch（若提供）→ success
- *   （新模式 + git_revision 前 8 位 + tree_root）。
+ *   → onSwitch（若提供）→ success（新模式 + git_revision 前 8 位 + tree_root）。
  */
 export async function modeCommandHandler(
   rawInput: string,
@@ -67,20 +58,6 @@ export async function modeCommandHandler(
     const blank = await deps.isBlankSession();
     if (!blank) {
       return { kind: 'error', text: `切换到 ${line} 需要空白会话（当前会话已有产出，不能切换）` };
-    }
-  }
-  if (deps.recompose !== undefined) {
-    const r = await deps.recompose(line);
-    if (!r.ok) {
-      // T8.2 降级语义（2026-08-22）：recompose 平台受限（如 per-line 预设缺失）→
-      // 会话内版本线状态切换仍生效（onSwitch 本地记录），成功文本明示受限。
-      if (deps.onSwitch !== undefined) {
-        await deps.onSwitch(line);
-      }
-      return {
-        kind: 'success',
-        text: `已切换到版本线 ${line}（会话内状态；recompose 受限：${r.detail}）`,
-      };
     }
   }
   if (deps.onSwitch !== undefined) {

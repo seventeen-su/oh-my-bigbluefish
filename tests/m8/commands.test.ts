@@ -1,7 +1,6 @@
-// T8.2 行为测试：/mode 真实 recompose 接线 + /bench 注册（runtime/plugin.ts，research-dsh.md §2）。
-// - /mode：ctx.agentPresets.recompose 存在 → handler 真实调用 recompose（目标 preset id 按线映射
-//   omb-v2-<line>）；失败 → 明确受限（error 文本文档化平台限制），本地线状态不切换；
-//   ctx 无 agentPresets → 降级为会话内当前线状态（既有 m0 行为不变）。
+// T8.2 行为测试：/mode 内部版本线切换（单模式）+ /bench 注册（runtime/plugin.ts，research-dsh.md §2）。
+// - /mode = OMB 内部版本线切换（单模式）：load 校验 + 空白会话守卫 + onSwitch 记账（激活记录落盘）；
+//   不涉及 DSH 预设切换——ctx 提供 agentPresets.recompose 也不会被调用（recompose 能力已从插件移除）。
 // - /bench（T2.3 起默认 v2 契约基准）：注册 bench 命令；handler 默认走 supervisor/bench-v2.ts runBenchV2
 //  （20 契约 + 回放执行器，明细 replay-v2-<line>-<ts>.jsonl）；`config.benchVersion: 'v1'` 切回 legacy
 //  （supervisor/bench.ts runBench，明细 replay-<line>-<ts>.jsonl——v1 语义原样保留）。
@@ -47,16 +46,11 @@ function makeInvocation(
 interface FakeCtxResult {
   captured: CapturedCommand[];
   ctx: ContextLike;
-  recomposed: string[];
 }
 
-/** fake ctx：commands + 可选 agentPresets.recompose（记录目标 preset id） */
-function makeFakeCtx(over: {
-  recompose?: (id: string) => Promise<unknown> | unknown;
-  noAgentPresets?: boolean;
-} = {}): FakeCtxResult {
+/** fake ctx：仅 commands 注册面（/mode 为 OMB 内部版本线切换，无需 agentPresets 面；register 捕获 def） */
+function makeFakeCtx(): FakeCtxResult {
   const captured: CapturedCommand[] = [];
-  const recomposed: string[] = [];
   const ctx: ContextLike = {
     commands: {
       register: (def: unknown) => {
@@ -64,89 +58,102 @@ function makeFakeCtx(over: {
       },
     },
   };
-  if (!over.noAgentPresets) {
-    ctx.agentPresets = {
-      recompose: async (agentCtx: unknown, id: string) => {
-        recomposed.push(id);
-        if (over.recompose !== undefined) {
-          return over.recompose(id);
-        }
-        return { ok: true };
-      },
-    };
-  }
-  return { captured, ctx, recomposed };
+  return { captured, ctx };
 }
 
 const mode = (c: FakeCtxResult): CapturedCommand => c.captured.find((x) => x.name === 'mode')!;
 const bench = (c: FakeCtxResult): CapturedCommand => c.captured.find((x) => x.name === 'bench')!;
 
-describe('T8.2 /mode 真实 recompose 接线', () => {
-  it('ctx 提供 agentPresets.recompose → /mode 切换时 handler 真实调用 recompose（目标 preset id=omb-v2-<line>）且成功', async () => {
+describe('T8.2 /mode 内部版本线切换（单模式；不涉及 DSH 预设切换）', () => {
+  it('切换成功：fake ctx（无 agentPresets 面）→ /mode latest → success 文案含 git_revision/tree_root，不含 recompose/受限', async () => {
     const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest'));
     expect(r.kind).toBe('success');
     expect(r.text).toContain('latest');
-    // 真实调用 recompose：目标 preset id 按线映射
-    expect(c.recomposed).toEqual(['omb-v2-latest']);
-    // 本地线状态同步更新
+    expect(r.text).toMatch(/git_revision [0-9a-f]{8}/);
+    expect(r.text).toContain('tree_root');
+    // 语义移除：成功文案固定为「已切换到版本线 X（git_revision …，tree_root …）」，无 recompose/受限 字样
+    expect(r.text).not.toContain('recompose');
+    expect(r.text).not.toContain('受限');
+    // 内部版本线状态切换生效（当前线已更新）
     const current = await mode(c).handler(makeInvocation(''));
-    expect(current.text).toContain('latest');
+    expect(current.text).toContain('当前版本线：latest');
   });
 
-  it('recompose 调用抛错 → 降级切换：success（会话内状态）+ 受限说明，本地线状态已更新', async () => {
-    const c = makeFakeCtx({ recompose: () => Promise.reject(new Error('preset omb-v2-latest 不存在')) });
-    apply(c.ctx, { bootstrap: false });
-
-    const r = await mode(c).handler(makeInvocation('latest'));
-    expect(r.kind).toBe('success');
-    expect(r.text).toMatch(/受限/);
-    expect(r.text).toContain('omb-v2-latest');
-    expect(r.text).toContain('latest');
-    // 降级语义：recompose 受限 → 会话内版本线状态切换仍生效
-    const current = await mode(c).handler(makeInvocation(''));
-    expect(current.text).toContain('latest');
-  });
-
-  it('recompose 返回 {ok:false} → 降级切换：success（会话内状态）+ detail 明示', async () => {
-    const c = makeFakeCtx({ recompose: () => ({ ok: false, detail: '目标 preset 未安装' }) });
-    apply(c.ctx, { bootstrap: false });
-
-    const r = await mode(c).handler(makeInvocation('initial'));
-    expect(r.kind).toBe('success');
-    expect(r.text).toContain('目标 preset 未安装');
-    expect(r.text).toContain('initial');
-    expect(c.recomposed).toEqual(['omb-v2-initial']);
-    const current = await mode(c).handler(makeInvocation(''));
-    expect(current.text).toContain('initial');
-  });
-
-  it('ctx 无 agentPresets → 降级为会话内当前线状态（recompose 不被调，切换仍成功——既有 m0 行为保持）', async () => {
-    const c = makeFakeCtx({ noAgentPresets: true });
+  it('recompose 零调用：ctx 提供 agentPresets.recompose → 切换成功且 recompose 从未被调用（证明语义移除）', async () => {
+    const c = makeFakeCtx();
+    const recompose = vi.fn(async () => ({ ok: true, detail: 'should-not-be-called' }));
+    // ContextLike 已无 agentPresets 面（recompose 能力已从插件移除）——经宽化引用注入，断言插件零接触
+    (c.ctx as { agentPresets?: { recompose: typeof recompose } }).agentPresets = { recompose };
     apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest'));
     expect(r.kind).toBe('success');
     expect(r.text).toContain('latest');
-    expect(c.recomposed).toEqual([]); // 无 recompose 可调
+    expect(recompose).not.toHaveBeenCalled();
   });
 
-  it('空白会话守卫仍生效：非空白会话拒绝切换（recompose 不被调）', async () => {
+  it('空白会话守卫仍生效：非空白会话拒绝切换（当前线不变）', async () => {
     const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest', [{ type: 'turn/start' }]));
     expect(r.kind).toBe('error');
     expect(r.text).toContain('空白会话');
-    expect(c.recomposed).toEqual([]);
+    // 未切换：当前线保持 stable
+    const current = await mode(c).handler(makeInvocation(''));
+    expect(current.text).toContain('当前版本线：stable');
+  });
+
+  it('激活记录：activationLogDir 配置 → /mode 切换后 completed/<id>.json 幂等落盘（M6 契约字段来自真实 revision）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-act-'));
+    try {
+      const c = makeFakeCtx();
+      apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
+
+      const r = await mode(c).handler(makeInvocation('stable', [], 'sess-act-1'));
+      expect(r.kind).toBe('success');
+
+      const completedDir = join(base, 'act', 'completed');
+      // 超时放宽：全量套件并行时真实 versions.git 有 git 竞争（m0 真实布局冒烟同仓操作），记录链可能变慢
+      await vi.waitFor(
+        () => {
+          expect(readdirSync(completedDir).length).toBeGreaterThan(0);
+        },
+        { timeout: 15000, interval: 20 },
+      );
+      const files = readdirSync(completedDir);
+      expect(files).toHaveLength(1);
+      const contract = JSON.parse(readFileSync(join(completedDir, files[0]!), 'utf8')) as {
+        predecessor: string;
+        candidate: string;
+        activation_scope: string;
+        schema: string;
+      };
+      expect(contract.predecessor).toMatch(/^[0-9a-f]{40}$/); // 切换前 stable revision
+      expect(contract.candidate).toMatch(/^[0-9a-f]{40}$/); // 切换后 stable revision
+      expect(contract.activation_scope).toBe('session');
+      expect(contract.schema).toBe('omb/M6');
+      // pending 标记已清理（完成路径：目录为空或不存在）
+      const pendingDir = join(base, 'act', 'pending');
+      let pendingFiles: string[] = [];
+      try {
+        pendingFiles = readdirSync(pendingDir);
+      } catch {
+        pendingFiles = [];
+      }
+      expect(pendingFiles).toHaveLength(0);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
   });
 });
 
 describe('T8.2 /bench 注册与触发', () => {
   it('注册 bench 命令：name=bench、description 含默认 v2 说明、recordInput=true', () => {
-    const c = makeFakeCtx({ noAgentPresets: true });
+    const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
     expect(bench(c)).toBeDefined();
@@ -159,7 +166,7 @@ describe('T8.2 /bench 注册与触发', () => {
   it('handler 默认 v2 契约基准（无 DSH 会话 → 回放 v2）：文本含「v2 契约基准」标识与 20/20；明细 replay-v2-stable-*.jsonl', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-v2-'));
     try {
-      const c = makeFakeCtx({ noAgentPresets: true });
+      const c = makeFakeCtx();
       apply(c.ctx, { benchPersistDir: join(base, 'bench'), bootstrap: false });
 
       const r = await bench(c).handler(makeInvocation(''));
@@ -183,7 +190,7 @@ describe('T8.2 /bench 注册与触发', () => {
   it('config.benchVersion: "v1" → 走 v1 legacy 路径（runBench v1；明细 replay-stable-*.jsonl；文本无 v2 标识）', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-v1-'));
     try {
-      const c = makeFakeCtx({ noAgentPresets: true });
+      const c = makeFakeCtx();
       apply(c.ctx, { benchPersistDir: join(base, 'bench'), benchVersion: 'v1', bootstrap: false });
 
       const r = await bench(c).handler(makeInvocation(''));
@@ -206,7 +213,7 @@ describe('T8.2 /bench 注册与触发', () => {
   it('/mode 切换记录版本激活（activationLogDir 配置 → completed/<id>.json 幂等落盘，M6 契约字段来自真实 revision）', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-act-'));
     try {
-      const c = makeFakeCtx({ noAgentPresets: true });
+      const c = makeFakeCtx();
       apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
 
       const r = await mode(c).handler(makeInvocation('stable', [], 'sess-act-1'));
@@ -249,7 +256,7 @@ describe('T8.2 /bench 注册与触发', () => {
   it('/mode 切换到 latest 记录版本激活（activationLogDir → completed/<activation_id>.json 含 activation_id/candidate/predecessor；pending 已清空）', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-act-latest-'));
     try {
-      const c = makeFakeCtx({ noAgentPresets: true });
+      const c = makeFakeCtx();
       apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
 
       // 空白会话前置条件（无 turn/start 事件）+ 会话 id → 确定性 activation_id
@@ -293,13 +300,13 @@ describe('T8.2 /bench 注册与触发', () => {
   });
 });
 
-describe('T8.30 config.line 固定初始版本线（三线部署接线：per-line 预设 omb-v2-<line> 注入本配置）', () => {
+describe('T8.30 config.line 固定初始版本线（后备机制 deploy-lines：per-line 预设 omb-v2-<line> 注入本配置）', () => {
   beforeEach(() => {
     clearDegradations();
   });
 
   it('line: "latest" → apply 后 /mode 空输入返回「当前版本线：latest」（固定初始线生效）', async () => {
-    const c = makeFakeCtx({ noAgentPresets: true });
+    const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false, line: 'latest' });
 
     const current = await mode(c).handler(makeInvocation(''));
@@ -309,7 +316,7 @@ describe('T8.30 config.line 固定初始版本线（三线部署接线：per-lin
   });
 
   it('非法 line（如 "foo"）→ 回退 stable 且记录 config/line 降级', async () => {
-    const c = makeFakeCtx({ noAgentPresets: true });
+    const c = makeFakeCtx();
     // 模拟配置被写坏（非法 line 值）——运行时应回退 stable 并记录降级（守卫式接入，不阻塞挂载）
     apply(c.ctx, { bootstrap: false, line: 'foo' as VersionLine });
 
@@ -319,7 +326,7 @@ describe('T8.30 config.line 固定初始版本线（三线部署接线：per-lin
   });
 
   it('line 缺省 → stable（既有行为不变，不记录 config/line 降级）', async () => {
-    const c = makeFakeCtx({ noAgentPresets: true });
+    const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
     const current = await mode(c).handler(makeInvocation(''));

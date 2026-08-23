@@ -2,9 +2,10 @@
 // 纯逻辑核心：planLinePresets(presetRoot, dshHome) 对 initial/stable/latest 三线各生成一个 per-line
 // 预设目录计划（不写盘；CLI 负责落盘）。
 //
-// 背景（T8.2 /mode 真实 recompose 接线）：插件按 presetIdForLine(line) → omb-v2-<line> 调用
-// ctx.agentPresets.recompose 重链，但三个 per-line 预设从未部署 → recompose 恒受限（降级为会话内
-// 版本线状态，文档化行为）。本模块补全部署：生成的 agent.cordis.yml **基于项目根组合文本级生成**
+// 背景（后备/兼容机制）：/mode 已正式改为 OMB 内部版本线切换（单模式，不涉及 DSH 预设切换），
+// recompose 能力已从插件移除；本脚本保留为宿主兼容测试/开发调试/未来多预设场景的后备手段——
+// 生成的 per-line 预设（omb-v2-initial/stable/latest）与主预设共享同一插件/工具面/数据，
+// 仅 config.line 固定本线初始版本线。本模块补全部署：生成的 agent.cordis.yml **基于项目根组合文本级生成**
 // （保留全部注释与工具行——B6 教训：只有 omb-v2 一行的预设是无工具会话，绝不能生成精简版），仅做两处改写：
 //   1. omb-v2 行 name 指向主预设编译产物：../<presetRoot 目录名>/lib/runtime/plugin.js?v=<原v值>
 //      （行 name 相对本组合目录解析 → 相对上级目录引用主预设编译产物，保持原 ?v= 缓存尾缀）；
@@ -45,9 +46,9 @@ function generationMarker(sourcePath: string): string {
 /** per-line preset.yml 内容（显示元数据；id 来自目录名） */
 function renderPresetYml(line: LinePreset): string {
   return [
-    `# OMB v2 per-line 预设显示元数据（由 scripts/deploy-lines.ts 生成；id = 目录名 omb-v2-${line}）`,
+    `# OMB v2 per-line 预设显示元数据（由 scripts/deploy-lines.ts 生成；id = 目录名 omb-v2-${line}；后备/兼容机制）`,
     `name: 大肥鱼模式 v2（${line}线）`,
-    `description: OMB v2 认知增强 preset（${line} 线；初始版本线由 config.line 固定，供 /mode recompose 重链）`,
+    `description: OMB v2 认知增强 preset（${line} 线；初始版本线由 config.line 固定——deploy-lines 后备/兼容机制，供宿主兼容测试/开发调试/未来多预设场景；正常生产为单模式 + /mode 内部版本线切换）`,
     '',
   ].join('\n');
 }

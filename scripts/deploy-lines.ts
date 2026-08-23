@@ -1,6 +1,6 @@
 // OMB v2 三线部署 CLI 入口（developer tooling）：`pnpm deploy-lines`。
-// 生成三个 per-line 预设目录（omb-v2-initial/stable/latest）到 $DSH_HOME/.agent-presets/，
-// 使 /mode 切换可真实 recompose 重链到对应线预设（插件 presetIdForLine 映射；未部署时降级为会话内状态）。
+// 后备/兼容机制（可选）：生成三个 per-line 预设目录（omb-v2-initial/stable/latest）到 $DSH_HOME/.agent-presets/
+//（供宿主兼容测试/开发调试/未来多预设场景；正常生产为单模式 + /mode 内部版本线切换，无需部署）。
 // 主逻辑在 main()，仅直接运行时执行（import 无副作用，测试 import 的公共 API 经本文件再导出）。
 // 纯逻辑核心在 scripts/deploy-lines-core.ts（本文件仅 CLI 编排 + 公共 API 再导出，仿 scripts/bench-report.ts）。
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -15,7 +15,7 @@ const USAGE = `用法：pnpm deploy-lines [--home <dshHome>]
   缺省 dshHome：$env:DSH_HOME（优先）→ <用户主目录>/.dsh
   产出：<dshHome>/.agent-presets/omb-v2-<initial|stable|latest>/（覆盖式生成 per-line 预设）
   退出码：0 = 三线全部写入成功；1 = 任一步失败
-  部署后 /mode 切换可真实 recompose 重链到对应线预设；未部署时 /mode 降级为会话内版本线状态`;
+  后备/兼容机制（可选）：供宿主兼容测试/开发调试/未来多预设场景；正常生产为单模式 + /mode 内部版本线切换`;
 
 /** CLI 主逻辑（仅直接运行时执行；返回退出码，调用方设置 process.exitCode） */
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {

@@ -6,7 +6,7 @@
 //   c. 模型调用零介入（动态）：完整模拟会话（三钩子全链：prepareTurn 注入 → 事件入链 → flush 收尾）期间
 //      llm.stream 从未被调用——OMB 钩子不驱动、不拦截、不包装模型调用
 //   d. systemPrompt 为追加贡献而非替换：仅调用 context()（additive section，cognitive:projection），无替换型 API
-//   e. agentPresets.recompose 装配期不触发（recompose 仅 /mode 用户主动调用且限空白会话——DSH 原生 API）
+//   e. 插件不再接触 agentPresets.recompose（recompose 能力已整体移除——/mode = OMB 内部版本线切换，单模式）
 //   f. 命令注册仅为 DSH 扩展点（mode/bench 两个），无 loop 控制命令
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -146,7 +146,7 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
     expect((await runtime.eventStore.query({ session_id: SESSION })).events.some((e) => e.type === 'tool/result')).toBe(true);
   });
 
-  it('systemPrompt 为追加贡献而非替换；recompose 装配期不触发；命令仅注册 mode/bench（DSH 扩展点）', () => {
+  it('systemPrompt 为追加贡献而非替换；插件不再接触 recompose（装配/命令注册零触发）；命令仅注册 mode/bench（DSH 扩展点）', () => {
     const systemPromptCalls: string[] = [];
     const contexts: Array<{ name: string; order: number; text: unknown }> = [];
     const registered: Array<{ name: string }> = [];
@@ -166,15 +166,17 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
         },
       },
       on: () => undefined,
-      agentPresets: { recompose },
     };
+    // ContextLike 已无 agentPresets 面（recompose 能力已从插件移除）——经宽化引用注入，断言插件零接触
+    (ctx as { agentPresets?: { recompose: typeof recompose } }).agentPresets = { recompose };
     apply(ctx, { bootstrap: false });
 
     // d. 仅调用 context()（additive section）；无 section()/替换型 API（若插件调用未定义方法会直接抛错）
     expect(systemPromptCalls).toEqual(['context']);
     expect(contexts[0]!.name).toBe('cognitive:projection');
     expect(typeof contexts[0]!.order).toBe('number');
-    // e. recompose 装配期不触发（仅 /mode 用户主动调用且限空白会话——DSH 原生重链，非 loop 重写）
+    // e. 插件不再接触 recompose：即使 ctx 提供 agentPresets.recompose，装配/命令注册也从未触发它
+    //   （recompose 能力整体移除；/mode = OMB 内部版本线切换，单模式）
     expect(recompose).not.toHaveBeenCalled();
     // f. 命令注册仅为 DSH 扩展点（mode/bench），无 loop 控制命令
     expect(registered.map((r) => r.name).sort()).toEqual(['bench', 'mode']);
