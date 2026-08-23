@@ -10,6 +10,7 @@
 //   ③ 三线真实分化：注入差异化适配器 → 三线 passed/cost 数字不同；与基线（回放）亦不同
 //   ④ 成本八字段实测记录（真实执行路径）
 //   ⑤ fail-loud：fixture 与 verifier 不匹配 → 抛错；adapter 抛错 → 传播
+//   ⑥ 输出预算：默认 maxTokens 提升至 8000（容纳推理+正文）与精简系统提示；opts.maxTokens 覆盖
 import { describe, expect, it } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -185,6 +186,33 @@ describe('④ 成本八字段实测（真实执行路径记录）', () => {
         'retrieval_calls',
         'tool_calls',
       ]);
+    });
+  });
+});
+
+describe('⑥ 输出预算：默认 maxTokens 提升至 8000（容纳推理+正文——4000 被 DSH 默认 high 推理吃光的修复）', () => {
+  it('makeRealExecutor 默认传 maxTokens=8000 与精简系统提示；opts.maxTokens 覆盖生效', async () => {
+    await withFixtures(async (dir) => {
+      const captured: Array<{ system?: string; maxTokens?: number }> = [];
+      const spy: ModelAdapter = {
+        provider: 'p',
+        model: 'm',
+        async generate(_prompt, genOpts = {}): Promise<ModelGenerateResult> {
+          captured.push(genOpts);
+          return { text: JSON.stringify({ answer: 42 }), usage: { inputTokens: 1, outputTokens: 1 } };
+        },
+      };
+      const executor = makeRealExecutor(spy, { fixturesDir: dir });
+      const r = await executor(exactTask);
+      expect(r.passed).toBe(true);
+      // 输出预算须容纳推理+正文：默认 8000（4000 被 high 推理吃光 → text 零输出的实测根因）
+      expect(captured[0]!.maxTokens).toBe(8000);
+      // 系统提示克制地加一句「不要长推理」
+      expect(captured[0]!.system).toContain('不要长推理');
+      // 显式 maxTokens 覆盖默认（预算面可调）
+      const overridden = makeRealExecutor(spy, { fixturesDir: dir, maxTokens: 16000 });
+      await overridden(exactTask);
+      expect(captured[1]!.maxTokens).toBe(16000);
     });
   });
 });

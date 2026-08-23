@@ -263,6 +263,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         const provider = config.model?.provider;
         const model = config.model?.model;
         if (llm !== undefined && provider !== undefined && provider.length > 0 && model !== undefined && model.length > 0) {
+          // reasoningEffort 不显式传 → createDshModelAdapter 吃默认 'low'（显式控制推理预算，
+          // 防止 llm-deepseek 默认 high 的推理吃光输出预算——真实 /bench maxTokens=4000 被吃光的根因；
+          // 基准/生成调用默认 low 即够）。TODO(config): 如需 per-model 推理档位，可从
+          // agent.cordis.yml config.model 扩展读取（本处不改配置文件）。
           modelAdapter = createDshModelAdapter(llm, { provider, model });
         }
       }

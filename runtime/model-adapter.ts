@@ -21,6 +21,8 @@ export interface LlmStreamOptionsLike {
   system?: string;
   temperature?: number;
   maxTokens?: number;
+  /** DSH GenerateOptions.reasoningEffort（llm/types.ts:346；合法值以 llm-deepseek 契约为准：off|low|high|max） */
+  reasoningEffort?: 'off' | 'low' | 'high' | 'max';
 }
 
 /** DSH LlmRuntime.stream 的最小结构接口（AsyncIterable<StreamChunk-like>） */
@@ -28,10 +30,17 @@ export interface LlmStreamLike {
   stream(options: LlmStreamOptionsLike): AsyncIterable<unknown>;
 }
 
-/** 装配参数：provider 路由 + model id */
+/** 装配参数：provider 路由 + model id + 推理档位（可选，默认 low） */
 export interface DshModelAdapterOptions {
   provider: string;
   model: string;
+  /**
+   * 推理档位（DSH GenerateOptions.reasoningEffort，合法值 'off'|'low'|'high'|'max'）。
+   * 默认 'low'：显式控制推理预算，防止小 maxTokens 被推理吃光——真实 /bench 实测
+   * maxTokens=4000 被 llm-deepseek 默认 high 的推理吃光、text 零输出（research-03
+   * raw_text 全空、model_tokens=4012）。基准/生成调用默认 low 即够，需要深度推理时可配 high/max。
+   */
+  reasoningEffort?: 'off' | 'low' | 'high' | 'max';
 }
 
 /**
@@ -39,6 +48,7 @@ export interface DshModelAdapterOptions {
  * 流抛错或 finish reason=error/aborted → reject（模型调用失败显式化）。
  */
 export function createDshModelAdapter(llm: LlmStreamLike, opts: DshModelAdapterOptions): ModelAdapter {
+  const reasoningEffort = opts.reasoningEffort ?? 'low';
   return {
     provider: opts.provider,
     model: opts.model,
@@ -50,6 +60,9 @@ export function createDshModelAdapter(llm: LlmStreamLike, opts: DshModelAdapterO
         ...(genOpts.system === undefined ? {} : { system: genOpts.system }),
         ...(genOpts.temperature === undefined ? {} : { temperature: genOpts.temperature }),
         ...(genOpts.maxTokens === undefined ? {} : { maxTokens: genOpts.maxTokens }),
+        // 始终显式传推理档位（调用未指定 → 工厂默认 'low'）：不依赖 llm-deepseek 默认 high，
+        // 防止推理独占输出预算；genOpts 显式指定（如 high/max）则覆盖。
+        reasoningEffort: genOpts.reasoningEffort ?? reasoningEffort,
       });
       let text = '';
       let sawDelta = false;

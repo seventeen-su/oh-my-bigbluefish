@@ -23,7 +23,7 @@ import {
   ProcessGenerator,
   type WorkingState,
 } from '../../runtime/generator.js';
-import { createDshModelAdapter, type LlmStreamLike } from '../../runtime/model-adapter.js';
+import { createDshModelAdapter, type LlmStreamLike, type LlmStreamOptionsLike } from '../../runtime/model-adapter.js';
 import { createCognitiveRuntime } from '../../runtime/assembly.js';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
 import type { ModelAdapter, ModelGenerateResult } from '../../kernel/schemas/model-adapter.js';
@@ -225,6 +225,27 @@ describe('⑧ createDshModelAdapter（DSH LlmRuntime.stream 结构最小接口�
     };
     const adapter = createDshModelAdapter(llm, { provider: 'p', model: 'm' });
     expect((await adapter.generate('x')).text).toBe('FALLBACK');
+  });
+
+  it('reasoningEffort 默认 low 且透传到 llm.stream 选项；工厂/调用显式指定则覆盖', async () => {
+    const captured: LlmStreamOptionsLike[] = [];
+    const llm: LlmStreamLike = {
+      stream: async function* (options: LlmStreamOptionsLike) {
+        captured.push(options);
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    // 未配置 → 默认 'low'（显式传档位，不依赖 llm-deepseek 默认 high——4000 被推理吃光的根因）
+    const adapter = createDshModelAdapter(llm, { provider: 'deepseek', model: 'deepseek-chat' });
+    await adapter.generate('hi');
+    expect(captured[0]!.reasoningEffort).toBe('low');
+    // 工厂级显式档位 → 覆盖默认
+    const adapterHigh = createDshModelAdapter(llm, { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' });
+    await adapterHigh.generate('hi');
+    expect(captured[1]!.reasoningEffort).toBe('high');
+    // 调用级显式档位 → 覆盖工厂默认
+    await adapter.generate('hi', { reasoningEffort: 'max' });
+    expect(captured[2]!.reasoningEffort).toBe('max');
   });
 });
 

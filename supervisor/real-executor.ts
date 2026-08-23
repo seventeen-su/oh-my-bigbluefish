@@ -23,10 +23,16 @@ import {
 
 /** 真实执行系统提示（要求 JSON 输出；非结构化场景可给文本） */
 const REAL_EXEC_SYSTEM =
-  '你是 OMB v2 基准执行器。完成任务：能结构化则输出 JSON（无解释），否则直接给出结果文本。';
+  '你是 OMB v2 基准执行器。完成任务：能结构化则输出 JSON（无解释），否则直接给出结果文本。不要长推理，直接给出答案。';
 
-/** 真实执行单次输出上限 */
-const REAL_EXEC_MAX_TOKENS = 4000;
+/**
+ * 真实执行单次输出上限（输出预算须容纳推理+正文：真实 /bench 实测 4000 被 DSH 默认
+ * reasoningEffort=high 的推理吃光——research-03 raw_text 全空、model_tokens=4012；
+ * 装配端已显式传 reasoningEffort=low（runtime/model-adapter.ts 默认），此处 8000 =
+ * 正文 4000 + 推理余量双保险。DSH 契约无显式上限（GenerateOptions.maxTokens?: number，
+ * llm/types.ts:358；llm-deepseek 默认 256_000，adapter.ts:101），8000 远低于默认值）。
+ */
+const REAL_EXEC_MAX_TOKENS = 8000;
 
 // ---- 提示构造 / 输出解析（纯函数） ----
 
