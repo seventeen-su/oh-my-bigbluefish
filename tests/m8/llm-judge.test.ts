@@ -3,8 +3,9 @@
 // 严格 TDD：本文件先于实现编写并确认失败（功能缺失）。
 // 覆盖：
 //   ① judgeBlind：fake adapter 返回结构化评分 JSON → 过 BlindJudgeScoreSchema（维度 + 证据引用）
-//   ② judgeBlind：非 JSON / schema 不过 / task_id 串任务 → fail-loud
-//   ③ buildJudgePrompt 含 rubric 与 output（盲评：judge 不见答案）
+//   ② judgeBlind：非 JSON / schema 不过 → fail-loud（盲化后 prompt 不含任务 id，模型无需回显——
+//      串任务防护随盲化移除，task_id 为可选自标字段，缺失/任意值均合法）
+//   ③ buildJudgePrompt 含 rubric 与 output（盲评：judge 不见答案；P4 盲化：不含任务 id/候选身份）
 //   ④ runBenchWithJudges：规则占位 + LLM judge 并存可对照（同任务两 judge 结果都记录；
 //      blind_judge 任务 llm 非空；非 blind_judge 任务 llm=null）
 //   ⑤ 无 judge 注入 → llm=null（离线规则化占位仍是默认）
@@ -109,13 +110,15 @@ describe('① judgeBlind：结构化评分（rubric 维度 + 证据引用，sche
     expect(score.evidence.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('buildJudgePrompt：含 task prompt、output 与 rubric（盲评：judge 只见输出不见参考答案）', async () => {
+  it('buildJudgePrompt：含 task prompt、output 与 rubric；不含任务 id（P4 盲化：judge 不知候选身份）', async () => {
     const adapter = recordingAdapter();
     const fixture = blindFixture();
     await judgeBlind(adapter, blindTask(), '候选输出文本', fixture);
     const prompt = adapter.prompts[0]!;
     const parsed = JSON.parse(prompt) as Record<string, unknown>;
-    expect(parsed.task_id).toBe('bench:judge');
+    // 盲化钉住（§7.1）：prompt 只含任务要求/rubric/输出文本——任务 id 不泄漏（id 不在 prompt/output 中）
+    expect(parsed.task_id).toBeUndefined();
+    expect(prompt).not.toContain('bench:judge');
     expect(parsed.prompt).toContain('评估');
     expect(parsed.output).toBe('候选输出文本');
     expect(parsed.rubric).toEqual(fixture.rubric);
@@ -136,11 +139,15 @@ describe('② judgeBlind：非法评分 fail-loud', () => {
     await expect(judgeBlind(adapter, blindTask(), 'x', blindFixture())).rejects.toThrow();
   });
 
-  it('task_id 与任务不符（串任务）→ 抛错', async () => {
+  it('模型评分缺 task_id → 接受（盲化后 prompt 不含任务 id，模型无需回显；task_id 可选自标字段）', async () => {
+    const rest = JSON.parse(scoreJson()) as Record<string, unknown>;
+    delete rest.task_id;
     const adapter = judgeAdapter({
-      generate: async () => ({ text: scoreJson({ task_id: 'bench:other' }) }),
+      generate: async () => ({ text: JSON.stringify(rest) }),
     });
-    await expect(judgeBlind(adapter, blindTask(), 'x', blindFixture())).rejects.toThrow(/task_id|串/);
+    const score = await judgeBlind(adapter, blindTask(), 'x', blindFixture());
+    expect(score.verdict).toBe(true);
+    expect(score.task_id).toBeUndefined();
   });
 });
 

@@ -313,6 +313,24 @@ export function renderMarkdown(
       lines.push(`| ${line} | ${s.passed}/${s.total} | ${pct(s.rate)} | ${s.realCount}/${s.replayCount} | ${costs} |`);
     }
     lines.push('');
+    // P4：judge 对照子段（D6 全任务双判；judge 仅旁证不作晋升硬信号——架构 §7.1 / P1e 门禁）
+    const judgeLines = BENCH_LINES.filter(
+      (l) => opts.v2!.byLine[l].judgeRun > 0 || opts.v2!.byLine[l].judgeDegraded > 0,
+    );
+    if (judgeLines.length > 0) {
+      lines.push('### 7.1 judge 对照（全任务双判，D6；judge 仅旁证，不作晋升硬信号——架构 §7.1 / P1e 门禁）');
+      lines.push('');
+      lines.push('| 线 | 判词/real任务 | 降级 | pass | fail | unknown | 双判一致率 | judge model_tokens 均值 | judge latency 均值 |');
+      lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+      for (const line of judgeLines) {
+        const s = opts.v2!.byLine[line];
+        const judged = s.judgeRun + s.judgeDegraded;
+        lines.push(
+          `| ${line} | ${s.judgeRun}/${judged} | ${s.judgeDegraded} | ${s.judgePass} | ${s.judgeFail} | ${s.judgeUnknown} | ${pct(s.judgeRate)} | ${fmt1(s.judgeTokensMean)} | ${fmt1(s.judgeLatencyMean)} |`,
+        );
+      }
+      lines.push('');
+    }
   }
   return lines.join('\n');
 }
@@ -383,7 +401,7 @@ export async function ensureBenchReports(dir: string): Promise<BenchReport[]> {
 /** v2 明细文件名匹配（<mode>-v2-<line>-<ts>.jsonl；line 限定四线） */
 const V2_DETAIL_FILE_RE = /^(replay|real)-v2-(initial|stable|latest|baseline)-.+\.jsonl$/;
 
-/** 单线 v2 汇总：passed/total/rate + real/replay 记录数 + 八字段成本均值 */
+/** 单线 v2 汇总：passed/total/rate + real/replay 记录数 + 八字段成本均值 + P4 judge 对照（D6 双判） */
 export interface BenchV2LineStats {
   passed: number;
   total: number;
@@ -391,6 +409,16 @@ export interface BenchV2LineStats {
   realCount: number;
   replayCount: number;
   costMean: Record<CostField, number>;
+  // P4：judge 对照（仅 real 记录计判词——judge 仅真实执行路径；replay 无 judge 是设计，不计降级）
+  judgeRun: number; // 有判词（judge 非 null）的 real 记录数
+  judgeDegraded: number; // real 记录 judge=null（失败/超时/无模型降级）数
+  judgePass: number;
+  judgeFail: number;
+  judgeUnknown: number;
+  judgeAgree: number; // 双判一致（规则 passed ↔ judge pass；规则失败 ↔ judge fail；unknown 不计）
+  judgeRate: number; // 双判一致率 = agree / (pass + fail)；无 decisive 判词 → 0
+  judgeTokensMean: number; // judge model_tokens 均值（有 cost 判词）
+  judgeLatencyMean: number; // judge latency_ms 均值（有 cost 判词）
 }
 
 /** v2 明细聚合结果（present=false → 目录无 v2 明细文件） */
@@ -409,6 +437,15 @@ function emptyV2LineStats(): BenchV2LineStats {
     realCount: 0,
     replayCount: 0,
     costMean: Object.fromEntries(COST_FIELDS.map((f) => [f, 0])) as Record<CostField, number>,
+    judgeRun: 0,
+    judgeDegraded: 0,
+    judgePass: 0,
+    judgeFail: 0,
+    judgeUnknown: 0,
+    judgeAgree: 0,
+    judgeRate: 0,
+    judgeTokensMean: 0,
+    judgeLatencyMean: 0,
   };
 }
 
@@ -425,7 +462,8 @@ function emptyV2DetailSummary(): BenchV2DetailSummary {
 }
 
 /**
- * 聚合 v2 明细 JSONL：按线汇总 passed/total + 成本字段均值（real/replay 记录数分列）。
+ * 聚合 v2 明细 JSONL：按线汇总 passed/total + 成本字段均值（real/replay 记录数分列）+
+ * P4 judge 对照（判词/降级/pass/fail/unknown/双判一致率/judge 成本均值；仅 real 记录计判词）。
  * 非破坏性读取：文件/单条记录不可读 → 跳过（同 summarizeEvolution 容错风格，不中断复盘）。
  */
 export async function summarizeV2Detail(dir: string): Promise<BenchV2DetailSummary> {
@@ -444,6 +482,10 @@ export async function summarizeV2Detail(dir: string): Promise<BenchV2DetailSumma
   const costSums = Object.fromEntries(
     BENCH_LINES.map((l) => [l, Object.fromEntries(COST_FIELDS.map((f) => [f, 0]))]),
   ) as Record<BenchLine, Record<CostField, number>>;
+  // P4：judge 成本累加（单列；按线）
+  const judgeCostSums = Object.fromEntries(
+    BENCH_LINES.map((l) => [l, { tokens: 0, latency: 0, count: 0 }]),
+  ) as Record<BenchLine, { tokens: number; latency: number; count: number }>;
   let records = 0;
   for (const file of v2Files) {
     const match = V2_DETAIL_FILE_RE.exec(file);
@@ -497,6 +539,43 @@ export async function summarizeV2Detail(dir: string): Promise<BenchV2DetailSumma
           costSums[line]![field] += value;
         }
       }
+      // P4：judge 段聚合（D6 双判）——real 记录计判词/降级；replay 无 judge 是设计，不计降级
+      const judge = rec.judge;
+      if (judge !== null && typeof judge === 'object' && !Array.isArray(judge)) {
+        const j = judge as Record<string, unknown>;
+        if (
+          typeof j.verdict === 'string' &&
+          (j.verdict === 'pass' || j.verdict === 'fail' || j.verdict === 'unknown')
+        ) {
+          stats.judgeRun++;
+          if (j.verdict === 'pass') {
+            stats.judgePass++;
+            if (rec.passed === true) {
+              stats.judgeAgree++;
+            }
+          } else if (j.verdict === 'fail') {
+            stats.judgeFail++;
+            if (rec.passed === false) {
+              stats.judgeAgree++;
+            }
+          } else {
+            stats.judgeUnknown++;
+          }
+          const jc = j.cost;
+          if (jc !== null && typeof jc === 'object' && !Array.isArray(jc)) {
+            const jCost = jc as Record<string, unknown>;
+            if (typeof jCost.model_tokens === 'number') {
+              judgeCostSums[line]!.tokens += jCost.model_tokens;
+            }
+            if (typeof jCost.latency_ms === 'number') {
+              judgeCostSums[line]!.latency += jCost.latency_ms;
+            }
+            judgeCostSums[line]!.count++;
+          }
+        }
+      } else if (mode === 'real') {
+        stats.judgeDegraded++; // real 记录 judge=null → 降级
+      }
       records++;
     }
   }
@@ -506,6 +585,11 @@ export async function summarizeV2Detail(dir: string): Promise<BenchV2DetailSumma
     for (const field of COST_FIELDS) {
       stats.costMean[field] = stats.total === 0 ? 0 : costSums[line]![field] / stats.total;
     }
+    const decisive = stats.judgePass + stats.judgeFail;
+    stats.judgeRate = decisive === 0 ? 0 : stats.judgeAgree / decisive;
+    const jc = judgeCostSums[line]!;
+    stats.judgeTokensMean = jc.count === 0 ? 0 : jc.tokens / jc.count;
+    stats.judgeLatencyMean = jc.count === 0 ? 0 : jc.latency / jc.count;
   }
   return { present: v2Files.length > 0, files: v2Files.length, records, byLine };
 }

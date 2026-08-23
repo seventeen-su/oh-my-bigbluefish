@@ -9,6 +9,8 @@
 //   ⑤ 报告幂等：同数据跑两次 → 同报告内容（确定性）
 //   ⑥ 参数标定建议：预置数据 → 建议文本含数据依据（非凭空数字；全零成本 → 不产出凭空建议）
 //   ⑦ v2 明细聚合（T2.3）：replay-v2-*/real-v2-*.jsonl 按线汇总 + renderMarkdown v2 段 + CLI 端到端；v1 路径可用
+//   ⑧ P4 judge 段聚合（D6 全任务双判）：summarizeV2Detail 判词/降级/pass/fail/unknown/一致率/成本均值；
+//      renderMarkdown v2 段含 judge 对照子表；CLI 控制台含 judge 摘要
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -101,6 +103,44 @@ async function writeBenchV2Data(dir: string): Promise<void> {
   await writeFile(join(dir, 'replay-v2-initial-2026-08-23T00-00-00-000Z.jsonl'), `${initial}\n`, 'utf8');
   await writeFile(join(dir, 'real-v2-stable-2026-08-23T00-00-00-000Z.jsonl'), `${stableReal}\n`, 'utf8');
   await writeFile(join(dir, 'replay-v2-stable-2026-08-23T00-00-00-000Z.jsonl'), `${stableReplay}\n`, 'utf8');
+}
+
+/**
+ * 预置含 judge 段的 v2 明细 JSONL（P4/D6 全任务双判）：
+ * - real-v2-stable-*：4 条——pass（规则过，judge cost 40/12）+ fail（规则败，cost 60/18）+
+ *   unknown（规则过，cost 50/15）+ null（judge 降级）→ stable judgeRun=3、degraded=1、agree=2、
+ *   rate=1、tokens 均值 50、latency 均值 15；
+ * - replay-v2-initial-*：1 条 judge=null（回放无 judge，不计降级）。
+ */
+async function writeBenchV2JudgeData(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const record = (
+    line: BenchLine,
+    mode: string,
+    passed: boolean,
+    judge: unknown,
+  ): string =>
+    JSON.stringify({
+      ts: 1780000000000,
+      task_id: 'data-01',
+      mode,
+      line,
+      passed,
+      verifier_kind: 'exact',
+      failure_reason: passed ? null : 'exact: 输出与 expected 不一致',
+      output: { users: [] },
+      cost: cost({ model_tokens: passed ? 100 : 50 }),
+      judge,
+    });
+  const stable = [
+    record('stable', 'real', true, { verdict: 'pass', reason: '一致', cost: { model_tokens: 40, latency_ms: 12 } }),
+    record('stable', 'real', false, { verdict: 'fail', reason: '不一致', cost: { model_tokens: 60, latency_ms: 18 } }),
+    record('stable', 'real', true, { verdict: 'unknown', cost: { model_tokens: 50, latency_ms: 15 } }),
+    record('stable', 'real', true, null),
+  ].join('\n');
+  const initial = record('initial', 'replay', true, null);
+  await writeFile(join(dir, 'real-v2-stable-2026-08-23T00-00-00-000Z.jsonl'), `${stable}\n`, 'utf8');
+  await writeFile(join(dir, 'replay-v2-initial-2026-08-23T00-00-00-000Z.jsonl'), `${initial}\n`, 'utf8');
 }
 
 /** spawn 脚本（node --import tsx，tsx 为 devDep；cwd = preset 根保证 tsx 可解析） */
@@ -394,6 +434,65 @@ describe('⑦ v2 明细聚合（summarizeV2Detail + renderMarkdown v2 段；v1 �
       const content = await readReport(dir);
       expect(content).toContain('## 7. v2 契约基准');
       expect(content).toContain('| stable | 1/2 | 50.0% | 1/1 |');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- ⑧ P4 judge 段聚合（D6 全任务双判；judge 仅旁证不作晋升硬信号——§7.1 / P1e 门禁） ----
+
+describe('⑧ v2 明细 judge 段聚合（summarizeV2Detail + renderMarkdown judge 子表 + CLI 摘要）', () => {
+  it('summarizeV2Detail：判词/降级/pass/fail/unknown/双判一致率/judge 成本均值', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omb-br-v2-judge-'));
+    try {
+      await writeBenchV2JudgeData(dir);
+      const s = await summarizeV2Detail(dir);
+      const st = s.byLine.stable;
+      // real 4 条：pass（规则过）+ fail（规则败）+ unknown（规则过）+ null（judge 降级）
+      expect(st.judgeRun).toBe(3);
+      expect(st.judgeDegraded).toBe(1);
+      expect(st.judgePass).toBe(1);
+      expect(st.judgeFail).toBe(1);
+      expect(st.judgeUnknown).toBe(1);
+      expect(st.judgeAgree).toBe(2); // pass↔规则过 + fail↔规则败
+      expect(st.judgeRate).toBe(1); // 2/2 decisive 全一致
+      expect(st.judgeTokensMean).toBe(50); // (40+60+50)/3
+      expect(st.judgeLatencyMean).toBe(15); // (12+18+15)/3
+      // replay 记录 judge=null → 不计降级（回放无 judge 是设计，非降级）
+      expect(s.byLine.initial.judgeRun).toBe(0);
+      expect(s.byLine.initial.judgeDegraded).toBe(0);
+      // 无 judge 记录的线全零
+      expect(s.byLine.latest.judgeRun).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('renderMarkdown v2 段含 judge 对照子表（判词/real任务、降级、分布、一致率、成本均值）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omb-br-v2-judge-md-'));
+    try {
+      await writeBenchV2JudgeData(dir);
+      const v2 = await summarizeV2Detail(dir);
+      const md = renderMarkdown(summarizeReports(allPassReports()), { date: '2026-08-23', benchDir: dir, v2 });
+      expect(md).toContain('judge 对照');
+      expect(md).toContain('| stable | 3/4 | 1 | 1 | 1 | 1 | 100.0% | 50 | 15 |');
+      // 无 judge 记录的线（initial/latest/baseline）不渲染 judge 行
+      expect(md).not.toMatch(/\| initial \| 0\/0 \| 0 \| 0 \| 0 \| 0 \|/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CLI 端到端：注入含 judge 段 JSONL → 控制台含 judge 摘要（判词/降级）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omb-br-v2-judge-cli-'));
+    try {
+      await writeBenchData(dir, allPassReports());
+      await writeBenchV2JudgeData(dir);
+      const { code, stdout } = await runCli(['--dir', dir], PRESET_ROOT);
+      expect(code).toBe(0);
+      expect(stdout).toContain('judge');
+      expect(stdout).toContain('3 判词 / 1 降级');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

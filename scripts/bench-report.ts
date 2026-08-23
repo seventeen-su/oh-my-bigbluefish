@@ -72,6 +72,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         console.log(`  v2 ${line}: ${s.passed}/${s.total} (${pct(s.rate)})`);
       }
     }
+    // P4：judge 对照摘要（D6 全任务双判；判词/降级/一致率——judge 仅旁证不作晋升硬信号）
+    for (const line of ['initial', 'stable', 'latest', 'baseline'] as const) {
+      const s = v2.byLine[line];
+      if (s.judgeRun + s.judgeDegraded > 0) {
+        console.log(
+          `  v2 ${line} judge：${s.judgeRun} 判词 / ${s.judgeDegraded} 降级（pass ${s.judgePass} / fail ${s.judgeFail} / unknown ${s.judgeUnknown}，双判一致率 ${pct(s.judgeRate)}）`,
+        );
+      }
+    }
   }
   if (summary.calibration.length > 0) {
     console.log(

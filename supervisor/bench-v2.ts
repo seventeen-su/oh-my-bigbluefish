@@ -13,10 +13,12 @@ import {
   BenchFixtureV2Schema,
   BenchLineSchema,
   CognitiveCostSchema,
+  JudgeVerdictSchema,
   type BenchContractV2,
   type BenchFixtureV2,
   type BenchLine,
   type CognitiveCost,
+  type JudgeVerdict,
   type OutputFieldV2,
   type OutputSchemaV2,
 } from '../kernel/schemas/bench.js';
@@ -284,26 +286,127 @@ export function makeReplayExecutorV2(fixtures: readonly BenchFixtureV2[]): Bench
   };
 }
 
-/** 单任务 v2 结果（task_id/line/passed/cost 与 v1 BenchResult 同构） */
+/** 单任务 v2 结果（task_id/line/passed/cost 与 v1 BenchResult 同构；P4 增 judge 判词并存） */
 export interface BenchV2Result {
   task_id: string;
   line: BenchLine;
   passed: boolean;
   cost: CognitiveCost;
+  /** P4：LLM judge 判词（D6 双判；未注入/回放模式/失败降级 → null） */
+  judge: JudgeVerdict | null;
 }
 
-/** v2 运行汇总（{line, results, total/passed}） */
+/**
+ * P4：v2 双判汇总（D6 全任务双判；judge 仅旁证不作晋升硬信号——架构 §7.1 / P1e 门禁）。
+ * - enabled：judge 注入且 real 模式（本运行执行双判）；
+ * - run/degraded：有判词（非 null）任务数 / judge 降级（异常/超时/非法判词 → null）任务数；
+ * - pass/fail/unknown：判词分布（unknown = 模型无法判定，合法判词非降级）；
+ * - agree/rate：双判一致（规则 passed ↔ judge pass；规则失败 ↔ judge fail；unknown 不计）与一致率；
+ * - cost_mean：judge 成本均值（model_tokens/latency_ms 单列；无 cost 判词 → null）。
+ */
+export interface BenchV2JudgeSummary {
+  enabled: boolean;
+  run: number;
+  degraded: number;
+  pass: number;
+  fail: number;
+  unknown: number;
+  agree: number;
+  rate: number;
+  cost_mean: { model_tokens: number; latency_ms: number } | null;
+}
+
+/** v2 运行汇总（{line, results, total/passed, judge}） */
 export interface BenchV2Report {
   line: BenchLine;
   results: BenchV2Result[];
   total: number;
   passed: number;
+  judge: BenchV2JudgeSummary;
+}
+
+/** P4：judge 注入面（D6 全任务双判）——每任务规则判定（verifyV2）后调用；null = 无 judge/失败降级 */
+export type JudgeFnV2 = (
+  task: BenchContractV2,
+  fixture: BenchFixtureV2,
+  output: unknown,
+  rawText?: string,
+) => Promise<JudgeVerdict | null>;
+
+/** 单任务 judge 执行（防御）：judge 抛错 / 返回非法判词 → null（降级；规则判定不受影响） */
+async function runJudgeForTask(
+  judge: JudgeFnV2,
+  contract: BenchContractV2,
+  fixture: BenchFixtureV2,
+  output: unknown,
+  rawText: string | undefined,
+): Promise<JudgeVerdict | null> {
+  try {
+    const verdict = await judge(contract, fixture, output, rawText);
+    return JudgeVerdictSchema.safeParse(verdict).success ? verdict : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 双判汇总（纯函数：由逐任务 judge 结果聚合；judge 未启用 → 全零 + enabled=false） */
+function summarizeJudge(judgeEnabled: boolean, results: readonly BenchV2Result[]): BenchV2JudgeSummary {
+  const summary: BenchV2JudgeSummary = {
+    enabled: judgeEnabled,
+    run: 0,
+    degraded: 0,
+    pass: 0,
+    fail: 0,
+    unknown: 0,
+    agree: 0,
+    rate: 0,
+    cost_mean: null,
+  };
+  let tokens = 0;
+  let latency = 0;
+  let costCount = 0;
+  for (const r of results) {
+    const judge = r.judge;
+    if (judge === null) {
+      if (judgeEnabled) {
+        summary.degraded++;
+      }
+      continue;
+    }
+    summary.run++;
+    if (judge.verdict === 'pass') {
+      summary.pass++;
+      if (r.passed) {
+        summary.agree++;
+      }
+    } else if (judge.verdict === 'fail') {
+      summary.fail++;
+      if (!r.passed) {
+        summary.agree++;
+      }
+    } else {
+      summary.unknown++;
+    }
+    if (judge.cost !== undefined) {
+      tokens += judge.cost.model_tokens;
+      latency += judge.cost.latency_ms;
+      costCount++;
+    }
+  }
+  const decisive = summary.pass + summary.fail;
+  summary.rate = decisive === 0 ? 0 : summary.agree / decisive;
+  summary.cost_mean = costCount === 0 ? null : { model_tokens: tokens / costCount, latency_ms: latency / costCount };
+  return summary;
 }
 
 /**
  * v2 基准运行（单线）：契约逐个过 schema（fail-loud）→ executor 逐任务执行 → verifyV2 判定 →
- * CognitiveCost 记录 → 汇总 {line, results, total/passed}；persistDir 时逐任务 JSONL 落盘
+ * CognitiveCost 记录 → 汇总 {line, results, total/passed, judge}；persistDir 时逐任务 JSONL 落盘
  * （文件名 replay-v2-<line>-<ts>.jsonl / real-v2-<line>-<ts>.jsonl，同 v1 风格）。
+ * P4（D6 全任务双判）：judge 注入且 mode='real' → 每任务规则判定（verifyV2）+ judge 判定并存
+ * （20 任务全部 judge——exact/tests/state_assert 与 predicate/blind_judge 的判据构造见
+ * supervisor/judge.ts buildJudgePromptV2）；judge 失败/超时/无模型 → 该任务 judge=null（规则判定
+ * 照常，report.judge.degraded 计数）；回放模式（mode='replay'）无 judge（回放产物无评判意义）。
  */
 export async function runBenchV2(opts: {
   contracts: readonly BenchContractV2[];
@@ -314,6 +417,8 @@ export async function runBenchV2(opts: {
   mode?: 'real' | 'replay';
   /** 明细落盘目录（可选）；缺省不落盘 */
   persistDir?: string;
+  /** P4：LLM judge 注入面（D6 全任务双判）——仅 mode='real' 时逐任务调用；null=无 judge/失败降级 */
+  judge?: JudgeFnV2;
 }): Promise<BenchV2Report> {
   const line = BenchLineSchema.parse(opts.line);
   const contracts = opts.contracts.map((contract) => BenchContractV2Schema.parse(contract));
@@ -324,6 +429,8 @@ export async function runBenchV2(opts: {
   }
   const fixtureById = new Map(fixtures.map((fixture): [string, BenchFixtureV2] => [fixture.task_id, fixture]));
   const mode = opts.mode ?? 'replay';
+  // P4：judge 双判仅真实执行路径启用（回放产物无评判意义；回放模式无 judge——D6）
+  const judgeEnabled = opts.judge !== undefined && mode === 'real';
   const persistFile = opts.persistDir === undefined
     ? undefined
     : join(opts.persistDir, `${mode}-v2-${line}-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
@@ -353,7 +460,11 @@ export async function runBenchV2(opts: {
     }
     const verdict =
       parseError === undefined ? verifyV2(contract, fixture, output) : { passed: false, reason: `parse: ${parseError}` };
-    results.push({ task_id: contract.id, line, passed: verdict.passed, cost });
+    // P4：judge 双判（仅 real 模式；失败/非法判词 → null 降级，规则判定照常）
+    const judge: JudgeVerdict | null = judgeEnabled
+      ? await runJudgeForTask(opts.judge!, contract, fixture, output, executed.rawText)
+      : null;
+    results.push({ task_id: contract.id, line, passed: verdict.passed, cost, judge });
     if (persistFile !== undefined) {
       const record = {
         ts: Date.now(),
@@ -366,12 +477,14 @@ export async function runBenchV2(opts: {
         output: executed.output,
         raw_text: executed.rawText,
         cost,
+        // P4：judge 段单列（判词 + 可选原因 + 成本；无 judge/降级 → null）
+        judge,
       };
       await appendFile(persistFile, `${JSON.stringify(record)}\n`, 'utf8');
     }
   }
   const passed = results.filter((result) => result.passed).length;
-  return { line, results, total: results.length, passed };
+  return { line, results, total: results.length, passed, judge: summarizeJudge(judgeEnabled, results) };
 }
 
 // ---- 数据加载（kernel/bench-tasks/v2/；非法契约/夹具 fail-loud） ----

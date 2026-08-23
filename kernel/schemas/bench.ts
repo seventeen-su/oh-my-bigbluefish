@@ -270,3 +270,26 @@ export const BenchFixtureV2Schema = z.object({
   output: z.unknown(),
 });
 export type BenchFixtureV2 = z.infer<typeof BenchFixtureV2Schema>;
+
+// ---- P4：judge 判定段（v2 双判对照；架构 §7.1 L3 语义层——judge 仅旁证、永不作晋升硬信号） ----
+
+export const JUDGE_VERDICTS = ['pass', 'fail', 'unknown'] as const;
+
+/**
+ * 单任务 LLM judge 判词（P4/D6 全任务双判）：
+ * - verdict：'pass' | 'fail' | 'unknown'（unknown = 模型无法判定——合法判词，非降级）；
+ * - reason：可选理由（模型输出）；
+ * - cost：judge 调用成本单列（model_tokens = usage input+output；latency_ms 计时）——
+ *   与执行成本（CognitiveCost）分离，JSONL 单列 judge 段（D6：judge 成本入 CognitiveCost 单列）。
+ */
+export const JudgeVerdictSchema = z.object({
+  verdict: z.enum(JUDGE_VERDICTS),
+  reason: z.string().optional(),
+  cost: z
+    .object({
+      model_tokens: z.number().int().nonnegative(),
+      latency_ms: z.number().nonnegative(),
+    })
+    .optional(),
+});
+export type JudgeVerdict = z.infer<typeof JudgeVerdictSchema>;

@@ -4,6 +4,8 @@
 // - /bench（T2.3 起默认 v2 契约基准）：注册 bench 命令；handler 默认走 supervisor/bench-v2.ts runBenchV2
 //  （20 契约 + 回放执行器，明细 replay-v2-<line>-<ts>.jsonl）；`config.benchVersion: 'v1'` 切回 legacy
 //  （supervisor/bench.ts runBench，明细 replay-<line>-<ts>.jsonl——v1 语义原样保留）。
+// - /bench × P4（D6 全任务双判）：modelAdapter 存在 → v2 分支注入 LLM judge（makeJudgeV2，同一 adapter
+//   ——exec 与 judge 双路调用；20 任务全部 judge）；无 modelAdapter → 回放无 judge（文本说明 + JSONL judge=null）。
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -12,6 +14,10 @@ import { join } from 'node:path';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
 import type { VersionLine } from '../../substrate/snapshot.js';
 import { clearDegradations, degradationLog } from '../../runtime/loop-hooks.js';
+import { loadBenchContractsV2 } from '../../supervisor/bench-v2.js';
+import { getReference } from '../../kernel/bench-tasks/reference/index.js';
+import type { ModelAdapter, ModelGenerateResult } from '../../kernel/schemas/model-adapter.js';
+import type { BenchContractV2 } from '../../kernel/schemas/bench.js';
 
 interface FakeSessionEvent {
   type?: string;
@@ -294,6 +300,75 @@ describe('T8.2 /bench 注册与触发', () => {
         pendingFiles = [];
       }
       expect(pendingFiles).toHaveLength(0);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('modelAdapter 存在 → v2 分支传 judge（真实模式 20 任务全部 judge 调用；JSONL 含 judge 段）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-judge-'));
+    try {
+      const contracts = await loadBenchContractsV2();
+      const byId = new Map(contracts.map((c): [string, BenchContractV2] => [c.id, c]));
+      const counter = { judgeCalls: 0 };
+      // 同一 adapter 双路：exec prompt（# 基准任务…）→ reference 输出（20/20）；judge prompt（JSON 对象）→ 判词
+      const adapter: ModelAdapter = {
+        provider: 'test',
+        model: 'fake-bench-judge',
+        async generate(prompt: string): Promise<ModelGenerateResult> {
+          if (prompt.trimStart().startsWith('{')) {
+            counter.judgeCalls++;
+            return { text: JSON.stringify({ verdict: 'pass', reason: 'ok' }), usage: { inputTokens: 5, outputTokens: 2 } };
+          }
+          const m = /^# 基准任务 (\S+)/m.exec(prompt);
+          const id = m?.[1];
+          const contract = id === undefined ? undefined : byId.get(id);
+          if (contract === undefined) {
+            throw new Error(`fake adapter: prompt 缺任务 id（${prompt.slice(0, 40)}…）`);
+          }
+          const expected = getReference(contract.id)(contract.input_artifacts);
+          return { text: JSON.stringify(expected), usage: { inputTokens: 10, outputTokens: 20 } };
+        },
+      };
+      const c = makeFakeCtx();
+      (c.ctx as { modelAdapter?: ModelAdapter }).modelAdapter = adapter;
+      apply(c.ctx, { benchPersistDir: join(base, 'bench'), bootstrap: false });
+
+      const r = await bench(c).handler(makeInvocation(''));
+      expect(r.kind).toBe('success');
+      expect(r.text).toContain('真实执行');
+      expect(r.text).toContain('judge'); // 文本含 judge 对照摘要
+      expect(counter.judgeCalls).toBe(20); // 全任务双判（D6）：20 任务全部 judge
+      // 落盘 real-v2-*.jsonl：逐条含 judge 段（判词非 null）
+      const files = readdirSync(join(base, 'bench'));
+      const file = files.find((f: string) => f.startsWith('real-v2-stable-') && f.endsWith('.jsonl'))!;
+      const lines = readFileSync(join(base, 'bench', file), 'utf8').trim().split('\n');
+      expect(lines).toHaveLength(20);
+      for (const l of lines) {
+        const rec = JSON.parse(l) as { judge: { verdict: string } | null };
+        expect(rec.judge).not.toBeNull();
+        expect(rec.judge!.verdict).toBe('pass');
+      }
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('无 modelAdapter → v2 回放 + 无 judge（文本说明 judge 未启用；JSONL 记录 judge=null）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-nojudge-'));
+    try {
+      const c = makeFakeCtx();
+      apply(c.ctx, { benchPersistDir: join(base, 'bench'), bootstrap: false });
+
+      const r = await bench(c).handler(makeInvocation(''));
+      expect(r.kind).toBe('success');
+      expect(r.text).toContain('回放执行');
+      expect(r.text).toContain('judge'); // 文本说明 judge 未启用（回放模式无 LLM judge）
+      const files = readdirSync(join(base, 'bench'));
+      const file = files.find((f: string) => f.startsWith('replay-v2-stable-') && f.endsWith('.jsonl'))!;
+      const first = readFileSync(join(base, 'bench', file), 'utf8').trim().split('\n')[0]!;
+      const rec = JSON.parse(first) as { judge: unknown };
+      expect(rec.judge).toBeNull();
     } finally {
       await rm(base, { recursive: true, force: true });
     }

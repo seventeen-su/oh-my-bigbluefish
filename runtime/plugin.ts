@@ -18,6 +18,7 @@ import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 import { loadBenchContractsV2, loadBenchFixturesV2, makeReplayExecutorV2, runBenchV2, type BenchExecutorV2 } from '../supervisor/bench-v2.js';
 import { makeRealExecutor, makeRealExecutorV2 } from '../supervisor/real-executor.js';
+import { makeJudgeV2 } from '../supervisor/judge.js';
 import { createCognitiveRuntime } from './assembly.js';
 import { registerKernTools, type KernStatusSummary, type ToolsLike } from './kern-tools.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
@@ -731,6 +732,13 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           const realV2 = modelAdapter !== undefined ? makeRealExecutorV2(modelAdapter) : undefined;
           const executor: BenchExecutorV2 =
             realV2 !== undefined ? (task) => realV2(task, fixtureById.get(task.id)!) : makeReplayExecutorV2(fixtures);
+          // P4（D6 全任务双判）：真实会话（modelAdapter 存在）→ 注入 LLM judge——与执行同一 modelAdapter
+          //（makeJudgeV2：judge 调用复用 generate，reasoningEffort=low / maxTokens=1000 默认合理值；
+          // judge 成本单列入 JSONL judge 段与 bench-report）；回放模式无 judge（回放产物无评判意义，
+          // 且 judge 成本无意义——文本说明）。
+          // 判定纪律：judge 仅旁证、永不作晋升硬信号（架构 §7.1；P1e 晋升门禁保持规则/基准判定——
+          // 本专项不改晋升逻辑，见 supervisor/judge.ts 头注释与 P1e）。
+          const judge = modelAdapter !== undefined ? makeJudgeV2(modelAdapter) : undefined;
           // 明细落盘（workspace/.omb/bench/<mode>-v2-<line>-<ts>.jsonl）：真实与回放分开记录（T8.18 归因）；
           // mode 仅标记不改变判定。
           const report = await runBenchV2({
@@ -740,11 +748,15 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
             executor,
             mode: modelAdapter !== undefined ? 'real' : 'replay',
             persistDir: resolveConfigPath(config.benchPersistDir) ?? BENCH_REPORTS_DIR,
+            judge,
           });
           const mode = modelAdapter !== undefined ? '真实执行' : '回放执行（无 DSH 会话，降级）';
+          const judgeText = report.judge.enabled
+            ? `；judge 对照（D6 全任务双判，仅旁证）：${report.judge.run}/${report.judge.run + report.judge.degraded} 判词（降级 ${report.judge.degraded}，双判一致率 ${(report.judge.rate * 100).toFixed(1)}%）`
+            : '；judge 对照：未启用（回放模式无 LLM judge）';
           return {
             kind: 'success',
-            text: `v2 契约基准完成：${report.line} ${report.passed}/${report.total} 通过（${report.total} 任务，${mode}；明细已落盘 workspace/.omb/bench）`,
+            text: `v2 契约基准完成：${report.line} ${report.passed}/${report.total} 通过（${report.total} 任务，${mode}${judgeText}；明细已落盘 workspace/.omb/bench）`,
           };
         }
         // v1 legacy 分支（benchVersion === 'v1'；原样保留 v1 全链路：supervisor/bench.ts runBench）
