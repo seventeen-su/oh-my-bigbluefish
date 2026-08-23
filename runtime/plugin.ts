@@ -11,7 +11,7 @@
 // M0：注册 /mode（handler 纯逻辑在 substrate/mode-command.ts）；T8.2：/mode 真实 recompose 接线
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
-import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, loadVersion, type VersionLine } from '../substrate/snapshot.js';
+import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, isVersionLine, loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
 import { bootStable } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
@@ -52,6 +52,9 @@ export interface PluginConfig {
   activationLogDir?: string;
   /** 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」；缺省 true；测试与手动控制用 bootstrap: false 关闭） */
   bootstrap?: boolean;
+  /** 固定初始版本线（缺省 stable；供 per-line 预设（omb-v2-<line>）固定本线——scripts/deploy-lines.ts
+   *  生成的三个 per-line 预设（omb-v2-initial/stable/latest）在 agent.cordis.yml 注入本配置） */
+  line?: VersionLine;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -270,8 +273,19 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   }
 
-  // 当前生效版本线（默认 stable，架构 §11.1）；recompose 失败/缺失时保持会话内状态
-  let current: VersionLine = 'stable';
+  // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（供 per-line 预设
+  // omb-v2-<line> 固定本线：/mode recompose 重链到该线预设后，本线初始版本线即生效）。
+  // 非法值 → 回退 stable 并记录降级（守卫式接入，不阻塞挂载）；recompose 失败/缺失时保持会话内状态。
+  const configuredLine: unknown = config.line;
+  let current: VersionLine;
+  if (isVersionLine(configuredLine)) {
+    current = configuredLine;
+  } else {
+    current = 'stable';
+    if (configuredLine !== undefined) {
+      recordDegradation('config/line', `非法 line 配置 "${String(configuredLine)}"（合法值 initial|stable|latest）——回退 stable`);
+    }
+  }
 
   /**
    * 版本线激活记录（T8.7 生产接线）：/mode 切换后调用。

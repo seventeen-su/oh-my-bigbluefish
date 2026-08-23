@@ -4,12 +4,14 @@
 //   ctx 无 agentPresets → 降级为会话内当前线状态（既有 m0 行为不变）。
 // - /bench：注册 bench 命令；handler 经 supervisor/bench.ts 真实 runBench（冻结基准集 20 任务，
 //   回放执行器）产出报告文本。
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
+import type { VersionLine } from '../../substrate/snapshot.js';
+import { clearDegradations, degradationLog } from '../../runtime/loop-hooks.js';
 
 interface FakeSessionEvent {
   type?: string;
@@ -215,5 +217,40 @@ describe('T8.2 /bench 注册与触发', () => {
     } finally {
       await rm(base, { recursive: true, force: true });
     }
+  });
+});
+
+describe('T8.30 config.line 固定初始版本线（三线部署接线：per-line 预设 omb-v2-<line> 注入本配置）', () => {
+  beforeEach(() => {
+    clearDegradations();
+  });
+
+  it('line: "latest" → apply 后 /mode 空输入返回「当前版本线：latest」（固定初始线生效）', async () => {
+    const c = makeFakeCtx({ noAgentPresets: true });
+    apply(c.ctx, { bootstrap: false, line: 'latest' });
+
+    const current = await mode(c).handler(makeInvocation(''));
+    expect(current.kind).toBe('success');
+    expect(current.text).toContain('当前版本线：latest');
+    expect(degradationLog().some((r) => r.hook === 'config/line')).toBe(false);
+  });
+
+  it('非法 line（如 "foo"）→ 回退 stable 且记录 config/line 降级', async () => {
+    const c = makeFakeCtx({ noAgentPresets: true });
+    // 模拟配置被写坏（非法 line 值）——运行时应回退 stable 并记录降级（守卫式接入，不阻塞挂载）
+    apply(c.ctx, { bootstrap: false, line: 'foo' as VersionLine });
+
+    const current = await mode(c).handler(makeInvocation(''));
+    expect(current.text).toContain('当前版本线：stable');
+    expect(degradationLog().some((r) => r.hook === 'config/line')).toBe(true);
+  });
+
+  it('line 缺省 → stable（既有行为不变，不记录 config/line 降级）', async () => {
+    const c = makeFakeCtx({ noAgentPresets: true });
+    apply(c.ctx, { bootstrap: false });
+
+    const current = await mode(c).handler(makeInvocation(''));
+    expect(current.text).toContain('当前版本线：stable');
+    expect(degradationLog().some((r) => r.hook === 'config/line')).toBe(false);
   });
 });
