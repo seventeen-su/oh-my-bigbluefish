@@ -1,6 +1,202 @@
-# OMB v2 preset 组合文件（DSH agent-presets 加载，顶层为插件行列表）。
-# 插件行用相对路径直指编译产物 JS（DSH 不 honor package.json exports，须指向具体文件，
-# 见 research-dsh.md §1.4）；编译：`pnpm build`（tsconfig.build.json → lib/）。
-# 本任务只注册 /mode 命令，不 publish 服务 → 无需 isolate 组（research-dsh.md §1.3）。
+# OMB v2 挂载组合（DSH agent-presets 加载，顶层为插件行列表）。
+# 预设 id = 目录名，须匹配 /^[a-z0-9][a-z0-9-]*$/；本项目目录即全小写合法 id：oh-my-bigbluefish。
+#
+# 组合依据（原架构意图，见 .omb/plans/2026-08-21-omb-v2-loop-integration.md §1/§4）：
+# OMB 是叠加在普通 DSH 会话之上的认知控制与状态层（无双 Loop：仅观察/注入/命令注册），
+# 承载会话应具备标准 DSH 智能体工具面——故本组合 = standard 预设的模型面行（工具/技能/
+# 目标/计划/压缩/委派/ask-user/todo/web，行结构与 isolate 组原样照抄）+ omb-v2 认知行。
+# 工具行不发布服务、无需 realm（standard 同款注释）；plan/compaction/delegation 组经
+# entry-local isolate realm 隔离，与其它 preset 的 standing mount 互不干扰。
+#
+# 行 name 相对本组合目录解析（插件内部 import 相对插件文件自身解析）→ 指向编译产物 lib/。
+# 认知装配：config.cognitiveRoot（相对 preset 根解析；events.db/memory.db 落此；bench 数据同处）+
+# config.model（/bench 真实执行；缺失 → 回放执行降级，文档化行为）。
+# 缓存说明：宿主 Node ESM 按 URL 缓存模块（进程内文件修改不会热重载）——修改 lib/ 下代码并
+# 重新 `pnpm build` 后，须递增行名尾缀 ?v=N（或重启宿主），新会话才会加载新代码。
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      你是运行在「大肥鱼模式 v2」（OMB v2 认知增强系统）下的智能体，基于 {{model}} 模型。
+      工作目录：{{cwd}}。系统会注入认知投影（governor 决策/记忆检索/工作状态），
+      提供 /mode（initial|stable|latest 三线版本切换）与 /bench（冻结基准）命令；
+      认知系统仅观察与注入，不接管 Agent Loop。
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+              You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+              Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+              The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+              Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+    - id: tool-subagent-codex
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: codex
+        toolName: subagent_codex
+        backgroundMode: one-shot
+        maxDepth: provider-managed
+
+    - id: tool-subagent-claude-code
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: claude-code
+        toolName: subagent_claude_code
+        backgroundMode: one-shot
+        maxDepth: provider-managed
+
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+
+# ── OMB v2 认知层 ───────────────────────────────────────────────────────────
+
 - id: omb-v2
-  name: './lib/runtime/plugin.js'
+  name: './lib/runtime/plugin.js?v=6'
+  config:
+    # 相对路径：相对 preset 根解析——迁移可移植，不绑定机器绝对路径
+    cognitiveRoot: 'workspace/.omb'
+    model:
+      provider: deepseek-official
+      model: deepseek-v4-flash
