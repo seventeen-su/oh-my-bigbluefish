@@ -83,4 +83,12 @@ export interface CandidateDraft {
   /** 来源信号 kind（corrections/oracle_fail/scope_miss/untrusted_object） */
   signal: string;
   change: CandidateChange;
+  /**
+   * 可选执行型验证脚本（P3 G3-exec）：.cjs 源码。宿主把脚本写入候选验证目录 verify.cjs
+   * （白名单固定名，仅候选目录内）后经 WRITE_RESTRICTED 受限通道执行（结果文件方案回传：
+   * 脚本写 OMB_SANDBOX_RESULT_FILE，宿主读——受限进程不能管道捕获孙进程输出）。
+   * 缺省 undefined = 无执行型验证内容（当前 L0 数据候选无脚本 → G3-exec N/A 标记；
+   * L1 代码候选未来复用）。
+   */
+  verify?: { script: string };
 }

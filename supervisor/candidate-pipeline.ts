@@ -3,10 +3,14 @@
 //
 // 内容：
 //   - validateDataCandidate：数据候选验证生产路径——G1（YAML + policy schema + 值域，zod fail-loud 转判定）
-//     → G2（数据候选 N/A，标记 skipped）→ G3（候选应用到临时目录（不可变物化副本 + diff 覆盖）→ 捆绑
-//     校验（supervisor 侧 loadPolicy 语义）→ 冻结基准回放 fitness（runBenchV2 回放执行器，passed 不降 +
-//     成本代理不显著劣化）→ 目录用后清理）→ G4（通过 G1+G3 → shadow exposure log 契约接线，
-//     .evolution/shadows/；真实放量依赖真实会话流量，文档化）。
+//     → G2（数据候选 N/A，标记 skipped）→ G3-replay（候选应用到临时目录（createCandidateDir 标准化
+//     候选验证环境 + diff 覆盖）→ 捆绑校验（supervisor 侧 loadPolicy 语义）→ 冻结基准回放 fitness
+//     （runBenchV2 回放执行器，passed 不降 + 成本代理不显著劣化）→ 目录用后清理）→ G3-exec（P3 执行型
+//     验证门：候选附执行型验证脚本（draft.verify，L0 数据候选无 → N/A 标记）→ 经 substrate/sandbox.ts
+//     WRITE_RESTRICTED 受限通道执行 + 结果文件方案回传（受限进程不能管道捕获孙进程输出）+ 沙盒语义
+//     写拒绝断言；受限通道不可用（koffi 缺失等）→ degraded 降级记录（D5），不阻塞门禁语义）→
+//     G4（通过 G1+G3 → shadow exposure log 契约接线，.evolution/shadows/；真实放量依赖真实会话
+//     流量，文档化）。
 //   - promoteDataCandidate：晋升与合并——临时 worktree（线工作副本）覆盖式 diff 提交（作者 OMB <omb@local>，
 //     消息 `evolve: <candidate_id> <motivation 摘要>`）→ 防误删检查（ls-tree/diff 比对，不删除其余文件）→
 //     `git update-ref refs/heads/trusted-latest` 原子推进（幂等键 candidate_id：同候选重复提交拒绝）→
@@ -24,6 +28,7 @@ import { basename, dirname, join } from 'node:path';
 import { load as parseYaml } from 'js-yaml';
 import { GIT_BIN, type VersionLayout } from '../substrate/snapshot.js';
 import { resolveLineCommit } from '../substrate/lines.js';
+import { createCandidateDir, runRestricted, sandboxStatus, type SandboxStatus } from '../substrate/sandbox.js';
 import { canonicalJson, makeImmutableId, makeMutableId } from '../kernel/schemas/base.js';
 import {
   BudgetPolicySchema,
@@ -72,9 +77,22 @@ export interface G4GateResult {
   detail: string;
 }
 
-/** G3 门结果（附冻结基准对照——Evolution Object.bench 数据源） */
+/** G3-replay 门结果（冻结基准回放——附 bench 对照；P3 起与 G3-exec 并列记录） */
 export interface G3GateResult extends GateResult {
+  /** 门型：G3-replay（冻结基准回放 fitness；与 G3-exec 执行型验证并列记录） */
+  mode: 'replay';
+  /** 冻结基准 fitness 对照（§6.5.3：passed 不降 + 成本代理不显著劣化；门禁判定数据化） */
   bench?: BenchCompare;
+}
+
+/** G3-exec 门结果（P3 执行型验证：受限通道 + 结果文件方案；与 G3-replay 并列记录） */
+export interface G3ExecGateResult extends GateResult {
+  /** 执行型门态：exec=受限通道执行 | na=候选无执行型验证脚本（N/A） | degraded=受限通道不可用跳过（D5） */
+  kind: 'exec' | 'na' | 'degraded';
+  /** 降级原因（kind='degraded' 时非空；机器可读） */
+  degraded?: string;
+  /** 受限执行结果（kind='exec' 时；code/timedOut） */
+  exec?: { code: number | null; timedOut: boolean };
 }
 
 /** 冻结基准 fitness 对照（§6.5.3：passed 不降 + 成本代理不显著劣化；门禁判定数据化） */
@@ -85,10 +103,10 @@ export interface BenchCompare {
   cost_degradation_ratio: number;
 }
 
-/** validateDataCandidate 结果（brief 契约：{passed, gates: {g1?, g3?}, reason} + G2/G4 + bench） */
+/** validateDataCandidate 结果（brief 契约：{passed, gates: {g1?, g3?, g3Exec?, g4?}} + G2 + bench） */
 export interface DataCandidateValidation {
   passed: boolean;
-  gates: { g1?: GateResult; g2?: GateResult; g3?: G3GateResult; g4?: G4GateResult };
+  gates: { g1?: GateResult; g2?: GateResult; g3?: G3GateResult; g3Exec?: G3ExecGateResult; g4?: G4GateResult };
   reason: string;
   /** G3 冻结基准对照（晋升 Evolution Object.bench 用；未跑 G3 → undefined） */
   bench?: BenchCompare;
@@ -104,6 +122,10 @@ export interface DataCandidateValidationDeps {
   fixturesDir?: string;
   /** G4 shadow exposure log 路径（.evolution/shadows/exposure.log；未提供 → 仅契约说明不落盘） */
   shadowLogPath?: string;
+  /** 候选验证临时目录根（P3 标准化：createCandidateDir；缺省 substrate 默认 candidates 根；测试注入 fixture 根） */
+  candidateRoot?: string;
+  /** 受限通道可用性探测（P3/D5 降级注入：缺省真实 sandboxStatus；测试注入不可用模拟） */
+  sandboxStatus?: () => SandboxStatus;
 }
 
 /** 晋升依赖（§3.2 事务 + §6.5.4 对象 + 实现规格 §10 幂等） */
@@ -300,23 +322,63 @@ async function copyDirRecursive(src: string, dst: string): Promise<void> {
   }
 }
 
-// ---- G3 冻结基准回放 fitness（数据候选） ----
+// ---- G3 冻结基准回放 fitness（G3-replay，数据候选）+ G3-exec 执行型验证（P3 沙盒门禁） ----
+
+/** G3-exec 验证脚本固定文件名（白名单：仅候选目录内固定名；不接受外部路径——防路径穿越） */
+const VERIFY_SCRIPT_NAME = 'verify.cjs';
+/** G3-exec 受限执行超时（验证脚本 30s；超时 TerminateJobObject 杀整棵进程树） */
+const G3_EXEC_TIMEOUT_MS = 30_000;
+
+/** 递归快照目录（相对路径 → 内容；G3-exec 宿主侧沙盒语义断言用） */
+async function snapshotDir(root: string): Promise<Map<string, string>> {
+  const snap = new Map<string, string>();
+  const walk = async (rel: string): Promise<void> => {
+    const abs = rel === '' ? root : join(root, rel);
+    for (const entry of await readdir(abs, { withFileTypes: true })) {
+      const childRel = rel === '' ? entry.name : join(rel, entry.name);
+      const childAbs = join(abs, entry.name);
+      if (entry.isDirectory()) {
+        await walk(childRel);
+      } else if (entry.isFile()) {
+        snap.set(childRel, await readFile(childAbs, 'utf8'));
+      }
+    }
+  };
+  await walk('');
+  return snap;
+}
+
+/** 快照差异（文件集合变化 / 内容变化 → 描述；一致 → null） */
+function diffSnapshot(before: Map<string, string>, after: Map<string, string>): string | null {
+  const added = [...after.keys()].filter((k) => !before.has(k));
+  const removed = [...before.keys()].filter((k) => !after.has(k));
+  if (added.length > 0 || removed.length > 0) {
+    return `文件集合变化（新增 ${added.join(', ') || '无'}；删除 ${removed.join(', ') || '无'}）`;
+  }
+  for (const [key, value] of before) {
+    if (after.get(key) !== value) {
+      return `文件内容被修改: ${key}`;
+    }
+  }
+  return null;
+}
 
 /**
- * G3（数据候选语义）：候选应用到临时目录（不可变物化副本 + diff 覆盖）→ 捆绑校验（loadPolicy 语义）→
- * 冻结基准回放 fitness（runBenchV2 回放执行器；与当前线基准对照：passed 不降 + 成本代理不显著劣化，
+ * G3-replay（数据候选语义）：候选应用到候选验证环境（createCandidateDir 标准化临时目录：
+ * 不可变物化副本 + diff 覆盖）→ 捆绑校验（loadPolicy 语义）→ 冻结基准回放 fitness
+ * （runBenchV2 回放执行器；与当前线基准对照：passed 不降 + 成本代理不显著劣化，
  * 门禁判定数据化——cost_degradation_tolerance 入 evolve.policy.candidate_gate）→ 目录用后清理。
  * ⚠️ 回放执行器输出为冻结 fixture（策略无关）——passed/成本对照为回归护栏语义；策略敏感度经成本代理
  *   （context_budget_tokens 投影预算）体现；真实放量 fitness 依赖真实会话（G4 shadow，文档化）。
  */
 async function runG3(draft: CandidateDraft, deps: DataCandidateValidationDeps): Promise<G3GateResult> {
-  const tempDir = await mkdtemp(join(tmpdir(), 'omb-cand-g3-'));
+  const cand = createCandidateDir(candidateDirName(draft.id), { root: deps.candidateRoot });
   try {
-    await copyDirRecursive(deps.baselinePolicyDir, tempDir);
-    await writeFile(join(tempDir, basename(draft.target)), draft.content, 'utf8');
-    const candidateBundle = await parsePolicyBundle(tempDir);
+    await copyDirRecursive(deps.baselinePolicyDir, cand.dir);
+    await writeFile(join(cand.dir, basename(draft.target)), draft.content, 'utf8');
+    const candidateBundle = await parsePolicyBundle(cand.dir);
     if (!candidateBundle.ok || candidateBundle.bundle === undefined) {
-      return { gate: 'G3', ok: false, detail: `G3 拒绝: 候选应用到临时目录后捆绑校验失败——${candidateBundle.detail}` };
+      return { gate: 'G3', mode: 'replay', ok: false, detail: `G3-replay 拒绝: 候选应用到临时目录后捆绑校验失败——${candidateBundle.detail}` };
     }
     // 冻结基准回放 fitness（与当前线基准对照）
     const contracts = await loadBenchContractsV2(deps.contractsDir);
@@ -350,27 +412,154 @@ async function runG3(draft: CandidateDraft, deps: DataCandidateValidationDeps): 
     if (candidate.passed < baseline.passed) {
       return {
         gate: 'G3',
+        mode: 'replay',
         ok: false,
-        detail: `G3 拒绝: 回放 fitness 下降（候选 ${candidate.passed}/${candidate.total} < 基线 ${baseline.passed}/${baseline.total}，passed 不得降）`,
+        detail: `G3-replay 拒绝: 回放 fitness 下降（候选 ${candidate.passed}/${candidate.total} < 基线 ${baseline.passed}/${baseline.total}，passed 不得降）`,
         bench,
       };
     }
     if (ratio > tolerance) {
       return {
         gate: 'G3',
+        mode: 'replay',
         ok: false,
-        detail: `G3 拒绝: 成本显著劣化（成本代理 ${candProxy} vs 基线 ${baseProxy}，劣化 ${(ratio * 100).toFixed(1)}% > 容忍 ${(tolerance * 100).toFixed(1)}%）`,
+        detail: `G3-replay 拒绝: 成本显著劣化（成本代理 ${candProxy} vs 基线 ${baseProxy}，劣化 ${(ratio * 100).toFixed(1)}% > 容忍 ${(tolerance * 100).toFixed(1)}%）`,
         bench,
       };
     }
     return {
       gate: 'G3',
+      mode: 'replay',
       ok: true,
-      detail: `G3 通过: 临时目录捆绑加载 OK + 回放 fitness ${candidate.passed}/${candidate.total}（基线 ${baseline.passed}/${baseline.total}，passed 不降）+ 成本代理劣化 ${(ratio * 100).toFixed(1)}% ≤ 容忍 ${(tolerance * 100).toFixed(1)}%`,
+      detail: `G3-replay 通过: 临时目录捆绑加载 OK + 回放 fitness ${candidate.passed}/${candidate.total}（基线 ${baseline.passed}/${baseline.total}，passed 不降）+ 成本代理劣化 ${(ratio * 100).toFixed(1)}% ≤ 容忍 ${(tolerance * 100).toFixed(1)}%`,
       bench,
     };
   } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    cand.cleanup();
+  }
+}
+
+/**
+ * G3-exec（执行型验证门，P3 接线；设计 §3.4 + D5 降级裁决）：
+ * 候选附执行型验证脚本（draft.verify.script；当前 L0 数据候选无脚本 → N/A 标记「无执行型验证内容」，
+ * L1 代码候选未来复用）→ 候选验证环境（createCandidateDir：基线 policy 物化副本 + 候选覆盖 +
+ * verify.cjs 宿主写入——白名单固定名，仅候选目录内）→ WRITE_RESTRICTED 受限通道执行
+ * （cwd=候选目录，writableDirs=[结果目录]，结果文件经 OMB_SANDBOX_RESULT_FILE 回传——受限进程
+ * 不能管道捕获孙进程输出 → 结果文件方案）→ 宿主读结果 JSON 判定（{ok, detail} 契约）+ 沙盒语义
+ * 验证（脚本尝试写候选目录必须被拒；宿主侧执行前后快照比对——候选目录被改 → 沙盒失效 fail-closed 拒绝）。
+ * 降级（D5）：受限通道不可用（sandboxStatus 注入/真实）或受限执行异常 → kind='degraded' 记录跳过，
+ * 不阻塞 G1/G3-replay 判定，门禁语义保持。
+ */
+async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDeps): Promise<G3ExecGateResult> {
+  if (draft.verify === undefined) {
+    return {
+      gate: 'G3',
+      ok: true,
+      kind: 'na',
+      detail:
+        'G3-exec N/A（L0 数据候选无执行型验证脚本——受限执行通道就绪，候选未附带验证内容；L1 代码候选未来复用）',
+    };
+  }
+  const status = (deps.sandboxStatus ?? sandboxStatus)();
+  if (!status.available) {
+    return {
+      gate: 'G3',
+      ok: true,
+      kind: 'degraded',
+      degraded: status.reason ?? '受限通道不可用',
+      detail: `G3-exec 跳过（受限通道不可用：${status.reason ?? '未知原因'}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+    };
+  }
+  const name = candidateDirName(draft.id);
+  const cand = createCandidateDir(`${name}-verify`, { root: deps.candidateRoot });
+  const out = createCandidateDir(`${name}-verify-result`, { root: deps.candidateRoot });
+  try {
+    await copyDirRecursive(deps.baselinePolicyDir, cand.dir);
+    await writeFile(join(cand.dir, basename(draft.target)), draft.content, 'utf8');
+    const scriptPath = join(cand.dir, VERIFY_SCRIPT_NAME);
+    await writeFile(scriptPath, draft.verify.script, 'utf8');
+
+    // 沙盒语义断言（宿主侧）：受限进程不得改动候选目录（执行前后快照比对——写拒绝）
+    const before = await snapshotDir(cand.dir);
+    const resultFile = join(out.dir, 'result.json');
+    const exec = await runRestricted({
+      script: scriptPath,
+      args: [cand.dir],
+      cwd: cand.dir,
+      writableDirs: [out.dir],
+      resultFile,
+      timeoutMs: G3_EXEC_TIMEOUT_MS,
+    });
+    const tampered = diffSnapshot(before, await snapshotDir(cand.dir));
+    if (tampered !== null) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'exec',
+        exec,
+        detail: `G3-exec 拒绝: 沙盒语义失效——受限进程改写了候选目录（${tampered}），WRITE_RESTRICTED 未生效`,
+      };
+    }
+    if (exec.timedOut) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'exec',
+        exec,
+        detail: 'G3-exec 拒绝: 验证脚本超时（受限进程被 TerminateJobObject 终止，结果文件未回传）',
+      };
+    }
+    if (exec.code !== 0) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'exec',
+        exec,
+        detail: `G3-exec 拒绝: 验证脚本非零退出（code=${exec.code}）`,
+      };
+    }
+    // 结果文件方案：宿主读受限进程写的结果 JSON（stdout 不可管道捕获 → 结果文件回传）
+    let verdict: { ok?: unknown; detail?: unknown };
+    try {
+      verdict = JSON.parse(await readFile(resultFile, 'utf8')) as { ok?: unknown; detail?: unknown };
+    } catch (err) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'exec',
+        exec,
+        detail: `G3-exec 拒绝: 验证脚本未写合法结果文件（结果文件方案失败：${(err as Error).message}）`,
+      };
+    }
+    if (verdict.ok !== true) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'exec',
+        exec,
+        detail: `G3-exec 拒绝: 验证脚本报告失败（${typeof verdict.detail === 'string' ? verdict.detail : '无 detail'}）`,
+      };
+    }
+    const detailText = typeof verdict.detail === 'string' ? verdict.detail : '';
+    return {
+      gate: 'G3',
+      ok: true,
+      kind: 'exec',
+      exec,
+      detail: `G3-exec 通过: 受限通道执行 OK（code=${exec.code}）+ 结果文件回传（${detailText}）+ 沙盒语义验证（候选目录写拒绝）`,
+    };
+  } catch (err) {
+    // D5：受限执行异常（Win32 失败等）→ 降级记录，不阻塞门禁语义
+    return {
+      gate: 'G3',
+      ok: true,
+      kind: 'degraded',
+      degraded: (err as Error).message,
+      detail: `G3-exec 跳过（受限执行异常：${(err as Error).message}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+    };
+  } finally {
+    cand.cleanup();
+    out.cleanup();
   }
 }
 
@@ -400,8 +589,9 @@ async function runG4(draft: CandidateDraft, deps: DataCandidateValidationDeps): 
 }
 
 /**
- * 数据候选验证生产路径（§6.5.3 G1-G4）：G1 静态 → G2 skipped → G3 冻结基准回放 fitness → G4 shadow。
- * G1/G3 任一失败 → passed=false + reason（门禁短路：G3 不跑在 G1 失败后）。
+ * 数据候选验证生产路径（§6.5.3 G1-G4）：G1 静态 → G2 skipped → G3-replay 冻结基准回放 fitness →
+ * G3-exec 执行型验证（受限通道 + 结果文件方案；无脚本 N/A / 通道不可用降级 D5）→ G4 shadow。
+ * G1/G3-replay 任一失败 → passed=false + reason（门禁短路：后续门不跑在失败后）。
  */
 export async function validateDataCandidate(
   draft: CandidateDraft,
@@ -420,11 +610,23 @@ export async function validateDataCandidate(
       bench: g3.bench,
     };
   }
+  const g3Exec = await runG3Exec(draft, deps);
+  if (!g3Exec.ok) {
+    // G3-exec 执行型验证拒绝（脚本报告失败 / 结果文件方案失败 / 沙盒语义失效）→ 候选不通过
+    return {
+      passed: false,
+      gates: { g1, g2: G2_SKIPPED, g3, g3Exec },
+      reason: `验证失败: ${g3Exec.detail}`,
+      bench: g3.bench,
+    };
+  }
   const g4 = await runG4(draft, deps);
+  const g3ExecNote =
+    g3Exec.kind === 'exec' ? '+G3-exec' : g3Exec.kind === 'degraded' ? '+G3-exec(降级跳过)' : '';
   return {
     passed: true,
-    gates: { g1, g2: G2_SKIPPED, g3, g4 },
-    reason: '验证通过（G1+G3；G2 skipped；G4 shadow 已标记）',
+    gates: { g1, g2: G2_SKIPPED, g3, g3Exec, g4 },
+    reason: `验证通过（G1+G3-replay${g3ExecNote}；G2 skipped；G4 shadow 已标记）`,
     bench: g3.bench,
   };
 }

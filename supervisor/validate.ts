@@ -21,6 +21,13 @@
 // non-circularity 机制留 M7 或后续（brief 注明）。
 // T8.14：Verification Synthesis 落地——reproduction oracle（生成 → 沙箱验证 → anti-circularity）
 // 在 ./oracle.ts（LOC ≤ 400 拆分，validate.ts 统一出口 re-export，同 generator.ts 拆 generator-ops 先例）。
+//
+// P3 核查说明（2026-08-23，候选验证沙盒门禁）：执行型验证的受限通道主接入点在
+// supervisor/candidate-pipeline.ts 的 G3-exec（WRITE_RESTRICTED 受限子进程 + 结果文件方案回传 +
+// 沙盒语义写拒绝；受限通道不可用 → degraded 降级记录 D5，不阻塞门禁语义）。本模块 G1 tsc /
+// G2 vitest / G3 回放子进程为 L1 代码/过程候选路径（普通 spawn，进程内可管道捕获 stdout）；
+// 未来接受限通道时按结果文件方案迁移（受限进程内 stdio:'pipe' 会 EPERM，research-dsh.md §3.4）——
+// 此处仅注释说明，不做改动。
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';

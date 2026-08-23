@@ -16,6 +16,9 @@
 // - fail-closed：任何 Win32 失败抛 Win32Error（含 API 名与精确错误码），绝不静默以完整令牌运行。
 //   writableDirs 的 ACE 常驻（确定性 SID 使重复授权 O(1)，DSH 的 reuse cache 语义）；
 //   私有 temp 的 ACE 每次运行撤销，自建 temp 目录运行后删除。
+// - 降级（P3/D5）：sandboxStatus() 显式探测受限通道可用性（非 Windows / koffi 加载失败 →
+//   { available:false, reason }，不抛不崩）；上层（candidate-pipeline G3-exec）在通道不可用时
+//   记录 degraded 并跳过，门禁语义保持。
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -92,6 +95,35 @@ export function createCandidateDir(id: string, opts: { root?: string } = {}): Ca
       pendingDirs.delete(dir)
       fs.rmSync(dir, { recursive: true, force: true })
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 受限通道可用性（P3/D5 降级入口）
+// ---------------------------------------------------------------------------
+
+export interface SandboxStatus {
+  /** 受限执行通道是否可用（Windows + koffi/Win32 绑定加载成功） */
+  available: boolean;
+  /** 不可用原因（available=false 时非空；机器可读） */
+  reason?: string;
+}
+
+/**
+ * 受限通道可用性探测（P3/D5）：非 Windows → { available:false, reason:'非 Windows 平台…' }；
+ * koffi/Win32 绑定加载失败 → { available:false, reason:'koffi/Win32 绑定加载失败: …' }。
+ * 绝不抛（探测本身不崩）；上层（candidate-pipeline G3-exec）据结果记录 degraded 并跳过，
+ * 不阻塞门禁语义。win32Sync 绑定为懒加载（首次调用才打开 DLL），探测即触发加载。
+ */
+export function sandboxStatus(): SandboxStatus {
+  if (process.platform !== 'win32') {
+    return { available: false, reason: '非 Windows 平台（WRITE_RESTRICTED 受限令牌仅 Windows 可用）' };
+  }
+  try {
+    win32Sync();
+    return { available: true };
+  } catch (err) {
+    return { available: false, reason: `koffi/Win32 绑定加载失败: ${(err as Error).message}` };
   }
 }
 
@@ -201,6 +233,7 @@ async function waitExit(api: Win32Bindings, spawned: SpawnedRestricted, timeoutM
  * CreateRestrictedToken([logon, Everyone, writeSid, tempSid]) → setTokenDefaultDaclGrant）→
  * 环境改写 → CreateProcessAsUserW（kill-on-close job）→ 轮询退出码/超时杀 → 清理。
  * 失败即抛（fail-closed）；writableDirs ACE 常驻，私有 temp ACE 撤销 + 自建目录删除。
+ * 调用方应在执行前经 sandboxStatus() 探测通道可用性（P3/D5：不可用 → 上层降级记录跳过）。
  */
 export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult> {
   const script = path.resolve(opts.script)
