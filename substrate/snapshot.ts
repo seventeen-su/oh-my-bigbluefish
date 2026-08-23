@@ -14,23 +14,25 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** git 可执行文件解析（迁移可移植；优先级：GIT_BIN 环境变量 → 常见安装位置 → PATH 'git'）。
+/** git 可执行文件解析（迁移可移植；优先级：GIT_BIN 环境变量 → Windows where.exe 发现 → PATH 'git'）。
  *  DSH 沙箱可能拦截 PATH 解析（CONVENTIONS §2）→ 部署可设 GIT_BIN 指向完整路径。 */
 function resolveGitBin(): string {
   const env = process.env.GIT_BIN;
   if (env !== undefined && env.length > 0) {
     return env;
   }
-  for (const candidate of [
-    'C:\\Program Files\\Git\\cmd\\git.exe',
-    'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
-  ]) {
+  if (process.platform === 'win32') {
     try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
+      const out = execFileSync('where.exe', ['git'], { encoding: 'utf8', windowsHide: true });
+      const first = out
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      if (first !== undefined) {
+        return first;
       }
     } catch {
-      // 探测失败忽略，继续下一个候选
+      // where.exe 发现失败（git 不在 PATH）→ 回退 PATH 'git'
     }
   }
   return 'git';

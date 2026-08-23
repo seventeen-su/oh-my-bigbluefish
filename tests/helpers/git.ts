@@ -5,29 +5,35 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-/** git 完整路径（沙箱拦截 PATH 解析，必须用完整路径；GIT_BIN 环境变量优先，回退常见安装位置/PATH） */
+/** git 完整路径（沙箱拦截 PATH 解析，优先完整路径；GIT_BIN 环境变量优先，其次 Windows where.exe 发现，最后 PATH 'git'） */
 export const GIT = ((): string => {
   const env = process.env.GIT_BIN;
   if (env !== undefined && env.length > 0) {
     return env;
   }
-  for (const candidate of [
-    'C:\\Program Files\\Git\\cmd\\git.exe',
-    'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
-  ]) {
+  if (process.platform === 'win32') {
     try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
+      const out = execFileSync('where.exe', ['git'], { encoding: 'utf8', windowsHide: true });
+      const first = out
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      if (first !== undefined) {
+        return first;
       }
     } catch {
-      // 忽略探测失败
+      // where.exe 发现失败（git 不在 PATH）→ 回退 PATH 'git'
     }
   }
   return 'git';
 })();
 
 function icaclsPath(): string {
-  return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe');
+  const systemRoot = process.env.SystemRoot;
+  if (systemRoot === undefined || systemRoot.length === 0) {
+    throw new Error('icacls 解析失败：环境变量 SystemRoot 缺失（Windows 上恒存在，请检查运行环境）');
+  }
+  return path.join(systemRoot, 'System32', 'icacls.exe');
 }
 
 export interface GitRunOptions {

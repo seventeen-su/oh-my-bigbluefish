@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { GIT } from '../helpers/git.js';
 import { canonicalJson, makeImmutableId, type Fingerprint } from '../../kernel/schemas/base.js';
 import type { EvolutionObject } from '../../kernel/schemas/m.js';
 import {
@@ -17,7 +18,6 @@ import {
   type ManifestEntry,
 } from '../../supervisor/share.js';
 
-const GIT = 'D:\\Git\\cmd\\git.exe';
 const ENV: Fingerprint = { os: 'win32', node: 'v24', dsh_version: '0.8.0', project: 'omb-v2' };
 
 /** 合法格式签名工厂（git:<signer>:<keyid-hex>:<base64>） */

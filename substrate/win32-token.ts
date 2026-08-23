@@ -123,7 +123,7 @@ function buildRestrictingSids(sids: readonly NativePtr[]): Buffer {
  * 创建写受限令牌。restricting 列表 = [logonSid, Everyone, ...writeSids]：
  * - logonSid + Everyone 是 keep-alive 组（缺它们早期 DLL 初始化 0xC0000142、CNG 失败——DSH 实测）；
  * - writeSids 是写能力 SID（workspace + temp），只有它们命中的 ACE 才放行受限进程的写；
- * - 无 Authenticated Users / INTERACTIVE / LOCAL：关闭 WMI 命名空间检查失败与 C:\ 根树创建逃逸（DSH README）。
+ * - 无 Authenticated Users / INTERACTIVE / LOCAL：关闭 WMI 命名空间检查失败与系统盘根目录树创建逃逸（DSH README）。
  * CreateRestrictedToken 返回主令牌，可直接用于 CreateProcessAsUserW（DSH 实测链路，无需 DuplicateTokenEx）。
  */
 export function createRestrictedToken(
