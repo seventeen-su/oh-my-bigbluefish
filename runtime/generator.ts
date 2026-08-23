@@ -6,6 +6,7 @@
 // layer 2（runtime/）：仅 import node: 内置 + kernel/（同层）+ runtime/ 内文件（CONVENTIONS §4）。
 import { BUILTIN_OPERATORS, ProcessDefSchema, type ProcessDef } from '../kernel/policy-loader.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
+import type { GenerationBudget } from '../kernel/schemas/policy.js';
 import {
   CANONICAL_CHAIN,
   INPUT_TYPES,
@@ -73,6 +74,9 @@ export interface GeneratorOptions {
    *  generator 构造 HYPOTHESIZE 提示 → 模型生成候选 → 产物解析 → ProcessDef schema + 预算守卫
    *  （与 llmGenerate 同守卫路径）；无真实 DSH 会话 → 不注入（缺省受限，纯规则阶梯）。 */
   modelAdapter?: ModelAdapter;
+  /** P5：generation 预算（触发条件②，budget.yaml budget.generation 数据化产物）——未启用/超单请求上限 →
+   *  LLM 路径整体拒绝（纯规则降级并记录）；缺省未配置 → 无约束（兼容既有 llmGenerate/modelAdapter 注入）。 */
+  generation?: GenerationBudget;
 }
 
 // ---- 产物校验（ProcessDef schema + 算子名 ∈ 内置集合；非法 → 拒绝走下一阶梯） ----
@@ -98,6 +102,8 @@ export function processCost(p: ProcessDef): number {
 /** HYPOTHESIZE 系统提示（模型以 JSON 输出 ProcessDef；成本预算由 generator 守卫） */
 const HYPOTHESIZE_SYSTEM =
   '你是 OMB v2 过程生成器。根据目标与过程库，生成一个 ProcessDef JSON（entry/exit/operators 算子图，算子名 ∈ 内置集合），仅输出 JSON。';
+/** HYPOTHESIZE 输出 token 上限缺省（generation 未配置时；P5 起由 budget.yaml generation.max_generate_tokens 数据化） */
+const DEFAULT_HYPOTHESIZE_MAX_TOKENS = 4000;
 
 /**
  * HYPOTHESIZE 提示构造（LLM 生成路径输入）：goal + working_state + applicability + 过程库摘要
@@ -141,6 +147,10 @@ export class ProcessGenerator {
   private readonly retrieveProcess: ((q: GeneratorQuery) => readonly ProcessDef[]) | undefined;
   private readonly llmGenerate: ((task: GeneratorTask) => Promise<ProcessDef>) | undefined;
   private readonly modelAdapter: ModelAdapter | undefined;
+  /** P5：generation 预算（触发条件②；undefined → 无约束，兼容既有注入） */
+  private readonly generation: GenerationBudget | undefined;
+  /** P5：单请求 LLM 生成调用计数（实例即单请求语义——生产 createScheduler 每次构造新生成器） */
+  private generationUsed = 0;
 
   constructor(opts: GeneratorOptions) {
     this.processes = opts.processes;
@@ -148,6 +158,7 @@ export class ProcessGenerator {
     this.retrieveProcess = opts.retrieveProcess;
     this.llmGenerate = opts.llmGenerate;
     this.modelAdapter = opts.modelAdapter;
+    this.generation = opts.generation;
   }
 
   /**
@@ -199,7 +210,14 @@ export class ProcessGenerator {
       }
     }
 
-    // ④ Generate（LLM 最后手段；M4 默认不注入）——校验后仍须过预算守卫（库空时 precheck 无最小成本可依）
+    // ④ Generate（LLM 最后手段；M4 默认不注入）——校验后仍须过预算守卫（库空时 precheck 无最小成本可依）。
+    // P5：触发条件② generation 预算守卫——未启用/超单请求上限 → LLM 路径整体拒绝（纯规则降级并记录）
+    const generationBlocked = this.generationBlockedReason();
+    if (generationBlocked !== null) {
+      return { process: null, method: 'none', reason: generationBlocked };
+    }
+    this.generationUsed += 1; // 预算守卫通过 → 计入本次 LLM 调用（超上限 → 同实例下次 generate 拒绝）
+
     if (this.llmGenerate) {
       try {
         const p = await this.llmGenerate(task);
@@ -345,12 +363,29 @@ export class ProcessGenerator {
     return Math.min(...this.processes.map((p) => processCost(p)));
   }
 
+  /** P5：generation 预算守卫（触发条件②）——未配置 → 无约束（既有注入兼容）；禁用/超上限 → 拒绝 + 降级原因 */
+  private generationBlockedReason(): string | null {
+    if (this.generation === undefined) {
+      return null;
+    }
+    if (!this.generation.enabled) {
+      return `generation: LLM 生成未启用（budget.generation.enabled=false）——纯规则降级`;
+    }
+    if (this.generationUsed >= this.generation.max_generate_per_request) {
+      return `generation: 单请求 LLM 生成次数超上限（${this.generation.max_generate_per_request}）——纯规则降级`;
+    }
+    return null;
+  }
+
   /** ModelAdapter 生成路径：HYPOTHESIZE 提示构造 → 模型生成 → 产物解析（非法 → null 降级） */
   private async generateViaModelAdapter(task: GeneratorTask): Promise<ProcessDef | null> {
     const prompt = buildHypothesizePrompt(task, this.processes);
     const res = await this.modelAdapter!.generate(prompt, {
       system: HYPOTHESIZE_SYSTEM,
-      maxTokens: 4000,
+      // P5：HYPOTHESIZE maxTokens/reasoningEffort 数据化（budget.generation；缺省 4000/low——沿用
+      // model-adapter 默认 low，防推理吃光输出预算；真实模型调用参数留宿主/策略配置，测试用 fake adapter 捕获）
+      maxTokens: this.generation?.max_generate_tokens ?? DEFAULT_HYPOTHESIZE_MAX_TOKENS,
+      reasoningEffort: this.generation?.reasoning_effort ?? 'low',
     });
     return parseProcessJson(res.text);
   }

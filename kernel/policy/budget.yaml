@@ -7,3 +7,9 @@ retrieval: 6        # 单请求检索调用上限
 branches: 8         # 全请求分支总数上限
 context: 16000      # 上下文 token 总量预算
 context_budget_tokens: 4000   # Context Compiler 投影预算（初值 4000，§17 参数标定）
+# P5：LLM 生成预算（架构 §5.3 Generate 阶梯最后手段 / D7：受 generation budget 约束；数据可演化，代码不感知内容）
+generation:
+  enabled: true                 # LLM 生成开关（阶梯不满足 + 预算允许 + adapter 存在 → 走 LLM；false → 纯规则降级）
+  max_generate_per_request: 1   # 单请求 LLM 生成调用次数上限（超上限 → 纯规则降级并记录）
+  max_generate_tokens: 4000     # HYPOTHESIZE 输出 token 上限（adapter.generate maxTokens）
+  reasoning_effort: low         # 推理档位（默认 low，防推理吃光输出预算；high/max 按需显式配置）

@@ -5,13 +5,17 @@
 // 无真实 DSH 会话时缺省受限（runtime/model-adapter.ts 的工厂 + 文档化降级）。
 import { z } from 'zod';
 
+/** DSH reasoningEffort 档位（合法值以 llm-deepseek 源码为准：off|low|high|max；P5 起供 policy 预算共用防漂移） */
+export const REASONING_EFFORTS = ['off', 'low', 'high', 'max'] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
 /** generate 可选参数（system 提示 / 采样温度 / 输出上限 / 推理档位；全部可选，缺省由适配器/平台决定） */
 export const ModelGenerateOptionsSchema = z.object({
   system: z.string().optional(),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().positive().optional(),
   /** DSH reasoningEffort 档位（合法值以 llm-deepseek 源码为准：off|low|high|max；缺省 → 适配器默认 low） */
-  reasoningEffort: z.enum(['off', 'low', 'high', 'max']).optional(),
+  reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
 });
 export type ModelGenerateOptions = z.infer<typeof ModelGenerateOptionsSchema>;
 

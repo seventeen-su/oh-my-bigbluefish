@@ -9,6 +9,8 @@
 //   （M4 loop 先例：tests/m4/milestone-loop.test.ts 的 generate → toOperatorGraph → executeGraph 链）。
 // layer 2（runtime/）：仅 import node: 内置 + kernel/（同层）+ runtime/ 内文件（CONVENTIONS §4）。
 import type { ProcessDef } from '../kernel/policy-loader.js';
+import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
+import type { GenerationBudget } from '../kernel/schemas/policy.js';
 import { ProcessGenerator, processCost, type GeneratorQuery } from './generator.js';
 import { assessApplicability, type Applicability, type WorkingState } from './generator-ops.js';
 
@@ -45,6 +47,10 @@ export interface SchedulerOptions {
   generatorBudget?: number;
   /** 检索注入（Generator 复用阶梯；缺省关键词检索） */
   retrieveProcess?: (q: GeneratorQuery) => readonly ProcessDef[];
+  /** P5：generation 预算（budget.yaml 数据化触发条件②；注入缺省生成器；缺省 → 无约束） */
+  generation?: GenerationBudget;
+  /** P5：ModelAdapter（触发条件③；生产装配经组合根注入；缺省 → 纯规则阶梯） */
+  modelAdapter?: ModelAdapter;
 }
 
 /**
@@ -62,6 +68,9 @@ export class ProcessScheduler {
         processes: opts.processes,
         budget: opts.generatorBudget ?? DEFAULT_GENERATOR_BUDGET,
         retrieveProcess: opts.retrieveProcess,
+        // P5：生产接线——generation 预算（budget.yaml 数据化）+ ModelAdapter（无 → 纯规则阶梯）注入缺省生成器
+        generation: opts.generation,
+        modelAdapter: opts.modelAdapter,
       });
   }
 

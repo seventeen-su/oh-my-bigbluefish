@@ -36,6 +36,7 @@ import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
 import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState } from './turn-helpers.js';
+import { ProcessScheduler } from './scheduler.js';
 import type { Experience } from '../kernel/schemas/c.js';
 // P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
 import { appendSignals, readSignals, signalsDirOf } from './evolution-signals.js';
@@ -451,6 +452,22 @@ export class CognitiveRuntime {
     this.processesPromise ??= loadProcesses(this.processesDir);
     await this.componentsReady(); // P2：组件激活 + 健康检查（幂等；失败降级不阻塞请求路径）
     return { policy: await this.policyPromise, processes: await this.processesPromise };
+  }
+
+  /**
+   * P5：生产路径 Generator 装配（架构 §5.3 Generate 阶梯生产接线）——ProcessScheduler 经组合根注入
+   * ModelAdapter（触发条件③）+ generation 预算（触发条件②，policy.budget.generation 数据化）→
+   * 阶梯 Reuse→Compose→Mutate 均不满足（OOD）且预算允许且 adapter 存在时才走 LLM；缺任一 → 纯规则降级。
+   * 真实会话才有模型（plugin.ts 装配 modelAdapter）；真实模型调用留宿主验证——测试用 fake adapter 验证触发逻辑。
+   * 每次调用构造新调度器/生成器 → generator 的 generationUsed 计数器即单请求语义（max_generate_per_request）。
+   */
+  async createScheduler(processes: readonly ProcessDef[]): Promise<ProcessScheduler> {
+    const { policy } = await this.ready();
+    return new ProcessScheduler({
+      processes,
+      generation: policy.budget.generation,
+      modelAdapter: this.modelAdapter ?? undefined,
+    });
   }
 
   /**

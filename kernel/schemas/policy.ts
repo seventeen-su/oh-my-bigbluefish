@@ -4,6 +4,7 @@
 // T7.2 元演化门禁 diff 校验复用本层 schema（GovernorPolicySchema / EvolvePolicySchema）。
 import { z } from 'zod';
 import { BudgetSchema } from './base.js';
+import { REASONING_EFFORTS } from './model-adapter.js';
 
 // ---- 枚举常量（as const 类型导出；决策/算子值域固定） ----
 
@@ -88,6 +89,31 @@ export const GovernorPolicySchema = z
   );
 export type GovernorPolicy = z.infer<typeof GovernorPolicySchema>;
 
+/**
+ * P5：LLM 生成预算（架构 §5.3 Generate 阶梯触发条件② + D7：阶梯不满足且预算允许时走 LLM）。
+ * 数据可演化（改 budget.yaml 即生效）；字段存在但非法（enabled 非布尔、次数/token 非正、档位越界）→ fail-loud。
+ * 段缺省（旧 budget.yaml 无 generation）→ 保守默认 disabled——无显式配置不启用 LLM 生成（防 token 黑洞）。
+ */
+export const GenerationBudgetSchema = z.object({
+  /** LLM 生成开关（阶梯最后手段；false → 纯规则降级并记录） */
+  enabled: z.boolean().default(false),
+  /** 单请求 LLM 生成调用次数上限（预算守卫：超上限 → 纯规则降级；generator 实例即单请求语义） */
+  max_generate_per_request: z.number().int().positive().default(1),
+  /** HYPOTHESIZE 输出 token 上限（adapter.generate maxTokens；防输出预算被推理/长文本吃光） */
+  max_generate_tokens: z.number().int().positive().default(4000),
+  /** 推理档位（DSH reasoningEffort：off|low|high|max；沿用 model-adapter 默认 low，防推理吃光输出预算） */
+  reasoning_effort: z.enum(REASONING_EFFORTS).default('low'),
+});
+export type GenerationBudget = z.infer<typeof GenerationBudgetSchema>;
+
+/** P5：generation 段缺省（保守：未显式配置 → LLM 生成不启用） */
+export const DEFAULT_GENERATION_BUDGET: GenerationBudget = {
+  enabled: false,
+  max_generate_per_request: 1,
+  max_generate_tokens: 4000,
+  reasoning_effort: 'low',
+};
+
 /** BudgetPolicy：计算分配器六维预算 + Context 投影预算（§5.1/§17 初值） */
 export const BudgetPolicySchema = z.object({
   depth: z.number().int().positive(),
@@ -97,6 +123,8 @@ export const BudgetPolicySchema = z.object({
   branches: z.number().int().positive(),
   context: z.number().int().positive(),
   context_budget_tokens: z.number().int().positive(),
+  /** P5：LLM 生成预算（§5.3 Generate 阶梯最后手段触发数据化 / D7 受 generation budget 约束；段缺省兼容旧 budget.yaml） */
+  generation: GenerationBudgetSchema.default(DEFAULT_GENERATION_BUDGET),
 });
 export type BudgetPolicy = z.infer<typeof BudgetPolicySchema>;
 
