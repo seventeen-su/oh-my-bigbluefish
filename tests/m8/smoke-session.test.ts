@@ -105,7 +105,7 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     const scheduler = new MaintenanceScheduler({ debtFile: join(base, 'debt.json') });
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir, maintenance: scheduler }));
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // ① 会话事实入链：turn/start + 用户消息（goal 经 user/message 映射为 session/start + claim/update）
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1000));
@@ -215,7 +215,7 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     const cpDir = join(root, 'checkpoints');
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir }));
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // 最小冒烟流：用户消息 → 投影注入（prepareTurn 预热）→ flush 收尾 → checkpoint
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));

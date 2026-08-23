@@ -102,7 +102,7 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     const scheduler = new MaintenanceScheduler({ debtFile: join(base, 'debt.json') });
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir, maintenance: scheduler }));
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // 会话事实入链（goal 经 user/message 映射）
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
@@ -170,7 +170,7 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     const cpDir = join(root, 'checkpoints');
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir }));
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // turn 事实入链 + turn 结束（无 flush 事件）
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
@@ -204,7 +204,7 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     const cpDir = join(root, 'checkpoints');
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir }));
     const { ctx, bus } = makeFakeCtx({ runtime });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     expect(() => bus.emit('session/flush', { id: SESSION })).not.toThrow();
     await new Promise((r) => setTimeout(r, 20));

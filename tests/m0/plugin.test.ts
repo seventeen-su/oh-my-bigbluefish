@@ -49,7 +49,7 @@ function makeInvocation(
 describe('runtime/plugin.ts apply(fakeCtx)', () => {
   it('注册 /mode 命令：name=mode、description 非空、input hint 含合法值、recordInput=true；fake ctx 无 agentPresets 不抛错', () => {
     const { captured, ctx } = makeFakeCtx();
-    expect(() => apply(ctx)).not.toThrow();
+    expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     const mode = captured.find((c) => c.name === 'mode')!;
     expect(mode.name).toBe('mode');
     expect(mode.description.length).toBeGreaterThan(0);
@@ -61,7 +61,7 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
 
   it('handler 无参数：返回 CommandResult 结构（success + text），当前线为默认 stable', async () => {
     const again = makeFakeCtx();
-    apply(again.ctx);
+    apply(again.ctx, { bootstrap: false });
     const r = await again.captured[0]!.handler(makeInvocation(''));
     expect(r).toMatchObject({ kind: 'success' });
     expect(typeof r.text).toBe('string');
@@ -70,7 +70,7 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
 
   it('handler 未知模式 fail-loud：error + 消息含合法值', async () => {
     const again = makeFakeCtx();
-    apply(again.ctx);
+    apply(again.ctx, { bootstrap: false });
     const r = await again.captured[0]!.handler(makeInvocation('gamma'));
     expect(r.kind).toBe('error');
     expect(r.text).toContain('initial | stable | latest');
@@ -78,7 +78,7 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
 
   it('handler 切换成功（真实布局只读冒烟）：success 含新模式与 git_revision 前 8 位，且当前线已更新', async () => {
     const again = makeFakeCtx();
-    apply(again.ctx);
+    apply(again.ctx, { bootstrap: false });
     const def = again.captured[0]!;
     const switched = await def.handler(makeInvocation('latest'));
     expect(switched.kind).toBe('success');
@@ -92,7 +92,7 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
 
   it('非空白会话（events 含 turn/start）拒绝切换：error + 需空白会话', async () => {
     const again = makeFakeCtx();
-    apply(again.ctx);
+    apply(again.ctx, { bootstrap: false });
     const r = await again.captured[0]!.handler(
       makeInvocation('latest', [{ type: 'turn/start' }]),
     );
@@ -101,7 +101,7 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
   });
 
   it('apply 无 commands / commands 缺失：不抛错（守卫生效）', () => {
-    expect(() => apply({})).not.toThrow();
-    expect(() => apply({ commands: undefined })).not.toThrow();
+    expect(() => apply({}, { bootstrap: false })).not.toThrow();
+    expect(() => apply({ commands: undefined }, { bootstrap: false })).not.toThrow();
   });
 });

@@ -288,7 +288,7 @@ describe('⑪ 装配：ModelAdapter 经组合根注入认知运行时（T8.12 de
         commands: { register: (d: unknown) => captured.push(d as { name: string; handler: (i: unknown) => unknown }) },
         llm,
       };
-      const handle = apply(ctx, { cognitiveRoot: base, model: { provider: 'deepseek', model: 'deepseek-chat' } });
+      const handle = apply(ctx, { cognitiveRoot: base, model: { provider: 'deepseek', model: 'deepseek-chat' }, bootstrap: false });
       expect(captured.map((c) => c.name)).toEqual(expect.arrayContaining(['mode', 'bench']));
       const runtime = handle.cognitive as unknown as { modelAdapter: ModelAdapter | null; close(): Promise<void> };
       expect(runtime.modelAdapter).not.toBeNull();
@@ -302,7 +302,7 @@ describe('⑪ 装配：ModelAdapter 经组合根注入认知运行时（T8.12 de
       const ctxNoLlm: ContextLike = {
         commands: { register: () => undefined },
       };
-      const handleNoLlm = apply(ctxNoLlm, { cognitiveRoot: base });
+      const handleNoLlm = apply(ctxNoLlm, { cognitiveRoot: base, bootstrap: false });
       const runtimeNoLlm = handleNoLlm.cognitive as unknown as {
         modelAdapter: ModelAdapter | null;
         close(): Promise<void>;

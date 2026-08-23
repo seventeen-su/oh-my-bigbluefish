@@ -79,7 +79,7 @@ function track(rt: CognitiveRuntime): CognitiveRuntime {
 describe('T8.26.3 systemPrompt.context 钩子（plugin.ts apply）', () => {
   it('注册断言：apply(fakeCtx) → systemPrompt.context 注册项存在（name=cognitive:projection、order 数字、text 为函数）', () => {
     const { ctx, contexts } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
     expect(contexts).toHaveLength(1);
     expect(contexts[0]!.name).toBe('cognitive:projection');
     expect(typeof contexts[0]!.order).toBe('number');
@@ -88,7 +88,7 @@ describe('T8.26.3 systemPrompt.context 钩子（plugin.ts apply）', () => {
 
   it('求值：text(assembleCtx) 调用 prepareTurn 并返回投影文本（含 working_state 投影 → goal 可见）；context/injected 入链（配 total_tokens）', async () => {
     const { ctx, contexts } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
     const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
     const assembleCtx = makeAssembleCtx([
       { type: 'user/message', data: { id: 'msg-1', content: [{ type: 'text', text: GOAL }], source: { kind: 'user' } } },
@@ -122,14 +122,14 @@ describe('T8.26.3 systemPrompt.context 钩子（plugin.ts apply）', () => {
 
   it('守卫降级：无 systemPrompt（接口缺失）→ apply 不抛、不注册，且记录降级', () => {
     const { ctx, contexts } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })), withSystemPrompt: false });
-    expect(() => apply(ctx)).not.toThrow();
+    expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     expect(contexts).toHaveLength(0);
     expect(degradationLog().some((r) => r.hook === 'systemPrompt.context')).toBe(true);
   });
 
   it('守卫降级：无 cognitive（未装配）→ 不注册 context（无认知注入，命令仍可用）+ 记录降级（不抛）', () => {
     const { ctx, contexts } = makeFakeCtx({ withSystemPrompt: true });
-    expect(() => apply(ctx)).not.toThrow();
+    expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     expect(contexts).toHaveLength(0);
     expect(degradationLog().some((r) => r.hook === 'cognitive-runtime')).toBe(true);
   });

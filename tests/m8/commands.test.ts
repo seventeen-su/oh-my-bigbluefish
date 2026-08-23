@@ -81,7 +81,7 @@ const bench = (c: FakeCtxResult): CapturedCommand => c.captured.find((x) => x.na
 describe('T8.2 /mode 真实 recompose 接线', () => {
   it('ctx 提供 agentPresets.recompose → /mode 切换时 handler 真实调用 recompose（目标 preset id=omb-v2-<line>）且成功', async () => {
     const c = makeFakeCtx();
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest'));
     expect(r.kind).toBe('success');
@@ -95,7 +95,7 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 
   it('recompose 调用抛错 → 降级切换：success（会话内状态）+ 受限说明，本地线状态已更新', async () => {
     const c = makeFakeCtx({ recompose: () => Promise.reject(new Error('preset omb-v2-latest 不存在')) });
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest'));
     expect(r.kind).toBe('success');
@@ -109,7 +109,7 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 
   it('recompose 返回 {ok:false} → 降级切换：success（会话内状态）+ detail 明示', async () => {
     const c = makeFakeCtx({ recompose: () => ({ ok: false, detail: '目标 preset 未安装' }) });
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('initial'));
     expect(r.kind).toBe('success');
@@ -122,7 +122,7 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 
   it('ctx 无 agentPresets → 降级为会话内当前线状态（recompose 不被调，切换仍成功——既有 m0 行为保持）', async () => {
     const c = makeFakeCtx({ noAgentPresets: true });
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest'));
     expect(r.kind).toBe('success');
@@ -132,7 +132,7 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 
   it('空白会话守卫仍生效：非空白会话拒绝切换（recompose 不被调）', async () => {
     const c = makeFakeCtx();
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     const r = await mode(c).handler(makeInvocation('latest', [{ type: 'turn/start' }]));
     expect(r.kind).toBe('error');
@@ -144,7 +144,7 @@ describe('T8.2 /mode 真实 recompose 接线', () => {
 describe('T8.2 /bench 注册与触发', () => {
   it('注册 bench 命令：name=bench、description 非空、recordInput=true', () => {
     const c = makeFakeCtx({ noAgentPresets: true });
-    apply(c.ctx);
+    apply(c.ctx, { bootstrap: false });
 
     expect(bench(c)).toBeDefined();
     expect(bench(c).name).toBe('bench');
@@ -156,7 +156,7 @@ describe('T8.2 /bench 注册与触发', () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-cmd-bench-'));
     try {
       const c = makeFakeCtx({ noAgentPresets: true });
-      apply(c.ctx, { benchPersistDir: join(base, 'bench') });
+      apply(c.ctx, { benchPersistDir: join(base, 'bench'), bootstrap: false });
 
       const r = await bench(c).handler(makeInvocation(''));
       expect(r.kind).toBe('success');
@@ -178,7 +178,7 @@ describe('T8.2 /bench 注册与触发', () => {
     const base = await mkdtemp(join(tmpdir(), 'omb-act-'));
     try {
       const c = makeFakeCtx({ noAgentPresets: true });
-      apply(c.ctx, { activationLogDir: join(base, 'act') });
+      apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
 
       const r = await mode(c).handler(makeInvocation('stable', [], 'sess-act-1'));
       expect(r.kind).toBe('success');

@@ -143,7 +143,7 @@ describe('T8.3 插件激活即装配（plugin.ts apply）', () => {
     const ctx: ContextLike = {
       commands: { register: (def: unknown) => captured.push(def) },
     };
-    const handle = apply(ctx, { cognitiveRoot: root });
+    const handle = apply(ctx, { cognitiveRoot: root, bootstrap: false });
     expect(handle.cognitive).toBeDefined();
     expect(handle.cognitive!.eventStore).toBeDefined();
     expect(handle.cognitive!.memory).toBeDefined();
@@ -160,7 +160,7 @@ describe('T8.3 插件激活即装配（plugin.ts apply）', () => {
       commands: { register: (def: unknown) => captured.push(def) },
       get: (name: string) => (name === 'cognitive' ? injected : undefined),
     };
-    const handle = apply(ctx, { cognitiveRoot: join(base, 'should-not-be-used') });
+    const handle = apply(ctx, { cognitiveRoot: join(base, 'should-not-be-used'), bootstrap: false });
     expect(handle.cognitive).toBe(injected); // 注入实例原样使用
     const fs = await import('node:fs');
     expect(fs.existsSync(join(base, 'should-not-be-used'))).toBe(false); // 未按缺省路径装配

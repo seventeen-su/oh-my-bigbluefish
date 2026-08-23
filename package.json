@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json",
-    "bench-report": "tsx scripts/bench-report.ts"
+    "bench-report": "tsx scripts/bench-report.ts",
+    "init-three-line": "tsx scripts/init-three-line.ts"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

@@ -86,14 +86,14 @@ function track(rt: CognitiveRuntime): CognitiveRuntime {
 describe('T8.26.4 事件监听（plugin.ts apply）', () => {
   it('注册断言：apply(fakeCtx) → session/event 与 tools/result 监听已注册', () => {
     const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
     expect(bus.listeners.has('session/event')).toBe(true);
     expect(bus.listeners.has('tools/result')).toBe(true);
   });
 
   it('事件流 → Event Store 可查 → State 更新正确（goal/utility_tool_calls/Contradiction 检测）', async () => {
     const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // 模拟 DSH 事件流：turn/start → user/message(A) → tool/call → tool/result → user/message(B，同 turn 不同指令)
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1000));
@@ -140,7 +140,7 @@ describe('T8.26.4 事件监听（plugin.ts apply）', () => {
 
   it('双路径幂等：tools/result（live）与 session/event tool/result 对同一 callId → 同一事件 id → 只入链一次', async () => {
     const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // live 路径先到（tools/result，exec 携带 callId/name/agent.session.id）
     bus.emit('tools/result',
@@ -174,7 +174,7 @@ describe('T8.26.4 事件监听（plugin.ts apply）', () => {
 
   it('反证解除：同 callId 不同结果签名（工具结果被修正）→ evidence/revoked 入链，历史保留，claim 证据态撤销', async () => {
     const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     bus.emit('session/event', { id: SESSION }, dshEvent('tool/result', {
       turn: 1,
@@ -213,14 +213,14 @@ describe('T8.26.4 事件监听（plugin.ts apply）', () => {
 
   it('守卫降级：无 ctx.on（接口缺失）→ apply 不抛、不注册监听、记录降级（命令仍可用）', () => {
     const { ctx, bus } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })), withOn: false });
-    expect(() => apply(ctx)).not.toThrow();
+    expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     expect(bus.listeners.size).toBe(0);
     expect(degradationLog().some((r) => r.hook === 'ctx.on')).toBe(true);
   });
 
   it('守卫降级：无 cognitive（未装配）→ 不注册监听 + 记录降级', () => {
     const { ctx, bus } = makeFakeCtx({ withOn: true });
-    expect(() => apply(ctx)).not.toThrow();
+    expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
     expect(bus.listeners.size).toBe(0);
     expect(degradationLog().some((r) => r.hook === 'cognitive-runtime')).toBe(true);
   });

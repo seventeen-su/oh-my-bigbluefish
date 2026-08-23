@@ -72,7 +72,7 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
         listeners.set(event, arr);
       },
     };
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
     // 三钩子均为观察/注入面；无任何 agent-loop 控制/拦截事件（如 model call、message 分发等）
     expect([...listeners.keys()].sort()).toEqual(['session/event', 'session/flush', 'tools/result']);
   });
@@ -108,7 +108,7 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
       llm,
       config: { model: { provider: 'test', model: 't1' } },
     };
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // ① 装配后 ctx.llm 引用与方法身份不变（未包装/替换：adapter 为捕获 llm 的新对象，不修改原对象）
     expect(ctx.llm).toBe(llm);
@@ -168,7 +168,7 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
       on: () => undefined,
       agentPresets: { recompose },
     };
-    apply(ctx);
+    apply(ctx, { bootstrap: false });
 
     // d. 仅调用 context()（additive section）；无 section()/替换型 API（若插件调用未定义方法会直接抛错）
     expect(systemPromptCalls).toEqual(['context']);

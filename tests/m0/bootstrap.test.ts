@@ -1,0 +1,225 @@
+// 专项行为测试：分享后自动初始化三线布局与只读 ACL（substrate/bootstrap.ts ensureThreeLineLayout）。
+// 独立临时目录 fixture 注入 layout（绝不触碰真实布局）；真实 git/icacls（禁 mock，同 m0 约定）。
+// 覆盖：缺失→完整初始化 / 健康→ok 幂等 / worktree 缺失→修复 / gitfile 旧机器残留→修复 /
+//       ACL 丢失→重新施加 / git 不可用→degraded / 非空无 .git→degraded 且保留用户数据。
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  MANIFEST_INITIAL,
+  MANIFEST_LATEST,
+  runGit,
+  runIcacls,
+} from '../helpers/git.js';
+import { ensureThreeLineLayout, type LayoutBootstrapResult } from '../../substrate/bootstrap.js';
+import { loadVersion, type VersionLayout } from '../../substrate/snapshot.js';
+
+/** 捕获写文件异常；返回 (error, code)。写成功则 error 为 null。 */
+function captureWriteError(target: string): { error: NodeJS.ErrnoException | null; code: string | undefined } {
+  try {
+    fs.writeFileSync(target, 'probe');
+    return { error: null, code: undefined };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return { error: e, code: e.code };
+  }
+}
+
+function makeLayout(root: string): VersionLayout {
+  return {
+    bareRepo: path.join(root, 'versions.git'),
+    stableWorktree: path.join(root, 'stable'),
+    latestWorktree: path.join(root, 'latest'),
+  };
+}
+
+/** 释放只读 ACL（icacls /reset /T /C）→ 删除临时根（照抄 helpers teardownLayoutFixture 模式） */
+function teardownRoot(root: string): void {
+  try {
+    fs.rmSync(root, { recursive: true, force: true });
+    return;
+  } catch {
+    try {
+      runIcacls([root, '/reset', '/T', '/C']);
+    } catch {
+      // 还原失败也继续尝试删除
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** 断言目录写被拒（真实 ACL：EPERM/EACCES，同 git-layout.test.ts 断言方式） */
+function assertReadOnly(dir: string): void {
+  const { error, code } = captureWriteError(path.join(dir, 'probe.txt'));
+  expect(error).not.toBeNull();
+  expect(['EPERM', 'EACCES']).toContain(code);
+}
+
+/**
+ * 读取 worktree 的 manifest.json 并归一化比较：git checkout 在 Windows 默认 core.autocrlf
+ * 会把 LF 归一为 CRLF（git-layout.test.ts 用 JSON.parse 规避）→ 这里 JSON.parse 后按
+ * 2 空格缩进重新序列化（等价种子内容 MANIFEST_INITIAL/LATEST，行尾无关）。
+ */
+function readManifest(dir: string): string {
+  const parsed = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8')) as {
+    name: string;
+    version: string;
+    line: string;
+    components: unknown;
+  };
+  return JSON.stringify(parsed, null, 2);
+}
+
+describe('ensureThreeLineLayout（独立临时 fixture）', () => {
+  let root: string;
+
+  afterEach(() => {
+    if (root !== undefined) {
+      teardownRoot(root);
+    }
+  });
+
+  it('缺失布局 → 完整初始化：bare+三引用+双 worktree manifest+候选 worktree+只读 ACL', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-init-'));
+    const layout = makeLayout(root);
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('initialized');
+    // versions.git 存在且含 bare 结构
+    expect(fs.existsSync(path.join(layout.bareRepo, 'HEAD'))).toBe(true);
+    expect(fs.existsSync(path.join(layout.bareRepo, 'objects'))).toBe(true);
+    expect(fs.existsSync(path.join(layout.bareRepo, 'refs'))).toBe(true);
+    // 三引用可解析（真实 git）
+    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main']) {
+      const hash = runGit(['rev-parse', '--verify', `${ref}^{commit}`], { cwd: layout.bareRepo });
+      expect(hash).toMatch(/^[0-9a-f]{40}$/);
+    }
+    // stable/latest manifest 内容与种子一致（JSON 归一化比较，git autocrlf 行尾无关）
+    expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
+    expect(readManifest(layout.latestWorktree)).toBe(MANIFEST_LATEST);
+    // 候选 worktree（0000-bootstrap）存在且是 git worktree
+    const candidate = path.join(root, 'workspace', '.omb', '.evolution', 'candidates', '0000-bootstrap');
+    expect(fs.existsSync(path.join(candidate, '.git'))).toBe(true);
+    // 正式 worktree 写被拒（真实 ACL）
+    assertReadOnly(layout.stableWorktree);
+    assertReadOnly(layout.latestWorktree);
+    // 两线已分叉（stable..main diff 非空）
+    const diff = runGit(['diff', '--stat', 'stable..main'], { cwd: layout.bareRepo });
+    expect(diff.length).toBeGreaterThan(0);
+  });
+
+  it('健康布局 → ok 且幂等（重复调用零副作用）', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-healthy-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    const r2 = ensureThreeLineLayout(layout);
+    expect(r2.status).toBe('ok');
+    const r3 = ensureThreeLineLayout(layout);
+    expect(r3.status).toBe('ok');
+    // 健康调用不产生新结构：候选 worktree 仍唯一
+    const candidates = fs.readdirSync(path.join(root, 'workspace', '.omb', '.evolution', 'candidates'));
+    expect(candidates).toEqual(['0000-bootstrap']);
+  });
+
+  it('worktree 缺失 → 修复重建（stable 内容恢复为 initial 基线 + 只读 ACL 重新施加）', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-missing-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    // 删除 stable worktree（先释放 ACL 才能删）
+    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    fs.rmSync(layout.stableWorktree, { recursive: true, force: true });
+    expect(fs.existsSync(layout.stableWorktree)).toBe(false);
+    // 修复重建
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
+    assertReadOnly(layout.stableWorktree);
+  });
+
+  it('gitfile 指向不存在路径（旧机器路径残留）→ 修复后可 loadVersion', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-gitfile-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    // 构造旧机器残留：释放 ACL → 清空 stable 内容（保留 .git 指针）→ 删注册项 →
+    // gitfile 指向不存在 gitdir。注意：git 创建的 .git 带 Hidden 属性，Node writeFileSync
+    //（O_TRUNC）对其 EPERM（libuv 已知行为）→ 先删除再重建指针文件（rm 不受 Hidden 影响）。
+    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    fs.rmSync(path.join(layout.stableWorktree, 'manifest.json'));
+    fs.rmSync(path.join(layout.stableWorktree, 'README.md'));
+    fs.rmSync(path.join(layout.bareRepo, 'worktrees', 'stable'), { recursive: true, force: true });
+    const gitfile = path.join(layout.stableWorktree, '.git');
+    fs.rmSync(gitfile);
+    fs.writeFileSync(gitfile, 'gitdir: C:/nonexistent/versions.git/worktrees/stable\n');
+    // 修复
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    // 修复后 stable 版本线可加载（内容 = initial 基线）
+    const snap = await loadVersion('stable', layout);
+    expect(readManifest(snap.tree_root)).toBe(MANIFEST_INITIAL);
+    assertReadOnly(layout.stableWorktree);
+  });
+
+  it('ACL 丢失（目录可写）→ 重新施加后写被拒', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-acl-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    // 模拟 ACL 丢失：/reset 恢复继承 ACL（目录重新可写）
+    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    runIcacls([layout.latestWorktree, '/reset', '/T', '/C']);
+    expect(captureWriteError(path.join(layout.stableWorktree, 'probe.txt')).error).toBeNull(); // 确认 ACL 确实丢失
+    // 修复 → 重新施加只读 ACL
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    assertReadOnly(layout.stableWorktree);
+    assertReadOnly(layout.latestWorktree);
+  });
+
+  it('全空 bare（存在但无提交）→ 按种子流程补基线（repaired）', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-empty-'));
+    const layout = makeLayout(root);
+    // 先建一个无提交的 bare（不指定 -b，HEAD 可能指向非 main）
+    fs.mkdirSync(layout.bareRepo, { recursive: true });
+    runGit(['init', '--bare', layout.bareRepo]);
+    expect(fs.existsSync(path.join(layout.bareRepo, 'HEAD'))).toBe(true);
+    // 补基线修复
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main']) {
+      const hash = runGit(['rev-parse', '--verify', `${ref}^{commit}`], { cwd: layout.bareRepo });
+      expect(hash).toMatch(/^[0-9a-f]{40}$/);
+    }
+    expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
+    expect(readManifest(layout.latestWorktree)).toBe(MANIFEST_LATEST);
+    assertReadOnly(layout.stableWorktree);
+  });
+
+  it('git 不可用（layout.gitBin 指向不存在 exe）→ degraded 不 throw', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-nogit-'));
+    const layout: VersionLayout = {
+      ...makeLayout(root),
+      gitBin: path.join(root, 'no-git.exe'),
+    };
+    let r: LayoutBootstrapResult | undefined;
+    expect(() => {
+      r = ensureThreeLineLayout(layout);
+    }).not.toThrow();
+    expect(r?.status).toBe('degraded');
+    expect((r?.detail ?? '').length).toBeGreaterThan(0);
+  });
+
+  it('非空无 .git 的 worktree 目录 → degraded 且内容未被删除', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-data-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    // 构造：释放 ACL → 删除 .git 指针 → 留下用户内容
+    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    fs.rmSync(path.join(layout.stableWorktree, '.git'));
+    fs.writeFileSync(path.join(layout.stableWorktree, 'user-data.txt'), 'keep me');
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('degraded');
+    expect(r.detail).toContain('stable');
+    // 用户数据未被删除
+    expect(fs.readFileSync(path.join(layout.stableWorktree, 'user-data.txt'), 'utf8')).toBe('keep me');
+    expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
+  });
+});

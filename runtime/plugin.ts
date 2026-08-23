@@ -12,6 +12,7 @@
 //（presetIdForLine 映射，失败 → mode-command 明确受限降级会话内状态）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, loadVersion, type VersionLine } from '../substrate/snapshot.js';
+import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
 import { bootStable } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
@@ -49,6 +50,8 @@ export interface PluginConfig {
   benchPersistDir?: string;
   /** 版本激活记录持久化目录（/mode 切换时写入 completed/<id>.json，T8.7 幂等持久化；缺省不落盘） */
   activationLogDir?: string;
+  /** 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」；缺省 true；测试与手动控制用 bootstrap: false 关闭） */
+  bootstrap?: boolean;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -197,6 +200,30 @@ export interface ApplyResult {
 }
 
 export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  // 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」）：versions.git/stable/latest
+  // 均 gitignored、不随仓库分发 → 项目被分享（clone/拷贝）后布局缺失/损坏/ACL 丢失 →
+  // 进程内自动初始化或保守修复。锁安全性：git/icacls 均以短生命周期子进程（execFileSync）运行，
+  // DSH 进程不持有 versions.git/stable/latest 的文件句柄（正式 worktree 运行只读）→ 无锁冲突；
+  // 布局健康时纯 fs 检查、零 git 子进程（零开销）。degraded → 记录降级（不阻塞挂载，命令仍可用）。
+  // 顺序：ensureThreeLineLayout → 跨进程残留清理 → bootStable（回退校验依赖布局就绪）。
+  if (config.bootstrap !== false) {
+    const r = ensureThreeLineLayout();
+    if (r.status === 'degraded') {
+      recordDegradation('layout/bootstrap', r.detail);
+    } else if (r.status !== 'ok') {
+      console.info(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
+    }
+  }
+  // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）
+  try {
+    const removed = cleanupStaleInitialWorktrees();
+    if (removed > 0) {
+      recordDegradation('initial/cleanup', `清理跨进程残留 initial 物化 worktree ${removed} 个`);
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
+  }
   // 恢复根启动完整性校验（架构 §3/§11.4；T8.1 生产接线补全）：stable 引用/内容损坏 →
   // bootStable 自动沿历史回退到上一完好快照。apply 为同步契约，bootStable 异步 fire-and-forget
   //（先于认知装配发起；回退成功/失败均记录降级，命令仍可用——不阻塞挂载）。
@@ -210,16 +237,6 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     const detail = err instanceof Error ? err.message : String(err);
     recordDegradation('boot/stable', `启动校验异常（${detail}）——跳过自动回退`);
   });
-  // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）
-  try {
-    const removed = cleanupStaleInitialWorktrees();
-    if (removed > 0) {
-      recordDegradation('initial/cleanup', `清理跨进程残留 initial 物化 worktree ${removed} 个`);
-    }
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
-  }
   // T8.3：认知系统装配进插件生命周期——经 deps 注入（get('cognitive')，组合根模式）或
   // 组合根缺省装配（runtime/assembly.ts；装配根 = config.cognitiveRoot）。
   // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
