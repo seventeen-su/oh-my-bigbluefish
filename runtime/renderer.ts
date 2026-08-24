@@ -45,7 +45,7 @@ export interface CandidateItem {
   content: string;
   tokens: number; // 输入侧 token 估算（精确计费为 §17 参数标定项，M2 透传）
   view: CandidateView;
-  info_value: number; // Δ信息价值（§17 开放项：当前由调用方提供；缺口匹配度启发式后续接入）
+  info_value: number; // Δ信息价值（S3：缺口匹配启发式动态估计——estimateInfoValue，调用方提供；空闲期反馈修正留待 §17）
   source_ref: string;
 }
 

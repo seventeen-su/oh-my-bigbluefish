@@ -1,12 +1,15 @@
 // R7 行为测试（P1 架构闭合）：Context 候选来源扩展（架构 §6.1 候选全集——
-// Memory/Evidence/Capability/Process/Artifact）。
-// 评估依据（.omb/drafts/下一步说明.md §14A）：buildContextProjection 输入 = WorkingState + retrieved.items
+// Memory/Evidence/Capability/Process/Artifact）+ S3 ΔInfoValue 缺口匹配启发式（§17 首版承诺）。
+// 评估依据（.omb/drafts/下一步说明.md §14A/B）：buildContextProjection 输入 = WorkingState + retrieved.items
 // （仅 Memory）→ 三视图结构已实现、内容来源不完整；R7 把候选来源扩展为设计全集：
 //   候选统一入口（gatherContextCandidates）+ 各来源接入（注入 fake 事件库/注册表/制品库）+
-//   编译面接入（新 source section + 预算贪心保持 + 确定性 + 空来源无新增 section）+ ΔInfoValue 留 §17。
+//   编译面接入（新 source section + 预算贪心保持 + 确定性 + 空来源无新增 section）；
+//   ΔInfoValue（S3）：WorkingState 缺口匹配启发式动态估计——五来源统一，固定值/r.value 近似移除。
 // 严格 TDD：本文件先于实现编写（runtime/context-candidates.ts 不存在 → RED）。
 // 覆盖：
-//   gather：memory/evidence/capability/process/artifact 五来源候选收集 + N/M/K 封顶 + 空来源缺省
+//   estimateInfoValue：确定性（同输入同值）+ gap 命中 > 未命中 + 冲突减分 + 空缺口低值 + 空内容 0
+//   gather：memory/evidence/capability/process/artifact 五来源候选收集 + N/M/K 封顶 + 空来源缺省 +
+//           info_value 统一经 estimateInfoValue（memory 不再用 r.value、process 不再固定 200）
 //   toCandidateItems：ContextCandidate → renderer CandidateItem（功能视图映射 + ref 透传）
 //   compile：新来源 section 输出（evidence/capability/artifact——process 统一并入）+ 预算截断 + 确定性
 //   buildContextProjection：sources 注入 → 新 section；sources 缺省 → 与既有一致（process 固定 section）
@@ -29,9 +32,12 @@ import {
   ARTIFACT_CANDIDATE_LIMIT,
   CAPABILITY_CANDIDATE_LIMIT,
   EVIDENCE_CANDIDATE_LIMIT,
+  INFO_VALUE_BASE,
+  estimateInfoValue,
   gatherContextCandidates,
   toCandidateItems,
   type ContextCandidate,
+  type InfoValueContext,
 } from '../../runtime/context-candidates.js';
 
 const POLICY_DIR = fileURLToPath(new URL('../../kernel/policy', import.meta.url));
@@ -165,7 +171,7 @@ function gatherInput(
 }
 
 describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事件库/注册表/制品库）', () => {
-  it('memory：检索项 → memory 候选（ref=memory id、info_value=r.value、view=summary、tokens 估算非零）', async () => {
+  it('memory：检索项 → memory 候选（ref=memory id、info_value=缺口匹配启发式（空缺口 → 基础值）、view=summary、tokens 估算非零）', async () => {
     const mem = memoryItem('mem:1', '记忆载荷', 0.7);
     const cands = await gatherContextCandidates(gatherInput({ memory_items: [mem] }));
     const m = cands.find((c) => c.kind === 'memory');
@@ -173,7 +179,8 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(m!.ref).toBe('mem:1');
     expect(m!.view).toBe('summary');
     expect(m!.content).toBe('记忆载荷');
-    expect(m!.info_value).toBe(0.7); // ΔInfoValue 仍为来源侧提供（§17 开放项：r.value 近似）
+    // S3：memory 统一缺口匹配启发式（r.value 为检索排序信号，不直接作为投影价值）；空缺口 → 基础值
+    expect(m!.info_value).toBe(INFO_VALUE_BASE);
     expect(m!.tokens_est).toBeGreaterThan(0);
   });
 
@@ -239,7 +246,7 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(cands.filter((c) => c.kind === 'capability')).toHaveLength(CAPABILITY_CANDIDATE_LIMIT);
   });
 
-  it('process：R3 调度结果 → process 候选（复用 process section 渲染；info_value 全源最高——决策过程贪心首选）', async () => {
+  it('process：R3 调度结果 → process 候选（复用 process section 渲染；info_value=缺口匹配启发式——固定 200 已移除，空缺口 → 基础值）', async () => {
     const cands = await gatherContextCandidates(gatherInput({ process: processInput() }));
     const p = cands.find((c) => c.kind === 'process');
     expect(p).toBeDefined();
@@ -247,7 +254,8 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(p!.view).toBe('original');
     expect(p!.content).toContain('认知过程');
     expect(p!.content).toContain('RETRIEVE → VERIFY → STOP');
-    expect(p!.info_value).toBeGreaterThan(150);
+    // S3：process 不再恒全源最高（固定 200 移除）——缺口匹配时才优先；空缺口 → 基础值
+    expect(p!.info_value).toBe(INFO_VALUE_BASE);
   });
 
   it('artifact：制品索引 → artifact 候选（view=pointer、按 created 降序取 K；ref=制品 id）', async () => {
@@ -332,6 +340,71 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     const cands = await gatherContextCandidates(gatherInput({ memory_items: [memoryItem('mem:1')] }));
     expect(cands).toHaveLength(1);
     expect(cands[0]!.kind).toBe('memory');
+  });
+});
+
+describe('S3 estimateInfoValue：缺口匹配启发式（§17 首版承诺——动态估计，确定性纯函数）', () => {
+  /** 缺口匹配输入工厂（结构面同 PromptWorkingState 缺口子集） */
+  function ctx(over: Partial<InfoValueContext> = {}): InfoValueContext {
+    return { evidence_gaps: [], open_questions: [], confirmed_facts: [], ...over };
+  }
+
+  it('确定性：同 candidate + 同 working_state → 同值（重复调用深相等）', () => {
+    const ws = ctx({ evidence_gaps: ['记忆检索'], open_questions: ['系统性能'] });
+    const a = estimateInfoValue('记忆检索完成', ws);
+    const b = estimateInfoValue('记忆检索完成', ws);
+    expect(b).toBe(a);
+    expect(Number.isFinite(a)).toBe(true);
+  });
+
+  it('gap 命中 > 未命中：候选内容覆盖 evidence_gaps → 高于基础值', () => {
+    const base = estimateInfoValue('无关内容', ctx());
+    const hit = estimateInfoValue('记忆检索', ctx({ evidence_gaps: ['记忆检索'] }));
+    expect(hit).toBeGreaterThan(base);
+    // 全命中：基础值 + 全 gap 加成（无 question/conflict 项）
+    expect(hit).toBe(INFO_VALUE_BASE + 120);
+  });
+
+  it('gap 命中权重 > question 命中权重：同内容分别命中 gap/question → gap 值更高', () => {
+    const gapHit = estimateInfoValue('记忆检索', ctx({ evidence_gaps: ['记忆检索'] }));
+    const qHit = estimateInfoValue('记忆检索', ctx({ open_questions: ['记忆检索'] }));
+    expect(qHit).toBe(INFO_VALUE_BASE + 60); // 全 question 命中：基础值 + 60
+    expect(gapHit).toBeGreaterThan(qHit); // gap 权重 120 > question 权重 60
+  });
+
+  it('冲突减分：候选内容与 confirmed_facts 重叠 → 低于未冲突（防重复信息）', () => {
+    const noConflict = estimateInfoValue('记忆检索', ctx({ evidence_gaps: ['记忆检索'] }));
+    const conflicted = estimateInfoValue('记忆检索', ctx({ evidence_gaps: ['记忆检索'], confirmed_facts: ['记忆检索'] }));
+    expect(conflicted).toBeLessThan(noConflict);
+    // 全冲突：基础值 + gap 120 − conflict 60
+    expect(conflicted).toBe(INFO_VALUE_BASE + 120 - 60);
+  });
+
+  it('冲突可减至 0：仅 confirmed_facts 全命中（无 gap/question）→ 0（不出现负值）', () => {
+    expect(estimateInfoValue('记忆检索', ctx({ confirmed_facts: ['记忆检索'] }))).toBe(0);
+  });
+
+  it('空缺口/空问题 → 均匀低基础值（所有候选同值；不臆造高价值）', () => {
+    const ws = ctx(); // 全空
+    expect(estimateInfoValue('记忆检索', ws)).toBe(INFO_VALUE_BASE);
+    expect(estimateInfoValue('系统性能', ws)).toBe(INFO_VALUE_BASE);
+    expect(estimateInfoValue('memory.retrieve', ws)).toBe(INFO_VALUE_BASE);
+    expect(INFO_VALUE_BASE).toBeLessThan(INFO_VALUE_BASE + 120); // 基础值低于命中值
+  });
+
+  it('候选内容空/空白 → 0', () => {
+    const ws = ctx({ evidence_gaps: ['记忆检索'] });
+    expect(estimateInfoValue('', ws)).toBe(0);
+    expect(estimateInfoValue('   ', ws)).toBe(0);
+  });
+
+  it('部分重叠按比例：重叠 token 比例越高 → 值越高（连续递增）', () => {
+    const ws = ctx({ evidence_gaps: ['记忆检索完成'] });
+    const none = estimateInfoValue('无关内容', ws);
+    const partial = estimateInfoValue('记忆检索', ws); // bigram 部分重叠
+    const full = estimateInfoValue('记忆检索完成', ws);
+    expect(partial).toBeGreaterThan(none);
+    expect(full).toBeGreaterThan(partial);
   });
 });
 

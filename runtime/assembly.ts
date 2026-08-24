@@ -785,7 +785,7 @@ export class CognitiveRuntime {
     );
     // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
     // Process 调度结果；Artifact 缺省空——CognitiveRuntime 未装配 artifact-store，装配方注入后生效）；
-    // ΔInfoValue 为来源侧启发式（§17 开放项，不实现动态估计）
+    // ΔInfoValue（S3）：WorkingState 缺口匹配启发式动态估计（estimateInfoValue）——五来源统一；空闲期反馈修正留待 §17
     const projection = await buildContextProjection(
       policy,
       req,

@@ -4,11 +4,15 @@
 //   gatherContextCandidates —— 从各来源收集（确定性：同来源状态 → 同候选序列，无随机/时钟依赖；
 //     I/O 仅限注入来源的只读查询面）→ ContextCandidate[]；
 //   toCandidateItems —— 映射为 renderer CandidateItem（marginal 贪心预算选择语义复用，编译面零感知）。
-// ΔInfoValue（§17 开放项）：info_value 仍为来源侧提供/启发式——memory 沿用检索价值 r.value（调用方
-//   近似），其余来源为固定启发式初值；**不实现动态 ΔInfoValue 估计**（估计规则留待 §17）。
+// ΔInfoValue（S3，§17 首版承诺）：info_value 经 estimateInfoValue 缺口匹配启发式动态估计——
+//   按 WorkingState 缺口（evidence_gaps/open_questions）与候选内容的 token 匹配度计算，替代来源侧固定值
+//   （memory 亦统一启发式——r.value 保留为检索排序信号，不直接作为投影价值；取较高者因尺度不可比
+//   等价恒取启发式，故统一；空闲期反馈修正（Retrieval Episode 归因）留待 §17）。
 // 层 DAG（CONVENTIONS §4）：runtime(2) → kernel(2)/memory(2)/runtime(2)/supervisor(1) 均满足
 //   "import 目标层 ≤ 源层"；仅 type-only import supervisor（结构查询面，无运行时依赖）。
 import type { RankedMemory } from '../memory/retrieve.js';
+// S3：匹配 token 化复用 cjk-ngram 双侧分词（CJK bigram / 非 CJK 空白分词）——memory(2) 同层，层 DAG ✓
+import { tokenizeForFts } from '../memory/cjk-ngram.js';
 import type { Event } from '../kernel/schemas/m.js';
 import type { CapabilityLike } from '../supervisor/capability.js';
 import type { ArtifactMeta } from '../supervisor/artifact-store.js';
@@ -32,17 +36,70 @@ export const ARTIFACT_CANDIDATE_LIMIT = 3;
  * 会话事件数超窗口时只保证窗口内最近 N 条；待标定 §17） */
 const EVIDENCE_FETCH_LIMIT = 200;
 
-// ---- ΔInfoValue 启发式初值（§17 开放项：当前为来源侧固定启发式，非动态估计——动态 ΔInfoValue
-//      估计规则留待 §17；memory 除外——沿用既有检索价值 r.value） ----
+// ---- ΔInfoValue 缺口匹配启发式（S3：§17 首版承诺——WorkingState 缺口匹配度动态估计，替代来源侧固定值） ----
+// 语义：info_value = 基础值 + gap 命中加权 + question 命中加权 − confirmed_facts 冲突减分（防重复信息）。
+// 匹配度 = 候选内容 token 集与各缺口/问题 token 集的重叠比例（token 化复用 memory/cjk-ngram bigram）。
+// 确定性纯函数：同 candidate + 同 working_state → 同值（无随机/时钟/I/O）。
+// 边界：gap/open_questions 空 → 均匀基础值；候选内容空 → 0；confirmed_facts 冲突可减至 0。
+// 首版权重为基础启发式（§17：空闲期反馈修正——Retrieval Episode 归因标定权重——留待后续，本版不实现）。
 
-/** evidence 候选信息价值（最近事实链相关性；待标定 §17） */
-export const EVIDENCE_INFO_VALUE = 120;
-/** capability 候选信息价值（当前可用能力；待标定 §17） */
-export const CAPABILITY_INFO_VALUE = 100;
-/** process 候选信息价值（决策过程——**全源最高** → 贪心首选，R3「认知过程」section 语义保持；待标定 §17） */
-export const PROCESS_INFO_VALUE = 200;
-/** artifact 候选信息价值（可 restore 制品；待标定 §17） */
-export const ARTIFACT_INFO_VALUE = 150;
+/** 基础信息价值（无缺口/无匹配时的低基础值——不臆造高价值；所有来源同尺度可比） */
+export const INFO_VALUE_BASE = 60;
+/** evidence_gaps 命中加权（缺口命中权重 > 问题命中权重——缺什么比问什么更关键） */
+export const INFO_VALUE_GAP_BONUS = 120;
+/** open_questions 命中加权 */
+export const INFO_VALUE_QUESTION_BONUS = 60;
+/** confirmed_facts 冲突减分（候选内容与已确认事实重叠 → 重复信息 → 减分，防重复投影） */
+export const INFO_VALUE_CONFLICT_PENALTY = 60;
+
+/** 缺口匹配启发式输入（WorkingState 缺口子集：evidence_gaps/open_questions/confirmed_facts） */
+export interface InfoValueContext {
+  evidence_gaps: readonly string[];
+  open_questions: readonly string[];
+  confirmed_facts: readonly string[];
+}
+
+/** token 化（复用 memory/cjk-ngram 双侧分词：CJK bigram / 非 CJK 空白分词）→ token 集 */
+function tokenSet(text: string): Set<string> {
+  return new Set(tokenizeForFts(text).split(' ').filter((t) => t.length > 0));
+}
+
+/** 候选 token 集与单个缺口文本 token 集的重叠比例（|cand ∩ entry| / |entry|；entry 空 → 0） */
+function overlapRatio(cand: Set<string>, entry: string): number {
+  const entryTokens = tokenSet(entry);
+  if (entryTokens.size === 0) return 0;
+  let hit = 0;
+  for (const t of entryTokens) {
+    if (cand.has(t)) hit += 1;
+  }
+  return hit / entryTokens.size;
+}
+
+/** 对一组缺口/问题取最大重叠比例（空组 → 0） */
+function maxOverlap(cand: Set<string>, entries: readonly string[]): number {
+  let best = 0;
+  for (const entry of entries) {
+    const r = overlapRatio(cand, entry);
+    if (r > best) best = r;
+  }
+  return best;
+}
+
+/**
+ * S3：首版 ΔInfoValue 缺口匹配启发式（§17 首版承诺——动态估计，替代来源侧固定值/ r.value 近似）。
+ * info_value = BASE + GAP_BONUS·gapOverlap + QUESTION_BONUS·questionOverlap − CONFLICT_PENALTY·factOverlap，
+ * 下限 0（冲突全命中可减至 0）。候选内容空 → 0。确定性纯函数。
+ */
+export function estimateInfoValue(content: string, working_state: InfoValueContext): number {
+  if (content.trim().length === 0) return 0;
+  const cand = tokenSet(content);
+  if (cand.size === 0) return 0;
+  const gap = maxOverlap(cand, working_state.evidence_gaps);
+  const question = maxOverlap(cand, working_state.open_questions);
+  const conflict = maxOverlap(cand, working_state.confirmed_facts);
+  const raw = INFO_VALUE_BASE + INFO_VALUE_GAP_BONUS * gap + INFO_VALUE_QUESTION_BONUS * question - INFO_VALUE_CONFLICT_PENALTY * conflict;
+  return Math.max(0, Math.round(raw));
+}
 
 /** evidence 候选事件类型（Observation/decision 类；会话事实链——与 state-reducer 已注册处理类型对齐） */
 export const EVIDENCE_EVENT_TYPES: readonly string[] = [
@@ -64,7 +121,7 @@ export interface ContextCandidate {
   view: 'original' | 'summary' | 'pointer';
   content: string;
   tokens_est: number;
-  /** Δ信息价值（§17 开放项：来源侧提供/启发式，非动态估计） */
+  /** Δ信息价值（S3：缺口匹配启发式动态估计——estimateInfoValue；空闲期反馈修正留待 §17） */
   info_value: number;
 }
 
@@ -92,7 +149,7 @@ export interface ContextCandidateSources {
   artifactStore?: ArtifactSource;
 }
 
-/** gatherContextCandidates 输入（working_state/goal 为契约预留——ΔInfoValue 动态估计 §17 接入点，最小实现暂不读取） */
+/** gatherContextCandidates 输入（working_state 被 estimateInfoValue 缺口匹配启发式读取——S3；goal 契约预留） */
 export interface GatherContextCandidatesInput {
   working_state: {
     goal: string;
@@ -119,14 +176,16 @@ export interface GatherContextCandidatesInput {
  * R7：候选统一入口——从各来源收集 ContextCandidate[]（Memory/Evidence/Capability/Process/Artifact）。
  * 确定性：同来源状态 → 同候选序列（来源查询只读、无随机/时钟；排序与封顶均为确定性规则）；
  * 各来源失败降级（查询异常/空）→ 该来源候选空（不阻塞其余来源——尽力而为）。
- * ΔInfoValue 文档化：memory 沿用 r.value（既有近似）；其余来源为固定启发式初值（§17 开放项：
- *   动态 ΔInfoValue 估计规则留待，本函数**不实现动态估计**）。
+ * ΔInfoValue（S3，§17 首版承诺）：五来源 info_value 统一经 estimateInfoValue 缺口匹配启发式动态估计
+ *   （memory 亦统一——r.value 为检索排序信号不直接作为投影价值；固定来源值已移除）。空闲期反馈修正
+ *   （Retrieval Episode 归因标定权重）留待 §17，本函数不实现。
  */
 export async function gatherContextCandidates(input: GatherContextCandidatesInput): Promise<ContextCandidate[]> {
-  const { memory_items, runtime, process, session_id } = input;
+  const { memory_items, runtime, process, session_id, working_state } = input;
   const out: ContextCandidate[] = [];
+  const valueOf = (content: string): number => estimateInfoValue(content, working_state);
 
-  // Memory：既有检索项（kind=memory；info_value 沿用检索价值 r.value——调用方近似，§17 开放项）
+  // Memory：既有检索项（kind=memory；info_value 经缺口匹配启发式——统一语义，见函数文档）
   for (const r of memory_items) {
     out.push({
       kind: 'memory',
@@ -134,7 +193,7 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
       view: 'summary',
       content: r.memory.payload,
       tokens_est: estimateTokens(r.memory.payload),
-      info_value: r.value,
+      info_value: valueOf(r.memory.payload),
     });
   }
 
@@ -151,7 +210,7 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
           view: 'original',
           content,
           tokens_est: estimateTokens(content),
-          info_value: EVIDENCE_INFO_VALUE,
+          info_value: valueOf(content),
         });
       }
     } catch {
@@ -170,14 +229,15 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
         view: 'original',
         content,
         tokens_est: estimateTokens(content),
-        info_value: CAPABILITY_INFO_VALUE,
+        info_value: valueOf(content),
       });
     }
   } catch {
     // 注册表查询失败 → 无 capability 候选（尽力而为）
   }
 
-  // Process：R3 调度结果（复用 process section 渲染；info_value 全源最高 → 贪心首选——决策过程始终入投影）
+  // Process：R3 调度结果（复用 process section 渲染；info_value 经缺口匹配启发式——固定 200 已移除，
+  // 「若未来引入更高价值来源过程可能让位」成为真实语义：决策过程不再恒全源最高，缺口匹配时才优先）
   if (process !== undefined && process !== null) {
     const content = renderProcessContent(process);
     out.push({
@@ -186,7 +246,7 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
       view: 'original',
       content,
       tokens_est: estimateTokens(content),
-      info_value: PROCESS_INFO_VALUE,
+      info_value: valueOf(content),
     });
   }
 
@@ -214,7 +274,7 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
           view: 'pointer',
           content,
           tokens_est: estimateTokens(content),
-          info_value: ARTIFACT_INFO_VALUE,
+          info_value: valueOf(content),
         });
       }
     } catch {
