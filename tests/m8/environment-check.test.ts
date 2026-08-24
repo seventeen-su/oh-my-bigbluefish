@@ -18,6 +18,7 @@ import {
   collectEnvironmentFingerprint,
   diffFingerprints,
 } from '../../kernel/environment-fingerprint.js';
+import { hostVersion } from '../../kernel/schemas/host-version.js';
 import { createCognitiveRuntime } from '../../runtime/assembly.js';
 import { MaintenanceScheduler } from '../../supervisor/maintenance.js';
 
@@ -208,7 +209,7 @@ describe('④ collectEnvironmentFingerprint（运行时采集，缺省覆盖）'
     expect(typeof fp.os).toBe('string');
     expect(fp.os.length).toBeGreaterThan(0);
     expect(fp.node).toBe(process.version);
-    expect(fp.dsh_version).toBe('0.1.0'); // 缺省（与 supervisor 运行时默认指纹同源）
+    expect(fp.dsh_version).toBe(hostVersion()); // R6：缺省 = 唯一宿主版本来源 hostVersion()（缺省 DSH_HOST_VERSION；装配注入后 = 注入值）
     expect(fp.project).toBe('omb-v2');
     const over = collectEnvironmentFingerprint({ dsh_version: '9.9.9', project: 'custom' });
     expect(over.dsh_version).toBe('9.9.9');

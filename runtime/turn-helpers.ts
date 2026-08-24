@@ -14,6 +14,8 @@ import { contentHash } from '../memory/staging-policy.js';
 import { compile, type ProcessSectionInput } from './renderer.js';
 import type { GovernorDecision, ProcessDecisionInfo } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 /** token 估算（与 renderer 内部同口径：字符/4；精确计费为 §17 参数标定项） */
 export function estimateTokens(text: string): number {
@@ -105,7 +107,7 @@ export function buildExperienceCandidate(
       source: 'runtime/assembly',
       event: 'decision/made',
       actor: 'omb-v2',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: decision.snapshot,
       timestamp: ts,
       transformation_chain: ['finalizeTurn', 'experience-candidate'],
@@ -226,7 +228,7 @@ export function makeRuntimeEvent(
       source: 'runtime/assembly',
       event: type,
       actor: 'omb-v2',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: snapshotHash,
       timestamp: ts,
       transformation_chain: chain,

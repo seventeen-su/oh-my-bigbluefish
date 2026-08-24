@@ -23,6 +23,8 @@ import {
 import { computeComponentHashes, computeDirContentHash } from './snapshot-hash.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
+// R6：宿主版本唯一来源注入面（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
@@ -185,6 +187,9 @@ export interface CognitiveAssemblyOptions {
   evolutionRoot?: string;
   /** P7：环境指纹采集器注入（environment_check 任务用；缺省 collectEnvironmentFingerprint——测试注入可变序列） */
   environmentFingerprint?: () => Fingerprint;
+  /** R6：宿主 DSH 版本唯一来源注入（可选；提供 → setHostVersion 覆写——运行时指纹采集与
+   *  事件 provenance 的 dsh_version 全部经 hostVersion() 读取同一值；缺省 DSH_HOST_VERSION） */
+  hostVersion?: string;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -448,6 +453,11 @@ export class CognitiveRuntime {
   private readonly repairDir: string;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
+    // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
+    // provenance 的 dsh_version 全部经 hostVersion() 读取同一值；缺省 DSH_HOST_VERSION）
+    if (opts.hostVersion !== undefined) {
+      setHostVersion(opts.hostVersion);
+    }
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
     this.eventStore = new EventStore(opts.eventDb ?? join(root, 'events.db'));
     this.memory = new RetrievalBackend(opts.memoryDb ?? join(root, 'memory.db'));

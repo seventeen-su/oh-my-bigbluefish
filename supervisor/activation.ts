@@ -22,6 +22,8 @@
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（IR 契约例外）+ supervisor/ 内文件。
 import { canonicalJson, makeImmutableId, makeMutableId } from '../kernel/schemas/base.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import {
   ActivationContractSchema,
   EvolutionObjectSchema,
@@ -114,13 +116,19 @@ export interface ActivationInput {
 /** 激活门禁：Regressed（回归，brief 硬性拒晋升）+ Unknown（§10.1 样本不足→延后/降级） */
 export const ACTIVATION_GATE: ReadonlySet<string> = new Set(['Regressed', 'Unknown']);
 
-/** 默认环境指纹（§4.4；与 versioning.ts 同款运行时默认） */
-const DEFAULT_ENVIRONMENT: Fingerprint = {
-  os: process.platform,
-  node: process.version,
-  dsh_version: '0.1.0',
-  project: 'omb-v2',
-};
+/**
+ * 默认环境指纹（§4.4；R6：dsh_version 经 hostVersion() 读取唯一宿主版本来源——运行时求值，
+ * 装配注入后 = 注入值；缺省 = DSH_HOST_VERSION。函数而非常量——模块加载早于装配注入，
+ * 常量会在注入前固化默认值造成漂移）。
+ */
+function defaultEnvironment(): Fingerprint {
+  return {
+    os: process.platform,
+    node: process.version,
+    dsh_version: hostVersion(),
+    project: 'omb-v2',
+  };
+}
 
 /** 进程内幂等注册表（无 logDir 时的幂等权威；有 logDir 时磁盘为权威，此表为缓存） */
 const completed = new Map<string, ActivationContract>();
@@ -139,7 +147,7 @@ function makeActivationEvent(
   classification: string,
 ): Event {
   const ts = new Date().toISOString();
-  const env = input.environment ?? DEFAULT_ENVIRONMENT;
+  const env = input.environment ?? defaultEnvironment();
   return {
     ir_version: '2.0',
     id: makeMutableId('evt'),
@@ -258,7 +266,7 @@ export async function activate(input: ActivationInput): Promise<ActivationContra
   }
 
   const ts = new Date().toISOString();
-  const env = input.environment ?? DEFAULT_ENVIRONMENT;
+  const env = input.environment ?? defaultEnvironment();
 
   // ⑥ ActivationContract 组装（M6；predecessor = 切换前 stable_head）
   const contract: ActivationContract = {

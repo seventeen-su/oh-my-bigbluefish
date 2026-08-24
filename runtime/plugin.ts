@@ -39,6 +39,8 @@ import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import type { BenchFixtureV2, BenchLine } from '../kernel/schemas/bench.js';
 import type { GovernorDecision } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 export const name = 'omb-v2';
 export const inject = ['commands'];
@@ -67,6 +69,10 @@ export interface PluginConfig {
   /** R2 启动竞态修复：boot 入口注入（最小可测性注入面——测试注入延迟 resolve / 失败 boot；
    *  缺省真实 bootStable）。语义等同 bootStable(opts)：ok:true / ok:false（无恢复路径）/ rollback。 */
   bootStableOverride?: (opts?: BootOptions) => Promise<BootResult>;
+  /** R6：宿主 DSH 版本覆写（可选；提供 → 覆写运行时指纹/事件 provenance 的 dsh_version 唯一来源；
+   *  缺省 DSH_HOST_VERSION = '0.1.0-rc.7'（kernel/schemas/host-version.ts，当前宿主）。
+   *  升级宿主后经本配置更新，无需改码——所有 Event/Memory/Experience/Snapshot 使用同一值）。 */
+  hostVersion?: string;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -373,6 +379,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         //（turn 收尾入队 + 请求间隙小量子；debt 落盘到认知数据根 .evolution/）
         checkpointDir: join(root, 'checkpoints'),
         maintenance: new MaintenanceScheduler({ debtFile: join(root, '.evolution', 'debt.json') }),
+        // R6：宿主版本唯一来源注入（提供 → 覆写运行时指纹/事件 provenance 的 dsh_version；缺省 DSH_HOST_VERSION）
+        hostVersion: config.hostVersion,
       });
       // P1a：lines 按线加载降级（线快照缺 policy / lines 不可用 → 已回退仓库默认）→ 记录降级（不抛，命令仍可用）
       if (cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {
@@ -447,7 +455,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           source: 'mode-command',
           event: activationId,
           actor: 'kernel',
-          environment: { os: 'windows', node: process.version, dsh_version: '0.1.1-rc.1', project: 'omb-v2' },
+          environment: { os: 'windows', node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
           runtime_snapshot: cognitive?.snapshotHash ?? 'rs:assembly',
           timestamp: now,
           transformation_chain: ['mode/switch'],

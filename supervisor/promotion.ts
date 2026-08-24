@@ -23,6 +23,9 @@ import { join } from 'node:path';
 import { rollbackTo, type WorktreeStatus } from '../substrate/rollback.js';
 import { resolveLineCommit, type VersionLayout } from '../substrate/lines.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
+import type { Fingerprint } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import {
   ActivationContractSchema,
   EventSchema,
@@ -112,13 +115,19 @@ export interface PromoteToStableResult {
   reason?: string;
 }
 
-/** 默认环境指纹（与 versioning/activation 同款运行时默认） */
-const DEFAULT_ENVIRONMENT = {
-  os: process.platform,
-  node: process.version,
-  dsh_version: '0.1.0',
-  project: 'omb-v2',
-};
+/**
+ * 默认环境指纹（R6：dsh_version 经 hostVersion() 读取唯一宿主版本来源——运行时求值，
+ * 装配注入后 = 注入值；缺省 = DSH_HOST_VERSION。函数而非常量——模块加载早于装配注入，
+ * 常量会在注入前固化默认值造成漂移）。
+ */
+function defaultEnvironment(): Fingerprint {
+  return {
+    os: process.platform,
+    node: process.version,
+    dsh_version: hostVersion(),
+    project: 'omb-v2',
+  };
+}
 
 /** 晋升 provenance（事件/契约共用）；snapshotHash 缺省 'rs:assembly' */
 function provenanceOf(verification: string, snapshotHash: string | undefined) {
@@ -127,7 +136,7 @@ function provenanceOf(verification: string, snapshotHash: string | undefined) {
     source: 'supervisor/promotion',
     event: 'activation/committed',
     actor: 'system',
-    environment: DEFAULT_ENVIRONMENT,
+    environment: defaultEnvironment(),
     runtime_snapshot: snapshotHash ?? 'rs:assembly',
     timestamp: ts,
     transformation_chain: ['candidate-pipeline', 'promotion-gate', 'promote'],

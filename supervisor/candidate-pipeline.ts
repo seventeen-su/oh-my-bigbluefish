@@ -30,6 +30,8 @@ import { GIT_BIN, type VersionLayout } from '../substrate/snapshot.js';
 import { resolveLineCommit } from '../substrate/lines.js';
 import { createCandidateDir, runRestricted, sandboxStatus, type SandboxStatus } from '../substrate/sandbox.js';
 import { canonicalJson, makeImmutableId, makeMutableId } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import {
   BudgetPolicySchema,
   ContextPolicySchema,
@@ -694,7 +696,7 @@ async function buildEvolutionObject(
       source: 'evolution/generator',
       event: 'evolution/promoted',
       actor: 'omb-v2',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: snapshot,
       timestamp: ts,
       transformation_chain: ['evolution/generator', 'candidate-validation', 'promote'],
@@ -736,7 +738,7 @@ function buildPromotedEvent(
       source: 'supervisor/candidate-pipeline',
       event: 'evolution/promoted',
       actor: 'omb-v2',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: snapshot,
       timestamp: ts,
       transformation_chain: ['evolution/generator', 'candidate-validation', 'promote'],

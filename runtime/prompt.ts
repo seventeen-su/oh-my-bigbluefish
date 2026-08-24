@@ -10,6 +10,8 @@
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { Event } from '../kernel/schemas/m.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 // ---- 视图类型（S1/S3 最小视图：prompt 只消费语义字段，不依赖完整 IR 对象） ----
 
@@ -159,7 +161,7 @@ export function makePromptVisibilityEvent(session_id: string, prompt_tokens: num
     owner: 'kernel',
     created: FIXED_TS,
     updated: FIXED_TS,
-    provenance: FIXED_PROVENANCE,
+    provenance: fixedProvenance(),
     refs: [],
     type: 'session/start',
     session_id,
@@ -202,14 +204,18 @@ const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]/;
 /** 固定纪元时间戳（确定性纯函数不读时钟；真实时间由调用层注入） */
 const FIXED_TS = '2026-08-21T00:00:00.000Z';
 
-/** 固定 Provenance（确定性占位；环境指纹固定，跨环境迁移语义由调用层负责） */
-const FIXED_PROVENANCE = {
-  source: 'prompt',
-  event: 'session/start',
-  actor: 'kernel',
-  environment: { os: 'win32', node: '24.12.0', dsh_version: '0.2.0', project: 'omb-v2' },
-  runtime_snapshot: 'rs:prompt',
-  timestamp: FIXED_TS,
-  transformation_chain: ['buildPrompt', 'logPromptVisibility'],
-  verification: 'deterministic-pure',
-};
+/** 固定 Provenance（确定性占位；时间戳/环境固定——R6：dsh_version 经 hostVersion() 取唯一宿主版本来源，
+ *  运行时求值：装配注入后 = 注入值（函数而非常量——常量会在注入前固化默认值造成漂移）；
+ *  跨环境迁移语义由调用层负责） */
+function fixedProvenance() {
+  return {
+    source: 'prompt',
+    event: 'session/start',
+    actor: 'kernel',
+    environment: { os: 'win32', node: '24.12.0', dsh_version: hostVersion(), project: 'omb-v2' },
+    runtime_snapshot: 'rs:prompt',
+    timestamp: FIXED_TS,
+    transformation_chain: ['buildPrompt', 'logPromptVisibility'],
+    verification: 'deterministic-pure',
+  };
+}

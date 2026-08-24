@@ -19,6 +19,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load as parseYaml } from 'js-yaml';
 import { canonicalJson, makeImmutableId, makeMutableId, type Fingerprint } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import type { BenchReport } from '../kernel/schemas/bench.js';
 import type { Event } from '../kernel/schemas/m.js';
 import {
@@ -184,13 +186,18 @@ export interface ApplyMetaChangeOpts {
   now?: () => string;
 }
 
-/** 默认环境指纹（§4.4；dsh_version 与 package.json version 同步——M7 出口升 0.8.0 时更新） */
-const DEFAULT_ENV: Fingerprint = {
-  os: process.platform,
-  node: process.version,
-  dsh_version: '0.7.0',
-  project: 'omb-v2',
-};
+/**
+ * 默认环境指纹（§4.4；R6：dsh_version 经 hostVersion() 读取唯一宿主版本来源（DSH_HOST_VERSION
+ * 缺省 / 装配注入覆写）——运行时求值，函数而非常量（模块加载早于装配注入，常量会固化默认值漂移）。
+ */
+function defaultEnv(): Fingerprint {
+  return {
+    os: process.platform,
+    node: process.version,
+    dsh_version: hostVersion(),
+    project: 'omb-v2',
+  };
+}
 
 /** evolution/policy-applied 事件组装（M3 Event 全字段；payload 记录变更审计信息） */
 function buildAppliedEvent(change: MetaChange, ts: string, env: Fingerprint): Event {
@@ -278,7 +285,7 @@ export async function applyMetaChange(change: MetaChange, opts: ApplyMetaChangeO
   const ts = now();
   const store = opts.eventStore ?? new EventStore(DEFAULT_EVENTS_DB);
   try {
-    await store.append(buildAppliedEvent(change, ts, opts.environment ?? DEFAULT_ENV));
+    await store.append(buildAppliedEvent(change, ts, opts.environment ?? defaultEnv()));
   } finally {
     if (opts.eventStore === undefined) {
       await store.close();

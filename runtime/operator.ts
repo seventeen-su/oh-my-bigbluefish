@@ -9,6 +9,8 @@
 import { createHash } from 'node:crypto';
 import type { CapabilityProvider } from '../kernel/capability-abi.js';
 import { canonicalJson } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import type { NegativePatternRecord } from '../memory/negative-pattern.js';
 
 // ---- 门面 re-export（统一出口：runtime/operator.*） ----
@@ -206,6 +208,6 @@ export function buildMicroCertificate(
     actual: { effect: opts.actual_effect ?? 'completed' },
     verifier: VERIFIER_ID,
     state_delta: opts.state_delta ?? {},
-    environment: { node: process.version, os: process.platform, dsh_version: '0.4.0', project: 'omb-v2', ...ctx.environment },
+    environment: { node: process.version, os: process.platform, dsh_version: hostVersion(), project: 'omb-v2', ...ctx.environment }, // R6：唯一宿主版本来源
   };
 }

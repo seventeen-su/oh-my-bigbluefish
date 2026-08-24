@@ -11,14 +11,16 @@
 import { platform } from 'node:os';
 import type { Fingerprint } from './schemas/base.js';
 import type { CapabilityDecayRecord, EnvironmentFieldDelta } from './schemas/evolution.js';
+// R6：dsh_version 唯一宿主版本来源（运行时经 hostVersion() 读取——注入优先，缺省 DSH_HOST_VERSION）
+import { DSH_HOST_VERSION, hostVersion } from './schemas/host-version.js';
 
 // ---- 常量（待标定 §17） ----
 
 /** §4.4 Fingerprint 参与 diff 的字段（固定顺序，保证 environment_delta 键序确定性；与 supervisor/maintenance.ts FP_FIELDS 同序） */
 export const FINGERPRINT_FIELDS: (keyof Fingerprint)[] = ['os', 'node', 'dsh_version', 'project', 'gpu', 'cuda'];
 
-/** 运行时默认 dsh_version（与 supervisor/versioning/activation/promotion 同款运行时默认指纹） */
-export const DEFAULT_DSH_VERSION = '0.1.0';
+/** 运行时默认 dsh_version（R6：唯一来源默认值 DSH_HOST_VERSION——与 supervisor 各 provenance 工厂同源） */
+export const DEFAULT_DSH_VERSION = DSH_HOST_VERSION;
 
 /** 运行时默认 project */
 export const DEFAULT_PROJECT = 'omb-v2';
@@ -51,7 +53,8 @@ export function collectEnvironmentFingerprint(opts: { dsh_version?: string; proj
   return {
     os: platform(),
     node: process.version,
-    dsh_version: opts.dsh_version ?? DEFAULT_DSH_VERSION,
+    // R6：缺省经 hostVersion() 读取唯一来源（装配注入后 = 注入值；缺省 = DSH_HOST_VERSION）
+    dsh_version: opts.dsh_version ?? hostVersion(),
     project: opts.project ?? DEFAULT_PROJECT,
   };
 }

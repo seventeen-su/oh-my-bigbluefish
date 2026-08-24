@@ -13,6 +13,8 @@
 // layer 2（runtime/）：仅 import 同层 kernel/（CONVENTIONS §4）；模块顶层无副作用。
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { canonicalJson, makeImmutableId } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import { type CandidateKind, type ContextPolicy } from '../kernel/policy-loader.js';
 
 // 共享候选 kind 枚举（策略 schema 与实现同一来源，防漂移；定义在 kernel/policy-loader.ts，此处再导出保持 renderer API）
@@ -192,7 +194,7 @@ export function compile(input: CompileInput): ContextProjection {
     owner: 'kernel',
     created: FIXED_TS,
     updated: FIXED_TS,
-    provenance: FIXED_PROVENANCE,
+    provenance: fixedProvenance(),
     refs: [],
   };
 
@@ -318,14 +320,18 @@ function sectionTokens(sections: readonly ProjectionSection[]): number {
 /** 固定纪元时间戳（确定性） */
 const FIXED_TS = '2026-08-21T00:00:00.000Z';
 
-/** 固定 Provenance（确定性占位；环境指纹固定，跨环境迁移语义由调用层负责） */
-const FIXED_PROVENANCE = {
-  source: 'renderer',
-  event: 'context/compile',
-  actor: 'kernel',
-  environment: { os: 'win32', node: '24.12.0', dsh_version: '0.2.0', project: 'omb-v2' },
-  runtime_snapshot: 'rs:compile',
-  timestamp: FIXED_TS,
-  transformation_chain: ['content_router', 'marginal_greedy', 'view_projection'],
-  verification: 'deterministic-pure',
-};
+/** 固定 Provenance（确定性占位；时间戳/环境固定——R6：dsh_version 经 hostVersion() 取唯一宿主版本来源，
+ *  运行时求值：装配注入后 = 注入值（函数而非常量——常量会在注入前固化默认值造成漂移）；
+ *  跨环境迁移语义由调用层负责） */
+function fixedProvenance() {
+  return {
+    source: 'renderer',
+    event: 'context/compile',
+    actor: 'kernel',
+    environment: { os: 'win32', node: '24.12.0', dsh_version: hostVersion(), project: 'omb-v2' },
+    runtime_snapshot: 'rs:compile',
+    timestamp: FIXED_TS,
+    transformation_chain: ['content_router', 'marginal_greedy', 'view_projection'],
+    verification: 'deterministic-pure',
+  };
+}

@@ -19,6 +19,8 @@ import type {
 } from './operator.js';
 import type { NegativePatternRecord } from '../memory/negative-pattern.js';
 import { canonicalJson, makeImmutableId } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 // ---- 常量 ----
 
@@ -187,7 +189,7 @@ function buildNegativePatternRecord(
     failed_operator: operator,
     code,
     message,
-    environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+    environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
     created: ts,
     provenance: {
       source: 'operator-executor',

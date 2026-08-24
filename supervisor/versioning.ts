@@ -22,6 +22,8 @@
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（IR 契约例外，CONVENTIONS §4）。
 import { createHash } from 'node:crypto';
 import { RuntimeSnapshotSchema, type RuntimeSnapshot } from '../kernel/schemas/m.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 /** 组件 sha256 清单（架构 §11.2 runtime 六键；值 = 组件内容 sha256，由调用方提供） */
 export interface ComponentHashes {
@@ -158,7 +160,7 @@ export function createSnapshot(input: {
       source: 'system',
       event: 'snapshot/created',
       actor: 'kernel',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.1.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: `sha256:${hash}`,
       timestamp: ts,
       transformation_chain: [],

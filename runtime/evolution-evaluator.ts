@@ -35,6 +35,8 @@ import {
   type SignalSource,
 } from './evaluator.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 // ---- 常量（§17 待标定：冻结基准集产出后校准；机制即数据——改数据不改代码） ----
 
@@ -45,13 +47,19 @@ export const EVOLUTION_THRESHOLDS = {
   WEAKER_TOLERANCE: 0.05,
 } as const;
 
-/** 默认环境指纹（§4.4；与 versioning.ts 同款运行时默认） */
-export const DEFAULT_ENVIRONMENT: Fingerprint = {
-  os: process.platform,
-  node: process.version,
-  dsh_version: '0.1.0',
-  project: 'omb-v2',
-};
+/**
+ * 默认环境指纹（§4.4；R6：dsh_version 经 hostVersion() 读取唯一宿主版本来源——运行时求值，
+ * 装配注入后 = 注入值；缺省 = DSH_HOST_VERSION。函数而非常量：模块加载早于装配注入，
+ * 常量会在注入前固化默认值造成漂移）。
+ */
+export function defaultEnvironment(): Fingerprint {
+  return {
+    os: process.platform,
+    node: process.version,
+    dsh_version: hostVersion(),
+    project: 'omb-v2',
+  };
+}
 
 /** 越低越好的维度（成本/维护成本/污染风险）；其余维度越高越好（§10.1） */
 const LOWER_IS_BETTER: ReadonlySet<CapabilityDimension> = new Set([
@@ -284,7 +292,7 @@ export function evaluate(
     facts,
     classification: 'Unknown',
     classification_confidence: 0,
-    environment: opts?.environment ?? DEFAULT_ENVIRONMENT,
+    environment: opts?.environment ?? defaultEnvironment(),
     created: Date.now(),
     provenance: { source: 'evolution-evaluator', events: [...new Set(facts.flatMap((f) => f.evidence_refs))] },
   };

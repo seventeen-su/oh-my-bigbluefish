@@ -12,6 +12,8 @@ import type { Event } from '../kernel/schemas/m.js';
 import type { GovernorDecision } from './governor.js';
 import type { CognitiveRequest } from './assembly.js';
 import type { PromptWorkingState } from './prompt.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 
 // ---- 降级记录（守卫式接入的可见日志；测试经 clearDegradations/degradationLog 断言） ----
 
@@ -140,7 +142,7 @@ export function makeDshEvent(
       source: 'dsh/loop-hooks',
       event: dshType,
       actor: 'omb-v2',
-      environment: { os: process.platform, node: process.version, dsh_version: '0.8.0', project: 'omb-v2' },
+      environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
       runtime_snapshot: snapshotHash,
       timestamp: ts,
       transformation_chain: ['dsh:' + dshType, 'observeEvent'],

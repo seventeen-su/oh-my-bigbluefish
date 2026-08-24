@@ -11,6 +11,8 @@
 // 解释性决策（详见 task-1.4-report.md）：world/self 未知为 null；contradiction/found 只追加；session/end 终结标记 = lifecycle retired。
 import { createHash } from 'node:crypto';
 import type { Fingerprint, Lifecycle, Owner, Provenance, Ref, Scope } from '../kernel/schemas/base.js';
+// R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
+import { hostVersion } from '../kernel/schemas/host-version.js';
 import type { State, WorkingState } from '../kernel/schemas/s.js';
 import type { Event } from '../kernel/schemas/m.js';
 import {
@@ -19,8 +21,14 @@ import {
   type EvidenceStatus,
 } from './constitution.js';
 const IR_VERSION = '2.0';
-/** 空事件流时的确定性环境指纹（不依赖运行时，保证重建确定性） */
-const DEFAULT_FP: Fingerprint = { os: 'unknown', node: 'unknown', dsh_version: '0.1.0', project: 'omb-v2' };
+/**
+ * 空事件流时的确定性环境指纹（不依赖运行时时钟，保证重建确定性；R6：dsh_version 经 hostVersion()
+ * 读取唯一宿主版本来源——进程内稳定（注入前 = DSH_HOST_VERSION，装配注入后 = 注入值）。
+ * 函数而非常量：模块加载早于装配注入，常量会在注入前固化默认值造成漂移）。
+ */
+function defaultFingerprint(): Fingerprint {
+  return { os: 'unknown', node: 'unknown', dsh_version: hostVersion(), project: 'omb-v2' };
+}
 // ---- 投影类型 ----
 
 export type Epistemic = 'supported' | 'contradicted' | 'unresolved';
@@ -106,7 +114,7 @@ function makeProvenance(last: Event | null, init: State | undefined, ts: string)
     source: 'system',
     event: last?.id ?? init?.provenance.event ?? '',
     actor: 'kernel',
-    environment: last?.provenance.environment ?? init?.provenance.environment ?? DEFAULT_FP,
+    environment: last?.provenance.environment ?? init?.provenance.environment ?? defaultFingerprint(),
     runtime_snapshot: last?.runtime_snapshot ?? init?.provenance.runtime_snapshot ?? '',
     timestamp: ts,
     transformation_chain: [],
@@ -409,7 +417,7 @@ export function reduce(events: ReducibleEvent[], opts: { initial?: State } = {})
     contradictedObserved: new Set(),
     goal: init?.working.goal ?? '',
     nextBestAction: init?.working.next_best_action ?? '',
-    environment: init?.working.environment ?? DEFAULT_FP,
+    environment: init?.working.environment ?? defaultFingerprint(),
     lifecycle: init?.lifecycle ?? 'active',
   };
 
