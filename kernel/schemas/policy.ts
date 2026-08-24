@@ -34,7 +34,9 @@ export const BUILTIN_OPERATORS = [
   'VERIFY',
 ] as const;
 
-/** 候选 kind 值域（§6.1 ContentRouter 分型；策略 schema 与 runtime/renderer 共享同一常量，防枚举漂移） */
+/** 候选 kind 值域（§6.1 ContentRouter 分型；策略 schema 与 runtime/renderer 共享同一常量，防枚举漂移）。
+ *  R7：新增 evidence/capability/process（Context 候选来源扩展——设计全集
+ *  Memory/Evidence/Capability/Process/Artifact，§6.1 候选集；kind_costs 表须同步含新 kind——改 YAML 即生效）。 */
 export const CANDIDATE_KINDS = [
   'code',
   'json',
@@ -43,6 +45,9 @@ export const CANDIDATE_KINDS = [
   'memory',
   'working_state',
   'artifact',
+  'evidence',
+  'capability',
+  'process',
 ] as const;
 export type CandidateKind = (typeof CANDIDATE_KINDS)[number];
 

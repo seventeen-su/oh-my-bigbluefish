@@ -114,6 +114,14 @@ export function route(item: Pick<CandidateItem, 'kind'>): RouteStrategy {
       return 'verbatim';
     case 'artifact':
       return 'pointer';
+    // R7（候选来源扩展）：evidence 保留原文（事实链证据——kept_as_evidence）；
+    // capability/process 原文（紧凑声明/渲染，不压缩）
+    case 'evidence':
+      return 'kept_as_evidence';
+    case 'capability':
+      return 'verbatim';
+    case 'process':
+      return 'verbatim';
   }
 }
 
@@ -230,13 +238,17 @@ function projectWorkingState(ws: WorkingStateView): ProjectionSection {
 }
 
 /**
- * R3：认知过程投影（架构 §4.6.1 动态过程调度 → planning 视图）。紧凑渲染，token 受控：
- * 「认知过程：<name>（<method>，预算 <budget_tokens> tokens）\n步骤：<op1> → <op2> …」
- * 模型可见（planning 视图经 prompt 追加进入 systemPrompt）——DSH 原生 Agent Loop 按此过程执行，
- * OMB 只做决策与投影（R3 边界：不驱动执行）。
+ * R3/R7：认知过程紧凑渲染（process section 与 R7 process 候选共用同一内容口径——统一并入候选流后
+ * section 内容与 R3 固定 section 完全一致）：「认知过程：<name>（<method>，预算 <budget_tokens> tokens）
+ * \n步骤：<op1> → <op2> …」模型可见（planning 视图经 prompt 追加进入 systemPrompt）——
+ * DSH 原生 Agent Loop 按此过程执行，OMB 只做决策与投影（R3 边界：不驱动执行）。
  */
+export function renderProcessContent(p: ProcessSectionInput): string {
+  return `认知过程：${p.name}（${p.method}，预算 ${p.budget_tokens} tokens）\n步骤：${p.steps.join(' → ')}`;
+}
+
 function projectProcess(p: ProcessSectionInput): ProjectionSection {
-  const content = `认知过程：${p.name}（${p.method}，预算 ${p.budget_tokens} tokens）\n步骤：${p.steps.join(' → ')}`;
+  const content = renderProcessContent(p);
   return {
     source_ref: `process:${p.process_id}`,
     view: 'planning',
@@ -306,8 +318,8 @@ function deriveType(sections: readonly ProjectionSection[]): ContextProjection['
   return 'mixed';
 }
 
-/** token 估算（无输入估算时的兜底：字符/4；精确计费为 §17 参数标定项） */
-function estimateTokens(text: string): number {
+/** token 估算（无输入估算时的兜底：字符/4；精确计费为 §17 参数标定项；R7：context-candidates 复用同口径） */
+export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 

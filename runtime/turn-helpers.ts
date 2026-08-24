@@ -11,7 +11,8 @@ import type { State } from '../kernel/schemas/s.js';
 import type { PolicyBundle } from '../kernel/policy-loader.js';
 import type { RankedMemory } from '../memory/retrieve.js';
 import { contentHash } from '../memory/staging-policy.js';
-import { compile, type ProcessSectionInput } from './renderer.js';
+import { compile, type CandidateItem, type ProcessSectionInput } from './renderer.js';
+import { gatherContextCandidates, toCandidateItems, type ContextCandidateSources } from './context-candidates.js';
 import type { GovernorDecision, ProcessDecisionInfo } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
 // R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
@@ -39,28 +40,55 @@ export function toPromptWorkingState(state: State): PromptWorkingState {
 
 /**
  * ContextCompiler 投影构建（§3.1 step 5）：Working State（verbatim）+ 检索结果（memory 候选）
- * +（R3）认知过程 section（Governor→Scheduler 调度结果；缺省无 → 兼容既有调用与测试）→ ContextProjection。
+ * +（R3）认知过程 section（Governor→Scheduler 调度结果）→ ContextProjection。
+ * R7（候选来源扩展，§6.1 候选全集）：sources 提供 → 经 gatherContextCandidates 统一收集
+ *   Memory/Evidence/Capability/Process/Artifact 候选（process 统一并入候选流——info_value 全源最高，
+ *   贪心首选，R3「认知过程」section 语义保持；evidence/capability/artifact 缺省无来源 → 无新增 section，
+ *   既有调用零感知）；sources 缺省 → 旧调用面兼容：候选 = 仅 memory，process 走固定 section（R3 原语义）。
+ * ΔInfoValue（§17 开放项）：仍为来源侧提供/启发式（memory=r.value；其余来源固定启发式初值）——
+ * 本函数不实现动态估计。
  */
-export function buildContextProjection(
+export async function buildContextProjection(
   policy: PolicyBundle,
   task: { goal: string; success_criteria: string[] },
   working_state: PromptWorkingState,
   items: RankedMemory[],
   process?: ProcessSectionInput | null,
-): ContextProjection {
+  sources?: ContextCandidateSources & { session_id?: string },
+): Promise<ContextProjection> {
+  const memoryCandidates: CandidateItem[] = items.map((r) => ({
+    id: r.memory.id,
+    kind: 'memory',
+    content: r.memory.payload,
+    tokens: estimateTokens(r.memory.payload),
+    view: 'planning',
+    info_value: r.value,
+    source_ref: r.memory.id,
+  }));
+  if (sources === undefined) {
+    // 旧调用面兼容（无候选来源）：候选 = 仅 memory；process 走 renderer 固定 section（R3 语义）
+    return compile({
+      task_contract: { goal: task.goal, success_criteria: task.success_criteria },
+      working_state,
+      process_section: process ?? undefined,
+      candidates: memoryCandidates,
+      budget_tokens: policy.budget.context_budget_tokens,
+      policy: policy.context,
+    });
+  }
+  // R7：候选统一入口——全来源收集（process 统一并入候选流；空来源 → 无新增 section）
+  const gathered = await gatherContextCandidates({
+    working_state,
+    goal: task.goal,
+    memory_items: items,
+    runtime: sources,
+    process: process ?? undefined,
+    session_id: sources.session_id,
+  });
   return compile({
     task_contract: { goal: task.goal, success_criteria: task.success_criteria },
     working_state,
-    process_section: process ?? undefined,
-    candidates: items.map((r) => ({
-      id: r.memory.id,
-      kind: 'memory',
-      content: r.memory.payload,
-      tokens: estimateTokens(r.memory.payload),
-      view: 'planning',
-      info_value: r.value,
-      source_ref: r.memory.id,
-    })),
+    candidates: [...memoryCandidates, ...toCandidateItems(gathered)],
     budget_tokens: policy.budget.context_budget_tokens,
     policy: policy.context,
   });

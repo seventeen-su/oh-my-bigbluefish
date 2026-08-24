@@ -610,7 +610,17 @@ export class CognitiveRuntime {
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
       { episode: false },
     );
-    const projection = buildContextProjection(policy, req, working_state, retrieved.items, toProcessSection(scheduled));
+    // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
+    // Process 调度结果；Artifact 缺省空——CognitiveRuntime 未装配 artifact-store，装配方注入后生效）；
+    // ΔInfoValue 为来源侧启发式（§17 开放项，不实现动态估计）
+    const projection = await buildContextProjection(
+      policy,
+      req,
+      working_state,
+      retrieved.items,
+      toProcessSection(scheduled),
+      { eventStore: this.eventStore, capabilities: this.capabilities, session_id: req.session_id },
+    );
 
     let events_appended = 0;
     if (opts.inject !== undefined) {
