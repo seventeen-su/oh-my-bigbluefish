@@ -14,18 +14,22 @@
 // 守卫：ctx.tools 缺失 / register 缺失 → 降级不崩（对齐插件既有守卫风格，recordDegradation 由调用方记录）。
 // 零依赖：本模块无 import（纯结构接口 + 纯函数）。
 //
-// ---- dynamicCordisRunner 留注（P2 不实现；P3 沙盒联调关系已接线说明） ----
+// ---- dynamicCordisRunner 留注（S9 2026-08-24 已接线；P3 沙盒联调关系） ----
 // 设计 §6：ctx.dynamicCordisRunner（cordis_define/run/stop/undefine）= 候选验证骨架——define 无副作用登记 /
 // run 生效 / stop 回退（dispose）/ undefine 先停后忘（+ vm 协约 + fiber 生命周期）；试验单元与稳定单元
 // 同一抽象（§4.5 混合路线：候选组件验证通过 → 晋升为 agent.cordis.yml 静态条目）。
-// P3 关系（2026-08-23 已接线）：候选验证沙盒门禁 G3-exec（supervisor/candidate-pipeline.ts）把候选
+// P3 关系（2026-08-23 接线）：候选验证沙盒门禁 G3-exec（supervisor/candidate-pipeline.ts）把候选
 // 附带的验证脚本（draft.verify.script → 候选验证目录 verify.cjs，白名单固定名）经 substrate/sandbox.ts
 // 受限通道执行（CreateRestrictedToken + WRITE_RESTRICTED + 结果文件方案：宿主写脚本 → 受限进程执行 →
 // 写结果文件 → 宿主读；受限孙进程无法用管道捕获输出，stdio:'pipe' spawn 在受限进程内 EPERM，
-// research-dsh.md §3.4；通道不可用 → sandboxStatus degraded 降级 D5 不阻塞）。dynamicCordisRunner
-// 提供「验证脚本内动态定义/运行/回退候选组件」的执行通道——仍不实现（留 P3 联调面：验证脚本经受限
-// 通道运行时经本桥 define/run/stop/undefine 候选组件并回退）。本桥以 kern_status 验证
-// ctx.tools.register 契约（P2），dynamicCordisRunner 面待后续联调接入。
+// research-dsh.md §3.4；通道不可用 → sandboxStatus degraded 降级 D5 不阻塞）。
+// S9（2026-08-24 已接线）：dynamicCordisRunner 经 supervisor/dynamic-runner.ts（结构最小接口
+// DynamicCordisRunnerLike + inspectDynamicRunner 守卫 + runCandidateViaRunner 通道）接入 G3-exec——
+// 宿主面存在且守卫通过 → 候选验证脚本作为 Cordis host 半包经 define（无副作用登记）→ run（生效，host-only
+// 无人工审批往返）→ invoke verify（结果读取契约：harness.handle('verify', handler)）→ stop（回退 dispose）
+// → undefine（先停后忘）执行；通道失败（define/run/invoke 抛错或拒绝）→ 降级回退受限子进程路径并记录
+// （runnerFallback）。宿主面缺失 → 既有受限子进程路径零变化。真实宿主契约（define/run/stop/undefine/
+// invoke 签名、vm 协约、fiber 生命周期）file:line 记录在 supervisor/dynamic-runner.ts 文件头注释。
 
 /** DSH 工具定义最小结构（真实类型 @deepseek-ai/dsh-tools ToolDefinition；宿主契约证据见文件头） */
 export interface ToolDefinitionLike {
