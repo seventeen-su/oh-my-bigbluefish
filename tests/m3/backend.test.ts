@@ -450,4 +450,26 @@ describe('中文检索实测（T8.16 中文分词接入后：bigram 双侧分词
     const page = await b.query({ scope: 'Project', text: 'SQLite', limit: 10, budget: 100 });
     expect(page.total).toBe(1);
   });
+
+  it('R5 旧库迁移回归：无 environment 列的既有 memory.db → 构造器成功（补列 + 索引创建 + ingest 可用）', async () => {
+    // 构造 R5 前的旧 schema 库（memory 表无 environment 列）——模拟真实挂载故障
+    //（SCHEMA_SQL 的 CREATE INDEX ... ON memory(environment) 在旧库上曾抛 no such column）。
+    const db = join(await mkdtemp(join(tmpdir(), 'omb-mem-legacy-')), 'memory.db');
+    dbPaths.push(db);
+    const { DatabaseSync } = await import('node:sqlite');
+    const legacy = new DatabaseSync(db);
+    legacy.exec(
+      'CREATE TABLE memory (id TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL, ' +
+        'lifecycle TEXT NOT NULL, prov_class TEXT NOT NULL, payload TEXT, payload_fts TEXT, ' +
+        'value_score REAL, utility_counts TEXT, belief_ref TEXT, lineage_ref TEXT, ' +
+        'created TEXT NOT NULL, updated TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, ' +
+        'body TEXT NOT NULL);',
+    );
+    legacy.close();
+    // 构造器必须先补列再跑 SCHEMA_SQL（索引引用 environment）——若顺序错误此处抛 no such column
+    const b = openBackend(db);
+    await b.ingest(makeMemory({ payload: '迁移后可用' }));
+    const page = await b.query({ scope: 'Project', text: '迁移后可用', limit: 10, budget: 100 });
+    expect(page.total).toBe(1);
+  });
 });
