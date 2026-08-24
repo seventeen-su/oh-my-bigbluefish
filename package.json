@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json",
     "bench-report": "tsx scripts/bench-report.ts",
+    "replay-recorder": "tsx scripts/replay-recorder.ts",
     "retrieval-bench": "tsx scripts/retrieval-bench.ts",
     "init-three-line": "tsx scripts/init-three-line.ts",
     "deploy-lines": "tsx scripts/deploy-lines.ts"
