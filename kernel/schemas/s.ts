@@ -42,22 +42,45 @@ export const StateSchema = irBase({
 });
 export type State = z.infer<typeof StateSchema>;
 
-/** S4 WorldModel（引用对象：当前能力/限制；环境状态） */
+/** S4 WorldModel（引用对象：当前能力/限制；环境状态）。
+ *  S1 运行接线扩展（可选字段——纯契约阶段对象可缺省）：项目架构事实（版本线/commit/lines 快照/布局/基准状态）。 */
 export const WorldModelSchema = irBase({
   kind: z.literal('world_model'),
   capabilities: z.array(z.string()),
   limitations: z.array(z.string()),
   environment: FingerprintSchema,
+  // S1 扩展：项目架构事实（装配期从 runtime 真实状态组装；commit/线快照未知 → 缺省（诚实，不臆造））
+  line: z.string().min(1).optional(),
+  commit: z.string().min(1).optional(),
+  line_snapshot: z.object({
+    line: z.string().min(1),
+    commit: z.string().min(1),
+    dir: z.string().min(1),
+  }).optional(),
+  layout_state: z.string().min(1).optional(),
+  bench: z.object({
+    recent_real_reports: z.number().int().nonnegative(),
+    recent_replay_reports: z.number().int().nonnegative(),
+  }).optional(),
 });
 export type WorldModel = z.infer<typeof WorldModelSchema>;
 
-/** S4 SelfModel（引用对象：可靠策略/盲点；当前状态） */
+/** S4 SelfModel（引用对象：可靠策略/盲点；当前状态）。
+ *  S1 运行接线扩展（可选字段）：版本（R6 hostVersion/插件版本）与资源（无硬数据 → 缺省，诚实未知）。 */
 export const SelfModelSchema = irBase({
   kind: z.literal('self_model'),
   reliable_strategies: z.array(z.string()),
   blind_spots: z.array(z.string()),
   current_state: z.string().min(1),
   environment: FingerprintSchema,
+  // S1 扩展：版本与资源（装配期真实值；资源无硬数据源 → memory_mb/cpus = null + detail 说明）
+  host_version: z.string().min(1).optional(),
+  plugin_version: z.string().min(1).optional(),
+  resources: z.object({
+    memory_mb: z.number().int().nullable(),
+    cpus: z.number().int().nullable(),
+    detail: z.string().min(1),
+  }).optional(),
 });
 export type SelfModel = z.infer<typeof SelfModelSchema>;
 

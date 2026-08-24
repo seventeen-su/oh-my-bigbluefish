@@ -8,9 +8,10 @@
 // "import 目标层 ≤ 源层"（eslint no-cross-layer-import 同款语义，tests/m0/dag-lint.test.ts 钉住）。
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { cpus, totalmem } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { GIT_BIN, defaultLayout, runGit } from '../substrate/snapshot.js';
 import { ensureLineSnapshot, isVersionLine, resolveLineCommit, type VersionLine, type VersionLayout } from '../substrate/lines.js';
@@ -27,7 +28,7 @@ import type { Fingerprint } from '../kernel/schemas/base.js';
 import { hostVersion, setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
-import type { State } from '../kernel/schemas/s.js';
+import { StateSchema, type State, type SelfModel, type WorldModel } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
@@ -84,17 +85,33 @@ import {
   makeReplayExecutorV2,
   runBenchV2,
 } from '../supervisor/bench-v2.js';
+// S1：基准明细目录（WorldModel bench 状态查询——最近 real/replay 报告存在性）
+import { BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 // P2：组件注册表装配（实现落 supervisor 层 1——runtime(2) 持有注册表，层 DAG 禁 runtime → components，
 // tests/m0/dag-lint.test.ts 钉住；components/registry.ts 为 ABI 出口）+ 能力注册表衔接 + kern_status 数据源
 import { ComponentRegistry, type ComponentHealthResult, type ComponentManifest } from '../supervisor/component-registry.js';
 import { CapabilityRegistry } from '../supervisor/capability.js';
 import { memoryRetrievalComponent } from '../memory/memory-retrieval.js';
 import type { KernStatusSummary } from './kern-tools.js';
+// S1：World/Self 模型运行接线——运行时状态视图 → 模型组装（纯读取、确定性）
+import { degradationLog } from './loop-hooks.js';
+import { buildSelfModel, buildWorldModel, type RuntimeView } from './models.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
 /** 仓库根：存在性回退（src 布局 HERE_CANDIDATE 即根；编译布局其下无 kernel/policy → 取上级） */
 const HERE = existsSync(join(HERE_CANDIDATE, 'kernel', 'policy')) ? HERE_CANDIDATE : dirname(HERE_CANDIDATE);
+
+/** S1：插件（preset）版本——package.json 读取（只读；不可读 → 'unknown' 诚实回退，不臆造） */
+function readPluginVersion(): string {
+  try {
+    const raw = readFileSync(join(HERE, 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    return typeof parsed.version === 'string' && parsed.version.length > 0 ? parsed.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** RuntimeSnapshot.id（sha256:<64hex>）→ 运行时快照哈希字符串（rs:<前16hex>，D1⑤ 格式） */
 function runtimeHashOf(snapshot: RuntimeSnapshot): string {
@@ -223,6 +240,9 @@ export interface CognitiveAssemblyOptions {
   evolutionRoot?: string;
   /** P7：环境指纹采集器注入（environment_check 任务用；缺省 collectEnvironmentFingerprint——测试注入可变序列） */
   environmentFingerprint?: () => Fingerprint;
+  /** S1：基准明细目录（WorldModel bench 状态——最近 real/replay 报告存在性；缺省 BENCH_REPORTS_DIR =
+   *  <preset>/workspace/.omb/bench；测试注入临时目录隔离真实 workspace） */
+  benchReportsDir?: string;
   /** R6：宿主 DSH 版本唯一来源注入（可选；提供 → setHostVersion 覆写——运行时指纹采集与
    *  事件 provenance 的 dsh_version 全部经 hostVersion() 读取同一值；缺省 DSH_HOST_VERSION） */
   hostVersion?: string;
@@ -500,6 +520,9 @@ export class CognitiveRuntime {
   private readonly decayDir: string;
   /** R5：repair 重验证记录落盘目录（<evolutionRoot>/repair；<ts>.json——受影响对象重验证审计） */
   private readonly repairDir: string;
+  /** S1：World/Self 模型缓存（视图 + 模型——首次访问装配，promote/rebuildSnapshotForLine 后重置；
+   *  同 runtime 状态 → 同视图 → 同模型内容（确定性）；装配为纯读取无副作用） */
+  private modelCache: { view: RuntimeView; world: WorldModel; self: SelfModel } | null = null;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
@@ -630,6 +653,91 @@ export class CognitiveRuntime {
       degraded: this.degraded
         ? `快照机制降级（${this.identityError ?? 'rs:assembly'}）`
         : this.componentAssemblyDegraded,
+    };
+  }
+
+  /**
+   * S1：WorldModel（S4）——当前项目架构/依赖/运行时/外部状态（架构 §4.6.1）。
+   * 装配期从 runtime 真实状态组装（纯读取、确定性：同 runtime 状态 → 同模型内容）；
+   * 首次访问装配并缓存；promote/rebuildSnapshotForLine 后重置（反映新快照/新线）。
+   */
+  get worldModel(): WorldModel {
+    return this.models().world;
+  }
+
+  /** S1：SelfModel（S4）——当前能力/已知限制/可靠策略/盲点（确定性同 worldModel） */
+  get selfModel(): SelfModel {
+    return this.models().self;
+  }
+
+  /**
+   * S1：State.world/self 引用填充（reduce 产出 State 后 null → 模型引用——s.ts StateSchema 仅允许
+   * 引用字符串，故组装模型后登记为引用 id）。StateSchema 校验：合规路径返回 parsed（fail-loud 于
+   * 接线自身违规）；事件流直归约的 working 缺省字段（如 next_best_action=''——既有诚实空语义，P7）
+   * 非 S1 接线缺陷 → 返回填充后的 state（checkpoint 契约层不机械校验内嵌 state，T1.5 契约）。
+   */
+  materializeState(reduced: ReducedState): State {
+    const state: State = { ...reduced, world: this.worldModel.id, self: this.selfModel.id };
+    const parsed = StateSchema.safeParse(state);
+    return parsed.success ? parsed.data : state;
+  }
+
+  /** S1：模型视图/模型缓存（首次访问装配；promote/rebuild 后重置） */
+  private models(): { view: RuntimeView; world: WorldModel; self: SelfModel } {
+    if (this.modelCache === null) {
+      const view = this.assembleModelView();
+      this.modelCache = { view, world: buildWorldModel(view), self: buildSelfModel(view) };
+    }
+    return this.modelCache;
+  }
+
+  /**
+   * S1：运行时状态视图装配（纯读取、同步、确定性：同 runtime 状态 → 同视图 → 同模型内容）。
+   * 数据源全部为 runtime 现有字段/只读读取（capabilities/components/lineSnapshot/snapshotHash/
+   * 降级记录/环境指纹/基准报告存在性/node:os 资源），无副作用。
+   */
+  private assembleModelView(): RuntimeView {
+    const line = this.lineSnapshot?.line ?? 'stable';
+    const layoutState = this.lineSnapshot !== null ? 'lines-injected' : 'repo-default';
+    let real = 0;
+    let replay = 0;
+    try {
+      const names = readdirSync(this.assemblyOpts.benchReportsDir ?? BENCH_REPORTS_DIR);
+      real = names.filter((n) => n.startsWith('real-')).length;
+      replay = names.filter((n) => n.startsWith('replay-')).length;
+    } catch {
+      // 目录缺失/不可读 → 0（诚实：无报告）
+    }
+    return {
+      assembledAt: new Date().toISOString(),
+      snapshotHash: this.snapshotHash,
+      line,
+      commit: this.lineSnapshot?.commit ?? null,
+      lineSnapshot: this.lineSnapshot,
+      lineDegraded: this.lineDegraded,
+      snapshotDegraded: this.degraded ? (this.identityError ?? 'rs:assembly') : null,
+      componentDegraded: this.componentAssemblyDegraded,
+      capabilities: this.capabilities.list(),
+      components: this.components.list().map((c) => ({
+        manifest_id: c.manifest_id,
+        status: c.status,
+        healthy: c.healthy,
+        health_detail: c.health_detail,
+      })),
+      degradations: degradationLog(),
+      hostVersion: hostVersion(),
+      pluginVersion: readPluginVersion(),
+      environmentFingerprint: this.fingerprintCollector(),
+      resources: {
+        memory_mb: Math.round(totalmem() / 1024 / 1024),
+        cpus: cpus().length,
+        detail: '系统级实测（node:os）——运行时预算见 policy.budget（请求级）',
+      },
+      bench: { recent_real_reports: real, recent_replay_reports: replay },
+      layoutState,
+      modelAdapterAvailable: this.modelAdapter !== null,
+      maintenanceAvailable: this.maintenance !== null,
+      checkpointAvailable: this.checkpointDir !== undefined,
     };
   }
 
@@ -978,6 +1086,7 @@ export class CognitiveRuntime {
       this.lineDegraded = dirs.lineDegraded;
       this.policyPromise = null;
       this.processesPromise = null;
+      this.modelCache = null; // S1：World/Self 模型反映新线（下一访问按新线/新快照重建）
       return { promoted: true, degraded: null };
     } catch (err) {
       return { promoted: false, degraded: `快照重建失败（${errorDetail(err)}）——当前快照保持` };
@@ -987,6 +1096,7 @@ export class CognitiveRuntime {
   /** P1b/P1e：外部晋升接口（构建好新快照后 promote → 下一请求生效；进行中请求不受影响，§6.5.7） */
   promoteSnapshot(next: RuntimeSnapshot): void {
     this.registry.promote(next);
+    this.modelCache = null; // S1：World/Self 模型反映新快照（内容寻址重建）
   }
 
   // ---- 内部 ----

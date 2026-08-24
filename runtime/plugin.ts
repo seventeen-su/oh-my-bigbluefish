@@ -176,6 +176,9 @@ export interface CognitiveRuntimeLike {
   }>;
   /** P2：kern_status 数据源——认知运行时状态摘要（版本线/快照/lineSnapshot/债务/信号数/组件健康；纯读取） */
   status?(): Promise<KernStatusSummary>;
+  /** S1：State.world/self 引用填充（reduce 产出 State 后 null → 模型引用；StateSchema 校验——
+   *  合规路径返回校验结果，事件流直归约的 working 缺省字段（既有诚实空语义）不阻塞接线） */
+  materializeState?(state: unknown): unknown;
   /** R8：/evolve share——发布机制级 Evolution Object（trusted-latest 演化链头 → GitRegistry 本地 registry；
    *  生产默认不自动发布（隐私原则），显式命令始终可用；无对象/失败 → ok:false + 明确文本，不崩） */
   shareEvolutionObject?(input: { session_id: string }): Promise<ShareCommandResultLike>;
@@ -582,7 +585,15 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       const sessionEvents = (await runtime.eventStore.query({ session_id: sessionId })).events;
       const reduced = reduce(sessionEvents).state as unknown as State;
       // 空流退化：无任何事件 → provenance.event 为空 → checkpoint M7 schema 校验失败 → 不传 state（checkpoint 跳过）
-      state = reduced.provenance.event.length > 0 ? reduced : undefined;
+      if (reduced.provenance.event.length === 0) {
+        state = undefined;
+      } else if (typeof runtime.materializeState === 'function') {
+        // S1：World/Self 运行接线——reduce 产出 State 后填充模型引用（null → 引用；StateSchema 校验，
+        // 事件流直归约的 working 缺省字段不阻塞接线）
+        state = runtime.materializeState(reduced) as State;
+      } else {
+        state = reduced; // 兼容：运行时未实现接线 → 事件流直归约状态
+      }
     } catch {
       state = undefined; // 不可归约 → 不传 state（checkpoint 跳过，收尾其余照常）
     }

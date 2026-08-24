@@ -6,8 +6,8 @@
 //   ③ turn 收尾闭环：flush → decision/made + checkpoint 可恢复（goal 恢复）+ MaintenanceDebt 有数据
 //   + signals 聚合：reduce(events).utility_counts.tool_calls ≥ 1（signals = reducer 投影，见报告）
 //   + 全链事件类型面完整 + happy path 无降级记录
-// 另含 checkpoint 契约复核（T8.26.5 关注点 3 / T1.5 契约约定层）：插件路径 checkpoint State 为事件流直归约
-// （world/self=null，reducer 解释性决策），working 视图可消费 + P7 回放一致性。
+// 另含 checkpoint 契约复核（T8.26.5 关注点 3 / T1.5 契约约定层）：插件路径 checkpoint State = 事件流直归约 +
+// world/self 模型引用填充（S1 运行接线），working 视图可消费 + P7 回放一致性。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -213,7 +213,7 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     scheduler.stop();
   });
 
-  it('checkpoint 契约复核：插件路径 checkpoint State = 事件流直归约（world/self=null 诚实未知），working 视图可消费 + P7 回放一致', async () => {
+  it('checkpoint 契约复核：插件路径 checkpoint State = 事件流直归约 + world/self 模型引用填充（S1 接线），working 视图可消费 + P7 回放一致', async () => {
     const cpDir = join(root, 'checkpoints');
     runtime = track(createCognitiveRuntime({ root, checkpointDir: cpDir }));
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
@@ -238,12 +238,15 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
       { timeout: 5000, interval: 10 },
     );
 
-    // 复核证据：checkpoint State 无 initial 回放 → world/self 为 null（T1.5 契约约定层：save 不机械校验内嵌 state，
-    // 调用方保证 schema 合规；插件路径以事件流为源（P7），world/self 模型未接线 → null 为 reducer 诚实"未知"）
+    // 复核证据：checkpoint State = 事件流直归约 + world/self 模型引用填充（S1 运行接线）——world/self 从
+    // null 变为运行时组装模型（S4）的引用 id（T1.5 契约约定层：save 不机械校验内嵌 state，调用方保证
+    // schema 合规；插件路径以事件流为源（P7），world/self 由装配期模型接线填充，非 reducer 臆造）
     const cps = await listCheckpoints({ dir: cpDir });
     const restored = await restoreCheckpoint(cps[0]!.id, { dir: cpDir });
-    expect((restored as { world: string | null }).world).toBeNull();
-    expect((restored as { self: string | null }).self).toBeNull();
+    expect(restored.world).toBe(runtime.worldModel.id);
+    expect(restored.self).toBe(runtime.selfModel.id);
+    expect(restored.world).not.toBeNull();
+    expect(restored.self).not.toBeNull();
 
     // working 视图可消费：prepareTurn loadWorkingState → toPromptWorkingState 只读 working.*（不触 world/self）
     const ws = toPromptWorkingState(restored);
