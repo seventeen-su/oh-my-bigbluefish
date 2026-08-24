@@ -20,6 +20,7 @@ import {
 } from '../kernel/schemas/m.js';
 import { DEFAULT_MEMORY_DB } from './backend.js';
 import { SCHEMA_SQL } from './sql.js';
+import { tokenizeForFts } from './cjk-ngram.js';
 import {
   DEFAULT_MIN_PROV_CLASS,
   DEFAULT_PRIORITY,
@@ -105,9 +106,9 @@ export class StagingManager {
        ORDER BY priority DESC, created ASC, id ASC`,
     );
     this.insertMemory = this.db.prepare(
-      `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, value_score,
-                           utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
+                           value_score, utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO NOTHING`,
     );
     this.insertStats = this.db.prepare('INSERT INTO memory_stats (id) VALUES (?)');
@@ -218,6 +219,9 @@ export class StagingManager {
     const updated = Date.parse(memory.updated);
     const r = this.insertMemory.run(
       memory.id, memory.scope, memory.kind, memory.lifecycle, memory.prov_class, memory.payload,
+      // R4（P0）修复：payload_fts 未写入 → FTS 检索漏 staging 落库记忆（admit 直插 SQL 与 backend.ingest
+      // 同列集——补齐分词列，FTS 触发器同步；否则「经验 → 记忆 → 下次检索」闭环在检索端断裂）
+      tokenizeForFts(memory.payload),
       memory.value_score, JSON.stringify(memory.utility_counts), memory.belief_ref ?? null,
       memory.lineage_ref ?? null, created, updated, memory.provenance.event, JSON.stringify(memory),
     );

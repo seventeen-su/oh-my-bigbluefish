@@ -113,6 +113,21 @@ export function candidateValidationAccrual(): DebtAccrual {
   };
 }
 
+/** R4：经验已入 staging → memory_consolidation 债务入账（§10.1 同形状；finalizeTurn 在
+ *  Experience Admission 后入队——保证「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度） */
+export function memoryConsolidationAccrual(): DebtAccrual {
+  const taskId: MaintenanceTaskId = 'memory_consolidation';
+  const value = MAINTENANCE_WEIGHTS[taskId];
+  const cost = MAINTENANCE_COSTS[taskId];
+  return {
+    task_id: taskId,
+    value,
+    estimated_cost: cost,
+    priority: Math.round((value / cost) * value),
+    urgency: ACCRUAL_URGENCY[taskId],
+  };
+}
+
 /** P7：环境变化 → 受影响对象重新验证入队（repair 债务；§14.5 Predictive Invalidation 触发面，
  *  与 debtAccrualsFromSummary 的 corrections/oracle_fail → repair 同语义） */
 export function repairAccrual(): DebtAccrual {

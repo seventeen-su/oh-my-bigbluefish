@@ -37,9 +37,12 @@ import { retrieve, type RankedMemory } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput, type ProcessDecisionInfo } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
-import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState, toProcessSection } from './turn-helpers.js';
+import { buildContextProjection, buildExperienceCandidate, experienceToStageEvent, EXPERIENCE_STAGE_PRIORITY, makeRuntimeEvent, MAX_EXPERIENCES_STAGED_PER_TURN, toPromptWorkingState, toProcessSection } from './turn-helpers.js';
 import { ProcessScheduler } from './scheduler.js';
 import type { Experience } from '../kernel/schemas/c.js';
+// R4（P0）：Experience → Memory 长期学习闭环——staging（准入）+ consolidate（dedup/merge/relation/decay）
+import { StagingManager } from '../memory/staging.js';
+import { consolidate } from '../memory/consolidate.js';
 // P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
 import { appendSignals, readSignals, signalsDirOf } from './evolution-signals.js';
 import { collectGeneralizationSignals } from './signal-collectors.js';
@@ -49,6 +52,7 @@ import {
   debtAccrualsFromSummary,
   decideEvolution,
   evaluationSignalsToRecords,
+  memoryConsolidationAccrual,
   repairAccrual,
   summarizeSignals,
 } from '../kernel/evolve-decision.js';
@@ -240,6 +244,8 @@ export interface FinalizeTurnInput {
 export interface FinalizeTurnResult {
   decision_event_id: string;
   experience: Experience | null;
+  /** R4（P0）：Experience Admission 结果（experience → staging；准入规则/量级守卫的逐条裁决） */
+  experience_admission: { staged: number; skipped: { id: string; reason: string }[] };
   signals: UtilityCounts;
   signals_degraded: string | null;
   /** P1c：演化信号落盘结果（.evolution/signals/<yyyy-mm-dd>.jsonl；尽力而为——失败降级不阻塞收尾） */
@@ -366,6 +372,8 @@ function resolveLineDirs(opts: CognitiveAssemblyOptions, line: VersionLine): Lin
 export class CognitiveRuntime {
   readonly eventStore: EventStore;
   readonly memory: RetrievalBackend;
+  /** R4（P0）：记忆 staging 管理器（同一 memory.db；Experience Admission 与 consolidation 共用） */
+  readonly staging: StagingManager;
   /**
    * P1b：当前（最新）运行时快照哈希（rs:<16hex>；opts.snapshotHash 覆盖注入；全降级 → 'rs:assembly'）。
    * getter 语义：promote（/mode 切换 / rebuildSnapshotForLine）后反映新快照——事件 provenance 用最新快照；
@@ -426,6 +434,9 @@ export class CognitiveRuntime {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
     this.eventStore = new EventStore(opts.eventDb ?? join(root, 'events.db'));
     this.memory = new RetrievalBackend(opts.memoryDb ?? join(root, 'memory.db'));
+    // R4（P0）：staging 与 memory 同库（单写者语义：stage/admit/consolidate 各自事务内顺序写；
+    // WAL + busy_timeout 兜底并发）。close() 幂等收尾先关。
+    this.staging = new StagingManager(opts.memoryDb ?? join(root, 'memory.db'));
     // P2：组件注册表装配——注册首个机制组件 memory-retrieval（manifest/inject/effect/disposer/health 契约，
     // ABI 出口 components/registry.ts，实现 supervisor/component-registry.ts）→ 组件能力登记进能力注册表
     //（冲突 fail-loud——同层同名注册是真实装配冲突，最早点报错（平台约束 fails loud））。
@@ -648,6 +659,13 @@ export class CognitiveRuntime {
 
     const experience = buildExperienceCandidate(input.session_id, input.decision, input.working_state);
 
+    // R4（P0）：Experience Admission——候选 → staging（准入规则 + 量级守卫；不直接写 memory——
+    // 长期记忆经维护期 memory_consolidation 落库：staging → admit → consolidate → memory/relation）
+    const experience_admission = await this.stageExperiences(
+      experience === null ? [] : [experience],
+      input.session_id,
+    );
+
     const { signals, degraded } = await this.aggregateSignals(input.session_id);
 
     // P1c：演化信号落盘（.evolution/signals/<yyyy-mm-dd>.jsonl 追加；信号源① = finalizeTurn 聚合的
@@ -672,6 +690,22 @@ export class CognitiveRuntime {
         countsToSignalRecords(signals as unknown as Record<string, number>, turnTs, input.session_id),
       );
       for (const acc of debtAccrualsFromSummary(summary)) {
+        await this.maintenance.enqueue(
+          {
+            id: acc.task_id,
+            value: acc.value,
+            estimated_cost: acc.estimated_cost,
+            priority: acc.priority,
+            urgency: acc.urgency,
+            run: this.maintenanceRun(acc.task_id, input.session_id),
+          },
+          { accrueDebt: true },
+        );
+      }
+      // R4（P0）：经验已入 staging → memory_consolidation 债务入账（§10.1 同形状）——保证
+      // 「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度（空闲期量子执行 consolidation）
+      if (experience_admission.staged > 0) {
+        const acc = memoryConsolidationAccrual();
         await this.maintenance.enqueue(
           {
             id: acc.task_id,
@@ -731,6 +765,7 @@ export class CognitiveRuntime {
     return {
       decision_event_id: made.id,
       experience,
+      experience_admission,
       signals,
       signals_degraded: degraded,
       signals_log,
@@ -738,6 +773,46 @@ export class CognitiveRuntime {
       checkpoint,
       events_appended: 1,
     };
+  }
+
+  /**
+   * R4（P0）：Experience Admission（§5.2/§7.2）——experience → staging 写入（准入规则 + 量级守卫）。
+   * finalizeTurn 调用面；测试/组件可复用。逐条裁决返回（staged/skipped+reason）。
+   * 准入规则（复用 memory/staging 既有语义，§7.2 纯代码）：
+   *   - 来源（无来源不入）：experienceToStageEvent 无 provenance → 不入 staging（no-provenance）；
+   *   - 重复去重：同内容经验 → stage no-op（幂等键 = 内容哈希，admitted:false 'duplicate'）；
+   *   - TTL/priority：stage 默认 TTL（DEFAULT_TTL_MS）+ EXPERIENCE_STAGE_PRIORITY；
+   *   - 稳定/新信息/scope：consolidation 的 admit 阶段执行（本步只入 staging——不直接写 memory，
+   *     不把全部 Experience 永久写入）。
+   * 量级守卫：每 finalizeTurn 最多 staging MAX_EXPERIENCES_STAGED_PER_TURN 条（超出 → limit）。
+   */
+  async stageExperiences(
+    experiences: readonly Experience[],
+    sessionId: string,
+  ): Promise<{ staged: number; skipped: { id: string; reason: string }[] }> {
+    const snapshot = this.resolveRuntimeSnapshot(sessionId);
+    const skipped: { id: string; reason: string }[] = [];
+    let staged = 0;
+    let remaining = MAX_EXPERIENCES_STAGED_PER_TURN;
+    for (const exp of experiences) {
+      if (remaining <= 0) {
+        skipped.push({ id: exp.id, reason: 'limit' });
+        continue;
+      }
+      const ev = experienceToStageEvent(exp, sessionId, snapshot);
+      if (ev === null) {
+        skipped.push({ id: exp.id, reason: 'no-provenance' });
+        continue;
+      }
+      const r = await this.staging.stage(ev, { priority: EXPERIENCE_STAGE_PRIORITY });
+      if (r.admitted) {
+        staged++;
+        remaining--;
+      } else {
+        skipped.push({ id: exp.id, reason: r.reason });
+      }
+    }
+    return { staged, skipped };
   }
 
   /**
@@ -778,6 +853,7 @@ export class CognitiveRuntime {
   async close(): Promise<void> {
     await this.components.disposeAll();
     await this.eventStore.close();
+    await this.staging.close();
     await this.memory.close();
   }
 
@@ -958,7 +1034,8 @@ export class CognitiveRuntime {
 
   /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d：candidate_validation 接真实管线——
    *  生成 → 验证 → 晋升（runEvolutionChain）；P1e：promotion_check 接晋升检查（stable ← trusted-latest
-   *  显式门禁）；repair/memory_consolidation 现为占位（P1d 范围外）） */
+   *  显式门禁）；R4：memory_consolidation 接真实 consolidation（runMemoryConsolidation——
+   *  staging→admit→dedup/merge/relation/decay）；repair 现为占位（R5 范围）） */
   private maintenanceRun(taskId: string, sessionId?: string): (signal?: AbortSignal) => Promise<void> {
     switch (taskId) {
       case 'gc':
@@ -986,9 +1063,14 @@ export class CognitiveRuntime {
         return async () => {
           await this.runEnvironmentCheck();
         };
-      case 'repair':
       case 'memory_consolidation':
-        // P1d 范围外占位：任务执行 = 债务清偿生命周期闭环（完成 → 归零）
+        // R4（P0）：经验 → 长期记忆 生产闭环（§5.2/§7.2）——执行体 runMemoryConsolidation
+        //（失败 → 任务抛错 → 债务不清零——R5 DeferredMaintenanceError 语义的最小落地）
+        return async (signal) => {
+          await this.runMemoryConsolidation(signal);
+        };
+      case 'repair':
+        // R5 范围外占位：repair 任务执行 = 债务清偿生命周期闭环（完成 → 归零）
         return async () => {};
       default:
         return async () => {};
@@ -1059,6 +1141,24 @@ export class CognitiveRuntime {
   }
 
   // ---- P7：Predictive Invalidation（设计 §14.5 + 实现规格 §15.4 最小落地） ----
+
+  /**
+   * R4（P0）：记忆整合批处理执行体（维护任务 memory_consolidation；可公开调用——测试/命令触发）。
+   * 全链：staging TTL 回收（sweepExpired）→ admit（准入：重复/新信息/稳定/scope/来源，§7.2 纯代码）
+   * → consolidate（dedup/merge/relation/decay，backend.transaction 独占写事务——§7.2 单写者语义）。
+   * 失败语义（R5 DeferredMaintenanceError 最小版）：任一步抛错 → 任务失败 → maintenance 债务不清零
+   * （不再「空实现假成功」清债）；中断（signal.aborted）→ 抛 AbortError 让出留队（可重试）。
+   */
+  async runMemoryConsolidation(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted === true) {
+      const err = new Error('memory_consolidation aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    await this.staging.sweepExpired();
+    await this.staging.admit();
+    await consolidate(this.memory);
+  }
 
   /**
    * P7：环境指纹检查（维护任务 environment_check 执行体，可公开调用——测试/命令触发）。

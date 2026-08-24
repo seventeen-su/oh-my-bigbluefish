@@ -10,6 +10,7 @@ import type { Event } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
 import type { PolicyBundle } from '../kernel/policy-loader.js';
 import type { RankedMemory } from '../memory/retrieve.js';
+import { contentHash } from '../memory/staging-policy.js';
 import { compile, type ProcessSectionInput } from './renderer.js';
 import type { GovernorDecision, ProcessDecisionInfo } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
@@ -118,6 +119,88 @@ export function buildExperienceCandidate(
   };
   const parsed = ExperienceSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
+}
+
+// ---- R4（P0）：Experience Admission 纯函数面（§5.2/§7.2：experience → staging 的最小适配） ----
+
+/** Experience staging 行 priority（高于 decision/made 默认 7——经验记忆为学习核心写入；待标定 §17） */
+export const EXPERIENCE_STAGE_PRIORITY = 8;
+
+/** 每 finalizeTurn 最多 staging 的 Experience 条数（量级守卫；当前每 turn 仅产 1 候选——
+ *  上限为批扩展预留；待标定 §17） */
+export const MAX_EXPERIENCES_STAGED_PER_TURN = 5;
+
+/** Experience（C11 PCR）→ 记忆 payload（可检索文本：context/action/result 拼装；规范化哈希 = 去重键） */
+export function experienceStagePayload(experience: Experience): string {
+  return `经验：${experience.context}；行动：${experience.action}；结果：${experience.result}`;
+}
+
+/** Experience → staging 幂等键（§11.3 event_id）：scope/kind/规范化 PCR 文本的内容哈希——相同经验
+ * （同内容，时间戳不参与）重复 finalizeTurn → stage no-op（重复去重；admit 层 contentExists 同语义兜底） */
+export function experienceStageKey(experience: Experience): string {
+  return `exp:stage:${contentHash('Project', 'Episodic', experienceStagePayload(experience))}`;
+}
+
+/**
+ * R4：Experience（C11 PCR）→ M3 staging 事件（§7.2 Event → staging 的适配：staging 面向 Event 而非
+ * Experience——experience 转 Event（payload.memory 承载记忆候选）后走既有 stage/admit 路径）。
+ * 准入规则（§7.2 纯代码；本函数为 experience 侧前置 gate）：
+ *   - 来源（无来源不入）：provenance 缺失/空 source/空 event → null（不入 staging）——记忆须可溯源；
+ *   - scope：固定 Project（经验记忆跨会话可检索；会话内细节留在事件链，P7 事实源）；
+ *   - kind：Episodic（经验记忆维度；MemoryKindEnum 无 Experience——consolidate KIND_LINK_RULES 同款映射）；
+ *   - prov_class：System-derived（系统确定性产出的 PCR 记录；信任序 1，稳定门槛 priority ≥ 2——
+ *     EXPERIENCE_STAGE_PRIORITY=8 达标）；
+ *   - 幂等键：experienceStageKey（内容哈希——重复经验 stage no-op）。
+ * 无 I/O 纯函数；staging 写入与量级守卫在 assembly 侧（CognitiveRuntime.stageExperiences）。
+ */
+export function experienceToStageEvent(experience: Experience, sessionId: string, snapshotHash: string): Event | null {
+  const prov = experience.provenance;
+  if (
+    prov === undefined ||
+    typeof prov.source !== 'string' ||
+    prov.source.length === 0 ||
+    typeof prov.event !== 'string' ||
+    prov.event.length === 0
+  ) {
+    return null; // 无来源 → 不入 staging
+  }
+  const ts = new Date().toISOString();
+  return {
+    ir_version: '2.0',
+    id: makeMutableId('evt'),
+    schema: 'omb/M3',
+    scope: 'Session',
+    lifecycle: 'active',
+    immutable: false,
+    owner: 'kernel',
+    created: ts,
+    updated: ts,
+    provenance: {
+      source: prov.source,
+      event: experienceStageKey(experience),
+      actor: prov.actor,
+      environment: prov.environment,
+      runtime_snapshot: snapshotHash,
+      timestamp: ts,
+      transformation_chain: [...prov.transformation_chain, 'experience-admission'],
+      verification: 'r4-experience-admission',
+    },
+    refs: [],
+    type: 'decision/made',
+    session_id: sessionId,
+    runtime_snapshot: snapshotHash,
+    parent_event: null,
+    payload: {
+      memory: {
+        scope: 'Project',
+        kind: 'Episodic',
+        prov_class: 'System-derived',
+        payload: experienceStagePayload(experience),
+        value_score: 0.5,
+      },
+    },
+    timestamp: ts,
+  };
 }
 
 /** M3 事件构造（三能力共用；transformation_chain 标识能力来源） */
