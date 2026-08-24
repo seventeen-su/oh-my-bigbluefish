@@ -26,7 +26,7 @@ import {
   MemorySchema,
   type Memory,
 } from '../kernel/schemas/m.js';
-import { SCHEMA_SQL, ftsMatchExpr, parseCursor } from './sql.js';
+import { SCHEMA_SQL, environmentJson, ftsMatchExpr, parseCursor } from './sql.js';
 import { tokenizeForFts } from './cjk-ngram.js';
 
 /** 默认 DB 文件（用户态目录，CONVENTIONS §7：workspace/.omb/） */
@@ -76,10 +76,19 @@ export class SqliteMemoryBackend implements MemoryBackend {
     this.db = new DatabaseSync(dbPath, { timeout: BUSY_TIMEOUT_MS }); // busy_timeout 兜底（单写者语义）
     this.db.exec('PRAGMA journal_mode=WAL');
     this.db.exec(SCHEMA_SQL);
+    // R5：environment 列迁移——新库由 SCHEMA_SQL 直接建列；既有库（列已存在）ALTER 报
+    // duplicate column → no-op（幂等）。既有行的 environment 为 NULL（未回填）→
+    // findAffectedObjects 视作无环境声明（诚实：不臆造匹配），回填留后续数据迁移。
+    try {
+      this.db.exec('ALTER TABLE memory ADD COLUMN environment TEXT');
+    } catch {
+      // 列已存在（新库）→ no-op
+    }
     this.insertMemory = this.db.prepare(
       `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
-                           value_score, utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           value_score, utility_counts, belief_ref, lineage_ref, created, updated,
+                           event_id, environment, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO NOTHING`,
     );
     this.insertStats = this.db.prepare('INSERT INTO memory_stats (id) VALUES (?)');
@@ -99,7 +108,7 @@ export class SqliteMemoryBackend implements MemoryBackend {
       const r = this.insertMemory.run(
         v.id, v.scope, v.kind, v.lifecycle, v.prov_class, v.payload, tokenizeForFts(v.payload),
         v.value_score, JSON.stringify(v.utility_counts), v.belief_ref ?? null, v.lineage_ref ?? null,
-        created, updated, v.provenance.event, JSON.stringify(v),
+        created, updated, v.provenance.event, environmentJson(v.provenance.environment), JSON.stringify(v),
       );
       let id: string;
       if (r.changes === 0) {

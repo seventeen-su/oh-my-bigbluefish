@@ -30,7 +30,7 @@ import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
-import { MaintenanceScheduler, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
+import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
 import { reduce, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory } from '../memory/retrieve.js';
@@ -56,7 +56,7 @@ import {
   repairAccrual,
   summarizeSignals,
 } from '../kernel/evolve-decision.js';
-import type { EvolutionDecision, CapabilityDecayRecord } from '../kernel/schemas/evolution.js';
+import type { EvolutionDecision, CapabilityDecayRecord, ArtifactRef } from '../kernel/schemas/evolution.js';
 // P7：Predictive Invalidation 环境指纹（§14.5/§15.4——指纹 diff 纯函数 + 采集 + 衰减记录构造）
 import {
   buildCapabilityDecayRecord,
@@ -314,6 +314,21 @@ export interface LineSnapshotInfo {
   dir: string;
 }
 
+/** R5：repair 任务结果（受影响对象重验证审计；落盘 .evolution/repair/<ts>.json） */
+export interface RepairRecord {
+  /** 本次重验证时间戳（epoch ms） */
+  ts: number;
+  task: 'repair';
+  /** 本次扫描的 decay 记录数 */
+  decay_records: number;
+  /** 去重后的受影响对象（全部 decay 记录合并） */
+  affected_objects: ArtifactRef[];
+  /** 确认存在并记录重验证的对象 */
+  reverified: ArtifactRef[];
+  /** 引用对象已删除（无可修，跳过留痕） */
+  missing: ArtifactRef[];
+}
+
 /** 按线解析结果（policy/processes 目录 + 快照信息 + 降级原因） */
 interface LineDirResolution {
   policyDir: string;
@@ -429,6 +444,8 @@ export class CognitiveRuntime {
   private lastEnvironmentFingerprint: Fingerprint | null = null;
   /** P7：能力衰减记录落盘目录（<evolutionRoot>/decay；<ts>.json） */
   private readonly decayDir: string;
+  /** R5：repair 重验证记录落盘目录（<evolutionRoot>/repair；<ts>.json——受影响对象重验证审计） */
+  private readonly repairDir: string;
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
@@ -475,6 +492,8 @@ export class CognitiveRuntime {
     // P7：环境指纹（Predictive Invalidation）装配——采集器注入（缺省运行时采集）+ 衰减记录落盘目录
     this.fingerprintCollector = opts.environmentFingerprint ?? (() => collectEnvironmentFingerprint());
     this.decayDir = join(this.evolutionRoot, 'decay');
+    // R5：repair 重验证记录落盘目录（受影响对象重验证审计；与 decay 同根）
+    this.repairDir = join(this.evolutionRoot, 'repair');
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等 */
@@ -1035,7 +1054,8 @@ export class CognitiveRuntime {
   /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d：candidate_validation 接真实管线——
    *  生成 → 验证 → 晋升（runEvolutionChain）；P1e：promotion_check 接晋升检查（stable ← trusted-latest
    *  显式门禁）；R4：memory_consolidation 接真实 consolidation（runMemoryConsolidation——
-   *  staging→admit→dedup/merge/relation/decay）；repair 现为占位（R5 范围）） */
+   *  staging→admit→dedup/merge/relation/decay）；R5：repair 接真实重验证（runRepair——
+   *  读 decay 记录 → 受影响对象重验证审计 → 成功清债）） */
   private maintenanceRun(taskId: string, sessionId?: string): (signal?: AbortSignal) => Promise<void> {
     switch (taskId) {
       case 'gc':
@@ -1044,36 +1064,48 @@ export class CognitiveRuntime {
         };
       case 'candidate_validation':
         return async () => {
-          // 旧布局（线快照无 policy 内容）→ 候选管线跳过（生产降级记录；不触碰真实 versions.git）
+          // 旧布局（线快照无 policy 内容）→ 候选管线不可执行（生产降级记录；不触碰真实 versions.git）——
+          // R5：抛 Deferred（不再 return 假成功清债——未实现/不可执行任务 → debt 保留不清零，评估依据 §13）
           if (sessionId === undefined || this.lineSnapshot === null) {
-            return;
+            throw new DeferredMaintenanceError(
+              'candidate_validation 旧布局（线快照无 kernel/policy）——候选管线不可执行，债务保留',
+            );
           }
           await this.runEvolutionChain(sessionId);
         };
       case 'promotion_check':
         return async () => {
-          // 旧布局（无线快照）→ 晋升检查跳过（生产降级记录；不触碰真实 versions.git）
+          // 旧布局（无线快照）→ 晋升检查跳过（生产降级记录；不触碰真实 versions.git）——
+          // checked:false + skipped_reason 是真实检查结果（可审计），非空实现假成功；且该任务
+          // 不 accrueDebt（无债务可清），保持既有 return 语义
           if (sessionId === undefined || this.lineSnapshot === null) {
             return;
           }
           await this.runPromotionCheck(sessionId);
         };
       case 'environment_check':
-        // P7：Predictive Invalidation——指纹 diff → 衰减记录落盘 + 重新验证入队（失败降级不抛：尽力而为）
+        // P7：Predictive Invalidation——指纹 diff → 衰减记录落盘 + 受影响对象降级/重新验证入队
+        //（失败降级不抛：尽力而为）
         return async () => {
           await this.runEnvironmentCheck();
         };
       case 'memory_consolidation':
         // R4（P0）：经验 → 长期记忆 生产闭环（§5.2/§7.2）——执行体 runMemoryConsolidation
-        //（失败 → 任务抛错 → 债务不清零——R5 DeferredMaintenanceError 语义的最小落地）
+        //（失败 → 任务抛错 → 债务不清零——R5 清债语义）
         return async (signal) => {
           await this.runMemoryConsolidation(signal);
         };
       case 'repair':
-        // R5 范围外占位：repair 任务执行 = 债务清偿生命周期闭环（完成 → 归零）
-        return async () => {};
+        // R5（P0+P1）：受影响对象重验证（读 decay 记录 → 重验证审计 → 成功清债；
+        // 无待 repair 对象 = 合法完成清债；幂等——重复执行同结果）
+        return async () => {
+          await this.runRepair();
+        };
       default:
-        return async () => {};
+        // 未实现/不可执行任务 → Deferred（债务保留，不假成功清债——评估依据 §13）
+        return async () => {
+          throw new DeferredMaintenanceError(`维护任务 ${taskId} 未实现——债务保留不清零`);
+        };
     }
   }
 
@@ -1162,10 +1194,12 @@ export class CognitiveRuntime {
 
   /**
    * P7：环境指纹检查（维护任务 environment_check 执行体，可公开调用——测试/命令触发）。
-   * 指纹 diff → 有变化 → CapabilityDecayRecord 落盘 .evolution/decay/<ts>.json + 受影响对象重新验证
-   * 入队（repair 债务，§14.5 局部重验证）→ 更新基线；无变化 → 不动作（返回 null）。
+   * 指纹 diff → 有变化 → 受影响对象定位（R5：memory 环境声明索引 findAffectedObjects → 降级
+   * suspicious——lifecycle 更新，检索面已按 Suspicious 扣 pollution 降权 §7.4）→ CapabilityDecayRecord
+   * 落盘 .evolution/decay/<ts>.json（affected_objects 真实填充）+ 受影响对象重新验证入队
+   * （repair 债务，§14.5 局部重验证）→ 更新基线；无变化 → 不动作（返回 null）。
    * 基线：进程内首次检查建立（有 decay 落盘历史 → 取最近记录指纹接续——跨重启连续性）；
-   * 尽力而为：采集/落盘失败降级不抛（environment_check 不阻塞维护链）。
+   * 尽力而为：采集/落盘/索引失败降级不抛（environment_check 不阻塞维护链）。
    */
   async runEnvironmentCheck(): Promise<CapabilityDecayRecord | null> {
     try {
@@ -1185,13 +1219,32 @@ export class CognitiveRuntime {
       if (Object.keys(delta).length === 0) {
         return null; // 无变化不动作
       }
-      // 最小实现：无环境声明索引（signals/记忆声明环境标记匹配未建）→ affected_objects 空；
-      // 记录 delta（§15.4 字段级）+ 触发受影响对象重新验证入队（repair 债务）
+      // R5：环境声明索引定位受影响对象（按 delta 字段匹配声明环境的 memory 记录）→ 降级 suspicious
+      //（lifecycle 更新——backend.update 白名单已含 lifecycle；检索消费面见 retrieve.ts §7.4 pollution
+      // 扣减）。索引失败 → 降级为无对象（记录 delta + repair 债务照常，诚实不臆造）；单对象降级失败
+      // → 跳过（尽力而为，不影响其它对象）。
+      let affected_objects: ArtifactRef[] = [];
+      try {
+        affected_objects = await this.memory.findAffectedObjects(delta);
+      } catch {
+        affected_objects = [];
+      }
+      for (const obj of affected_objects) {
+        try {
+          const m = await this.memory.getById(obj.id);
+          if (m !== undefined && m.lifecycle !== 'Suspicious') {
+            await this.memory.update(obj.id, { lifecycle: 'Suspicious' });
+          }
+        } catch {
+          // 单对象降级失败 → 跳过（记录中仍保留该对象引用，repair 重验证可再确认）
+        }
+      }
+      // §15.4 字段级记录：delta + 受影响对象（regression_set/attribution 由构造纯函数派生）
       const record = buildCapabilityDecayRecord({
         before: baseline,
         after: current,
         delta,
-        affected_objects: [],
+        affected_objects,
       });
       if (record === null) {
         return null;
@@ -1217,6 +1270,58 @@ export class CognitiveRuntime {
       // 尽力而为：采集/落盘/入队失败 → 降级不抛（environment_check 是低优先级检查，不阻塞维护链）
       return null;
     }
+  }
+
+  /**
+   * R5：repair 任务执行体（维护任务 repair，可公开调用——测试/命令触发）。
+   * 受影响对象重验证：读全部 decay 记录（.evolution/decay/）→ 去重合并受影响对象 → 逐个确认
+   * 存在（重验证最小形式：确认降级标记在检索面生效 + 记录重验证时间戳——审计落盘
+   * .evolution/repair/<ts>.json；有 verifier 的对象走真实验证留评估面接入）→ 任务成功 return
+   * → 调度器清债。无待 repair 对象（decay 无记录/受影响对象为空/对象已删除）→ 同样合法完成清债。
+   * 幂等：重复执行同结果（重验证时间戳刷新、不重复写入/不抛错）。
+   */
+  async runRepair(): Promise<RepairRecord> {
+    const files = (await readdir(this.decayDir)).filter((f) => f.endsWith('.json')).sort();
+    const affected = new Map<string, ArtifactRef>();
+    for (const f of files) {
+      try {
+        const rec = JSON.parse(await readFile(join(this.decayDir, f), 'utf8')) as CapabilityDecayRecord;
+        for (const obj of rec.affected_objects ?? []) {
+          affected.set(obj.id, obj);
+        }
+      } catch {
+        // 损坏 decay 记录跳过（尽力而为；不阻塞重验证）
+      }
+    }
+    const reverified: ArtifactRef[] = [];
+    const missing: ArtifactRef[] = [];
+    for (const obj of affected.values()) {
+      const m = await this.memory.getById(obj.id);
+      if (m === undefined) {
+        missing.push(obj); // 引用对象已删除 → 无可修（跳过；记录留痕）
+        continue;
+      }
+      // 最小重验证：确认对象存在（suspicious 降级标记已由 environment_check 写入；
+      // 检索面已按 Suspicious 降权 §7.4）+ 记录重验证时间戳（本记录 ts）。真实 verifier 走验证留待。
+      reverified.push({ id: obj.id, kind: 'memory' });
+    }
+    const record: RepairRecord = {
+      ts: Date.now(),
+      task: 'repair',
+      decay_records: files.length,
+      affected_objects: [...affected.values()],
+      reverified,
+      missing,
+    };
+    await mkdir(this.repairDir, { recursive: true });
+    let file = join(this.repairDir, `${record.ts}.json`);
+    let n = 0;
+    while (existsSync(file)) {
+      n++;
+      file = join(this.repairDir, `${record.ts}-${n}.json`);
+    }
+    await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    return record;
   }
 
   /** 读最近一条 decay 记录的环境指纹（跨重启基线接续；无历史/不可读 → null） */

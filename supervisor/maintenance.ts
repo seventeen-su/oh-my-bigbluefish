@@ -2,6 +2,8 @@
 // Invalidation + §9.5 ROI + §4.4 Fingerprint）：
 // - 调度：统一按 ROI = value/estimated_cost（降序），priority 为 tie-break；critical 强制最前。
 // - Debt：失败/未执行（中断、hard 限跳过）→ 累计（value 累加 + accumulated_at 更新）；成功 → 清除；
+//   R5：DeferredMaintenanceError（未实现/不可执行）→ 出队但债务保留（不清债）+ deferredEvents 记录
+//   （不视为失败崩溃——队列继续；「未实现/未完成 → debt 保留」不再空实现假成功清债）。
 //   持久化 .evolution/debt.json（原子写 tmp+rename）。soft 限 → quantum 频率提升（tick 间隔减半）；
 //   hard 限 → 非必要（normal）任务跳过；critical → 下一 quantum/tick 优先。
 // - Quantum：requestQuantum 每次执行 1 个任务（可中断：外部 AbortSignal 与 stop() 的 inFlight
@@ -25,6 +27,26 @@ import type { MaintenanceUrgency } from '../kernel/schemas/evolution.js';
 // ---- 类型 ----
 
 export type Urgency = MaintenanceUrgency;
+
+/**
+ * R5：维护任务 Deferred（未实现/不可执行）语义——任务抛出本错误 → 调度器**出队但不清债**
+ * （债务保留）+ 记录 deferred 事件 + 不视为失败崩溃（队列继续）。
+ * 与真实失败（普通 Error）的差异仅在可观测性（deferredEvents 记录）——两者债务语义一致：
+ * 「未实现/未完成任务 → debt 保留不清零」（不再空实现假成功清债，评估依据 §13）。
+ */
+export class DeferredMaintenanceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeferredMaintenanceError';
+  }
+}
+
+/** Deferred 事件记录（未实现/不可执行任务：task_id + 时间 + 原因；仅可观测，不参与调度） */
+export interface DeferredEvent {
+  task_id: string;
+  at: number;
+  reason: string;
+}
 
 export interface MaintenanceTask {
   id: string;
@@ -127,6 +149,8 @@ export class MaintenanceScheduler {
   private debtLoaded = false;
   private tickCountValue = 0;
   private readonly inFlight = new AbortController();
+  /** R5：Deferred 事件记录（未实现/不可执行任务；见 DeferredMaintenanceError） */
+  private deferredLog: DeferredEvent[] = [];
 
   constructor(opts: MaintenanceSchedulerOptions = {}) {
     this.debtFile = opts.debtFile ?? join(process.cwd(), 'workspace', '.omb', '.evolution', 'debt.json');
@@ -236,6 +260,11 @@ export class MaintenanceScheduler {
       .map((d) => ({ ...d }));
   }
 
+  /** R5：Deferred 事件记录快照（未实现/不可执行任务的出队但债务保留事件；task_id 排序，确定性） */
+  deferredEvents(): DeferredEvent[] {
+    return [...this.deferredLog].sort((a, b) => a.task_id.localeCompare(b.task_id));
+  }
+
   /** Predictive Invalidation（§9.1）：Fingerprint diff → markSuspicious + 最小回归子集 + 衰减记录 */
   predictiveInvalidate(
     fingerprint: Fingerprint,
@@ -323,18 +352,40 @@ export class MaintenanceScheduler {
     return AbortSignal.any([this.inFlight.signal, optsSignal]);
   }
 
-  /** 执行单个任务：成功 → 出队 + 清债；失败 → 出队 + 债务累计；中断 → 留队 + 债务累计（可重试） */
+  /**
+   * 执行单个任务（R5 清债语义）：
+   * - 成功 → 出队 + 清债（清偿归零）；
+   * - DeferredMaintenanceError（未实现/不可执行）→ 出队但债务保留（accrueDebt 任务债务已在入队时
+   *   入账，保留不清零）+ deferredEvents 记录 + 不视为失败崩溃（队列继续）；
+   * - 真实失败（普通 Error）→ 出队 + 债务保留（既有失败语义，评估依据 §13）；
+   * - 中断 → 留队 + 债务累计（可重试）。
+   * 防双计（P1c §10.1）：accrueDebt 任务的债务在入队时已累计——出队前记录是否已入账，避免
+   * removeFromQueue 清除 accruedAtEnqueue 标记后 accrueOnNonRun 重复累计（失败/Deferred 均只保留
+   * 入账值，不翻倍）。
+   */
   private async runOne(t: MaintenanceTask, signal?: AbortSignal): Promise<QuantumReport> {
     try {
       await t.run(signal);
     } catch (err) {
       const aborted = signal?.aborted === true || (err instanceof Error && err.name === 'AbortError');
       if (aborted) {
-        this.accrueOnNonRun(t); // 未执行 → 债务累计
+        this.accrueOnNonRun(t); // 未执行 → 债务累计（留队可重试）
         return { ran: [], skipped: [t.id] };
       }
+      // 出队前记录入账标记（防双计：removeFromQueue 会清除 accruedAtEnqueue）
+      const wasAccrued = this.accruedAtEnqueue.has(t.id);
       this.removeFromQueue(t.id);
-      this.accrueOnNonRun(t); // 执行失败 → 债务累计
+      if (err instanceof DeferredMaintenanceError) {
+        // R5：未实现/不可执行 → 出队但债务保留（不清债）+ 记录 deferred；不视为失败崩溃
+        this.deferredLog.push({ task_id: t.id, at: this.nowFn(), reason: err.message });
+        if (!wasAccrued) {
+          this.accrueOnNonRun(t); // 未入账任务 → 债务累计（未完成 → debt 保留）
+        }
+        return { ran: [t.id], skipped: [] };
+      }
+      if (!wasAccrued) {
+        this.accrueOnNonRun(t); // 执行失败 → 债务累计（保留；已入账任务保留入账值防双计）
+      }
       return { ran: [t.id], skipped: [] };
     }
     this.removeFromQueue(t.id);

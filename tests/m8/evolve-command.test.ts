@@ -137,8 +137,11 @@ describe('② /evolve now 触发链路（判定 → 入队 → quantum → 摘�
     expect(candPayload.object_layer).toBe('L1');
     expect(candPayload.candidate_id).toBeNull(); // P1d 填充真实候选 id
     expect(events.some((e) => e.type === 'maintenance/quantum')).toBe(true);
-    // debt 清偿：quantum 已执行 candidate_validation → 归零
-    expect(scheduler.debtSnapshot()).toEqual([]);
+    // R5 清债语义（评估依据 §13）：测试环境无 versions.git 线快照（旧布局）→ candidate_validation
+    // 抛 DeferredMaintenanceError → 债务保留不清零（不再空实现假成功清债；出队 + deferredEvents 记录）
+    const remaining = scheduler.debtSnapshot();
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]).toMatchObject({ task_id: 'candidate_validation', value: 8 });
     scheduler.stop();
   });
 

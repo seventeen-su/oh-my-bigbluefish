@@ -158,7 +158,7 @@ describe('③ environment_check：首次建基线不动作 → 无变化不动�
       affected_objects: unknown[];
     };
     expect(onDisk.environment_delta).toEqual(rec!.environment_delta);
-    expect(onDisk.affected_objects).toEqual([]); // 最小实现：无环境声明索引 → 空（记录 delta + 重新验证入队）
+    expect(onDisk.affected_objects).toEqual([]); // R5：诚实空——memory 库无环境声明记录（无声明不臆造受影响对象）
     // 受影响对象重新验证入队（repair 债务；§14.5 局部重验证）
     const debt = scheduler.debtSnapshot();
     const repair = debt.find((d) => d.task_id === 'repair');

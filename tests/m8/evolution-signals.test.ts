@@ -7,7 +7,8 @@
 //   ④ 判定纯函数：确定性（同输入同输出）；corrections 触发 → L1/strength 0.9；无触发不演化；
 //      债务 ≥ hard → 限制非必要演化
 //   ⑤ 债务权重映射：repair+20/candidate+8/memory+2/gc+1；priority = EV/C × debt
-//   ⑥ 生产路径：finalizeTurn 信号 → §10.1 债务入队累计 → debt.json 落盘 → quantum 清偿归零
+//   ⑥ 生产路径：finalizeTurn 信号 → §10.1 债务入队累计 → debt.json 落盘 → quantum 执行
+//      （真实任务清偿归零；R5：旧布局 candidate_validation → Deferred → 债务保留不清零）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
 import { appendFile, mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -276,7 +277,8 @@ describe('⑥ MaintenanceDebt 生产路径（finalizeTurn 信号 → §10.1 入�
     const onDisk = JSON.parse(await readFile(debtFile, 'utf8')) as unknown[];
     expect(onDisk).toEqual(debt);
 
-    // ④ 清偿：quantum 逐个执行 → 任务完成 → 债务归零
+    // ④ 清偿：quantum 逐个执行 → 真实任务（turn-finalize/gc）完成清偿；旧布局 candidate_validation
+    //    → Deferred（R5，评估依据 §13）→ 债务保留不清零（不再空实现假成功清债）
     const ran: string[] = [];
     for (let i = 0; i < 10; i++) {
       const report = await scheduler.requestQuantum();
@@ -284,9 +286,12 @@ describe('⑥ MaintenanceDebt 生产路径（finalizeTurn 信号 → §10.1 入�
       ran.push(...report.ran);
     }
     expect(ran).toContain(`turn-finalize:${SESSION}`); // 会话收尾先执行（ROI 1 > 债务任务）
-    expect(ran).toContain('candidate_validation');
+    expect(ran).toContain('candidate_validation'); // 已尝试执行（Deferred 出队）
     expect(ran).toContain('gc');
-    expect(scheduler.debtSnapshot()).toEqual([]); // 全部完成 → 清偿归零
+    // 测试环境无 versions.git 线快照（旧布局）→ candidate_validation 债务保留（8）；其余真实任务已清偿
+    const remaining = scheduler.debtSnapshot();
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]).toMatchObject({ task_id: 'candidate_validation', value: 8 });
     scheduler.stop();
   });
 

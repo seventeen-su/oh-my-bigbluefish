@@ -6,7 +6,14 @@
 // T8.16 双侧分词（中文分词接入）：memory 表新增 payload_fts 列（JS 侧分词结果）——FTS 虚拟表
 // payload_text 改由 new.payload_fts 同步（触发器无法调用 JS 分词器；ingest/update 在 JS 侧
 // tokenizeForFts 后写入 payload_fts，查询侧同分词再 MATCH——unicode61 中文子串不命中的修复）。
-// layer 2（memory/）：仅 node: 内置与同层模块——本模块无任何 import。
+// R5（Predictive Invalidation 对象定位）：memory 表新增 environment 列——ingest 时写入
+// provenance.environment 的固定字段序 JSON（仅含声明字段；可选键 gpu/cuda 未声明则省略），
+// 供 findAffectedObjects 按 delta 字段做 `"<key>":"<value>"` 子串匹配（LIKE）。选择说明：
+// 与「查询 body JSON 全量扫描」相比，本列提供了可索引/可查询的独立环境声明面（改动最小且
+// 可索引——新库由 DDL 建列、既有库由 backend 构造器 ALTER 补列）；匹配面（backend-retrieval.ts
+// findAffectedObjects）以键值相邻子串匹配，键序无关，仅要求序列化固定字段序（见 environmentJson）。
+// layer 2（memory/）：仅 node: 内置与同层模块——本模块无任何 import（environmentJson 用结构类型
+// 免引入 kernel/schemas 类型，保持纯模块；字段序与 kernel/environment-fingerprint.ts 同源防漂移）。
 /** 建表 SQL：memory / memory_relation / memory_stats / retrieval_episode / staging / checkpoint
  *  / negative_pattern（T8.8 失败样本表）+ memory_fts（fts5 独立表）+ 触发器同步
  * （INSERT 直插、UPDATE/DELETE 按 rowid 删后重插；payload_text = new.payload_fts 分词列）。 */
@@ -16,10 +23,12 @@ export const SCHEMA_SQL = `
     prov_class TEXT NOT NULL, payload TEXT NOT NULL, payload_fts TEXT NOT NULL DEFAULT '',
     value_score REAL NOT NULL,
     utility_counts TEXT NOT NULL, belief_ref TEXT, lineage_ref TEXT,
-    created INTEGER NOT NULL, updated INTEGER NOT NULL, event_id TEXT UNIQUE, body TEXT NOT NULL
+    created INTEGER NOT NULL, updated INTEGER NOT NULL, event_id TEXT UNIQUE,
+    environment TEXT, body TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_memory_scope_kind_lifecycle ON memory(scope, kind, lifecycle);
   CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory(updated);
+  CREATE INDEX IF NOT EXISTS idx_memory_environment ON memory(environment);
   CREATE TABLE IF NOT EXISTS memory_relation (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     type TEXT NOT NULL, UNIQUE(from_id, to_id, type)
@@ -65,6 +74,31 @@ export const SCHEMA_SQL = `
     VALUES (new.rowid, new.id, new.scope, new.kind, new.lifecycle, new.prov_class, new.payload_fts);
   END;
 `;
+
+/** §4.4 Fingerprint 参与环境声明的字段序（与 kernel/environment-fingerprint.ts FINGERPRINT_FIELDS 同序——
+ *  防漂移注释：environmentJson 与 findAffectedObjects 的 `"<key>":"<value>"` 子串匹配仅要求固定字段序，
+ *  不要求键序与匹配面顺序一致（子串匹配与位置无关）。 */
+const ENV_FIELD_ORDER = ['os', 'node', 'dsh_version', 'project', 'gpu', 'cuda'] as const;
+
+/** R5：环境声明 JSON（memory.environment 列）——Fingerprint 固定字段序序列化（仅含声明字段，
+ *  可选键 gpu/cuda 未声明则省略——findAffectedObjects 对 delta.from===undefined 以「未声明该键」匹配）。 */
+export function environmentJson(fp: {
+  os: string;
+  node: string;
+  dsh_version: string;
+  project: string;
+  gpu?: string;
+  cuda?: string;
+}): string {
+  const obj: Record<string, string> = {};
+  for (const f of ENV_FIELD_ORDER) {
+    const v = fp[f];
+    if (v !== undefined) {
+      obj[f] = v;
+    }
+  }
+  return JSON.stringify(obj);
+}
 
 /** FTS5 MATCH 表达式构造：单 token 一律引号化（规避 AND/OR/NOT/NEAR 保留字语法错误）；
  *  含特殊字符（冒号=列过滤语法、括号/星号/^/- 等操作符）→ 整体短语化 + 内部引号加倍转义；

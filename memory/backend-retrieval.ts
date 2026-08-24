@@ -5,6 +5,8 @@
 // 句柄，子类是保持封装的拆分方式，记录在 T3.4 报告）。
 // layer 2（memory/）：仅 node: 内置 + kernel/schemas/（同层契约）+ memory/ 内文件。
 import type { Memory } from '../kernel/schemas/m.js';
+import type { EnvironmentFieldDelta } from '../kernel/schemas/evolution.js';
+import type { ArtifactRef } from '../kernel/schemas/evolution.js';
 import { SqliteMemoryBackend } from './backend.js';
 
 /** retrieval_episode 行（数组列在 DB 中以 JSON 存储，此处为解析后形态，§7.4 Retrieval Episode） */
@@ -40,8 +42,57 @@ interface EpisodeRowRaw {
   created: number;
 }
 
+/** LIKE 模式转义（%/_/反斜杠字面匹配；配合 SQL `ESCAPE '\'` 使用） */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
 /** 记忆后端 + 检索域存储操作（T3.4 检索路由/效用反馈用；其余方法继承 SqliteMemoryBackend） */
 export class RetrievalBackend extends SqliteMemoryBackend {
+  /**
+   * R5：环境声明索引定位受影响对象（Predictive Invalidation §14.5/§15.4）——按指纹 delta 字段
+   * 匹配声明环境的 memory 记录（environment 列，ingest 时写入 provenance.environment 的固定字段序 JSON）。
+   * 匹配语义（诚实）：delta 字段 f 的旧值 = 记录声明值（声明了旧环境的记录在新环境下可能失效）；
+   * delta.from === undefined（可选键新增）→ 匹配「未声明该键」的记录（曾在无该键环境下验证）。
+   * 返回 ArtifactRef[]（id = memory id，kind = 'memory'）；无 delta / 无声明匹配 → 空数组（不臆造）。
+   * 检索消费面：suspicious 降级后 retrieve.ts 的 Memory Value 已按 lifecycle 扣 pollution 降权（§7.4）。
+   */
+  async findAffectedObjects(delta: Record<string, EnvironmentFieldDelta>): Promise<ArtifactRef[]> {
+    const fields = Object.keys(delta);
+    if (fields.length === 0) {
+      return [];
+    }
+    const rows: { id: string }[] = [];
+    for (const f of fields) {
+      const d = delta[f]!;
+      if (d.from === undefined) {
+        // 字段新增（from=无）→ 受影响 = 未声明该键的记录（LIKE 子串匹配不到 `"<key>":`）
+        const pat = `%${escapeLike(`"${f}":`)}%`;
+        rows.push(
+          ...(this.db
+            .prepare(`SELECT id FROM memory WHERE environment IS NOT NULL AND environment NOT LIKE ? ESCAPE '\\'`)
+            .all(pat) as unknown as { id: string }[]),
+        );
+      } else {
+        // 字段从旧值变为新值 → 受影响 = 声明旧值的记录（`"<key>":"<旧值>"` 子串匹配）
+        const pat = `%${escapeLike(`"${f}":"${JSON.stringify(d.from).slice(1, -1)}"`)}%`;
+        rows.push(
+          ...(this.db
+            .prepare(`SELECT id FROM memory WHERE environment LIKE ? ESCAPE '\\'`)
+            .all(pat) as unknown as { id: string }[]),
+        );
+      }
+    }
+    // 去重（同一记录可能命中多个 delta 字段）
+    const seen = new Map<string, ArtifactRef>();
+    for (const r of rows) {
+      if (!seen.has(r.id)) {
+        seen.set(r.id, { id: r.id, kind: 'memory' });
+      }
+    }
+    return [...seen.values()];
+  }
+
   /** getById：按 id 取完整 Memory（relation/expansion 检索需按 id 回捞；未知 id → undefined） */
   async getById(id: string): Promise<Memory | undefined> {
     const row = this.db.prepare('SELECT body FROM memory WHERE id = ?').get(id) as { body: string } | undefined;
