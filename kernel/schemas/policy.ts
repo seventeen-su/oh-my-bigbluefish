@@ -291,6 +291,31 @@ export const DEFAULT_E_PROCESS_POLICY: EProcessPolicy = {
   fallback_to_rule: true,
 };
 
+// ---- R8：集体共享显式开关（架构 §13 共享与集体演化；生产默认不自动发布/吸收） ----
+
+/**
+ * 共享策略（evolve.policy `share` 段）——生产默认**不自动发布/吸收**：
+ * 隐私原则：集体共享仅发布/吸收**机制级** Evolution Object（策略 diff/验证门/bench 元数据/
+ * provenance），绝不发布私人记忆/会话内容；本段仅控制未来自动路径（本次无自动路径），
+ * 显式命令（/evolve share、/evolve absorb <id>）始终可用，不受本段影响。
+ */
+export const SharePolicySchema = z.object({
+  /** 自动发布机制级 Evolution Object（默认 false——生产不自动发布；为未来自动路径预留） */
+  publish_mechanism_objects: z.boolean().default(false),
+  /** 自动发现/吸收外部对象（默认 false——生产不自动吸收；为未来自动路径预留） */
+  auto_discover: z.boolean().default(false),
+  /** 本地 registry 目录（缺省 <evolutionRoot>/registry = workspace/.omb/.evolution/registry；
+   *  相对路径相对演化工作区根解析；绝对路径原样） */
+  registry_dir: z.string().min(1).optional(),
+});
+export type SharePolicy = z.infer<typeof SharePolicySchema>;
+
+/** 共享策略缺省（生产默认不自动发布/吸收——隐私原则；显式命令不受影响） */
+export const DEFAULT_SHARE_POLICY: SharePolicy = {
+  publish_mechanism_objects: false,
+  auto_discover: false,
+};
+
 /**
  * EvolvePolicy：演化规则（架构 §9.5 预算与元演化 + P1c §6.5.1/§6.5.7 数据化判定）——
  *   - Daily Evolution Budget：evolution_cost/day 上限（仅 DSH 运行期间累计）
@@ -319,5 +344,7 @@ export const EvolvePolicySchema = z.object({
   promotion_gate: PromotionGateSchema.optional(),
   /** P7：金丝雀判定主判开关（e-process anytime-valid 主判 / rule 初值规则降级对照；缺省 e-process + fallback） */
   e_process: EProcessPolicySchema.default(DEFAULT_E_PROCESS_POLICY),
+  /** R8：集体共享显式开关（生产默认不自动发布/吸收——隐私原则；显式命令 /evolve share|absorb 始终可用） */
+  share: SharePolicySchema.default(DEFAULT_SHARE_POLICY),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

@@ -86,7 +86,8 @@ describe('① /evolve 命令注册面（设计 §6 命令表）', () => {
     const cmd = captured.find((c) => c.name === 'evolve')!;
     expect(cmd).toBeDefined();
     expect(cmd.description).toContain('演化判定');
-    expect(cmd.input?.hint).toBe('<now>');
+    // R8：/evolve 扩展 share/absorb 子命令（显式集体共享）——hint 同步
+    expect(cmd.input?.hint).toBe('<now|share|absorb <id>>');
     expect(cmd.recordInput).toBe(true);
   });
 

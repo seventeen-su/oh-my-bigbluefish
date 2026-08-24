@@ -4,6 +4,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——
+ *  rollback.test.ts 同款 P7 flake 处置：5s 默认超时放宽至 30s；本文件用例均构建 fixture） */
+const FIXTURE_TIMEOUT = 30000;
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
 import { loadVersion, type VersionLine, type VersionSnapshot } from '../../substrate/snapshot.js';
 import {
   buildLayoutFixture,
@@ -40,7 +45,7 @@ describe('loadVersion 三模式加载（独立临时 fixture）', () => {
     }
   });
 
-  it('三种模式（initial/stable/latest）各自加载：tree_root 存在、git_revision 为 40 位 hex 且可解析到 commit', async () => {
+  fixtureIt('三种模式（initial/stable/latest）各自加载：tree_root 存在、git_revision 为 40 位 hex 且可解析到 commit', async () => {
     fx = buildLayoutFixture();
     const lines: VersionLine[] = ['initial', 'stable', 'latest'];
     for (const line of lines) {
@@ -57,7 +62,7 @@ describe('loadVersion 三模式加载（独立临时 fixture）', () => {
     }
   });
 
-  it('版本内容正确：manifest.json 的 line 字段与模式一致（stable/latest 真实分叉）', async () => {
+  fixtureIt('版本内容正确：manifest.json 的 line 字段与模式一致（stable/latest 真实分叉）', async () => {
     fx = buildLayoutFixture();
     // fixture 布局：stable 分支 = initial 基线（line=initial）；main 已推进（line=latest）
     const cases: Array<[VersionLine, string]> = [
@@ -75,20 +80,20 @@ describe('loadVersion 三模式加载（独立临时 fixture）', () => {
     expect(stable.git_revision).not.toBe(latest.git_revision);
   });
 
-  it('未知模式 fail-loud：loadVersion("gamma") 抛错且消息含合法值', async () => {
+  fixtureIt('未知模式 fail-loud：loadVersion("gamma") 抛错且消息含合法值', async () => {
     fx = buildLayoutFixture();
     await expect(loadVersion('gamma' as VersionLine, layoutFor(fx))).rejects.toThrow(
       /initial \| stable \| latest/,
     );
   });
 
-  it('引用缺失 fail-loud：删掉 refs/heads/stable 后加载 stable 抛错', async () => {
+  fixtureIt('引用缺失 fail-loud：删掉 refs/heads/stable 后加载 stable 抛错', async () => {
     fx = buildLayoutFixture();
     runGit(['update-ref', '-d', 'refs/heads/stable'], { cwd: fx.bare });
     await expect(loadVersion('stable', layoutFor(fx))).rejects.toThrow(/refs\/heads\/stable/);
   });
 
-  it('initial 内容锚定 initial tag：stable 分支推进后 initial 仍读到 initial 基线', async () => {
+  fixtureIt('initial 内容锚定 initial tag：stable 分支推进后 initial 仍读到 initial 基线', async () => {
     fx = buildLayoutFixture();
     // 1. 移除 stable worktree（先还原 ACL 才能删），解除 stable 分支的 checkout 锁
     runIcacls([fx.stable, '/reset', '/T', '/C']);

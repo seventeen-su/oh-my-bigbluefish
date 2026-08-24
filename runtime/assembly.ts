@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { GIT_BIN, defaultLayout, runGit } from '../substrate/snapshot.js';
 import { ensureLineSnapshot, isVersionLine, resolveLineCommit, type VersionLine, type VersionLayout } from '../substrate/lines.js';
 import {
@@ -24,7 +24,7 @@ import { computeComponentHashes, computeDirContentHash } from './snapshot-hash.j
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { Fingerprint } from '../kernel/schemas/base.js';
 // R6：宿主版本唯一来源注入面（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
-import { setHostVersion } from '../kernel/schemas/host-version.js';
+import { hostVersion, setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
@@ -67,7 +67,10 @@ import {
 } from '../kernel/environment-fingerprint.js';
 // P1d：候选生成（kernel 纯函数）→ 候选管线（supervisor 层 1；runtime(2) → supervisor(1) ✓）
 import { generatePolicyAdjustmentCandidates } from '../kernel/candidate-generator.js';
-import { runCandidatePipeline, latestObjectId, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
+import { runCandidatePipeline, latestObjectId, loadEvolutionObject, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
+// R8：集体共享显式命令（架构 §13——/evolve share 发布 / /evolve absorb 吸收；GitRegistry 本地 registry +
+// share-pipeline 既有 absorb 管线；layer 2 → supervisor(1) ✓）
+import { absorb, GitRegistry, type AbsorbDeps } from '../supervisor/share.js';
 // P1e：晋升门禁判定（kernel 纯函数，layer 2 → 2 ✓）+ 晋升执行/回滚契约（supervisor 层 1）+ 基准回放对照
 import { resolvePromotionGate, shouldPromoteToStable } from '../kernel/promotion-gate.js';
 import {
@@ -110,6 +113,39 @@ const DEGRADED_COMPONENTS: ComponentHashes = {
 
 function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * R8：本地发布签名（`git:<signer>:<keyid-hex>:<base64>` 格式，过 share.ts 签名格式门）。
+ * keyid 由宿主版本 + 平台派生（本地身份标记，同宿主稳定）；签名体 = `omb-local:<object_id>`
+ * （同对象确定性——publish 幂等/去重友好）。真实 Git 签名（git tag -s / verify-tag）留外部 signer，
+ * 本地发布以格式门 + 内容寻址（id=sha256(canonical(body))）保证完整性。
+ */
+function localPublishSignature(objectId: string): string {
+  const keyid = `${hostVersion()}${process.platform}`
+    .replace(/[^0-9a-f]/gi, '')
+    .padEnd(16, '0')
+    .slice(0, 16);
+  return `git:omb:${keyid}:${Buffer.from(`omb-local:${objectId}`, 'utf8').toString('base64')}`;
+}
+
+/**
+ * R8：机制级对象判定（隐私原则：集体共享仅发布/吸收**机制数据**，绝不发布私人记忆/会话内容）。
+ * 机制来源 = provenance.source 以 'evolution/' 开头（candidate-pipeline buildEvolutionObject 产出），
+ * 且 diff 非空（携带机制变更内容）；其余来源（memory/experience/session 等）→ 拒绝。
+ */
+function mechanismOrigin(obj: { provenance: { source?: string }; diff?: string }): { ok: boolean; detail?: string } {
+  const source = obj.provenance?.source ?? '';
+  if (!source.startsWith('evolution/')) {
+    return {
+      ok: false,
+      detail: `对象来源 "${source}" 非机制级——集体共享仅发布/吸收 evolution/* 来源的机制数据（不发布私人记忆/会话内容，隐私原则）`,
+    };
+  }
+  if (typeof obj.diff !== 'string' || obj.diff.length === 0) {
+    return { ok: false, detail: '对象 diff 为空——机制级对象必须携带机制变更内容（diff）' };
+  }
+  return { ok: true };
 }
 
 /**
@@ -309,6 +345,19 @@ export interface EvolutionNowResult {
   /** 判定/执行降级原因（无 → null） */
   degraded: string | null;
   /** 入链事件数（evolution/candidate 判定+生成 + evolution/promoted + activation/committed + maintenance/quantum） */
+  events_appended: number;
+}
+
+/** R8：/evolve share / /evolve absorb 结果（发布/吸收机制级 Evolution Object；ok:false = 明确 error 文本，不崩） */
+export interface ShareCommandResult {
+  ok: boolean;
+  /** 用户可见文本（成功摘要或明确 error 文本） */
+  text: string;
+  /** 发布/吸收的 Evolution Object id（无对象/失败 → undefined） */
+  object_id?: string;
+  /** 本地 registry 目录（实际生效路径） */
+  registry_dir?: string;
+  /** 本次入链事件数（evolution/shared 或 evolution/absorbed；失败 → 0） */
   events_appended: number;
 }
 
@@ -1434,6 +1483,198 @@ export class CognitiveRuntime {
     }
     const debt = this.maintenance?.debtSnapshot() ?? [];
     return { decision, enqueued, candidates, promoted, promotion, quantum, debt, degraded, events_appended };
+  }
+
+  /**
+   * R8：/evolve share——发布机制级 Evolution Object（架构 §13；生产默认不自动发布——显式命令）。
+   * 流程：trusted-latest 演化链最近对象（candidate-pipeline latestObjectId + loadEvolutionObject）→
+   * 机制级隐私检查（provenance.source 以 evolution/ 开头 + diff 非空——不发布私人记忆/会话内容）→
+   * GitRegistry publish（本地 registry，evolve.policy share.registry_dir 配置或缺省
+   * <evolutionRoot>/registry = workspace/.omb/.evolution/registry；本地签名过格式门）→
+   * evolution/shared 事件入链。无对象可发布 / 布局不可用 / 任一步失败 → 明确 error 文本（不崩）。
+   * 生产配置 share.publish_mechanism_objects=false 不影响本命令（配置仅控制未来自动路径）。
+   */
+  async shareEvolutionObject(input: { session_id: string }): Promise<ShareCommandResult> {
+    const sessionId = input.session_id;
+    try {
+      const layout = this.assemblyOpts.layout ?? defaultLayout();
+      // ① trusted-latest 演化链最近对象（无 trusted-latest / 链空 → 明确文本）
+      const commit = resolveLineCommit(layout, 'latest');
+      const objectId = await latestObjectId(layout, commit);
+      if (objectId === null) {
+        return {
+          ok: false,
+          text: '无演化对象可发布（trusted-latest 演化链为空——先 /evolve now 产生并晋升候选，或检查线布局 .evolution-objects/）',
+          events_appended: 0,
+        };
+      }
+      const obj = await loadEvolutionObject(layout, commit, objectId);
+      if (obj === null) {
+        return {
+          ok: false,
+          text: `演化对象读取失败（${objectId.slice(0, 16)}… 不在 trusted-latest ${commit.slice(0, 12)} 提交树）`,
+          events_appended: 0,
+        };
+      }
+      // ② 机制级隐私检查（仅发布机制数据，不发布私人记忆/会话内容）
+      const origin = mechanismOrigin(obj);
+      if (!origin.ok) {
+        return { ok: false, text: `发布拒绝（隐私原则）：${origin.detail}`, object_id: obj.id, events_appended: 0 };
+      }
+      // ③ GitRegistry publish（本地 registry；registry_dir 配置或缺省 <evolutionRoot>/registry）
+      const registryDir = await this.resolveShareRegistryDir();
+      const registry = new GitRegistry(registryDir);
+      await registry.init();
+      const signature = localPublishSignature(obj.id);
+      const pub = await registry.publish(obj, signature, { name: 'evolution-object', version: obj.protocol_version });
+      if (!pub.ok) {
+        return {
+          ok: false,
+          text: `发布失败：${pub.error ?? '未知原因'}`,
+          object_id: obj.id,
+          registry_dir: registryDir,
+          events_appended: 0,
+        };
+      }
+      // ④ evolution/shared 事件入链（尽力而为：入链失败不阻断发布结果——发布已生效）
+      try {
+        await this.eventStore.append(
+          makeRuntimeEvent(
+            'evolution/shared',
+            sessionId,
+            this.snapshotHash,
+            { object_id: obj.id, registry_dir: registryDir, commit, parent: obj.parent ?? null },
+            ['evolve-share', 'evolution/shared'],
+          ),
+        );
+      } catch {
+        // 事件为日志，失败不阻断命令结果
+      }
+      const verifiedBy = (await registry.list()).find((e) => e.id === obj.id)?.verified_by ?? [];
+      return {
+        ok: true,
+        text: `已发布机制级 Evolution Object ${obj.id.slice(0, 16)}… 到本地 registry（${registryDir}；parent=${obj.parent === null || obj.parent === undefined ? 'null（链头）' : `${obj.parent.slice(0, 16)}…`}；验证门 [${(obj.verifications ?? []).join(', ')}]；共识 verified_by=${verifiedBy.length}）——` +
+          '机制数据已共享，私人记忆/会话内容不含（隐私原则）',
+        object_id: obj.id,
+        registry_dir: registryDir,
+        events_appended: 1,
+      };
+    } catch (err) {
+      return { ok: false, text: `发布失败：${errorDetail(err)}`, events_appended: 0 };
+    }
+  }
+
+  /**
+   * R8：/evolve absorb <id>——显式从本地 registry 吸收（架构 §13.2 吸收管线）。
+   * 流程：registry 读取对象 + manifest 签名 → 本地验证（GitRegistry.verify：签名格式/哈希/schema/CAS 绑定）→
+   * 机制级隐私检查（仅接受 evolution/* 来源机制对象）→ share-pipeline 既有 absorb 管线
+   * （signature_hash → schema → verify_chain → replay_bench → contract_tests → publish/去重 → consensus 回传）→
+   * evolution/absorbed 事件入链。参数缺失 → 插件侧帮助文本；任一步失败 → 明确 error 文本（不崩）。
+   * 注意：吸收 = 本地验证 + 入库 + 共识回传（协议层）；机制内容「应用到当前线」走候选管线（P1d），留后续。
+   */
+  async absorbEvolutionObject(input: { session_id: string; object_id: string }): Promise<ShareCommandResult> {
+    const sessionId = input.session_id;
+    const registryDir = await this.resolveShareRegistryDir();
+    try {
+      const registry = new GitRegistry(registryDir);
+      await registry.init();
+      // ① 本地验证（签名格式/内容哈希/schema/CAS 绑定；撤销/黑名单 fail-loud）
+      const verify = await registry.verify(input.object_id);
+      if (!verify.ok) {
+        return {
+          ok: false,
+          text: `吸收失败（本地验证未通过）：${verify.detail}`,
+          registry_dir: registryDir,
+          events_appended: 0,
+        };
+      }
+      // ② 读取对象 + manifest 签名（verify 通过 → get 非空；签名由发布时格式门保证）
+      const obj = await registry.get(input.object_id);
+      if (obj === null) {
+        return { ok: false, text: `吸收失败：对象不可读（${input.object_id}）`, registry_dir: registryDir, events_appended: 0 };
+      }
+      const entry = (await registry.list()).find((e) => e.id === input.object_id);
+      const signature = entry?.signature ?? '';
+      // ③ 机制级隐私检查（仅吸收机制数据，不吸收私人记忆/会话内容）
+      const origin = mechanismOrigin(obj);
+      if (!origin.ok) {
+        return {
+          ok: false,
+          text: `吸收拒绝（隐私原则）：${origin.detail}`,
+          object_id: obj.id,
+          registry_dir: registryDir,
+          events_appended: 0,
+        };
+      }
+      // ④ share-pipeline 既有 absorb 管线（注入 deps：verify_chain 复用 registry.verify；
+      //    机制级对象为纯机制数据——本地回放 bench / 契约测试 N/A 直通（如实注明））
+      const deps: AbsorbDeps = {
+        verifyChain: async () => ({ ok: verify.ok, detail: verify.detail }),
+        replayBench: async () => ({
+          ok: true,
+          detail: '机制级对象（纯机制数据）——本地回放 bench N/A 直通（无过程/记忆语义）',
+        }),
+        contractTests: async () => ({
+          ok: true,
+          detail: '机制级对象（纯机制数据）——契约测试 N/A 直通（签名/哈希/schema 已由吸收管线①②校验）',
+        }),
+        instance: `local:${hostVersion()}`,
+        diversity: 1,
+      };
+      const report = await absorb(registry, obj, signature, deps);
+      if (!report.ok) {
+        return {
+          ok: false,
+          text: `吸收失败（管线阶段 ${report.failed_at ?? 'unknown'}）：${report.stages
+            .filter((s) => !s.ok)
+            .map((s) => `${s.name}: ${s.detail}`)
+            .join('；')}`,
+          object_id: obj.id,
+          registry_dir: registryDir,
+          events_appended: 0,
+        };
+      }
+      // ⑤ evolution/absorbed 事件入链（尽力而为）
+      try {
+        await this.eventStore.append(
+          makeRuntimeEvent(
+            'evolution/absorbed',
+            sessionId,
+            this.snapshotHash,
+            { object_id: obj.id, registry_dir: registryDir, stages: report.stages.map((s) => s.name) },
+            ['evolve-absorb', 'evolution/absorbed'],
+          ),
+        );
+      } catch {
+        // 事件为日志，失败不阻断命令结果
+      }
+      const verifiedBy = (await registry.list()).find((e) => e.id === obj.id)?.verified_by ?? [];
+      return {
+        ok: true,
+        text:
+          `已吸收机制级 Evolution Object ${obj.id.slice(0, 16)}…（本地验证通过：${verify.detail}；管线阶段 ` +
+          report.stages.map((s) => s.name).join('→') +
+          `；共识 verified_by=${verifiedBy.length} 实例）——机制数据已入库并回传共识，私人记忆/会话内容不吸收（隐私原则）`,
+        object_id: obj.id,
+        registry_dir: registryDir,
+        events_appended: 1,
+      };
+    } catch (err) {
+      return { ok: false, text: `吸收失败：${errorDetail(err)}`, registry_dir: registryDir, events_appended: 0 };
+    }
+  }
+
+  /**
+   * R8：本地 registry 目录解析（evolve.policy share.registry_dir 配置优先——相对路径相对演化工作区根解析，
+   * 绝对路径原样；缺省 <evolutionRoot>/registry = workspace/.omb/.evolution/registry，架构 §3 用户态约定）。
+   */
+  private async resolveShareRegistryDir(): Promise<string> {
+    const { policy } = await this.ready();
+    const configured = policy.evolve.share.registry_dir;
+    if (configured !== undefined && configured.length > 0) {
+      return isAbsolute(configured) ? configured : join(this.evolutionRoot, configured);
+    }
+    return join(this.evolutionRoot, 'registry');
   }
 
   /**

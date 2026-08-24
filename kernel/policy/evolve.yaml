@@ -41,6 +41,18 @@ promotion_gate:
   max_shadow_failure_rate: 0.1
   cost_degradation_tolerance: 0.1
 
+# R8 集体共享显式开关（架构 §13 共享与集体演化——生产默认不自动发布/吸收）：
+#   - publish_mechanism_objects：自动发布机制级 Evolution Object（默认 false——生产不自动发布；
+#     隐私原则：仅发布机制数据（策略 diff/验证门/bench 元数据/provenance），绝不发布私人记忆/会话内容；
+#     本次无自动发布路径——本配置为未来自动路径预留；显式命令 /evolve share 始终可用，不受本配置影响）
+#   - auto_discover：自动发现/吸收外部对象（默认 false——生产不自动吸收；为未来自动路径预留；
+#     显式命令 /evolve absorb <id> 始终可用）
+#   - registry_dir：本地 registry 目录（缺省 <evolutionRoot>/registry = workspace/.omb/.evolution/registry；
+#     相对路径相对演化工作区根解析）
+share:
+  publish_mechanism_objects: false
+  auto_discover: false
+
 debt_thresholds:
   soft: 10        # 对齐 MaintenanceScheduler DEFAULT_SOFT_LIMIT（债务 ≥ → quantum 频率提升）
   hard: 50        # 对齐 MaintenanceScheduler DEFAULT_HARD_LIMIT（债务 ≥ → 非必要演化受限）

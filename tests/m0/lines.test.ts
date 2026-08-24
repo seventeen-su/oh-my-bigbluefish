@@ -10,6 +10,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——
+ *  rollback.test.ts 同款 P7 flake 处置：5s 默认超时放宽至 30s；本文件用例均构建 fixture） */
+const FIXTURE_TIMEOUT = 30000;
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
 import { ensureThreeLineLayout } from '../../substrate/bootstrap.js';
 import {
   LINE_POINTER_REFS,
@@ -78,7 +83,7 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     }
   });
 
-  it('LINE_POINTER_REFS：initial=tag、stable=stable、latest=trusted-latest（D1 裁决）', () => {
+  fixtureIt('LINE_POINTER_REFS：initial=tag、stable=stable、latest=trusted-latest（D1 裁决）', () => {
     expect(LINE_POINTER_REFS).toEqual({
       initial: 'refs/tags/initial',
       stable: 'refs/heads/stable',
@@ -86,7 +91,7 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     });
   });
 
-  it('三线各自解析：initial=tag、stable=stable 分支、latest=trusted-latest 分支（与真实引用一致）', () => {
+  fixtureIt('三线各自解析：initial=tag、stable=stable 分支、latest=trusted-latest 分支（与真实引用一致）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     // fixture：stable 分支 = initial 基线；trusted-latest = latest 基线
@@ -102,7 +107,7 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     );
   });
 
-  it('latest 缺失 fail-loud：删除 trusted-latest ref（main 仍存在）→ 抛错（R1 不再回退 main，消息含 ref 与重建指引）', () => {
+  fixtureIt('latest 缺失 fail-loud：删除 trusted-latest ref（main 仍存在）→ 抛错（R1 不再回退 main，消息含 ref 与重建指引）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/heads/trusted-latest'], { cwd: fx.bare });
@@ -111,7 +116,7 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     expect(() => resolveLineCommit(lay, 'latest')).toThrow(/init-three-line|自动重建/);
   });
 
-  it('latest 与 main 均缺失：仍抛错（消息含 refs/heads/trusted-latest）', () => {
+  fixtureIt('latest 与 main 均缺失：仍抛错（消息含 refs/heads/trusted-latest）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/heads/trusted-latest'], { cwd: fx.bare });
@@ -119,14 +124,14 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     expect(() => resolveLineCommit(lay, 'latest')).toThrow(/refs\/heads\/trusted-latest/);
   });
 
-  it('initial fail-loud：删除 initial tag → 抛错（消息含 refs/tags/initial；tag 无回退）', () => {
+  fixtureIt('initial fail-loud：删除 initial tag → 抛错（消息含 refs/tags/initial；tag 无回退）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/tags/initial'], { cwd: fx.bare });
     expect(() => resolveLineCommit(lay, 'initial')).toThrow(/refs\/tags\/initial/);
   });
 
-  it('未知版本线 fail-loud：抛错且消息含合法值', () => {
+  fixtureIt('未知版本线 fail-loud：抛错且消息含合法值', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     expect(() => resolveLineCommit(lay, 'gamma' as VersionLine)).toThrow(/initial \| stable \| latest/);
@@ -142,7 +147,9 @@ describe('materializeLineSnapshot：物化展开（只读 git 枚举逐文件写
     }
   });
 
-  it('展开内容与线提交一致：manifest/README + kernel/policy + kernel/processes 齐全，字节保真（物化文件 === git blob）', () => {
+  // R8：全量并行下 buildLayoutFixture（git+icacls）+ 逐文件物化超过 5s 默认超时——fixtureIt 统一放宽 30s
+  //（rollback.test.ts 同款 P7 flake 处置；套件扩容（R8 share-command 新增 fixture 测试）加剧并行 git 竞争，非断言失败）
+  fixtureIt('展开内容与线提交一致：manifest/README + kernel/policy + kernel/processes 齐全，字节保真（物化文件 === git blob）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const dir = materializeLineSnapshot(lay, 'stable', fx.initialHash);
@@ -174,7 +181,7 @@ describe('materializeLineSnapshot：物化展开（只读 git 枚举逐文件写
     expect(manifestLine(dir)).toBe('initial');
   });
 
-  it('幂等：同 commit 二次调用返回同一路径（目录即内容，复用不重写）', () => {
+  fixtureIt('幂等：同 commit 二次调用返回同一路径（目录即内容，复用不重写）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const dir1 = materializeLineSnapshot(lay, 'stable', fx.initialHash);
@@ -183,7 +190,7 @@ describe('materializeLineSnapshot：物化展开（只读 git 枚举逐文件写
     expect(fs.existsSync(dir1)).toBe(true);
   });
 
-  it('不同 commit → 不同目录（stable=initial 基线 vs latest=latest 基线，内容按线分化）', () => {
+  fixtureIt('不同 commit → 不同目录（stable=initial 基线 vs latest=latest 基线，内容按线分化）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const stableDir = materializeLineSnapshot(lay, 'stable', fx.initialHash);
@@ -206,7 +213,7 @@ describe('指针：lines/<line>/pointer（原子写 tmp+rename）', () => {
     }
   });
 
-  it('ensureLineSnapshot：解析 → 物化 → 写指针；currentLineCommit 读回；指针文件内容 = commit', () => {
+  fixtureIt('ensureLineSnapshot：解析 → 物化 → 写指针；currentLineCommit 读回；指针文件内容 = commit', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     // 初始无指针
@@ -221,7 +228,7 @@ describe('指针：lines/<line>/pointer（原子写 tmp+rename）', () => {
     );
   });
 
-  it('switchLinePointer 原子生效：切换到另一 commit → currentLineCommit 读回新值；ensureLineSnapshot 按线重新对账指针', () => {
+  fixtureIt('switchLinePointer 原子生效：切换到另一 commit → currentLineCommit 读回新值；ensureLineSnapshot 按线重新对账指针', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     ensureLineSnapshot(lay, 'stable');
@@ -238,7 +245,7 @@ describe('指针：lines/<line>/pointer（原子写 tmp+rename）', () => {
     expect(currentLineCommit(lay, 'stable')).toBe(fx.initialHash);
   });
 
-  it('各线指针独立：initial/stable/latest 各自指向本线 commit', () => {
+  fixtureIt('各线指针独立：initial/stable/latest 各自指向本线 commit', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     ensureLineSnapshot(lay, 'initial');
@@ -267,7 +274,7 @@ describe('种子升级（P1a）：fixture 与 ensureThreeLineLayout 等价', () 
     }
   });
 
-  it('fixture：trusted-latest 分支存在且指向 latest 基线提交（D1 裁决初始值）', () => {
+  fixtureIt('fixture：trusted-latest 分支存在且指向 latest 基线提交（D1 裁决初始值）', () => {
     fx = buildLayoutFixture();
     const refs = runGit(['for-each-ref', '--format=%(refname)'], { cwd: fx.bare });
     expect(refs).toContain('refs/heads/trusted-latest');
@@ -276,7 +283,7 @@ describe('种子升级（P1a）：fixture 与 ensureThreeLineLayout 等价', () 
     );
   });
 
-  it('fixture：initial/latest 基线提交树含 kernel/policy + kernel/processes（出厂基线 = repo 快照）', () => {
+  fixtureIt('fixture：initial/latest 基线提交树含 kernel/policy + kernel/processes（出厂基线 = repo 快照）', () => {
     fx = buildLayoutFixture();
     for (const commit of [fx.initialHash, fx.latestHash]) {
       const tree = runGit(['ls-tree', '-r', '--name-only', commit], { cwd: fx.bare });
@@ -292,7 +299,7 @@ describe('种子升级（P1a）：fixture 与 ensureThreeLineLayout 等价', () 
     }
   });
 
-  it('ensureThreeLineLayout 初始化：trusted-latest 分支 + 基线提交含 kernel 对象 + worktree 含 policy/processes（与 fixture 等价）', () => {
+  fixtureIt('ensureThreeLineLayout 初始化：trusted-latest 分支 + 基线提交含 kernel 对象 + worktree 含 policy/processes（与 fixture 等价）', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-lines-bootstrap-'));
     const layout: VersionLayout = {
       bareRepo: path.join(root, 'versions.git'),
@@ -339,7 +346,7 @@ describe('装配注入：createCognitiveRuntime 按线加载（P1a）', () => {
     return tmpRoot;
   }
 
-  it('线快照含 kernel/policy + kernel/processes → policyDir/processesDir 注入线快照路径，lineSnapshot 就绪', async () => {
+  fixtureIt('线快照含 kernel/policy + kernel/processes → policyDir/processesDir 注入线快照路径，lineSnapshot 就绪', async () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const runtime = createCognitiveRuntime({ root: makeRoot(), line: 'stable', layout: lay });
@@ -360,7 +367,7 @@ describe('装配注入：createCognitiveRuntime 按线加载（P1a）', () => {
     expect(policy.governor.rules.length).toBeGreaterThan(0);
   });
 
-  it('lines 不可用（stable 引用缺失）→ 回退仓库默认目录 + lineDegraded 记录（装配不崩）', async () => {
+  fixtureIt('lines 不可用（stable 引用缺失）→ 回退仓库默认目录 + lineDegraded 记录（装配不崩）', async () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/heads/stable'], { cwd: fx.bare });
@@ -377,7 +384,7 @@ describe('装配注入：createCognitiveRuntime 按线加载（P1a）', () => {
     expect(policy.budget).toBeDefined();
   });
 
-  it('线快照缺少 kernel/policy（旧布局种子）→ 回退仓库默认 + 降级原因指向缺失目录（不崩）', async () => {
+  fixtureIt('线快照缺少 kernel/policy（旧布局种子）→ 回退仓库默认 + 降级原因指向缺失目录（不崩）', async () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const dir = materializeLineSnapshot(lay, 'stable', fx.initialHash);
@@ -392,7 +399,7 @@ describe('装配注入：createCognitiveRuntime 按线加载（P1a）', () => {
     expect(runtime.processesDir).toBe(REPO_PROCESSES_DIR);
   });
 
-  it('显式 policyDir/processesDir → 显式目录优先，不走按线加载（测试/兼容注入）', async () => {
+  fixtureIt('显式 policyDir/processesDir → 显式目录优先，不走按线加载（测试/兼容注入）', async () => {
     fx = buildLayoutFixture();
     const customPolicy = path.join(fx.root, 'custom-policy');
     const customProcesses = path.join(fx.root, 'custom-processes');
@@ -411,7 +418,7 @@ describe('装配注入：createCognitiveRuntime 按线加载（P1a）', () => {
     expect(runtime.processesDir).toBe(customProcesses);
   });
 
-  it('非法 line 配置 → 回退 stable（守卫式接入）', async () => {
+  fixtureIt('非法 line 配置 → 回退 stable（守卫式接入）', async () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     const runtime = createCognitiveRuntime({ root: makeRoot(), line: 'gamma' as VersionLine, layout: lay });

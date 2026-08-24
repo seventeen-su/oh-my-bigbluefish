@@ -176,7 +176,21 @@ export interface CognitiveRuntimeLike {
   }>;
   /** P2：kern_status 数据源——认知运行时状态摘要（版本线/快照/lineSnapshot/债务/信号数/组件健康；纯读取） */
   status?(): Promise<KernStatusSummary>;
+  /** R8：/evolve share——发布机制级 Evolution Object（trusted-latest 演化链头 → GitRegistry 本地 registry；
+   *  生产默认不自动发布（隐私原则），显式命令始终可用；无对象/失败 → ok:false + 明确文本，不崩） */
+  shareEvolutionObject?(input: { session_id: string }): Promise<ShareCommandResultLike>;
+  /** R8：/evolve absorb <id>——显式从本地 registry 吸收（本地验证 → share-pipeline absorb 管线 → 共识回传） */
+  absorbEvolutionObject?(input: { session_id: string; object_id: string }): Promise<ShareCommandResultLike>;
   close(): Promise<void>;
+}
+
+/** R8：共享命令结果最小结构面（/evolve share | absorb；ok:false = 明确 error 文本） */
+export interface ShareCommandResultLike {
+  ok: boolean;
+  text: string;
+  object_id?: string;
+  registry_dir?: string;
+  events_appended: number;
 }
 
 /** DSH assembleContextFor 的结构最小面（真实类型见 @deepseek-ai/dsh-system-prompt AssembleContext：{ agent, scope, signal }） */
@@ -858,22 +872,67 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     },
   });
 
-  // P1c：/evolve 命令（设计 §6 命令表）——立即执行一次演化判定与维护量子。
-  // 语法：/evolve now（或空参数）；其余参数 → 明确 error 文本（不崩）。
-  // 行为：读 signals → evolve.policy 判定（数据化，纯函数）→ 应演化则入队 candidate_validation（债务入账）
+  // P1c：/evolve 命令（设计 §6 命令表）——立即执行一次演化判定与维护量子 + R8 显式集体共享。
+  // 语法：/evolve now（或空参数）→ 演化判定与维护量子；/evolve share → 发布机制级 Evolution Object
+  //      （trusted-latest 演化链头 → 本地 registry，隐私原则：仅机制数据，不发布私人记忆/会话内容）；
+  //      /evolve absorb <id> → 显式吸收（本地验证 schema/签名 → share-pipeline absorb 管线 → 共识回传）；
+  //      其余参数 → 明确 error 文本（不崩）。
+  // 行为（now）：读 signals → evolve.policy 判定（数据化，纯函数）→ 应演化则入队 candidate_validation（债务入账）
   //       + evolution/candidate 事件入链 → 执行一次维护量子 → maintenance/quantum 事件入链 →
   //       返回摘要（判定结果/入队任务/quantum 执行/debt 快照）。
   // 守卫：认知运行时未装配 → error 文本；任一步失败 → error 文本（不崩）。
+  // R8 语义：生产默认（evolve.policy share.publish_mechanism_objects=false/auto_discover=false）不影响
+  // 显式命令——配置仅控制未来自动路径。
   ctx.commands?.register?.({
     name: 'evolve',
-    description: '立即执行一次演化判定与维护量子（读 signals → evolve.policy 判定 → 入队/执行）',
-    input: { hint: '<now>' },
+    description: '演化判定与维护量子（now）；显式集体共享（share 发布机制级对象 / absorb <id> 吸收）',
+    input: { hint: '<now|share|absorb <id>>' },
     recordInput: true,
     handler: async (invocation) => {
       try {
         const raw = (invocation.rawInput ?? '').trim();
+        // R8：/evolve share——发布机制级 Evolution Object（显式命令始终可用，配置不阻塞）
+        if (raw === 'share' || raw.startsWith('share ')) {
+          if (raw !== 'share') {
+            return { kind: 'error', text: `evolve share 不支持子参数："${raw}"（语法：/evolve share）` };
+          }
+          const runtime = cognitive;
+          if (runtime === undefined) {
+            return { kind: 'error', text: '认知运行时未装配——/evolve share 不可用' };
+          }
+          if (typeof runtime.shareEvolutionObject !== 'function') {
+            return { kind: 'error', text: '运行时未实现共享发布（shareEvolutionObject 缺失）' };
+          }
+          // R2 boot gate：恢复完成前认知不进入服务
+          if (!(await cognitiveServiceable())) {
+            return { kind: 'error', text: '启动恢复未完成/失败——认知运行时降级（仅命令模式），/evolve share 不可用' };
+          }
+          const sessionId = (invocation.agent.session as { id?: string } | undefined)?.id ?? 'anon';
+          const r = await runtime.shareEvolutionObject({ session_id: sessionId });
+          return r.ok ? { kind: 'success', text: r.text } : { kind: 'error', text: r.text };
+        }
+        // R8：/evolve absorb <id>——显式吸收（参数缺失 → 帮助文本）
+        if (raw === 'absorb' || raw.startsWith('absorb ')) {
+          const id = raw === 'absorb' ? '' : raw.slice('absorb '.length).trim();
+          if (id.length === 0) {
+            return { kind: 'error', text: 'evolve absorb 需要对象 id（语法：/evolve absorb <id>；id 可从 registry manifest 或 /evolve share 输出获取）' };
+          }
+          const runtime = cognitive;
+          if (runtime === undefined) {
+            return { kind: 'error', text: '认知运行时未装配——/evolve absorb 不可用' };
+          }
+          if (typeof runtime.absorbEvolutionObject !== 'function') {
+            return { kind: 'error', text: '运行时未实现共享吸收（absorbEvolutionObject 缺失）' };
+          }
+          if (!(await cognitiveServiceable())) {
+            return { kind: 'error', text: '启动恢复未完成/失败——认知运行时降级（仅命令模式），/evolve absorb 不可用' };
+          }
+          const sessionId = (invocation.agent.session as { id?: string } | undefined)?.id ?? 'anon';
+          const r = await runtime.absorbEvolutionObject({ session_id: sessionId, object_id: id });
+          return r.ok ? { kind: 'success', text: r.text } : { kind: 'error', text: r.text };
+        }
         if (raw !== '' && raw !== 'now') {
-          return { kind: 'error', text: `evolve 命令参数非法："${raw}"（支持空或 now）` };
+          return { kind: 'error', text: `evolve 命令参数非法："${raw}"（支持空、now、share、absorb <id>）` };
         }
         const runtime = cognitive;
         if (runtime === undefined) {

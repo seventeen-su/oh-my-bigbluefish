@@ -14,6 +14,7 @@ import {
   ContextPolicySchema,
   DEFAULT_CANDIDATE_GATE,
   DEFAULT_E_PROCESS_POLICY,
+  DEFAULT_SHARE_POLICY,
   EvolvePolicySchema,
   GovernorPolicySchema,
   ProcessDefSchema,
@@ -40,6 +41,8 @@ export {
   CandidateGateSchema,
   DEFAULT_E_PROCESS_POLICY,
   EProcessPolicySchema,
+  DEFAULT_SHARE_POLICY,
+  SharePolicySchema,
   DEFAULT_GENERATION_BUDGET,
   GenerationBudgetSchema,
   EvolvePolicySchema,
@@ -65,6 +68,7 @@ export {
   type ObjectLayer,
   type OperatorDef,
   type ProcessDef,
+  type SharePolicy,
   type SignalTrigger,
 } from './schemas/policy.js';
 
@@ -85,6 +89,7 @@ const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
   debt_thresholds: { soft: 10, hard: 50, critical: 100 },
   candidate_gate: { ...DEFAULT_CANDIDATE_GATE },
   e_process: { ...DEFAULT_E_PROCESS_POLICY },
+  share: { ...DEFAULT_SHARE_POLICY },
 };
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */

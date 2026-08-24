@@ -669,6 +669,28 @@ export async function latestObjectId(layout: VersionLayout, commit: string): Pro
   return head?.id ?? null;
 }
 
+/**
+ * R8：读取指定提交内 `.evolution-objects/<hex>.json` 的 Evolution Object（不存在/损坏/ID 不匹配 → null）。
+ * /evolve share（发布机制级对象：trusted-latest 演化链头 → 本地 registry）复用；与 latestObjectId 配对——
+ * 先取链头 id 再读对象内容。CAS 语义：文件内容 id 必须等于请求 id（防 swap 篡改）。
+ */
+export async function loadEvolutionObject(
+  layout: VersionLayout,
+  commit: string,
+  id: string,
+): Promise<EvolutionObject | null> {
+  const raw = gitShow(layout, commit, `.evolution-objects/${candidateDirName(id)}.json`);
+  if (raw === null) {
+    return null;
+  }
+  try {
+    const obj = EvolutionObjectSchema.parse(JSON.parse(raw));
+    return obj.id === id ? obj : null;
+  } catch {
+    return null; // 损坏对象不阻断（fail-loud 留给消费方）
+  }
+}
+
 /** Evolution Object 构造（M4：id = sha256(canonical(除 id 外全字段))；immutable） */
 async function buildEvolutionObject(
   draft: CandidateDraft,
