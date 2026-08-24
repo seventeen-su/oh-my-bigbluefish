@@ -109,11 +109,14 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     const { ctx, bus, contexts } = makeFakeCtx({ runtime });
     apply(ctx, { bootstrap: false });
 
-    // ① 会话事实入链：turn/start + 用户消息（goal 经 user/message 映射为 session/start + claim/update）
-    bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1000));
-    bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
+    // ① 会话事实入链：用户消息 + turn/start（S8 适配：user/message 先于 turn/start——事件驱动预热
+    //   （turn/start → prepareTurn）用最近已观察 goal，首拍投影即含本 turn 目标；宿主 canonical 顺序为
+    //   turn/start → assemble → step() 内 append user/message，首拍 goal 为上一 turn 最近指令（诚实边界，
+    //   见 preheat-turnstart.test.ts ⑦ goal 收敛）；goal 经 user/message 映射为 session/start + claim/update）
+    bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1000));
+    bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1001));
 
-    // ② context 注入（prepareTurn）：provider 首次求值返回空串（异步预热），等待 context/injected 入链
+    // ② context 注入（prepareTurn）：provider 首次求值返回空串（turn/start 预热异步进行中），等待 context/injected 入链
     const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
     expect(provider(assembleCtx([userMessage('msg-1', GOAL)]))).toBe('');
     await vi.waitFor(

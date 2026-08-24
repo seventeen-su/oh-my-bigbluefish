@@ -647,66 +647,91 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   };
 
+  // S8：投影缓存/防重入/prepare 链状态（context 求值 kick 与 turn/start 预热共用——同一投影管线）。
+  const projectionTexts = new Map<string, string>();
+  const preparing = new Set<string>();
+  // S8：投影管线激活标志——systemPrompt.context 注册成功且认知已装配时，turn/start 预热才触发；
+  // 未激活（降级：无 systemPrompt/无认知）→ 不预热（投影缓存无人消费，降级路径行为不变）。
+  const projectionActive = systemPrompt?.context !== undefined && cognitive !== undefined;
+
+  /**
+   * S8：投影预热链（context 求值 kick 与 turn/start 事件预热共用）。
+   * 一拍时序（下一步说明.md 十五节）：DSH systemPrompt.context 为同步求值、prepareTurn 异步 →
+   * 首次 context 请求返回空串、下次才用缓存投影（宿主 API 约束折中）。S8 改进：事件驱动预热——
+   * DSH 事件流顺序 turn/start → context 求值 → 模型（宿主 agent-loop 实测：turn/start 先于
+   * systemPrompt.assemble），session/event 的 turn/start 处理器（事件回调为异步面，不阻塞 DSH
+   * 事件派发）提前触发 prepareTurn → context 同步求值时投影通常已就绪，首拍命中率提升；仍可能
+   * 未完成（boot pending/检索耗时）→ context 求值返回空串/上次投影（既有缓存兜底，宿主限制文档化）。
+   * 防重入：preparing set（turn/start 预热与 context 求值共享——并发只跑一次 prepare）。
+   * 守卫：R2 boot gate 含于链内（等待 bootReady；boot 失败 → 本轮无投影）。
+   * goal 边界（诚实）：宿主在 context 求值后才将 user/message 入链（agent-loop step() 内 append），
+   * turn/start 时最近已观察 goal = 上一 turn 的最近人类指令（首 turn 空）——首拍投影以最近已知 goal
+   * 为准；当前指令的投影在 goal 可观察后的下一次 context 求值收敛（既有「每求值即 kick」语义保留）。
+   */
+  const prepareForTurn = (sessionId: string, events?: ReadonlyArray<{ type?: string; data?: unknown }>): void => {
+    const runtime = cognitive;
+    if (runtime === undefined) {
+      return; // 防御：注册时已守卫运行时存在；并发装配变化时静默降级
+    }
+    if (preparing.has(sessionId)) {
+      return; // 防重入：同一会话的并发预热/求值只跑一次 prepare
+    }
+    preparing.add(sessionId);
+    // goal 来源：插件自身会话追踪（session/event 已观察到的最近人类指令）优先，事件数组兜底
+    const goal = traces.get(sessionId)?.lastGoal ?? lastUserMessageText(events);
+    const request = buildRequestFromSession(sessionId, goal);
+    void (async () => {
+      // R2 boot gate：恢复完成前认知不进入服务——等待 bootReady；boot 失败 → 本轮无投影（命令仍可用）
+      if (!(await cognitiveServiceable())) {
+        return;
+      }
+      // 请求间隙维护小量子（生产装配）：下一请求开始前执行 1 个待维护任务
+      //（turn 收尾入队 → 本 turn 结束 → 下 turn 准备前按债务/优先级执行；无调度器 → 跳过）
+      const m = cognitive?.maintenance;
+      if (m !== undefined && m !== null) {
+        void m.requestQuantum().catch((err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
+        });
+      }
+      // T8.26.5 惰性收尾（无 flush 触发时的退化路径）：先收尾上一 turn，再准备本 turn
+      if (pendingFinalize.has(sessionId)) {
+        await finalizePendingTurn(sessionId, goal);
+        recordDegradation('finalize/lazy', `turn 收尾经 prepareTurn 惰性路径（无 flush 触发）——session ${sessionId}`);
+      }
+      const result = await runtime.prepareTurn(request, {
+        inject: (projection) => {
+          projectionTexts.set(sessionId, projectionToText(projection));
+        },
+      });
+      preparedTurns.set(sessionId, { decision: result.decision, working_state: result.working_state });
+      projectionTexts.set(sessionId, projectionToText(result.projection));
+    })().catch((err) => {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('context-provider', `prepareTurn 失败（${detail}）——本轮无投影注入`);
+    }).finally(() => {
+      preparing.delete(sessionId);
+    });
+  };
+
   // T8.26.3：systemPrompt.context 钩子——按请求求值 → prepareTurn → 投影注入（Model-visible ⟺ logged）。
   // 守卫（计划 §2 应对策略 2）：systemPrompt.context 缺失 → 记录降级（无认知注入，命令仍可用）；
   // 认知运行时未装配 → 记录降级、不注册（无注入面）。
   // 求值语义：DSH 的 context text 提供器为同步求值，而 prepareTurn 为异步——故采用「缓存 + 异步预热」：
-  //   首请求触发 prepareTurn（fire-and-forget，防重入），返回空串（空文本不贡献）；prepareTurn 的 inject
-  //   回调把投影文本写入缓存并触发 context/injected 事件入链（投影摘要：id/total_tokens/views）；后续请求
-  //   同步返回缓存投影文本——每次注入的文本都有对应 context/injected 事件（Model-visible ⟺ logged）。
+  //   S8：首个 prepare 由 turn/start 事件预热提前触发（见 prepareForTurn——事件驱动预热，首拍命中率提升）；
+  //   context 求值 kick 与预热共享同一 preparing 防重入（预热在飞时静默跳过）；求值同步返回缓存投影文本，
+  //   未完成 → 空串/上次投影（首拍余量，宿主同步接口约束文档化——下一步说明.md 十五节）。prepareTurn 的
+  //   inject 回调把投影文本写入缓存并触发 context/injected 事件入链（投影摘要：id/total_tokens/views）；
+  //   后续请求同步返回缓存投影文本——每次注入的文本都有对应 context/injected 事件（Model-visible ⟺ logged）。
   if (systemPrompt?.context !== undefined) {
     if (cognitive !== undefined) {
-      const projectionTexts = new Map<string, string>();
-      const preparing = new Set<string>();
+      // S8：context 求值 kick 转交共享预热链（prepareForTurn）——sessionId 提取 + 事件数组兜底（goal 来源）
       const kickPrepare = (assembleCtx: AssembleContextLike): void => {
-        const runtime = cognitive;
-        if (runtime === undefined) {
-          return; // 防御：注册时已守卫运行时存在；并发装配变化时静默降级
-        }
-        const agent = assembleCtx?.agent;
-        const sessionId = agent?.session?.id;
+        const sessionId = assembleCtx?.agent?.session?.id;
         if (typeof sessionId !== 'string' || sessionId.length === 0) {
           return; // 无会话身份 → 无可注入
         }
-        if (preparing.has(sessionId)) {
-          return; // 防重入：同一会话的并发 assembly 只跑一次 prepare
-        }
-        preparing.add(sessionId);
-        // goal 来源：插件自身会话追踪（session/event 已观察到的最近人类指令）优先，assembleCtx 事件兜底
-        const goal = traces.get(sessionId)?.lastGoal ?? lastUserMessageText(agent?.session?.events);
-        const request = buildRequestFromSession(sessionId, goal);
-        void (async () => {
-          // R2 boot gate：恢复完成前认知不进入服务——等待 bootReady；boot 失败 → 本轮无投影（命令仍可用）
-          if (!(await cognitiveServiceable())) {
-            return;
-          }
-          // 请求间隙维护小量子（生产装配）：下一请求开始前执行 1 个待维护任务
-          //（turn 收尾入队 → 本 turn 结束 → 下 turn 准备前按债务/优先级执行；无调度器 → 跳过）
-          const m = cognitive?.maintenance;
-          if (m !== undefined && m !== null) {
-            void m.requestQuantum().catch((err) => {
-              const detail = err instanceof Error ? err.message : String(err);
-              recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
-            });
-          }
-          // T8.26.5 惰性收尾（无 flush 触发时的退化路径）：先收尾上一 turn，再准备本 turn
-          if (pendingFinalize.has(sessionId)) {
-            await finalizePendingTurn(sessionId, goal);
-            recordDegradation('finalize/lazy', `turn 收尾经 prepareTurn 惰性路径（无 flush 触发）——session ${sessionId}`);
-          }
-          const result = await runtime.prepareTurn(request, {
-            inject: (projection) => {
-              projectionTexts.set(sessionId, projectionToText(projection));
-            },
-          });
-          preparedTurns.set(sessionId, { decision: result.decision, working_state: result.working_state });
-          projectionTexts.set(sessionId, projectionToText(result.projection));
-        })().catch((err) => {
-          const detail = err instanceof Error ? err.message : String(err);
-          recordDegradation('context-provider', `prepareTurn 失败（${detail}）——本轮无投影注入`);
-        }).finally(() => {
-          preparing.delete(sessionId);
-        });
+        prepareForTurn(sessionId, assembleCtx?.agent?.session?.events);
       };
       systemPrompt.context({
         name: 'cognitive:projection',
@@ -747,6 +772,14 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         const prev = traces.get(sessionId) ?? initialTraceState();
         const mapped = mapSessionEvent(sessionId, dshEvent as never, runtime.snapshotHash, prev);
         traces.set(sessionId, mapped.state);
+        // S8：turn/start 预热——事件回调为异步面（不阻塞 DSH 事件派发），提前触发 prepareTurn：
+        // DSH 事件流顺序 turn/start → context 求值 → 模型（宿主 agent-loop：turn/start 先于
+        // systemPrompt.assemble），预热后 context 同步求值通常命中缓存投影（首拍命中）。
+        // 守卫：投影管线未激活（systemPrompt.context 未注册/认知未装配）→ 不预热（缓存无人消费，
+        // 降级路径行为不变）；防重入与 boot gate 由 prepareForTurn 承载（preparing set + cognitiveServiceable）。
+        if ((dshEvent as { type?: unknown } | undefined)?.type === 'turn/start' && projectionActive) {
+          prepareForTurn(sessionId);
+        }
         // R2 boot gate：恢复完成前认知不进入服务——观察入链等待 bootReady；boot 失败 → 事件不入链
         void (async () => {
           if (!(await cognitiveServiceable())) {
