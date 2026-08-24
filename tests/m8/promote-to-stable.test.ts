@@ -7,7 +7,7 @@
 //   ② 幂等：同 commit 对重复推进 → 拒绝（duplicate），stable 不变
 //   ③ 门禁失败 → 不推进、reasons 返回（候选保持 trusted-latest，等待下次检查）
 //   ④ rollbackPromotion：stable 回退旧 commit、rolled_back 事件、activation-log rolled_back 记录、
-//      error 池留痕（record.json + reason.txt + payload/provenance 保留）
+//      error 池留痕（record.json + reason.txt + payload/provenance 保留；S6：缺省组件 → error/kernel/<id>/）
 //   ⑤ 竞态守卫：stable 已前进（≠ 预期 predecessor）→ 拒绝（不覆盖）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { readFile } from 'node:fs/promises';
@@ -220,8 +220,9 @@ describe('④ rollbackPromotion：RollbackContract 回退 + rolled_back 事件 +
     expect(rec!.to).toBe(fx.initialHash);
     expect(rec!.candidate_id).toBe(input.candidate_id);
 
-    // error 池留痕（record.json status=error + reason.txt + payload/provenance 保留）
-    const errDir = join(evolutionRoot, 'error', candidateDirName(input.candidate_id!));
+    // error 池留痕（record.json status=error + reason.txt + payload/provenance 保留；
+    // S6：未传组件 → 缺省 kernel 组件目录 error/kernel/<id>/）
+    const errDir = join(evolutionRoot, 'error', 'kernel', candidateDirName(input.candidate_id!));
     const record = JSON.parse(await readFile(join(errDir, 'record.json'), 'utf8')) as { status: string; id: string };
     expect(record.status).toBe('error');
     expect(record.id).toBe(input.candidate_id);

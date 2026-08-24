@@ -12,7 +12,8 @@
 //     evolution/promoted 事件入链。
 //   - rollbackPromotion：RollbackContract {target_snapshot, scope, affected_sessions, restore_plan}
 //     （实现规格 §5.4）→ rollbackTo 回退（update-ref stable 回退）→ evolution/rolled_back 事件 +
-//     activation-log rolled_back 记录 + 候选 error 池标记（candidates.markError，§3.3 error/<id>/）。
+//     activation-log rolled_back 记录 + 候选 error 池标记（candidates.markError，§3.3
+//     error/<组件>/<id>——组件归属 deps.component，缺省 kernel：非组件候选）。
 //   - readShadowSignals：.evolution/shadows/exposure.log → L2 统计输入（n/failures；缺文件 → 空）。
 //   - promotionActivationId：激活幂等键确定性派生（dshEventId 风格：dsh:evt:<sha256(stable|candidate)>）。
 //
@@ -373,6 +374,9 @@ export interface RollbackPromotionDeps {
   candidate_id?: string;
   /** 回滚对象 Evolution Object id（error 池键回退；可选） */
   object_id?: string;
+  /** S6：回滚对象组件归属（markError 归档 error/<component>/<id>；缺省 kernel——非组件候选，
+   *  候选 provenance.component 解析由 CandidatePool 内部兜底） */
+  component?: string;
   /** RollbackContract.affected_sessions（P1b 收集面 = 快照 registry 活跃请求绑定，调用方收集；缺省 []） */
   affectedSessions?: string[];
   /** 显式传入契约（无 activationLogDir 时）；缺省从 activationLogDir 读 completed */
@@ -441,7 +445,8 @@ function buildRolledBackEvent(
  *    restore_plan='update-ref stable 回退 + worktree checkout'}；
  * ③ rollbackTo 执行（update-ref 原子回退 + fsync + worktree best-effort）；
  * ④ evolution/rolled_back 事件 + activation-log rolled_back 记录（from→to/reason/候选与对象 id）；
- * ⑤ 候选 error 池标记（candidates.markError——保留 payload/provenance/出错信号，§3.3 error/<id>/）。
+ * ⑤ 候选 error 池标记（candidates.markError——保留 payload/provenance/出错信号，
+ *    §3.3 error/<组件>/<id>，组件归属 deps.component 缺省 kernel）。
  * 失败（缺契约/rollbackTo 抛错）→ fail-loud（抛错；不静默——回滚失败必须可见）。
  */
 export async function rollbackPromotion(
@@ -515,7 +520,7 @@ export async function rollbackPromotion(
   if (deps.evolutionRoot !== undefined && errorKey !== undefined) {
     try {
       const pool = new CandidatePool(deps.evolutionRoot);
-      await pool.markError(errorKey, `rollbackPromotion(${activationId}): ${reason}`);
+      await pool.markError(errorKey, `rollbackPromotion(${activationId}): ${reason}`, { component: deps.component });
     } catch (err) {
       warning = `error 池标记失败（${(err as Error).message}）——回滚已生效，仅归档缺失`;
     }
