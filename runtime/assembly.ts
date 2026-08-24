@@ -35,9 +35,9 @@ import { reduce, type Projections, type ReducedState, type UtilityCounts } from 
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
-import { decide, type GovernorDecision, type GovernorInput } from './governor.js';
+import { decide, type GovernorDecision, type GovernorInput, type ProcessDecisionInfo } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
-import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState } from './turn-helpers.js';
+import { buildContextProjection, buildExperienceCandidate, makeRuntimeEvent, toPromptWorkingState, toProcessSection } from './turn-helpers.js';
 import { ProcessScheduler } from './scheduler.js';
 import type { Experience } from '../kernel/schemas/c.js';
 // P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
@@ -545,8 +545,9 @@ export class CognitiveRuntime {
   }
 
   /**
-   * prepareTurn（§3.1）：turn 开始认知准备——快照/工作状态/Governor 决策（准备级）/分层检索/
-   * ContextCompiler 投影编译；（提供注入接收器时）注入 + context/injected 入链（Model-visible ⟺ logged）。
+   * prepareTurn（§3.1）：turn 开始认知准备——快照/工作状态/Governor 决策（准备级）/（R3）Governor→Scheduler→
+   * Process 调度（选定/生成过程 → decision 载荷 + Working State 过程引用 + Context Projection「认知过程」section）/
+   * 分层检索/ContextCompiler 投影编译；（提供注入接收器时）注入 + context/injected 入链（Model-visible ⟺ logged）。
    */
   async prepareTurn(req: CognitiveRequest, opts: PrepareTurnOptions = {}): Promise<PreparedTurn> {
     const { policy, processes } = await this.ready();
@@ -554,12 +555,22 @@ export class CognitiveRuntime {
     const snapshot = this.resolveRuntimeSnapshot(req.session_id);
     const working_state = await this.loadWorkingState(req);
     const decision = decide(this.buildGovernorInput(req, processes, policy, snapshot), policy.governor);
+    // R3（P0）：Governor → Scheduler → Process 进入请求链（架构 §5.1/§4.6.1：Fast Governor + Rare Generator）。
+    // 只做决策与投影——不驱动执行：不调用 operator executor、不循环调用模型（DSH 原生 Agent Loop 是唯一执行者）。
+    // 调度结果并入 decision 载荷（decision/made 事件 payload 已由 finalizeTurn 记录 chosen/reason——不新增事件类型）；
+    // 失败降级（scheduler 异常/无过程可选）→ decision.process.degraded 记录，不阻塞 prepareTurn 其余流程。
+    const scheduled = await this.scheduleProcess(req, processes);
+    decision.process = scheduled;
+    if (scheduled.kind !== 'none' && scheduled.process_id !== null) {
+      // 过程引用写入 Working State（next_best_action）：DSH Loop 的下一步 = 执行认知过程
+      working_state.next_best_action = `认知过程 ${scheduled.process_id}（${scheduled.method}）`;
+    }
     const retrieved = await retrieve(
       this.memory,
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
       { episode: false },
     );
-    const projection = buildContextProjection(policy, req, working_state, retrieved.items);
+    const projection = buildContextProjection(policy, req, working_state, retrieved.items, toProcessSection(scheduled));
 
     let events_appended = 0;
     if (opts.inject !== undefined) {
@@ -858,6 +869,44 @@ export class CognitiveRuntime {
       return toPromptWorkingState(state);
     } catch {
       return req.working_state; // checkpoint 不可用 → 降级到请求态
+    }
+  }
+
+  /**
+   * R3：Governor→Scheduler 调度步骤（prepareTurn 内，架构 §5.1/§4.6.1）。
+   * 数据流：已知过程（Strong/Partial）→ 复用（确定性零成本）；OOD → Generator 阶梯（Compose/Mutate/Generate，
+   * generation 预算经 createScheduler 注入 policy.budget.generation——P5 语义）；Contradictory/Failed →
+   * 不触发生成（Governor 决策域，本层只报告不执行）。
+   * 边界（R3 明确）：只做决策与投影——不驱动执行（不调用 operator executor、不循环调用模型；DSH 原生
+   * Agent Loop 是唯一执行者）。失败降级：scheduler 构造/调度异常 → 降级记录（degraded），不抛——
+   * prepareTurn 其余流程照常（投影不含过程 section）。
+   */
+  private async scheduleProcess(req: CognitiveRequest, processes: readonly ProcessDef[]): Promise<ProcessDecisionInfo> {
+    try {
+      // 每次调用构造新调度器/生成器（P5：generationUsed 计数器即单请求语义——max_generate_per_request）
+      const scheduler = await this.createScheduler(processes);
+      const res = await scheduler.schedule({ goal: req.goal, state: req.working_state });
+      return {
+        kind: res.kind,
+        process_id: res.process?.id ?? null,
+        name: res.process?.id ?? null, // ProcessDef.id 即过程名（无独立 name 字段）
+        steps: res.process === null ? [] : res.process.operators.map((o) => o.op),
+        method: res.method,
+        applicability: res.applicability ?? null,
+        budget_tokens: res.process?.budget.tokens ?? null,
+        degraded: res.kind === 'none' ? `process/schedule: ${res.reason}` : null,
+      };
+    } catch (err) {
+      return {
+        kind: 'none',
+        process_id: null,
+        name: null,
+        steps: [],
+        method: 'none',
+        applicability: null,
+        budget_tokens: null,
+        degraded: `process/schedule: ${errorDetail(err)}`,
+      };
     }
   }
 

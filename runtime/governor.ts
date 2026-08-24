@@ -3,13 +3,14 @@
 // 改 kernel/policy/governor.yaml 即改行为）；困难提高 compute；陌生才调 Generator。
 // layer 2（runtime/）：仅 import 同层 kernel/（CONVENTIONS §4）；纯函数——无 I/O、无随机、无时间依赖。
 import type { BudgetPolicy, GovernorPolicy, GovernorRule } from '../kernel/policy-loader.js';
+import type { Applicability } from './generator-ops.js';
 
 // ---- 值域（类型从 T2.1 决策表 schema 派生，防漂移） ----
 
 /** Governor 决策并集（§5.1 GovernorDecision；值域锚定 T2.1 GOVERNOR_DECISIONS） */
 export type GovernorDecisionKind = GovernorRule['decision'];
-/** Process Applicability（§5.1：Strong/Partial/Failed/Contradictory/OOD） */
-type Applicability = NonNullable<GovernorRule['when']>['applicability'];
+// Process Applicability（§5.1：Strong/Partial/Failed/Contradictory/OOD）——复用 generator-ops 导出
+// （同一 APPLICABILITY 枚举派生，防漂移；Governor 决策表 when.applicability 与其同源）
 /** 证据缺口二值（§5.1 evidence_sufficiency → none/some） */
 type EvidenceGaps = NonNullable<GovernorRule['when']>['evidence_gaps'];
 
@@ -111,6 +112,33 @@ export interface GovernorDecision {
   budget_allocation: BudgetAllocation;
   expected_gain: number;
   snapshot: string;
+  /** R3：Governor→Scheduler 调度结果（prepareTurn 调度步骤写入；Governor 纯决策本身不含——optional） */
+  process?: ProcessDecisionInfo;
+}
+
+/**
+ * R3：调度结果并入决策载荷（架构 §5.1/§4.6.1：Governor 决策 → ProcessScheduler → 选定/生成过程）。
+ * kind=known/generated 时 process_id/name/steps/budget_tokens 非空；kind=none（无过程可选/生成被拒/
+ * scheduler 异常）→ degraded 记录降级原因（decision/made 事件 payload 已由 finalizeTurn 记录 chosen/reason，
+ * 调度结果并入 decision 即可——不新增事件类型）。
+ */
+export interface ProcessDecisionInfo {
+  /** 调度结果分类：known=复用已有过程；generated=Ephemeral 生成；none=无过程（含降级） */
+  kind: 'known' | 'generated' | 'none';
+  /** 过程 id（kind=none → null；ProcessDef.id 即过程名，无独立 name 字段） */
+  process_id: string | null;
+  /** 过程名（= process_id；kind=none → null） */
+  name: string | null;
+  /** 步骤摘要（算子名序列；kind=none → []） */
+  steps: string[];
+  /** 生成/复用方法（阶梯命中：reuse/compose/mutate/generate；无 → none） */
+  method: 'reuse' | 'compose' | 'mutate' | 'generate' | 'none';
+  /** 已知过程适用性（kind=known 时 meaningful；其余 → null） */
+  applicability: Applicability | null;
+  /** 过程预算 token（ProcessDef.budget.tokens；kind=none → null） */
+  budget_tokens: number | null;
+  /** 降级原因（scheduler 异常/无过程可选/生成被拒；无降级 → null） */
+  degraded: string | null;
 }
 
 // ---- isSuccessCriteriaCovered：task_done 唯一判定源（主会话裁决 2026-08-21 归一） ----

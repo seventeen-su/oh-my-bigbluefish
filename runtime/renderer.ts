@@ -65,11 +65,26 @@ export interface TaskContractView {
   success_criteria: string[];
 }
 
+/**
+ * R3：认知过程投影输入（Governor→Scheduler 调度结果的最小投影面；架构 §4.6.1 动态过程调度）。
+ * 提供时确定性进入 planning 视图（模型可见——DSH 原生 Agent Loop 按过程执行）；token 受控——
+ * content 由 projectProcess 紧凑渲染（name + 步骤摘要 + 预算），token 计入投影预算与 total_tokens。
+ */
+export interface ProcessSectionInput {
+  process_id: string;
+  name: string;
+  steps: readonly string[];
+  budget_tokens: number;
+  method: string;
+}
+
 /** compile 输入（§6.1：TaskContract + WorkingState + 候选集 + 预算 + 策略） */
 export interface CompileInput {
   task_contract: TaskContractView;
   /** 工作状态（可选）：提供时 verbatim 原文进入 planning 视图（绝不盲压缩），token 计入 total_tokens */
   working_state?: WorkingStateView;
+  /** R3：认知过程（可选）：选定/生成的过程 → planning 视图 section（缺省无——兼容既有调用） */
+  process_section?: ProcessSectionInput;
   candidates: CandidateItem[];
   budget_tokens: number;
   policy: ContextPolicy;
@@ -132,8 +147,11 @@ export function marginal(item: CandidateItem, policy: ContextPolicy): number {
  */
 export function compile(input: CompileInput): ContextProjection {
   const policy = input.policy;
+  // R3：固定开销 = working_state verbatim + 认知过程 section（同为决策既定内容，不走边际贪心——token 计入预算）
   const wsSection = input.working_state === undefined ? [] : [projectWorkingState(input.working_state)];
-  const candidateBudget = Math.max(0, input.budget_tokens - sectionTokens(wsSection));
+  const processSection = input.process_section === undefined ? [] : [projectProcess(input.process_section)];
+  const fixedSections = [...wsSection, ...processSection];
+  const candidateBudget = Math.max(0, input.budget_tokens - sectionTokens(fixedSections));
 
   // 空 content 守卫（A3 契约：section content 非空 z.string().min(1)）：空内容候选无投影价值，入口过滤（其余候选照常）
   const candidates = input.candidates.filter((c) => c.content.length > 0);
@@ -155,7 +173,7 @@ export function compile(input: CompileInput): ContextProjection {
     used += item.tokens;
   }
 
-  const sections = [...wsSection, ...selected.map(projectItem)].sort(byViewOrder);
+  const sections = [...fixedSections, ...selected.map(projectItem)].sort(byViewOrder);
   const type = deriveType(sections);
   const original_artifact_ids = selected.filter((i) => i.kind === 'artifact').map((i) => i.id);
 
@@ -207,6 +225,22 @@ function projectItem(item: CandidateItem): ProjectionSection {
 function projectWorkingState(ws: WorkingStateView): ProjectionSection {
   const content = JSON.stringify(ws);
   return { source_ref: 'working_state', view: 'planning', content, tokens: estimateTokens(content) };
+}
+
+/**
+ * R3：认知过程投影（架构 §4.6.1 动态过程调度 → planning 视图）。紧凑渲染，token 受控：
+ * 「认知过程：<name>（<method>，预算 <budget_tokens> tokens）\n步骤：<op1> → <op2> …」
+ * 模型可见（planning 视图经 prompt 追加进入 systemPrompt）——DSH 原生 Agent Loop 按此过程执行，
+ * OMB 只做决策与投影（R3 边界：不驱动执行）。
+ */
+function projectProcess(p: ProcessSectionInput): ProjectionSection {
+  const content = `认知过程：${p.name}（${p.method}，预算 ${p.budget_tokens} tokens）\n步骤：${p.steps.join(' → ')}`;
+  return {
+    source_ref: `process:${p.process_id}`,
+    view: 'planning',
+    content,
+    tokens: estimateTokens(content),
+  };
 }
 
 /** 按分型投影内容：semantic → 摘要；pointer → ArtifactRef 指针；其余保留原文 */

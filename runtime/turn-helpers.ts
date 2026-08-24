@@ -10,8 +10,8 @@ import type { Event } from '../kernel/schemas/m.js';
 import type { State } from '../kernel/schemas/s.js';
 import type { PolicyBundle } from '../kernel/policy-loader.js';
 import type { RankedMemory } from '../memory/retrieve.js';
-import { compile } from './renderer.js';
-import type { GovernorDecision } from './governor.js';
+import { compile, type ProcessSectionInput } from './renderer.js';
+import type { GovernorDecision, ProcessDecisionInfo } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
 
 /** token 估算（与 renderer 内部同口径：字符/4；精确计费为 §17 参数标定项） */
@@ -34,16 +34,21 @@ export function toPromptWorkingState(state: State): PromptWorkingState {
   };
 }
 
-/** ContextCompiler 投影构建（§3.1 step 5）：Working State（verbatim）+ 检索结果（memory 候选）→ ContextProjection */
+/**
+ * ContextCompiler 投影构建（§3.1 step 5）：Working State（verbatim）+ 检索结果（memory 候选）
+ * +（R3）认知过程 section（Governor→Scheduler 调度结果；缺省无 → 兼容既有调用与测试）→ ContextProjection。
+ */
 export function buildContextProjection(
   policy: PolicyBundle,
   task: { goal: string; success_criteria: string[] },
   working_state: PromptWorkingState,
   items: RankedMemory[],
+  process?: ProcessSectionInput | null,
 ): ContextProjection {
   return compile({
     task_contract: { goal: task.goal, success_criteria: task.success_criteria },
     working_state,
+    process_section: process ?? undefined,
     candidates: items.map((r) => ({
       id: r.memory.id,
       kind: 'memory',
@@ -56,6 +61,23 @@ export function buildContextProjection(
     budget_tokens: policy.budget.context_budget_tokens,
     policy: policy.context,
   });
+}
+
+/**
+ * R3：调度结果 → ContextProjection 过程 section 输入（纯映射）。无过程（kind=none/异常降级）→ null
+ * ——投影不含「认知过程」section（降级不阻塞 prepareTurn 其余流程）。token 受控：renderer 侧紧凑渲染。
+ */
+export function toProcessSection(scheduled: ProcessDecisionInfo): ProcessSectionInput | null {
+  if (scheduled.kind === 'none' || scheduled.process_id === null) {
+    return null;
+  }
+  return {
+    process_id: scheduled.process_id,
+    name: scheduled.name ?? scheduled.process_id,
+    steps: scheduled.steps,
+    budget_tokens: scheduled.budget_tokens ?? 0,
+    method: scheduled.method,
+  };
 }
 
 /**
