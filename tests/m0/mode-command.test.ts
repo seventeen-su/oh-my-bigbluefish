@@ -74,13 +74,13 @@ describe('modeCommandHandler', () => {
   it('load 校验失败 fail-loud：返回 error 文本（含失败原因），不触发 onSwitch', async () => {
     const deps = makeDeps({
       load: async () => {
-        throw new Error('版本线 "latest" 引用缺失或不可解析（refs/heads/main）');
+        throw new Error('版本线 "latest" 引用缺失或不可解析（refs/heads/trusted-latest）：旧种子/未重建——启动时 ensureThreeLineLayout 自动重建');
       },
     });
     const result = await modeCommandHandler('latest', deps);
     expect(result.kind).toBe('error');
     expect(result.text).toContain('切换到 latest 失败');
-    expect(result.text).toContain('refs/heads/main');
+    expect(result.text).toContain('refs/heads/trusted-latest');
     expect(deps.calls.switched).toEqual([]);
   });
 

@@ -80,21 +80,23 @@ describe('runtime/plugin.ts apply(fakeCtx)', () => {
     const again = makeFakeCtx();
     apply(again.ctx, { bootstrap: false });
     const def = again.captured[0]!;
-    const switched = await def.handler(makeInvocation('latest'));
+    // R1：latest 解析 = trusted-latest（真实 versions.git 为旧种子，无 trusted-latest → /mode latest fail-loud，
+    // 待启动 ensureThreeLineLayout 自动迁移重建）→ 冒烟用 stable（任何种子形态均可加载）
+    const switched = await def.handler(makeInvocation('stable'));
     expect(switched.kind).toBe('success');
-    expect(switched.text).toContain('latest');
+    expect(switched.text).toContain('stable');
     expect(switched.text).toMatch(/git_revision [0-9a-f]{8}/);
-    // 当前线已更新：无参数再查显示 latest
+    // 当前线已更新：无参数再查显示 stable
     const current = await def.handler(makeInvocation(''));
     expect(current.kind).toBe('success');
-    expect(current.text).toContain('latest');
+    expect(current.text).toContain('stable');
   });
 
   it('非空白会话（events 含 turn/start）拒绝切换：error + 需空白会话', async () => {
     const again = makeFakeCtx();
     apply(again.ctx, { bootstrap: false });
     const r = await again.captured[0]!.handler(
-      makeInvocation('latest', [{ type: 'turn/start' }]),
+      makeInvocation('stable', [{ type: 'turn/start' }]),
     );
     expect(r.kind).toBe('error');
     expect(r.text).toContain('空白会话');

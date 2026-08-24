@@ -1,11 +1,14 @@
 // layer 0：版本加载器（三线版本 initial/stable/latest，架构 §11.1）。
 // 只 import node: 内置（CONVENTIONS §4：substrate 不得 import 任何上层）。
 //
-// 设计决策（T0.3）：
-// - 三线映射：initial → refs/tags/initial；stable → refs/heads/stable；latest → refs/heads/main
+// 设计决策（T0.3，R1 修订）：
+// - 三线映射：initial → refs/tags/initial；stable → refs/heads/stable；latest → refs/heads/trusted-latest
+//   （R1：唯一版本线解析源 = lines.ts resolveLineCommit——loadVersion('latest') 委托 lines，
+//   旧 latest→main 语义已收掉；main 仅为演化推进的物化/回退目标分支，不再作为 latest 解析源）。
 // - git_revision = 引用解析到的完整 commit hash（rev-parse <ref>^{commit}）
-// - tree_root：stable/latest 用对应正式 worktree（只读）；initial 无专用 worktree，
-//   把 initial tag 的 commit 物化为 detached worktree（进程内缓存，每 bare 一次），
+// - tree_root：stable/latest 用对应正式 worktree（只读）——**校验/展示用**（manifest 校验 + /mode 文案）；
+//   运行加载走 lines 物化（P1a D1 裁决：ensureLineSnapshot → <root>/workspace/.omb/lines/<line>/<commit>/）；
+//   initial 无专用 worktree，把 initial tag 的 commit 物化为 detached worktree（进程内缓存，每 bare 一次），
 //   保证 stable 分支推进后 initial 仍读到 initial tag 的内容（不随 stable 漂移）。
 // - 未知模式 / 引用缺失 / 内容不可读 → fail-loud（抛错，消息含合法值）。
 import { execFileSync } from 'node:child_process';
@@ -13,6 +16,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// R1：latest 解析委托 lines.ts（唯一版本线解析源）。ESM 循环 import（lines → snapshot 的
+// runGit/GIT_BIN）安全：两模块仅函数级延迟引用（无模块求值期交叉调用）。
+import { resolveLineCommit } from './lines.js';
 
 /** git 可执行文件解析（迁移可移植；优先级：GIT_BIN 环境变量 → Windows where.exe 发现 → PATH 'git'）。
  *  DSH 沙箱可能拦截 PATH 解析（CONVENTIONS §2）→ 部署可设 GIT_BIN 指向完整路径。 */
@@ -65,11 +71,15 @@ export interface VersionLayout {
   gitBin?: string;
 }
 
-/** 三线 → 引用（boot.ts 等 substrate 内文件复用；refs/tags/initial、refs/heads/stable、refs/heads/main） */
+/**
+ * 三线 → 引用（boot.ts 等 substrate 内文件复用）。latest = refs/heads/trusted-latest（D1 裁决：
+ * trusted head 指针）。**注意：loadVersion('latest') 的 commit 解析已委托 lines.ts resolveLineCommit
+ * （唯一版本线解析源，R1）；本表 latest 仅供 boot 回退枚举/文档语义，不再作为 latest 解析源**。
+ */
 export const LINE_REFS: Record<VersionLine, string> = {
   initial: 'refs/tags/initial',
   stable: 'refs/heads/stable',
-  latest: 'refs/heads/main',
+  latest: 'refs/heads/trusted-latest',
 };
 
 /** 进程内 initial 物化目录缓存（每 bare 一次；避免重复 worktree add 与内容漂移） */
@@ -251,14 +261,22 @@ export async function loadVersion(line: VersionLine, layout?: VersionLayout): Pr
     throw new Error(`未知版本线 "${String(line)}"：合法值为 ${VALID_LINES.join(' | ')}`);
   }
   let commit: string;
-  try {
-    commit = runGit(lay, ['rev-parse', '--verify', `${ref}^{commit}`]);
-  } catch (err) {
-    throw new Error(
-      `版本线 "${line}" 引用缺失或不可解析（${ref}）：请检查 versions.git（${lay.bareRepo}）`,
-      { cause: err },
-    );
+  if (line === 'latest') {
+    // R1：latest 委托 lines.ts 唯一解析源（trusted head 指针 trusted-latest；缺失 fail-loud，
+    // 不回退 main——旧种子由启动 ensureThreeLineLayout 自动重建）
+    commit = resolveLineCommit(lay, 'latest');
+  } else {
+    try {
+      commit = runGit(lay, ['rev-parse', '--verify', `${ref}^{commit}`]);
+    } catch (err) {
+      throw new Error(
+        `版本线 "${line}" 引用缺失或不可解析（${ref}）：请检查 versions.git（${lay.bareRepo}）`,
+        { cause: err },
+      );
+    }
   }
+  // tree_root：stable/latest 用对应正式 worktree（只读）——校验/展示用（manifest 校验 + /mode 文案）；
+  // 运行加载走 lines 物化（P1a：ensureLineSnapshot → <root>/workspace/.omb/lines/<line>/<commit>/）。
   let treeRoot: string;
   if (line === 'stable') {
     treeRoot = lay.stableWorktree;

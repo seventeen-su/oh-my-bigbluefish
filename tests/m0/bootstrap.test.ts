@@ -71,6 +71,45 @@ function readManifest(dir: string): string {
   return JSON.stringify(parsed, null, 2);
 }
 
+/**
+ * 构造旧种子（T0.2 旧布局形态，eval §17 真实旧种子：无 trusted-latest、基线树无 kernel/policy）：
+ * bare init（-b main）→ initial 基线提交（manifest+README，无 kernel/）→ tag initial + stable 分支 →
+ * main 推进一版（manifest line=latest，无 kernel/）→ stable/latest 正式 worktree + 只读 ACL。
+ * 返回 { initialHash, latestHash }（断言备份数据保留用）。
+ */
+function buildLegacySeed(root: string, layout: VersionLayout): { initialHash: string; latestHash: string } {
+  const bare = layout.bareRepo;
+  fs.mkdirSync(path.dirname(bare), { recursive: true });
+  runGit(['init', '--bare', '-b', 'main', bare]);
+  const seedInitial = path.join(root, '_seed-legacy-initial');
+  fs.mkdirSync(seedInitial);
+  fs.writeFileSync(path.join(seedInitial, 'manifest.json'), MANIFEST_INITIAL);
+  fs.writeFileSync(path.join(seedInitial, 'README.md'), 'OMB v2 版本树引导基线（initial）。\n');
+  runGit(['add', '.'], { gitDir: bare, workTree: seedInitial });
+  runGit(
+    ['-c', 'user.name=OMB', '-c', 'user.email=omb@local', 'commit', '-m', 'initial baseline'],
+    { gitDir: bare, workTree: seedInitial },
+  );
+  const initialHash = runGit(['rev-parse', 'HEAD'], { cwd: bare });
+  runGit(['tag', 'initial'], { cwd: bare });
+  runGit(['branch', 'stable'], { cwd: bare });
+  const seedLatest = path.join(root, '_seed-legacy-latest');
+  fs.mkdirSync(seedLatest);
+  fs.writeFileSync(path.join(seedLatest, 'manifest.json'), MANIFEST_LATEST);
+  fs.writeFileSync(path.join(seedLatest, 'README.md'), 'OMB v2 latest 基线（main 分支）。\n');
+  runGit(['add', '.'], { gitDir: bare, workTree: seedLatest });
+  runGit(
+    ['-c', 'user.name=OMB', '-c', 'user.email=omb@local', 'commit', '-m', 'latest baseline'],
+    { gitDir: bare, workTree: seedLatest },
+  );
+  const latestHash = runGit(['rev-parse', 'HEAD'], { cwd: bare });
+  runGit(['worktree', 'add', layout.stableWorktree, 'stable'], { cwd: bare });
+  runGit(['worktree', 'add', layout.latestWorktree, 'main'], { cwd: bare });
+  runIcacls([layout.stableWorktree, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C']);
+  runIcacls([layout.latestWorktree, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C']);
+  return { initialHash, latestHash };
+}
+
 describe('ensureThreeLineLayout（独立临时 fixture）', () => {
   let root: string;
 
@@ -201,6 +240,70 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     expect(readManifest(layout.stableWorktree)).toBe(MANIFEST_INITIAL);
     expect(readManifest(layout.latestWorktree)).toBe(MANIFEST_LATEST);
     assertReadOnly(layout.stableWorktree);
+  }, 30_000);
+
+  it('旧种子（无 trusted-latest，R1 判定 a）→ 自动迁移重建：备份目录存在 + 新种子完整（trusted-latest=新 main head、基线含 kernel/policy）+ 旧快照清理 + 幂等', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-legacy-'));
+    const layout = makeLayout(root);
+    const old = buildLegacySeed(root, layout);
+    // 预置旧快照目录（模拟旧 commit 物化残留——重建后失效应清理）
+    const oldSnapshot = path.join(root, 'workspace', '.omb', 'lines', 'latest', old.latestHash);
+    fs.mkdirSync(oldSnapshot, { recursive: true });
+    fs.writeFileSync(path.join(oldSnapshot, 'manifest.json'), '{}');
+    // ensure → 自动迁移重建
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    expect(r.detail).toContain('旧种子已自动迁移重建');
+    // 备份目录存在（versions.git.legacy-<ts>，数据保留：旧 main/stable/initial 仍可解析）
+    const backups = fs.readdirSync(root).filter((n) => n.startsWith('versions.git.legacy-'));
+    expect(backups).toHaveLength(1);
+    const legacyBare = path.join(root, backups[0]!);
+    expect(runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: legacyBare })).toBe(old.latestHash);
+    expect(runGit(['rev-parse', '--verify', 'refs/heads/stable^{commit}'], { cwd: legacyBare })).toBe(old.initialHash);
+    // 新种子完整：trusted-latest 存在且 = 新 main head；基线含 kernel/policy（P1a 种子特征）
+    for (const ref of ['refs/tags/initial', 'refs/heads/stable', 'refs/heads/main', 'refs/heads/trusted-latest']) {
+      expect(runGit(['rev-parse', '--verify', `${ref}^{commit}`], { cwd: layout.bareRepo })).toMatch(/^[0-9a-f]{40}$/);
+    }
+    const trusted = runGit(['rev-parse', '--verify', 'refs/heads/trusted-latest^{commit}'], { cwd: layout.bareRepo });
+    const main = runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: layout.bareRepo });
+    expect(trusted).toBe(main);
+    const tree = runGit(['ls-tree', '-r', '--name-only', main], { cwd: layout.bareRepo });
+    expect(tree).toContain('kernel/policy/budget.yaml');
+    expect(tree).toContain('kernel/processes/hypothesize-test.yaml');
+    // 正式 worktree 重建：含 policy/processes + 只读 ACL
+    expect(fs.existsSync(path.join(layout.stableWorktree, 'kernel', 'policy', 'budget.yaml'))).toBe(true);
+    assertReadOnly(layout.stableWorktree);
+    // 旧快照目录已清理（重建后旧 commit 快照失效）
+    expect(fs.existsSync(oldSnapshot)).toBe(false);
+    // 幂等：二次调用不再迁移（状态 ok、无新备份）
+    const r2 = ensureThreeLineLayout(layout);
+    expect(r2.status).toBe('ok');
+    expect(fs.readdirSync(root).filter((n) => n.startsWith('versions.git.legacy-'))).toHaveLength(1);
+  }, 30_000);
+
+  it('旧种子（stable 基线树缺 kernel/policy，R1 判定 b——即使有 trusted-latest）→ 自动迁移重建', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-legacy-b-'));
+    const layout = makeLayout(root);
+    buildLegacySeed(root, layout);
+    // 混合形态：有 trusted-latest 但 stable 基线树无 kernel/policy → 判定 (b) 触发迁移
+    runGit(['branch', 'trusted-latest', 'refs/heads/main'], { cwd: layout.bareRepo });
+    const r = ensureThreeLineLayout(layout);
+    expect(r.status).toBe('repaired');
+    expect(r.detail).toContain('旧种子已自动迁移重建');
+    // 备份 + 新种子 trusted-latest = 新 main head
+    expect(fs.readdirSync(root).filter((n) => n.startsWith('versions.git.legacy-'))).toHaveLength(1);
+    const trusted = runGit(['rev-parse', '--verify', 'refs/heads/trusted-latest^{commit}'], { cwd: layout.bareRepo });
+    const main = runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: layout.bareRepo });
+    expect(trusted).toBe(main);
+    const tree = runGit(['ls-tree', '-r', '--name-only', main], { cwd: layout.bareRepo });
+    expect(tree).toContain('kernel/policy/budget.yaml');
+  }, 30_000);
+
+  it('新种子 → 不迁移（trusted-latest + policy 齐备 → 正常初始化，零 legacy 备份）', () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-bootstrap-nomigrate-'));
+    const layout = makeLayout(root);
+    expect(ensureThreeLineLayout(layout).status).toBe('initialized');
+    expect(fs.readdirSync(root).filter((n) => n.startsWith('versions.git.legacy-'))).toHaveLength(0);
   }, 30_000);
 
   it('git 不可用（layout.gitBin 指向不存在 exe）→ degraded 不 throw', () => {

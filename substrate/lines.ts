@@ -2,8 +2,9 @@
 // 三线承载版本化认知对象（policy/processes 等）：运行时按当前版本线从 versions.git 解析 commit →
 // 物化到 <presetRoot>/workspace/.omb/lines/<line>/<commit>/（不可变快照目录）→ 构造运行时快照 → 加载。
 // initial = 永久不可变 tag；stable = refs/heads/stable；latest = trusted head 指针
-// （refs/heads/trusted-latest，缺失回退 refs/heads/main——兼容旧布局）。切换 = 改指针（原子写），
-// 下一请求读新快照；**禁止原地 checkout/worktree/archive 改写运行目录**（Windows git/icacls 锁竞态）。
+// （refs/heads/trusted-latest——R1 起缺失即 fail-loud：旧种子由启动 ensureThreeLineLayout 自动重建，
+// 不再回退 main）。切换 = 改指针（原子写），下一请求读新快照；
+// **禁止原地 checkout/worktree/archive 改写运行目录**（Windows git/icacls 锁竞态）。
 // 只 import node: 内置与 substrate 内文件（CONVENTIONS §4：substrate 不得 import 任何上层）。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -18,9 +19,6 @@ export const LINE_POINTER_REFS: Record<VersionLine, string> = {
   stable: 'refs/heads/stable',
   latest: 'refs/heads/trusted-latest',
 };
-
-/** latest 回退引用（旧布局无 trusted-latest → 回退 main，兼容既有三线布局） */
-const LATEST_FALLBACK_REF = 'refs/heads/main';
 
 /** 瞬态锁错误（Windows 文件锁/杀软竞态）：短退避有限次重试（与 snapshot.ts runGit 同款风格）；非锁错误/超次 → 直接抛错 */
 const LOCK_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
@@ -97,43 +95,26 @@ function pointerPath(layout: VersionLayout, line: VersionLine): string {
 }
 
 /**
- * 引用存在性静默探测（`show-ref --verify --quiet`：缺失引用 exit 非 0 且**无 stderr**——
- * 避免失败路径把 `fatal: Needed a single revision` 泄漏到进程 stderr（/mode 切换中断提示噪声源））。
- */
-function refExists(layout: VersionLayout, ref: string): boolean {
-  try {
-    runGit(layout, ['show-ref', '--verify', '--quiet', ref]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * 解析版本线指针 → 完整 commit hash（40 位 hex）。
  * - initial：tag 缺失/不可解析 → 抛错（fail-loud，initial 为永久基线不可回退）；
  * - stable：分支缺失 → 抛错；
- * - latest：trusted-latest 缺失/不可解析 → 回退 refs/heads/main（兼容旧布局——旧种子无 trusted-latest）；
- *   两者均不可解析 → 抛错（消息含两个引用）。
+ * - latest：trusted-latest 缺失/不可解析 → fail-loud（R1：不再回退 main——旧种子/未重建时
+ *   由启动 ensureThreeLineLayout 自动迁移重建，或手动 pnpm init-three-line；消息含重建指引）。
  */
 export function resolveLineCommit(layout: VersionLayout, line: VersionLine): string {
   const ref = LINE_POINTER_REFS[line];
   if (ref === undefined) {
     throw new Error(`未知版本线 "${String(line)}"：合法值为 ${VALID_LINES.join(' | ')}`);
   }
-  if (line === 'latest' && !refExists(layout, ref)) {
-    if (refExists(layout, LATEST_FALLBACK_REF)) {
-      return runGit(layout, ['rev-parse', '--verify', `${LATEST_FALLBACK_REF}^{commit}`]);
-    }
-    throw new Error(
-      `版本线 "latest" 引用缺失或不可解析（${ref} 与 ${LATEST_FALLBACK_REF} 均不可用）：请检查 versions.git（${layout.bareRepo}）`,
-    );
-  }
   try {
     return runGit(layout, ['rev-parse', '--verify', `${ref}^{commit}`]);
   } catch (err) {
+    const guidance =
+      line === 'latest'
+        ? '（旧种子/未重建——启动时 ensureThreeLineLayout 自动重建；或手动 pnpm init-three-line）'
+        : '';
     throw new Error(
-      `版本线 "${line}" 引用缺失或不可解析（${ref}）：请检查 versions.git（${layout.bareRepo}）`,
+      `版本线 "${line}" 引用缺失或不可解析（${ref}）：请检查 versions.git（${layout.bareRepo}）${guidance}`,
       { cause: err },
     );
   }

@@ -186,15 +186,18 @@ describe('P1b /mode 切换 → 快照重建（plugin.ts onSwitch 生产接线）
     return { ctx, modeCmd: () => captured };
   }
 
-  it('/mode latest → onSwitch 重建快照（下一请求生效）：注入 runtime 的 snapshotHash 变化，prepareTurn 用新快照', async () => {
+  it('/mode 切换 → onSwitch 重建快照（下一请求生效）：注入 runtime 的 snapshotHash 变化，prepareTurn 用新快照', async () => {
     fx = buildLayoutFixture();
-    const runtime = track(createCognitiveRuntime({ root: path.join(base, 'r'), line: 'stable', layout: layoutFor(fx) }));
+    // R1：/mode 的 loadVersion 校验走真实布局（旧种子无 trusted-latest → /mode latest fail-loud，
+    // 待启动自动迁移）→ 本测试用「latest 运行时 → /mode stable」：真实 stable 可加载，fixture 内
+    // stable（initialHash）≠ latest（latestHash）→ 快照重建仍验证不同线切换语义
+    const runtime = track(createCognitiveRuntime({ root: path.join(base, 'r'), line: 'latest', layout: layoutFor(fx) }));
     const v1 = runtime.snapshotHash;
     const { ctx, modeCmd } = makeModeCtx(runtime);
     apply(ctx, { bootstrap: false });
     expect(modeCmd()).toBeDefined();
 
-    await modeCmd()!.handler({ commandId: 'c', agent: { session: { id: 'sess-mode', events: [] } }, rawInput: 'latest', signal: undefined });
+    await modeCmd()!.handler({ commandId: 'c', agent: { session: { id: 'sess-mode', events: [] } }, rawInput: 'stable', signal: undefined });
     expect(runtime.snapshotHash).not.toBe(v1); // 重建 + promote（下一请求生效）
 
     // 下一请求 → 新快照（与当前一致）
@@ -205,16 +208,16 @@ describe('P1b /mode 切换 → 快照重建（plugin.ts onSwitch 生产接线）
 
   it('/mode 切换但物化失败 → 降级记录（lines/rebuild）+ 快照保持', async () => {
     fx = buildLayoutFixture();
-    const runtime = track(createCognitiveRuntime({ root: path.join(base, 'r'), line: 'stable', layout: layoutFor(fx) }));
+    const runtime = track(createCognitiveRuntime({ root: path.join(base, 'r'), line: 'latest', layout: layoutFor(fx) }));
     const v1 = runtime.snapshotHash;
     const { ctx, modeCmd } = makeModeCtx(runtime);
     apply(ctx, { bootstrap: false });
-    // 破坏 latest 线 → onSwitch 的 rebuildSnapshotForLine 降级
-    runGit(['update-ref', '-d', 'refs/heads/trusted-latest'], { cwd: fx.bare });
-    runGit(['update-ref', '-d', 'refs/heads/main'], { cwd: fx.bare });
-    const res = await modeCmd()!.handler({ commandId: 'c', agent: { session: { id: 'sess-mode', events: [] } }, rawInput: 'latest', signal: undefined });
+    // 破坏切换目标线（fixture stable）→ onSwitch 的 rebuildSnapshotForLine 降级
+    runGit(['update-ref', '-d', 'refs/heads/stable'], { cwd: fx.bare });
+    const res = await modeCmd()!.handler({ commandId: 'c', agent: { session: { id: 'sess-mode', events: [] } }, rawInput: 'stable', signal: undefined });
     expect(res.kind).toBe('success'); // 切换本身成功（降级只影响快照）
     expect(runtime.snapshotHash).toBe(v1); // 快照保持
     expect(degradationLog().some((rec) => rec.hook === 'lines/rebuild')).toBe(true);
+    expect(runtime.lineSnapshot?.line).toBe('latest'); // 快照/目录未切换
   }, FIXTURE_TIMEOUT);
 });

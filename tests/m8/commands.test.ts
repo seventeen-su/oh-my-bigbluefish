@@ -71,13 +71,15 @@ const mode = (c: FakeCtxResult): CapturedCommand => c.captured.find((x) => x.nam
 const bench = (c: FakeCtxResult): CapturedCommand => c.captured.find((x) => x.name === 'bench')!;
 
 describe('T8.2 /mode 内部版本线切换（单模式；不涉及 DSH 预设切换）', () => {
-  it('切换成功：fake ctx（无 agentPresets 面）→ /mode latest → success 文案含 git_revision/tree_root，不含 recompose/受限', async () => {
+  it('切换成功：fake ctx（无 agentPresets 面）→ /mode stable → success 文案含 git_revision/tree_root，不含 recompose/受限', async () => {
     const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
-    const r = await mode(c).handler(makeInvocation('latest'));
+    // R1：latest 解析 = trusted-latest（真实 versions.git 为旧种子无 trusted-latest → /mode latest fail-loud，
+    // 待启动 ensureThreeLineLayout 自动迁移重建）→ 切换冒烟用 stable（任何种子形态均可加载）
+    const r = await mode(c).handler(makeInvocation('stable'));
     expect(r.kind).toBe('success');
-    expect(r.text).toContain('latest');
+    expect(r.text).toContain('stable');
     expect(r.text).toMatch(/git_revision [0-9a-f]{8}/);
     expect(r.text).toContain('tree_root');
     // 语义移除：成功文案固定为「已切换到版本线 X（git_revision …，tree_root …）」，无 recompose/受限 字样
@@ -85,7 +87,7 @@ describe('T8.2 /mode 内部版本线切换（单模式；不涉及 DSH 预设切
     expect(r.text).not.toContain('受限');
     // 内部版本线状态切换生效（当前线已更新）
     const current = await mode(c).handler(makeInvocation(''));
-    expect(current.text).toContain('当前版本线：latest');
+    expect(current.text).toContain('当前版本线：stable');
   });
 
   it('recompose 零调用：ctx 提供 agentPresets.recompose → 切换成功且 recompose 从未被调用（证明语义移除）', async () => {
@@ -95,9 +97,9 @@ describe('T8.2 /mode 内部版本线切换（单模式；不涉及 DSH 预设切
     (c.ctx as { agentPresets?: { recompose: typeof recompose } }).agentPresets = { recompose };
     apply(c.ctx, { bootstrap: false });
 
-    const r = await mode(c).handler(makeInvocation('latest'));
+    const r = await mode(c).handler(makeInvocation('stable'));
     expect(r.kind).toBe('success');
-    expect(r.text).toContain('latest');
+    expect(r.text).toContain('stable');
     expect(recompose).not.toHaveBeenCalled();
   });
 
@@ -105,7 +107,7 @@ describe('T8.2 /mode 内部版本线切换（单模式；不涉及 DSH 预设切
     const c = makeFakeCtx();
     apply(c.ctx, { bootstrap: false });
 
-    const r = await mode(c).handler(makeInvocation('latest', [{ type: 'turn/start' }]));
+    const r = await mode(c).handler(makeInvocation('stable', [{ type: 'turn/start' }]));
     expect(r.kind).toBe('error');
     expect(r.text).toContain('空白会话');
     // 未切换：当前线保持 stable
@@ -259,14 +261,15 @@ describe('T8.2 /bench 注册与触发', () => {
     }
   });
 
-  it('/mode 切换到 latest 记录版本激活（activationLogDir → completed/<activation_id>.json 含 activation_id/candidate/predecessor；pending 已清空）', async () => {
-    const base = await mkdtemp(join(tmpdir(), 'omb-act-latest-'));
+  it('/mode 切换记录版本激活（activationLogDir → completed/<activation_id>.json 含 activation_id/candidate/predecessor；pending 已清空）', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omb-act-'));
     try {
       const c = makeFakeCtx();
       apply(c.ctx, { activationLogDir: join(base, 'act'), bootstrap: false });
 
-      // 空白会话前置条件（无 turn/start 事件）+ 会话 id → 确定性 activation_id
-      const r = await mode(c).handler(makeInvocation('latest', [], 'sess-act-2'));
+      // R1：真实 versions.git 为旧种子（无 trusted-latest）→ /mode latest fail-loud；激活记录用 stable
+      // （任何种子形态可加载；latest 的 trusted-latest 解析语义由 lines.test.ts/loader.test.ts 覆盖）
+      const r = await mode(c).handler(makeInvocation('stable', [], 'sess-act-2'));
       expect(r.kind).toBe('success');
 
       const completedDir = join(base, 'act', 'completed');
@@ -287,7 +290,7 @@ describe('T8.2 /bench 注册与触发', () => {
         schema: string;
       };
       expect(contract.id).toMatch(/^dsh:evt:[0-9a-f]{64}$/); // activation_id（确定性派生）
-      expect(contract.candidate).toMatch(/^[0-9a-f]{40}$/); // 切换后 latest revision
+      expect(contract.candidate).toMatch(/^[0-9a-f]{40}$/); // 切换后 stable revision
       expect(contract.predecessor).toMatch(/^[0-9a-f]{40}$/); // 切换前 stable revision
       expect(contract.activation_scope).toBe('session');
       expect(contract.schema).toBe('omb/M6');

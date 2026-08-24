@@ -140,6 +140,34 @@ function applyReadOnlyAcl(lay: VersionLayout, dir: string): void {
   throw new Error(`icacls ${dir} 只读 ACL 施加失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
 }
 
+/** 释放只读 ACL：icacls <dir> /reset /T /C（旧种子迁移删除旧 worktree 前置；与 applyReadOnlyAcl 同款锁重试） */
+function resetReadOnlyAcl(dir: string): void {
+  const systemRoot = process.env.SystemRoot;
+  if (systemRoot === undefined || systemRoot.length === 0) {
+    throw new Error('icacls 解析失败：环境变量 SystemRoot 缺失（Windows 上恒存在，请检查运行环境）');
+  }
+  const icacls = path.join(systemRoot, 'System32', 'icacls.exe');
+  let last: unknown;
+  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
+    try {
+      execFileSync(icacls, [dir, '/reset', '/T', '/C'], { encoding: 'utf8', windowsHide: true });
+      return;
+    } catch (err) {
+      last = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
+        break;
+      }
+      if (attempt < LOCK_RETRY_COUNT - 1) {
+        sleepMs(50 * (attempt + 1));
+      }
+    }
+  }
+  const e = last as { status?: number; stderr?: Buffer | string };
+  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
+  throw new Error(`icacls ${dir} 只读 ACL 释放失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
+}
+
 /**
  * 只读探测（实测修正，见报告）：fs.accessSync(dir, W_OK) 在 Windows 上对 Everyone:RX 目录
  * 仍返回"可写"（Node 的 access 检查不完整反映 ACL）→ 用真实写探测：创建探针文件成功 = 可写
@@ -354,7 +382,8 @@ function seedBaseline(lay: VersionLayout, opts: { initBare: boolean }): void {
   }
 
   // 3.5. trusted-latest ← main head（D1 裁决：latest = trusted head 指针；初始 = latest 基线提交。
-  //      仅种子流程创建；修复分支不补（旧布局无 trusted-latest 可继续用，resolveLineCommit 回退 main））
+  //      仅种子流程创建；修复分支不补——旧布局（无 trusted-latest/无 policy）由 ensureThreeLineLayout
+  //      旧种子检测自动迁移重建（R1），不靠修补维持）
   if (!refExists(lay, 'refs/heads/trusted-latest')) {
     const mainHead = runGit(lay, ['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: lay.bareRepo });
     runGit(lay, ['branch', 'trusted-latest', mainHead], { cwd: lay.bareRepo });
@@ -480,13 +509,118 @@ function repairLayout(lay: VersionLayout): boolean {
 }
 
 /**
+ * 旧种子快速预检（纯 fs，健康路径零 git 调用）：trusted-latest 松散 ref 缺失 或 stable worktree
+ * 缺 kernel/policy → 「可能旧种子」（需 git 确认，防 packed-refs/worktree 失效误判）；
+ * 两者皆在 → 非旧种子（新种子特征，零 git 开销直接放行）。
+ */
+function legacySeedHint(lay: VersionLayout): boolean {
+  const hasTrustedLoose = fs.existsSync(path.join(lay.bareRepo, 'refs', 'heads', 'trusted-latest'));
+  const hasPolicyWorktree = fs.existsSync(path.join(lay.stableWorktree, 'kernel', 'policy'));
+  return !hasTrustedLoose || !hasPolicyWorktree;
+}
+
+/**
+ * 旧种子 git 确认（R1 种子自动重建判定）：versions.git 存在且基线引用齐全（initial tag + stable +
+ * main——真实三线旧种子形态）但（a）无 refs/heads/trusted-latest 或（b）stable 分支基线树缺
+ * kernel/policy（P1a 种子特征）→ 旧种子。引用缺失（损坏/空库）→ false（走既有修复路径，不迁移）。
+ */
+function isLegacySeed(lay: VersionLayout): boolean {
+  if (!fs.existsSync(lay.bareRepo)) {
+    return false;
+  }
+  if (
+    !refExists(lay, 'refs/tags/initial') ||
+    !refExists(lay, 'refs/heads/stable') ||
+    !refExists(lay, 'refs/heads/main')
+  ) {
+    return false; // 引用缺失 = 损坏/空库 → 修复分支处理（不触发迁移）
+  }
+  if (refExists(lay, 'refs/heads/trusted-latest')) {
+    // trusted-latest 存在 → 检查 stable 基线树含 kernel/policy（对象级，与 worktree 状态无关）
+    const tree = runGit(lay, ['ls-tree', 'refs/heads/stable', 'kernel/policy'], { cwd: lay.bareRepo });
+    return tree.trim().length === 0;
+  }
+  return true;
+}
+
+/**
+ * 旧种子自动迁移（仅 ensureThreeLineLayout 旧种子判定后调用；幂等由判定保证——重建后不再命中）：
+ * 1. 释放旧正式 worktree 只读 ACL 并删除 stable/ latest/（内容 = 旧种子 commit checkout，对象数据
+ *    保留在备份 bare，不丢失）；
+ * 2. 移动 versions.git → versions.git.legacy-<ts>（保留数据不删除）；
+ * 3. 清理 workspace/.omb/lines/ 旧快照目录与 .evolution/candidates/ 旧候选 worktree
+ *    （指向旧 bare 的 gitfile/注册项，重建后旧 commit 快照失效）；
+ * 4. 走既有完整初始化流程重建新种子（含 policy/processes 快照 + trusted-latest + 只读 ACL + 候选 worktree）；
+ * 5. console.info 中文说明。返回备份目录路径（versions.git.legacy-<ts>）。
+ */
+function migrateLegacySeed(lay: VersionLayout): string {
+  const root = path.dirname(lay.bareRepo);
+  // 1. 释放并删除旧正式 worktree（数据在备份 bare 的对象库，不丢失）
+  for (const wt of [lay.stableWorktree, lay.latestWorktree]) {
+    if (!fs.existsSync(wt)) {
+      continue;
+    }
+    try {
+      resetReadOnlyAcl(wt);
+    } catch {
+      // ACL 释放失败不致命——rmSync force 再试（仍失败则整体 degraded，数据保留）
+    }
+    fs.rmSync(wt, { recursive: true, force: true });
+  }
+  // 2. 移动 versions.git → versions.git.legacy-<ts>
+  const legacy = `${lay.bareRepo}.legacy-${Date.now()}`;
+  fs.renameSync(lay.bareRepo, legacy);
+  // 3. 清理旧快照与旧候选 worktree（指向旧 bare 的 gitfile，重建后失效）
+  const linesDir = path.join(root, 'workspace', '.omb', 'lines');
+  if (fs.existsSync(linesDir)) {
+    fs.rmSync(linesDir, { recursive: true, force: true });
+  }
+  const candidatesDir = path.join(root, 'workspace', '.omb', '.evolution', 'candidates');
+  if (fs.existsSync(candidatesDir)) {
+    for (const name of fs.readdirSync(candidatesDir)) {
+      const dir = path.join(candidatesDir, name);
+      try {
+        const gitfile = path.join(dir, '.git');
+        if (fs.existsSync(gitfile) && fs.statSync(gitfile).isFile()) {
+          // 旧候选 worktree（gitdir 指向已移走的 bare）→ 删除（内容 = 旧提交 checkout，不丢失）
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      } catch {
+        // 单个候选清理失败 → 保留（ensureEvolution 兜底 degraded，新种子主流程不受阻）
+      }
+    }
+  }
+  // 4. 完整初始化重建新种子（含 policy/processes + trusted-latest）
+  seedBaseline(lay, { initBare: true });
+  const still = healthProblem(lay);
+  if (still !== null) {
+    throw new Error(`迁移重建后布局仍不健康：${still}`);
+  }
+  // 5. 记录（中文说明；插件 apply 另经 status 输出「自动修复完成」）
+  console.info(
+    `[omb-v2] 旧种子已自动迁移重建：versions.git → ${legacy}（数据备份保留；新种子含 policy/processes 快照与 trusted-latest）`,
+  );
+  return legacy;
+}
+
+/**
  * 进程内自动初始化/修复三线布局（同步；绝不 throw——失败 → {status:'degraded', detail: 原因}）。
  * 幂等：健康布局重复调用 → 'ok'，零副作用（不产生任何 git 子进程）。
+ * R1：旧种子（无 trusted-latest / 基线缺 kernel/policy）→ 启动时自动备份 versions.git（移动为
+ * versions.git.legacy-<ts>）并重建新种子——先于健康检查（旧种子可能结构健康——worktree/ACL 完好）。
  * @param layout 布局覆盖（测试注入临时 fixture；缺省用真实 preset 布局）
  */
 export function ensureThreeLineLayout(layout?: VersionLayout): LayoutBootstrapResult {
   const lay = layout ?? defaultLayout();
   try {
+    // R1 旧种子自动迁移（仅启动时调用面执行；幂等：重建后新种子不再命中判定；修复分支不触发迁移）
+    if (fs.existsSync(lay.bareRepo) && legacySeedHint(lay) && isLegacySeed(lay)) {
+      const legacy = migrateLegacySeed(lay);
+      return {
+        status: 'repaired',
+        detail: `旧种子已自动迁移重建（versions.git → ${legacy} 备份保留；新种子含 policy/processes 快照与 trusted-latest）`,
+      };
+    }
     const problem = healthProblem(lay);
     if (problem === null) {
       return { status: 'ok', detail: '三线布局完整（versions.git 引用/正式 worktree/只读 ACL 均正常）' };

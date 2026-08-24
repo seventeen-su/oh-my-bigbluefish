@@ -1,8 +1,8 @@
 // P1a 行为测试：lines 按线加载机制（substrate/lines.ts，D1 裁决：版本化目录 + 提交级快照）。
 // 真实 git 操作（禁 mock）：独立临时 fixture（升级后的 buildLayoutFixture——种子含 kernel/policy +
 // kernel/processes 快照 + trusted-latest 分支）上做全部断言，绝不触碰真实布局。
-// 覆盖：三线指针解析 / latest 回退 main / initial fail-loud / 物化（字节保真 + 幂等 + 不同 commit 不同目录）/
-// 指针（原子写 + 读回 + ensure 幂等）/ 种子升级断言（fixture 与 ensureThreeLineLayout 等价）/
+// 覆盖：三线指针解析 / latest 缺失 fail-loud（R1：不再回退 main）/ initial fail-loud / 物化（字节保真 + 幂等 +
+// 不同 commit 不同目录）/ 指针（原子写 + 读回 + ensure 幂等）/ 种子升级断言（fixture 与 ensureThreeLineLayout 等价）/
 // 装配注入（createCognitiveRuntime 按线注入 lines 目录 + 缺失回退仓库默认 + 显式目录优先）。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -102,23 +102,21 @@ describe('resolveLineCommit：三线指针解析（升级后 fixture）', () => 
     );
   });
 
-  it('latest 回退：删除 trusted-latest ref → 回退 refs/heads/main（兼容旧布局）', () => {
+  it('latest 缺失 fail-loud：删除 trusted-latest ref（main 仍存在）→ 抛错（R1 不再回退 main，消息含 ref 与重建指引）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/heads/trusted-latest'], { cwd: fx.bare });
-    expect(resolveLineCommit(lay, 'latest')).toBe(fx.latestHash); // main = latest 基线
-    // 与 main 引用一致
-    expect(resolveLineCommit(lay, 'latest')).toBe(
-      runGit(['rev-parse', '--verify', 'refs/heads/main^{commit}'], { cwd: fx.bare }),
-    );
+    expect(() => resolveLineCommit(lay, 'latest')).toThrow(/refs\/heads\/trusted-latest/);
+    // main 仍可解析（未回退——latest 权威 = trusted-latest，缺失即 fail-loud）
+    expect(() => resolveLineCommit(lay, 'latest')).toThrow(/init-three-line|自动重建/);
   });
 
-  it('latest 回退再缺失：trusted-latest 与 main 均不可解析 → 抛错（消息含两个引用）', () => {
+  it('latest 与 main 均缺失：仍抛错（消息含 refs/heads/trusted-latest）', () => {
     fx = buildLayoutFixture();
     const lay = layoutFor(fx);
     runGit(['update-ref', '-d', 'refs/heads/trusted-latest'], { cwd: fx.bare });
     runGit(['update-ref', '-d', 'refs/heads/main'], { cwd: fx.bare });
-    expect(() => resolveLineCommit(lay, 'latest')).toThrow(/refs\/heads\/trusted-latest.*refs\/heads\/main|refs\/heads\/main.*refs\/heads\/trusted-latest/);
+    expect(() => resolveLineCommit(lay, 'latest')).toThrow(/refs\/heads\/trusted-latest/);
   });
 
   it('initial fail-loud：删除 initial tag → 抛错（消息含 refs/tags/initial；tag 无回退）', () => {

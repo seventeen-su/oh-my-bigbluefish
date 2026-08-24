@@ -1243,7 +1243,8 @@ export class CognitiveRuntime {
       }
       const layout = this.assemblyOpts.layout ?? defaultLayout();
       // 旧布局检测（D1 裁决特征）：trusted-latest 分支缺失（P1d 候选晋升后才存在）→ 晋升检查降级跳过——
-      // 防在无 trusted-latest 的旧种子布局上对真实 versions.git 误判/误写（resolveLineCommit 会回退 main）
+      // 防在无 trusted-latest 的旧种子布局上对真实 versions.git 误判/误写（R1：resolveLineCommit('latest')
+      // 缺失即 fail-loud——先探测防误写；旧种子由启动 ensureThreeLineLayout 自动迁移重建）
       try {
         runGit(layout, ['show-ref', '--verify', 'refs/heads/trusted-latest']);
       } catch {

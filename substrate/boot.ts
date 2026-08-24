@@ -144,8 +144,9 @@ export async function bootStable(opts: BootOptions = {}): Promise<BootResult> {
     warn({ kind: 'stable_damaged', detail: `版本线 ${line} 启动校验失败: ${detail}` });
   }
 
-  // 自动回退：stable/latest 为分支（可 update-ref 切换）；initial 是 tag → 无分支可回退
-  const branch = line === 'stable' ? 'stable' : line === 'latest' ? 'main' : null;
+  // 自动回退：stable/latest 为分支（可 update-ref 切换）；initial 是 tag → 无分支可回退。
+  // R1：latest 的分支引用 = trusted-latest（trusted head 指针，不再回退 main）
+  const branch = line === 'stable' ? 'stable' : line === 'latest' ? 'trusted-latest' : null;
   if (branch === null) {
     warn({ kind: 'no_recovery', detail: `版本线 ${line} 为 tag（initial），无分支引用可自动回退` });
     return { ok: false, line, git_revision: '', tree_root: '', warnings };
