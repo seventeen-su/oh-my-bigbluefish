@@ -13,7 +13,7 @@
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, isVersionLine, loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
-import { bootStable } from '../substrate/boot.js';
+import { bootStable, type BootOptions, type BootResult } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 import { loadBenchContractsV2, loadBenchFixturesV2, makeReplayExecutorV2, runBenchV2, type BenchExecutorV2 } from '../supervisor/bench-v2.js';
@@ -64,6 +64,9 @@ export interface PluginConfig {
   /** 固定初始版本线（缺省 stable；后备/兼容机制 scripts/deploy-lines.ts 生成的 per-line 预设
    *  （omb-v2-initial/stable/latest）在 agent.cordis.yml 注入本配置固定本线初始版本线） */
   line?: VersionLine;
+  /** R2 启动竞态修复：boot 入口注入（最小可测性注入面——测试注入延迟 resolve / 失败 boot；
+   *  缺省真实 bootStable）。语义等同 bootStable(opts)：ok:true / ok:false（无恢复路径）/ rollback。 */
+  bootStableOverride?: (opts?: BootOptions) => Promise<BootResult>;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -245,6 +248,13 @@ export interface ApplyResult {
   cognitive?: CognitiveRuntimeLike;
 }
 
+/**
+ * R2 启动竞态修复：bootReady resolve 载荷（受控 promise——认知 gate 与降级记录共用）。
+ * bootStable 的认知 gate 子集：最终是否可用（回退后仍不可加载/无恢复路径 → false）、
+ * 校验版本线、告警记录、自动回退详情。bootStable 异常 → ok:false 兜底（不 reject）。
+ */
+export type BootReady = Pick<BootResult, 'ok' | 'line' | 'warnings' | 'rollback'>;
+
 export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   // 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」）：versions.git/stable/latest
   // 均 gitignored、不随仓库分发 → 项目被分享（clone/拷贝）后布局缺失/损坏/ACL 丢失 →
@@ -274,19 +284,45 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
     }
   }
-  // 恢复根启动完整性校验（架构 §3/§11.4；T8.1 生产接线补全）：stable 引用/内容损坏 →
-  // bootStable 自动沿历史回退到上一完好快照。apply 为同步契约，bootStable 异步 fire-and-forget
-  //（先于认知装配发起；回退成功/失败均记录降级，命令仍可用——不阻塞挂载）。
-  void bootStable().then((r) => {
+  // R2（P0）启动顺序竞态修复：恢复根启动完整性校验升级为受控 promise（bootReady）。
+  // 背景（ChatGPT 评估 #2）：bootStable 异步后台执行期间 CognitiveRuntime 已按（可能损坏的）
+  // stable 装配——恢复根最终运行 Vn、认知已按损坏 Vm 装配。修复原则：**恢复完成以前，
+  // 认知运行时不得进入可服务状态**。方案：gate（装配结构不动，钩子内部 gate——改动面最小）——
+  // 认知服务入口（prepareTurn/observeEvent/finalizeTurn 三钩子 + /mode 认知部分 + /evolve）统一经
+  // cognitiveServiceable() 等待 bootReady settle；boot 失败（无恢复路径）→ 认知降级为仅命令模式
+  // （一次性认知侧降级记录 'cognitive/boot'），命令仍可用。apply 为同步契约，boot 仍异步后台执行，
+  // 但不再 fire-and-forget：bootReady 为受控句柄（resolve 载荷 { ok, line, warnings, rollback? }）。
+  const boot = config.bootStableOverride ?? bootStable;
+  const bootReady: Promise<BootReady> = boot().then((r) => {
     if (r.ok === false) {
       recordDegradation('boot/stable', `启动校验失败：版本线 ${r.line} 无恢复路径（${r.warnings.map((w) => w.kind).join(',')}）`);
     } else if (r.rollback !== undefined) {
       recordDegradation('boot/stable', `启动自动回退：${r.rollback.previous_head.slice(0, 8)} → ${r.rollback.new_head.slice(0, 8)}（worktree ${r.rollback.worktree_status}）`);
     }
+    return { ok: r.ok, line: r.line, warnings: r.warnings, rollback: r.rollback };
   }).catch((err) => {
     const detail = err instanceof Error ? err.message : String(err);
     recordDegradation('boot/stable', `启动校验异常（${detail}）——跳过自动回退`);
+    return { ok: false, line: 'stable', warnings: [], rollback: undefined };
   });
+
+  /**
+   * R2 boot gate：恢复完成前认知运行时不得进入可服务状态——认知服务入口统一 await 本 gate。
+   * boot settle 前 → 等待（事件/请求暂存，恢复完成后处理）；boot 失败（无恢复路径）→ 返回 false
+   *（认知降级为仅命令模式；认知侧降级一次性记录）。命令（/mode 空输入等）不经本 gate——仍可用。
+   */
+  let bootGateDegraded = false;
+  const cognitiveServiceable = async (): Promise<boolean> => {
+    const bootState = await bootReady;
+    if (bootState.ok) {
+      return true;
+    }
+    if (!bootGateDegraded) {
+      bootGateDegraded = true;
+      recordDegradation('cognitive/boot', `启动校验失败（版本线 ${bootState.line} 无恢复路径）——认知运行时降级：仅命令模式，不进入服务`);
+    }
+    return false;
+  };
   // T8.3：认知系统装配进插件生命周期——经 deps 注入（get('cognitive')，组合根模式）或
   // 组合根缺省装配（runtime/assembly.ts；装配根 = config.cognitiveRoot）。
   // 未提供装配根 → 仅注册命令（认知装配为可选配置面，生产经 agent.cordis.yml config 接线）。
@@ -438,15 +474,18 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         });
       }
       if (cognitive !== undefined && typeof sessionId === 'string' && sessionId.length > 0) {
-        await cognitive.eventStore.append(makeDshEvent(
-          'activation/committed',
-          sessionId,
-          cognitive.snapshotHash,
-          { activation_id: activationId, line, previous_line: previous, git_revision: snap.git_revision },
-          'mode',
-          undefined,
-          activationId,
-        ));
+        // R2 boot gate：激活事件入链等待 bootReady；boot 失败 → 事件不入链（激活记录落盘路径不受影响）
+        if (await cognitiveServiceable()) {
+          await cognitive.eventStore.append(makeDshEvent(
+            'activation/committed',
+            sessionId,
+            cognitive.snapshotHash,
+            { activation_id: activationId, line, previous_line: previous, git_revision: snap.git_revision },
+            'mode',
+            undefined,
+            activationId,
+          ));
+        }
       }
       if (logDir !== undefined) {
         writeCompleted(logDir, activationId, contract);
@@ -506,6 +545,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     if (runtime === undefined) {
       return;
     }
+    // R2 boot gate：恢复完成前认知不进入服务——boot 失败 → 收尾跳过（认知降级为仅命令模式）
+    if (!(await cognitiveServiceable())) {
+      return;
+    }
     if (!pendingFinalize.has(sessionId) && !preparedTurns.has(sessionId)) {
       return; // 无收尾状态（无 prepare/无 turn 结束）→ 不虚构收尾
     }
@@ -556,19 +599,23 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           return; // 防重入：同一会话的并发 assembly 只跑一次 prepare
         }
         preparing.add(sessionId);
-        // 请求间隙维护小量子（生产装配）：下一请求开始前执行 1 个待维护任务
-        //（turn 收尾入队 → 本 turn 结束 → 下 turn 准备前按债务/优先级执行；无调度器 → 跳过）
-        const m = cognitive?.maintenance;
-        if (m !== undefined && m !== null) {
-          void m.requestQuantum().catch((err) => {
-            const detail = err instanceof Error ? err.message : String(err);
-            recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
-          });
-        }
         // goal 来源：插件自身会话追踪（session/event 已观察到的最近人类指令）优先，assembleCtx 事件兜底
         const goal = traces.get(sessionId)?.lastGoal ?? lastUserMessageText(agent?.session?.events);
         const request = buildRequestFromSession(sessionId, goal);
         void (async () => {
+          // R2 boot gate：恢复完成前认知不进入服务——等待 bootReady；boot 失败 → 本轮无投影（命令仍可用）
+          if (!(await cognitiveServiceable())) {
+            return;
+          }
+          // 请求间隙维护小量子（生产装配）：下一请求开始前执行 1 个待维护任务
+          //（turn 收尾入队 → 本 turn 结束 → 下 turn 准备前按债务/优先级执行；无调度器 → 跳过）
+          const m = cognitive?.maintenance;
+          if (m !== undefined && m !== null) {
+            void m.requestQuantum().catch((err) => {
+              const detail = err instanceof Error ? err.message : String(err);
+              recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
+            });
+          }
           // T8.26.5 惰性收尾（无 flush 触发时的退化路径）：先收尾上一 turn，再准备本 turn
           if (pendingFinalize.has(sessionId)) {
             await finalizePendingTurn(sessionId, goal);
@@ -627,12 +674,18 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         const prev = traces.get(sessionId) ?? initialTraceState();
         const mapped = mapSessionEvent(sessionId, dshEvent as never, runtime.snapshotHash, prev);
         traces.set(sessionId, mapped.state);
-        for (const ev of mapped.events) {
-          void runtime.observeEvent(ev).catch((err) => {
-            const detail = err instanceof Error ? err.message : String(err);
-            recordDegradation('session/event', `observeEvent 失败（${detail}）——事件已记录降级`);
-          });
-        }
+        // R2 boot gate：恢复完成前认知不进入服务——观察入链等待 bootReady；boot 失败 → 事件不入链
+        void (async () => {
+          if (!(await cognitiveServiceable())) {
+            return;
+          }
+          for (const ev of mapped.events) {
+            void runtime.observeEvent(ev).catch((err) => {
+              const detail = err instanceof Error ? err.message : String(err);
+              recordDegradation('session/event', `observeEvent 失败（${detail}）——事件已记录降级`);
+            });
+          }
+        })();
         // T8.26.5：turn/end = turn 事实关闭 → 标记待收尾（flush 或下一次 prepareTurn 触发 finalizeTurn）
         if ((dshEvent as { type?: unknown } | undefined)?.type === 'turn/end') {
           pendingFinalize.add(sessionId);
@@ -661,10 +714,16 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           return;
         }
         const ev = mapLiveToolResult(sessionId, exec, result, runtime.snapshotHash);
-        void runtime.observeEvent(ev).catch((err) => {
-          const detail = err instanceof Error ? err.message : String(err);
-          recordDegradation('tools/result', `observeEvent 失败（${detail}）——工具结果 live 信号降级`);
-        });
+        // R2 boot gate：恢复完成前认知不进入服务——live 信号入链等待 bootReady；boot 失败 → 不入链
+        void (async () => {
+          if (!(await cognitiveServiceable())) {
+            return;
+          }
+          await runtime.observeEvent(ev).catch((err) => {
+            const detail = err instanceof Error ? err.message : String(err);
+            recordDegradation('tools/result', `observeEvent 失败（${detail}）——工具结果 live 信号降级`);
+          });
+        })();
       });
     } else {
       recordDegradation('cognitive-runtime', '认知运行时未装配——事件不采集（命令仍可用）');
@@ -688,18 +747,22 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         onSwitch: async (line) => {
           const previous = current;
           current = line;
-          // P1b：切换后重建运行时快照（新线物化 → 新快照 → registry.promote → 下一请求生效，D1⑤：
-          // 请求运行于「线 stable + commit a81f + 快照 rs:7c91」而非模糊的「我现在应该是 stable」）。
-          // 失败降级：物化失败 → 记录降级，当前快照保持（切换状态仍生效，快照不变）。
-          if (cognitive !== undefined && typeof cognitive.rebuildSnapshotForLine === 'function') {
-            try {
-              const r = cognitive.rebuildSnapshotForLine(line);
-              if (r.degraded !== null && r.degraded !== undefined) {
-                recordDegradation('lines/rebuild', r.degraded);
+          // R2 boot gate：恢复完成前认知不进入服务——快照重建等待 bootReady；boot 失败 → 认知部分
+          // 跳过（切换本身已生效——命令仍可用）
+          if (await cognitiveServiceable()) {
+            // P1b：切换后重建运行时快照（新线物化 → 新快照 → registry.promote → 下一请求生效，D1⑤：
+            // 请求运行于「线 stable + commit a81f + 快照 rs:7c91」而非模糊的「我现在应该是 stable」）。
+            // 失败降级：物化失败 → 记录降级，当前快照保持（切换状态仍生效，快照不变）。
+            if (cognitive !== undefined && typeof cognitive.rebuildSnapshotForLine === 'function') {
+              try {
+                const r = cognitive.rebuildSnapshotForLine(line);
+                if (r.degraded !== null && r.degraded !== undefined) {
+                  recordDegradation('lines/rebuild', r.degraded);
+                }
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                recordDegradation('lines/rebuild', `快照重建异常（${detail}）——当前快照保持`);
               }
-            } catch (err) {
-              const detail = err instanceof Error ? err.message : String(err);
-              recordDegradation('lines/rebuild', `快照重建异常（${detail}）——当前快照保持`);
             }
           }
           // T8.7 生产接线：版本线激活记录——activation/committed 事件入链（认知装配时）+
@@ -810,6 +873,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         }
         if (typeof runtime.runEvolutionNow !== 'function') {
           return { kind: 'error', text: '运行时未实现演化判定（runEvolutionNow 缺失）' };
+        }
+        // R2 boot gate：恢复完成前认知不进入服务——等待 bootReady；boot 失败 → /evolve 不可用（仅命令模式）
+        if (!(await cognitiveServiceable())) {
+          return { kind: 'error', text: '启动恢复未完成/失败——认知运行时降级（仅命令模式），/evolve now 不可用' };
         }
         const sessionId = (invocation.agent.session as { id?: string } | undefined)?.id ?? 'anon';
         const r = await runtime.runEvolutionNow({ session_id: sessionId });
