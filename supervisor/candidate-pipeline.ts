@@ -29,6 +29,9 @@ import { load as parseYaml } from 'js-yaml';
 import { GIT_BIN, type VersionLayout } from '../substrate/snapshot.js';
 import { resolveLineCommit } from '../substrate/lines.js';
 import { createCandidateDir, runRestricted, sandboxStatus, type SandboxStatus } from '../substrate/sandbox.js';
+// S9：dynamicCordisRunner 候选验证增强通道（宿主面存在 → 候选验证脚本经 runner 动态定义/运行/回退；
+// 缺失/部分缺失/通道失败 → 降级回退受限子进程路径——接口守卫与通道见 dynamic-runner.ts）
+import { inspectDynamicRunner, runCandidateViaRunner, type DynamicCordisRunnerLike } from './dynamic-runner.js';
 import { canonicalJson, makeImmutableId, makeMutableId } from '../kernel/schemas/base.js';
 // R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层例外，supervisor(1) → kernel/schemas/ ✓）
 import { hostVersion } from '../kernel/schemas/host-version.js';
@@ -93,8 +96,22 @@ export interface G3ExecGateResult extends GateResult {
   kind: 'exec' | 'na' | 'degraded';
   /** 降级原因（kind='degraded' 时非空；机器可读） */
   degraded?: string;
-  /** 受限执行结果（kind='exec' 时；code/timedOut） */
+  /** 受限执行结果（kind='exec' 且走受限子进程路径时；code/timedOut） */
   exec?: { code: number | null; timedOut: boolean };
+  /** S9：dynamicCordisRunner 通道执行详情（kind='exec' 且经 runner 通道时；受限子进程路径无此字段） */
+  runner?: {
+    pluginId: string;
+    packageId: string;
+    pluginRunId: string;
+    /** invoke 读取的脚本裁决（结果读取契约：host 半 harness.handle('verify', handler)） */
+    verdict: { ok: boolean; detail: string };
+    /** 回滚记录：stop（回退 dispose）是否成功 */
+    stopped: boolean;
+    /** 回滚记录：undefine（先停后忘）是否成功 */
+    undefined: boolean;
+  };
+  /** S9：runner 通道失败 → 降级回退受限子进程路径的记录（无 → 未走回退） */
+  runnerFallback?: string;
 }
 
 /** 冻结基准 fitness 对照（§6.5.3：passed 不降 + 成本代理不显著劣化；门禁判定数据化） */
@@ -128,6 +145,10 @@ export interface DataCandidateValidationDeps {
   candidateRoot?: string;
   /** 受限通道可用性探测（P3/D5 降级注入：缺省真实 sandboxStatus；测试注入不可用模拟） */
   sandboxStatus?: () => SandboxStatus;
+  /** S9：dynamicCordisRunner 注入面（宿主 ctx.dynamicCordisRunner 结构最小面；缺失/部分缺失 → 守卫降级受限子进程路径） */
+  dynamicRunner?: DynamicCordisRunnerLike;
+  /** S9：会话归属（runner 通道 define.sessionId/agent.id 契约；缺省 'anon'） */
+  sessionId?: string;
 }
 
 /** 晋升依赖（§3.2 事务 + §6.5.4 对象 + 实现规格 §10 幂等） */
@@ -442,15 +463,21 @@ async function runG3(draft: CandidateDraft, deps: DataCandidateValidationDeps): 
 }
 
 /**
- * G3-exec（执行型验证门，P3 接线；设计 §3.4 + D5 降级裁决）：
+ * G3-exec（执行型验证门，P3 接线 + S9 dynamicCordisRunner 增强通道；设计 §3.4 + §4.5 混合路线 + D5 降级裁决）：
  * 候选附执行型验证脚本（draft.verify.script；当前 L0 数据候选无脚本 → N/A 标记「无执行型验证内容」，
- * L1 代码候选未来复用）→ 候选验证环境（createCandidateDir：基线 policy 物化副本 + 候选覆盖 +
- * verify.cjs 宿主写入——白名单固定名，仅候选目录内）→ WRITE_RESTRICTED 受限通道执行
- * （cwd=候选目录，writableDirs=[结果目录]，结果文件经 OMB_SANDBOX_RESULT_FILE 回传——受限进程
- * 不能管道捕获孙进程输出 → 结果文件方案）→ 宿主读结果 JSON 判定（{ok, detail} 契约）+ 沙盒语义
- * 验证（脚本尝试写候选目录必须被拒；宿主侧执行前后快照比对——候选目录被改 → 沙盒失效 fail-closed 拒绝）。
- * 降级（D5）：受限通道不可用（sandboxStatus 注入/真实）或受限执行异常 → kind='degraded' 记录跳过，
- * 不阻塞 G1/G3-replay 判定，门禁语义保持。
+ * L1 代码候选未来复用）。两条执行通道：
+ *   1. dynamicCordisRunner 通道（S9，宿主面存在且守卫通过时优先）：候选验证脚本 = Cordis host 半包——
+ *      define（无副作用登记，host-only → run 无人工审批往返）→ run（生效）→ invoke verify（结果读取契约：
+ *      host 半 harness.handle('verify', handler)）→ stop（回退 dispose）→ undefine（先停后忘）。
+ *      verdict.ok=false（脚本报告失败）≠ 通道失败——按受限路径同语义拒绝候选。
+ *      通道失败（define/run/invoke 抛错或拒绝）→ 记录 runnerFallback → 回退受限子进程路径。
+ *   2. 受限子进程路径（既有行为，零变化）：候选验证环境（createCandidateDir：基线 policy 物化副本 +
+ *      候选覆盖 + verify.cjs 宿主写入——白名单固定名，仅候选目录内）→ WRITE_RESTRICTED 受限通道执行
+ *      （cwd=候选目录，writableDirs=[结果目录]，结果文件经 OMB_SANDBOX_RESULT_FILE 回传——受限进程
+ *      不能管道捕获孙进程输出 → 结果文件方案）→ 宿主读结果 JSON 判定（{ok, detail} 契约）+ 沙盒语义
+ *      验证（脚本尝试写候选目录必须被拒；宿主侧执行前后快照比对——候选目录被改 → 沙盒失效 fail-closed 拒绝）。
+ * 降级（D5）：两通道均不可用（runner 缺失/部分缺失/通道失败 + 受限通道不可用（sandboxStatus 注入/真实）
+ * 或受限执行异常）→ kind='degraded' 记录跳过，不阻塞 G1/G3-replay 判定，门禁语义保持。
  */
 async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDeps): Promise<G3ExecGateResult> {
   if (draft.verify === undefined) {
@@ -462,14 +489,67 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
         'G3-exec N/A（L0 数据候选无执行型验证脚本——受限执行通道就绪，候选未附带验证内容；L1 代码候选未来复用）',
     };
   }
+
+  // ---- S9：dynamicCordisRunner 增强通道（宿主面存在且守卫通过 → 优先；失败 → 回退受限子进程路径） ----
+  let runnerFallback: string | undefined;
+  if (deps.dynamicRunner !== undefined) {
+    const guard = inspectDynamicRunner(deps.dynamicRunner);
+    if (guard.available) {
+      try {
+        const outcome = await runCandidateViaRunner({
+          runner: deps.dynamicRunner,
+          sessionId: deps.sessionId ?? 'anon',
+          name: `verify-${candidateDirName(draft.id)}`,
+          purpose: 'OMB 候选验证（dynamicCordisRunner 通道）',
+          script: draft.verify.script,
+        });
+        if (outcome.ok) {
+          const runnerDetail = {
+            pluginId: outcome.pluginId!,
+            packageId: outcome.packageId!,
+            pluginRunId: outcome.pluginRunId!,
+            verdict: outcome.verdict!,
+            stopped: outcome.stopped,
+            undefined: outcome.undefined,
+          };
+          const detailText = outcome.verdict?.detail ?? '';
+          if (outcome.verdict?.ok === true) {
+            return {
+              gate: 'G3',
+              ok: true,
+              kind: 'exec',
+              runner: runnerDetail,
+              detail: `G3-exec 通过: dynamicCordisRunner 通道执行 OK（define→run→invoke verify→stop→undefine；verdict=${detailText}）`,
+            };
+          }
+          // verdict.ok=false（脚本报告失败）≠ 通道失败——脚本已执行并给出裁决，按受限路径同语义拒绝候选
+          return {
+            gate: 'G3',
+            ok: false,
+            kind: 'exec',
+            runner: runnerDetail,
+            detail: `G3-exec 拒绝: 验证脚本报告失败（${detailText}）——dynamicCordisRunner 通道`,
+          };
+        }
+        // 通道失败 → 降级回退受限子进程路径 + 记录
+        runnerFallback = `dynamicCordisRunner 通道失败（${outcome.reason ?? '未知原因'}）→ 回退受限子进程路径`;
+      } catch (err) {
+        runnerFallback = `dynamicCordisRunner 通道异常（${(err as Error).message}）→ 回退受限子进程路径`;
+      }
+    } else {
+      runnerFallback = `dynamicCordisRunner 守卫降级（${guard.reason ?? '未知原因'}）→ 回退受限子进程路径`;
+    }
+  }
+
+  // ---- 受限子进程路径（既有行为；runner 通道缺失/失败时回退至此） ----
   const status = (deps.sandboxStatus ?? sandboxStatus)();
   if (!status.available) {
     return {
       gate: 'G3',
       ok: true,
       kind: 'degraded',
-      degraded: status.reason ?? '受限通道不可用',
-      detail: `G3-exec 跳过（受限通道不可用：${status.reason ?? '未知原因'}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+      degraded: [status.reason ?? '受限通道不可用', runnerFallback].filter(Boolean).join('；'),
+      detail: `G3-exec 跳过（受限通道不可用：${status.reason ?? '未知原因'}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
     };
   }
   const name = candidateDirName(draft.id);
@@ -548,7 +628,7 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
       ok: true,
       kind: 'exec',
       exec,
-      detail: `G3-exec 通过: 受限通道执行 OK（code=${exec.code}）+ 结果文件回传（${detailText}）+ 沙盒语义验证（候选目录写拒绝）`,
+      detail: `G3-exec 通过: 受限通道执行 OK（code=${exec.code}）+ 结果文件回传（${detailText}）+ 沙盒语义验证（候选目录写拒绝）${runnerFallback !== undefined ? `；${runnerFallback}` : ''}`,
     };
   } catch (err) {
     // D5：受限执行异常（Win32 失败等）→ 降级记录，不阻塞门禁语义
@@ -556,8 +636,8 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
       gate: 'G3',
       ok: true,
       kind: 'degraded',
-      degraded: (err as Error).message,
-      detail: `G3-exec 跳过（受限执行异常：${(err as Error).message}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+      degraded: [(err as Error).message, runnerFallback].filter(Boolean).join('；'),
+      detail: `G3-exec 跳过（受限执行异常：${(err as Error).message}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
     };
   } finally {
     cand.cleanup();
@@ -970,6 +1050,8 @@ export async function runCandidatePipeline(
     contractsDir: deps.contractsDir,
     fixturesDir: deps.fixturesDir,
     shadowLogPath: deps.shadowLogPath,
+    dynamicRunner: deps.dynamicRunner,
+    sessionId: deps.sessionId,
   });
   if (!vr.passed) {
     return { ...base, validated: false, gates: vr.gates, promoted: false, reason: `验证失败: ${vr.reason}` };
