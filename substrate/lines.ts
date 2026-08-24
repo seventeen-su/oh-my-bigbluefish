@@ -97,6 +97,19 @@ function pointerPath(layout: VersionLayout, line: VersionLine): string {
 }
 
 /**
+ * 引用存在性静默探测（`show-ref --verify --quiet`：缺失引用 exit 非 0 且**无 stderr**——
+ * 避免失败路径把 `fatal: Needed a single revision` 泄漏到进程 stderr（/mode 切换中断提示噪声源））。
+ */
+function refExists(layout: VersionLayout, ref: string): boolean {
+  try {
+    runGit(layout, ['show-ref', '--verify', '--quiet', ref]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 解析版本线指针 → 完整 commit hash（40 位 hex）。
  * - initial：tag 缺失/不可解析 → 抛错（fail-loud，initial 为永久基线不可回退）；
  * - stable：分支缺失 → 抛错；
@@ -108,20 +121,17 @@ export function resolveLineCommit(layout: VersionLayout, line: VersionLine): str
   if (ref === undefined) {
     throw new Error(`未知版本线 "${String(line)}"：合法值为 ${VALID_LINES.join(' | ')}`);
   }
+  if (line === 'latest' && !refExists(layout, ref)) {
+    if (refExists(layout, LATEST_FALLBACK_REF)) {
+      return runGit(layout, ['rev-parse', '--verify', `${LATEST_FALLBACK_REF}^{commit}`]);
+    }
+    throw new Error(
+      `版本线 "latest" 引用缺失或不可解析（${ref} 与 ${LATEST_FALLBACK_REF} 均不可用）：请检查 versions.git（${layout.bareRepo}）`,
+    );
+  }
   try {
     return runGit(layout, ['rev-parse', '--verify', `${ref}^{commit}`]);
   } catch (err) {
-    if (line === 'latest') {
-      try {
-        return runGit(layout, ['rev-parse', '--verify', `${LATEST_FALLBACK_REF}^{commit}`]);
-      } catch {
-        // main 也不可解析 → 落入下方合并报错（主因 = trusted-latest 缺失/损坏）
-      }
-      throw new Error(
-        `版本线 "latest" 引用缺失或不可解析（${ref} 与 ${LATEST_FALLBACK_REF} 均不可用）：请检查 versions.git（${layout.bareRepo}）`,
-        { cause: err },
-      );
-    }
     throw new Error(
       `版本线 "${line}" 引用缺失或不可解析（${ref}）：请检查 versions.git（${layout.bareRepo}）`,
       { cause: err },
