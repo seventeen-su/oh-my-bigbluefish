@@ -13,7 +13,7 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { cpus, totalmem } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
-import { GIT_BIN, defaultLayout, runGit } from '../substrate/snapshot.js';
+import { GIT_BIN, VALID_LINES, defaultLayout, runGit } from '../substrate/snapshot.js';
 import { ensureLineSnapshot, isVersionLine, resolveLineCommit, type VersionLine, type VersionLayout } from '../substrate/lines.js';
 import {
   createSnapshot,
@@ -23,11 +23,11 @@ import {
 } from '../supervisor/versioning.js';
 import { computeComponentHashes, computeDirContentHash } from './snapshot-hash.js';
 import { makeMutableId } from '../kernel/schemas/base.js';
-import type { Fingerprint } from '../kernel/schemas/base.js';
+import type { Fingerprint, Scope } from '../kernel/schemas/base.js';
 // R6：宿主版本唯一来源注入面（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
 import { hostVersion, setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
-import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot } from '../kernel/schemas/m.js';
+import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type MemoryKind } from '../kernel/schemas/m.js';
 import { StateSchema, type State, type SelfModel, type WorldModel } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
@@ -36,7 +36,7 @@ import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveC
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
 import { reduce, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
-import { retrieve, type RankedMemory } from '../memory/retrieve.js';
+import { retrieve, type RankedMemory, type RetrieveQuery } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput, type ProcessDecisionInfo } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
@@ -84,7 +84,11 @@ import {
   loadBenchFixturesV2,
   makeReplayExecutorV2,
   runBenchV2,
+  type BenchExecutorV2,
 } from '../supervisor/bench-v2.js';
+import { makeRealExecutorV2 } from '../supervisor/real-executor.js';
+import { makeJudgeV2 } from '../supervisor/judge.js';
+import type { BenchFixtureV2, BenchLine } from '../kernel/schemas/bench.js';
 // S1：基准明细目录（WorldModel bench 状态查询——最近 real/replay 报告存在性）
 import { BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 // P2：组件注册表装配（实现落 supervisor 层 1——runtime(2) 持有注册表，层 DAG 禁 runtime → components，
@@ -130,6 +134,25 @@ const DEGRADED_COMPONENTS: ComponentHashes = {
 
 function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** S5：记忆 payload 摘要（JSON 对象取常见文本字段；否则原样截断——kern_memory 条目 snippet） */
+function memorySnippet(payload: string, max = 120): string {
+  try {
+    const obj = JSON.parse(payload) as unknown;
+    if (obj !== null && typeof obj === 'object') {
+      const rec = obj as Record<string, unknown>;
+      for (const key of ['content', 'text', 'summary', 'goal', 'question', 'detail', 'note']) {
+        const v = rec[key];
+        if (typeof v === 'string' && v.length > 0) {
+          return v.length > max ? `${v.slice(0, max)}…` : v;
+        }
+      }
+    }
+  } catch {
+    // payload 非 JSON → 原样截断
+  }
+  return payload.length > max ? `${payload.slice(0, max)}…` : payload;
 }
 
 /**
@@ -411,6 +434,54 @@ interface LineDirResolution {
   lineDegraded: string | null;
 }
 
+/** S5：kern_bench 数据源结果（v2 契约基准摘要；失败 ok:false + detail——kern-tools.ts 桥消费） */
+export interface BenchV2ToolResult {
+  ok: boolean;
+  line: BenchLine;
+  mode: 'real' | 'replay';
+  passed: number;
+  total: number;
+  judge_enabled: boolean;
+  judge_run: number;
+  judge_degraded: number;
+  judge_rate: number;
+  persisted: boolean;
+  detail?: string;
+}
+
+/** S5：kern_switch 数据源结果（版本线切换执行摘要；无 /mode 空白会话守卫——见 switchLine 方法注释） */
+export interface SwitchLineToolResult {
+  ok: boolean;
+  text: string;
+  previous_line: string;
+  line: string;
+  /** 快照是否已重建（false = 切换状态生效但快照保持——降级见 degraded） */
+  rebuilt: boolean;
+  degraded: string | null;
+  /** 激活记录事件入链数（尽力而为） */
+  events_appended: number;
+}
+
+/** S5：kern_memory 单条检索摘要（id/kind/scope/value/snippet） */
+export interface MemoryRetrievalEntry {
+  id: string;
+  kind: string;
+  scope: string;
+  prov_class: string;
+  updated: string;
+  value: number;
+  snippet: string;
+}
+
+/** S5：kern_memory 数据源结果（retrieve 路由摘要；失败 ok:false + degraded——kern-tools.ts 桥消费） */
+export interface MemoryRetrievalToolResult {
+  ok: boolean;
+  items: MemoryRetrievalEntry[];
+  channel_used: string;
+  scope_chain: string[];
+  degraded: string | null;
+}
+
 /**
  * P1a：按线解析 policy/processes 目录（D1 裁决：运行时按当前版本线从 lines 物化快照加载）。
  * 最佳努力（装配失败不崩）：线快照存在 kernel/policy + kernel/processes → 注入线快照路径；
@@ -670,6 +741,177 @@ export class CognitiveRuntime {
         ? `快照机制降级（${this.identityError ?? 'rs:assembly'}）`
         : this.componentAssemblyDegraded,
     };
+  }
+
+  // ---- S5：kern_* 工具数据源（kern-tools.ts 桥的运行时方法——复用既有能力薄封装，非命令 handler） ----
+
+  /**
+   * S5：kern_bench 数据源——v2 契约基准（与 /bench v2 分支同款 runBenchV2 接线：无 modelAdapter → 回放
+   * 执行器；有 → 真实执行 + LLM judge 对照；persist 缺省落盘明细到 benchReportsDir/BENCH_REPORTS_DIR）。
+   * 参数 line 缺省当前线（非法值 → 当前线）；任一步失败 → ok:false + detail（不崩）。
+   * 注：/bench 命令 handler（plugin.ts）保持独立接线（benchPersistDir 为插件配置面）——本方法供 kern_bench
+   * 复用同一 runBenchV2 契约与执行器选择逻辑，两处语义一致。
+   */
+  async benchV2(input: { line?: VersionLine; persist?: boolean } = {}): Promise<BenchV2ToolResult> {
+    const line: BenchLine = isVersionLine(input.line) ? input.line : (this.lineSnapshot?.line ?? 'stable');
+    // modelAdapter 缺省为 null（未注入）——null/undefined 均视作无适配器（回放路径）；与 assembleModelView
+    // 的 modelAdapterAvailable 同语义
+    const hasAdapter = this.modelAdapter !== null && this.modelAdapter !== undefined;
+    const mode: 'real' | 'replay' = hasAdapter ? 'real' : 'replay';
+    const disabled = { judge_enabled: false, judge_run: 0, judge_degraded: 0, judge_rate: 0 };
+    try {
+      const contracts = await loadBenchContractsV2();
+      const fixtures = await loadBenchFixturesV2();
+      const fixtureById = new Map(fixtures.map((f): [string, BenchFixtureV2] => [f.task_id, f]));
+      const realV2 = hasAdapter ? makeRealExecutorV2(this.modelAdapter!) : undefined;
+      const executor: BenchExecutorV2 =
+        realV2 !== undefined ? (task) => realV2(task, fixtureById.get(task.id)!) : makeReplayExecutorV2(fixtures);
+      const judge = hasAdapter ? makeJudgeV2(this.modelAdapter!) : undefined;
+      const persist = input.persist !== false;
+      const report = await runBenchV2({
+        contracts,
+        fixtures,
+        line,
+        executor,
+        mode,
+        persistDir: persist ? (this.assemblyOpts.benchReportsDir ?? BENCH_REPORTS_DIR) : undefined,
+        judge,
+      });
+      return {
+        ok: true,
+        line: report.line,
+        mode,
+        passed: report.passed,
+        total: report.total,
+        judge_enabled: report.judge.enabled,
+        judge_run: report.judge.run,
+        judge_degraded: report.judge.degraded,
+        judge_rate: report.judge.rate,
+        persisted: persist,
+      };
+    } catch (err) {
+      return { ok: false, line, mode, passed: 0, total: 0, ...disabled, persisted: false, detail: errorDetail(err) };
+    }
+  }
+
+  /**
+   * S5：kern_switch 数据源——版本线切换（与 /mode onSwitch 同语义：校验（isVersionLine）+ 快照重建
+   * （rebuildSnapshotForLine）+ 激活记录（activation/committed 事件入链，尽力而为））。
+   * **与 /mode 的差异**：/mode 命令有空白会话守卫（mode-command.ts isBlankSession——用户在会话开始前
+   * 切换才允许）；本方法由模型在运行中显式调用（= 显式意图，DSH 会话必然非空白）→ 无空白守卫，
+   * 差异在返回文本注明。同当前线 → 无副作用早退。M6 激活契约落盘（activationLogDir，插件配置面）不适用
+   * 工具路径——激活记录以事件入链承载（诚实差异，/mode recordLineActivation 仍完整保留）。
+   */
+  async switchLine(input: { line: string; session_id?: string }): Promise<SwitchLineToolResult> {
+    const previous = this.lineSnapshot?.line ?? 'stable';
+    if (!isVersionLine(input.line)) {
+      return {
+        ok: false,
+        text: `未知版本线 "${input.line}"（合法值 ${VALID_LINES.join(' | ')}）`,
+        previous_line: previous,
+        line: input.line,
+        rebuilt: false,
+        degraded: null,
+        events_appended: 0,
+      };
+    }
+    if (previous === input.line) {
+      return {
+        ok: true,
+        text: `已是当前版本线 ${input.line}（无需切换）`,
+        previous_line: previous,
+        line: input.line,
+        rebuilt: false,
+        degraded: null,
+        events_appended: 0,
+      };
+    }
+    const r = this.rebuildSnapshotForLine(input.line);
+    // 激活记录（事件入链；尽力而为——失败不阻断切换结果，对齐 /mode recordLineActivation 降级记录语义）
+    let events_appended = 0;
+    try {
+      await this.eventStore.append(
+        makeRuntimeEvent(
+          'activation/committed',
+          input.session_id ?? 'anon',
+          this.snapshotHash,
+          { line: input.line, previous_line: previous, trigger: 'kern_switch' },
+          ['kern-switch'],
+        ),
+      );
+      events_appended = 1;
+    } catch {
+      // 事件为日志，失败不阻断切换结果
+    }
+    const guardNote = '；kern_switch 由模型显式调用（=显式意图），无 /mode 空白会话守卫';
+    if (r.promoted) {
+      return {
+        ok: true,
+        text: `已切换到版本线 ${input.line}（快照已重建——下一请求生效${guardNote}）`,
+        previous_line: previous,
+        line: input.line,
+        rebuilt: true,
+        degraded: null,
+        events_appended,
+      };
+    }
+    return {
+      ok: true,
+      text: `已切换到版本线 ${input.line}（快照重建降级：${r.degraded}——切换状态生效，快照保持${guardNote}）`,
+      previous_line: previous,
+      line: input.line,
+      rebuilt: false,
+      degraded: r.degraded,
+      events_appended,
+    };
+  }
+
+  /**
+   * S5：kern_memory 数据源——记忆检索查询（复用 memory/retrieve 六阶段路由：scope 覆盖链/kind 过滤/
+   * 通道选择/价值排序；只读——opts.episode=false 不记录 Retrieval Episode）。scope/kind/limit 非法 →
+   * MemoryQuerySchema fail-loud → ok:false + degraded（不抛）；无匹配 → 空 items（ok:true）。
+   */
+  async retrieveMemory(input: {
+    text?: string;
+    scope?: string;
+    kind?: string;
+    limit?: number;
+    relation?: string;
+  } = {}): Promise<MemoryRetrievalToolResult> {
+    try {
+      const q: RetrieveQuery = {
+        scope: (input.scope ?? 'Project') as Scope,
+        limit: input.limit ?? 5,
+        budget: 1000,
+      };
+      if (input.text !== undefined && input.text.length > 0) {
+        q.text = input.text;
+      }
+      if (input.relation !== undefined && input.relation.length > 0) {
+        q.relation = input.relation;
+      }
+      if (input.kind !== undefined && input.kind.length > 0) {
+        q.kind = input.kind as MemoryKind;
+      }
+      const r = await retrieve(this.memory, q, { episode: false });
+      return {
+        ok: true,
+        items: r.items.map((it) => ({
+          id: it.memory.id,
+          kind: it.memory.kind,
+          scope: it.memory.scope,
+          prov_class: it.memory.prov_class,
+          updated: it.memory.updated,
+          value: it.value,
+          snippet: memorySnippet(it.memory.payload),
+        })),
+        channel_used: r.channel_used,
+        scope_chain: r.scope_chain,
+        degraded: null,
+      };
+    } catch (err) {
+      return { ok: false, items: [], channel_used: 'lexical', scope_chain: [], degraded: errorDetail(err) };
+    }
   }
 
   /**

@@ -176,6 +176,45 @@ export interface CognitiveRuntimeLike {
   }>;
   /** P2：kern_status 数据源——认知运行时状态摘要（版本线/快照/lineSnapshot/债务/信号数/组件健康；纯读取） */
   status?(): Promise<KernStatusSummary>;
+  /** S5：kern_bench 数据源——v2 契约基准（runBenchV2 接线：无 modelAdapter → 回放；有 → 真实+judge；
+   *  失败 ok:false + detail，不崩；input 可选——运行时缺省当前线） */
+  benchV2?(input?: { line?: string; persist?: boolean }): Promise<{
+    ok: boolean;
+    line: string;
+    mode: 'real' | 'replay';
+    passed: number;
+    total: number;
+    judge_enabled: boolean;
+    judge_run: number;
+    judge_degraded: number;
+    judge_rate: number;
+    persisted: boolean;
+    detail?: string;
+  }>;
+  /** S5：kern_switch 数据源——版本线切换（校验+快照重建+激活事件；无 /mode 空白会话守卫——工具显式调用） */
+  switchLine?(input: { line: string; session_id?: string }): Promise<{
+    ok: boolean;
+    text: string;
+    previous_line: string;
+    line: string;
+    rebuilt: boolean;
+    degraded: string | null;
+    events_appended: number;
+  }>;
+  /** S5：kern_memory 数据源——记忆检索查询（retrieve 路由；只读不记录 episode；input 可选——缺省 Project/5 条） */
+  retrieveMemory?(input?: {
+    text?: string;
+    scope?: string;
+    kind?: string;
+    limit?: number;
+    relation?: string;
+  }): Promise<{
+    ok: boolean;
+    items: Array<{ id: string; kind: string; scope: string; prov_class: string; updated: string; value: number; snippet: string }>;
+    channel_used: string;
+    scope_chain: string[];
+    degraded: string | null;
+  }>;
   /** S1：State.world/self 引用填充（reduce 产出 State 后 null → 模型引用；StateSchema 校验——
    *  合规路径返回校验结果，事件流直归约的 working 缺省字段（既有诚实空语义）不阻塞接线） */
   materializeState?(state: unknown): unknown;
@@ -407,10 +446,11 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   }
 
   /**
-   * P2：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
-   * 本次仅注册 kern_status（桥机制验证；kern_bench/kern_evolve/kern_switch/kern_memory 留清单按需注册，
-   * 见 runtime/kern-tools.ts registerKernTools）。守卫：tools 面缺失 → 记录降级不崩（对齐既有守卫风格）；
-   * 认知运行时未装配 → 不注册（记录——kern_status 依赖运行时状态）。
+   * P2/S5：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
+   * 工具集：kern_status（P2 桥机制验证）+ kern_bench/kern_evolve/kern_switch/kern_memory（S5 补齐）——
+   * 全部为认知运行时方法（status/benchV2/runEvolutionNow/switchLine/retrieveMemory）的薄封装
+   * （runtime/kern-tools.ts registerKernTools 统一注册；守卫：tools 面缺失 → 记录降级不崩，对齐既有守卫风格；
+   * 认知运行时未装配 → 不注册（记录——kern_* 依赖运行时状态）。
    * P8（注册皆效应）：工具注册 disposer 集入 DSH 生命周期（ctx.effect）——插件关闭 → 批量注销回滚。
    * ⚠️ Guard 契约（B3 教训）：tools 必须经 ctx.get('tools') 读取（真实宿主对未 inject 的属性读取抛
    * `cannot get property "tools" without inject`）——禁止直接访问 ctx.tools。
