@@ -279,3 +279,46 @@ describe('P2 DSH 工具注册桥（kern_status）', () => {
     expect(memoryRetrievalComponent.manifest.provides).toEqual(['memory.retrieve']);
   });
 });
+
+describe('P2 Guard 契约回归（B3 教训：真实宿主对未 inject 的 ctx 属性读取抛错）', () => {
+  /** 模拟 Cordis reflect Guard：未声明属性读取即抛（真实宿主行为，plugin.test B3 修复后回归防线） */
+  function makeGuardCtx(overrides: Record<string, unknown>): ContextLike {
+    const declared = new Set(['get', 'commands', 'effect', 'on']);
+    const target: Record<string, unknown> = {
+      get: (name: string) => overrides[name],
+      commands: { register: () => undefined },
+      effect: () => () => undefined,
+      on: () => undefined,
+    };
+    return new Proxy(target, {
+      get(t, prop, receiver) {
+        if (typeof prop === 'string' && !declared.has(prop)) {
+          throw new Error(`cannot get property "${prop}" without inject`);
+        }
+        return Reflect.get(t, prop, receiver);
+      },
+    }) as unknown as ContextLike;
+  }
+
+  it('tools 经 ctx.get("tools") 提供：apply 挂载成功且 kern_status 注册（不再直接读 ctx.tools）', () => {
+    const tools: ToolDefinitionLike[] = [];
+    const rt = track(createCognitiveRuntime({ root }));
+    const guard = makeGuardCtx({
+      tools: {
+        register: (def: unknown) => {
+          tools.push(def as ToolDefinitionLike);
+          return undefined;
+        },
+      },
+      cognitive: rt,
+    });
+    expect(() => apply(guard, { bootstrap: false })).not.toThrow();
+    expect(tools.some((t) => t.name === 'kern_status')).toBe(true);
+  });
+
+  it('无 tools 面：apply 不抛 + ctx.tools 降级记录（Guard 下走 get 返回 undefined）', () => {
+    const guard = makeGuardCtx({});
+    expect(() => apply(guard, { bootstrap: false })).not.toThrow();
+    expect(degradationLog().some((d) => d.hook === 'ctx.tools')).toBe(true);
+  });
+});

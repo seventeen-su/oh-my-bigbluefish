@@ -60,7 +60,9 @@ function renderPresetYml(line: LinePreset): string {
  * 锚点缺失/格式不符 → 抛错（fail-loud）。
  */
 function renderAgentCordis(source: string, line: LinePreset, presetRootName: string, marker: string): string {
-  const lines = source.split('\n');
+  // 换行归一化：工作树/拷贝后的组合文件可能是 CRLF（git autocrlf）——锚点按 \n 行匹配，须先归一化
+  const normalized = source.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
   const ombIdx = lines.findIndex((l) => l.trimEnd() === OMB_ROW);
   if (ombIdx === -1) {
     throw new Error(`主组合缺少 omb-v2 行锚点 "${OMB_ROW}"（agent.cordis.yml 被改坏？）`);

@@ -348,13 +348,16 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   /**
    * P2：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
    * 本次仅注册 kern_status（桥机制验证；kern_bench/kern_evolve/kern_switch/kern_memory 留清单按需注册，
-   * 见 runtime/kern-tools.ts registerKernTools）。守卫：ctx.tools 缺失 → 记录降级不崩（对齐既有守卫风格）；
+   * 见 runtime/kern-tools.ts registerKernTools）。守卫：tools 面缺失 → 记录降级不崩（对齐既有守卫风格）；
    * 认知运行时未装配 → 不注册（记录——kern_status 依赖运行时状态）。
    * P8（注册皆效应）：工具注册 disposer 集入 DSH 生命周期（ctx.effect）——插件关闭 → 批量注销回滚。
+   * ⚠️ Guard 契约（B3 教训）：tools 必须经 ctx.get('tools') 读取（真实宿主对未 inject 的属性读取抛
+   * `cannot get property "tools" without inject`）——禁止直接访问 ctx.tools。
    */
-  if (typeof ctx.tools?.register === 'function') {
+  const tools = readService<ToolsLike>(ctx, 'tools');
+  if (tools !== undefined && typeof tools.register === 'function') {
     if (cognitive !== undefined) {
-      const r = registerKernTools(ctx.tools, cognitive);
+      const r = registerKernTools(tools, cognitive);
       if (r.degraded !== null) {
         recordDegradation('kern/tools', r.degraded);
       }
