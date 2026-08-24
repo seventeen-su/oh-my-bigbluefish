@@ -14,12 +14,13 @@
 //     （实现规格 §5.4）→ rollbackTo 回退（update-ref stable 回退）→ evolution/rolled_back 事件 +
 //     activation-log rolled_back 记录 + 候选 error 池标记（candidates.markError，§3.3
 //     error/<组件>/<id>——组件归属 deps.component，缺省 kernel：非组件候选）。
-//   - readShadowSignals：.evolution/shadows/exposure.log → L2 统计输入（n/failures；缺文件 → 空）。
+//   - readShadowSignals：.evolution/shadows/（exposure.log + S7 exposure-<date>.jsonl）→ L2 统计输入
+//     （n/failures；缺目录/文件 → 空；S7 per-session 条目按 (session,candidate) 键最后一条胜出计数）。
 //   - promotionActivationId：激活幂等键确定性派生（dshEventId 风格：dsh:evt:<sha256(stable|candidate)>）。
 //
 // 层规则：仅 import node: 内置 + kernel/schemas/（IR 契约例外）+ supervisor/ + substrate/。
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { rollbackTo, type WorktreeStatus } from '../substrate/rollback.js';
 import { resolveLineCommit, type VersionLayout } from '../substrate/lines.js';
@@ -547,27 +548,36 @@ export interface ShadowSignalsLike {
 }
 
 /**
- * 读取 shadow exposure log（.evolution/shadows/exposure.log JSONL）→ L2 统计输入：
- * n = 全部曝光条目（decision ∈ shadow/canary/control/skip/canary_rollback），
- * failures = canary_rollback（回滚触发 = 失败后验）或 outcome=restore_failed 条目。
- * 文件缺失/不可读 → {n:0, failures:0}（无 shadow 数据，以基准门禁为准——不抛）；单行损坏跳过（读取面降级）。
+ * 读取 shadow exposure 日志（JSONL）→ L2 统计输入（n=曝光样本数 / failures=失败样本数；n=0 → 无 shadow 数据不阻塞）。
+ * 入参为**文件路径** → 读该文件（既有契约）；为**目录**（S7：.evolution/shadows/）→ 扫描目录内
+ * exposure*.log / exposure*.jsonl（既有 exposure.log + S7 按日分片 exposure-<date>.jsonl 一并纳入，排序确定性）。
+ * 计数语义（双格式并存，不重复计数）：
+ *   - 既有条目（decision 字段，T5.3/G4 格式）：n = decision ∈ shadow/canary/control/skip/canary_rollback；
+ *     failures = canary_rollback（回滚触发 = 失败后验）或 outcome=restore_failed 条目；
+ *   - S7 per-session 条目（{candidate_id, bucket, session_id, task_domain, exposure_ts, outcome}，无 decision）：
+ *     按 (session_id, candidate_id) 键**最后一条胜出**——exposure 占位（outcome='pending'）被 finalizeTurn
+ *     回写的 success/degraded 覆盖（同键不重复计数）；n = 键数（有曝光即计入），failures = 最终
+ *     outcome='degraded' 的键数（outcome='pending' 仅曝光未收尾 → 计入 n 不计失败——诚实保守）。
+ * 文件/目录缺失或不可读 → {n:0, failures:0}（无 shadow 数据，以基准门禁为准——不抛）；单行损坏跳过（读取面降级）。
  */
-export async function readShadowSignals(logPath: string): Promise<ShadowSignalsLike> {
-  let raw: string;
-  try {
-    raw = await readFile(logPath, 'utf8');
-  } catch {
-    return { n: 0, failures: 0 };
-  }
+export async function readShadowSignals(logPathOrDir: string): Promise<ShadowSignalsLike> {
+  const raw = await readShadowRaw(logPathOrDir);
   let n = 0;
   let failures = 0;
+  const sessionOutcomes = new Map<string, string>();
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (trimmed.length === 0) {
       continue;
     }
+    let entry: { decision?: string; outcome?: string; session_id?: string; candidate_id?: string };
     try {
-      const entry = JSON.parse(trimmed) as { decision?: string; outcome?: string };
+      entry = JSON.parse(trimmed) as typeof entry;
+    } catch {
+      continue; // 单行损坏跳过（审计日志不为判定器抛错）
+    }
+    if (entry.decision !== undefined) {
+      // 既有条目（T5.3/G4 格式）——原计数语义
       if (entry.decision === 'canary_rollback' || entry.outcome === 'restore_failed') {
         failures += 1;
         n += 1;
@@ -579,11 +589,48 @@ export async function readShadowSignals(logPath: string): Promise<ShadowSignalsL
       ) {
         n += 1;
       }
-    } catch {
-      // 单行损坏跳过（审计日志不为判定器抛错）
+      continue;
+    }
+    // S7 per-session 条目——(session_id, candidate_id) 键最后一条胜出（outcome 回写覆盖占位）
+    if (
+      typeof entry.session_id === 'string' &&
+      typeof entry.candidate_id === 'string' &&
+      typeof entry.outcome === 'string'
+    ) {
+      sessionOutcomes.set(`${entry.session_id}|${entry.candidate_id}`, entry.outcome);
+    }
+  }
+  for (const outcome of sessionOutcomes.values()) {
+    n += 1;
+    if (outcome === 'degraded') {
+      failures += 1;
     }
   }
   return { n, failures };
+}
+
+/** 读取 exposure 日志原文：目录 → 扫描 exposure*.log/exposure*.jsonl（排序）拼接；文件 → 读文件；缺失/不可读 → '' */
+async function readShadowRaw(path: string): Promise<string> {
+  try {
+    const info = await stat(path);
+    if (info.isDirectory()) {
+      const names = (await readdir(path))
+        .filter((f) => /^exposure.*\.(jsonl|log)$/.test(f))
+        .sort();
+      const parts: string[] = [];
+      for (const name of names) {
+        try {
+          parts.push(await readFile(join(path, name), 'utf8'));
+        } catch {
+          // 单文件不可读跳过（读取面降级）
+        }
+      }
+      return parts.join('\n');
+    }
+    return await readFile(path, 'utf8');
+  } catch {
+    return ''; // 缺失/不可读 → 无 shadow 数据（不抛）
+  }
 }
 
 /** shadow exposure log 相对 .evolution 的路径约定（与 candidate-pipeline G4 落盘一致） */

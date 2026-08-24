@@ -244,6 +244,20 @@ export class SnapshotRegistry {
     return opts.current;
   }
 
+  /**
+   * S7：显式绑定指定快照（shadow 路由——会话绑定 latest 线快照，请求级锁定同一原语 §6.5.7）。
+   * 已绑定 → 返回原快照（幂等，不覆盖——进行中请求全程锁定）；非法快照 → fail-loud（状态不被污染）。
+   */
+  bind(requestId: string, snapshot: RuntimeSnapshot): RuntimeSnapshot {
+    assertSnapshot(snapshot);
+    const existing = this.bindings.get(requestId);
+    if (existing) {
+      return existing;
+    }
+    this.bindings.set(requestId, snapshot);
+    return snapshot;
+  }
+
   /** 当前活跃请求绑定数（测试/诊断） */
   activeCount(): number {
     return this.bindings.size;

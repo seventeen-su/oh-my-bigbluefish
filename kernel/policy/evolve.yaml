@@ -28,6 +28,12 @@
 #   - 初值 + 观测中：无真实维护执行数据 → 不臆造标定；最终值待 .evolution/maintenance-observations
 #     数据积累后按 §10.1 ROI 观测标定（改本段即生效）；
 #   - 缺省兼容旧形状（无本段/部分键 → 出厂初值）；字段存在但非法（负数/非数值）→ fail-loud。
+# S7 per-session shadow 真实放量路由（实现规格 §5.3 Shadow 流量分配；G4 真实放量）：
+#   - shadow.enabled：全局开关（缺省开启；无 trusted-latest 差异/缺失时零开销不路由）
+#   - shadow.exposure_rate：曝光率（0..100 整数：bucket = hash(session_id + candidate_id) % 100 <
+#     exposure_rate 的会话路由到 latest 线快照运行（per-request 生效：快照身份/线状态真实变化 +
+#     policy/processes 按线加载）+ exposure/outcome 落盘（.evolution/shadows/exposure-<date>.jsonl）→
+#     promotion gate L2 消费真实 outcome（readShadowSignals））
 # 初值待冻结基准标定（架构 §17）。
 daily_evolution_cost: 100
 roi_min: 1.0
@@ -41,6 +47,10 @@ maintenance_costs:
   environment_check: 2
   evolution_decision: 2
   gc: 2
+
+shadow:
+  enabled: true
+  exposure_rate: 10
 
 e_process:
   mode: e-process

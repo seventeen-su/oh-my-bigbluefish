@@ -357,6 +357,27 @@ export const DEFAULT_SHARE_POLICY: SharePolicy = {
   auto_discover: false,
 };
 
+// ---- S7：shadow/Canary 真实放量路由（实现规格 §5.3 Shadow 流量分配 + G4 真实放量；per-session 桶分流） ----
+
+/**
+ * shadow 路由策略（evolve.policy `shadow` 段）——per-session shadow 放量：
+ * trusted-latest ≠ stable 且启用时，按 bucket = hash(session_id + candidate_id) % 100 < exposure_rate
+ * 把影子桶会话分流到 latest 线快照运行（per-request 生效）+ exposure/outcome 落盘 →
+ * promotion gate L2 消费真实 outcome（supervisor/promotion.ts readShadowSignals）。
+ * 缺省兼容旧形状（无本段 → 出厂缺省 enabled=true、exposure_rate=10——无 trusted-latest 差异/缺失时
+ * 零开销不路由）；字段存在但非法（exposure_rate 非整数/越界 0..100）→ fail-loud 拒绝。
+ */
+export const ShadowPolicySchema = z.object({
+  /** 全局开关（false → 不路由任何会话——零开销默认路径；数据即机制，改 YAML 即生效） */
+  enabled: z.boolean().default(true),
+  /** 曝光率（0..100 整数：bucket < exposure_rate 的会话路由到 latest 线；0 = 不曝光，100 = 全量） */
+  exposure_rate: z.number().int().min(0).max(100).default(10),
+});
+export type ShadowPolicy = z.infer<typeof ShadowPolicySchema>;
+
+/** shadow 路由缺省（出厂：开启 + 曝光率 10%——无 trusted-latest 差异/缺失时零开销不路由） */
+export const DEFAULT_SHADOW_POLICY: ShadowPolicy = { enabled: true, exposure_rate: 10 };
+
 /**
  * EvolvePolicy：演化规则（架构 §9.5 预算与元演化 + P1c §6.5.1/§6.5.7 数据化判定）——
  *   - Daily Evolution Budget：evolution_cost/day 上限（仅 DSH 运行期间累计）
@@ -364,6 +385,7 @@ export const DEFAULT_SHARE_POLICY: SharePolicy = {
  *   - LLM maintenance rate：可观测指标 + 自适应软预算（超预算降优先级，非硬禁止）
  *   - signal_triggers：触发信号种类 → 是否演化/强度/对象层映射（§6.5.1 判定表；缺省空 = 不演化）
  *   - debt_thresholds：soft/hard/critical 债务阈值（§6.5.7；缺省 DEFAULT_DEBT_THRESHOLDS）
+ *   - shadow：S7 per-session shadow 放量路由开关（§5.3；缺省 DEFAULT_SHADOW_POLICY）
  * 旧形状（仅前三字段）经缺省仍合法（向后兼容，元演化门禁 T7.2 复用本 schema）；
  * 字段存在但非法（strength>1、负阈值等）→ fail-loud 拒绝（对齐既有 policy 纪律）。
  * 元演化门禁（T7.2）diff 校验：evolve.policy 目标内容必须过本 schema（数据即机制）。
@@ -389,5 +411,7 @@ export const EvolvePolicySchema = z.object({
   share: SharePolicySchema.default(DEFAULT_SHARE_POLICY),
   /** S2：维护任务成本估计（§10.1 estimated_cost 数据化；缺省 = DEFAULT_MAINTENANCE_COSTS 初值——观测积累后标定） */
   maintenance_costs: MaintenanceCostsSchema.default(DEFAULT_MAINTENANCE_COSTS),
+  /** S7：per-session shadow 放量路由开关（§5.3；缺省 DEFAULT_SHADOW_POLICY） */
+  shadow: ShadowPolicySchema.default(DEFAULT_SHADOW_POLICY),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

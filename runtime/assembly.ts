@@ -9,7 +9,7 @@
 // 策略/过程为"机制即数据"（P3）：懒加载（首次请求），改 YAML 即生效。
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { cpus, totalmem } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -30,7 +30,9 @@ import type { ContextProjection } from '../kernel/schemas/a.js';
 import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type MemoryKind } from '../kernel/schemas/m.js';
 import { StateSchema, type State, type SelfModel, type WorldModel } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
-import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef } from '../kernel/policy-loader.js';
+import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type ShadowPolicy } from '../kernel/policy-loader.js';
+// S7：per-session shadow 路由纯函数（kernel 层 2；桶分配 + 路由判定——实现规格 §5.3）
+import { shouldRouteShadow } from '../kernel/shadow-route.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
@@ -77,7 +79,6 @@ import { resolvePromotionGate, shouldPromoteToStable } from '../kernel/promotion
 import {
   promoteToStable,
   readShadowSignals,
-  SHADOW_LOG_REL,
 } from '../supervisor/promotion.js';
 import {
   loadBenchContractsV2,
@@ -98,7 +99,7 @@ import { CapabilityRegistry } from '../supervisor/capability.js';
 import { memoryRetrievalComponent } from '../memory/memory-retrieval.js';
 import type { KernStatusSummary } from './kern-tools.js';
 // S1：World/Self 模型运行接线——运行时状态视图 → 模型组装（纯读取、确定性）
-import { degradationLog } from './loop-hooks.js';
+import { degradationLog, recordDegradation } from './loop-hooks.js';
 import { buildSelfModel, buildWorldModel, type RuntimeView } from './models.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
@@ -434,6 +435,21 @@ interface LineDirResolution {
   lineDegraded: string | null;
 }
 
+/**
+ * S7：per-session shadow 路由结果（prepareTurn 内部；route=true → 会话按 latest 线运行）。
+ * exposure/outcome 落盘共用（candidate_id/bucket/task_domain——与 readShadowSignals 计数键对齐）。
+ */
+interface ShadowRoute {
+  route: boolean;
+  bucket: number;
+  /** exposure 条目 candidate_id（缺省 'latest' 标记——无演化对象时；有 → latest 线最近演化对象 id） */
+  candidate_id: string;
+  /** 判定原因（可审计；非路由路径 = 不路由原因） */
+  reason: string;
+  /** 任务域（缺省 'general'；真实任务域判定留待语义扩展——注释见 recordShadowExposure） */
+  task_domain: string;
+}
+
 /** S5：kern_bench 数据源结果（v2 契约基准摘要；失败 ok:false + detail——kern-tools.ts 桥消费） */
 export interface BenchV2ToolResult {
   ok: boolean;
@@ -594,6 +610,23 @@ export class CognitiveRuntime {
   /** S1：World/Self 模型缓存（视图 + 模型——首次访问装配，promote/rebuildSnapshotForLine 后重置；
    *  同 runtime 状态 → 同视图 → 同模型内容（确定性）；装配为纯读取无副作用） */
   private modelCache: { view: RuntimeView; world: WorldModel; self: SelfModel } | null = null;
+  // ---- S7：per-session shadow 路由（实现规格 §5.3 + G4 真实放量）----
+  /** S7：trusted-latest commit 记忆化（undefined=未解析；string=commit；null=缺失/不可解析——
+   *  失败缓存防每请求 git 探测；rebuild/promote/候选晋升后失效重建） */
+  private trustedLatestCommit: string | null | undefined;
+  /** S7：candidate_id 记忆化（{commit, id}——trusted-latest commit 变化时重解析（git ls-tree）） */
+  private shadowCandidateCache: { commit: string; id: string } | null = null;
+  /** S7：latest 线策略/过程 bundle（per-line 记忆化——首次 shadow 请求加载后缓存；
+   *  与 ready() 协调：ready 仍加载装配线，shadow 请求用 per-line bundle；加载失败 → 降级回退装配线 + 记录） */
+  private shadowBundle: Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] }> | null = null;
+  /** S7：latest 线 bundle 加载失败标记（记忆化失败——不重复尝试；rebuild/promote 后重置可重试） */
+  private shadowBundleFailed = false;
+  /** S7：per-line 运行时快照身份（line → RuntimeSnapshot；内容寻址——线 commit/内容变化时失效重建） */
+  private readonly shadowSnapshots = new Map<string, RuntimeSnapshot>();
+  /** S7：shadow 会话 → 路由信息（exposure 已落盘；finalizeTurn 据此回写 outcome——(session,candidate) 键对齐 L2） */
+  private readonly shadowSessions = new Map<string, ShadowRoute>();
+  /** S7：per-line WorldModel 视图（worldModelFor——同线同状态 → 同模型；runtime 级 modelCache 不含 shadow 线） */
+  private readonly perLineWorldModels = new Map<string, WorldModel>();
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
@@ -667,12 +700,13 @@ export class CognitiveRuntime {
    * 阶梯 Reuse→Compose→Mutate 均不满足（OOD）且预算允许且 adapter 存在时才走 LLM；缺任一 → 纯规则降级。
    * 真实会话才有模型（plugin.ts 装配 modelAdapter）；真实模型调用留宿主验证——测试用 fake adapter 验证触发逻辑。
    * 每次调用构造新调度器/生成器 → generator 的 generationUsed 计数器即单请求语义（max_generate_per_request）。
+   * S7：可注入生效线 policy（shadow 会话 = latest 线 bundle——generation 预算按线加载；缺省 → 装配线 ready()）。
    */
-  async createScheduler(processes: readonly ProcessDef[]): Promise<ProcessScheduler> {
-    const { policy } = await this.ready();
+  async createScheduler(processes: readonly ProcessDef[], policy?: PolicyBundle): Promise<ProcessScheduler> {
+    const effective = policy ?? (await this.ready()).policy;
     return new ProcessScheduler({
       processes,
-      generation: policy.budget.generation,
+      generation: effective.budget.generation,
       modelAdapter: this.modelAdapter ?? undefined,
     });
   }
@@ -940,6 +974,40 @@ export class CognitiveRuntime {
     return parsed.success ? parsed.data : state;
   }
 
+  /**
+   * S7：per-session 生效版本线（实现规格 §5.3 真实放量路由）——shadow 桶会话 → 'latest'
+   * （trusted-latest 存在且与当前线分叉时），否则当前（装配）线。判定为纯函数 shouldRouteShadow
+   * 的运行时装配（commit/candidate_id 记忆化解析；无 trusted-latest 差异/未启用 → 当前线，零开销）。
+   * async 原因：shadow 配置源 = 装配线策略（ready() 懒加载——机制即数据，改 YAML 即生效）。
+   */
+  async effectiveLineFor(sessionId: string): Promise<VersionLine> {
+    const { policy } = await this.ready();
+    const route = await this.computeShadowRoute(sessionId, policy.evolve.shadow);
+    if (route.route) {
+      return 'latest';
+    }
+    return this.lineSnapshot?.line ?? 'stable';
+  }
+
+  /**
+   * S7：per-request WorldModel——按会话生效线组装（S1 的 assembleModelView 用 effectiveLine）。
+   * 同线同状态 → 同模型（内容寻址确定性）；生效线 = 当前线 → 复用运行时级 worldModel（既有缓存，零开销）；
+   * 其它线（shadow latest）→ per-line 缓存（rebuild/promote 后失效）。纯读取无副作用。
+   */
+  async worldModelFor(sessionId: string): Promise<WorldModel> {
+    const effLine = await this.effectiveLineFor(sessionId);
+    const current = this.lineSnapshot?.line ?? 'stable';
+    if (effLine === current) {
+      return this.worldModel; // 运行时级模型（既有缓存）
+    }
+    let cached = this.perLineWorldModels.get(effLine);
+    if (cached === undefined) {
+      cached = buildWorldModel(this.assembleModelView(effLine));
+      this.perLineWorldModels.set(effLine, cached);
+    }
+    return cached;
+  }
+
   /** S1：模型视图/模型缓存（首次访问装配；promote/rebuild 后重置） */
   private models(): { view: RuntimeView; world: WorldModel; self: SelfModel } {
     if (this.modelCache === null) {
@@ -953,10 +1021,30 @@ export class CognitiveRuntime {
    * S1：运行时状态视图装配（纯读取、同步、确定性：同 runtime 状态 → 同视图 → 同模型内容）。
    * 数据源全部为 runtime 现有字段/只读读取（capabilities/components/lineSnapshot/snapshotHash/
    * 降级记录/环境指纹/基准报告存在性/node:os 资源），无副作用。
+   * S7：可选 effectiveLine（per-request 视图——shadow 会话按生效线组装：line/commit/lineSnapshot/
+   * layoutState 取自该线解析；缺省 → 当前（装配）线视图）。解析失败 → 保持当前线视图（尽力而为）。
    */
-  private assembleModelView(): RuntimeView {
-    const line = this.lineSnapshot?.line ?? 'stable';
-    const layoutState = this.lineSnapshot !== null ? 'lines-injected' : 'repo-default';
+  private assembleModelView(effectiveLine?: VersionLine): RuntimeView {
+    let line = this.lineSnapshot?.line ?? 'stable';
+    let commit = this.lineSnapshot?.commit ?? null;
+    let lineSnapshot = this.lineSnapshot;
+    let lineDegraded = this.lineDegraded;
+    let layoutState: 'lines-injected' | 'repo-default' =
+      this.lineSnapshot !== null ? 'lines-injected' : 'repo-default';
+    if (effectiveLine !== undefined && effectiveLine !== line) {
+      try {
+        const dirs = resolveLineDirs(this.assemblyOpts, effectiveLine);
+        if (dirs.lineSnapshot !== null) {
+          line = dirs.lineSnapshot.line;
+          commit = dirs.lineSnapshot.commit;
+          lineSnapshot = dirs.lineSnapshot;
+          lineDegraded = dirs.lineDegraded;
+          layoutState = 'lines-injected';
+        }
+      } catch {
+        // 解析失败 → 保持当前线视图（尽力而为，不臆造）
+      }
+    }
     let real = 0;
     let replay = 0;
     try {
@@ -970,9 +1058,9 @@ export class CognitiveRuntime {
       assembledAt: new Date().toISOString(),
       snapshotHash: this.snapshotHash,
       line,
-      commit: this.lineSnapshot?.commit ?? null,
-      lineSnapshot: this.lineSnapshot,
-      lineDegraded: this.lineDegraded,
+      commit,
+      lineSnapshot,
+      lineDegraded,
       snapshotDegraded: this.degraded ? (this.identityError ?? 'rs:assembly') : null,
       componentDegraded: this.componentAssemblyDegraded,
       capabilities: this.capabilities.list(),
@@ -999,22 +1087,290 @@ export class CognitiveRuntime {
     };
   }
 
+  // ---- S7：per-session shadow 路由（实现规格 §5.3 + G4 真实放量；快路径零开销，慢路径记忆化） ----
+
+  /**
+   * S7：shadow 路由判定（配置源 = 装配线策略 shadow 段）。快路径（零开销默认路径）：
+   * 未启用 / 旧布局（无线快照）/ 当前线已是 latest / trusted-latest 缺失 / 两线未分叉 → 不路由
+   * （无 candidate_id 解析 I/O——bucket 仅在两线分叉后计算）；分叉 → candidate_id 记忆化解析
+   * （latestObjectId → 'latest' 标记）→ shouldRouteShadow 纯函数判定（桶 < exposure_rate）。
+   * trusted-latest commit 记忆化（resolveTrustedLatestCommit——失败缓存，防每请求 git 探测）。
+   */
+  private async computeShadowRoute(sessionId: string, shadow: ShadowPolicy): Promise<ShadowRoute> {
+    const noRoute = (reason: string, bucket = 0, candidateId = 'latest'): ShadowRoute => ({
+      route: false,
+      bucket,
+      candidate_id: candidateId,
+      reason,
+      task_domain: 'general',
+    });
+    // 快路径（零 I/O）：未启用 / 旧布局 / 已在 latest 线
+    if (!shadow.enabled) {
+      return noRoute('shadow 未启用（evolve.policy.shadow.enabled=false）——默认路径');
+    }
+    if (this.lineSnapshot === null) {
+      return noRoute('旧布局（无线快照 kernel/policy）——shadow 路由不可用');
+    }
+    if (this.lineSnapshot.line === 'latest') {
+      return noRoute('当前线已是 latest——无分流语义（会话已运行最新线）');
+    }
+    // trusted-latest 存在且与当前线分叉（commit 记忆化；缺失/不可解析 → 无候选线）
+    const layout = this.assemblyOpts.layout ?? defaultLayout();
+    const latestCommit = this.resolveTrustedLatestCommit(layout);
+    if (latestCommit === null) {
+      return noRoute('trusted-latest 缺失/不可解析——无候选线可路由（零开销）');
+    }
+    if (latestCommit === this.lineSnapshot.commit) {
+      return noRoute('trusted-latest == 当前线 commit——无分叉，零开销');
+    }
+    // 分叉 → candidate_id（记忆化；latest 线最近演化对象 id 或 'latest' 标记）→ 桶判定（纯函数）
+    const candidateId = await this.resolveShadowCandidateId(layout, latestCommit);
+    const verdict = shouldRouteShadow({
+      session_id: sessionId,
+      candidate_id: candidateId,
+      trusted_latest_commit: latestCommit,
+      stable_commit: this.lineSnapshot.commit,
+      policy: shadow,
+    });
+    return {
+      route: verdict.route,
+      bucket: verdict.bucket,
+      candidate_id: candidateId,
+      reason: verdict.reason,
+      task_domain: 'general',
+    };
+  }
+
+  /** S7：trusted-latest commit 记忆化解析（resolveLineCommit；缺失/失败 → null 缓存——防每请求 git 探测；
+   *   rebuild/promote/switchLine/候选晋升后 invalidateShadowCaches 失效重建；外部进程推进 ref 的陈旧窗口
+   *   可接受——路由仅决策分流，实际物化 ensureLineSnapshot 恒读当前 ref） */
+  private resolveTrustedLatestCommit(layout: VersionLayout): string | null {
+    if (this.trustedLatestCommit !== undefined) {
+      return this.trustedLatestCommit;
+    }
+    try {
+      this.trustedLatestCommit = resolveLineCommit(layout, 'latest');
+    } catch {
+      this.trustedLatestCommit = null; // 缺失/不可解析（含旧种子布局）——记忆化失败
+    }
+    return this.trustedLatestCommit;
+  }
+
+  /** S7：exposure candidate_id 记忆化（latest 线最近演化对象 id；无对象/读取失败 → 'latest' 标记——
+   *   readShadowSignals 计数键 (session,candidate) 与该值对齐；trusted-latest commit 变化时重解析） */
+  private async resolveShadowCandidateId(layout: VersionLayout, latestCommit: string): Promise<string> {
+    if (this.shadowCandidateCache !== null && this.shadowCandidateCache.commit === latestCommit) {
+      return this.shadowCandidateCache.id;
+    }
+    let id = 'latest';
+    try {
+      const objectId = await latestObjectId(layout, latestCommit);
+      if (objectId !== null) {
+        id = objectId;
+      }
+    } catch {
+      // 读取失败 → 'latest' 标记（尽力而为）
+    }
+    this.shadowCandidateCache = { commit: latestCommit, id };
+    return id;
+  }
+
+  /**
+   * S7：latest 线 policy/processes 加载（per-line 记忆化：首次 shadow 请求加载后缓存——与 ready() 的一次性
+   * 加载协调：ready 仍加载装配线，shadow 请求用 per-line bundle；加载失败 → 降级回退装配线 + 降级记录
+   *（shadowBundleFailed 记忆化失败——不重复尝试；rebuild/promote 后重置可重试））。
+   */
+  private async loadShadowBundle(): Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] } | null> {
+    if (this.shadowBundleFailed) {
+      return null;
+    }
+    if (this.shadowBundle === null) {
+      const line: VersionLine = 'latest';
+      this.shadowBundle = (async () => {
+        const dirs = resolveLineDirs(this.assemblyOpts, line);
+        if (dirs.lineSnapshot === null) {
+          throw new Error(dirs.lineDegraded ?? `版本线 ${line} 快照未就绪——shadow 策略/过程不可加载`);
+        }
+        const [policy, processes] = await Promise.all([
+          loadPolicy(dirs.policyDir),
+          loadProcesses(dirs.processesDir),
+        ]);
+        return { policy, processes };
+      })();
+    }
+    try {
+      return await this.shadowBundle;
+    } catch (err) {
+      this.shadowBundleFailed = true;
+      recordDegradation(
+        'shadow/route',
+        `latest 线策略/过程加载失败（${errorDetail(err)}）——shadow 会话降级回退装配线（策略/过程按装配线加载）`,
+      );
+      return null;
+    }
+  }
+
+  /** S7：per-line 运行时快照身份（latest 线 commit + 目录内容 + 组件 → M5 快照；内容寻址记忆化；
+   *   构建失败 → null——调用方降级回退当前线快照） */
+  private resolveLineSnapshotIdentity(line: VersionLine): RuntimeSnapshot | null {
+    const cached = this.shadowSnapshots.get(line);
+    if (cached !== undefined) {
+      return cached;
+    }
+    let dirs: LineDirResolution;
+    try {
+      dirs = resolveLineDirs(this.assemblyOpts, line);
+    } catch {
+      return null;
+    }
+    if (dirs.lineSnapshot === null) {
+      return null;
+    }
+    try {
+      const snap = buildSnapshotIdentity(dirs, HERE);
+      this.shadowSnapshots.set(line, snap);
+      return snap;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * S7：shadow 会话快照解析——绑定 latest 线快照身份（请求级锁定同一原语 §6.5.7；finalizeTurn 的
+   * decision/made provenance 用绑定快照）；latest 线身份构建失败 → 降级回退当前线快照 + 记录。
+   */
+  private resolveShadowSnapshot(reqId: string): string {
+    if (this.snapshotOverride !== null) {
+      return this.snapshotOverride;
+    }
+    if (this.degraded) {
+      return 'rs:assembly';
+    }
+    const lineSnap = this.resolveLineSnapshotIdentity('latest');
+    if (lineSnap === null) {
+      recordDegradation('shadow/route', 'latest 线快照身份构建失败——shadow 会话快照回退当前线');
+      return this.resolveRuntimeSnapshot(reqId);
+    }
+    this.registry.bind(reqId, lineSnap);
+    return runtimeHashOf(lineSnap);
+  }
+
+  /**
+   * S7：shadow 会话首请求 exposure 落盘（.evolution/shadows/exposure-<date>.jsonl，JSONL 追加）。
+   * 格式对齐 readShadowSignals（supervisor/promotion.ts）：{candidate_id, bucket, session_id,
+   * task_domain, exposure_ts, outcome}——outcome='pending' 占位，finalizeTurn 以真实 outcome 回写
+   *（同 (session,candidate) 键最后一条胜出，L2 不重复计数）。task_domain 缺省 'general'
+   *（真实任务域判定留待语义扩展）。尽力而为：失败 → 降级记录（会话继续，不追踪 outcome）。
+   */
+  private async recordShadowExposure(req: CognitiveRequest, route: ShadowRoute): Promise<void> {
+    if (this.shadowSessions.has(req.session_id)) {
+      return; // 首请求只写一次（进程内记忆化）
+    }
+    const shadowsDir = join(this.evolutionRoot, 'shadows');
+    const file = join(shadowsDir, `exposure-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    try {
+      await mkdir(shadowsDir, { recursive: true });
+      await appendFile(
+        file,
+        `${JSON.stringify({
+          candidate_id: route.candidate_id,
+          bucket: route.bucket,
+          session_id: req.session_id,
+          task_domain: route.task_domain,
+          exposure_ts: Date.now(),
+          outcome: 'pending', // 占位——finalizeTurn 回写真实 outcome
+        })}\n`,
+        'utf8',
+      );
+      this.shadowSessions.set(req.session_id, route);
+    } catch (err) {
+      recordDegradation(
+        'shadow/route',
+        `exposure 落盘失败（${errorDetail(err)}）——shadow 会话继续（尽力而为，不追踪 outcome）`,
+      );
+    }
+  }
+
+  /**
+   * S7：shadow 会话收尾 outcome 回写（exposure-<date>.jsonl 追加同键条目——(session,candidate) 最后一条
+   * 胜出）。outcome 代理（计划 §S7）：**以是否产生降级/decision 为代理**——decision.process.degraded
+   * 非空（调度/过程失败）→ 'degraded'，否则 'success'；真实任务成功判定（success_criteria 达成评估）
+   * 留待语义扩展（本代理仅为 promotion gate L2 后验统计入口，非任务级成功判定）。尽力而为。
+   */
+  private async writeShadowOutcome(sessionId: string, decision: GovernorDecision): Promise<void> {
+    const route = this.shadowSessions.get(sessionId);
+    if (route === undefined) {
+      return; // 非 shadow 会话（或 exposure 未落盘）→ 不回写
+    }
+    const outcome: 'success' | 'degraded' =
+      decision.process?.degraded !== null && decision.process?.degraded !== undefined ? 'degraded' : 'success';
+    const shadowsDir = join(this.evolutionRoot, 'shadows');
+    const file = join(shadowsDir, `exposure-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    try {
+      await mkdir(shadowsDir, { recursive: true });
+      await appendFile(
+        file,
+        `${JSON.stringify({
+          candidate_id: route.candidate_id,
+          bucket: route.bucket,
+          session_id: sessionId,
+          task_domain: route.task_domain,
+          exposure_ts: Date.now(),
+          outcome,
+        })}\n`,
+        'utf8',
+      );
+    } catch (err) {
+      recordDegradation('shadow/route', `outcome 回写失败（${errorDetail(err)}）——尽力而为`);
+    }
+  }
+
+  /** S7：shadow 路由缓存失效（线/快照/内容变化点调用——/mode 切换、promote、候选晋升 trusted-latest 推进） */
+  private invalidateShadowCaches(): void {
+    this.trustedLatestCommit = undefined;
+    this.shadowCandidateCache = null;
+    this.shadowBundle = null;
+    this.shadowBundleFailed = false;
+    this.shadowSnapshots.clear();
+    this.perLineWorldModels.clear();
+  }
+
   /**
    * prepareTurn（§3.1）：turn 开始认知准备——快照/工作状态/Governor 决策（准备级）/（R3）Governor→Scheduler→
    * Process 调度（选定/生成过程 → decision 载荷 + Working State 过程引用 + Context Projection「认知过程」section）/
    * 分层检索/ContextCompiler 投影编译；（提供注入接收器时）注入 + context/injected 入链（Model-visible ⟺ logged）。
+   * S7：per-session shadow 路由——先加载装配线策略（配置源），再按 shadow 桶判定生效线：桶会话 →
+   * latest 线快照运行（快照身份/线状态真实变化 + policy/processes 按线加载）+ exposure 落盘（首请求）；
+   * 无 trusted-latest 差异/未启用 → 零开销（默认路径不变）。
    */
   async prepareTurn(req: CognitiveRequest, opts: PrepareTurnOptions = {}): Promise<PreparedTurn> {
-    const { policy, processes } = await this.ready();
-    // P1b：请求开始解析快照（未绑定 → 绑定当前快照，整个请求锁定 §6.5.7；晋升只影响后续请求）
-    const snapshot = this.resolveRuntimeSnapshot(req.session_id);
+    const ready = await this.ready();
+    let policy = ready.policy;
+    let processes = ready.processes;
+    // S7：shadow 路由判定（配置源 = 装配线策略；只判不 I/O——commit/candidate 记忆化解析）
+    const route = await this.computeShadowRoute(req.session_id, ready.policy.evolve.shadow);
+    let shadowRouted = false;
+    if (route.route) {
+      // shadow 桶会话：latest 线 policy/processes（per-line 记忆化；加载失败 → 降级回退装配线 + 记录）
+      const latestBundle = await this.loadShadowBundle();
+      if (latestBundle !== null) {
+        policy = latestBundle.policy;
+        processes = latestBundle.processes;
+        shadowRouted = true;
+      }
+    }
+    // P1b：请求开始解析快照（未绑定 → 绑定当前快照，整个请求锁定 §6.5.7；晋升只影响后续请求）。
+    // S7：shadow 桶会话 → 绑定 latest 线快照身份（rs:<latest commit 哈希>——快照真实不同）
+    const snapshot = shadowRouted
+      ? this.resolveShadowSnapshot(req.session_id)
+      : this.resolveRuntimeSnapshot(req.session_id);
     const working_state = await this.loadWorkingState(req);
     const decision = decide(this.buildGovernorInput(req, processes, policy, snapshot), policy.governor);
     // R3（P0）：Governor → Scheduler → Process 进入请求链（架构 §5.1/§4.6.1：Fast Governor + Rare Generator）。
     // 只做决策与投影——不驱动执行：不调用 operator executor、不循环调用模型（DSH 原生 Agent Loop 是唯一执行者）。
     // 调度结果并入 decision 载荷（decision/made 事件 payload 已由 finalizeTurn 记录 chosen/reason——不新增事件类型）；
     // 失败降级（scheduler 异常/无过程可选）→ decision.process.degraded 记录，不阻塞 prepareTurn 其余流程。
-    const scheduled = await this.scheduleProcess(req, processes);
+    const scheduled = await this.scheduleProcess(req, processes, policy);
     decision.process = scheduled;
     if (scheduled.kind !== 'none' && scheduled.process_id !== null) {
       // 过程引用写入 Working State（next_best_action）：DSH Loop 的下一步 = 执行认知过程
@@ -1036,6 +1392,11 @@ export class CognitiveRuntime {
       toProcessSection(scheduled),
       { eventStore: this.eventStore, capabilities: this.capabilities, session_id: req.session_id },
     );
+
+    // S7：shadow 会话首请求 exposure 落盘（尽力而为——失败降级记录不阻塞请求）
+    if (shadowRouted) {
+      await this.recordShadowExposure(req, route);
+    }
 
     let events_appended = 0;
     if (opts.inject !== undefined) {
@@ -1216,6 +1577,11 @@ export class CognitiveRuntime {
       checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: snapshot });
     }
 
+    // S7：shadow 会话收尾回写 outcome（success/degraded——以是否产生降级/decision 为代理；
+    // 真实任务成功判定（success_criteria 达成评估）留待语义扩展，注释见 writeShadowOutcome；
+    // 尽力而为——失败降级记录不阻塞收尾）
+    await this.writeShadowOutcome(input.session_id, input.decision);
+
     // P1b：请求结束 → 释放快照绑定（未绑定请求 end 为空操作——cleanup 路径幂等安全）
     this.registry.end(input.session_id);
 
@@ -1348,6 +1714,7 @@ export class CognitiveRuntime {
       this.policyPromise = null;
       this.processesPromise = null;
       this.modelCache = null; // S1：World/Self 模型反映新线（下一访问按新线/新快照重建）
+      this.invalidateShadowCaches(); // S7：线切换 → shadow 路由缓存失效（trusted-latest/线 bundle/快照身份）
       return { promoted: true, degraded: null };
     } catch (err) {
       return { promoted: false, degraded: `快照重建失败（${errorDetail(err)}）——当前快照保持` };
@@ -1358,6 +1725,7 @@ export class CognitiveRuntime {
   promoteSnapshot(next: RuntimeSnapshot): void {
     this.registry.promote(next);
     this.modelCache = null; // S1：World/Self 模型反映新快照（内容寻址重建）
+    this.invalidateShadowCaches(); // S7：快照切换 → shadow 路由缓存失效（线状态可能已变）
   }
 
   // ---- 内部 ----
@@ -1416,10 +1784,14 @@ export class CognitiveRuntime {
    * Agent Loop 是唯一执行者）。失败降级：scheduler 构造/调度异常 → 降级记录（degraded），不抛——
    * prepareTurn 其余流程照常（投影不含过程 section）。
    */
-  private async scheduleProcess(req: CognitiveRequest, processes: readonly ProcessDef[]): Promise<ProcessDecisionInfo> {
+  private async scheduleProcess(
+    req: CognitiveRequest,
+    processes: readonly ProcessDef[],
+    policy?: PolicyBundle,
+  ): Promise<ProcessDecisionInfo> {
     try {
       // 每次调用构造新调度器/生成器（P5：generationUsed 计数器即单请求语义——max_generate_per_request）
-      const scheduler = await this.createScheduler(processes);
+      const scheduler = await this.createScheduler(processes, policy);
       const res = await scheduler.schedule({ goal: req.goal, state: req.working_state });
       return {
         kind: res.kind,
@@ -2097,6 +2469,7 @@ export class CognitiveRuntime {
       outcomes.push(outcome);
       if (outcome.promoted && outcome.commit_hash !== undefined && outcome.object_id !== undefined) {
         events += 1; // evolution/promoted（pipeline 内入链）
+        this.invalidateShadowCaches(); // S7：候选晋升 → trusted-latest 推进/线内容变化 → shadow 路由缓存失效
         return {
           outcomes,
           promoted: { candidate_id: outcome.candidate_id, object_id: outcome.object_id, commit_hash: outcome.commit_hash },
@@ -2104,6 +2477,7 @@ export class CognitiveRuntime {
         };
       }
     }
+    this.invalidateShadowCaches(); // S7：候选管线跑完（trusted-latest 可能已推进）→ shadow 路由缓存失效
     return { outcomes, promoted: null, events_appended: events };
   }
 
@@ -2169,8 +2543,9 @@ export class CognitiveRuntime {
         candidate: { passed: candidate.passed, total: candidate.total },
         cost_degradation_ratio: Math.round(ratio * 1000) / 1000,
       };
-      // L2 统计（.evolution/shadows/exposure.log；无样本 → 记录不阻塞，以基准门禁为准）
-      const shadow = await readShadowSignals(join(this.evolutionRoot, SHADOW_LOG_REL));
+      // L2 统计（.evolution/shadows/——S7 exposure-<date>.jsonl + 既有 exposure.log 一并纳入；
+      // 无样本 → 记录不阻塞，以基准门禁为准）
+      const shadow = await readShadowSignals(join(this.evolutionRoot, 'shadows'));
       // 三层信号门禁判定（kernel 纯函数；阈值数据化）
       const { policy } = await this.ready();
       const gate = shouldPromoteToStable({

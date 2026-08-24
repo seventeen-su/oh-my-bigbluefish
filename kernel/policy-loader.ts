@@ -15,6 +15,7 @@ import {
   DEFAULT_CANDIDATE_GATE,
   DEFAULT_E_PROCESS_POLICY,
   DEFAULT_MAINTENANCE_COSTS,
+  DEFAULT_SHADOW_POLICY,
   DEFAULT_SHARE_POLICY,
   EvolvePolicySchema,
   GovernorPolicySchema,
@@ -50,6 +51,9 @@ export {
   MAINTENANCE_TASK_IDS,
   DEFAULT_MAINTENANCE_COSTS,
   MaintenanceCostsSchema,
+  // S7：per-session shadow 放量路由配置公共面（§5.3；DEFAULT_SHADOW_POLICY = 出厂缺省）
+  DEFAULT_SHADOW_POLICY,
+  ShadowPolicySchema,
   EvolvePolicySchema,
   GovernorPolicySchema,
   GovernorRuleSchema,
@@ -75,6 +79,7 @@ export {
   type ObjectLayer,
   type OperatorDef,
   type ProcessDef,
+  type ShadowPolicy,
   type SharePolicy,
   type SignalTrigger,
 } from './schemas/policy.js';
@@ -98,6 +103,8 @@ const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
   e_process: { ...DEFAULT_E_PROCESS_POLICY },
   share: { ...DEFAULT_SHARE_POLICY },
   maintenance_costs: { ...DEFAULT_MAINTENANCE_COSTS },
+  // S7：per-session shadow 放量路由（出厂缺省；无 trusted-latest 差异/缺失时零开销不路由）
+  shadow: { ...DEFAULT_SHADOW_POLICY },
 };
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */
