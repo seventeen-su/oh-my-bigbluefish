@@ -5,6 +5,9 @@
 // 层 DAG（CONVENTIONS §4）：kernel(2) → kernel/schemas(2) 满足"import 目标层 ≤ 源层"；
 // 消费方 = runtime(2)（assembly/plugin）与 tests（豁免）；supervisor 不依赖本文件（契约例外仅限 kernel/schemas）。
 import type { EvolvePolicy, SignalTrigger } from './schemas/policy.js';
+// S2：维护任务成本单一来源（DEFAULT_MAINTENANCE_COSTS = policy 缺省初值；MaintenanceTaskId = 七任务全集）
+import { DEFAULT_MAINTENANCE_COSTS, type MaintenanceTaskId } from './schemas/policy.js';
+export type { MaintenanceTaskId } from './schemas/policy.js';
 import type {
   EvolutionDecision,
   MaintenanceUrgency,
@@ -21,28 +24,34 @@ export const MAINTENANCE_WEIGHTS = {
   repair: 20,
   gc: 1,
 } as const;
-export type MaintenanceTaskId = keyof typeof MAINTENANCE_WEIGHTS;
 
-/** 维护任务成本估计（§10.1 estimated_cost，priority = EV/C × debt 的 C；待标定 §17）。
- *  取值 ≥ 权重 → 债务任务 ROI ≤ 1，低于会话级收尾任务（turn-finalize ROI 1）——
- *  会话收尾（事件库 GC）先执行、信号债务任务随后（既有调度顺序不破坏，既有测试锚定）。
- *  §17 标定留档（2026-08-23，P6）：维护任务真实执行数据（real-v2-stable 基准 cost 中
- *  tool_calls/retrieval_calls 全 0、无维护执行观测）尚未产出 → 常量保持初值不臆造，
- *  待维护任务真实执行数据产出后按 ROI 观测标定（同一 EV/C×debt 机制，改本表即生效）。 */
-export const MAINTENANCE_COSTS: Record<MaintenanceTaskId, number> = {
-  memory_consolidation: 4,
-  candidate_validation: 10,
-  repair: 25,
-  gc: 2,
-};
+/**
+ * 维护任务成本估计（§10.1 estimated_cost，priority = EV/C × debt 的 C）。
+ * S2 成本数据化：运行期来源 = policy.evolve.maintenance_costs（装配时注入——改 evolve.yaml 即生效）；
+ * 本常量 = 出厂缺省初值（与 policy 缺省同源）。
+ * 初值 + 观测中：无真实维护执行数据 → 不臆造标定；最终值待 .evolution/maintenance-observations
+ * 观测数据积累后按 §10.1 ROI 观测标定（同一 EV/C×debt 机制，改 policy maintenance_costs 即生效）。
+ */
+export const MAINTENANCE_COSTS: Readonly<Record<MaintenanceTaskId, number>> = { ...DEFAULT_MAINTENANCE_COSTS };
 
-/** 债务任务紧迫度（§10.1：repair/candidate 高价值维护 → soft 提升 quantum 频率；memory/gc 常规） */
+/** 债务任务紧迫度（§10.1：repair/candidate 高价值维护 → soft 提升 quantum 频率；其余常规） */
 const ACCRUAL_URGENCY: Record<MaintenanceTaskId, MaintenanceUrgency> = {
   repair: 'soft',
   candidate_validation: 'soft',
   memory_consolidation: 'normal',
   gc: 'normal',
+  promotion_check: 'normal',
+  environment_check: 'normal',
+  evolution_decision: 'normal',
 };
+
+/** S2：可注入的维护成本表（装配时传 policy.evolve.maintenance_costs；缺省 → 出厂初值） */
+export type MaintenanceCostsLike = Readonly<Partial<Record<MaintenanceTaskId, number>>>;
+
+/** 成本解析：注入值优先，缺省 → 出厂初值（0 为合法注入值，不回落） */
+function costOf(costs: MaintenanceCostsLike | undefined, taskId: MaintenanceTaskId): number {
+  return costs?.[taskId] ?? MAINTENANCE_COSTS[taskId];
+}
 
 /** 单位信号量的演化成本（decideEvolution.budget_estimate 估算基数；待标定 §17） */
 const EVOLUTION_UNIT_COST = 10;
@@ -59,11 +68,12 @@ export interface DebtAccrual {
   urgency: MaintenanceUrgency;
 }
 
-/** 信号摘要 → §10.1 维护债务入账（按实际信号类型累计权重；零计数不产生债务；gc 为每收尾常驻 +1） */
-export function debtAccrualsFromSummary(summary: SignalSummary): DebtAccrual[] {
+/** 信号摘要 → §10.1 维护债务入账（按实际信号类型累计权重；零计数不产生债务；gc 为每收尾常驻 +1）。
+ *  @param costs S2 成本注入（policy.evolve.maintenance_costs）；缺省 → 出厂初值 */
+export function debtAccrualsFromSummary(summary: SignalSummary, costs?: MaintenanceCostsLike): DebtAccrual[] {
   const out: DebtAccrual[] = [];
   const push = (taskId: MaintenanceTaskId, value: number): void => {
-    const cost = MAINTENANCE_COSTS[taskId];
+    const cost = costOf(costs, taskId);
     out.push({
       task_id: taskId,
       value,
@@ -99,11 +109,12 @@ export function debtAccrualsFromSummary(summary: SignalSummary): DebtAccrual[] {
   return out;
 }
 
-/** 应演化时入队 candidate_validation 的债务入账（§6.5.1 → §10.1；P1d 接真实候选生成/验证） */
-export function candidateValidationAccrual(): DebtAccrual {
+/** 应演化时入队 candidate_validation 的债务入账（§6.5.1 → §10.1；P1d 接真实候选生成/验证）。
+ *  @param costs S2 成本注入（policy.evolve.maintenance_costs）；缺省 → 出厂初值 */
+export function candidateValidationAccrual(costs?: MaintenanceCostsLike): DebtAccrual {
   const taskId: MaintenanceTaskId = 'candidate_validation';
   const value = MAINTENANCE_WEIGHTS[taskId];
-  const cost = MAINTENANCE_COSTS[taskId];
+  const cost = costOf(costs, taskId);
   return {
     task_id: taskId,
     value,
@@ -114,11 +125,12 @@ export function candidateValidationAccrual(): DebtAccrual {
 }
 
 /** R4：经验已入 staging → memory_consolidation 债务入账（§10.1 同形状；finalizeTurn 在
- *  Experience Admission 后入队——保证「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度） */
-export function memoryConsolidationAccrual(): DebtAccrual {
+ *  Experience Admission 后入队——保证「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度）。
+ *  @param costs S2 成本注入（policy.evolve.maintenance_costs）；缺省 → 出厂初值 */
+export function memoryConsolidationAccrual(costs?: MaintenanceCostsLike): DebtAccrual {
   const taskId: MaintenanceTaskId = 'memory_consolidation';
   const value = MAINTENANCE_WEIGHTS[taskId];
-  const cost = MAINTENANCE_COSTS[taskId];
+  const cost = costOf(costs, taskId);
   return {
     task_id: taskId,
     value,
@@ -129,11 +141,12 @@ export function memoryConsolidationAccrual(): DebtAccrual {
 }
 
 /** P7：环境变化 → 受影响对象重新验证入队（repair 债务；§14.5 Predictive Invalidation 触发面，
- *  与 debtAccrualsFromSummary 的 corrections/oracle_fail → repair 同语义） */
-export function repairAccrual(): DebtAccrual {
+ *  与 debtAccrualsFromSummary 的 corrections/oracle_fail → repair 同语义）。
+ *  @param costs S2 成本注入（policy.evolve.maintenance_costs）；缺省 → 出厂初值 */
+export function repairAccrual(costs?: MaintenanceCostsLike): DebtAccrual {
   const taskId: MaintenanceTaskId = 'repair';
   const value = MAINTENANCE_WEIGHTS[taskId];
-  const cost = MAINTENANCE_COSTS[taskId];
+  const cost = costOf(costs, taskId);
   return {
     task_id: taskId,
     value,

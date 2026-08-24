@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   APPLICABILITY,
   BUILTIN_OPERATORS,
+  DEFAULT_MAINTENANCE_COSTS,
   EVIDENCE_GAPS,
   loadPolicy,
   loadProcesses,
@@ -313,5 +314,99 @@ describe('⑦ 公共 API 导出面（防漂移：policy-loader re-export 完整�
     expect(
       contract.GovernorPolicySchema.safeParse({ rules: [invalidRule, defaultRule] }).success,
     ).toBe(false);
+  });
+});
+
+describe('⑧ maintenance_costs（S2 成本数据化：§10.1 estimated_cost 初值 + 观测积累后标定）', () => {
+  it('真实 evolve.yaml 含 maintenance_costs 七任务初值（memory+4/candidate+10/repair+25/检查类+2/gc+2）', async () => {
+    const p = await loadPolicy(POLICY_DIR);
+    expect(p.evolve.maintenance_costs).toEqual({
+      memory_consolidation: 4,
+      candidate_validation: 10,
+      repair: 25,
+      promotion_check: 2,
+      environment_check: 2,
+      evolution_decision: 2,
+      gc: 2,
+    });
+    expect(p.evolve.maintenance_costs).toEqual(DEFAULT_MAINTENANCE_COSTS);
+  });
+
+  it('缺省兼容旧形状：无 maintenance_costs 段（仅 §9.5 三字段）→ 出厂初值', async () => {
+    const dir = await policyFixture({
+      'evolve.yaml': ['daily_evolution_cost: 100', 'roi_min: 1.0', 'maintenance_rate: 0.5'].join('\n'),
+    });
+    const p = await loadPolicy(dir);
+    expect(p.evolve.maintenance_costs).toEqual(DEFAULT_MAINTENANCE_COSTS);
+  });
+
+  it('部分键合法：未列任务缺省 = 出厂初值（段内逐键缺省兼容）', async () => {
+    const dir = await policyFixture({
+      'evolve.yaml': [
+        'daily_evolution_cost: 100',
+        'roi_min: 1.0',
+        'maintenance_rate: 0.5',
+        'maintenance_costs:',
+        '  gc: 99',
+      ].join('\n'),
+    });
+    const p = await loadPolicy(dir);
+    expect(p.evolve.maintenance_costs.gc).toBe(99);
+    expect(p.evolve.maintenance_costs.repair).toBe(25);
+    expect(p.evolve.maintenance_costs.memory_consolidation).toBe(4);
+  });
+
+  it('非法值拒绝（fail-loud）：负数 / 非数值 → loadPolicy 抛错并指明字段', async () => {
+    const dirNeg = await policyFixture({
+      'evolve.yaml': [
+        'daily_evolution_cost: 100',
+        'roi_min: 1.0',
+        'maintenance_rate: 0.5',
+        'maintenance_costs:',
+        '  gc: -1',
+      ].join('\n'),
+    });
+    await expect(loadPolicy(dirNeg)).rejects.toThrow(/gc/);
+    const dirStr = await policyFixture({
+      'evolve.yaml': [
+        'daily_evolution_cost: 100',
+        'roi_min: 1.0',
+        'maintenance_rate: 0.5',
+        'maintenance_costs:',
+        '  gc: nope',
+      ].join('\n'),
+    });
+    await expect(loadPolicy(dirStr)).rejects.toThrow(/gc/);
+  });
+
+  it('改动即生效：evolve.yaml 改 repair 成本 → loadPolicy 返回新值（机制即数据）', async () => {
+    const dir = await policyFixture({
+      'evolve.yaml': [
+        'daily_evolution_cost: 100',
+        'roi_min: 1.0',
+        'maintenance_rate: 0.5',
+        'maintenance_costs:',
+        '  repair: 7',
+      ].join('\n'),
+    });
+    const p = await loadPolicy(dir);
+    expect(p.evolve.maintenance_costs.repair).toBe(7);
+  });
+
+  it('MAINTENANCE_TASK_IDS / DEFAULT_MAINTENANCE_COSTS 公共 API 导出面（policy-loader re-export 完整）', async () => {
+    const loader = await import('../../kernel/policy-loader.js');
+    const contract = await import('../../kernel/schemas/policy.js');
+    expect(loader.DEFAULT_MAINTENANCE_COSTS).toBeDefined();
+    expect(loader.DEFAULT_MAINTENANCE_COSTS).toEqual(contract.DEFAULT_MAINTENANCE_COSTS);
+    expect(loader.MAINTENANCE_TASK_IDS).toEqual(contract.MAINTENANCE_TASK_IDS);
+    expect(loader.MAINTENANCE_TASK_IDS).toEqual([
+      'memory_consolidation',
+      'candidate_validation',
+      'repair',
+      'promotion_check',
+      'environment_check',
+      'evolution_decision',
+      'gc',
+    ]);
   });
 });

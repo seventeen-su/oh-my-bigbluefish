@@ -17,9 +17,14 @@
 // - P1c §10.1 债务语义：enqueue(input, { accrueDebt: true }) → 入队同时累计债务（事件入队累加 value，
 //   立即持久化）；任务成功 → 清偿（归零）；失败/中断/hard 跳过 → 已入账债务不再重复累计（防双计）。
 //   既有默认（accrueDebt: false）行为不变（仅失败/跳过/中断累计）。
+// - S2 维护观测：每任务执行后追加写 .evolution/maintenance-observations/<yyyy-mm-dd>.jsonl
+//   （{ts, task_id, duration_ms, result: success|deferred|failed|interrupted, debt_before, debt_after}；
+//   幂等建目录、失败降级不阻塞调度）；observationsSummary() 摘要（今日任务数 + 各任务平均耗时）供 kern_status；
+//   成本注入面 maintenanceCosts/setMaintenanceCosts（装配时传 policy.evolve.maintenance_costs——§10.1
+//   estimated_cost 数据化；enqueue 未给 cost 且 id 命中 → 用 policy 成本，未列出 id 仍 M3 缺省 1）。
 // layer 1（supervisor/）：仅 node: 内置 + kernel/schemas/（契约例外）+ supervisor/ 内文件。
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Fingerprint } from '../kernel/schemas/base.js';
 import type { MaintenanceUrgency } from '../kernel/schemas/evolution.js';
@@ -70,6 +75,36 @@ export interface MaintenanceDebt {
   urgency: string;
 }
 
+// ---- S2：维护观测（§10.1 estimated_cost 标定数据源——真实执行耗时/结果落盘，供观测积累后标定） ----
+
+/** 维护任务执行结果（S2 观测：success 成功清偿 / deferred 未实现（R5）/ failed 真实失败 / interrupted 中断让出） */
+export type MaintenanceObservationResult = 'success' | 'deferred' | 'failed' | 'interrupted';
+
+/** 单次维护任务执行观测（追加写 .evolution/maintenance-observations/<yyyy-mm-dd>.jsonl，每行一条） */
+export interface MaintenanceObservation {
+  /** 任务开始时间（epoch ms；观测按日分文件用） */
+  ts: number;
+  task_id: string;
+  duration_ms: number;
+  result: MaintenanceObservationResult;
+  /** 执行前该任务已累计债务（accrueDebt 入队即累计；未入账 → 0） */
+  debt_before: number;
+  /** 执行后该任务债务（success 清偿 → 0；deferred/failed/interrupted 保留/累计 → 非零） */
+  debt_after: number;
+}
+
+/** S2：观测摘要（kern_status 可读入口——今日任务数 + 各任务平均耗时；per_task 按 task_id 排序，确定性） */
+export interface MaintenanceObservationSummary {
+  date: string;
+  total: number;
+  per_task: Array<{ task_id: string; count: number; avg_duration_ms: number }>;
+}
+
+/** 观测按日分文件（<yyyy-mm-dd>.jsonl；UTC 日期——与 signals 同约定，跨时区一致） */
+function utcDay(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
 export interface QuantumReport {
   ran: string[];
   skipped: string[];
@@ -103,6 +138,12 @@ export interface PredictiveInvalidationDeps {
 export interface MaintenanceSchedulerOptions {
   /** 债务持久化文件（缺省 workspace/.omb/.evolution/debt.json；根 .gitignore 已覆盖该目录） */
   debtFile?: string;
+  /** S2：维护观测落盘目录（缺省 <debtFile 同目录>/maintenance-observations =
+   *  .evolution/maintenance-observations；按日分文件 <yyyy-mm-dd>.jsonl） */
+  observationsDir?: string;
+  /** S2：维护任务成本注入面（装配时传 policy.evolve.maintenance_costs；enqueue 未给 estimated_cost
+   *  且任务 id 命中 → 用 policy 成本，未列出 id 仍 M3 缺省 1；setMaintenanceCosts 可后续覆写） */
+  maintenanceCosts?: Readonly<Partial<Record<string, number>>>;
   /** soft 阈值：债务合计 ≥ → quantum 频率提升（tick 间隔减半） */
   softLimit?: number;
   /** hard 阈值：债务合计 ≥ → 非必要（urgency='normal'）任务跳过 */
@@ -133,6 +174,10 @@ const FP_FIELDS: (keyof Fingerprint)[] = ['os', 'node', 'dsh_version', 'project'
 
 export class MaintenanceScheduler {
   private readonly debtFile: string;
+  /** S2：维护观测落盘目录（缺省 <debtFile 同目录>/maintenance-observations） */
+  private readonly observationsDir: string;
+  /** S2：维护任务成本注入面（policy.evolve.maintenance_costs；enqueue 缺省成本按 id 查找） */
+  private maintenanceCosts: Readonly<Partial<Record<string, number>>>;
   private readonly softLimit: number;
   private readonly hardLimit: number;
   private readonly baseTickMs: number;
@@ -154,6 +199,9 @@ export class MaintenanceScheduler {
 
   constructor(opts: MaintenanceSchedulerOptions = {}) {
     this.debtFile = opts.debtFile ?? join(process.cwd(), 'workspace', '.omb', '.evolution', 'debt.json');
+    this.observationsDir =
+      opts.observationsDir ?? join(dirname(this.debtFile), 'maintenance-observations');
+    this.maintenanceCosts = opts.maintenanceCosts ?? {};
     this.softLimit = opts.softLimit ?? DEFAULT_SOFT_LIMIT;
     this.hardLimit = opts.hardLimit ?? DEFAULT_HARD_LIMIT;
     this.baseTickMs = opts.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS;
@@ -171,7 +219,8 @@ export class MaintenanceScheduler {
     const task: MaintenanceTask = {
       id: input.id,
       value: input.value ?? 1,
-      estimated_cost: input.estimated_cost ?? 1,
+      // S2：成本注入面——未给 estimated_cost 且任务 id 命中注入表 → 用 policy 成本（未列出 id 仍 M3 缺省 1）
+      estimated_cost: input.estimated_cost ?? this.maintenanceCosts[input.id] ?? 1,
       priority: input.priority ?? 0,
       urgency: input.urgency ?? 'normal',
       run: input.run,
@@ -263,6 +312,55 @@ export class MaintenanceScheduler {
   /** R5：Deferred 事件记录快照（未实现/不可执行任务的出队但债务保留事件；task_id 排序，确定性） */
   deferredEvents(): DeferredEvent[] {
     return [...this.deferredLog].sort((a, b) => a.task_id.localeCompare(b.task_id));
+  }
+
+  /**
+   * S2：维护任务成本注入（装配时传 policy.evolve.maintenance_costs——数据即机制，改 evolve.yaml 即生效）。
+   * 幂等：每次调用以最新注入值整体替换（调度器缺省成本面 = 当前 policy 值）。
+   */
+  setMaintenanceCosts(costs: Readonly<Partial<Record<string, number>>>): void {
+    this.maintenanceCosts = { ...costs };
+  }
+
+  /**
+   * S2：观测摘要（kern_status 可读入口）——今日（UTC）任务数 + 各任务平均耗时（per_task 按 task_id 排序，确定性）。
+   * 无观测目录/文件 → 全零（安全降级）；文件不可读 → 抛错（调用方降级字段记录，不静默吞错）。
+   */
+  observationsSummary(): MaintenanceObservationSummary {
+    const date = utcDay(this.nowFn());
+    const file = join(this.observationsDir, `${date}.jsonl`);
+    const perTask = new Map<string, { count: number; totalMs: number }>();
+    if (existsSync(file)) {
+      let raw: string;
+      try {
+        raw = readFileSync(file, 'utf8');
+      } catch (err) {
+        throw new Error(`maintenance observations unreadable: ${file}: ${(err as Error).message}`);
+      }
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+        try {
+          const obs = JSON.parse(trimmed) as MaintenanceObservation;
+          if (typeof obs.task_id !== 'string') continue;
+          const agg = perTask.get(obs.task_id) ?? { count: 0, totalMs: 0 };
+          agg.count++;
+          agg.totalMs += typeof obs.duration_ms === 'number' ? obs.duration_ms : 0;
+          perTask.set(obs.task_id, agg);
+        } catch {
+          // 损坏观测行跳过（观测为审计日志——不因坏行崩摘要）
+        }
+      }
+    }
+    const per_task = [...perTask.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([task_id, agg]) => ({
+        task_id,
+        count: agg.count,
+        avg_duration_ms: agg.count > 0 ? Math.round(agg.totalMs / agg.count) : 0,
+      }));
+    const total = per_task.reduce((acc, p) => acc + p.count, 0);
+    return { date, total, per_task };
   }
 
   /** Predictive Invalidation（§9.1）：Fingerprint diff → markSuspicious + 最小回归子集 + 衰减记录 */
@@ -364,12 +462,23 @@ export class MaintenanceScheduler {
    * 入账值，不翻倍）。
    */
   private async runOne(t: MaintenanceTask, signal?: AbortSignal): Promise<QuantumReport> {
+    // S2 观测：任务开始时间 + 执行前债务（accrueDebt 任务入队即累计；未入账 → 0）
+    const started = this.nowFn();
+    const debtBefore = this.debt.get(t.id)?.value ?? 0;
     try {
       await t.run(signal);
     } catch (err) {
       const aborted = signal?.aborted === true || (err instanceof Error && err.name === 'AbortError');
       if (aborted) {
         this.accrueOnNonRun(t); // 未执行 → 债务累计（留队可重试）
+        await this.appendObservation({
+          ts: started,
+          task_id: t.id,
+          duration_ms: this.nowFn() - started,
+          result: 'interrupted',
+          debt_before: debtBefore,
+          debt_after: this.debt.get(t.id)?.value ?? 0,
+        });
         return { ran: [], skipped: [t.id] };
       }
       // 出队前记录入账标记（防双计：removeFromQueue 会清除 accruedAtEnqueue）
@@ -381,15 +490,39 @@ export class MaintenanceScheduler {
         if (!wasAccrued) {
           this.accrueOnNonRun(t); // 未入账任务 → 债务累计（未完成 → debt 保留）
         }
+        await this.appendObservation({
+          ts: started,
+          task_id: t.id,
+          duration_ms: this.nowFn() - started,
+          result: 'deferred',
+          debt_before: debtBefore,
+          debt_after: this.debt.get(t.id)?.value ?? 0,
+        });
         return { ran: [t.id], skipped: [] };
       }
       if (!wasAccrued) {
         this.accrueOnNonRun(t); // 执行失败 → 债务累计（保留；已入账任务保留入账值防双计）
       }
+      await this.appendObservation({
+        ts: started,
+        task_id: t.id,
+        duration_ms: this.nowFn() - started,
+        result: 'failed',
+        debt_before: debtBefore,
+        debt_after: this.debt.get(t.id)?.value ?? 0,
+      });
       return { ran: [t.id], skipped: [] };
     }
     this.removeFromQueue(t.id);
     this.clearDebt(t.id);
+    await this.appendObservation({
+      ts: started,
+      task_id: t.id,
+      duration_ms: this.nowFn() - started,
+      result: 'success',
+      debt_before: debtBefore,
+      debt_after: 0, // 成功清偿归零
+    });
     return { ran: [t.id], skipped: [] };
   }
 
@@ -464,6 +597,19 @@ export class MaintenanceScheduler {
     const tmp = `${this.debtFile}.tmp`;
     await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
     await rename(tmp, this.debtFile);
+  }
+
+  /**
+   * S2：维护观测落盘（追加写 .evolution/maintenance-observations/<yyyy-mm-dd>.jsonl；幂等建目录）。
+   * 尽力而为：写入失败 → 降级不阻塞调度（观测为审计日志——缺观测不中断维护链）。
+   */
+  private async appendObservation(obs: MaintenanceObservation): Promise<void> {
+    try {
+      await mkdir(this.observationsDir, { recursive: true });
+      await appendFile(join(this.observationsDir, `${utcDay(obs.ts)}.jsonl`), `${JSON.stringify(obs)}\n`, 'utf8');
+    } catch {
+      // 观测写入失败 → 降级（不抛：调度照常；观测缺失由摘要面诚实呈现）
+    }
   }
 
   // ---- 定时器 ----

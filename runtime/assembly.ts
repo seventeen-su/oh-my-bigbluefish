@@ -583,7 +583,11 @@ export class CognitiveRuntime {
     this.policyPromise ??= loadPolicy(this.policyDir);
     this.processesPromise ??= loadProcesses(this.processesDir);
     await this.componentsReady(); // P2：组件激活 + 健康检查（幂等；失败降级不阻塞请求路径）
-    return { policy: await this.policyPromise, processes: await this.processesPromise };
+    const policy = await this.policyPromise;
+    // S2：维护成本数据化——装配读取 policy.evolve.maintenance_costs → 注入维护调度器
+    //（缺省成本面：enqueue 未给 estimated_cost 且任务 id 命中 → policy 成本；改 evolve.yaml 即生效）
+    this.maintenance?.setMaintenanceCosts(policy.evolve.maintenance_costs);
+    return { policy, processes: await this.processesPromise };
   }
 
   /**
@@ -633,6 +637,16 @@ export class CognitiveRuntime {
       signals_degraded = errorDetail(err);
     }
     const entries = this.components.list();
+    // S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + 降级字段，不抛）
+    let maintenance_observations: KernStatusSummary['maintenance_observations'] = null;
+    let observations_degraded: string | null = null;
+    if (this.maintenance !== null) {
+      try {
+        maintenance_observations = this.maintenance.observationsSummary();
+      } catch (err) {
+        observations_degraded = errorDetail(err);
+      }
+    }
     return {
       line: this.lineSnapshot?.line ?? 'stable',
       snapshot_hash: this.snapshotHash,
@@ -641,6 +655,8 @@ export class CognitiveRuntime {
         : null,
       line_degraded: this.lineDegraded,
       debt: this.maintenance?.debtSnapshot() ?? [],
+      maintenance_observations,
+      observations_degraded,
       recent_signals,
       signals_degraded,
       components: {
@@ -870,11 +886,14 @@ export class CognitiveRuntime {
 
     let maintenance: { enqueued: boolean; debt: MaintenanceDebt[] } = { enqueued: false, debt: [] };
     if (this.maintenance !== null) {
+      // S2：维护任务成本数据化——estimated_cost 从 policy.evolve.maintenance_costs 读取（改 evolve.yaml 即生效）
+      const { policy } = await this.ready();
+      const maintenanceCosts = policy.evolve.maintenance_costs;
       // 既有：会话级收尾任务（事件库 GC/compact；债务语义不变——仅失败/中断/跳过累计）
       await this.maintenance.enqueue({
         id: `turn-finalize:${input.session_id}`,
         value: 1,
-        estimated_cost: 1,
+        estimated_cost: 1, // 会话级收尾：固定成本 1（非维护任务表；ROI 1 优先语义不变）
         run: async () => {
           await this.eventStore.compact(Date.now());
         },
@@ -885,7 +904,7 @@ export class CognitiveRuntime {
       const summary = summarizeSignals(
         countsToSignalRecords(signals as unknown as Record<string, number>, turnTs, input.session_id),
       );
-      for (const acc of debtAccrualsFromSummary(summary)) {
+      for (const acc of debtAccrualsFromSummary(summary, maintenanceCosts)) {
         await this.maintenance.enqueue(
           {
             id: acc.task_id,
@@ -901,7 +920,7 @@ export class CognitiveRuntime {
       // R4（P0）：经验已入 staging → memory_consolidation 债务入账（§10.1 同形状）——保证
       // 「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度（空闲期量子执行 consolidation）
       if (experience_admission.staged > 0) {
-        const acc = memoryConsolidationAccrual();
+        const acc = memoryConsolidationAccrual(maintenanceCosts);
         await this.maintenance.enqueue(
           {
             id: acc.task_id,
@@ -919,7 +938,7 @@ export class CognitiveRuntime {
       await this.maintenance.enqueue({
         id: 'evolution_decision',
         value: 1,
-        estimated_cost: 2,
+        estimated_cost: maintenanceCosts.evolution_decision,
         priority: 0,
         urgency: 'normal',
         run: async (signal) => {
@@ -931,7 +950,7 @@ export class CognitiveRuntime {
       await this.maintenance.enqueue({
         id: 'promotion_check',
         value: 1,
-        estimated_cost: 2,
+        estimated_cost: maintenanceCosts.promotion_check,
         priority: 0,
         urgency: 'normal',
         run: this.maintenanceRun('promotion_check', input.session_id),
@@ -942,7 +961,7 @@ export class CognitiveRuntime {
       await this.maintenance.enqueue({
         id: 'environment_check',
         value: 1,
-        estimated_cost: 2,
+        estimated_cost: maintenanceCosts.environment_check,
         priority: 0,
         urgency: 'normal',
         run: this.maintenanceRun('environment_check', input.session_id),
@@ -1306,7 +1325,8 @@ export class CognitiveRuntime {
     const decision = decideEvolution({ summary, policy: policy.evolve, debt: debtTotal });
     const enqueued: string[] = [];
     if (decision.should_evolve && this.maintenance !== null) {
-      const acc = candidateValidationAccrual();
+      // S2：债务成本从 policy.evolve.maintenance_costs 读取（装配注入——改 evolve.yaml 即生效）
+      const acc = candidateValidationAccrual(policy.evolve.maintenance_costs);
       await this.maintenance.enqueue(
         {
           id: acc.task_id,
@@ -1431,7 +1451,9 @@ export class CognitiveRuntime {
       await this.writeDecayRecord(record);
       this.lastEnvironmentFingerprint = current;
       if (this.maintenance !== null) {
-        const acc = repairAccrual();
+        // S2：repair 债务成本从 policy.evolve.maintenance_costs 读取（装配注入——改 evolve.yaml 即生效）
+        const { policy } = await this.ready();
+        const acc = repairAccrual(policy.evolve.maintenance_costs);
         await this.maintenance.enqueue(
           {
             id: acc.task_id,

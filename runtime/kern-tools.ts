@@ -51,7 +51,7 @@ export interface ToolsLike {
 
 /**
  * kern_status 状态摘要（纯读取：从认知运行时现有字段组装；任一段降级 → 对应降级字段非空，不抛）。
- * 字段：当前版本线/快照哈希/lineSnapshot/维护债务快照/最近信号数/组件健康。
+ * 字段：当前版本线/快照哈希/lineSnapshot/维护债务快照/维护观测摘要/最近信号数/组件健康。
  */
 export interface KernStatusSummary {
   /** 当前版本线（runtime.lineSnapshot?.line；缺省 stable） */
@@ -64,6 +64,14 @@ export interface KernStatusSummary {
   line_degraded: string | null;
   /** 维护债务快照（未注入 scheduler → 空数组） */
   debt: Array<{ task_id: string; value: number }>;
+  /** S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + observations_degraded） */
+  maintenance_observations: {
+    date: string;
+    total: number;
+    per_task: Array<{ task_id: string; count: number; avg_duration_ms: number }>;
+  } | null;
+  /** S2：维护观测摘要降级原因（无观测/调度器缺失 → null） */
+  observations_degraded: string | null;
   /** 最近信号数（.evolution/signals 当日记录数；读取失败 → 0 + signals_degraded） */
   recent_signals: number;
   signals_degraded: string | null;
@@ -87,7 +95,7 @@ export interface KernRuntimeLike {
 export function kernStatusTool(runtime: KernRuntimeLike): ToolDefinitionLike {
   return {
     name: 'kern_status',
-    description: '认知运行时状态摘要（当前版本线/快照哈希/lineSnapshot/维护债务/最近信号数/组件健康）',
+    description: '认知运行时状态摘要（当前版本线/快照哈希/lineSnapshot/维护债务/维护观测摘要/最近信号数/组件健康）',
     parameters: { type: 'object', properties: {} },
     output: {
       schema: { type: 'object' },

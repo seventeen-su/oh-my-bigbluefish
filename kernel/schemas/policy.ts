@@ -197,6 +197,47 @@ export const ProcessDefSchema = z
   });
 export type ProcessDef = z.infer<typeof ProcessDefSchema>;
 
+// ---- S2：维护任务成本数据化（§10.1 estimated_cost；初值 = 出厂缺省——观测积累后标定） ----
+
+/** 维护任务全集（§12.3 维护任务 + §10.1 债务任务；S2 成本数据化键集，单一来源） */
+export const MAINTENANCE_TASK_IDS = [
+  'memory_consolidation',
+  'candidate_validation',
+  'repair',
+  'promotion_check',
+  'environment_check',
+  'evolution_decision',
+  'gc',
+] as const;
+export type MaintenanceTaskId = (typeof MAINTENANCE_TASK_IDS)[number];
+
+/**
+ * 维护任务成本估计缺省（§10.1 estimated_cost 初值：memory+4 / candidate+10 / repair+25 /
+ * 检查类（promotion/environment/evolution_decision）+2 / gc+2——取值 ≥ 权重 → 债务任务 ROI ≤ 1，
+ * 低于会话级收尾任务（turn-finalize ROI 1），既有调度顺序不破坏）。
+ * 初值 + 观测中（S2）：无真实维护执行数据 → 不臆造标定；最终值待 .evolution/maintenance-observations
+ * 数据积累后按 §10.1 ROI 观测标定（改 evolve.yaml maintenance_costs 即生效）。
+ */
+export const DEFAULT_MAINTENANCE_COSTS: Record<MaintenanceTaskId, number> = {
+  memory_consolidation: 4,
+  candidate_validation: 10,
+  repair: 25,
+  promotion_check: 2,
+  environment_check: 2,
+  evolution_decision: 2,
+  gc: 2,
+};
+
+/** 维护任务成本表（§10.1 estimated_cost；每任务非负数值；逐键缺省 = 出厂初值——旧形状（无本段/部分键）兼容；
+ *  字段存在但非法（负数/非数值）→ fail-loud 拒绝（对齐既有 policy 纪律）） */
+export const MaintenanceCostsSchema = z.object(
+  MAINTENANCE_TASK_IDS.reduce(
+    (shape, id) => ({ ...shape, [id]: z.number().nonnegative().default(DEFAULT_MAINTENANCE_COSTS[id]) }),
+    {} as Record<MaintenanceTaskId, z.ZodDefault<z.ZodNumber>>,
+  ),
+);
+export type MaintenanceCosts = z.infer<typeof MaintenanceCostsSchema>;
+
 // ---- EvolvePolicy（架构 §9.5 元演化规则；T7.2 新增契约，初值待冻结基准标定 §17） ----
 
 // ---- P1c：演化判定数据化（§6.5.1 触发链 / §6.5.7 债务阈值） ----
@@ -346,5 +387,7 @@ export const EvolvePolicySchema = z.object({
   e_process: EProcessPolicySchema.default(DEFAULT_E_PROCESS_POLICY),
   /** R8：集体共享显式开关（生产默认不自动发布/吸收——隐私原则；显式命令 /evolve share|absorb 始终可用） */
   share: SharePolicySchema.default(DEFAULT_SHARE_POLICY),
+  /** S2：维护任务成本估计（§10.1 estimated_cost 数据化；缺省 = DEFAULT_MAINTENANCE_COSTS 初值——观测积累后标定） */
+  maintenance_costs: MaintenanceCostsSchema.default(DEFAULT_MAINTENANCE_COSTS),
 });
 export type EvolvePolicy = z.infer<typeof EvolvePolicySchema>;

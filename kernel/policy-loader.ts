@@ -14,6 +14,7 @@ import {
   ContextPolicySchema,
   DEFAULT_CANDIDATE_GATE,
   DEFAULT_E_PROCESS_POLICY,
+  DEFAULT_MAINTENANCE_COSTS,
   DEFAULT_SHARE_POLICY,
   EvolvePolicySchema,
   GovernorPolicySchema,
@@ -45,6 +46,10 @@ export {
   SharePolicySchema,
   DEFAULT_GENERATION_BUDGET,
   GenerationBudgetSchema,
+  // S2：维护任务成本数据化公共面（§10.1 estimated_cost；DEFAULT_MAINTENANCE_COSTS = 出厂初值）
+  MAINTENANCE_TASK_IDS,
+  DEFAULT_MAINTENANCE_COSTS,
+  MaintenanceCostsSchema,
   EvolvePolicySchema,
   GovernorPolicySchema,
   GovernorRuleSchema,
@@ -65,6 +70,8 @@ export {
   type GovernorPolicy,
   type GovernorRule,
   type KindCostTable,
+  type MaintenanceCosts,
+  type MaintenanceTaskId,
   type ObjectLayer,
   type OperatorDef,
   type ProcessDef,
@@ -90,6 +97,7 @@ const DEFAULT_EVOLVE_POLICY: EvolvePolicy = {
   candidate_gate: { ...DEFAULT_CANDIDATE_GATE },
   e_process: { ...DEFAULT_E_PROCESS_POLICY },
   share: { ...DEFAULT_SHARE_POLICY },
+  maintenance_costs: { ...DEFAULT_MAINTENANCE_COSTS },
 };
 
 /** 仓库根候选（src 布局本文件在 <preset>/kernel/ → 上一级即 preset 根；编译布局 <preset>/lib/kernel/ 多一层 → 存在性回退） */

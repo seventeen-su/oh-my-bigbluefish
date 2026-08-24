@@ -22,10 +22,25 @@
 # P7 金丝雀判定主判开关（§10.3 Anytime-valid Certificate——anytime-valid 为主判，初值规则保留为降级/对照）：
 #   - e_process.mode：'e-process'（自实现 Bernoulli 超鞅主判）| 'rule'（初值规则主判，降级/对照）
 #   - e_process.fallback_to_rule：e-process 判定异常 → 回退初值规则（fail-safe 不静默吞错）
+# S2 维护任务成本估计（§10.1 estimated_cost 数据化；priority = EV/C × debt 的 C）：
+#   - maintenance_costs：每维护任务 estimated_cost 初值（memory+4/candidate+10/repair+25/检查类+2/gc+2——
+#     取值 ≥ 权重 → 债务任务 ROI ≤ 1，低于会话级收尾任务（turn-finalize ROI 1），既有调度顺序不破坏）；
+#   - 初值 + 观测中：无真实维护执行数据 → 不臆造标定；最终值待 .evolution/maintenance-observations
+#     数据积累后按 §10.1 ROI 观测标定（改本段即生效）；
+#   - 缺省兼容旧形状（无本段/部分键 → 出厂初值）；字段存在但非法（负数/非数值）→ fail-loud。
 # 初值待冻结基准标定（架构 §17）。
 daily_evolution_cost: 100
 roi_min: 1.0
 maintenance_rate: 0.5
+
+maintenance_costs:
+  memory_consolidation: 4
+  candidate_validation: 10
+  repair: 25
+  promotion_check: 2
+  environment_check: 2
+  evolution_decision: 2
+  gc: 2
 
 e_process:
   mode: e-process
