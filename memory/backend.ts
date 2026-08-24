@@ -75,15 +75,17 @@ export class SqliteMemoryBackend implements MemoryBackend {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath, { timeout: BUSY_TIMEOUT_MS }); // busy_timeout 兜底（单写者语义）
     this.db.exec('PRAGMA journal_mode=WAL');
-    this.db.exec(SCHEMA_SQL);
-    // R5：environment 列迁移——新库由 SCHEMA_SQL 直接建列；既有库（列已存在）ALTER 报
-    // duplicate column → no-op（幂等）。既有行的 environment 为 NULL（未回填）→
-    // findAffectedObjects 视作无环境声明（诚实：不臆造匹配），回填留后续数据迁移。
+    // R5 迁移必须在 SCHEMA_SQL 之前执行：SCHEMA_SQL 的 `CREATE INDEX IF NOT EXISTS
+    // idx_memory_environment ON memory(environment)` 会引用 environment 列——旧库（R5 前建表、
+    // 无该列）若先跑 SCHEMA_SQL 会在索引语句处抛 `no such column: environment`（2026-08-25
+    // 真实挂载故障根因）。先补列：新库（memory 表尚不存在）ALTER 抛 no such table → 捕获；
+    // 旧库 → 列补齐后 SCHEMA_SQL 的表/索引全部可执行。
     try {
       this.db.exec('ALTER TABLE memory ADD COLUMN environment TEXT');
     } catch {
-      // 列已存在（新库）→ no-op
+      // 新库（表不存在）或列已存在 → no-op
     }
+    this.db.exec(SCHEMA_SQL);
     this.insertMemory = this.db.prepare(
       `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
                            value_score, utility_counts, belief_ref, lineage_ref, created, updated,
