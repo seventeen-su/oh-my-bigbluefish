@@ -68,7 +68,8 @@ export interface DebtAccrual {
   urgency: MaintenanceUrgency;
 }
 
-/** 信号摘要 → §10.1 维护债务入账（按实际信号类型累计权重；零计数不产生债务；gc 为每收尾常驻 +1）。
+/** 信号摘要 → §10.1 维护债务入账（按实际信号类型累计权重；零计数不产生债务；
+ *  GC 不再每收尾常驻入账——事件库 compact 已由 turn-finalize 任务覆盖，见下方 gc 段注释）。
  *  @param costs S2 成本注入（policy.evolve.maintenance_costs）；缺省 → 出厂初值 */
 export function debtAccrualsFromSummary(summary: SignalSummary, costs?: MaintenanceCostsLike): DebtAccrual[] {
   const out: DebtAccrual[] = [];
