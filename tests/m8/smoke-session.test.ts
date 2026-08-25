@@ -63,6 +63,12 @@ function makeFakeCtx(opts: { runtime: CognitiveRuntime }): {
   return { ctx, bus, contexts };
 }
 
+/** W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前） */
+function projectionProvider(contexts: Array<{ name: string; order: number; text: unknown }>): (assembleCtx: unknown) => string {
+  const def = contexts.find((c) => c.name === 'cognitive:projection')!;
+  return def.text as (assembleCtx: unknown) => string;
+}
+
 function dshEvent(type: string, data: unknown, time: number): { type: string; data: unknown; time: number } {
   return { type, data, time };
 }
@@ -117,7 +123,7 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1001));
 
     // ② context 注入（prepareTurn）：provider 首次求值返回空串（turn/start 预热异步进行中），等待 context/injected 入链
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     expect(provider(assembleCtx([userMessage('msg-1', GOAL)]))).toBe('');
     await vi.waitFor(
       async () => {
@@ -224,7 +230,7 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
 
     // 最小冒烟流：用户消息 → 投影注入（prepareTurn 预热）→ flush 收尾 → checkpoint
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     provider(assembleCtx([userMessage('msg-1', GOAL)]));
     await vi.waitFor(
       async () => {

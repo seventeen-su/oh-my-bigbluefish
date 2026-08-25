@@ -177,6 +177,12 @@ function makeFakeCtx(opts: {
   return { ctx, bus, contexts };
 }
 
+/** W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前） */
+function projectionProvider(contexts: Array<{ name: string; order: number; text: unknown }>): (assembleCtx: unknown) => string {
+  const def = contexts.find((c) => c.name === 'cognitive:projection')!;
+  return def.text as (assembleCtx: unknown) => string;
+}
+
 function dshEvent(type: string, data: unknown, time = 1000): { type: string; data: unknown; time: number } {
   return { type, data, time };
 }
@@ -234,7 +240,7 @@ describe('S8 投影一拍时序：turn/start 事件驱动预热（plugin.ts appl
     const { rt } = makeInstantRuntime();
     const { ctx, bus, contexts } = makeFakeCtx({ runtime: rt });
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(okBoot()) });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
 
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1000));
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1001));
@@ -249,7 +255,7 @@ describe('S8 投影一拍时序：turn/start 事件驱动预热（plugin.ts appl
     const { rt, prepareSpy, open } = makeBlockingRuntime();
     const { ctx, bus, contexts } = makeFakeCtx({ runtime: rt });
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(okBoot()) });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
 
     // 预热在飞（prepareTurn 内部 gate 未 open）：重复 turn/start + context 求值 kick 均被 preparing 抑制
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 999));
@@ -276,7 +282,7 @@ describe('S8 投影一拍时序：turn/start 事件驱动预热（plugin.ts appl
     });
     const { ctx, bus, contexts } = makeFakeCtx({ runtime: rt });
     apply(ctx, { bootstrap: false, bootStableOverride: () => bootGate });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
 
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1000));
     await new Promise((r) => setTimeout(r, 20));
@@ -298,7 +304,7 @@ describe('S8 投影一拍时序：turn/start 事件驱动预热（plugin.ts appl
     const { rt, prepareSpy } = makeInstantRuntime();
     const { ctx, bus, contexts } = makeFakeCtx({ runtime: rt });
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(failBoot()) });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
 
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/start', { turn: 1 }, 1000));
     await new Promise((r) => setTimeout(r, 20));
@@ -325,7 +331,7 @@ describe('S8 投影一拍时序：turn/start 事件驱动预热（plugin.ts appl
     const { rt } = makeInstantRuntime();
     const { ctx, bus, contexts } = makeFakeCtx({ runtime: rt });
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(okBoot()) });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
 
     // 上一 turn 的 goal 已观察；turn/start 预热用该 goal（首拍：上一已知目标投影）
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', '上一目标'), 1000));

@@ -116,7 +116,9 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
 
     // ② 完整模拟会话（三钩子全链：prepareTurn 注入 → 事件入链 → flush 收尾）——模型调用零介入
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    // W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前）
+    const projection = contexts.find((c) => c.name === 'cognitive:projection')!;
+    const provider = projection.text as (assembleCtx: unknown) => string;
     provider({ agent: { session: { id: SESSION, events: [userMessage('msg-1', GOAL)] } } });
     await vi.waitFor(
       async () => {
@@ -172,9 +174,10 @@ describe('T8.26.7 无双 Loop 验证（DSH Agent Loop 未被替换/包装）', (
     apply(ctx, { bootstrap: false });
 
     // d. 仅调用 context()（additive section）；无 section()/替换型 API（若插件调用未定义方法会直接抛错）
-    expect(systemPromptCalls).toEqual(['context']);
-    expect(contexts[0]!.name).toBe('cognitive:projection');
-    expect(typeof contexts[0]!.order).toBe('number');
+    expect(systemPromptCalls).toEqual(['context', 'context', 'context']);
+    // W5：context 现注册三段——contract(80)/capabilities(85)/projection(90)，均为追加贡献（additive section）
+    expect(contexts.map((c) => c.name)).toEqual(['cognitive:contract', 'cognitive:capabilities', 'cognitive:projection']);
+    expect(contexts.map((c) => c.order)).toEqual([80, 85, 90]);
     // e. 插件不再接触 recompose：即使 ctx 提供 agentPresets.recompose，装配/命令注册也从未触发它
     //   （recompose 能力整体移除；/mode = OMB 内部版本线切换，单模式）
     expect(recompose).not.toHaveBeenCalled();

@@ -50,6 +50,12 @@ function makeFakeCtx(opts: {
   return { ctx, contexts };
 }
 
+/** W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前） */
+function projectionProvider(contexts: Array<{ name: string; order: number; text: unknown }>): (assembleCtx: unknown) => string {
+  const def = contexts.find((c) => c.name === 'cognitive:projection')!;
+  return def.text as (assembleCtx: unknown) => string;
+}
+
 let base: string;
 let root: string;
 let runtime: CognitiveRuntime;
@@ -77,19 +83,23 @@ function track(rt: CognitiveRuntime): CognitiveRuntime {
 }
 
 describe('T8.26.3 systemPrompt.context 钩子（plugin.ts apply）', () => {
-  it('注册断言：apply(fakeCtx) → systemPrompt.context 注册项存在（name=cognitive:projection、order 数字、text 为函数）', () => {
+  it('注册断言：apply(fakeCtx) → systemPrompt.context 注册三段（order 80/85/90 存在）——name=cognitive:contract/capabilities/projection、text 分别为静态常量/同步文本/函数', () => {
     const { ctx, contexts } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
     apply(ctx, { bootstrap: false });
-    expect(contexts).toHaveLength(1);
-    expect(contexts[0]!.name).toBe('cognitive:projection');
-    expect(typeof contexts[0]!.order).toBe('number');
-    expect(typeof contexts[0]!.text).toBe('function');
+    // W5：三层结构——第一层固定契约（80）+ 第二层动态能力（85）+ 既有投影（90）；order 小者在前
+    expect(contexts.map((c) => c.name)).toEqual(['cognitive:contract', 'cognitive:capabilities', 'cognitive:projection']);
+    expect(contexts.map((c) => c.order)).toEqual([80, 85, 90]);
+    expect(typeof contexts.find((c) => c.name === 'cognitive:contract')!.text).toBe('string');
+    expect(typeof contexts.find((c) => c.name === 'cognitive:capabilities')!.text).toBe('string');
+    const projection = contexts.find((c) => c.name === 'cognitive:projection')!;
+    expect(typeof projection.order).toBe('number');
+    expect(typeof projection.text).toBe('function');
   });
 
   it('求值：text(assembleCtx) 调用 prepareTurn 并返回投影文本（含 working_state 投影 → goal 可见）；context/injected 入链（配 total_tokens）', async () => {
     const { ctx, contexts } = makeFakeCtx({ runtime: track(createCognitiveRuntime({ root })) });
     apply(ctx, { bootstrap: false });
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     const assembleCtx = makeAssembleCtx([
       { type: 'user/message', data: { id: 'msg-1', content: [{ type: 'text', text: GOAL }], source: { kind: 'user' } } },
     ]);
