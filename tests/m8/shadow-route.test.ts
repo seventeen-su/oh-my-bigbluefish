@@ -285,16 +285,21 @@ describe('S7 per-session 生效（fixture 两线分叉：stable=initialHash ≠ 
 });
 
 describe('S7 exposure/outcome 与 L2 消费', () => {
-  fixtureIt('finalizeTurn 回写 outcome：success（正常决策）/ degraded（决策链降级代理）；readShadowSignals 同键最后一条胜出', async () => {
+  fixtureIt('finalizeTurn 回写 outcome：有 criteria + 无 judge 证据 → UNKNOWN \'unknown\'（P2 验证契约判定）/ degraded（硬约束 fail）；readShadowSignals 同键最后一条胜出（unknowns 独立档）', async () => {
     const layout = layoutFor(fx);
     const root = rootOf('r');
     const rt = track(createCognitiveRuntime({ root, layout }));
     const shadowsDir = shadowsDirOf(root);
 
-    // 桶会话 A：正常决策 → outcome 'success'
+    // 桶会话 A：正常决策 + 契约 criteria（经 FinalizeTurnInput.task 传递）无确定性/补充证据 → UNKNOWN → outcome 'unknown'
     const pA = await rt.prepareTurn(req(BUCKET_SESSION) as never);
-    await rt.finalizeTurn({ session_id: BUCKET_SESSION, decision: pA.decision, working_state: pA.working_state });
-    // 桶会话 B：决策链降级代理（process.degraded 非空）→ outcome 'degraded'
+    await rt.finalizeTurn({
+      session_id: BUCKET_SESSION,
+      decision: pA.decision,
+      working_state: pA.working_state,
+      task: { goal: GOAL, success_criteria: ['验证检索闭环'] },
+    });
+    // 桶会话 B：决策链硬约束 fail（process.degraded 非空）→ FAIL → outcome 'degraded'
     const pB = await rt.prepareTurn(req(BUCKET_SESSION_2) as never);
     const degradedDecision = {
       ...pB.decision,
@@ -309,19 +314,32 @@ describe('S7 exposure/outcome 与 L2 消费', () => {
         degraded: 'process/schedule: 测试降级',
       },
     };
-    await rt.finalizeTurn({ session_id: BUCKET_SESSION_2, decision: degradedDecision, working_state: pB.working_state });
+    await rt.finalizeTurn({
+      session_id: BUCKET_SESSION_2,
+      decision: degradedDecision,
+      working_state: pB.working_state,
+      task: { goal: GOAL, success_criteria: ['验证检索闭环'] },
+    });
 
     // 每条会话 2 条（exposure pending + outcome）→ 同 (session,candidate) 键最后一条胜出
     const entries = readExposureEntries(shadowsDir);
     expect(entries).toHaveLength(4);
-    const outcomes = entries.filter((e) => e.outcome === 'success' || e.outcome === 'degraded');
+    const outcomes = entries.filter(
+      (e) => e.outcome === 'success' || e.outcome === 'degraded' || e.outcome === 'unknown',
+    );
     expect(outcomes).toHaveLength(2);
-    expect(outcomes.find((e) => e.session_id === BUCKET_SESSION)?.outcome).toBe('success');
+    expect(outcomes.find((e) => e.session_id === BUCKET_SESSION)?.outcome).toBe('unknown');
     expect(outcomes.find((e) => e.session_id === BUCKET_SESSION_2)?.outcome).toBe('degraded');
+    // P2 新记录字段：verdict/contract_id/evidence_quality/reason（契约判定可审计）
+    const finalA = outcomes.find((e) => e.session_id === BUCKET_SESSION)!;
+    expect(finalA.verdict).toBe('UNKNOWN');
+    expect(finalA.contract_id).toBe(`shadow:${BUCKET_SESSION}`);
+    expect(finalA.evidence_quality).toBe(0.67); // 3 项应查（硬约束 + 决策 + criteria），2 项权威有结果
+    expect(typeof finalA.reason).toBe('string');
 
-    // L2 读取：目录扫描（含按日分片文件）→ n=2、failures=1（degraded 计入失败）
+    // L2 读取：目录扫描（含按日分片文件）→ n=2、failures=1（degraded 计入失败）、unknowns=1（UNKNOWN 独立档不计失败）
     const signals = await readShadowSignals(shadowsDir);
-    expect(signals).toEqual({ n: 2, failures: 1 });
+    expect(signals).toEqual({ n: 2, failures: 1, unknowns: 1 });
   });
 
   it('readShadowSignals：双格式并存不重复计数（G4 decision 条目 + S7 per-session 条目）；文件模式兼容', async () => {
@@ -354,13 +372,13 @@ describe('S7 exposure/outcome 与 L2 消费', () => {
     const signals = await readShadowSignals(dir);
     // G4：shadow×2 → n+2；canary_rollback ok → n+1 失败+1；canary_rollback restore_failed → n+1 失败+1 → n=4 failures=2
     // S7：a1/b2/c3 三键 → n+3；b2 degraded → 失败+1 → n=3 failures=1
-    // 合计 n=7 failures=3
-    expect(signals).toEqual({ n: 7, failures: 3 });
+    // 合计 n=7 failures=3；无三态（unknown）条目 → unknowns=0
+    expect(signals).toEqual({ n: 7, failures: 3, unknowns: 0 });
     // 文件模式兼容（旧契约：单文件路径）
     const fileSignals = await readShadowSignals(path.join(dir, 'exposure-2026-08-24.jsonl'));
-    expect(fileSignals).toEqual({ n: 3, failures: 1 });
-    // 缺失目录 → 空
-    expect(await readShadowSignals(path.join(base, 'no-such-dir'))).toEqual({ n: 0, failures: 0 });
+    expect(fileSignals).toEqual({ n: 3, failures: 1, unknowns: 0 });
+    // 缺失目录 → 空三元
+    expect(await readShadowSignals(path.join(base, 'no-such-dir'))).toEqual({ n: 0, failures: 0, unknowns: 0 });
   });
 
   it('L2 门禁：有 outcome 数据 → shadow 失败率统计真实纳入（超限拒晋升）', () => {
