@@ -32,6 +32,8 @@ import {
   validateDataCandidate,
   type CandidateOutcome,
 } from '../../supervisor/candidate-pipeline.js';
+// P4：候选验证契约门禁（真实内核门禁注入路径集成——同一契约语义覆盖管线）
+import { runCandidateGate } from '../../kernel/candidate-contract.js';
 import type { CandidateDraft } from '../../kernel/schemas/evolution.js';
 import { buildLayoutFixture, runGit, teardownLayoutFixture, type LayoutFixture } from '../helpers/git.js';
 
@@ -489,5 +491,94 @@ describe('⑧ runCandidatePipeline 端到端（验证 → 注册 → 晋升 → 
     expect(outcome.promoted).toBe(false);
     expect(outcome.reason).toMatch(/G1/);
     expect(resolveLineCommit(makeLayout(fx), 'latest')).toBe(before);
+  });
+});
+
+describe('⑨ P4 验证契约门禁注入（deps 回调；ok=false 不触碰版本库；ok=true 对象挂载 verification）', () => {
+  fixtureIt('注入 fake gate ok=false → 不晋升（版本库无提交 / outcome.promoted=false / reason 含门禁拒绝）', async () => {
+    fx = buildLayoutFixture();
+    const before = resolveLineCommit(makeLayout(fx), 'latest');
+    const outcome = await runCandidatePipeline(
+      draft('kernel/policy/evolve.yaml', await evolveTweakContent(0.95)),
+      {
+        layout: makeLayout(fx),
+        evolutionRoot: poolRootOf(fx),
+        baselinePolicyDir: await baselinePolicyDirOf(fx),
+        verificationGate: async () => ({ ok: false, reason: 'fake 门禁拒绝（信任不足）' }),
+      },
+    );
+    expect(outcome.validated).toBe(true); // G1-G4 验证本身通过
+    expect(outcome.promoted).toBe(false);
+    expect(outcome.reason).toContain('验证契约门禁拒绝');
+    expect(outcome.reason).toContain('fake 门禁拒绝（信任不足）');
+    expect(resolveLineCommit(makeLayout(fx), 'latest')).toBe(before); // 版本库无提交（trusted-latest 未动）
+  });
+
+  fixtureIt('注入 fake gate ok=true → 正常晋升；Evolution Object 携带 verification payload', async () => {
+    fx = buildLayoutFixture();
+    const outcome = await runCandidatePipeline(
+      draft('kernel/policy/evolve.yaml', await evolveTweakContent(0.95)),
+      {
+        layout: makeLayout(fx),
+        evolutionRoot: poolRootOf(fx),
+        baselinePolicyDir: await baselinePolicyDirOf(fx),
+        verificationGate: async () => ({
+          ok: true,
+          reason: 'fake 门禁通过',
+          verification: { verdict: 'PASS', verifier_trust: 'L2', contract_id: 'candidate:test' },
+        }),
+      },
+    );
+    expect(outcome.promoted).toBe(true);
+    const raw = showFile(fx, outcome.commit_hash!, `.evolution-objects/${candidateDirName(outcome.object_id!)}.json`)!;
+    const obj = EvolutionObjectSchema.parse(JSON.parse(raw));
+    expect(obj.verification).toEqual({ verdict: 'PASS', verifier_trust: 'L2', contract_id: 'candidate:test' });
+  });
+
+  fixtureIt('注入真实 runCandidateGate（全过）→ 正常晋升；对象 verification 为内核契约判定 payload', async () => {
+    fx = buildLayoutFixture();
+    const outcome = await runCandidatePipeline(
+      draft('kernel/policy/evolve.yaml', await evolveTweakContent(0.95)),
+      {
+        layout: makeLayout(fx),
+        evolutionRoot: poolRootOf(fx),
+        baselinePolicyDir: await baselinePolicyDirOf(fx),
+        verificationGate: async (ctx) => {
+          const g = runCandidateGate(ctx.draft, {
+            g1: ctx.validation.gates.g1?.ok === true,
+            g3: ctx.validation.gates.g3?.ok === true,
+            g4: ctx.validation.gates.g4?.ok === true,
+          });
+          return {
+            ok: g.ok,
+            reason: g.reason,
+            verification: g.ok
+              ? { verdict: g.result.verdict, verifier_trust: 'L2', contract_id: g.result.contract_id }
+              : undefined,
+          };
+        },
+      },
+    );
+    expect(outcome.promoted).toBe(true);
+    const raw = showFile(fx, outcome.commit_hash!, `.evolution-objects/${candidateDirName(outcome.object_id!)}.json`)!;
+    const obj = EvolutionObjectSchema.parse(JSON.parse(raw));
+    expect(obj.verification?.verdict).toBe('PASS');
+    expect(obj.verification?.verifier_trust).toBe('L2');
+    expect(obj.verification?.contract_id).toMatch(/^candidate:sha256:/);
+  });
+
+  fixtureIt('未注入 gate → 既有行为（正常晋升；对象无 verification 字段）', async () => {
+    fx = buildLayoutFixture();
+    const outcome = await runCandidatePipeline(
+      draft('kernel/policy/evolve.yaml', await evolveTweakContent(0.95)),
+      {
+        layout: makeLayout(fx),
+        evolutionRoot: poolRootOf(fx),
+        baselinePolicyDir: await baselinePolicyDirOf(fx),
+      },
+    );
+    expect(outcome.promoted).toBe(true);
+    const raw = showFile(fx, outcome.commit_hash!, `.evolution-objects/${candidateDirName(outcome.object_id!)}.json`)!;
+    expect((JSON.parse(raw) as { verification?: unknown }).verification).toBeUndefined();
   });
 });

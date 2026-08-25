@@ -78,6 +78,15 @@ export const EventSchema = irBase({
 });
 export type Event = z.infer<typeof EventSchema>;
 
+/** P4：Evolution Object 验证契约判定挂载（晋升信任门禁输入——verdict/verifier_trust/contract_id；
+ *  可选：旧对象无此字段 → stable 晋升 fail-closed 拒绝（验证标准不能被验证器自己定义）） */
+export const EvolutionObjectVerificationSchema = z.object({
+  verdict: z.string().min(1),
+  verifier_trust: z.string().min(1),
+  contract_id: z.string().min(1),
+});
+export type EvolutionObjectVerification = z.infer<typeof EvolutionObjectVerificationSchema>;
+
 /** M4 EvolutionObject { id=sha256, protocol_version, parent, diff, compat, bench, provenance, spdx, verifications } */
 export const EvolutionObjectSchema = irBase({
   protocol_version: z.string().min(1),
@@ -88,6 +97,8 @@ export const EvolutionObjectSchema = irBase({
   provenance: ProvenanceSchema,
   spdx: z.string().min(1),
   verifications: z.array(z.string()),
+  /** P4：验证契约判定挂载（可选——无此字段的对象 stable 晋升被信任门禁 fail-closed 拒绝） */
+  verification: EvolutionObjectVerificationSchema.optional(),
 });
 export type EvolutionObject = z.infer<typeof EvolutionObjectSchema>;
 
