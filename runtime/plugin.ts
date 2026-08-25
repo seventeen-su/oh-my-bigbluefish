@@ -28,6 +28,9 @@ import { reduce } from '../supervisor/state-reducer.js';
 import { MaintenanceScheduler } from '../supervisor/maintenance.js';
 // S2：验证债务队列（layer 1 JSONL——plugin 装配面显式注入隔离根；与 assembly 缺省同路径语义）
 import { VerificationDebt } from '../supervisor/verification-debt.js';
+// W3（未接线审计修复 2026-08-25）：dynamicCordisRunner 结构最小面（S9 增强通道——候选验证脚本经动态
+// 插件半执行；supervisor 层 1——runtime(2) → supervisor(1) ✓）
+import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面注入 spawnJudge）
 import { createJudgeExecutor } from './judge-executor.js';
 import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
@@ -278,6 +281,11 @@ export interface ContextLike {
   llm?: LlmStreamLike;
   /** T8.12：注入的 ModelAdapter（组合根显式注入优先；未注入且 llm+config.model 齐备 → 自动装配）——经 get('modelAdapter') 读取 */
   modelAdapter?: ModelAdapter;
+  /** W3（未接线审计修复 2026-08-25）：宿主 dynamicCordisRunner 服务（S9 增强通道——候选验证脚本经
+   *  动态插件半执行；真实类型 cordis-host-runner DynamicCordisRunnerService，结构最小面见
+   *  supervisor/dynamic-runner.ts）——经 get('dynamicCordisRunner') 读取。存在且守卫通过 → 候选验证
+   *  走 runner 通道（G3-exec 优先）；缺失/部分缺失 → 管线守卫降级受限子进程路径（诚实降级）。 */
+  dynamicCordisRunner?: DynamicCordisRunnerLike;
   /** T8.26.3：DSH systemPrompt 服务（context 贡献注册面；真实类型 @deepseek-ai/dsh-system-prompt）——经 get('systemPrompt') 读取 */
   systemPrompt?: SystemPromptLike;
   /** T8.26.4：DSH 事件注册面（session/event 会话事实 + tools/result 工具结果 live；真实类型 Cordis Context.on，mixin accessor） */
@@ -461,6 +469,17 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         };
         judgeExecutor = createJudgeExecutor({ spawnJudge });
       }
+      // W3（未接线审计修复 2026-08-25）：宿主 dynamicCordisRunner 服务读取（S9 增强通道——候选验证
+      // 脚本经动态插件半执行，G3-exec 优先走 runner 通道）。Guard 契约（B3 教训）：宿主服务必须经
+      // ctx.get 读取（直接 ctx.dynamicCordisRunner 对未 inject 的属性读取抛 `cannot get property
+      // "dynamicCordisRunner" without inject`）——try/catch → undefined 降级；存在 → 注入
+      // createCognitiveRuntime（缺失/部分缺失 → 管线守卫自动降级受限子进程路径——既有行为不变，诚实降级）。
+      let dynamicRunner: DynamicCordisRunnerLike | undefined;
+      try {
+        dynamicRunner = readService<DynamicCordisRunnerLike>(ctx, 'dynamicCordisRunner');
+      } catch {
+        dynamicRunner = undefined; // B3 教训：未注入 → 诚实降级（候选验证走受限子进程路径）
+      }
       // T8.12：组合根装配 ModelAdapter——显式注入优先；否则 llm 服务 + config.model 齐备时自动装配
       //（真实 DSH 会话经 llm 服务提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
       if (modelAdapter === undefined) {
@@ -491,6 +510,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         // 诚实降级——仅验证债务路径触发、正常任务 0 额外成本）
         verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
         ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
+        // W3：dynamicCordisRunner 增强通道注入（宿主面存在 → 候选验证脚本经 runner 通道；未注入 → 管线守卫降级受限子进程路径）
+        ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
       });
       // P1a：lines 按线加载降级（线快照缺 policy / lines 不可用 → 已回退仓库默认）→ 记录降级（不抛，命令仍可用）
       if (cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {

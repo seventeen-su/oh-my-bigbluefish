@@ -118,6 +118,9 @@ import {
 // P1d：候选生成（kernel 纯函数）→ 候选管线（supervisor 层 1；runtime(2) → supervisor(1) ✓）
 import { generatePolicyAdjustmentCandidates } from '../kernel/candidate-generator.js';
 import { runCandidatePipeline, latestObjectId, loadEvolutionObject, type CandidateOutcome } from '../supervisor/candidate-pipeline.js';
+// W3（未接线审计修复 2026-08-25）：dynamicCordisRunner 结构最小面（S9 增强通道——候选验证脚本经动态
+// 插件半执行；supervisor 层 1——runtime(2) → supervisor(1) ✓）
+import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 // R8：集体共享显式命令（架构 §13——/evolve share 发布 / /evolve absorb 吸收；GitRegistry 本地 registry +
 // share-pipeline 既有 absorb 管线；layer 2 → supervisor(1) ✓）
 import { absorb, GitRegistry, type AbsorbDeps } from '../supervisor/share.js';
@@ -362,6 +365,11 @@ export interface CognitiveAssemblyOptions {
   /** S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面经 plugin.ts 注入 spawnJudge；
    *  未注入 → judge 不可用（诚实降级——仅验证债务路径触发、正常任务 0 额外成本）） */
   judgeExecutor?: JudgeExecutor;
+  /** W3（未接线审计修复 2026-08-25）：dynamicCordisRunner 增强通道（宿主 ctx.dynamicCordisRunner 结构
+   *  最小面——plugin.ts 装配面经 readService 读取注入；候选验证脚本经 runner 通道执行（G3-exec 优先，
+   *  define→run→invoke→stop→undefine）；未注入/部分缺失 → 管线守卫自动降级受限子进程路径——既有行为
+   *  不变，诚实降级） */
+  dynamicRunner?: DynamicCordisRunnerLike;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -727,6 +735,9 @@ export class CognitiveRuntime {
   /** S2：单次结构化 Judge 执行器（装配面注入 spawnJudge；null = 未注入 → judge 不可用，
    *  复核按不可用转人工（诚实降级——不假装判定）） */
   readonly judgeExecutor: JudgeExecutor | null;
+  /** W3：dynamicCordisRunner 增强通道（候选验证脚本经动态插件半执行；未注入 → undefined——管线守卫
+   *  降级受限子进程路径，既有行为不变） */
+  readonly dynamicRunner: DynamicCordisRunnerLike | undefined;
   /** S4：事件驱动制品索引（.evolution/artifacts/index.jsonl——最近产物查询面；装配即用，构造零 I/O） */
   readonly artifactIndex: ArtifactIndex;
   private policyPromise: Promise<PolicyBundle> | null = null;
@@ -839,6 +850,8 @@ export class CognitiveRuntime {
     // 测试注入隔离队列；judgeExecutor 未注入 → null = judge 不可用，诚实降级）
     this.verificationDebt = opts.verificationDebt ?? new VerificationDebt({ root: this.verificationRoot });
     this.judgeExecutor = opts.judgeExecutor ?? null;
+    // W3：dynamicCordisRunner 增强通道（plugin.ts 装配面注入；未注入 → undefined——管线守卫降级受限子进程路径）
+    this.dynamicRunner = opts.dynamicRunner;
     // S4：制品索引装配（缺省 <evolutionRoot>/artifacts = <root>/.evolution/artifacts——与 signals/
     // decay/repair/verification 同 .evolution 根系；构造零 I/O 首写建目录；测试注入临时目录隔离）
     this.artifactIndex = new ArtifactIndex({
@@ -3172,6 +3185,10 @@ export class CognitiveRuntime {
         baselinePolicyDir: this.policyDir,
         eventStore: this.eventStore,
         sessionId,
+        // W3（未接线审计修复 2026-08-25）：候选验证增强通道注入——生产宿主面存在（plugin.ts readService
+        // ctx.dynamicCordisRunner）→ 候选验证脚本经 runner 通道（G3-exec 优先：define→run→invoke→
+        // stop→undefine）；undefined → 管线守卫自动降级受限子进程路径（既有行为不变，诚实降级）
+        dynamicRunner: this.dynamicRunner,
         snapshotHash: this.snapshotHash,
         shadowLogPath: join(this.evolutionRoot, 'shadows', 'exposure.log'),
         sourceEvents: [`evolution/candidate:${draft.id}`],
