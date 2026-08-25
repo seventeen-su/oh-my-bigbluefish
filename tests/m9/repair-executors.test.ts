@@ -1,8 +1,8 @@
 // P3.5（2026-08-25-verification-contract）：Repair 真实验证执行器测试（runtime/repair-executors.ts）。
 // 覆盖：
 //   ① 真实执行器逐项（fake services 注入）：检索一致性（稳定两次 → pass / 构造变化 → fail / 抛错 → unknown /
-//     无能力 → unknown）；过程定义结构合法（合法定义 pass / 非法 fail / 未定位 unknown / 加载抛错 fail）；
-//     技能定义结构合法（合法 pass / 非法 fail / 无 payload unknown）；策略 schema 合法（合法 fixture pass /
+//     无能力 → unknown）；过程定义结构合法（真实加载面命中 pass / 损坏定义解析失败 fail / 未定位 unknown /
+//     加载抛错 fail）；技能定义结构合法（合法 pass / 非法 fail / 无 payload unknown）；策略 schema 合法（合法 fixture pass /
 //     坏 YAML fail / 无 dir unknown）；组件健康（匹配+ok → pass / ok=false → fail / 不匹配 → unknown）；
 //     能力契约满足（合法契约 pass / 非法 fail / 无契约字段 unknown）；投影 schema（合法 pass / 非法 fail）；
 //     必填字段齐全（复用投影 pass / 非投影 unknown）；快照物化（存在 pass / 缺失 fail / 无快照 unknown）；
@@ -41,7 +41,7 @@ import {
   type RepairExecutorServices,
 } from '../../runtime/repair-executors.js';
 import { createCognitiveRuntime } from '../../runtime/assembly.js';
-import { A3_VALID, P1_VALID, P3_VALID, P5_VALID, PROV, TS, base, omit } from '../m1/ir-samples.js';
+import { A3_VALID, P3_VALID, P5_VALID, PROV, TS, base, omit } from '../m1/ir-samples.js';
 
 // ---- 测试工具 ----
 
@@ -226,21 +226,21 @@ describe('① 真实执行器逐项（fake services 注入）', () => {
     expect(noText.detail).toContain('无可提取的查询文本');
   });
 
-  it('过程定义结构合法：合法定义（P1 Process）→ pass；非法 → fail；未定位（真实目录）→ unknown；加载抛错 → fail；无 dir → unknown', async () => {
-    // 合法定义：loadProcesses 返回 P1 Process（ProcessSchema 结构合法——irBase + operator_graph）
-    const p1 = { ...P1_VALID, id: 'proc-ok' };
-    const ex = createRepairExecutors(
-      fakeServices({ processesDir: '/fixture', loadProcesses: async () => [p1] }),
-    );
-    const ok = await ex.executeCheck('过程定义结构合法（schema 校验）', { objectId: 'proc-ok', kind: 'process' });
+  it('过程定义结构合法：真实加载面命中（真实 ProcessDef）→ pass；损坏定义（解析失败）→ fail；未定位 → unknown；加载抛错 → fail；无 dir → unknown', async () => {
+    // 合法定义：真实 loadProcesses + 仓库过程目录（真实 ProcessDef YAML 解析成功 = 结构合法，单一事实源——
+    // W4 不再叠加形状不匹配的 P1 ProcessSchema），objectId 命中 → pass
+    const ex = createRepairExecutors(fakeServices({ processesDir: REPO_PROCESSES_DIR, loadProcesses }));
+    const ok = await ex.executeCheck('过程定义结构合法（schema 校验）', { objectId: 'retrieve-verify', kind: 'process' });
     expect(ok.result).toBe('pass');
-    // 非法：返回非 P1 Process 形态（缺 operator_graph/irBase 字段）→ ProcessSchema 校验失败
-    const exBad = createRepairExecutors(
-      fakeServices({ processesDir: '/fixture', loadProcesses: async () => [{ id: 'proc-bad' }] }),
-    );
-    const bad = await exBad.executeCheck('过程定义结构合法（schema 校验）', { objectId: 'proc-bad', kind: 'process' });
+    expect(ok.detail).toContain('真实加载面');
+    // 非法：真实加载面解析失败（损坏 YAML = 结构非法）→ loadProcesses 抛错 → fail
+    const badDir = await tmpRoot('omb-repair-badproc-');
+    await cp(REPO_PROCESSES_DIR, badDir, { recursive: true });
+    await writeFile(join(badDir, 'retrieve-verify.yaml'), 'id: retrieve-verify\noperators: [unclosed\n', 'utf8');
+    const exBad = createRepairExecutors(fakeServices({ processesDir: badDir, loadProcesses }));
+    const bad = await exBad.executeCheck('过程定义结构合法（schema 校验）', { objectId: 'retrieve-verify', kind: 'process' });
     expect(bad.result).toBe('fail');
-    expect(bad.detail).toContain('校验失败');
+    expect(bad.detail).toContain('过程加载抛错');
     // 未定位：真实 loadProcesses + 仓库过程目录（合法 ProcessDef 文件），objectId 不在其中 → unknown
     const exMiss = createRepairExecutors(fakeServices({ processesDir: REPO_PROCESSES_DIR, loadProcesses }));
     const miss = await exMiss.executeCheck('过程定义结构合法（schema 校验）', { objectId: 'nope', kind: 'process' });
