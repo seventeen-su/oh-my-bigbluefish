@@ -60,6 +60,9 @@ import {
   type FactStore,
   type TaskStore,
 } from '../supervisor/verification-stores.js';
+// S2：机械评分器（过程质量向量 + 可控性分类——kernel 层 2 纯函数；runtime(2) → kernel(2) ✓）
+import { normalizeProcessQuality, qualityVectorFromSignals } from '../kernel/process-quality.js';
+import { classifyFromText } from '../kernel/controllability.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
@@ -1426,13 +1429,20 @@ export class CognitiveRuntime {
    *   （确定性一级：过程无降级 + 决策已产生；LLM judge 注入面本阶段不调用——成功条件无确定性证据时
    *   诚实 UNKNOWN）→ decideVerdict（三态）→ shadowOutcomeFromResult（success/degraded/unknown，
    *   success/degraded 语义与既有代理判定一致，unknown 为 UNKNOWN 独立档——L2 不计失败不污染评分）。
-   * 落盘记录扩展 {verdict, contract_id, evidence_quality, reason}；process_quality/controllability 本阶段
-   * 不落（无真实评分器——诚实缺省，P3 注入面）。真实 LLM judge 生产调用留 P2.5（本阶段仅注入面）。尽力而为。
+   * S2：落盘记录扩展 {process_quality, process_quality_vector, controllability}（机械评分器——
+   *   用户裁决 S2/S7：可解释机械向量先保留原始向量再综合分，不做黑盒）：
+   *   process_quality = normalizeProcessQuality(qualityVectorFromSignals({decision_made: true,
+   *   claims_count（归约投影可得则取，否则 0）, tool_calls/memory_ops/corrections（signals.utility_counts）,
+   *   degradations（degradationLog().length——无恢复计数面，以降级数近似"成功恢复"）}))；
+   *   controllability = classifyFromText(decision.process?.degraded ?? '')（机械关键词规则表）。
+   * 验证债务（S2 接线见第二阶段）——outcome=UNKNOWN 且 criteria 非空 → 入队维护期复核；尽力而为。
+   * 真实 LLM judge 生产调用由 verification_review 维护任务经空白子代理单次裁判执行（P2.5 搁置解除）。
    */
   private async writeShadowOutcome(
     sessionId: string,
     decision: GovernorDecision,
     task?: { goal: string; success_criteria: string[] },
+    processContext?: { signals: UtilityCounts; claims_count: number },
   ): Promise<void> {
     const route = this.shadowSessions.get(sessionId);
     if (route === undefined) {
@@ -1446,6 +1456,18 @@ export class CognitiveRuntime {
     });
     const result = decideVerdict(contract, evidence);
     const outcome = shadowOutcomeFromResult(result);
+    // S2：机械过程质量向量（保留原始向量 + 综合分）——signals.utility_counts（tool_calls/memory_ops/
+    // corrections）+ 归约投影 claims_count（无归约 → 0）+ 模块级降级日志数（无恢复计数面，近似"成功恢复"）
+    const vector = qualityVectorFromSignals({
+      decision_made: true,
+      claims_count: processContext?.claims_count ?? 0,
+      tool_calls: processContext?.signals.tool_calls ?? 0,
+      corrections: processContext?.signals.corrections ?? 0,
+      degradations: degradationLog().length,
+    });
+    const processQuality = normalizeProcessQuality(vector);
+    // S2：可控性机械分类（degraded 文本关键词规则表——网络/权限/验证码 → external；工具/代码 → controllable）
+    const controllability = classifyFromText(decision.process?.degraded ?? '');
     const shadowsDir = join(this.evolutionRoot, 'shadows');
     const file = join(shadowsDir, `exposure-${new Date().toISOString().slice(0, 10)}.jsonl`);
     try {
@@ -1463,6 +1485,10 @@ export class CognitiveRuntime {
           contract_id: result.contract_id,
           evidence_quality: result.evidence_quality,
           reason: result.reason,
+          // S2：机械评分器落盘（原始向量保留 + 综合分；controllability 分类 + cause）
+          process_quality: processQuality,
+          process_quality_vector: vector,
+          controllability: { controllability: controllability.controllability, cause: controllability.cause },
         })}\n`,
         'utf8',
       );
@@ -1728,12 +1754,21 @@ export class CognitiveRuntime {
 
     // S7：shadow 会话收尾回写 outcome（P2 验证契约判定：success/degraded/unknown——契约种子 = 会话
     // task_contract（goal + success_criteria，经 FinalizeTurnInput.task 传递；缺省仅 working_state.goal，
-    // criteria 空 → 无语义应查）；成功条件无确定性证据时诚实 UNKNOWN；注释见 writeShadowOutcome；
-    // 尽力而为——失败降级记录不阻塞收尾）
-    await this.writeShadowOutcome(input.session_id, input.decision, {
-      goal: input.working_state.goal,
-      success_criteria: input.task?.success_criteria ?? [],
-    });
+    // criteria 空 → 无语义应查）；成功条件无确定性证据时诚实 UNKNOWN；S2：机械评分器落盘
+    // process_quality/controllability（信号源：本收尾聚合的 signals/归约投影 claims/降级日志）+
+    // 验证债务接线（S2 第二阶段）；注释见 writeShadowOutcome；尽力而为——失败降级记录不阻塞收尾）
+    await this.writeShadowOutcome(
+      input.session_id,
+      input.decision,
+      {
+        goal: input.working_state.goal,
+        success_criteria: input.task?.success_criteria ?? [],
+      },
+      {
+        signals,
+        claims_count: projections?.claims.size ?? 0,
+      },
+    );
 
     // P1b：请求结束 → 释放快照绑定（未绑定请求 end 为空操作——cleanup 路径幂等安全）
     this.registry.end(input.session_id);
