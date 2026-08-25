@@ -14,6 +14,13 @@
 //     detail 聚合检查结果；检索一致性真实走 memory retrieve（episode=false 只读）；generic 契约 PASS 路径
 //     （对象存在且可读 + 对象结构 schema 校验 → PASS → reverified）；幂等（重复执行同结果）
 //   ④ 确定性：同输入同输出（executeCheck 两次 → deep equal）
+//   ⑤ P3.6 数据面执行器（只读事实库/基线库）：无矛盾（无事实 unknown / 任一 valid=false fail / 全 valid pass）；
+//     重放一致（无基线 unknown / 全匹配 pass / 环境指纹不匹配 unknown / current 缺失 unknown）；
+//     代表任务（无基线 unknown / 匹配 pass）；冻结回归集（无基线 unknown / 全等 pass / 差异 case fail——
+//     真实 decideEvolution 重跑 / 占位注册 unknown）；可恢复（无基线 unknown / 重建输入齐备 pass / 占位 unknown）；
+//     真实数据面 duck-typed 注入（supervisor 实例）；确定性
+//   ⑥ P3.6 runRepair 集成：policy 对象结构全 pass 且无基线 → 基线自动注册（版本化字段齐备）；第二次有基线
+//     分支不重复注册；回归集覆写注册后重跑全等 → PASS；幂等
 import { afterEach, describe, expect, it } from 'vitest';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -24,7 +31,15 @@ import { makeMutableId } from '../../kernel/schemas/base.js';
 import type { Memory } from '../../kernel/schemas/m.js';
 import type { CapabilityDecayRecord } from '../../kernel/schemas/evolution.js';
 import { loadPolicy, loadProcesses } from '../../kernel/policy-loader.js';
-import { createRepairExecutors, type RepairExecutorServices } from '../../runtime/repair-executors.js';
+import { decideEvolution } from '../../kernel/evolve-decision.js';
+import type { EvolvePolicy } from '../../kernel/schemas/policy.js';
+import type { SignalSummary } from '../../kernel/schemas/evolution.js';
+import { BaselineStore, FactStore, type BaselineRecord, type FactRecord } from '../../supervisor/verification-stores.js';
+import {
+  createRepairExecutors,
+  VERIFIER_VERSION,
+  type RepairExecutorServices,
+} from '../../runtime/repair-executors.js';
 import { createCognitiveRuntime } from '../../runtime/assembly.js';
 import { A3_VALID, P1_VALID, P3_VALID, P5_VALID, PROV, TS, base, omit } from '../m1/ir-samples.js';
 
@@ -40,6 +55,29 @@ function fakeServices(over: Partial<RepairExecutorServices> = {}): RepairExecuto
   return {
     memory: { getById: async () => ({ id: 'm-1', payload: 'fixture payload' }) },
     ...over,
+  };
+}
+
+/**
+ * P3.6：fake 验证数据面（facts/baselines duck-typed 最小形状——未注入 → 对应检查 unknown；
+ * over.facts.factsFor / over.baselines.getBaseline 覆写被测面）。
+ */
+function fakeStores(
+  over: {
+    facts?: { factsFor?: () => Promise<FactRecord[]> };
+    baselines?: { getBaseline?: (id: string, kind: string) => Promise<BaselineRecord | null> };
+  } = {},
+): RepairExecutorServices {
+  return {
+    memory: { getById: async () => ({ id: 'm-1', payload: 'fixture payload' }) },
+    stores: {
+      facts: {
+        factsFor: over.facts?.factsFor ?? (async () => []),
+      },
+      baselines: {
+        getBaseline: over.baselines?.getBaseline ?? (async () => null),
+      },
+    },
   };
 }
 
@@ -410,6 +448,229 @@ describe('② 诚实 unknown 路径（detail 注明依赖面，不臆造证据�
   });
 });
 
+// ---- ⑤ P3.6：数据面执行器（只读事实库/基线库；duck-typed fake 注入） ----
+
+describe('⑤ P3.6 数据面执行器（只读事实库/基线库）', () => {
+  const FP: Record<string, unknown> = { os: 'win32', node: 'v22.0.0', dsh_version: '0.1.0', project: 'omb-v2' };
+  const CURRENT = { environment_fingerprint: FP, runtime_snapshot: 'rs:same', verifier_version: VERIFIER_VERSION };
+  const BASE: BaselineRecord = {
+    id: 'obj-1',
+    kind: 'process',
+    input: { in: 1 },
+    environment_fingerprint: FP,
+    runtime_snapshot: 'rs:same',
+    expected_result: { verdict: 'PASS' },
+    verifier_version: VERIFIER_VERSION,
+  };
+
+  it('无矛盾：无相关事实 → unknown；任一 valid=false → fail；全 valid → pass', async () => {
+    const exNone = createRepairExecutors(fakeStores());
+    const none = await exNone.executeCheck('无矛盾（contradiction 检查通过）', { objectId: 'obj-1', kind: 'memory' });
+    expect(none.result).toBe('unknown');
+    expect(none.detail).toContain('无相关事实');
+    const exFail = createRepairExecutors(
+      fakeStores({ facts: { factsFor: async () => [{ id: 'c1', text: '已推翻', provenance: 'obj-1', valid: false }] } }),
+    );
+    const fail = await exFail.executeCheck('无矛盾（contradiction 检查通过）', { objectId: 'obj-1', kind: 'memory' });
+    expect(fail.result).toBe('fail');
+    expect(fail.detail).toContain('矛盾');
+    const exPass = createRepairExecutors(
+      fakeStores({
+        facts: {
+          factsFor: async () => [
+            { id: 'c1', text: 't1', provenance: 'obj-1', valid: true },
+            { id: 'c2', text: 't2', provenance: 'obj-1', valid: true },
+          ],
+        },
+      }),
+    );
+    const pass = await exPass.executeCheck('无矛盾（contradiction 检查通过）', { objectId: 'obj-1', kind: 'memory' });
+    expect(pass.result).toBe('pass');
+    expect(pass.detail).toContain('全部有效');
+  });
+
+  it('无矛盾：数据面未注入（stores 缺省）→ unknown（诚实不臆造）', async () => {
+    const ex = createRepairExecutors(fakeServices());
+    const out = await ex.executeCheck('无矛盾（contradiction 检查通过）', { objectId: 'obj-1', kind: 'memory' });
+    expect(out.result).toBe('unknown');
+    expect(out.detail).toContain('事实库不可用');
+  });
+
+  it('重放一致：无 process 基线 → unknown（建议首次验证后注册）；全匹配 → pass；环境指纹不匹配 → unknown', async () => {
+    const exNone = createRepairExecutors(fakeStores());
+    const none = await exNone.executeCheck('重放一致（replay + state_delta 匹配）', {
+      objectId: 'obj-1',
+      kind: 'process',
+      current: CURRENT,
+    });
+    expect(none.result).toBe('unknown');
+    expect(none.detail).toContain('无 process 基线');
+    const exPass = createRepairExecutors(fakeStores({ baselines: { getBaseline: async () => BASE } }));
+    const pass = await exPass.executeCheck('重放一致（replay + state_delta 匹配）', {
+      objectId: 'obj-1',
+      kind: 'process',
+      current: CURRENT,
+    });
+    expect(pass.result).toBe('pass');
+    expect(pass.detail).toContain('全匹配');
+    // 环境指纹不匹配 → unknown（基线过期需重放确认）
+    const exFp = createRepairExecutors(
+      fakeStores({ baselines: { getBaseline: async () => ({ ...BASE, environment_fingerprint: { os: 'linux' } }) } }),
+    );
+    const fp = await exFp.executeCheck('重放一致（replay + state_delta 匹配）', {
+      objectId: 'obj-1',
+      kind: 'process',
+      current: CURRENT,
+    });
+    expect(fp.result).toBe('unknown');
+    expect(fp.detail).toContain('基线过期');
+  });
+
+  it('重放一致：ctx.current 缺失 → unknown（版本化对比无法执行，不臆造 pass）', async () => {
+    const ex = createRepairExecutors(fakeStores({ baselines: { getBaseline: async () => BASE } }));
+    const out = await ex.executeCheck('重放一致（replay + state_delta 匹配）', { objectId: 'obj-1', kind: 'process' });
+    expect(out.result).toBe('unknown');
+  });
+
+  it('代表任务：无 skill-task 基线 → unknown；版本化对比匹配 → pass', async () => {
+    const exNone = createRepairExecutors(fakeStores());
+    const none = await exNone.executeCheck('代表任务可执行（representative task + output contract）', {
+      objectId: 'sk-1',
+      kind: 'skill',
+      current: CURRENT,
+    });
+    expect(none.result).toBe('unknown');
+    expect(none.detail).toContain('无 skill-task 基线');
+    const exPass = createRepairExecutors(
+      fakeStores({ baselines: { getBaseline: async () => ({ ...BASE, id: 'sk-1', kind: 'skill-task' }) } }),
+    );
+    const pass = await exPass.executeCheck('代表任务可执行（representative task + output contract）', {
+      objectId: 'sk-1',
+      kind: 'skill',
+      current: CURRENT,
+    });
+    expect(pass.result).toBe('pass');
+  });
+
+  it('冻结回归集：无基线 → unknown；全等 → pass（真实 decideEvolution 重跑）；任一不等 → fail（detail 列差异 case）', async () => {
+    const policy = {
+      signal_triggers: { memory_ops: { evolve: true, strength: 1, object_layer: 'L2' } },
+      debt_thresholds: { soft: 100, hard: 1000, critical: 5000 },
+      daily_evolution_cost: 10000,
+    } as unknown as EvolvePolicy;
+    const signals: SignalSummary = { window: { from: 0, to: 0 }, counts: { memory_ops: 3 } };
+    // 期望判定用真实 kernel 纯函数算出（以真实导入优先——冻结回归集重跑与期望同源）
+    const expected = decideEvolution({ summary: signals, policy });
+    const exNone = createRepairExecutors(fakeStores());
+    const none = await exNone.executeCheck('冻结回归集通过（frozen regression set）', { objectId: 'pol-1', kind: 'policy' });
+    expect(none.result).toBe('unknown');
+    expect(none.detail).toContain('无 policy-regression 基线');
+    const exPass = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({ ...BASE, id: 'pol-1', kind: 'policy-regression', input: { policy, cases: [{ signals, expected_decision: expected }] } }),
+        },
+      }),
+    );
+    const pass = await exPass.executeCheck('冻结回归集通过（frozen regression set）', { objectId: 'pol-1', kind: 'policy' });
+    expect(pass.result).toBe('pass');
+    expect(pass.detail).toContain('全部与基线期望一致');
+    const exFail = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({
+            ...BASE,
+            id: 'pol-1',
+            kind: 'policy-regression',
+            input: { policy, cases: [{ signals, expected_decision: { ...expected, strength: 0 } }] },
+          }),
+        },
+      }),
+    );
+    const fail = await exFail.executeCheck('冻结回归集通过（frozen regression set）', { objectId: 'pol-1', kind: 'policy' });
+    expect(fail.result).toBe('fail');
+    expect(fail.detail).toContain('case[0]');
+    // 占位注册（input = 对象 payload，无回归 case）→ unknown
+    const exPh = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({ ...BASE, id: 'pol-1', kind: 'policy-regression', input: 'policy yaml payload' }),
+        },
+      }),
+    );
+    const ph = await exPh.executeCheck('冻结回归集通过（frozen regression set）', { objectId: 'pol-1', kind: 'policy' });
+    expect(ph.result).toBe('unknown');
+    expect(ph.detail).toContain('占位注册');
+  });
+
+  it('可恢复：无基线 → unknown；重建输入齐备 + payload 合法投影 → pass；占位注册（无重建输入）→ unknown', async () => {
+    const exNone = createRepairExecutors(fakeStores());
+    const none = await exNone.executeCheck('可恢复（restore）', { objectId: 'prj-1', kind: 'projection' });
+    expect(none.result).toBe('unknown');
+    expect(none.detail).toContain('无 projection-rebuild 基线');
+    const exPass = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({ ...BASE, id: 'prj-1', kind: 'projection-rebuild', input: { rebuild_input: 'source' } }),
+        },
+      }),
+    );
+    const pass = await exPass.executeCheck('可恢复（restore）', { objectId: 'prj-1', kind: 'projection', payload: A3_VALID });
+    expect(pass.result).toBe('pass');
+    // memory 包装（payload JSON 字符串）也可解析为合法投影
+    const exWrapper = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({ ...BASE, id: 'prj-1', kind: 'projection-rebuild', input: { rebuild_input: 'source' } }),
+        },
+      }),
+    );
+    const wrapper = await exWrapper.executeCheck('可恢复（restore）', {
+      objectId: 'prj-1',
+      kind: 'projection',
+      payload: { payload: JSON.stringify(A3_VALID) },
+    });
+    expect(wrapper.result).toBe('pass');
+    // 占位注册（input = 对象 payload，无 rebuild_input）→ unknown
+    const exPh = createRepairExecutors(
+      fakeStores({
+        baselines: {
+          getBaseline: async () => ({ ...BASE, id: 'prj-1', kind: 'projection-rebuild', input: 'raw payload' }),
+        },
+      }),
+    );
+    const ph = await exPh.executeCheck('可恢复（restore）', { objectId: 'prj-1', kind: 'projection', payload: A3_VALID });
+    expect(ph.result).toBe('unknown');
+    expect(ph.detail).toContain('无重建输入');
+  });
+
+  it('真实数据面 duck-typed 注入（supervisor 实例 → 执行器只读判定）', async () => {
+    const root = await tmpRoot('omb-repair-stores-');
+    const facts = new FactStore({ root });
+    const baselines = new BaselineStore({ root });
+    await facts.registerFact({ id: 'c1', text: '已推翻', provenance: 'obj-1', valid: false });
+    await baselines.registerBaseline({ ...BASE, id: 'obj-1', kind: 'process' });
+    const ex = createRepairExecutors(fakeServices({ stores: { facts, baselines } }));
+    const contradiction = await ex.executeCheck('无矛盾（contradiction 检查通过）', { objectId: 'obj-1', kind: 'memory' });
+    expect(contradiction.result).toBe('fail'); // 事实库真实只读 → 命中已推翻事实
+    const replay = await ex.executeCheck('重放一致（replay + state_delta 匹配）', {
+      objectId: 'obj-1',
+      kind: 'process',
+      current: CURRENT,
+    });
+    expect(replay.result).toBe('pass'); // 版本化对比全匹配（真实基线库只读）
+  });
+
+  it('确定性：数据面执行器同输入同输出（两次执行 deep equal）', async () => {
+    const ex = createRepairExecutors(fakeStores({ baselines: { getBaseline: async () => BASE } }));
+    const ctx = { objectId: 'obj-1', kind: 'process', current: CURRENT } as const;
+    const r1 = await ex.executeCheck('重放一致（replay + state_delta 匹配）', { ...ctx });
+    const r2 = await ex.executeCheck('重放一致（replay + state_delta 匹配）', { ...ctx });
+    expect(r1).toEqual(r2);
+    expect(JSON.stringify(r1)).toBe(JSON.stringify(r2));
+  });
+});
+
 // ---- ③ 集成（createCognitiveRuntime + fixture 布局） ----
 
 describe('③ 集成：runRepair 真实验证执行器接线（检索一致性真实走 memory retrieve）', () => {
@@ -488,6 +749,67 @@ describe('③ 集成：runRepair 真实验证执行器接线（检索一致性�
     expect(rec.missing).toEqual([]);
     // 处置执行：clear_suspicious 仅 memory kind 恢复 lifecycle——generic 仅记录（保持 Suspicious）
     expect((await runtime.memory.getById(memId))!.lifecycle).toBe('Suspicious');
+  });
+
+  it('P3.6 集成：policy 对象结构检查全 pass 且无基线 → 基线自动注册（版本化字段齐备）；第二次 runRepair 走有基线分支；回归集注册后重跑全等 → PASS', async () => {
+    // 注：经真实 runRepair（payload=Memory 包装）只有 policy 硬检查（策略 schema 合法——目录级校验，
+    // 与对象载荷无关）可真实 pass；process/skill/projection 硬检查受既有接线形状（ProcessSchema vs
+    // ProcessDef / SkillSchema vs Memory 包装 / ContextProjectionSchema vs Memory 包装）约束无法过——
+    // 版本化对比（环境指纹/快照/版本全匹配 → pass）由 ⑤ 单元 + duck-type 覆盖，此处钉住自动注册主链。
+    const root = await tmpRoot('omb-repair-bl-');
+    const runtime = trackRuntime(createCognitiveRuntime({ root }));
+    const memId = await runtime.memory.ingest(makeMemory('policy fixture payload'));
+    await runtime.memory.update(memId, { lifecycle: 'Suspicious' });
+    await writeDecay(root, 'bl.json', { affected_objects: [{ id: memId, kind: 'policy' }] });
+
+    // 首次：结构检查（策略 schema 合法）pass + 冻结回归集无基线 unknown → UNKNOWN；判定后自动注册基线
+    const rec = await runtime.runRepair();
+    expect(rec.objects).toHaveLength(1);
+    const o = rec.objects[0]!;
+    expect(o.verdict).toBe('UNKNOWN');
+    expect(o.evidence_quality).toBe(0.5); // 策略 schema 合法 pass（1/2 有结果）+ 回归集 unknown
+    expect(o.detail).toContain('策略 schema 合法=pass');
+    expect(o.detail).toContain('冻结回归集通过（frozen regression set）=unknown');
+    expect(o.detail).toContain('基线已注册，下次可版本化对比');
+    // 基线可查且版本化字段全量齐备（环境指纹/运行时快照/期望结果/验证器版本）
+    const base = await runtime.baselineStore.getBaseline(memId, 'policy-regression');
+    expect(base).not.toBeNull();
+    expect(base!.id).toBe(memId);
+    expect(base!.kind).toBe('policy-regression');
+    expect(base!.verifier_version).toBe('1');
+    expect(base!.environment_fingerprint).toHaveProperty('os');
+    expect(base!.environment_fingerprint).toHaveProperty('node');
+    expect(base!.runtime_snapshot).toMatch(/^rs:/);
+    expect(base!.expected_result).toEqual({ verdict: 'UNKNOWN', evidence_quality: 0.5, disposition: 'keep_suspicious' });
+
+    // 第二次：基线已存在 → 不重复注册（list 仍 1；对象 detail 不再含「基线已注册」）；
+    // 冻结回归集仍 unknown（占位注册——input=payload 无回归 case，证据 detail 承载，对象 detail 只聚合
+    // 检查名=result）——「有基线」分支与版本化对比路径由 ⑤ 单元 + duck-type 覆盖
+    const rec2 = await runtime.runRepair();
+    const o2 = rec2.objects[0]!;
+    expect(o2.detail).toContain('冻结回归集通过（frozen regression set）=unknown');
+    expect(o2.detail).not.toContain('基线已注册');
+    expect(await runtime.baselineStore.list('policy-regression')).toHaveLength(1);
+
+    // 回归集注册（覆写同 id+kind 基线：冻结策略 + 期望 case）→ 第三次重跑 → 全等 pass → 结构+语义全过 → PASS
+    const policy = {
+      signal_triggers: { memory_ops: { evolve: true, strength: 1, object_layer: 'L2' } },
+      debt_thresholds: { soft: 100, hard: 1000, critical: 5000 },
+      daily_evolution_cost: 10000,
+    } as unknown as EvolvePolicy;
+    const signals: SignalSummary = { window: { from: 0, to: 0 }, counts: { memory_ops: 2 } };
+    await runtime.baselineStore.registerBaseline({
+      ...base!,
+      input: { policy, cases: [{ signals, expected_decision: decideEvolution({ summary: signals, policy }) }] },
+    });
+    const rec3 = await runtime.runRepair();
+    const o3 = rec3.objects[0]!;
+    expect(o3.detail).toContain('冻结回归集通过（frozen regression set）=pass');
+    expect(o3.verdict).toBe('PASS');
+    expect(o3.evidence_quality).toBe(1);
+    // 确定性/幂等：第三次重复执行同结果
+    const rec3again = await runtime.runRepair();
+    expect(rec3again.objects).toEqual(rec3.objects);
   });
 });
 
