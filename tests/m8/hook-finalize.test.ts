@@ -58,6 +58,12 @@ function makeFakeCtx(opts: {
   return { ctx, bus, contexts };
 }
 
+/** W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前） */
+function projectionProvider(contexts: Array<{ name: string; order: number; text: unknown }>): (assembleCtx: unknown) => string {
+  const def = contexts.find((c) => c.name === 'cognitive:projection')!;
+  return def.text as (assembleCtx: unknown) => string;
+}
+
 function dshEvent(type: string, data: unknown, time: number): { type: string; data: unknown; time: number } {
   return { type, data, time };
 }
@@ -109,7 +115,7 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     bus.emit('session/event', { id: SESSION }, dshEvent('tool/call', { callId: 'c1', name: 'read', arguments: '{}', turn: 1, step: 1 }, 1002));
 
     // prepareTurn 预热（provider 求值 → 决策缓存 + context/injected；assembleCtx 携带会话事件）
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     provider(assembleCtx([userMessage('msg-1', GOAL)]));
     await vi.waitFor(
       async () => {
@@ -178,7 +184,7 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     bus.emit('session/event', { id: SESSION }, dshEvent('turn/end', { turn: 1, reason: { kind: 'completed' } }, 2000));
 
     // 下一次 prepareTurn（provider 求值）→ 惰性收尾
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     provider(assembleCtx([userMessage('msg-1', GOAL)]));
     await vi.waitFor(
       async () => {

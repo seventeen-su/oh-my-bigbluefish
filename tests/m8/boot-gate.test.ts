@@ -83,6 +83,12 @@ function makeFakeCtx(opts: { runtime?: CognitiveRuntime }): {
   return { ctx, bus, contexts, captured };
 }
 
+/** W5：按名取投影 section（context 现注册 contract(80)/capabilities(85)/projection(90) 三段——order 小者在前） */
+function projectionProvider(contexts: Array<{ name: string; order: number; text: unknown }>): (assembleCtx: unknown) => string {
+  const def = contexts.find((c) => c.name === 'cognitive:projection')!;
+  return def.text as (assembleCtx: unknown) => string;
+}
+
 function dshEvent(type: string, data: unknown, time: number): { type: string; data: unknown; time: number } {
   return { type, data, time };
 }
@@ -152,8 +158,8 @@ describe('R2 boot gate（runtime/plugin.ts apply）', () => {
     apply(ctx, { bootstrap: false, bootStableOverride: () => bootGate });
 
     // 装配结构照旧（gate 方案）：context 钩子已注册（认知不提前“服务”，但结构在位）
-    expect(contexts).toHaveLength(1);
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    expect(contexts).toHaveLength(3); // W5：contract(80)/capabilities(85)/projection(90) 三段
+    const provider = projectionProvider(contexts);
 
     // pending 语义：boot 未 settle → provider 返回空串（异步预热不产出），无 context/injected 入链
     const assembleCtx = makeAssembleCtx([userEvent('msg-1', GOAL)]);
@@ -209,7 +215,7 @@ describe('R2 boot gate（runtime/plugin.ts apply）', () => {
     const { ctx, contexts } = makeFakeCtx({ runtime });
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(okBoot(root)) });
 
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     const assembleCtx = makeAssembleCtx([userEvent('msg-1', GOAL)]);
     expect(provider(assembleCtx)).toBe('');
     await vi.waitFor(
@@ -229,7 +235,7 @@ describe('R2 boot gate（runtime/plugin.ts apply）', () => {
     apply(ctx, { bootstrap: false, bootStableOverride: () => Promise.resolve(failBoot()) });
 
     // 认知不进入服务：provider 恒空串（gate 首次调用即记录认知侧降级）、无 context/injected；事件不入链
-    const provider = contexts[0]!.text as (assembleCtx: unknown) => string;
+    const provider = projectionProvider(contexts);
     expect(provider(makeAssembleCtx([userEvent('msg-1', GOAL)]))).toBe('');
     bus.emit('session/event', { id: SESSION }, dshEvent('user/message', userMessage('msg-1', GOAL), 1001));
     await new Promise((r) => setTimeout(r, 20));

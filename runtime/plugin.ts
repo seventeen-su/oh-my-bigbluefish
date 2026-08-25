@@ -48,6 +48,10 @@ import type { GovernorDecision } from './governor.js';
 import type { PromptWorkingState } from './prompt.js';
 // R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
 import { hostVersion } from '../kernel/schemas/host-version.js';
+// W5：OMB Runtime Contract（三层结构）——第一层固定契约（OMB_RUNTIME_CONTRACT）+ 第二层动态能力行
+//（buildCapabilitiesLine）+ 第三层 skill 路径纯函数（skillSourcePath/skillMirrorPath，提交 2 镜像接线使用）。
+// 层 DAG 合规：runtime-contract.ts 只依赖 node:path 与类型（runtime(2) → runtime(2) ✓）。
+import { buildCapabilitiesLine, OMB_RUNTIME_CONTRACT } from './runtime-contract.js';
 
 export const name = 'omb-v2';
 export const inject = ['commands'];
@@ -235,6 +239,14 @@ export interface CognitiveRuntimeLike {
   /** S1：State.world/self 引用填充（reduce 产出 State 后 null → 模型引用；StateSchema 校验——
    *  合规路径返回校验结果，事件流直归约的 working 缺省字段（既有诚实空语义）不阻塞接线） */
   materializeState?(state: unknown): unknown;
+  /** W5：能力注册表视图（capabilities.list() → 能力名清单；第二层动态能力行数据源——同步只读） */
+  capabilities?: { list(): Array<{ name?: string; id?: string }> };
+  /** W5：组件注册表视图（components.list() → manifest 名清单；第二层动态能力行数据源补充） */
+  components?: { list(): Array<{ manifest_id?: string }> };
+  /** W5：语义裁判执行器（null = 未注入 → judge 不可用；available 布尔——动态能力行「语义裁判」段） */
+  judgeExecutor?: { available: boolean } | null;
+  /** W5：dynamicCordisRunner 增强通道注入面（存在 → 候选验证通道 = runner；缺失 → 受限子进程） */
+  dynamicRunner?: DynamicCordisRunnerLike | undefined;
   /** R8：/evolve share——发布机制级 Evolution Object（trusted-latest 演化链头 → GitRegistry 本地 registry；
    *  生产默认不自动发布（隐私原则），显式命令始终可用；无对象/失败 → ok:false + 明确文本，不崩） */
   shareEvolutionObject?(input: { session_id: string }): Promise<ShareCommandResultLike>;
@@ -303,6 +315,47 @@ function readService<T>(ctx: ContextLike, name: string): T | undefined {
     return ctx.get(name) as T | undefined;
   }
   return (ctx as unknown as Record<string, T | undefined>)[name];
+}
+
+/**
+ * W5：认知运行时 → 第二层动态能力行视图（同步读取：capabilities/components 名称、judgeExecutor 可用性、
+ * dynamicRunner 注入存在性；运行时缺失/字段缺失 → 对应维度未知——buildCapabilitiesLine 兜底「当前无额外能力面」）。
+ * 仅存在性/名称读取，零副作用；真实运行时实例结构上满足（CapabilityLike.name / ComponentListEntry.manifest_id）。
+ */
+function capabilitiesViewOf(rt: CognitiveRuntimeLike | undefined): {
+  capabilities?: string[];
+  judgeAvailable?: boolean;
+  runnerAvailable?: boolean;
+} {
+  if (rt === undefined) {
+    return {};
+  }
+  const names: string[] = [];
+  const caps = rt.capabilities?.list?.();
+  if (Array.isArray(caps)) {
+    for (const c of caps) {
+      if (typeof c?.name === 'string' && c.name.length > 0) {
+        names.push(c.name);
+      }
+    }
+  }
+  const components = rt.components?.list?.();
+  if (Array.isArray(components)) {
+    for (const c of components) {
+      if (typeof c?.manifest_id === 'string' && c.manifest_id.length > 0) {
+        names.push(c.manifest_id);
+      }
+    }
+  }
+  const view: { capabilities?: string[]; judgeAvailable?: boolean; runnerAvailable?: boolean } = {};
+  if (names.length > 0) {
+    view.capabilities = [...new Set(names)];
+  }
+  if (rt.judgeExecutor !== undefined && rt.judgeExecutor !== null) {
+    view.judgeAvailable = rt.judgeExecutor.available === true;
+  }
+  view.runnerAvailable = rt.dynamicRunner !== undefined;
+  return view;
 }
 
 /** 插件 preset 根（src 布局 <preset>/runtime/ → 上一级；编译布局 <preset>/lib/runtime/ → 存在性回退取上级） */
@@ -801,6 +854,12 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   //   后续请求同步返回缓存投影文本——每次注入的文本都有对应 context/injected 事件（Model-visible ⟺ logged）。
   if (systemPrompt?.context !== undefined) {
     if (cognitive !== undefined) {
+      // W5：三层结构接线（宿主架构研究结论）——第一层固定契约（静态常量 section，order 80，零 session 依赖）
+      // + 第二层动态能力行（order 85，同步求值自运行时实例：capabilities/components 名称、judgeExecutor
+      // 可用性、dynamicRunner 注入）+ 第三层渐进指导（DSH 原生 skill omb-runtime 按需加载——镜像接线见 apply
+      // 上部；order 小者在前：contract(80) → capabilities(85) → projection(90)）。
+      systemPrompt.context({ name: 'cognitive:contract', order: 80, text: OMB_RUNTIME_CONTRACT });
+      systemPrompt.context({ name: 'cognitive:capabilities', order: 85, text: buildCapabilitiesLine(capabilitiesViewOf(cognitive)) });
       // S8：context 求值 kick 转交共享预热链（prepareForTurn）——sessionId 提取 + 事件数组兜底（goal 来源）
       const kickPrepare = (assembleCtx: AssembleContextLike): void => {
         const sessionId = assembleCtx?.agent?.session?.id;
@@ -822,10 +881,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         },
       });
     } else {
-      recordDegradation('cognitive-runtime', '认知运行时未装配——无认知投影注入（命令仍可用）');
+      recordDegradation('cognitive-runtime', '认知运行时未装配——无认知契约/能力/投影注入（命令仍可用）');
     }
   } else {
-    recordDegradation('systemPrompt.context', '接口缺失（systemPrompt.context 不存在）——无认知投影注入（命令仍可用）');
+    recordDegradation('systemPrompt.context', '接口缺失（systemPrompt.context 不存在）——无认知契约/能力/投影注入（命令仍可用）');
   }
 
   // T8.26.4：事件监听——session/event（turn 生命周期 + 工具事实）与 tools/result（live 工具结果）→ observeEvent
