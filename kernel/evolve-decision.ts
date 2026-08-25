@@ -104,8 +104,10 @@ export function debtAccrualsFromSummary(summary: SignalSummary, costs?: Maintena
   ) {
     push('memory_consolidation', MAINTENANCE_WEIGHTS.memory_consolidation);
   }
-  // gc：每次收尾常驻维护（事件库 compact）
-  push('gc', MAINTENANCE_WEIGHTS.gc);
+  // gc：不再每收尾常驻入账（2026-08-25 修复）——事件库 compact 已由 turn-finalize 任务
+  // （ROI 1，每次收尾执行）覆盖；重复入账导致 gc 债务无限增长且 gc 任务（ROI 0.5）在
+  // 请求间隙量子中几乎轮不到（实测 gc 债务 1340 只入账不清偿）。§10.1 GC:+1 权重保留于
+  // MAINTENANCE_WEIGHTS/成本表（供显式 gc 任务使用），此处不再自动入账。
   return out;
 }
 
