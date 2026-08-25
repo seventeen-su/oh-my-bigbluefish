@@ -13,6 +13,8 @@
 //   trustGate：TRUST_LEVELS 序号 >= required 序号 → 放行（含 equal）；trust < required 不能用于 stable 晋升（P4 消费）。
 //   nonCircularityCheck：Verifier 来源若等于候选自身 → 拒绝（防循环自证：AI 生成 Candidate → AI 生成 Verifier →
 //     Verifier 通过 Candidate 的循环链被阻断）。
+// 宪法级原则（P4 注记，2026-08-25）：验证标准不能被验证器自己定义——验证器可演化，但验证标准必须是独立
+//   审计对象（trustGate + nonCircularityCheck + stablePromotionTrustGate fail-closed 共同落实）。
 import type {
   TrustLevel,
   Verdict,
