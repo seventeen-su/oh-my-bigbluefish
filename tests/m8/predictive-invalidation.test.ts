@@ -226,7 +226,8 @@ describe('③ repair：受影响对象重验证 + 清债；空 → 合法完成�
     expect(record.task).toBe('repair');
     expect(record.decay_records).toBe(1);
     expect(record.affected_objects).toEqual([{ id: memId, kind: 'memory' }]);
-    // P3：契约化重验证——对象存在（getById 命中 → hard pass）但 outcome 无执行器 → 诚实 UNKNOWN；
+    // P3/P3.5：契约化重验证——对象存在（getById 命中 → hard pass）且检索一致性通过（真实 memory retrieve）；
+    // 无矛盾（语义面）无执行器 → 诚实 UNKNOWN（evidence_quality = 2/3 = 0.67，较旧「仅 getById」0.33 提高）；
     // 所属 decay 记录带 environment_delta → environment_change → local_regression（对象保持 Suspicious，
     // 处置仅记录；degrade_or_rollback/quarantine 落地动作属后续语义）
     expect(record.reverified).toEqual([]); // reverified 语义（P3）= verdict=PASS 的对象（UNKNOWN 不属通过）
@@ -237,10 +238,12 @@ describe('③ repair：受影响对象重验证 + 清债；空 → 合法完成�
         kind: 'memory',
         contract_id: `repair:${memId}`,
         verdict: 'UNKNOWN',
-        evidence_quality: 0.33, // 1/3 应查检查有结果（getById 命中，outcome 无证据）
+        evidence_quality: 0.67, // 2/3 应查检查有结果（对象可检索 + 检索一致性；无矛盾 unknown）
         disposition: 'local_regression',
         score_eligible: true,
         reason: expect.stringContaining('环境变化'),
+        detail:
+          '对象可检索（getById 命中）=pass；检索一致性（同查询同结果）=pass；无矛盾（contradiction 检查通过）=unknown',
       },
     ]);
     // 幂等：直接再跑一次 → 同结果（判定确定性；不抛、不重复副作用）
