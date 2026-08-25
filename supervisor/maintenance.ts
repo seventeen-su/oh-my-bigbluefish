@@ -258,8 +258,10 @@ export class MaintenanceScheduler {
     const report: QuantumReport = { ran: [], skipped: [] };
     for (const t of this.sortedQueue()) {
       if (this.hardBlocked(t)) {
+        // 硬跳过 = 调度延迟而非失败（2026-08-25 死亡螺旋修复）：不累计债务——
+        // 否则债务合计 ≥ 硬限后每次跳过都 +value，债务永不回落（实测 gc/turn-finalize
+        // 债务上千的根因）。跳过仅记录（skipped），债务由任务真实执行/失败决定。
         report.skipped.push(t.id);
-        this.accrueOnNonRun(t);
         continue;
       }
       const r = await this.runOne(t, signal);
@@ -285,8 +287,7 @@ export class MaintenanceScheduler {
         if (signal.aborted) break;
         if (this.hardBlocked(t)) {
           report.skipped.push(t.id);
-          this.accrueOnNonRun(t);
-          continue;
+          continue; // 硬跳过不累计债务（死亡螺旋修复，见 hardBlocked/requestQuantum 注释）
         }
         const r = await this.runOne(t, signal);
         report.ran.push(...r.ran);
@@ -439,8 +440,15 @@ export class MaintenanceScheduler {
     });
   }
 
-  /** hard 限：债务合计 ≥ hardLimit 时非必要（normal）任务跳过（限制非必要演化） */
+  /** hard 限：债务合计 ≥ hardLimit 时非必要（normal）任务跳过（限制非必要演化）。
+   *  必要维护任务豁免（2026-08-25 死亡螺旋修复）：gc/收尾/记忆整合/环境检查为廉价必要维护——
+   *  若被硬限阻塞则其债务永不清偿、债务合计永不回落，硬限成为永久冻结（实测 turn-finalize 债务
+   *  1163 = 被硬跳过 1163 次）。§10.1「限制非必要 evolution」——仅演化类任务（candidate_validation/
+   *  evolution_decision/promotion_check/repair）受硬限约束。 */
   private hardBlocked(t: MaintenanceTask): boolean {
+    if (t.id === 'gc' || t.id === 'memory_consolidation' || t.id === 'environment_check' || t.id.startsWith('turn-finalize:')) {
+      return false;
+    }
     return this.debtTotal() >= this.hardLimit && t.urgency === 'normal';
   }
 

@@ -167,6 +167,38 @@ describe('维护调度（§12.3）', () => {
     expect(ran).toEqual([]);
   });
 
+  it('死亡螺旋回归：硬跳过不累计债务（跳过 = 调度延迟非失败）；必要维护豁免硬限', async () => {
+    const s = mkScheduler({ softLimit: 5, hardLimit: 8 });
+    const ran: string[] = [];
+    // 制造债务超硬限（12 ≥ 8）
+    s.enqueue(task({ id: 'f1', value: 6, estimated_cost: 1, run: fail }));
+    await s.requestQuantum();
+    s.enqueue(task({ id: 'f2', value: 6, estimated_cost: 1, run: fail }));
+    await s.requestQuantum();
+    const debtBefore = s.debtSnapshot().reduce((acc, d) => acc + d.value, 0);
+    // 非必要任务被跳过但不累计债务（债务快照不变——2026-08-25 死亡螺旋修复）
+    s.enqueue(task({ id: 'normal-work', value: 1, estimated_cost: 1, run: async () => { ran.push('normal-work'); } }));
+    const r1 = await s.requestQuantum();
+    expect(r1.skipped).toContain('normal-work');
+    const debtAfterSkip = s.debtSnapshot().reduce((acc, d) => acc + d.value, 0);
+    expect(debtAfterSkip).toBe(debtBefore);
+    // 必要维护任务（gc/turn-finalize:/memory_consolidation/environment_check）豁免硬限——照样执行并清偿
+    s.enqueue(task({ id: 'gc', value: 1, estimated_cost: 1, run: async () => { ran.push('gc'); } }));
+    s.enqueue(task({ id: 'turn-finalize:s1', value: 1, estimated_cost: 1, run: async () => { ran.push('tf'); } }));
+    s.enqueue(task({ id: 'memory_consolidation', value: 1, estimated_cost: 1, run: async () => { ran.push('mc'); } }));
+    s.enqueue(task({ id: 'environment_check', value: 1, estimated_cost: 1, run: async () => { ran.push('ec'); } }));
+    const r2 = await s.requestQuantum(); // 每次一个：四个必要任务分四次 quantum（同 ROI/priority → id 字典序）
+    expect(r2.ran).toEqual(['environment_check']); // ran = 任务 id
+    await s.requestQuantum();
+    await s.requestQuantum();
+    await s.requestQuantum();
+    expect(ran).toEqual(['ec', 'gc', 'mc', 'tf']); // 执行序按 id 字典序
+    // 演化类任务（candidate_validation）仍受硬限约束
+    s.enqueue(task({ id: 'candidate_validation', value: 1, estimated_cost: 1, run: async () => { ran.push('cv'); } }));
+    const r3 = await s.requestQuantum();
+    expect(r3.skipped).toContain('candidate_validation');
+  });
+
   it('critical：markCritical/urgency=critical → 下一 quantum/tick 优先执行（先于 ROI 更高者）', async () => {
     const s = mkScheduler();
     const ran: string[] = [];
