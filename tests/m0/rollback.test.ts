@@ -233,9 +233,18 @@ describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () =>
     expect(stableHead).toMatch(/^[0-9a-f]{40}$/);
   });
 
-  it('真实 stable worktree 内容可读（只读冒烟，不做任何切换）', () => {
+  it('真实 stable worktree 内容可读且与线引用一致（只读冒烟，不做任何切换）', () => {
     const stableWt = path.join(PRESET_ROOT, 'stable');
+    // manifest 存在且可解析
     expect(fs.existsSync(path.join(stableWt, 'manifest.json'))).toBe(true);
-    expect(manifestLine(stableWt)).toBe('initial');
+    const manifest = JSON.parse(fs.readFileSync(path.join(stableWt, 'manifest.json'), 'utf8')) as {
+      name: string;
+    };
+    expect(manifest.name).toBe('omb-v2');
+    // 真实冒烟语义：worktree 的 line 与权威线引用（versions.git refs/heads/stable）一致，而非假设某个固定线
+    const refManifest = JSON.parse(
+      runGit(['show', 'refs/heads/stable:manifest.json'], { cwd: REAL_BARE }),
+    ) as { line?: string };
+    expect(manifestLine(stableWt)).toBe(refManifest.line ?? '');
   });
 });

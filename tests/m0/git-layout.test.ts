@@ -127,13 +127,21 @@ describe('三线 git 布局（独立临时 fixture 完整复现）', () => {
 });
 
 describe('真实布局只读冒烟', () => {
-  it('真实 stable/manifest.json 可读且为 initial 基线', () => {
+  it('真实 stable/manifest.json 可读且与线引用一致', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(REAL_STABLE, 'manifest.json'), 'utf8')) as {
       name: string;
       version: string;
       line: string;
     };
-    expect(manifest).toMatchObject({ name: 'omb-v2', version: '0.1.0', line: 'initial' });
+    // 身份锚点：产品名固定
+    expect(manifest.name).toBe('omb-v2');
+    // 真实冒烟语义：工作树内容与权威线引用（versions.git refs/heads/stable）一致，而非假设某个固定线
+    const refManifest = JSON.parse(
+      runGit(['show', 'refs/heads/stable:manifest.json'], {
+        cwd: path.join(PRESET_ROOT, 'versions.git'),
+      }),
+    );
+    expect(manifest).toEqual(refManifest);
   });
 
   it('真实 stable/ 写被拒且只读语义完整（真实观察到拒绝，不许 mock）', () => {
