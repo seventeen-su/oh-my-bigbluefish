@@ -45,10 +45,11 @@ import {
   type RepairDisposition,
 } from '../kernel/repair-contract.js';
 import { decideVerdict, trustGate } from '../kernel/verification.js';
-// P4：Evolution 收敛——候选晋升验证契约门禁（kernel 层 2；runtime(2) → kernel(2) ✓；
-// supervisor 侧经 deps 注入回调消费——本文件为 kernel 逻辑唯一消费方；stablePromotionTrustGate 随
-// P4 stable 晋升信任门禁接线（commit 2）一并引入）
-import { runCandidateGate } from '../kernel/candidate-contract.js';
+// P4：Evolution 收敛——候选晋升验证契约门禁 + stable 晋升信任门禁（kernel 层 2；runtime(2) → kernel(2) ✓；
+// supervisor 侧经 deps 注入回调消费——本文件为 kernel 逻辑唯一消费方）
+import { runCandidateGate, stablePromotionTrustGate } from '../kernel/candidate-contract.js';
+// P4：Benchmark 收敛——bench v2 适配层（结果 → 验证契约语义纯映射；kernel 层 2）
+import { benchContractFromTask, benchEvidenceFromResult } from '../kernel/bench-contract.js';
 import type { Verdict, VerificationEvidence } from '../kernel/schemas/verification.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
@@ -106,7 +107,7 @@ import {
 } from '../supervisor/bench-v2.js';
 import { makeRealExecutorV2 } from '../supervisor/real-executor.js';
 import { makeJudgeV2 } from '../supervisor/judge.js';
-import type { BenchFixtureV2, BenchLine } from '../kernel/schemas/bench.js';
+import type { BenchContractV2, BenchFixtureV2, BenchLine } from '../kernel/schemas/bench.js';
 // S1：基准明细目录（WorldModel bench 状态查询——最近 real/replay 报告存在性）
 import { BENCH_REPORTS_DIR } from '../supervisor/bench.js';
 // P2：组件注册表装配（实现落 supervisor 层 1——runtime(2) 持有注册表，层 DAG 禁 runtime → components，
@@ -505,6 +506,8 @@ export interface BenchV2ToolResult {
   judge_rate: number;
   persisted: boolean;
   detail?: string;
+  /** P4：bench 契约适配层摘要行（逐任务经 bench-contract 映射为验证契约判定；如「验证契约：PASS 20/20」） */
+  verification_text?: string;
 }
 
 /** S5：kern_switch 数据源结果（版本线切换执行摘要；无 /mode 空白会话守卫——见 switchLine 方法注释） */
@@ -853,6 +856,28 @@ export class CognitiveRuntime {
         persistDir: persist ? (this.assemblyOpts.benchReportsDir ?? BENCH_REPORTS_DIR) : undefined,
         judge,
       });
+      // P4 加性：bench 契约适配层（逐任务经 bench-contract 映射为验证契约判定——同一套
+      // Contract/Evidence/Result 语义覆盖 bench；不修改 runBenchV2 逻辑/输出结构——冻结基准零风险；
+      // 适配层失败 → verification_text 缺省（加性降级，不阻断基准结果））
+      let verification_text: string | undefined;
+      try {
+        const counts = { PASS: 0, FAIL: 0, UNKNOWN: 0 };
+        const contractById = new Map(contracts.map((c): [string, BenchContractV2] => [c.id, c]));
+        for (const r of report.results) {
+          const task = contractById.get(r.task_id);
+          if (task === undefined) {
+            continue;
+          }
+          const contract = benchContractFromTask({ id: task.id, prompt: task.requirement });
+          // parse_ok 以 passed 为代理（report 仅携带 passed；passed ⇒ 输出可解析且过 schema）
+          const evidence = benchEvidenceFromResult(contract, { passed: r.passed, parse_ok: r.passed });
+          counts[decideVerdict(contract, [evidence]).verdict]++;
+        }
+        verification_text =
+          `验证契约：PASS ${counts.PASS}/${report.total}（FAIL ${counts.FAIL}；UNKNOWN ${counts.UNKNOWN}）`;
+      } catch {
+        verification_text = undefined; // 加性降级：适配层异常不阻断基准摘要
+      }
       return {
         ok: true,
         line: report.line,
@@ -864,6 +889,7 @@ export class CognitiveRuntime {
         judge_degraded: report.judge.degraded,
         judge_rate: report.judge.rate,
         persisted: persist,
+        verification_text,
       };
     } catch (err) {
       return { ok: false, line, mode, passed: 0, total: 0, ...disabled, persisted: false, detail: errorDetail(err) };
@@ -2733,6 +2759,9 @@ export class CognitiveRuntime {
       }
       // 应晋升 → promoteToStable（activation_scope='project' 显式传入；object_id = P1d Evolution Object 链头）
       const objectId = await latestObjectId(layout, latest);
+      // P4：验证契约信任门禁需读取的 Evolution Object（loadEvolutionObject 结果传入 promoteToStable；
+      // 无对象（旧布局/首个候选前）→ 门禁跳过——既有行为不变）
+      const object = objectId !== null ? await loadEvolutionObject(layout, latest, objectId) : null;
       const pr = await promoteToStable(
         {
           gate,
@@ -2740,6 +2769,7 @@ export class CognitiveRuntime {
           stable_commit: stable,
           bench,
           object_id: objectId ?? undefined,
+          object: object ?? undefined,
           activation_scope: 'project',
         },
         {
@@ -2748,6 +2778,17 @@ export class CognitiveRuntime {
           eventStore: this.eventStore,
           sessionId,
           snapshotHash: this.snapshotHash,
+          // P4：stable 晋升信任门禁（kernel 纯函数注入——VerifierTrust < required 拒绝 / 非循环检查 /
+          // 无验证记录 fail-closed；DAG：runtime(2) → kernel(2) ✓；supervisor 不 import kernel 逻辑；
+          // verification 载荷窄化为门禁最小视图）
+          verificationGate: async (obj) =>
+            stablePromotionTrustGate({
+              id: obj.id,
+              verification:
+                obj.verification !== null && typeof obj.verification === 'object'
+                  ? (obj.verification as { verdict?: string; verifier_trust?: string })
+                  : undefined,
+            }),
         },
       );
       if (!pr.promoted) {

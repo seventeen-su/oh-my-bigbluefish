@@ -92,6 +92,8 @@ export interface PromoteToStableInput {
   activation_scope: string;
   /** M6 compatible_schema（缺省 'policy/v1'） */
   compatible_schema?: string;
+  /** P4：晋升目标 Evolution Object（验证契约信任门禁输入；由调用方从 loadEvolutionObject 结果传入——可选） */
+  object?: { id: string; verification?: unknown };
 }
 
 export interface PromoteToStableDeps {
@@ -101,6 +103,12 @@ export interface PromoteToStableDeps {
   eventStore?: EventStore;
   sessionId?: string;
   snapshotHash?: string;
+  /**
+   * P4：验证契约信任门禁（deps 注入回调——supervisor 不 import kernel 逻辑，实现由 runtime 层装配注入
+   * kernel/candidate-contract.ts stablePromotionTrustGate；层 DAG 零改动）。门禁序列中调用（gate.ok 之后）：
+   * 未提供或 input.object 缺失 → 跳过（既有行为不变）；ok=false → 跳过晋升 + 降级记录（不 update-ref）。
+   */
+  verificationGate?: (object: { id: string; verification?: unknown }) => Promise<{ ok: boolean; reason: string }>;
 }
 
 export interface PromoteToStableResult {
@@ -250,6 +258,17 @@ export async function promoteToStable(
         promoted: false,
         reason: `门禁未通过——不推进（候选保持 trusted-latest，等待下次检查）: ${input.gate.reasons.join('；')}`,
       };
+    }
+    // ①b P4：验证契约信任门禁（deps 注入回调；未提供或无对象可验 → 跳过——既有行为不变；
+    //     ok=false → 跳过晋升 + 降级记录（不 update-ref））
+    if (deps.verificationGate !== undefined && input.object !== undefined) {
+      const vg = await deps.verificationGate(input.object);
+      if (!vg.ok) {
+        return {
+          promoted: false,
+          reason: `验证契约信任门禁拒绝——不推进（候选保持 trusted-latest，等待下次检查）: ${vg.reason}`,
+        };
+      }
     }
     const activationId = promotionActivationId(input.stable_commit, input.candidate_commit);
 

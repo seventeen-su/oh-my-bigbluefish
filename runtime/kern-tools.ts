@@ -105,6 +105,8 @@ export interface BenchV2ToolResultLike {
   persisted: boolean;
   /** 失败原因（ok:false 时非空） */
   detail?: string;
+  /** P4：bench 契约适配层摘要行（如「验证契约：PASS 20/20」；无 → 摘要文本不附加） */
+  verification_text?: string;
 }
 
 /** S5：kern_evolve 结果（runtime.runEvolutionNow 返回——与 plugin.ts CognitiveRuntimeLike.runEvolutionNow 同构） */
@@ -263,13 +265,16 @@ export function kernBenchTool(runtime: KernRuntimeLike): ToolDefinitionLike {
       const judgeText = r.judge_enabled
         ? `；judge 对照（D6 全任务双判，仅旁证）：${r.judge_run}/${r.judge_run + r.judge_degraded} 判词（降级 ${r.judge_degraded}，双判一致率 ${(r.judge_rate * 100).toFixed(1)}%）`
         : '；judge 对照：未启用（回放模式无 LLM judge）';
+      // P4：bench 契约适配层摘要行（同一套验证契约语义覆盖 bench；无 → 不附加）
+      const verificationText = r.verification_text !== undefined ? `；${r.verification_text}` : '';
       return {
         ok: true,
         line: r.line,
         mode: r.mode,
         passed: r.passed,
         total: r.total,
-        text: `v2 契约基准完成：${r.line} ${r.passed}/${r.total} 通过（${r.total} 任务，${mode}${judgeText}${r.persisted ? '；明细已落盘 workspace/.omb/bench' : ''}）`,
+        verification_text: r.verification_text,
+        text: `v2 契约基准完成：${r.line} ${r.passed}/${r.total} 通过（${r.total} 任务，${mode}${judgeText}${verificationText}${r.persisted ? '；明细已落盘 workspace/.omb/bench' : ''}）`,
       };
     },
   };

@@ -24,6 +24,8 @@ import {
   type PromoteToStableDeps,
   type PromoteToStableInput,
 } from '../../supervisor/promotion.js';
+// P4：stable 晋升信任门禁（真实内核门禁注入路径集成——VerifierTrust/非循环/fail-closed）
+import { stablePromotionTrustGate } from '../../kernel/candidate-contract.js';
 import { buildLayoutFixture, runGit, teardownLayoutFixture, type LayoutFixture } from '../helpers/git.js';
 
 const SESSION = 'sess-promote-1';
@@ -58,6 +60,20 @@ function mkDeps(fx: LayoutFixture, over: Partial<PromoteToStableDeps> = {}): Pro
     layout: makeLayout(fx),
     activationLogDir: join(poolRootOf(fx), 'activations'),
     ...over,
+  };
+}
+
+/** P4：注入面 verification 载荷（unknown）窄化为门禁最小视图（supervisor 注入面与 kernel 门禁的边界适配） */
+function narrowVerification(obj: { id: string; verification?: unknown }): {
+  id: string;
+  verification?: { verdict?: string; verifier_trust?: string };
+} {
+  return {
+    id: obj.id,
+    verification:
+      obj.verification !== null && typeof obj.verification === 'object'
+        ? (obj.verification as { verdict?: string; verifier_trust?: string })
+        : undefined,
   };
 }
 
@@ -232,5 +248,64 @@ describe('④ rollbackPromotion：RollbackContract 回退 + rolled_back 事件 +
     expect(payload).toContain('evolve.yaml 微调'); // 对象内容保留
     // 原 trusted 区不再存在（已移入 error 池）
     await expect(pool.load(input.candidate_id!)).rejects.toThrow(/未注册/);
+  });
+});
+
+describe('⑥ P4 验证契约信任门禁注入（deps 回调；ok=false → 跳过晋升 + 降级记录，不 update-ref）', () => {
+  fixtureIt('注入 fake gate ok=false → 不推进（stable 未动；reason 含门禁拒绝——降级记录）', async () => {
+    fx = buildLayoutFixture();
+    const r = await promoteToStable(
+      mkInput(fx, { object: { id: 'sha256:obj', verification: { verdict: 'PASS', verifier_trust: 'L1' } } }),
+      mkDeps(fx, {
+        verificationGate: async (obj) => ({ ok: false, reason: `fake 信任门禁拒绝: ${obj.id}` }),
+      }),
+    );
+    expect(r.promoted).toBe(false);
+    expect(r.reason).toContain('验证契约信任门禁拒绝');
+    expect(r.reason).toContain('fake 信任门禁拒绝');
+    expect(resolveLineCommit(makeLayout(fx), 'stable')).toBe(fx.initialHash); // 不 update-ref
+  });
+
+  fixtureIt('注入 fake gate ok=true → 正常推进（stable = trusted-latest）', async () => {
+    fx = buildLayoutFixture();
+    const r = await promoteToStable(
+      mkInput(fx, { object: { id: 'sha256:obj' } }),
+      mkDeps(fx, { verificationGate: async () => ({ ok: true, reason: 'fake 信任门禁通过' }) }),
+    );
+    expect(r.promoted).toBe(true);
+    expect(resolveLineCommit(makeLayout(fx), 'stable')).toBe(fx.latestHash);
+  });
+
+  fixtureIt('注入真实 stablePromotionTrustGate：对象无验证记录 → fail-closed 拒绝晋升（验证标准不能被验证器自己定义）', async () => {
+    fx = buildLayoutFixture();
+    const r = await promoteToStable(
+      mkInput(fx, { object: { id: 'sha256:obj' } }), // 无 verification
+      mkDeps(fx, { verificationGate: async (obj) => stablePromotionTrustGate(narrowVerification(obj)) }),
+    );
+    expect(r.promoted).toBe(false);
+    expect(r.reason).toContain('对象无验证记录');
+    expect(resolveLineCommit(makeLayout(fx), 'stable')).toBe(fx.initialHash);
+  });
+
+  fixtureIt('注入真实 stablePromotionTrustGate：verification PASS + trust L2 → 正常推进', async () => {
+    fx = buildLayoutFixture();
+    const r = await promoteToStable(
+      mkInput(fx, {
+        object: {
+          id: 'sha256:obj',
+          verification: { verdict: 'PASS', verifier_trust: 'L2', contract_id: 'candidate:test' },
+        },
+      }),
+      mkDeps(fx, { verificationGate: async (obj) => stablePromotionTrustGate(narrowVerification(obj)) }),
+    );
+    expect(r.promoted).toBe(true);
+    expect(resolveLineCommit(makeLayout(fx), 'stable')).toBe(fx.latestHash);
+  });
+
+  fixtureIt('未注入 gate → 既有行为（正常推进）', async () => {
+    fx = buildLayoutFixture();
+    const r = await promoteToStable(mkInput(fx, { object: { id: 'sha256:obj' } }), mkDeps(fx));
+    expect(r.promoted).toBe(true);
+    expect(resolveLineCommit(makeLayout(fx), 'stable')).toBe(fx.latestHash);
   });
 });
