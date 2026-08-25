@@ -33,6 +33,9 @@ import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type ShadowPolicy } from '../kernel/policy-loader.js';
 // S7：per-session shadow 路由纯函数（kernel 层 2；桶分配 + 路由判定——实现规格 §5.3）
 import { shouldRouteShadow } from '../kernel/shadow-route.js';
+// P2：Shadow 真实判定——验证契约种子/证据构造/判定映射（kernel 层 2；runtime(2) → kernel(2) ✓）
+import { buildShadowEvidence, seedShadowContract, shadowOutcomeFromResult } from '../kernel/shadow-contract.js';
+import { decideVerdict } from '../kernel/verification.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
@@ -321,6 +324,9 @@ export interface FinalizeTurnInput {
   session_id: string;
   decision: GovernorDecision;
   working_state: PromptWorkingState;
+  /** P2：会话任务契约（goal + success_criteria）——shadow outcome 验证契约种子；缺省仅取
+   *  working_state.goal（PromptWorkingState 无 success_criteria 字段——handleRequest 经此传递请求契约） */
+  task?: { goal: string; success_criteria: string[] };
   /** 供 checkpoint 保存的 schema 合规 State（T1.5 契约；缺省不保存） */
   state?: State;
 }
@@ -1293,17 +1299,31 @@ export class CognitiveRuntime {
 
   /**
    * S7：shadow 会话收尾 outcome 回写（exposure-<date>.jsonl 追加同键条目——(session,candidate) 最后一条
-   * 胜出）。outcome 代理（计划 §S7）：**以是否产生降级/decision 为代理**——decision.process.degraded
-   * 非空（调度/过程失败）→ 'degraded'，否则 'success'；真实任务成功判定（success_criteria 达成评估）
-   * 留待语义扩展（本代理仅为 promotion gate L2 后验统计入口，非任务级成功判定）。尽力而为。
+   * 胜出）。P2：判定从代理升级为**验证契约判定**（用户裁决 2026-08-25）——
+   *   seedShadowContract（task_contract：goal + success_criteria + 默认硬约束）→ buildShadowEvidence
+   *   （确定性一级：过程无降级 + 决策已产生；LLM judge 注入面本阶段不调用——成功条件无确定性证据时
+   *   诚实 UNKNOWN）→ decideVerdict（三态）→ shadowOutcomeFromResult（success/degraded/unknown，
+   *   success/degraded 语义与既有代理判定一致，unknown 为 UNKNOWN 独立档——L2 不计失败不污染评分）。
+   * 落盘记录扩展 {verdict, contract_id, evidence_quality, reason}；process_quality/controllability 本阶段
+   * 不落（无真实评分器——诚实缺省，P3 注入面）。真实 LLM judge 生产调用留 P2.5（本阶段仅注入面）。尽力而为。
    */
-  private async writeShadowOutcome(sessionId: string, decision: GovernorDecision): Promise<void> {
+  private async writeShadowOutcome(
+    sessionId: string,
+    decision: GovernorDecision,
+    task?: { goal: string; success_criteria: string[] },
+  ): Promise<void> {
     const route = this.shadowSessions.get(sessionId);
     if (route === undefined) {
       return; // 非 shadow 会话（或 exposure 未落盘）→ 不回写
     }
-    const outcome: 'success' | 'degraded' =
-      decision.process?.degraded !== null && decision.process?.degraded !== undefined ? 'degraded' : 'success';
+    const contract = seedShadowContract(sessionId, task ?? { goal: '', success_criteria: [] });
+    // 确定性一级证据：degraded = decision.process.degraded 非空；decision_made 恒 true——finalize 路径必有 decision
+    const evidence = buildShadowEvidence(contract, {
+      degraded: decision.process?.degraded !== null && decision.process?.degraded !== undefined,
+      decision_made: true,
+    });
+    const result = decideVerdict(contract, evidence);
+    const outcome = shadowOutcomeFromResult(result);
     const shadowsDir = join(this.evolutionRoot, 'shadows');
     const file = join(shadowsDir, `exposure-${new Date().toISOString().slice(0, 10)}.jsonl`);
     try {
@@ -1317,6 +1337,10 @@ export class CognitiveRuntime {
           task_domain: route.task_domain,
           exposure_ts: Date.now(),
           outcome,
+          verdict: result.verdict,
+          contract_id: result.contract_id,
+          evidence_quality: result.evidence_quality,
+          reason: result.reason,
         })}\n`,
         'utf8',
       );
@@ -1577,10 +1601,14 @@ export class CognitiveRuntime {
       checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: snapshot });
     }
 
-    // S7：shadow 会话收尾回写 outcome（success/degraded——以是否产生降级/decision 为代理；
-    // 真实任务成功判定（success_criteria 达成评估）留待语义扩展，注释见 writeShadowOutcome；
+    // S7：shadow 会话收尾回写 outcome（P2 验证契约判定：success/degraded/unknown——契约种子 = 会话
+    // task_contract（goal + success_criteria，经 FinalizeTurnInput.task 传递；缺省仅 working_state.goal，
+    // criteria 空 → 无语义应查）；成功条件无确定性证据时诚实 UNKNOWN；注释见 writeShadowOutcome；
     // 尽力而为——失败降级记录不阻塞收尾）
-    await this.writeShadowOutcome(input.session_id, input.decision);
+    await this.writeShadowOutcome(input.session_id, input.decision, {
+      goal: input.working_state.goal,
+      success_criteria: input.task?.success_criteria ?? [],
+    });
 
     // P1b：请求结束 → 释放快照绑定（未绑定请求 end 为空操作——cleanup 路径幂等安全）
     this.registry.end(input.session_id);
@@ -1662,6 +1690,8 @@ export class CognitiveRuntime {
       session_id: req.session_id,
       decision: prepared.decision,
       working_state: prepared.working_state,
+      // P2：会话任务契约随收尾传递——shadow outcome 验证契约种子（goal + success_criteria）
+      task: { goal: req.goal, success_criteria: req.success_criteria },
     });
 
     return {

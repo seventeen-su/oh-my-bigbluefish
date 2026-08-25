@@ -541,29 +541,40 @@ export async function rollbackPromotion(
 
 // ---- L2 统计输入（.evolution/shadows/exposure.log） ----
 
-/** L2 shadow 统计输入（n=曝光样本数 / failures=失败样本数；n=0 → 无 shadow 数据不阻塞） */
+/**
+ * L2 shadow 统计输入（n=曝光样本数 / failures=失败样本数 / unknowns=UNKNOWN 独立档样本数；
+ * n=0 → 无 shadow 数据不阻塞）。P2：UNKNOWN 独立一档——不计入 failures、不污染失败率评分；
+ * 失败率公式保持 failures/n 不变（不回归既有门禁宽松度）。
+ */
 export interface ShadowSignalsLike {
   n: number;
   failures: number;
+  /** P2：UNKNOWN 判定（outcome='unknown'）样本数——独立一档：不计 failures、不污染失败率评分 */
+  unknowns: number;
 }
 
 /**
- * 读取 shadow exposure 日志（JSONL）→ L2 统计输入（n=曝光样本数 / failures=失败样本数；n=0 → 无 shadow 数据不阻塞）。
+ * 读取 shadow exposure 日志（JSONL）→ L2 统计输入（n=曝光样本数 / failures=失败样本数 /
+ * unknowns=UNKNOWN 独立档样本数；n=0 → 无 shadow 数据不阻塞）。
  * 入参为**文件路径** → 读该文件（既有契约）；为**目录**（S7：.evolution/shadows/）→ 扫描目录内
  * exposure*.log / exposure*.jsonl（既有 exposure.log + S7 按日分片 exposure-<date>.jsonl 一并纳入，排序确定性）。
  * 计数语义（双格式并存，不重复计数）：
  *   - 既有条目（decision 字段，T5.3/G4 格式）：n = decision ∈ shadow/canary/control/skip/canary_rollback；
- *     failures = canary_rollback（回滚触发 = 失败后验）或 outcome=restore_failed 条目；
+ *     failures = canary_rollback（回滚触发 = 失败后验）或 outcome=restore_failed 条目；无三态 → unknowns 恒 0；
  *   - S7 per-session 条目（{candidate_id, bucket, session_id, task_domain, exposure_ts, outcome}，无 decision）：
  *     按 (session_id, candidate_id) 键**最后一条胜出**——exposure 占位（outcome='pending'）被 finalizeTurn
- *     回写的 success/degraded 覆盖（同键不重复计数）；n = 键数（有曝光即计入），failures = 最终
- *     outcome='degraded' 的键数（outcome='pending' 仅曝光未收尾 → 计入 n 不计失败——诚实保守）。
- * 文件/目录缺失或不可读 → {n:0, failures:0}（无 shadow 数据，以基准门禁为准——不抛）；单行损坏跳过（读取面降级）。
+ *     回写的 success/degraded/unknown 覆盖（同键不重复计数）；n = 键数（有曝光即计入），failures = 最终
+ *     outcome='degraded' 的键数，unknowns = 最终 outcome='unknown' 的键数（P2 UNKNOWN 独立档）；
+ *     outcome='pending' 仅曝光未收尾 → 计入 n 不计失败不计 unknown（诚实保守）；旧格式（无 verdict 字段）
+ *     记录天然兼容（只读 outcome 字符串）。
+ * 文件/目录缺失或不可读 → {n:0, failures:0, unknowns:0}（无 shadow 数据，以基准门禁为准——不抛）；
+ * 单行损坏跳过（读取面降级）。
  */
 export async function readShadowSignals(logPathOrDir: string): Promise<ShadowSignalsLike> {
   const raw = await readShadowRaw(logPathOrDir);
   let n = 0;
   let failures = 0;
+  let unknowns = 0;
   const sessionOutcomes = new Map<string, string>();
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -577,7 +588,7 @@ export async function readShadowSignals(logPathOrDir: string): Promise<ShadowSig
       continue; // 单行损坏跳过（审计日志不为判定器抛错）
     }
     if (entry.decision !== undefined) {
-      // 既有条目（T5.3/G4 格式）——原计数语义
+      // 既有条目（T5.3/G4 格式）——原计数语义（无三态 verdict → unknowns 恒 0）
       if (entry.decision === 'canary_rollback' || entry.outcome === 'restore_failed') {
         failures += 1;
         n += 1;
@@ -604,9 +615,11 @@ export async function readShadowSignals(logPathOrDir: string): Promise<ShadowSig
     n += 1;
     if (outcome === 'degraded') {
       failures += 1;
+    } else if (outcome === 'unknown') {
+      unknowns += 1; // P2：UNKNOWN 独立档——不计 failures、不污染失败率评分
     }
   }
-  return { n, failures };
+  return { n, failures, unknowns };
 }
 
 /** 读取 exposure 日志原文：目录 → 扫描 exposure*.log/exposure*.jsonl（排序）拼接；文件 → 读文件；缺失/不可读 → '' */
