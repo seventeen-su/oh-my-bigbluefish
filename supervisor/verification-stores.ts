@@ -1,6 +1,6 @@
-// layer 1（supervisor/）：验证数据面三库（P3.6——用户 2026-08-25 第二阶段裁决 S1）。
-// 事实库 FactStore + 基线库 BaselineStore + 任务库 TaskStore：JSON 文件注册面（目录
-// .evolution/verification/{facts,baselines,tasks}，根由构造参数注入，缺省
+// layer 1（supervisor/）：验证数据面三库 + 验证器注册库（P3.6 三库 + 专项 3 Verifier Evolution 注册面）。
+// 事实库 FactStore + 基线库 BaselineStore + 任务库 TaskStore + 验证器库 VerifierStore：JSON 文件注册面（目录
+// .evolution/verification/{facts,baselines,tasks,verifiers}，根由构造参数注入，缺省
 // <cwd>/workspace/.omb/.evolution/verification——与 debt.json 同根系）。
 //
 // 记录存储：每库目录下每记录一个 JSON 文件（文件名 = 复合键 sha256 hex——Windows 文件名安全，
@@ -259,20 +259,87 @@ export class TaskStore {
   }
 }
 
-// ---- 三库装配 ----
+// ---- 验证器注册库（VerifierStore） ----
 
-/** 三库聚合（同一 verification 根目录；assembly 装配期构造） */
+/**
+ * 验证器注册记录（Verifier Evolution 注册面——用户裁决：固定规范 + 固定验证基准 + 独立测试集 + 自身版本号；
+ * origin 为非循环检查用来源标识；registered_at 为注册时间戳）。
+ * 替换语义：同 verifier_id 覆写 = 最新注册胜出（版本递增防回退由 kernel/verifier-evolution.ts 门禁保证——
+ * 本库是注册面，不做门禁校验）。
+ */
+export interface VerifierRecord {
+  /** 验证器 id */
+  verifier_id: string;
+  /** 固定规范：能证明什么（checks，至少一项非空）/ 证明不了什么（blind_spots，可为空 = 无声明盲区） */
+  spec: { checks: string[]; blind_spots: string[] };
+  /** 固定验证基准引用（validation_benchmark ref——已知验证集基准） */
+  validation_benchmark: string;
+  /** 独立测试集引用（independent_test_set ref——隐藏验证集基准） */
+  independent_test_set: string;
+  /** 自身版本号（非负整数字符串约定，与 P3.6 verifier_version '1' 一致；替换门禁消费：严格递增防回退） */
+  version: string;
+  /** 来源标识（可选；非循环检查用——origin === verifier_id → 拒绝） */
+  origin?: string;
+  /** 注册时间戳（epoch ms；调用方注入——存储层不读墙钟） */
+  registered_at: number;
+}
+
+/** 验证器库：Verifier Evolution 注册面（同 verifier_id 覆写——最新注册胜出；与三库同文件/原子写/降级语义） */
+export class VerifierStore {
+  private readonly dir: string;
+  private writeError: string | null = null;
+
+  constructor(opts: { root: string }) {
+    this.root = opts.root;
+    this.dir = join(opts.root, 'verifiers');
+  }
+
+  /** 注册面根目录（审计 JSONL 落盘 <root>/verifier-evolution.jsonl 用——kernel verifier-evolution 消费） */
+  readonly root: string;
+
+  /** 最近一次写降级原因（无 → null；写失败降级记录不抛——审计面） */
+  get degraded(): string | null {
+    return this.writeError;
+  }
+
+  /** 落地侧降级记录（审计写失败等——kernel verifier-evolution 消费；尽力而为记录不抛） */
+  noteDegraded(reason: string): void {
+    this.writeError = reason;
+  }
+
+  /** 注册/覆写验证器（同 verifier_id 覆写；写失败降级记录不抛） */
+  async registerVerifier(rec: VerifierRecord): Promise<void> {
+    this.writeError = await writeRecord(this.dir, rec.verifier_id, rec, 'verifiers');
+  }
+
+  /** 按 verifier_id 取验证器（无 → null；损坏 → fail-loud 抛错） */
+  async getVerifier(verifier_id: string): Promise<VerifierRecord | null> {
+    return readRecord<VerifierRecord>(this.dir, verifier_id, 'verifiers');
+  }
+
+  /** 验证器清单（损坏 → fail-loud 抛错） */
+  async listVerifiers(): Promise<VerifierRecord[]> {
+    return listRecords<VerifierRecord>(this.dir, 'verifiers');
+  }
+}
+
+// ---- 四库装配 ----
+
+/** 四库聚合（facts/baselines/tasks/verifiers——同一 verification 根目录；assembly 装配期构造） */
 export interface VerificationStores {
   facts: FactStore;
   baselines: BaselineStore;
   tasks: TaskStore;
+  /** 验证器注册库（Verifier Evolution 注册面——替换门禁消费） */
+  verifiers: VerifierStore;
 }
 
-/** 三库工厂（root = .evolution/verification 根；内部建 facts/baselines/tasks 子目录） */
+/** 四库工厂（root = .evolution/verification 根；内部建 facts/baselines/tasks/verifiers 子目录） */
 export function createVerificationStores(root: string): VerificationStores {
   return {
     facts: new FactStore({ root }),
     baselines: new BaselineStore({ root }),
     tasks: new TaskStore({ root }),
+    verifiers: new VerifierStore({ root }),
   };
 }
