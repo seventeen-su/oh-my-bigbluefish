@@ -26,6 +26,10 @@ import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
 import { reduce } from '../supervisor/state-reducer.js';
 import { MaintenanceScheduler } from '../supervisor/maintenance.js';
+// S2：验证债务队列（layer 1 JSONL——plugin 装配面显式注入隔离根；与 assembly 缺省同路径语义）
+import { VerificationDebt } from '../supervisor/verification-debt.js';
+// S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面注入 spawnJudge）
+import { createJudgeExecutor } from './judge-executor.js';
 import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
 import { ActivationContractSchema, type ActivationContract } from '../kernel/schemas/m.js';
 import { dshEventId, makeDshEvent } from './loop-hooks.js';
@@ -412,6 +416,41 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
     if (root !== undefined) {
+      // S2（P2.5 搁置解除——用户 2026-08-25 裁决）：空白子代理同模型单次裁判。
+      // Guard 契约（B3 教训）：宿主服务必须经 ctx.get 读取（直接 ctx.subagents 对未 inject 的
+      // 属性读取抛 `cannot get property "subagents" without inject`）——try/catch → undefined 降级；
+      // 存在 → spawnJudge：subagents.start('spawn', { prompt:[{type:'text',text}], toolFilter:[],
+      // signal }) 前台等待最终输出（spawn provider 全新会话、纯文本裁判、同模型不增加订阅成本）。
+      let subagents: unknown;
+      try {
+        subagents = readService(ctx, 'subagents');
+      } catch {
+        subagents = undefined; // B3 教训：未注入 → 诚实降级（judge 不可用）
+      }
+      let judgeExecutor: ReturnType<typeof createJudgeExecutor> | undefined;
+      if (subagents !== undefined && typeof (subagents as { start?: unknown }).start === 'function') {
+        const spawnJudge = async (prompt: string, signal?: AbortSignal): Promise<string> => {
+          const r = await (subagents as {
+            start: (provider: string, opts: Record<string, unknown>) => Promise<unknown>;
+          }).start('spawn', {
+            prompt: [{ type: 'text', text: prompt }],
+            toolFilter: [],
+            signal,
+          });
+          // 宿主形状容错（DSH 0.1.1-rc.1 subagents.start 返回形状以实际为准）：finalText ?? text ?? String(r)
+          const anyR = r as { finalText?: unknown; text?: unknown } | null | undefined;
+          if (anyR !== null && anyR !== undefined) {
+            if (typeof anyR.finalText === 'string' && anyR.finalText.length > 0) {
+              return anyR.finalText;
+            }
+            if (typeof anyR.text === 'string' && anyR.text.length > 0) {
+              return anyR.text;
+            }
+          }
+          return String(r);
+        };
+        judgeExecutor = createJudgeExecutor({ spawnJudge });
+      }
       // T8.12：组合根装配 ModelAdapter——显式注入优先；否则 llm 服务 + config.model 齐备时自动装配
       //（真实 DSH 会话经 llm 服务提供；缺失 → 缺省受限，LLM 路径不装配，纯规则阶梯）。
       if (modelAdapter === undefined) {
@@ -437,6 +476,11 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         maintenance: new MaintenanceScheduler({ debtFile: join(root, '.evolution', 'debt.json') }),
         // R6：宿主版本唯一来源注入（提供 → 覆写运行时指纹/事件 provenance 的 dsh_version；缺省 DSH_HOST_VERSION）
         hostVersion: config.hostVersion,
+        // S2：验证债务队列（<root>/.evolution/verification/debt.jsonl——与 assembly 缺省构造同路径，
+        // 显式注入便于装配面审计）+ 空白子代理单次裁判（subagents 缺失 → 不注入 = judge 不可用，
+        // 诚实降级——仅验证债务路径触发、正常任务 0 额外成本）
+        verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
+        ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
       });
       // P1a：lines 按线加载降级（线快照缺 policy / lines 不可用 → 已回退仓库默认）→ 记录降级（不抛，命令仍可用）
       if (cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {

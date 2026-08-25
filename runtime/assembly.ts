@@ -60,9 +60,13 @@ import {
   type FactStore,
   type TaskStore,
 } from '../supervisor/verification-stores.js';
+// S2：验证债务队列（layer 1 JSONL——shadow/repair 未决验证统一复核面；runtime(2) → supervisor(1) ✓）
+import { VerificationDebt } from '../supervisor/verification-debt.js';
 // S2：机械评分器（过程质量向量 + 可控性分类——kernel 层 2 纯函数；runtime(2) → kernel(2) ✓）
 import { normalizeProcessQuality, qualityVectorFromSignals } from '../kernel/process-quality.js';
 import { classifyFromText } from '../kernel/controllability.js';
+// S2：单次结构化 Judge 执行器（空白子代理同模型裁判——layer 2；装配面注入 spawnJudge）
+import type { JudgeExecutor } from './judge-executor.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
@@ -329,6 +333,12 @@ export interface CognitiveAssemblyOptions {
   /** P3.6：验证数据面根目录（事实库/基线库/任务库；缺省 <root>/.evolution/verification——与
    *  signals/decay/repair 同 .evolution 根系；测试注入临时目录隔离真实 workspace） */
   verificationRoot?: string;
+  /** S2：验证债务队列（shadow/repair 未决验证；缺省 <verificationRoot>/debt.jsonl 内部构造——
+   *  测试注入隔离队列；消费：writeShadowOutcome/runRepair 入队 + verification_review 复核） */
+  verificationDebt?: VerificationDebt;
+  /** S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面经 plugin.ts 注入 spawnJudge；
+   *  未注入 → judge 不可用（诚实降级——仅验证债务路径触发、正常任务 0 额外成本）） */
+  judgeExecutor?: JudgeExecutor;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -677,6 +687,12 @@ export class CognitiveRuntime {
   readonly baselineStore: BaselineStore;
   /** P3.6：任务库（Task Contract/Success Criteria/Verifier 注册面；当前无执行器消费——留后续） */
   readonly taskStore: TaskStore;
+  /** S2：验证债务队列（shadow/repair 未决验证——writeShadowOutcome/runRepair 入队；维护期
+   *  verification_review 复核（空白子代理单次裁判）；恒构造（缺省 <verificationRoot>/debt.jsonl）） */
+  readonly verificationDebt: VerificationDebt;
+  /** S2：单次结构化 Judge 执行器（装配面注入 spawnJudge；null = 未注入 → judge 不可用，
+   *  复核按不可用转人工（诚实降级——不假装判定）） */
+  readonly judgeExecutor: JudgeExecutor | null;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
   /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
@@ -783,6 +799,10 @@ export class CognitiveRuntime {
     this.factStore = verificationStores.facts;
     this.baselineStore = verificationStores.baselines;
     this.taskStore = verificationStores.tasks;
+    // S2：验证债务队列装配（缺省 <verificationRoot>/debt.jsonl 内部构造——构造零 I/O 首写建目录；
+    // 测试注入隔离队列；judgeExecutor 未注入 → null = judge 不可用，诚实降级）
+    this.verificationDebt = opts.verificationDebt ?? new VerificationDebt({ root: this.verificationRoot });
+    this.judgeExecutor = opts.judgeExecutor ?? null;
     // P7：环境指纹（Predictive Invalidation）装配——采集器注入（缺省运行时采集）+ 衰减记录落盘目录
     this.fingerprintCollector = opts.environmentFingerprint ?? (() => collectEnvironmentFingerprint());
     this.decayDir = join(this.evolutionRoot, 'decay');
@@ -1435,8 +1455,11 @@ export class CognitiveRuntime {
    *   claims_count（归约投影可得则取，否则 0）, tool_calls/memory_ops/corrections（signals.utility_counts）,
    *   degradations（degradationLog().length——无恢复计数面，以降级数近似"成功恢复"）}))；
    *   controllability = classifyFromText(decision.process?.degraded ?? '')（机械关键词规则表）。
-   * 验证债务（S2 接线见第二阶段）——outcome=UNKNOWN 且 criteria 非空 → 入队维护期复核；尽力而为。
-   * 真实 LLM judge 生产调用由 verification_review 维护任务经空白子代理单次裁判执行（P2.5 搁置解除）。
+   * 验证债务（裁决 S2）：outcome=UNKNOWN 且 success_criteria 非空 → verificationDebt.enqueue
+   *   {key: `shadow:${sessionId}`, kind:'shadow', ...}——未决验证入队维护期复核（不污染普通请求）；
+   *   尽力而为（失败降级记录不抛）。阶梯式验证注记：机械 → 外部 → 历史/回归 → 单次结构化裁判 →
+   *   UNKNOWN 合法终态（债务保留待复核，不强迫猜）。真实 LLM judge 生产调用由 verification_review
+   *   维护任务经空白子代理单次裁判执行（P2.5 搁置解除——用户 2026-08-25 裁决）。
    */
   private async writeShadowOutcome(
     sessionId: string,
@@ -1494,6 +1517,25 @@ export class CognitiveRuntime {
       );
     } catch (err) {
       recordDegradation('shadow/route', `outcome 回写失败（${errorDetail(err)}）——尽力而为`);
+    }
+    // S2：验证债务入队（outcome=UNKNOWN 且成功标准非空 → 未决验证维护期复核；同 key 覆写去重；
+    // 尽力而为——失败降级记录不抛，不污染 shadow 收尾）
+    if (result.verdict === 'UNKNOWN' && (task?.success_criteria ?? []).length > 0) {
+      try {
+        await this.verificationDebt.enqueue({
+          key: `shadow:${sessionId}`,
+          kind: 'shadow',
+          contract_id: result.contract_id,
+          materials: {
+            goal: task?.goal ?? '',
+            success_criteria: task?.success_criteria ?? [],
+            degraded: decision.process?.degraded ?? null,
+            decision_made: true,
+          },
+        });
+      } catch (err) {
+        recordDegradation('verification/debt', `shadow 验证债务入队失败（${errorDetail(err)}）——尽力而为`);
+      }
     }
   }
 
@@ -2138,6 +2180,13 @@ export class CognitiveRuntime {
         return async () => {
           await this.runRepair();
         };
+      case 'verification_review':
+        // S2：验证债务复核（阶梯式验证——机械 → 外部 → 历史/回归 → 单次结构化裁判 → UNKNOWN 合法终态；
+        // 空白子代理同模型单次裁判（P2.5 搁置解除，用户 2026-08-25 裁决）——仅债务路径触发、
+        // 正常任务 0 额外成本；失败/中断 → 债务保留不清零（R5 清债语义））
+        return async (signal) => {
+          await this.runVerificationReview(signal);
+        };
       default:
         // 未实现/不可执行任务 → Deferred（债务保留，不假成功清债——评估依据 §13）
         return async () => {
@@ -2496,6 +2545,26 @@ export class CognitiveRuntime {
         // P3.5：逐检查结果聚合（检查名=result；'；' 分隔——审计可回溯；执行器不可用 → 降级原因）
         ...(detailParts.length > 0 ? { detail: detailParts.join('；') } : {}),
       });
+      // S2：验证债务入队（per-object verdict=UNKNOWN 且 evidence_quality < 1 → 未决验证维护期复核；
+      // key=`repair:${objectId}` 同键覆写去重；尽力而为——失败降级记录不抛，不阻塞 repair 主链）
+      if (result.verdict === 'UNKNOWN' && result.evidence_quality < 1) {
+        try {
+          await this.verificationDebt.enqueue({
+            key: `repair:${id}`,
+            kind: 'repair',
+            contract_id: contract.id,
+            object_ref: id,
+            materials: {
+              kind,
+              verdict: result.verdict,
+              evidence_quality: result.evidence_quality,
+              disposition: disp.disposition,
+            },
+          });
+        } catch (err) {
+          recordDegradation('verification/debt', `repair 验证债务入队失败（${errorDetail(err)}）——尽力而为`);
+        }
+      }
       // 处置执行：仅 memory 对象且 clear_suspicious → 清除存疑（lifecycle 恢复 Active——检索面恢复
       // 正常权重）；失败降级记录不抛。degrade_or_rollback（降级/回滚）与 quarantine（隔离标记）的
       // 落地动作属后续语义（P4 注记）——其余处置仅记录（保持 suspicious/不动）。
@@ -2529,6 +2598,77 @@ export class CognitiveRuntime {
     }
     await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
     return record;
+  }
+
+  /**
+   * S2：验证债务复核执行体（维护任务 verification_review，可公开调用——测试/命令触发）。
+   * 阶梯式验证注记（用户裁决 S6）：机械 → 外部 → 历史/回归 → 单次结构化裁判 → UNKNOWN 合法终态——
+   * 债务复核 = 阶梯末级「单次结构化裁判」：空白子代理同模型单次判定（P2.5 搁置解除，用户
+   * 2026-08-25 裁决——同模型不增加第二个订阅成本、spawn 全新会话、toolFilter:[] 纯文本），
+   * 仅验证债务路径触发、正常任务 0 额外成本；不污染普通请求。
+   * 逐条处理（debt.listPending(3)——每次最多 3 条，最老优先）：
+   *   judgeExecutor.available → judge(materials, signal)：
+   *     PASS/FAIL → markResolved（resolution {verdict, judge_used:true, ts}——债务清偿）；
+   *     UNKNOWN → bumpAttempts，attempts>=2 → markPendingManual（低频人工复核——不无限重试）；
+   *     judge 返回 null（输出不可解析/spawn 抛错）→ 视同 UNKNOWN（bumpAttempts 重试——债务保留）；
+   *   judge 不可用（未装配）→ markPendingManual（resolution.detail 记「judge 不可用」——诚实降级）。
+   * signal.aborted → 让出（不标记——债务保留，下次量子继续）。
+   * 全部尽力而为：单条抛错 → 降级记录不抛（债务保留）；队列空 → 正常完成（无事可做即成功）。
+   */
+  async runVerificationReview(signal?: AbortSignal): Promise<void> {
+    let pending: Array<{ key: string; attempts: number; materials: unknown }> = [];
+    try {
+      pending = await this.verificationDebt.listPending(3);
+    } catch (err) {
+      recordDegradation('verification/review', `债务读取失败（${errorDetail(err)}）——复核跳过（债务保留）`);
+      return;
+    }
+    for (const rec of pending) {
+      if (signal?.aborted === true) {
+        return; // 让出（不标记）——债务保留，下次量子继续
+      }
+      try {
+        if (this.judgeExecutor === null || !this.judgeExecutor.available) {
+          // judge 不可用（未装配）→ 转人工复核（低频人工复核标记——不假装判定）
+          await this.verificationDebt.markPendingManual(rec.key, 'judge 不可用——空白子代理未装配（诚实降级）');
+          continue;
+        }
+        const m = (rec.materials ?? {}) as { goal?: unknown; success_criteria?: unknown };
+        const goal =
+          typeof m.goal === 'string' && m.goal.length > 0 ? m.goal : `验证债务 ${rec.key}`;
+        const success_criteria = Array.isArray(m.success_criteria)
+          ? m.success_criteria.filter((c): c is string => typeof c === 'string')
+          : [];
+        const materials =
+          typeof rec.materials === 'string' ? rec.materials : JSON.stringify(rec.materials ?? {});
+        const verdict = await this.judgeExecutor.judge({ goal, success_criteria, materials }, signal);
+        if (verdict === null) {
+          // judge 未产出判定（输出不可解析/spawn 抛错）→ 视同 UNKNOWN（重试；债务保留）
+          const attempts = await this.verificationDebt.bumpAttempts(rec.key);
+          if (attempts !== null && attempts >= 2) {
+            await this.verificationDebt.markPendingManual(rec.key, 'UNKNOWN 两次未决——转低频人工复核');
+          }
+          continue;
+        }
+        if (verdict.verdict === 'PASS' || verdict.verdict === 'FAIL') {
+          // 高置信裁决 → 债务清偿（resolution 落盘可审计）
+          await this.verificationDebt.markResolved(rec.key, {
+            verdict: verdict.verdict,
+            judge_used: true,
+            ts: Date.now(),
+          });
+          continue;
+        }
+        // UNKNOWN（合法终态——不强迫猜）→ 重试计数；>=2 → 转人工复核
+        const attempts = await this.verificationDebt.bumpAttempts(rec.key);
+        if (attempts !== null && attempts >= 2) {
+          await this.verificationDebt.markPendingManual(rec.key, 'UNKNOWN 两次未决——转低频人工复核');
+        }
+      } catch (err) {
+        // 单条复核失败 → 降级记录不抛（债务保留——不清偿不标记，下次量子重试）
+        recordDegradation('verification/review', `复核失败（${rec.key}）：${errorDetail(err)}——债务保留`);
+      }
+    }
   }
 
   /** 读最近一条 decay 记录的环境指纹（跨重启基线接续；无历史/不可读 → null） */
