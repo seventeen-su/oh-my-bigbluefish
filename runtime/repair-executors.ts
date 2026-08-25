@@ -13,13 +13,17 @@
 //   · 版本化对比（用户裁决 S1）：基线 environment_fingerprint + runtime_snapshot + verifier_version 与
 //     当前（ctx.current，runRepair 注入）全匹配 → pass；任一不匹配 → unknown（基线过期需重放确认——
 //     未来演化后知道"究竟和哪个历史状态比较"）；
+//   · W4（形态修复，未接线审计修复第 4 项）：process 走真实加载面（loadProcesses 成功 = 真实结构校验——
+//     单一事实源，不叠加形状不匹配的 P1 ProcessSchema）；skill/projection 校验面从「整条 memory 记录」
+//     改为「内层定义 payload」（记录含 lifecycle 等包装字段，与 SkillSchema/ContextProjectionSchema 冲突）
+//     ——解锁 process/skill/projection 对象真实结构检查通过 → 首次基线自动注册可达；
 //   · 确定性：同输入同输出（同检查名 + 同 ctx + 同服务状态 → 同结果）。
 //
 // 层 DAG：runtime(2) → kernel(2)/kernel/schemas(2) ✓（decideEvolution 冻结回归集重跑）；不 import
 // supervisor/（层 1 存储逻辑禁止——stores 以最小形状经 services 注入，supervisor 实例由装配方构造）。
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CapabilityContractSchema, ProcessSchema, SkillSchema } from '../kernel/schemas/p.js';
+import { CapabilityContractSchema, SkillSchema } from '../kernel/schemas/p.js';
 import { ContextProjectionSchema } from '../kernel/schemas/a.js';
 import {
   REPAIR_CHECK_GENERIC_READABLE,
@@ -222,8 +226,12 @@ function versionedBaselineCompare(
   };
 }
 
-/** 投影载荷提取：payload 直接为投影对象 / JSON 字符串 / {payload: JSON 字符串}（memory 包装）→ 解析对象；不可解析 → null */
-function extractProjectionPayload(payload: unknown): unknown {
+/**
+ * W4（形态修复）：定义载荷提取——校验面从「记录整体」改为「内层定义 payload」。payload 直接为定义对象 /
+ * JSON 字符串 / {payload: 字符串|对象}（memory 记录包装——记录含 lifecycle 等包装字段，非定义本身）→
+ * 解包为实际定义内容；内层为字符串 → JSON.parse（不可解析 → null，诚实无定义可校验）。
+ */
+function extractDefinitionPayload(payload: unknown): unknown {
   let raw: unknown = payload;
   if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
     const inner = (payload as { payload?: unknown }).payload;
@@ -313,7 +321,10 @@ async function execNoContradiction(
   }
 }
 
-/** ④ 过程定义结构合法（schema 校验）：processesDir 可读 → loadProcesses 后按 objectId 定位 → ProcessSchema.safeParse；
+/** ④ 过程定义结构合法（schema 校验）：W4 形态修复——process 走真实加载面（单一事实源）：
+ *  loadProcesses 成功 = 真实结构校验（YAML 解析 + ProcessDefSchema 校验，解析失败即抛错 = 结构非法），
+ *  不再叠加形状不匹配的 P1 ProcessSchema（P1 Process 面向另一形态——irBase 对象；真实目录是 ProcessDef，
+ *  zod strip 后不可能过 P1）；processesDir 可读 → loadProcesses 后按 objectId 定位 → 命中 → pass；
  *  未定位 → unknown；加载抛错 → fail；无 processesDir/loadProcesses → unknown */
 async function execProcessSchema(
   services: RepairExecutorServices,
@@ -328,10 +339,7 @@ async function execProcessSchema(
     if (def === undefined) {
       return { result: 'unknown', detail: `loadProcesses 未定位到过程 ${ctx.objectId}（processesDir=${services.processesDir}）——无定义可校验` };
     }
-    const parsed = ProcessSchema.safeParse(def);
-    return parsed.success
-      ? { result: 'pass', detail: `过程 ${ctx.objectId} 通过 ProcessSchema 校验（结构合法）` }
-      : { result: 'fail', detail: `过程 ${ctx.objectId} ProcessSchema 校验失败：${zodFailDetail(parsed.error)}` };
+    return { result: 'pass', detail: `过程 ${ctx.objectId} 经真实加载面校验通过（loadProcesses 解析成功 = 结构合法）` };
   } catch (err) {
     return { result: 'fail', detail: `过程加载抛错（${errorText(err)}）——过程定义结构校验失败` };
   }
@@ -361,14 +369,20 @@ async function execReplayConsistency(
   }
 }
 
-/** ⑥ 技能定义结构合法：payload 可得 → SkillSchema.safeParse → pass/fail；无 payload → unknown */
+/** ⑥ 技能定义结构合法：W4 形态修复——校验面从「整条 memory 记录」改为「内层定义 payload」（记录含
+ *  lifecycle 等包装字段，与 SkillSchema 冲突；真实技能定义在记录内层 payload）；payload 可得 → 解包内层
+ *  payload（字符串/对象取实际定义内容）过 SkillSchema → pass/fail；无 payload / 内层不可解析 → unknown */
 function execSkillSchema(services: RepairExecutorServices, ctx: ExecuteCheckContext): CheckOutcome {
   if (ctx.payload === undefined) {
     return { result: 'unknown', detail: '无 payload——技能定义结构校验无法执行' };
   }
-  const parsed = SkillSchema.safeParse(ctx.payload);
+  const def = extractDefinitionPayload(ctx.payload);
+  if (def === null) {
+    return { result: 'unknown', detail: '内层 payload 不可解析（非 JSON 对象/无定义内容）——技能定义结构校验无法执行' };
+  }
+  const parsed = SkillSchema.safeParse(def);
   return parsed.success
-    ? { result: 'pass', detail: `技能 ${ctx.objectId} 通过 SkillSchema 校验（结构合法）` }
+    ? { result: 'pass', detail: `技能 ${ctx.objectId} 通过 SkillSchema 校验（内层定义 payload 结构合法）` }
     : { result: 'fail', detail: `技能 ${ctx.objectId} SkillSchema 校验失败：${zodFailDetail(parsed.error)}` };
 }
 
@@ -516,29 +530,40 @@ function execCapabilityContract(
     : { result: 'fail', detail: `组件 ${ctx.objectId} 能力契约校验失败：${zodFailDetail(parsed.error)}` };
 }
 
-/** ⑫ 投影 schema 校验通过：payload 可得 → ContextProjectionSchema.safeParse → pass/fail；无 payload → unknown */
+/** ⑫ 投影 schema 校验通过：W4 形态修复——校验面从「整条 memory 记录」改为「内层定义 payload」（记录含
+ *  lifecycle 等包装字段，与 ContextProjectionSchema 冲突）；payload 可得 → 解包内层 payload 过
+ *  ContextProjectionSchema → pass/fail；无 payload / 内层不可解析 → unknown */
 function execProjectionSchema(services: RepairExecutorServices, ctx: ExecuteCheckContext): CheckOutcome {
   if (ctx.payload === undefined) {
     return { result: 'unknown', detail: '无 payload——投影 schema 校验无法执行' };
   }
-  const parsed = ContextProjectionSchema.safeParse(ctx.payload);
+  const def = extractDefinitionPayload(ctx.payload);
+  if (def === null) {
+    return { result: 'unknown', detail: '内层 payload 不可解析（非 JSON 对象/无定义内容）——投影 schema 校验无法执行' };
+  }
+  const parsed = ContextProjectionSchema.safeParse(def);
   return parsed.success
-    ? { result: 'pass', detail: `投影 ${ctx.objectId} 通过 ContextProjectionSchema 校验（schema 合法）` }
+    ? { result: 'pass', detail: `投影 ${ctx.objectId} 通过 ContextProjectionSchema 校验（内层定义 payload schema 合法）` }
     : { result: 'fail', detail: `投影 ${ctx.objectId} ContextProjectionSchema 校验失败：${zodFailDetail(parsed.error)}` };
 }
 
-/** ⑬ 必填字段齐全（required fields）：复用投影 schema 校验（detail 注明）；payload 非投影形态/无 payload → unknown */
+/** ⑬ 必填字段齐全（required fields）：W4 形态修复——复用投影 schema 校验（校验内层定义 payload）；
+ *  内层非投影形态（无 type/sections）/ 无 payload / 内层不可解析 → unknown */
 function execRequiredFields(services: RepairExecutorServices, ctx: ExecuteCheckContext): CheckOutcome {
-  if (ctx.payload === undefined || ctx.payload === null || typeof ctx.payload !== 'object') {
+  if (ctx.payload === undefined || ctx.payload === null) {
     return { result: 'unknown', detail: '无 payload——必填字段校验无法执行（复用投影 schema 校验面）' };
   }
-  const p = ctx.payload as Record<string, unknown>;
-  if (!('type' in p) || !('sections' in p)) {
-    return { result: 'unknown', detail: 'payload 非投影形态（无 type/sections）——必填字段校验不适用（复用投影 schema 校验面）' };
+  const def = extractDefinitionPayload(ctx.payload);
+  if (def === null) {
+    return { result: 'unknown', detail: '内层 payload 不可解析——必填字段校验无法执行（复用投影 schema 校验面）' };
   }
-  const parsed = ContextProjectionSchema.safeParse(ctx.payload);
+  const p = def as Record<string, unknown>;
+  if (typeof p !== 'object' || p === null || !('type' in p) || !('sections' in p)) {
+    return { result: 'unknown', detail: '内层 payload 非投影形态（无 type/sections）——必填字段校验不适用（复用投影 schema 校验面）' };
+  }
+  const parsed = ContextProjectionSchema.safeParse(def);
   return parsed.success
-    ? { result: 'pass', detail: '投影必填字段齐全（复用 ContextProjectionSchema 校验）' }
+    ? { result: 'pass', detail: '投影必填字段齐全（复用 ContextProjectionSchema 校验内层定义 payload）' }
     : { result: 'fail', detail: `投影必填字段缺失/非法：${zodFailDetail(parsed.error)}` };
 }
 
@@ -565,7 +590,7 @@ async function execRestore(services: RepairExecutorServices, ctx: ExecuteCheckCo
         detail: 'projection-rebuild 基线无重建输入（占位注册——待重建输入注册后对比）',
       };
     }
-    const projection = extractProjectionPayload(ctx.payload);
+    const projection = extractDefinitionPayload(ctx.payload);
     if (projection === null) {
       return {
         result: 'unknown',
