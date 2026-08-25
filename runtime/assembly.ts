@@ -44,7 +44,7 @@ import {
 } from '../kernel/repair-contract.js';
 import { decideVerdict, trustGate } from '../kernel/verification.js';
 // P3.5：Repair 真实验证执行器（七类对象——对象契约应查检查的确定性执行面；runtime(2) → runtime(2) ✓）
-import { createRepairExecutors, type RepairExecutors } from './repair-executors.js';
+import { createRepairExecutors, type RepairExecutors, VERIFIER_VERSION } from './repair-executors.js';
 // P4：Evolution 收敛——候选晋升验证契约门禁 + stable 晋升信任门禁（kernel 层 2；runtime(2) → kernel(2) ✓；
 // supervisor 侧经 deps 注入回调消费——本文件为 kernel 逻辑唯一消费方）
 import { runCandidateGate, stablePromotionTrustGate } from '../kernel/candidate-contract.js';
@@ -52,9 +52,17 @@ import { runCandidateGate, stablePromotionTrustGate } from '../kernel/candidate-
 import { benchContractFromTask, benchEvidenceFromResult } from '../kernel/bench-contract.js';
 import type { Verdict, VerificationEvidence } from '../kernel/schemas/verification.js';
 import { EventStore } from '../supervisor/event-store.js';
+// P3.6：验证数据面三库（事实库/基线库/任务库——layer 1 JSON 注册面；runtime(2) → supervisor(1) ✓）
+import {
+  createVerificationStores,
+  type BaselineKind,
+  type BaselineStore,
+  type FactStore,
+  type TaskStore,
+} from '../supervisor/verification-stores.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
-import { reduce, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
+import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory, type RetrieveQuery } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
@@ -153,6 +161,33 @@ const DEGRADED_COMPONENTS: ComponentHashes = {
 
 function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * P3.6：Repair 对象 kind → 基线 kind 映射（用户裁决 S1 基线面：Process 首次成功快照/Skill 代表任务/
+ * Policy 冻结回归集/Projection 重建输入；memory→无（事实面覆盖）；capability/version/未列 kind → 无——
+ * 仅四类对象结构类检查全 pass 时自动注册版本化基线）。
+ */
+const REPAIR_KIND_TO_BASELINE: Partial<Record<string, BaselineKind>> = {
+  process: 'process',
+  skill: 'skill-task',
+  policy: 'policy-regression',
+  projection: 'projection-rebuild',
+};
+
+/** P3.6：基线 input = 对象 payload（非空字符串/对象）或契约摘要（payload 缺失/空 → {kind, object_id, contract_id}） */
+function baselineInputOf(
+  m: { payload?: unknown },
+  summary: { kind: string; id: string; contract_id: string },
+): unknown {
+  const p = m.payload;
+  if (typeof p === 'string' && p.length > 0) {
+    return p;
+  }
+  if (p !== null && typeof p === 'object') {
+    return p;
+  }
+  return { kind: summary.kind, object_id: summary.id, contract_id: summary.contract_id };
 }
 
 /** S5：记忆 payload 摘要（JSON 对象取常见文本字段；否则原样截断——kern_memory 条目 snippet） */
@@ -288,6 +323,9 @@ export interface CognitiveAssemblyOptions {
   /** R6：宿主 DSH 版本唯一来源注入（可选；提供 → setHostVersion 覆写——运行时指纹采集与
    *  事件 provenance 的 dsh_version 全部经 hostVersion() 读取同一值；缺省 DSH_HOST_VERSION） */
   hostVersion?: string;
+  /** P3.6：验证数据面根目录（事实库/基线库/任务库；缺省 <root>/.evolution/verification——与
+   *  signals/decay/repair 同 .evolution 根系；测试注入临时目录隔离真实 workspace） */
+  verificationRoot?: string;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -627,6 +665,15 @@ export class CognitiveRuntime {
   readonly signalsDir: string;
   /** P1d：演化工作区根（CandidatePool 信任池 <root>/.evolution；候选管线注册/晋升/拒绝） */
   readonly evolutionRoot: string;
+  /** P3.6：验证数据面根目录（<root>/.evolution/verification——事实库/基线库/任务库 JSON 注册面） */
+  readonly verificationRoot: string;
+  /** P3.6：事实库（已确认 Claim 的当前有效性——finalizeTurn 自动填充 / 无矛盾检查只读） */
+  readonly factStore: FactStore;
+  /** P3.6：基线库（版本化基线 {输入+环境指纹+运行时快照+期望结果+验证器版本}——runRepair 首次验证
+   *  通过自动注册 / 版本化对比检查只读） */
+  readonly baselineStore: BaselineStore;
+  /** P3.6：任务库（Task Contract/Success Criteria/Verifier 注册面；当前无执行器消费——留后续） */
+  readonly taskStore: TaskStore;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
   /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
@@ -726,6 +773,13 @@ export class CognitiveRuntime {
     this.maintenance = opts.maintenance ?? null;
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
     this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
+    // P3.6：验证数据面三库装配（JSON 文件注册面；构造不触 I/O——首写建目录；缺省
+    // <root>/.evolution/verification——与 signals/decay/repair 同 .evolution 根系；测试注入临时目录隔离）
+    this.verificationRoot = opts.verificationRoot ?? join(root, '.evolution', 'verification');
+    const verificationStores = createVerificationStores(this.verificationRoot);
+    this.factStore = verificationStores.facts;
+    this.baselineStore = verificationStores.baselines;
+    this.taskStore = verificationStores.tasks;
     // P7：环境指纹（Predictive Invalidation）装配——采集器注入（缺省运行时采集）+ 衰减记录落盘目录
     this.fingerprintCollector = opts.environmentFingerprint ?? (() => collectEnvironmentFingerprint());
     this.decayDir = join(this.evolutionRoot, 'decay');
@@ -1573,7 +1627,10 @@ export class CognitiveRuntime {
       input.session_id,
     );
 
-    const { signals, degraded } = await this.aggregateSignals(input.session_id);
+    const { signals, projections, degraded } = await this.aggregateSignals(input.session_id);
+
+    // P3.6：事实库自动填充（归约投影 claims → FactStore；尽力而为——失败降级记录不抛；无 claims/无归约 → 跳过）
+    await this.persistTurnFacts(projections?.claims ?? null);
 
     // P1c：演化信号落盘（.evolution/signals/<yyyy-mm-dd>.jsonl 追加；信号源① = finalizeTurn 聚合的
     // utility_counts、信号源② = L1 generalization 采集器输出面；尽力而为——失败降级不阻塞收尾）
@@ -1916,15 +1973,23 @@ export class CognitiveRuntime {
     }
   }
 
-  /** 信号聚合（零成本）：会话事件 → reducer utility_counts；归约失败 → 全零 + 降级原因 */
-  private async aggregateSignals(session_id: string): Promise<{ signals: UtilityCounts; degraded: string | null }> {
+  /**
+   * 信号聚合（零成本）：会话事件 → reducer utility_counts；归约失败 → 全零 + 降级原因。
+   * P3.6：同时返回归约投影（claims——事实库自动填充数据源；归约失败 → null → 跳过填充）。
+   */
+  private async aggregateSignals(session_id: string): Promise<{
+    signals: UtilityCounts;
+    projections: Projections | null;
+    degraded: string | null;
+  }> {
     try {
       const sessionEvents = (await this.eventStore.query({ session_id })).events;
       const { projections } = reduce(sessionEvents);
-      return { signals: projections.utility_counts, degraded: null };
+      return { signals: projections.utility_counts, projections, degraded: null };
     } catch (err) {
       return {
         signals: { tool_calls: 0, retrieval_calls: 0, memory_ops: 0, corrections: 0, reads: 0, hits: 0 },
+        projections: null,
         degraded: err instanceof Error ? err.message : String(err),
       };
     }
@@ -1959,6 +2024,31 @@ export class CognitiveRuntime {
       return { files: r.files, appended: r.appended, degraded: null };
     } catch (err) {
       return { files: [], appended: 0, degraded: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * P3.6：事实库自动填充（尽力而为——失败降级记录不抛；无 claims/无归约 → 跳过）——遍历归约投影
+   * claims（如可得）→ FactStore.registerFact({ id: claim_id, text, provenance: claim 来源锚点,
+   * valid: 非已推翻/矛盾 })：valid=false = 已推翻（evidence_status revoked）或矛盾（epistemic
+   * contradicted）——语义「valid=false = 已推翻/矛盾」；归约投影未保留来源事件 id → provenance 以
+   * claim id 作来源锚点（无矛盾检查按 provenanceContains 关联对象事实）。
+   */
+  private async persistTurnFacts(claims: ReadonlyMap<string, ClaimView> | null): Promise<void> {
+    if (claims === null || claims.size === 0) {
+      return; // 无 claims/无归约 → 跳过
+    }
+    for (const [claimId, view] of claims) {
+      try {
+        await this.factStore.registerFact({
+          id: claimId,
+          text: view.text,
+          provenance: claimId,
+          valid: view.evidence_status !== 'revoked' && view.epistemic !== 'contradicted',
+        });
+      } catch {
+        // 单条事实注册失败降级记录不抛（尽力而为——注册面缺失不阻塞 turn 收尾）
+      }
     }
   }
 
@@ -2209,6 +2299,8 @@ export class CognitiveRuntime {
   ): Promise<RepairRecord> {
     // P3.5：真实验证执行器懒构造（实例字段缓存——重复执行幂等；构造失败降级记录不抛——
     // 执行器不可用 → 全检查 unknown → 诚实 UNKNOWN，不阻塞 repair）。检索以 episode=false 只读语义注入。
+    // P3.6：验证数据面（事实库/基线库）注入——六个缺数据面检查（无矛盾/重放一致/代表任务/冻结回归集/
+    // 可恢复）只读数据面执行（stores duck-typed 最小形状；真实 store 经此注入）。
     if (this.repairExecutors === null) {
       try {
         this.repairExecutors = createRepairExecutors({
@@ -2222,6 +2314,7 @@ export class CognitiveRuntime {
           processesDir: this.processesDir,
           loadPolicy,
           loadProcesses,
+          stores: { facts: this.factStore, baselines: this.baselineStore },
         });
         this.repairExecutorsDegraded = null;
       } catch (err) {
@@ -2265,6 +2358,8 @@ export class CognitiveRuntime {
       const detVerifier = contract.verifiers.find((v) => v.kind === 'deterministic')!;
       const evidence: VerificationEvidence[] = [];
       const detailParts: string[] = [];
+      // P3.6：逐检查执行结果（基线注册判定用——对象结构类检查全 pass 才注册；执行器不可用 → 空 → 不注册）
+      const checks: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }> = [];
       if (this.repairExecutors !== null) {
         const expected: string[] = [];
         const seenCheck = new Set<string>();
@@ -2274,9 +2369,15 @@ export class CognitiveRuntime {
             expected.push(name);
           }
         }
-        const checks: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }> = [];
+        // P3.6：版本化对比当前态注入（环境指纹/运行时快照/验证器版本——与基线全匹配判定；
+        // 与首次基线注册同源：注册时存的就是同一组当前态，第二次起可版本化对比）
+        const current = {
+          environment_fingerprint: this.fingerprintCollector(),
+          runtime_snapshot: this.snapshotHash,
+          verifier_version: VERIFIER_VERSION,
+        };
         for (const name of expected) {
-          const outcome = await this.repairExecutors.executeCheck(name, { objectId: id, kind, payload: m });
+          const outcome = await this.repairExecutors.executeCheck(name, { objectId: id, kind, payload: m, current });
           checks.push({ name, result: outcome.result, ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) });
           detailParts.push(`${name}=${outcome.result}`);
         }
@@ -2316,6 +2417,38 @@ export class CognitiveRuntime {
         structural_checks: contract.hard_constraints,
       });
       const disp = applyRepairDisposition(kind, id, damage);
+      // P3.6：首次基线注册（判定后执行——不改变本次 verdict）——对象结构类检查（hard 约束）全 pass
+      // 且该 kind 映射的基线不存在 → 自动注册版本化基线（kind 映射：memory→无；process→'process'；
+      // skill→'skill-task'；policy→'policy-regression'；projection→'projection-rebuild'；input = 对象
+      // payload/契约摘要；environment_fingerprint = 当前环境指纹（采集器注入面，缺省 collectEnvironmentFingerprint）；
+      // runtime_snapshot = 当前快照哈希；expected_result = 本次判定摘要；verifier_version = '1'）→
+      // detail 注明「基线已注册，下次可版本化对比」；注册失败降级记录不抛（尽力而为——注册面缺失不阻塞验证主链）
+      const baselineKind = REPAIR_KIND_TO_BASELINE[kind];
+      const hardPass =
+        baselineKind !== undefined &&
+        contract.hard_constraints.every((h) => checks.some((c) => c.name === h && c.result === 'pass'));
+      if (hardPass) {
+        try {
+          if ((await this.baselineStore.getBaseline(id, baselineKind)) === null) {
+            await this.baselineStore.registerBaseline({
+              id,
+              kind: baselineKind,
+              input: baselineInputOf(m, { kind, id, contract_id: contract.id }),
+              environment_fingerprint: this.fingerprintCollector(),
+              runtime_snapshot: this.snapshotHash,
+              expected_result: {
+                verdict: result.verdict,
+                evidence_quality: result.evidence_quality,
+                disposition: disp.disposition,
+              },
+              verifier_version: VERIFIER_VERSION,
+            });
+            detailParts.push('基线已注册，下次可版本化对比');
+          }
+        } catch {
+          // 基线注册失败降级记录不抛（尽力而为——数据面损坏/不可写不阻塞验证主链）
+        }
+      }
       objects.push({
         id,
         kind,

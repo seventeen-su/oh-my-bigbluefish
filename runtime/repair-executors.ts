@@ -1,17 +1,22 @@
-// layer 2（runtime/）：P3.5 Repair 真实验证执行器（七类对象）——对象验证契约应查检查的确定性执行面。
-// （计划 .omb/plans/2026-08-25-verification-contract.md P3.5；用户裁决 2026-08-25：P3.5 开工、
+// layer 2（runtime/）：P3.5/P3.6 Repair 真实验证执行器（七类对象）——对象验证契约应查检查的确定性执行面。
+// （计划 .omb/plans/2026-08-25-verification-contract.md P3.5 + P3.6；用户裁决 2026-08-25：P3.5 开工、
 //  P2.5 真实 LLM judge 接线搁置——多数用户负担不起第二模型成本，注入面保留。）
 //
 // 语义：
 //   · 检查名与 seedRepairContract 契约 hard_constraints/outcome_conditions 完全一致（防字符串漂移）；
-//     执行 = 真实只读校验；当前无法真实执行的面（无矛盾/重放一致/代表任务/冻结回归集/可恢复）→
-//     诚实 unknown + detail 注明依赖面（需 P3.6 数据面/基线注册面，或 judge（P2.5 搁置））——不臆造证据；
+//     执行 = 真实只读校验；P3.6 起六个缺数据面检查（无矛盾/重放一致/代表任务/冻结回归集/可恢复）改为
+//     只读验证数据面（stores.facts / stores.baselines，duck-typed 最小形状）——无数据面/无记录 →
+//     诚实 unknown + detail 注明（不臆造证据）；数据面齐备 → 真实判定（pass/fail）；
 //   · 依赖注入服务面（RepairExecutorServices，duck-typed 最小形状）——测试可注入 fake，装配注入真实服务；
 //   · 纯逻辑、无副作用（只读）：检索一致性以 episode=false 只读语义调用 retrieve；抛错按表归入 fail/unknown，
 //     不向外抛（兜底 catch → unknown）；
+//   · 版本化对比（用户裁决 S1）：基线 environment_fingerprint + runtime_snapshot + verifier_version 与
+//     当前（ctx.current，runRepair 注入）全匹配 → pass；任一不匹配 → unknown（基线过期需重放确认——
+//     未来演化后知道"究竟和哪个历史状态比较"）；
 //   · 确定性：同输入同输出（同检查名 + 同 ctx + 同服务状态 → 同结果）。
 //
-// 层 DAG：runtime(2) → kernel(2)/kernel/schemas(2) ✓；不 import supervisor/（层 1 maintenance 等逻辑禁止）。
+// 层 DAG：runtime(2) → kernel(2)/kernel/schemas(2) ✓（decideEvolution 冻结回归集重跑）；不 import
+// supervisor/（层 1 存储逻辑禁止——stores 以最小形状经 services 注入，supervisor 实例由装配方构造）。
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { CapabilityContractSchema, ProcessSchema, SkillSchema } from '../kernel/schemas/p.js';
@@ -20,6 +25,13 @@ import {
   REPAIR_CHECK_GENERIC_READABLE,
   REPAIR_CHECK_RETRIEVABLE,
 } from '../kernel/repair-contract.js';
+// P3.6：冻结回归集重跑——decideEvolution 纯函数（信号摘要+冻结策略 → 判定；与基线期望逐 case 对比）
+import { decideEvolution } from '../kernel/evolve-decision.js';
+import type { EvolvePolicy } from '../kernel/schemas/policy.js';
+import type { SignalSummary } from '../kernel/schemas/evolution.js';
+
+/** P3.6：当前验证器版本（基线注册与版本化对比共用；Verifier Evolution 后递增——版本不等 → 基线过期需重放确认） */
+export const VERIFIER_VERSION = '1';
 
 // ---- 服务注入面（最小形状，duck-typed；字段以 assembly 实际可用为准） ----
 
@@ -28,6 +40,33 @@ export interface RepairExecutorMemoryService {
   getById(id: string): Promise<{ id: string; payload?: unknown } | undefined>;
   /** 检索（只读语义由装配方保证——episode=false）；无能力 → 检索一致性检查诚实 unknown */
   retrieve?(q: unknown): Promise<{ items?: Array<{ memory?: { id?: string } }> }>;
+}
+
+// ---- P3.6：验证数据面 duck-typed 最小形状（测试可注入 fake；真实实现 = supervisor/verification-stores.ts，
+// 装配方构造后经 services.stores 注入——runtime 不 import supervisor 存储逻辑，层 DAG 零改动） ----
+
+/** 事实库最小形状（只读：factsFor 按 provenance 子串过滤——无矛盾检查关联对象事实；缺省/空对象 → 全量） */
+export interface FactStoreLike {
+  factsFor(query?: { provenanceContains?: string }): Promise<ReadonlyArray<{ id: string; text: string; provenance: string; valid: boolean }>>;
+}
+
+/** 基线库最小形状（只读：getBaseline 按 id+kind——重放/代表任务/回归集/重建输入检查共用） */
+export interface BaselineStoreLike {
+  getBaseline(id: string, kind: string): Promise<{
+    id: string;
+    kind: string;
+    input: unknown;
+    environment_fingerprint: Record<string, unknown>;
+    runtime_snapshot: string;
+    expected_result: unknown;
+    verifier_version: string;
+  } | null>;
+}
+
+/** 验证数据面注入（facts + baselines；tasks 目前无执行器消费——任务库为注册面，消费留后续） */
+export interface RepairExecutorStores {
+  facts: FactStoreLike;
+  baselines: BaselineStoreLike;
 }
 
 /** 执行器依赖服务面（全部可选——缺失能力 → 对应检查诚实 unknown/fail，不崩） */
@@ -49,6 +88,8 @@ export interface RepairExecutorServices {
   loadPolicy?(dir?: string): Promise<unknown>;
   /** 过程加载器（缺省 → 过程检查 unknown） */
   loadProcesses?(dir?: string): Promise<ReadonlyArray<{ id?: string }>>;
+  /** P3.6：验证数据面（事实库 + 基线库；缺失 → 无矛盾/重放/代表任务/回归集/可恢复 诚实 unknown） */
+  stores?: RepairExecutorStores;
 }
 
 /** 单检查执行上下文（runRepair 注入：对象 id/契约 kind/对象载荷） */
@@ -56,6 +97,15 @@ export interface ExecuteCheckContext {
   objectId: string;
   kind: string;
   payload?: unknown;
+  /**
+   * P3.6：版本化对比当前态（runRepair 注入：环境指纹/运行时快照/验证器版本）——重放一致/代表任务
+   * 与基线全匹配判定用；缺失 → 版本化对比按不匹配处理（unknown，基线过期需重放确认——诚实不臆造）。
+   */
+  current?: {
+    environment_fingerprint: Record<string, unknown>;
+    runtime_snapshot: string;
+    verifier_version: string;
+  };
 }
 
 /** 单检查结果三态（与 VerificationEvidence 检查条目同语义） */
@@ -114,6 +164,83 @@ function sameTop5IdSet(a: Array<string | undefined>, b: Array<string | undefined
   return na.length === nb.length && na.every((x, i) => x === nb[i]);
 }
 
+/** 确定性深比较（对象键序无关；递归；JSON 可序列化值）——版本化对比 / 回归期望对比用 */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+    return false;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((x, i) => deepEqual(x, b[i]));
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return false;
+  }
+  const ka = Object.keys(a as Record<string, unknown>).sort();
+  const kb = Object.keys(b as Record<string, unknown>).sort();
+  return (
+    ka.length === kb.length &&
+    ka.every(
+      (k, i) => k === kb[i] && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]),
+    )
+  );
+}
+
+/**
+ * P3.6：版本化基线对比（重放一致/代表任务共用）——基线 environment_fingerprint + runtime_snapshot +
+ * verifier_version 与当前（ctx.current）全匹配 → pass；任一缺失/不匹配 → unknown（detail 注明差异面，
+ * 基线过期需重放确认——未来演化后知道"究竟和哪个历史状态比较"）。
+ */
+function versionedBaselineCompare(
+  base: NonNullable<Awaited<ReturnType<BaselineStoreLike['getBaseline']>>>,
+  current: ExecuteCheckContext['current'],
+): CheckOutcome {
+  if (current === undefined) {
+    return {
+      result: 'unknown',
+      detail: '无当前态注入（ctx.current 缺失）——版本化对比无法执行，基线过期需重放确认',
+    };
+  }
+  const fpMatch = deepEqual(base.environment_fingerprint, current.environment_fingerprint);
+  const snapMatch = base.runtime_snapshot === current.runtime_snapshot;
+  const verMatch = base.verifier_version === current.verifier_version;
+  if (fpMatch && snapMatch && verMatch) {
+    return {
+      result: 'pass',
+      detail: '基线版本化对比全匹配（环境指纹/运行时快照/验证器版本）——与基线记录的历史状态一致',
+    };
+  }
+  const diffs: string[] = [];
+  if (!fpMatch) diffs.push('环境指纹');
+  if (!snapMatch) diffs.push('运行时快照');
+  if (!verMatch) diffs.push('验证器版本');
+  return {
+    result: 'unknown',
+    detail: `基线版本化对比不匹配（${diffs.join('、')}）——基线过期需重放确认（不能拿新状态硬比旧基线）`,
+  };
+}
+
+/** 投影载荷提取：payload 直接为投影对象 / JSON 字符串 / {payload: JSON 字符串}（memory 包装）→ 解析对象；不可解析 → null */
+function extractProjectionPayload(payload: unknown): unknown {
+  let raw: unknown = payload;
+  if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
+    const inner = (payload as { payload?: unknown }).payload;
+    if (inner !== undefined && (typeof inner === 'string' || typeof inner === 'object')) {
+      raw = inner;
+    }
+  }
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  return raw;
+}
+
 // ---- 各检查执行器（检查名与 seedRepairContract 完全一致；真实执行 vs 诚实 unknown） ----
 
 /** ① 对象可检索（getById 命中）：memory.getById 命中 → pass；未命中 → fail（预检已保证存在，双保险）；抛错 → fail */
@@ -155,12 +282,35 @@ async function execRetrievalConsistency(
   }
 }
 
-/** ③ 无矛盾（contradiction 检查通过）：诚实 unknown——矛盾检测依赖事件归约/语义面，repair 路径无该面 */
-function execNoContradiction(): CheckOutcome {
-  return {
-    result: 'unknown',
-    detail: '矛盾检测依赖事件归约/语义面，repair 路径无该面——需 P3.6 数据面或 judge（P2.5 搁置）',
-  };
+/** ③ 无矛盾（contradiction 检查通过）：事实库只读——provenance 含 objectId 的相关事实；
+ *  无相关事实 → unknown（detail 无事实）；任一 valid=false → fail（矛盾/已推翻）；全 valid → pass */
+async function execNoContradiction(
+  services: RepairExecutorServices,
+  ctx: ExecuteCheckContext,
+): Promise<CheckOutcome> {
+  const facts = services.stores?.facts;
+  if (facts === undefined) {
+    return { result: 'unknown', detail: '事实库不可用（stores.facts 未注入）——矛盾检查无法执行（无事实可判定）' };
+  }
+  try {
+    const related = await facts.factsFor({ provenanceContains: ctx.objectId });
+    if (related.length === 0) {
+      return { result: 'unknown', detail: `事实库无相关事实（provenance 含 ${ctx.objectId}）——矛盾检查无事实可判定` };
+    }
+    const invalid = related.filter((f) => f.valid === false);
+    if (invalid.length > 0) {
+      return {
+        result: 'fail',
+        detail: `事实库存在已推翻/矛盾事实（${invalid.map((f) => f.id).join('、')}，provenance 含 ${ctx.objectId}）——矛盾检查失败`,
+      };
+    }
+    return {
+      result: 'pass',
+      detail: `事实库相关事实 ${related.length} 条全部有效（provenance 含 ${ctx.objectId}）——矛盾检查通过`,
+    };
+  } catch (err) {
+    return { result: 'unknown', detail: `事实库读取抛错（${errorText(err)}）——矛盾检查无法执行` };
+  }
 }
 
 /** ④ 过程定义结构合法（schema 校验）：processesDir 可读 → loadProcesses 后按 objectId 定位 → ProcessSchema.safeParse；
@@ -187,12 +337,28 @@ async function execProcessSchema(
   }
 }
 
-/** ⑤ 重放一致（replay + state_delta 匹配）：诚实 unknown——无过程重放基线存储 */
-function execReplayConsistency(): CheckOutcome {
-  return {
-    result: 'unknown',
-    detail: '无过程重放基线存储（replay + state_delta 需基线注册面）——需 P3.6 基线注册面或 judge（P2.5 搁置）',
-  };
+/** ⑤ 重放一致（replay + state_delta 匹配）：process 基线只读——无基线 → unknown（detail 建议首次
+ *  验证后注册）；有 → 版本化对比（环境指纹/运行时快照/验证器版本全匹配 → pass；任一不匹配 → unknown） */
+async function execReplayConsistency(
+  services: RepairExecutorServices,
+  ctx: ExecuteCheckContext,
+): Promise<CheckOutcome> {
+  const baselines = services.stores?.baselines;
+  if (baselines === undefined) {
+    return { result: 'unknown', detail: '基线库不可用（stores.baselines 未注入）——重放一致检查无法执行' };
+  }
+  try {
+    const base = await baselines.getBaseline(ctx.objectId, 'process');
+    if (base === null) {
+      return {
+        result: 'unknown',
+        detail: `无 process 基线（对象 ${ctx.objectId}）——建议首次验证通过后注册基线，下次可版本化对比`,
+      };
+    }
+    return versionedBaselineCompare(base, ctx.current);
+  } catch (err) {
+    return { result: 'unknown', detail: `基线库读取抛错（${errorText(err)}）——重放一致检查无法执行` };
+  }
 }
 
 /** ⑥ 技能定义结构合法：payload 可得 → SkillSchema.safeParse → pass/fail；无 payload → unknown */
@@ -206,12 +372,28 @@ function execSkillSchema(services: RepairExecutorServices, ctx: ExecuteCheckCont
     : { result: 'fail', detail: `技能 ${ctx.objectId} SkillSchema 校验失败：${zodFailDetail(parsed.error)}` };
 }
 
-/** ⑦ 代表任务可执行（representative task + output contract）：诚实 unknown——无代表任务注册面 */
-function execRepresentativeTask(): CheckOutcome {
-  return {
-    result: 'unknown',
-    detail: '无代表任务注册面（representative task + output contract 需任务注册/执行面）——需 P3.6 或 judge（P2.5 搁置）',
-  };
+/** ⑦ 代表任务可执行（representative task + output contract）：skill-task 基线只读——无基线 → unknown；
+ *  有 → 版本化对比（同上）→ pass/unknown */
+async function execRepresentativeTask(
+  services: RepairExecutorServices,
+  ctx: ExecuteCheckContext,
+): Promise<CheckOutcome> {
+  const baselines = services.stores?.baselines;
+  if (baselines === undefined) {
+    return { result: 'unknown', detail: '基线库不可用（stores.baselines 未注入）——代表任务检查无法执行' };
+  }
+  try {
+    const base = await baselines.getBaseline(ctx.objectId, 'skill-task');
+    if (base === null) {
+      return {
+        result: 'unknown',
+        detail: `无 skill-task 基线（对象 ${ctx.objectId}，代表任务）——建议首次验证通过后注册基线，下次可版本化对比`,
+      };
+    }
+    return versionedBaselineCompare(base, ctx.current);
+  } catch (err) {
+    return { result: 'unknown', detail: `基线库读取抛错（${errorText(err)}）——代表任务检查无法执行` };
+  }
 }
 
 /** ⑧ 策略 schema 合法：policyDir 可得 → loadPolicy(policyDir) 成功 → pass；抛错 → fail；无 policyDir/loadPolicy → unknown */
@@ -227,12 +409,60 @@ async function execPolicySchema(services: RepairExecutorServices): Promise<Check
   }
 }
 
-/** ⑨ 冻结回归集通过（frozen regression set）：诚实 unknown——无冻结回归集存储 */
-function execFrozenRegressionSet(): CheckOutcome {
-  return {
-    result: 'unknown',
-    detail: '无冻结回归集存储——需回归基线面（P3.6）或 judge（P2.5 搁置）',
-  };
+/** ⑨ 冻结回归集通过（frozen regression set）：policy-regression 基线只读——无基线 → unknown；
+ *  有 → 逐 case（{signals, expected_decision}）以基线冻结策略重跑 decideEvolution（kernel/evolve-decision.js）
+ *  对比 → 全等 → pass；任一不等 → fail（detail 列差异 case）；基线无回归 case（占位注册）→ unknown */
+async function execFrozenRegressionSet(
+  services: RepairExecutorServices,
+  ctx: ExecuteCheckContext,
+): Promise<CheckOutcome> {
+  const baselines = services.stores?.baselines;
+  if (baselines === undefined) {
+    return { result: 'unknown', detail: '基线库不可用（stores.baselines 未注入）——冻结回归集检查无法执行' };
+  }
+  try {
+    const base = await baselines.getBaseline(ctx.objectId, 'policy-regression');
+    if (base === null) {
+      return {
+        result: 'unknown',
+        detail: `无 policy-regression 基线（对象 ${ctx.objectId}，冻结回归集）——建议首次验证通过后注册基线`,
+      };
+    }
+    // 基线 input 形状：{ policy: 冻结时 EvolvePolicy, cases: [{signals, expected_decision}] }
+    const input = base.input as
+      | { policy?: unknown; cases?: Array<{ signals?: unknown; expected_decision?: unknown }> }
+      | null;
+    const cases = input?.cases;
+    if (!Array.isArray(cases) || cases.length === 0) {
+      return {
+        result: 'unknown',
+        detail: 'policy-regression 基线无回归 case（占位注册——待冻结回归集注册后对比）',
+      };
+    }
+    const diffs: string[] = [];
+    for (let i = 0; i < cases.length; i++) {
+      const c = cases[i]!;
+      // 冻结回归集重跑：用基线冻结时的策略（历史状态）——不是当前策略（未来演化后才知道与哪个历史状态比较）
+      const actual = decideEvolution({
+        summary: (c.signals ?? { window: { from: 0, to: 0 }, counts: {} }) as SignalSummary,
+        policy: input!.policy as EvolvePolicy,
+      });
+      if (!deepEqual(actual, c.expected_decision)) {
+        diffs.push(`case[${i}]`);
+      }
+    }
+    return diffs.length === 0
+      ? {
+          result: 'pass',
+          detail: `冻结回归集 ${cases.length} case 全部与基线期望一致（decideEvolution 重跑对比）——回归集通过`,
+        }
+      : {
+          result: 'fail',
+          detail: `冻结回归集差异 case（${diffs.join('、')}）——decideEvolution 重跑与基线期望不一致，回归集失败`,
+        };
+  } catch (err) {
+    return { result: 'unknown', detail: `冻结回归集重跑抛错（${errorText(err)}）——回归集检查无法执行` };
+  }
 }
 
 /** ⑩ 组件健康检查通过：objectId 匹配 components.list() 某 manifest_id → healthCheck() 该组件 ok → pass/fail；
@@ -312,12 +542,46 @@ function execRequiredFields(services: RepairExecutorServices, ctx: ExecuteCheckC
     : { result: 'fail', detail: `投影必填字段缺失/非法：${zodFailDetail(parsed.error)}` };
 }
 
-/** ⑭ 可恢复（restore）：诚实 unknown——restore 机制未注册 */
-function execRestore(): CheckOutcome {
-  return {
-    result: 'unknown',
-    detail: 'restore 机制未注册——需 P3.6 restore 注册面或 judge（P2.5 搁置）',
-  };
+/** ⑭ 可恢复（restore）：projection-rebuild 基线只读——无基线 → unknown；有 → baseline.input 含重建输入
+ *  （rebuild_input 非空）且对象 payload 可解析为合法投影（ContextProjectionSchema）→ pass；否则 unknown */
+async function execRestore(services: RepairExecutorServices, ctx: ExecuteCheckContext): Promise<CheckOutcome> {
+  const baselines = services.stores?.baselines;
+  if (baselines === undefined) {
+    return { result: 'unknown', detail: '基线库不可用（stores.baselines 未注入）——可恢复检查无法执行' };
+  }
+  try {
+    const base = await baselines.getBaseline(ctx.objectId, 'projection-rebuild');
+    if (base === null) {
+      return {
+        result: 'unknown',
+        detail: `无 projection-rebuild 基线（对象 ${ctx.objectId}，重建输入）——建议首次验证通过后注册基线`,
+      };
+    }
+    // 基线 input 形状：{ rebuild_input: 重建输入 }（占位注册 → 无重建输入 → unknown）
+    const input = base.input as { rebuild_input?: unknown } | null;
+    if (input === null || input.rebuild_input === undefined || input.rebuild_input === null) {
+      return {
+        result: 'unknown',
+        detail: 'projection-rebuild 基线无重建输入（占位注册——待重建输入注册后对比）',
+      };
+    }
+    const projection = extractProjectionPayload(ctx.payload);
+    if (projection === null) {
+      return {
+        result: 'unknown',
+        detail: '对象 payload 不可解析（非 JSON 字符串/非对象）——可恢复检查无法执行',
+      };
+    }
+    const parsed = ContextProjectionSchema.safeParse(projection);
+    return parsed.success
+      ? { result: 'pass', detail: '重建输入齐备且对象 payload 可解析为合法投影——可恢复检查通过' }
+      : {
+          result: 'unknown',
+          detail: `对象 payload 解析后非合法投影（ContextProjectionSchema 校验失败：${zodFailDetail(parsed.error)}）——可恢复检查无法执行`,
+        };
+  } catch (err) {
+    return { result: 'unknown', detail: `可恢复检查抛错（${errorText(err)}）——无法执行` };
+  }
 }
 
 /** ⑮ 快照物化完整可读：lineSnapshot.dir 的 kernel/policy + kernel/processes 子目录可读（readdir 成功）→ pass；
