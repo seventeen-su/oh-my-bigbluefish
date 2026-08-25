@@ -7,6 +7,8 @@
 //   提取路径样 token（文件扩展名白名单正则）→ root 提供时解析到 root 下且文件存在 → 读内容 sha256 →
 //   manifest（restorable:true）；不存在/越界 → 跳过（不索引幽灵路径）；root 未提供 → 仍索引
 //   （hash='unavailable'、restorable=false——诚实缺省：索引「事件提及的路径」这一事实，不臆造可恢复性）。
+//   查询：queryRecent（最近序）/ queryRelevant（专项 D：按任务目标相关性排序——关键词重叠 + 类型提示 +
+//   最近性的廉价打分，无 embedding，轻量分词器内嵌不跨层 import）。
 //   provenance/producing_event = 事件 id；environment = 传入指纹；created_at = now ?? Date.now()；
 //   每事件最多 MAX_ARTIFACTS_PER_EVENT 个制品（防噪声）；抛错降级返回 []（尽力而为）。
 // 层 DAG（CONVENTIONS §4）：layer 1（supervisor/）仅 import node: 内置 + kernel/schemas/
@@ -39,6 +41,55 @@ export const ARTIFACT_DISCOVERY_FETCH_LIMIT = 100;
 /** 路径样 token 提取正则（文件扩展名白名单：ts/js/tsx/jsx/json/md/yaml/yml/py/txt/log；
  *  交替序最长优先——`js`/`ts` 是 `json`/`tsx` 的前缀，须放其后（"package.js" 会截断 "package.json"）） */
 const ARTIFACT_PATH_TOKEN_RE = /[A-Za-z0-9_\-./\\]+\.(tsx|jsx|json|ts|js|yaml|yml|md|txt|py|log)/g;
+
+// ---- 专项 D：产物按任务相关性排序（评审问题二——廉价近似，无 embedding、无新依赖） ----
+
+/** 相关性排序候选池大小（最近 N 条内打分——超池截断防全量打分成本；待标定 §17） */
+export const ARTIFACT_RELEVANCE_POOL = 50;
+
+/** 关键词重叠权重（每命中一个 goal∩path+type token 记 1 分；待标定 §17） */
+export const ARTIFACT_OVERLAP_WEIGHT = 1.0;
+
+/** 类型提示加分（goal token 命中制品 type 词——如 goal 含 'md' 而制品是 doc/md；待标定 §17） */
+export const ARTIFACT_TYPE_HINT_BONUS = 1.5;
+
+/** 最近性权重（池内相对最近性 [0,1] 的权重——越新略高；弱于关键词重叠，作决胜项；待标定 §17） */
+export const ARTIFACT_RECENCY_WEIGHT = 0.02;
+
+/**
+ * 轻量相关性分词（专项 D——layer 1 内嵌近似，**不 import memory/cjk-ngram**（层 DAG：supervisor(1) →
+ * memory(2) 禁止；context-candidates 的 tokenizeForFts 是 runtime(2) 同层用例，本面不满足层条件））。
+ * 近似语义（与 cjk-ngram 同构的廉价版）：CJK 段滑动 bigram（单字 CJK 段 → 单字）+ 非 CJK 段按
+ * 非字母数字分隔取小写单词。仅用于相关性重叠打分，非检索索引（召回准确性非本面职责）。
+ */
+function relevanceTokens(text: string): string[] {
+  const out: string[] = [];
+  const cjkRe = /[\u4e00-\u9fff]+/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = cjkRe.exec(text)) !== null) {
+    for (const w of text.slice(last, m.index).toLowerCase().split(/[^a-z0-9]+/)) {
+      if (w.length > 0) {
+        out.push(w);
+      }
+    }
+    const run = m[0];
+    if (run.length === 1) {
+      out.push(run);
+    } else {
+      for (let i = 0; i < run.length - 1; i++) {
+        out.push(run.slice(i, i + 2));
+      }
+    }
+    last = m.index + run.length;
+  }
+  for (const w of text.slice(last).toLowerCase().split(/[^a-z0-9]+/)) {
+    if (w.length > 0) {
+      out.push(w);
+    }
+  }
+  return out;
+}
 
 // ---- 小工具 ----
 
@@ -171,6 +222,51 @@ export class ArtifactIndex {
       (a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
     );
     return limit === undefined ? sorted : sorted.slice(0, limit);
+  }
+
+  /**
+   * 按任务目标相关性排序（专项 D——评审问题二）：候选池 = 最近 ARTIFACT_RELEVANCE_POOL 条
+   * （created_at 降序截断；超池的最旧产物不参与打分——防全量打分成本）。廉价相关性打分（无 embedding）：
+   *   score = ARTIFACT_OVERLAP_WEIGHT × |goalTokens ∩ (path+type)Tokens|   关键词重叠
+   *         + ARTIFACT_TYPE_HINT_BONUS × (type 词 ∈ goalTokens ? 1 : 0)     类型提示
+   *         + ARTIFACT_RECENCY_WEIGHT × (created_at − 池最小) / max(1, 池跨度)  最近性（池内相对，越新略高）
+   * 返回 score 降序 top limit；同分 → created_at 降序、id 升序（确定性，与 queryRecent 同款决胜）。
+   * goal 为空 → 关键词/类型项恒 0 → 纯最近性序（等价 queryRecent(pool) 语义）。确定性：同索引同 goal
+   * → 恒同序（打分纯函数，无时间/随机依赖——池内相对最近性）。
+   */
+  async queryRelevant(goal: string, limit: number): Promise<ArtifactManifest[]> {
+    const records = await this.readAll();
+    const recent = records
+      .sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .slice(0, ARTIFACT_RELEVANCE_POOL);
+    const goalTokens = new Set(relevanceTokens(goal));
+    const minCreated = recent.length > 0 ? Math.min(...recent.map((m) => m.created_at)) : 0;
+    const span = recent.length > 0 ? Math.max(...recent.map((m) => m.created_at)) - minCreated : 0;
+    const scored = recent.map((m) => {
+      const artTokens = new Set(relevanceTokens(`${m.path} ${m.type}`));
+      let overlap = 0;
+      for (const t of artTokens) {
+        if (goalTokens.has(t)) {
+          overlap++;
+        }
+      }
+      const typeHit = goalTokens.has(m.type.toLowerCase()) ? 1 : 0;
+      const recency = span > 0 ? (m.created_at - minCreated) / span : 0;
+      return {
+        m,
+        score:
+          ARTIFACT_OVERLAP_WEIGHT * overlap +
+          ARTIFACT_TYPE_HINT_BONUS * typeHit +
+          ARTIFACT_RECENCY_WEIGHT * recency,
+      };
+    });
+    scored.sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.m.created_at - a.m.created_at ||
+        (a.m.id < b.m.id ? -1 : a.m.id > b.m.id ? 1 : 0),
+    );
+    return scored.slice(0, limit).map((s) => s.m);
   }
 
   /** 全量清单（文件序；排序不保证——查询请用 queryRecent） */

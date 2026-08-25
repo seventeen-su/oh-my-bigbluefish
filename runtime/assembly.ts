@@ -1792,7 +1792,8 @@ export class CognitiveRuntime {
       this.recordSessionEpisode(req.session_id, retrieved.episode.id);
     }
     // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
-    // Process 调度结果 + Artifact 制品索引（S4：queryRecent 最近产物 → {id, payload} 最小形状））；
+    // Process 调度结果 + Artifact 制品索引（专项 D：queryRelevant 按任务目标相关性排序最近产物
+    // → {id, payload} 最小形状；替代纯 queryRecent 最近序））；
     // ΔInfoValue（S3）：WorkingState 缺口匹配启发式动态估计（estimateInfoValue）——五来源统一；空闲期反馈修正留待 §17
     const projection = await buildContextProjection(
       policy,
@@ -1804,7 +1805,7 @@ export class CognitiveRuntime {
         eventStore: this.eventStore,
         capabilities: this.capabilities,
         artifacts: (goal, limit) =>
-          this.artifactIndex.queryRecent(limit).then((list) =>
+          this.artifactIndex.queryRelevant(goal, limit).then((list) =>
             list.map((a) => ({ id: a.id, payload: `制品 ${a.type}: ${a.path}` })),
           ),
         session_id: req.session_id,
