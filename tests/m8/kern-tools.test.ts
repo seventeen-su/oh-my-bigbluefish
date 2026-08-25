@@ -1,6 +1,7 @@
 // S5 行为测试：kern_* 工具补齐（TDD——先于实现编写）。kern_bench/kern_evolve/kern_switch/kern_memory
-// 四工具 + kern_status 合计 5（工具数 <10 纪律）；全部复用认知运行时方法（benchV2/runEvolutionNow/
-// switchLine/retrieveMemory——薄封装，非命令 handler）；守卫与降级对齐 kern_status（缺失 → 降级不抛）。
+// 四工具 + kern_status 合计 5；W1（2026-08-25 未接线审计修复）新增 kern_profile 画像写入——合计 6
+// （工具数 <10 纪律）；全部复用认知运行时方法（benchV2/runEvolutionNow/switchLine/retrieveMemory/
+// upsertProfile——薄封装，非命令 handler）；守卫与降级对齐 kern_status（缺失 → 降级不抛）。
 // 覆盖：注册（名称/描述/parameters/execute + 工具数 <10）、execute 各路径（成功/参数非法/方法缺失降级）、
 // registerKernTools 统一注册与 disposers、注册失败降级；既有 kern_status 测试（component-assembly.test.ts）不破坏。
 // fixture：mkdtemp 临时 db + 临时 bench 明细目录（不动真实 workspace/.omb，CONVENTIONS §6）；
@@ -99,8 +100,8 @@ function makeMemory(payload: string, over: Record<string, unknown> = {}): Memory
   } as unknown as Memory;
 }
 
-describe('S5 kern_* 工具注册（registerKernTools 统一；工具数 <10）', () => {
-  it('apply 注册全部 5 个工具：kern_status/kern_bench/kern_evolve/kern_switch/kern_memory（名称/描述/parameters/output/execute 齐备）', async () => {
+describe('S5/W1 kern_* 工具注册（registerKernTools 统一；工具数 <10）', () => {
+  it('apply 注册全部 6 个工具：kern_status/kern_bench/kern_evolve/kern_switch/kern_memory/kern_profile（名称/描述/parameters/output/execute 齐备）', async () => {
     runtime = track(createCognitiveRuntime({ root }));
     const { ctx, tools } = makeFakeCtx({ runtime });
     expect(() => apply(ctx, { bootstrap: false })).not.toThrow();
@@ -108,6 +109,7 @@ describe('S5 kern_* 工具注册（registerKernTools 统一；工具数 <10）',
       'kern_bench',
       'kern_evolve',
       'kern_memory',
+      'kern_profile',
       'kern_status',
       'kern_switch',
     ]);
@@ -121,7 +123,7 @@ describe('S5 kern_* 工具注册（registerKernTools 统一；工具数 <10）',
     }
   });
 
-  it('registerKernTools 直接注册：registered 含 5 名（注册序）、disposers 收集（register 返回函数）、degraded null', () => {
+  it('registerKernTools 直接注册：registered 含 6 名（注册序）、disposers 收集（register 返回函数）、degraded null', () => {
     const invoked: string[] = [];
     const r = registerKernTools(
       {
@@ -134,10 +136,10 @@ describe('S5 kern_* 工具注册（registerKernTools 统一；工具数 <10）',
       { status: undefined },
     );
     expect(r.degraded).toBeNull();
-    expect(r.registered).toEqual(['kern_status', 'kern_bench', 'kern_evolve', 'kern_switch', 'kern_memory']);
-    expect(r.disposers).toHaveLength(5);
+    expect(r.registered).toEqual(['kern_status', 'kern_bench', 'kern_evolve', 'kern_switch', 'kern_memory', 'kern_profile']);
+    expect(r.disposers).toHaveLength(6);
     r.disposers.forEach((d) => d());
-    expect(invoked).toEqual(['kern_status', 'kern_bench', 'kern_evolve', 'kern_switch', 'kern_memory']);
+    expect(invoked).toEqual(['kern_status', 'kern_bench', 'kern_evolve', 'kern_switch', 'kern_memory', 'kern_profile']);
   });
 
   it('registerKernTools 守卫：tools.register 缺失 → 降级不崩（registered 空 + degraded 非空）', () => {

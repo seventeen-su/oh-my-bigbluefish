@@ -219,6 +219,16 @@ export interface CognitiveRuntimeLike {
     scope_chain: string[];
     degraded: string | null;
   }>;
+  /** W1（未接线审计修复 2026-08-25）：kern_profile 数据源——画像写入（Profile 记忆 Global 作用域；
+   *  upsert 语义：存在更新 payload（replace 覆写/缺省合并追加）/ 不存在新建；失败 → degraded 不抛） */
+  upsertProfile?(input: { profile: string; replace?: boolean }): Promise<{
+    id: string;
+    kind: 'Profile';
+    scope: string;
+    created: boolean;
+    updated: boolean;
+    degraded: string | null;
+  }>;
   /** S1：State.world/self 引用填充（reduce 产出 State 后 null → 模型引用；StateSchema 校验——
    *  合规路径返回校验结果，事件流直归约的 working 缺省字段（既有诚实空语义）不阻塞接线） */
   materializeState?(state: unknown): unknown;
@@ -490,9 +500,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   }
 
   /**
-   * P2/S5：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
-   * 工具集：kern_status（P2 桥机制验证）+ kern_bench/kern_evolve/kern_switch/kern_memory（S5 补齐）——
-   * 全部为认知运行时方法（status/benchV2/runEvolutionNow/switchLine/retrieveMemory）的薄封装
+   * P2/S5/W1：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，工具数 <10）。
+   * 工具集：kern_status（P2 桥机制验证）+ kern_bench/kern_evolve/kern_switch/kern_memory（S5 补齐）+
+   * kern_profile（W1 未接线审计修复——画像写入面）——
+   * 全部为认知运行时方法（status/benchV2/runEvolutionNow/switchLine/retrieveMemory/upsertProfile）的薄封装
    * （runtime/kern-tools.ts registerKernTools 统一注册；守卫：tools 面缺失 → 记录降级不崩，对齐既有守卫风格；
    * 认知运行时未装配 → 不注册（记录——kern_* 依赖运行时状态）。
    * P8（注册皆效应）：工具注册 disposer 集入 DSH 生命周期（ctx.effect）——插件关闭 → 批量注销回滚。
