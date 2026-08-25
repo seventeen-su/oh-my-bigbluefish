@@ -90,6 +90,10 @@ export interface PluginConfig {
    *  缺省 process.env.DSH_HOME ?? join(os.homedir(), '.dsh')——DSH skill-filesystem 默认扫描
    *  <dshHome>/skills（includeDefaultRoots 缺省 true），omb-runtime 技能镜像后被原生发现）。 */
   dshHome?: string;
+  /** 专项 D：prepareTurn 检索的 Retrieval Episode 采样率（0~1；缺省 0.02 = 2%——确定性哈希采样；
+   *  高价值任务（open_questions/evidence_gaps 非空）自动提升；kern_memory 显式工具恒记录不受此限；
+   *  非法值 → 降级记录 + 使用缺省） */
+  episodeSampleRate?: number;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -527,6 +531,18 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   }
 
+  // 专项 D：记忆检索 Episode 采样率解析（agent.cordis.yml config.episodeSampleRate；缺省不配 →
+  // undefined → 运行时缺省 0.02；非法值 → 降级记录 + 不传——配置错误显式留痕不静默吞掉）
+  let episodeSampleRate: number | undefined;
+  if (config.episodeSampleRate !== undefined) {
+    const r = config.episodeSampleRate;
+    if (typeof r === 'number' && Number.isFinite(r) && r >= 0 && r <= 1) {
+      episodeSampleRate = r;
+    } else {
+      recordDegradation('config/episodeSampleRate', `非法 episodeSampleRate 配置 "${String(r)}"（应为 [0,1]）——使用缺省 0.02`);
+    }
+  }
+
   if (cognitive === undefined) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
@@ -596,6 +612,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         modelAdapter,
         // P1a：按当前版本线加载 policy/processes（lines 物化快照注入；缺失/失败 → 运行时回退仓库默认）
         line: current,
+        // 专项 D：记忆检索 Episode 采样率（agent.cordis.yml config 可配；缺省不配 → 运行时缺省 0.02；
+        // 非法值 → 降级记录 + 不传（运行时缺省）——配置错误显式留痕不静默）
+        ...(episodeSampleRate !== undefined ? { episodeSampleRate } : {}),
         // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
         //（turn 收尾入队 + 请求间隙小量子；debt 落盘到认知数据根 .evolution/）
         checkpointDir: join(root, 'checkpoints'),

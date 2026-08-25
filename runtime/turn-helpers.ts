@@ -3,6 +3,7 @@
 //       M3 事件构造（Model-visible ⟺ logged 的统一事件面）。全部纯函数：无 I/O、无随机、无时间依赖
 //       （IRBase 时间戳为固定/入参值；真实时间由调用层注入）。
 // 层 DAG（CONVENTIONS §4）：runtime(2) → kernel(2)/memory(2)/runtime(2) 均满足"import 目标层 ≤ 源层"。
+import { createHash } from 'node:crypto';
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import { ExperienceSchema, type Experience } from '../kernel/schemas/c.js';
@@ -21,6 +22,27 @@ import { hostVersion } from '../kernel/schemas/host-version.js';
 /** token 估算（与 renderer 内部同口径：字符/4；精确计费为 §17 参数标定项） */
 export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
+}
+
+// ---- 专项 D：记忆检索 Episode 采样（评审问题一——确定性哈希采样，可测） ----
+
+/** 采样桶基数（hash % SCALE < round(rate*SCALE) 语义；SCALE=10000 → rate 支持 4 位小数精度） */
+export const EPISODE_SAMPLE_SCALE = 10_000;
+
+/**
+ * 记忆检索 Episode 采样判定（确定性哈希采样——prepareTurn 调用面；kern_memory 恒记录不经此函数）：
+ *   bucket = parseInt(sha256(`${sessionId}:${turnToken}`) 前 8 hex, 16) % SCALE；
+ *   命中 ⇔ bucket < round(rate × SCALE)。
+ * 同 (sessionId, turnToken, rate) → 恒同判定（确定性可测——测试注入固定会话 id + turn 序即复现）；
+ * rate=0 → 永不采样；rate=1 → 恒采样；非法 rate（非有限数或 ∉ [0,1]）→ fail-loud（配置错误显式暴露）。
+ */
+export function shouldSampleEpisode(sessionId: string, turnToken: string, rate: number): boolean {
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+    throw new Error(`shouldSampleEpisode: 采样率非法 ${String(rate)}（应为 [0,1]）`);
+  }
+  const digest = createHash('sha256').update(`${sessionId}:${turnToken}`, 'utf8').digest('hex');
+  const bucket = parseInt(digest.slice(0, 8), 16) % EPISODE_SAMPLE_SCALE;
+  return bucket < Math.round(rate * EPISODE_SAMPLE_SCALE);
 }
 
 /** S2 State.working（S3）→ PromptWorkingState（S3 视图子集；environment 为 Fingerprint → 取 os 展示值） */

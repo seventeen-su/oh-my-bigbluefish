@@ -181,7 +181,7 @@ describe('T8.21 generalization 真实化（跨 scope 检索 episode 统计 → L
     expect(fact!.signal_sources).toContain('L1_mechanical'); // 真实采集（非 L3 占位）
   });
 
-  it('无归因 episode（outcome 全 null）→ 采集空信号 → generalization 事实 null（缺数据不出事实）', async () => {
+  it('无归因 episode（outcome 全 null）→ 采集「已记录待归因」scope_recorded 信号 → generalization 事实 null（缺归因不出事实）', async () => {
     const backend = openBackend(await tmpDb());
     const mem = await backend.ingest(makeMemory({ payload: '无归因样本' }));
     await recordEpisode(backend, {
@@ -192,8 +192,10 @@ describe('T8.21 generalization 真实化（跨 scope 检索 episode 统计 → L
       injected_ids: [mem],
     }); // 不 reportEpisodeOutcome → outcome null
 
+    // 专项 D（评审问题一）：null-outcome「已记录待归因」单独计为 scope_recorded（检索数据量照常入信号，
+    // 不当作 hit 也不当作 miss——归因观测面留待；generalization 比率只认 scope_hit/scope_miss → 事实仍 null）
     const signals = await collectGeneralizationSignals(backend, TARGET, WINDOW);
-    expect(signals).toEqual([]);
+    expect(signals).toEqual([{ layer: 'L1', kind: 'scope_recorded', target: TARGET, count: 1, window: WINDOW }]);
     expect(getFact(evaluate(signals, TARGET), 'generalization')).toBeNull();
   });
 });
