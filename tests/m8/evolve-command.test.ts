@@ -9,7 +9,7 @@
 //   ⑤ evolution/candidate|promoted|rolled_back + maintenance/quantum 事件类型（FIXED 枚举 + schema）
 //   ⑥ 候选 provenance 清单（registerCandidate → candidates/<id>/provenance.json；promote 随记录迁移）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
@@ -19,9 +19,16 @@ import { clearDegradations } from '../../runtime/loop-hooks.js';
 import { EventTypeSchema, FIXED_EVENT_TYPES } from '../../kernel/schemas/m.js';
 import { MaintenanceScheduler } from '../../supervisor/maintenance.js';
 import { CandidatePool, candidateDirName, type CandidateProvenance, type CandidateRecord } from '../../supervisor/candidates.js';
-import { buildLayoutFixture, teardownLayoutFixture } from '../helpers/git.js';
+import { buildLayoutFixture, removeDirRetry, teardownLayoutFixture } from '../helpers/git.js';
 
 const SESSION = 'sess-evolve-1';
+
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行时
+ *  git/icacls 饱和（已知 flake 类：candidate-pipeline/rollback/boot/txn-capability/line-snapshot 同款）→ 放宽防环境超时） */
+const FIXTURE_TIMEOUT = 30000;
+
+/** fixture 重测试包装（全量套件并行 git/icacls 饱和 → 放宽超时防 flake） */
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
 
 interface CapturedCommand {
   name: string;
@@ -70,7 +77,7 @@ afterEach(async () => {
     await rt.close();
   }
   runtimes = [];
-  await rm(base, { recursive: true, force: true });
+  await removeDirRetry(base);
 });
 
 function track(rt: CognitiveRuntime): CognitiveRuntime {
@@ -113,7 +120,7 @@ describe('① /evolve 命令注册面（设计 §6 命令表）', () => {
 // ---- ② /evolve now 全链路 ----
 
 describe('② /evolve now 触发链路（判定 → 入队 → quantum → 摘要 + 事件入链）', () => {
-  it('触发信号（corrections）→ should_evolve=true → 入队 candidate_validation → quantum 执行 → evolution/candidate + maintenance/quantum 事件可查', async () => {
+  fixtureIt('触发信号（corrections）→ should_evolve=true → 入队 candidate_validation → quantum 执行 → evolution/candidate + maintenance/quantum 事件可查', async () => {
     // 注入临时新种子布局（2026-08-25 修复后真实 versions.git 已为新种子——默认布局会解析真实
     // lineSnapshot，测试必须隔离于临时 fixture，避免触碰真实 versions.git）
     const fx = buildLayoutFixture();

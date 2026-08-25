@@ -11,7 +11,7 @@
 //      （真实任务清偿归零；R5：旧布局 candidate_validation → Deferred → 债务保留不清零）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,10 +28,17 @@ import {
 import { EvolvePolicySchema, loadPolicy } from '../../kernel/policy-loader.js';
 import { MaintenanceScheduler } from '../../supervisor/maintenance.js';
 import type { SignalRecord } from '../../kernel/schemas/evolution.js';
-import { buildLayoutFixture, teardownLayoutFixture } from '../helpers/git.js';
+import { buildLayoutFixture, removeDirRetry, teardownLayoutFixture } from '../helpers/git.js';
 
 const REPO_POLICY_DIR = fileURLToPath(new URL('../../kernel/policy', import.meta.url));
 const SESSION = 'sess-p1c-1';
+
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行时
+ *  git/icacls 饱和（已知 flake 类：candidate-pipeline/rollback/boot/txn-capability/line-snapshot 同款）→ 放宽防环境超时） */
+const FIXTURE_TIMEOUT = 30000;
+
+/** fixture 重测试包装（全量套件并行 git/icacls 饱和 → 放宽超时防 flake） */
+const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
 
 let base: string;
 let root: string;
@@ -48,7 +55,7 @@ afterEach(async () => {
     await rt.close();
   }
   runtimes = [];
-  await rm(base, { recursive: true, force: true });
+  await removeDirRetry(base);
 });
 
 function track(rt: CognitiveRuntime): CognitiveRuntime {
@@ -246,7 +253,7 @@ describe('⑤ §10.1 债务权重（memory+2/candidate+8/repair+20/GC+1）', () 
 // ---- ⑥ 生产路径：finalizeTurn → 债务 → 落盘 → 清偿 ----
 
 describe('⑥ MaintenanceDebt 生产路径（finalizeTurn 信号 → §10.1 入队累计 → 落盘 → 清偿）', () => {
-  it('finalizeTurn 信号 → 债务权重入队累计 → debt.json 落盘（存在且有内容）→ quantum 执行清偿归零', async () => {
+  fixtureIt('finalizeTurn 信号 → 债务权重入队累计 → debt.json 落盘（存在且有内容）→ quantum 执行清偿归零', async () => {
     // 注入临时新种子布局（2026-08-25 修复后真实 versions.git 已为新种子——默认布局会解析真实
     // lineSnapshot，测试必须隔离于临时 fixture，避免触碰真实 versions.git）
     const fx = buildLayoutFixture();
