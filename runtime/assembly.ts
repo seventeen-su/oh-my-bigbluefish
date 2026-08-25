@@ -34,7 +34,14 @@ import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type Sha
 // S7：per-session shadow 路由纯函数（kernel 层 2；桶分配 + 路由判定——实现规格 §5.3）
 import { shouldRouteShadow } from '../kernel/shadow-route.js';
 // P2：Shadow 真实判定——验证契约种子/证据构造/判定映射（kernel 层 2；runtime(2) → kernel(2) ✓）
-import { buildShadowEvidence, seedShadowContract, shadowOutcomeFromResult } from '../kernel/shadow-contract.js';
+// W2：SHADOW_PROXY_VERIFIER_ID / SHADOW_JUDGE_VERIFIER_ID——任务库登记的两枚 verifier 引用（同一来源，不复制常量）
+import {
+  SHADOW_JUDGE_VERIFIER_ID,
+  SHADOW_PROXY_VERIFIER_ID,
+  buildShadowEvidence,
+  seedShadowContract,
+  shadowOutcomeFromResult,
+} from '../kernel/shadow-contract.js';
 // P3：Repair 升级——损坏类型分类/对象验证契约种子/最小验证计划/处置语义（kernel 层 2；runtime(2) → kernel(2) ✓）
 import {
   applyRepairDisposition,
@@ -1570,6 +1577,8 @@ export class CognitiveRuntime {
    *   尽力而为（失败降级记录不抛）。阶梯式验证注记：机械 → 外部 → 历史/回归 → 单次结构化裁判 →
    *   UNKNOWN 合法终态（债务保留待复核，不强迫猜）。真实 LLM judge 生产调用由 verification_review
    *   维护任务经空白子代理单次裁判执行（P2.5 搁置解除——用户 2026-08-25 裁决）。
+   * W2（未接线审计修复 2026-08-25）：任务库登记——契约种子后 registerTask（会话任务契约登记，见内联注释）；
+   *   尽力而为（失败降级记录不抛，不阻塞 outcome 落盘；任务库未装配 → 跳过）。
    */
   private async writeShadowOutcome(
     sessionId: string,
@@ -1582,6 +1591,21 @@ export class CognitiveRuntime {
       return; // 非 shadow 会话（或 exposure 未落盘）→ 不回写
     }
     const contract = seedShadowContract(sessionId, task ?? { goal: '', success_criteria: [] });
+    // W2（未接线审计修复 2026-08-25）：任务库登记——会话任务契约登记（Task Contract / Success Criteria /
+    // Verifier 引用——S1 任务库语义落地）。task_id = 契约键 `shadow:<sessionId>`（同键覆写不重复）；
+    // contract_ref = 本次验证契约 id（seedShadowContract 产物——契约判定可回溯）；success_criteria 透传
+    // 会话任务契约；verifier_refs 恒两枚（deterministic 权威 + structured_llm 补充，与契约声明一致）。
+    // 尽力而为：写失败/任务库未装配 → 降级记录不抛（不阻塞 outcome 落盘、不污染 shadow 收尾）。
+    try {
+      await this.taskStore.registerTask({
+        task_id: `shadow:${sessionId}`,
+        contract_ref: contract.id,
+        success_criteria: task?.success_criteria ?? [],
+        verifier_refs: [SHADOW_PROXY_VERIFIER_ID, SHADOW_JUDGE_VERIFIER_ID],
+      });
+    } catch (err) {
+      recordDegradation('verification/tasks', `任务库登记失败（${errorDetail(err)}）——尽力而为`);
+    }
     // 确定性一级证据：degraded = decision.process.degraded 非空；decision_made 恒 true——finalize 路径必有 decision
     const evidence = buildShadowEvidence(contract, {
       degraded: decision.process?.degraded !== null && decision.process?.degraded !== undefined,
