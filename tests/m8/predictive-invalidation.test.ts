@@ -5,7 +5,8 @@
 //   ① 环境声明索引（findAffectedObjects）：有环境声明的 memory 可被 delta 命中；无声明 → 空；
 //      可选键 from=undefined（字段新增）→ 匹配未声明该键的记录；多字段命中去重
 //   ② 环境变化 → affected_objects 真实填充 + 受影响对象降级 suspicious（lifecycle）+ decay 落盘含对象
-//   ③ repair 执行：读 decay 记录 → 重验证审计记录 + 清债；空（无受影响对象）→ 合法完成清债；幂等
+//   ③ repair 执行：读 decay 记录 → 契约化重验证（P3：对象契约 → 最小验证计划 → 损坏分类 → 处置语义，
+//      RepairRecord.objects 逐对象记录）+ 清债；空（无受影响对象）→ 合法完成清债；幂等
 //   ④ Deferred 语义：candidate_validation 旧布局（lineSnapshot===null）→ 抛 Deferred → debt 保留不清零
 //     （调度器级 Deferred 语义见 tests/m5/maintenance-deferred.test.ts）
 import { afterEach, describe, expect, it } from 'vitest';
@@ -211,15 +212,41 @@ describe('③ repair：受影响对象重验证 + 清债；空 → 合法完成�
       affected_objects: unknown[];
       reverified: unknown[];
       missing: unknown[];
+      objects: Array<{
+        id: string;
+        kind: string;
+        contract_id: string;
+        verdict: string;
+        evidence_quality: number;
+        disposition: string;
+        score_eligible: boolean;
+        reason: string;
+      }>;
     };
     expect(record.task).toBe('repair');
     expect(record.decay_records).toBe(1);
     expect(record.affected_objects).toEqual([{ id: memId, kind: 'memory' }]);
-    expect(record.reverified).toEqual([{ id: memId, kind: 'memory' }]); // 重验证时间戳已记录（记录 ts）
+    // P3：契约化重验证——对象存在（getById 命中 → hard pass）但 outcome 无执行器 → 诚实 UNKNOWN；
+    // 所属 decay 记录带 environment_delta → environment_change → local_regression（对象保持 Suspicious，
+    // 处置仅记录；degrade_or_rollback/quarantine 落地动作属后续语义）
+    expect(record.reverified).toEqual([]); // reverified 语义（P3）= verdict=PASS 的对象（UNKNOWN 不属通过）
     expect(record.missing).toEqual([]);
-    // 幂等：直接再跑一次 → 同结果（不抛、不重复副作用）
+    expect(record.objects).toEqual([
+      {
+        id: memId,
+        kind: 'memory',
+        contract_id: `repair:${memId}`,
+        verdict: 'UNKNOWN',
+        evidence_quality: 0.33, // 1/3 应查检查有结果（getById 命中，outcome 无证据）
+        disposition: 'local_regression',
+        score_eligible: true,
+        reason: expect.stringContaining('环境变化'),
+      },
+    ]);
+    // 幂等：直接再跑一次 → 同结果（判定确定性；不抛、不重复副作用）
     const again = await runtime.runRepair();
-    expect(again.reverified).toEqual([{ id: memId, kind: 'memory' }]);
+    expect(again.objects).toEqual(record.objects);
+    expect(again.reverified).toEqual([]);
     expect(again.decay_records).toBe(1);
     expect(await readdir(repairDir)).toHaveLength(2); // 审计记录追加（每 run 一条）
   });
@@ -244,9 +271,11 @@ describe('③ repair：受影响对象重验证 + 清债；空 → 合法完成�
     const record = JSON.parse(await readFile(join(root, '.evolution', 'repair', files[0]!), 'utf8')) as {
       affected_objects: unknown[];
       reverified: unknown[];
+      objects: unknown[];
     };
     expect(record.affected_objects).toEqual([]);
     expect(record.reverified).toEqual([]);
+    expect(record.objects).toEqual([]);
   });
 });
 

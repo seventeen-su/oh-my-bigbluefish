@@ -35,7 +35,17 @@ import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type Sha
 import { shouldRouteShadow } from '../kernel/shadow-route.js';
 // P2：Shadow 真实判定——验证契约种子/证据构造/判定映射（kernel 层 2；runtime(2) → kernel(2) ✓）
 import { buildShadowEvidence, seedShadowContract, shadowOutcomeFromResult } from '../kernel/shadow-contract.js';
-import { decideVerdict } from '../kernel/verification.js';
+// P3：Repair 升级——损坏类型分类/对象验证契约种子/最小验证计划/处置语义（kernel 层 2；runtime(2) → kernel(2) ✓）
+import {
+  applyRepairDisposition,
+  classifyRepairDamage,
+  seedRepairContract,
+  REPAIR_CHECK_GENERIC_READABLE,
+  REPAIR_CHECK_RETRIEVABLE,
+  type RepairDisposition,
+} from '../kernel/repair-contract.js';
+import { decideVerdict, trustGate } from '../kernel/verification.js';
+import type { Verdict, VerificationEvidence } from '../kernel/schemas/verification.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
@@ -418,7 +428,27 @@ export interface LineSnapshotInfo {
   dir: string;
 }
 
-/** R5：repair 任务结果（受影响对象重验证审计；落盘 .evolution/repair/<ts>.json） */
+/** P3：逐对象契约化重验证结果（RepairRecord.objects 条目——verdict/disposition/score_eligible/reason 可审计） */
+export interface RepairObjectOutcome {
+  /** 受影响对象 id */
+  id: string;
+  /** 契约化 kind（ArtifactRef 'experience' → 'memory'；其余原样） */
+  kind: string;
+  /** 验证契约 id（repair:<objectId>） */
+  contract_id: string;
+  /** 三态判定（PASS/FAIL/UNKNOWN） */
+  verdict: Verdict;
+  /** 证据质量（0~1；decideVerdict 纯函数计算） */
+  evidence_quality: number;
+  /** 处置动作（clear_suspicious 由 runRepair 执行生命周期恢复；其余仅记录留后续语义） */
+  disposition: RepairDisposition;
+  /** 是否计入能力评分（false = 验证器不可信/外部不可控失败——不污染评分） */
+  score_eligible: boolean;
+  /** 中文可审计理由（损坏类型 + kind + objectId） */
+  reason: string;
+}
+
+/** R5+P3：repair 任务结果（契约化重验证审计；落盘 .evolution/repair/<ts>.json） */
 export interface RepairRecord {
   /** 本次重验证时间戳（epoch ms） */
   ts: number;
@@ -427,10 +457,12 @@ export interface RepairRecord {
   decay_records: number;
   /** 去重后的受影响对象（全部 decay 记录合并） */
   affected_objects: ArtifactRef[];
-  /** 确认存在并记录重验证的对象 */
+  /** 契约化重验证通过（verdict=PASS）的对象（P3：原「确认存在并记录重验证」语义升级为 PASS 语义） */
   reverified: ArtifactRef[];
   /** 引用对象已删除（无可修，跳过留痕） */
   missing: ArtifactRef[];
+  /** P3：逐对象契约化验证结果（id/kind/contract_id/verdict/evidence_quality/disposition/score_eligible/reason） */
+  objects: RepairObjectOutcome[];
 }
 
 /** 按线解析结果（policy/processes 目录 + 快照信息 + 降级原因） */
@@ -1938,8 +1970,9 @@ export class CognitiveRuntime {
           await this.runMemoryConsolidation(signal);
         };
       case 'repair':
-        // R5（P0+P1）：受影响对象重验证（读 decay 记录 → 重验证审计 → 成功清债；
-        // 无待 repair 对象 = 合法完成清债；幂等——重复执行同结果）
+        // R5（P0+P1）+P3：受影响对象契约化重验证（读 decay 记录 → 对象契约 → 最小验证计划 →
+        // 执行验证器 → 损坏分类 → 处置语义 → 成功清债；无待 repair 对象 = 合法完成清债；
+        // 幂等——重复执行同结果）
         return async () => {
           await this.runRepair();
         };
@@ -2118,45 +2151,128 @@ export class CognitiveRuntime {
   }
 
   /**
-   * R5：repair 任务执行体（维护任务 repair，可公开调用——测试/命令触发）。
-   * 受影响对象重验证：读全部 decay 记录（.evolution/decay/）→ 去重合并受影响对象 → 逐个确认
-   * 存在（重验证最小形式：确认降级标记在检索面生效 + 记录重验证时间戳——审计落盘
-   * .evolution/repair/<ts>.json；有 verifier 的对象走真实验证留评估面接入）→ 任务成功 return
-   * → 调度器清债。无待 repair 对象（decay 无记录/受影响对象为空/对象已删除）→ 同样合法完成清债。
-   * 幂等：重复执行同结果（重验证时间戳刷新、不重复写入/不抛错）。
+   * R5+P3：repair 任务执行体（维护任务 repair，可公开调用——测试/命令触发）。
+   * 受影响对象契约化重验证：读全部 decay 记录（.evolution/decay/）→ 去重合并受影响对象（逐对象携带
+   * 所属 decay 记录的环境变化标志——environment_delta 非空 → environment_changed=true）→ 逐个
+   * seedRepairContract（对象验证契约）→ 执行最小验证计划（仅当前运行时可执行的检查：getById 命中 →
+   * 确定性 pass；replay/检索一致性/回归集等无执行器 → 不产证据 → decideVerdict 诚实 UNKNOWN）→
+   * classifyRepairDamage（损坏类型分类）→ applyRepairDisposition（处置语义）→ 逐对象记录
+   * {id, kind, contract_id, verdict, evidence_quality, disposition, score_eligible, reason} 落盘
+   * .evolution/repair/<ts>.json；clear_suspicious 且 memory 对象 → lifecycle 恢复 Active（清除存疑）。
+   * judgeChecks 为 P3 语义补充验证器证据注入面（与 P2 shadow judgeChecks 同模式；真实 LLM judge 调用
+   * 留待注记——不提供 → 诚实 UNKNOWN）。任务成功 return → 调度器清债。无待 repair 对象
+   * （decay 无记录/受影响对象为空/对象已删除）→ 同样合法完成清债。
+   * 幂等：重复执行同结果（判定确定性——同证据同输入 → 同输出；审计记录追加、不抛错）。
    */
-  async runRepair(): Promise<RepairRecord> {
+  async runRepair(
+    judgeChecks?: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }>,
+  ): Promise<RepairRecord> {
     const files = (await readdir(this.decayDir)).filter((f) => f.endsWith('.json')).sort();
-    const affected = new Map<string, ArtifactRef>();
+    // 受影响对象合并（逐对象携带环境变化标志：所属任一 decay 记录 environment_delta 非空 → true）
+    const affected = new Map<string, { ref: ArtifactRef; environment_changed: boolean }>();
     for (const f of files) {
       try {
         const rec = JSON.parse(await readFile(join(this.decayDir, f), 'utf8')) as CapabilityDecayRecord;
+        const envChanged =
+          rec.environment_delta !== undefined && Object.keys(rec.environment_delta).length > 0;
         for (const obj of rec.affected_objects ?? []) {
-          affected.set(obj.id, obj);
+          const prev = affected.get(obj.id);
+          affected.set(obj.id, {
+            ref: obj,
+            environment_changed: (prev?.environment_changed ?? false) || envChanged,
+          });
         }
       } catch {
         // 损坏 decay 记录跳过（尽力而为；不阻塞重验证）
       }
     }
-    const reverified: ArtifactRef[] = [];
+    const objects: RepairObjectOutcome[] = [];
     const missing: ArtifactRef[] = [];
-    for (const obj of affected.values()) {
-      const m = await this.memory.getById(obj.id);
+    for (const [id, entry] of affected) {
+      // kind 映射：ArtifactRef 'experience' → 'memory'；其余原样传入（seedRepairContract generic 兜底）
+      const kind = entry.ref.kind === 'experience' ? 'memory' : entry.ref.kind;
+      const m = await this.memory.getById(id);
       if (m === undefined) {
-        missing.push(obj); // 引用对象已删除 → 无可修（跳过；记录留痕）
+        missing.push(entry.ref); // 引用对象已删除 → 无可修（missing 语义不变：跳过留痕）
         continue;
       }
-      // 最小重验证：确认对象存在（suspicious 降级标记已由 environment_check 写入；
-      // 检索面已按 Suspicious 降权 §7.4）+ 记录重验证时间戳（本记录 ts）。真实 verifier 走验证留待。
-      reverified.push({ id: obj.id, kind: 'memory' });
+      // 对象验证契约 → 最小验证计划（仅当前运行时可执行的检查）
+      const contract = seedRepairContract(kind, id);
+      const detVerifier = contract.verifiers.find((v) => v.kind === 'deterministic')!;
+      const evidence: VerificationEvidence[] = [];
+      // 确定性一级：getById 命中 → 硬约束 pass（source='runRepair:deterministic'，contract_id 匹配；
+      // 未命中 → 上面 missing 短路——executor 内仅可能 pass）
+      const getByIdChecks = contract.hard_constraints.filter(
+        (h) => h === REPAIR_CHECK_RETRIEVABLE || h === REPAIR_CHECK_GENERIC_READABLE,
+      );
+      if (getByIdChecks.length > 0) {
+        evidence.push({
+          verifier_id: `repair:${kind}:deterministic`,
+          contract_id: contract.id,
+          checks: getByIdChecks.map((name) => ({
+            name,
+            result: 'pass' as const,
+            detail: 'getById 命中——对象存在且可读（检索面已按 lifecycle 降权 §7.4）',
+          })),
+          ts: Date.now(),
+          source: 'runRepair:deterministic',
+        });
+      }
+      // 语义补充一级：judgeChecks 注入面（P3 与 P2 shadow 同模式；真实语义验证器
+      //（replay/代表任务/回归集执行）留待注记——不提供 → 不产补充证据 → 诚实 UNKNOWN）
+      if (judgeChecks !== undefined && judgeChecks.length > 0) {
+        evidence.push({
+          verifier_id: `repair:${kind}:judge`,
+          contract_id: contract.id,
+          checks: judgeChecks.map((c) => ({ name: c.name, result: c.result, detail: c.detail })),
+          ts: Date.now(),
+          source: 'runRepair:judge',
+        });
+      }
+      const result = decideVerdict(contract, evidence);
+      // 损坏类型分类（优先级不可协商）：内部确定性验证器 L1 ≥ trust_required L1（trustGate 校验）→
+      // verifier_trusted=true；uncontrollable 恒 false（环境/外部不可控面后续经契约 controllability 注入）；
+      // structural_checks = 契约 hard_constraints（FAIL 时命中任一 → 结构损坏）
+      const damage = classifyRepairDamage(result, {
+        environment_changed: entry.environment_changed,
+        verifier_trusted: trustGate(detVerifier.trust, contract.trust_required),
+        uncontrollable: false,
+        structural_checks: contract.hard_constraints,
+      });
+      const disp = applyRepairDisposition(kind, id, damage);
+      objects.push({
+        id,
+        kind,
+        contract_id: contract.id,
+        verdict: result.verdict,
+        evidence_quality: result.evidence_quality,
+        disposition: disp.disposition,
+        score_eligible: disp.score_eligible,
+        reason: disp.reason,
+      });
+      // 处置执行：仅 memory 对象且 clear_suspicious → 清除存疑（lifecycle 恢复 Active——检索面恢复
+      // 正常权重）；失败降级记录不抛。degrade_or_rollback（降级/回滚）与 quarantine（隔离标记）的
+      // 落地动作属后续语义（P4 注记）——其余处置仅记录（保持 suspicious/不动）。
+      if (disp.disposition === 'clear_suspicious' && kind === 'memory') {
+        try {
+          await this.memory.update(id, { lifecycle: 'Active' });
+        } catch {
+          // 单对象清除失败 → 跳过（objects 记录仍留痕；不阻塞 repair）
+        }
+      }
     }
+    // reverified 语义（P3）：verdict=PASS 的对象（契约化重验证通过）
+    const reverified: ArtifactRef[] = objects
+      .filter((o) => o.verdict === 'PASS')
+      .map((o) => ({ id: o.id, kind: o.kind }));
     const record: RepairRecord = {
       ts: Date.now(),
       task: 'repair',
       decay_records: files.length,
-      affected_objects: [...affected.values()],
+      affected_objects: [...affected.values()].map((e) => e.ref),
       reverified,
       missing,
+      objects,
     };
     await mkdir(this.repairDir, { recursive: true });
     let file = join(this.repairDir, `${record.ts}.json`);
