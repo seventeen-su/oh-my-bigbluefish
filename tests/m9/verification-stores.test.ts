@@ -18,6 +18,8 @@ import {
   BaselineStore,
   FactStore,
   TaskStore,
+  VerifierStore,
+  createVerificationStores,
   type BaselineRecord,
   type FactRecord,
   type TaskRecord,
@@ -279,5 +281,27 @@ describe('⑥ 确定性：同注册序列 → 同读取结果', () => {
       return s.list();
     };
     expect(await seq(await mk())).toEqual(await seq(await mk()));
+  });
+});
+
+// ---- ⑦ 聚合工厂（createVerificationStores 返回四库——含验证器注册库；专项 3 适配） ----
+
+describe('⑦ 聚合工厂 createVerificationStores 返回四库（含 verifiers）', () => {
+  it('返回 facts/baselines/tasks/verifiers 且 verifiers 可用（注册/取回）', async () => {
+    const stores = createVerificationStores(await tmpRoot('omb-aggregate-'));
+    expect(stores.facts).toBeInstanceOf(FactStore);
+    expect(stores.baselines).toBeInstanceOf(BaselineStore);
+    expect(stores.tasks).toBeInstanceOf(TaskStore);
+    expect(stores.verifiers).toBeInstanceOf(VerifierStore);
+    expect(await stores.verifiers.listVerifiers()).toEqual([]);
+    await stores.verifiers.registerVerifier({
+      verifier_id: 'v:1',
+      spec: { checks: ['结构合法'], blind_spots: [] },
+      validation_benchmark: 'bench:1',
+      independent_test_set: 'its:1',
+      version: '1',
+      registered_at: 1_700_000_000_000,
+    });
+    expect((await stores.verifiers.getVerifier('v:1'))!.version).toBe('1');
   });
 });
