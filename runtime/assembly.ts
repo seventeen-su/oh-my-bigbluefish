@@ -40,11 +40,11 @@ import {
   applyRepairDisposition,
   classifyRepairDamage,
   seedRepairContract,
-  REPAIR_CHECK_GENERIC_READABLE,
-  REPAIR_CHECK_RETRIEVABLE,
   type RepairDisposition,
 } from '../kernel/repair-contract.js';
 import { decideVerdict, trustGate } from '../kernel/verification.js';
+// P3.5：Repair 真实验证执行器（七类对象——对象契约应查检查的确定性执行面；runtime(2) → runtime(2) ✓）
+import { createRepairExecutors, type RepairExecutors } from './repair-executors.js';
 // P4：Evolution 收敛——候选晋升验证契约门禁 + stable 晋升信任门禁（kernel 层 2；runtime(2) → kernel(2) ✓；
 // supervisor 侧经 deps 注入回调消费——本文件为 kernel 逻辑唯一消费方）
 import { runCandidateGate, stablePromotionTrustGate } from '../kernel/candidate-contract.js';
@@ -451,6 +451,8 @@ export interface RepairObjectOutcome {
   score_eligible: boolean;
   /** 中文可审计理由（损坏类型 + kind + objectId） */
   reason: string;
+  /** P3.5：逐检查结果聚合（检查名=result；'；' 分隔——审计可回溯；执行器不可用 → 缺省） */
+  detail?: string;
 }
 
 /** R5+P3：repair 任务结果（契约化重验证审计；落盘 .evolution/repair/<ts>.json） */
@@ -652,6 +654,10 @@ export class CognitiveRuntime {
   private readonly decayDir: string;
   /** R5：repair 重验证记录落盘目录（<evolutionRoot>/repair；<ts>.json——受影响对象重验证审计） */
   private readonly repairDir: string;
+  /** P3.5：Repair 真实验证执行器（实例缓存——重复执行幂等；rebuildSnapshotForLine 线切换后重建） */
+  private repairExecutors: RepairExecutors | null = null;
+  /** P3.5：执行器构造失败降级原因（无 → null；构造失败 → repair 全检查 unknown 降级记录不抛） */
+  private repairExecutorsDegraded: string | null = null;
   /** S1：World/Self 模型缓存（视图 + 模型——首次访问装配，promote/rebuildSnapshotForLine 后重置；
    *  同 runtime 状态 → 同视图 → 同模型内容（确定性）；装配为纯读取无副作用） */
   private modelCache: { view: RuntimeView; world: WorldModel; self: SelfModel } | null = null;
@@ -1805,6 +1811,7 @@ export class CognitiveRuntime {
       this.lineDegraded = dirs.lineDegraded;
       this.policyPromise = null;
       this.processesPromise = null;
+      this.repairExecutors = null; // P3.5：线切换 → 执行器按新线目录重建（下一 runRepair 懒构造）
       this.modelCache = null; // S1：World/Self 模型反映新线（下一访问按新线/新快照重建）
       this.invalidateShadowCaches(); // S7：线切换 → shadow 路由缓存失效（trusted-latest/线 bundle/快照身份）
       return { promoted: true, degraded: null };
@@ -2181,22 +2188,47 @@ export class CognitiveRuntime {
   }
 
   /**
-   * R5+P3：repair 任务执行体（维护任务 repair，可公开调用——测试/命令触发）。
+   * R5+P3/P3.5：repair 任务执行体（维护任务 repair，可公开调用——测试/命令触发）。
    * 受影响对象契约化重验证：读全部 decay 记录（.evolution/decay/）→ 去重合并受影响对象（逐对象携带
    * 所属 decay 记录的环境变化标志——environment_delta 非空 → environment_changed=true）→ 逐个
-   * seedRepairContract（对象验证契约）→ 执行最小验证计划（仅当前运行时可执行的检查：getById 命中 →
-   * 确定性 pass；replay/检索一致性/回归集等无执行器 → 不产证据 → decideVerdict 诚实 UNKNOWN）→
-   * classifyRepairDamage（损坏类型分类）→ applyRepairDisposition（处置语义）→ 逐对象记录
-   * {id, kind, contract_id, verdict, evidence_quality, disposition, score_eligible, reason} 落盘
-   * .evolution/repair/<ts>.json；clear_suspicious 且 memory 对象 → lifecycle 恢复 Active（清除存疑）。
-   * judgeChecks 为 P3 语义补充验证器证据注入面（与 P2 shadow judgeChecks 同模式；真实 LLM judge 调用
-   * 留待注记——不提供 → 诚实 UNKNOWN）。任务成功 return → 调度器清债。无待 repair 对象
+   * seedRepairContract（对象验证契约）→ 遍历契约应查检查（hard ∪ outcome 去重）→ 真实验证执行器
+   * （runtime/repair-executors.ts，P3.5）逐项执行（source='runRepair:executors'；仍无法真实执行的面
+   * ——无矛盾/重放一致/代表任务/冻结回归集/可恢复 → 执行器诚实 unknown，detail 注明需基线/数据面
+   * （P3.6）或 judge（P2.5 搁置））→ decideVerdict（诚实三态）→ classifyRepairDamage（损坏类型分类）
+   * → applyRepairDisposition（处置语义）→ 逐对象记录 {id, kind, contract_id, verdict, evidence_quality,
+   * disposition, score_eligible, reason, detail?} 落盘 .evolution/repair/<ts>.json；clear_suspicious 且
+   * memory 对象 → lifecycle 恢复 Active（清除存疑）。
+   * judgeChecks 为 P3 语义补充验证器证据注入面（与 P2 shadow judgeChecks 同模式；真实 LLM judge 生产
+   * 调用搁置（P2.5——用户 2026-08-25 裁决：多数用户负担不起第二模型成本，注入面保留）——不提供 →
+   * 不产补充证据 → 诚实 UNKNOWN）。任务成功 return → 调度器清债。无待 repair 对象
    * （decay 无记录/受影响对象为空/对象已删除）→ 同样合法完成清债。
    * 幂等：重复执行同结果（判定确定性——同证据同输入 → 同输出；审计记录追加、不抛错）。
    */
   async runRepair(
     judgeChecks?: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }>,
   ): Promise<RepairRecord> {
+    // P3.5：真实验证执行器懒构造（实例字段缓存——重复执行幂等；构造失败降级记录不抛——
+    // 执行器不可用 → 全检查 unknown → 诚实 UNKNOWN，不阻塞 repair）。检索以 episode=false 只读语义注入。
+    if (this.repairExecutors === null) {
+      try {
+        this.repairExecutors = createRepairExecutors({
+          memory: {
+            getById: (id) => this.memory.getById(id),
+            retrieve: (q) => retrieve(this.memory, q as RetrieveQuery, { episode: false }),
+          },
+          components: this.components,
+          lineSnapshot: this.lineSnapshot,
+          policyDir: this.policyDir,
+          processesDir: this.processesDir,
+          loadPolicy,
+          loadProcesses,
+        });
+        this.repairExecutorsDegraded = null;
+      } catch (err) {
+        this.repairExecutors = null;
+        this.repairExecutorsDegraded = errorDetail(err); // 构造失败降级记录（不抛）
+      }
+    }
     const files = (await readdir(this.decayDir)).filter((f) => f.endsWith('.json')).sort();
     // 受影响对象合并（逐对象携带环境变化标志：所属任一 decay 记录 environment_delta 非空 → true）
     const affected = new Map<string, { ref: ArtifactRef; environment_changed: boolean }>();
@@ -2226,30 +2258,44 @@ export class CognitiveRuntime {
         missing.push(entry.ref); // 引用对象已删除 → 无可修（missing 语义不变：跳过留痕）
         continue;
       }
-      // 对象验证契约 → 最小验证计划（仅当前运行时可执行的检查）
+      // 对象验证契约 → 应查检查（hard ∪ outcome，去重保序）→ 真实验证执行器逐项执行（P3.5）：
+      // source='runRepair:executors'；仍未决的检查（无矛盾/重放一致/代表任务/冻结回归集/可恢复）由执行器
+      // 诚实 unknown（detail 注明需基线/数据面（P3.6）或 judge（P2.5 搁置））——不臆造证据。
       const contract = seedRepairContract(kind, id);
       const detVerifier = contract.verifiers.find((v) => v.kind === 'deterministic')!;
       const evidence: VerificationEvidence[] = [];
-      // 确定性一级：getById 命中 → 硬约束 pass（source='runRepair:deterministic'，contract_id 匹配；
-      // 未命中 → 上面 missing 短路——executor 内仅可能 pass）
-      const getByIdChecks = contract.hard_constraints.filter(
-        (h) => h === REPAIR_CHECK_RETRIEVABLE || h === REPAIR_CHECK_GENERIC_READABLE,
-      );
-      if (getByIdChecks.length > 0) {
-        evidence.push({
-          verifier_id: `repair:${kind}:deterministic`,
-          contract_id: contract.id,
-          checks: getByIdChecks.map((name) => ({
-            name,
-            result: 'pass' as const,
-            detail: 'getById 命中——对象存在且可读（检索面已按 lifecycle 降权 §7.4）',
-          })),
-          ts: Date.now(),
-          source: 'runRepair:deterministic',
-        });
+      const detailParts: string[] = [];
+      if (this.repairExecutors !== null) {
+        const expected: string[] = [];
+        const seenCheck = new Set<string>();
+        for (const name of [...contract.hard_constraints, ...contract.outcome_conditions]) {
+          if (!seenCheck.has(name)) {
+            seenCheck.add(name);
+            expected.push(name);
+          }
+        }
+        const checks: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }> = [];
+        for (const name of expected) {
+          const outcome = await this.repairExecutors.executeCheck(name, { objectId: id, kind, payload: m });
+          checks.push({ name, result: outcome.result, ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) });
+          detailParts.push(`${name}=${outcome.result}`);
+        }
+        if (checks.length > 0) {
+          evidence.push({
+            verifier_id: `repair:${kind}:deterministic`,
+            contract_id: contract.id,
+            checks,
+            ts: Date.now(),
+            source: 'runRepair:executors',
+          });
+        }
+      } else if (this.repairExecutorsDegraded !== null) {
+        // 执行器构造失败降级：不产确定性证据（全检查 unknown → 诚实 UNKNOWN）；记录降级原因
+        detailParts.push(`执行器不可用（${this.repairExecutorsDegraded}）`);
       }
-      // 语义补充一级：judgeChecks 注入面（P3 与 P2 shadow 同模式；真实语义验证器
-      //（replay/代表任务/回归集执行）留待注记——不提供 → 不产补充证据 → 诚实 UNKNOWN）
+      // 语义补充一级：judgeChecks 注入面（P3 与 P2 shadow 同模式；真实 LLM judge 生产调用搁置
+      //（P2.5——用户 2026-08-25 裁决：多数用户负担不起第二模型成本，注入面保留）——不提供 → 不产补充
+      // 证据 → 诚实 UNKNOWN）
       if (judgeChecks !== undefined && judgeChecks.length > 0) {
         evidence.push({
           verifier_id: `repair:${kind}:judge`,
@@ -2279,6 +2325,8 @@ export class CognitiveRuntime {
         disposition: disp.disposition,
         score_eligible: disp.score_eligible,
         reason: disp.reason,
+        // P3.5：逐检查结果聚合（检查名=result；'；' 分隔——审计可回溯；执行器不可用 → 降级原因）
+        ...(detailParts.length > 0 ? { detail: detailParts.join('；') } : {}),
       });
       // 处置执行：仅 memory 对象且 clear_suspicious → 清除存疑（lifecycle 恢复 Active——检索面恢复
       // 正常权重）；失败降级记录不抛。degrade_or_rollback（降级/回滚）与 quarantine（隔离标记）的

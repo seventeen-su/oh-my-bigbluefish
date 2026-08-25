@@ -9,9 +9,10 @@
 //   ⑤ decideVerdict 集成：memory getById 命中 → UNKNOWN（outcome 无证据）；未命中 → FAIL；
 //     全证据注入（含 judge pass 补缺）→ PASS
 //   ⑥ runRepair 集成（createCognitiveRuntime + fixture 布局，参照 tests/m8/predictive-invalidation.test.ts）：
-//     decay 记录 → 受影响对象 → RepairRecord.objects 条目（verdict/disposition/score_eligible）、missing、
-//     memory 对象 PASS 路径清 suspicious（judgeChecks 注入 → lifecycle 恢复 Active）、
-//     UNKNOWN 保持 Suspicious、环境变化 → local_regression、'experience'→'memory' kind 映射
+//     decay 记录 → 受影响对象 → RepairRecord.objects 条目（verdict/disposition/score_eligible/detail）、missing、
+//     P3.5 真实验证执行器证据（evidence_quality 0.67 提高）、judgeChecks 注入面（P2.5 搁置——补充证据
+//     不能覆盖权威 unknown → 诚实 UNKNOWN 保持 Suspicious）、UNKNOWN 保持 Suspicious、
+//     环境变化 → local_regression、'experience'→'memory' kind 映射
 //   ⑦ 确定性：同输入同输出（种子/计划/分类/处置/decideVerdict 全链 deep equal + JSON 字节一致）
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -435,6 +436,10 @@ describe('⑥ runRepair 集成：契约化重验证 + 处置执行', () => {
     const rec = await runtime.runRepair();
     expect(rec.task).toBe('repair');
     expect(rec.decay_records).toBe(4);
+    // P3.5：真实验证执行器——对象可检索 pass + 检索一致性 pass（真实 memory retrieve）→ 无矛盾 unknown；
+    // evidence_quality = 2/3 = 0.67（较旧「仅 getById 证据」0.33 提高）；detail 聚合逐检查结果
+    const MEM_DETAIL =
+      '对象可检索（getById 命中）=pass；检索一致性（同查询同结果）=pass；无矛盾（contradiction 检查通过）=unknown';
     // objects：A（UNKNOWN/keep_suspicious）、C（UNKNOWN 判定 + local_regression 处置）、E（kind 映射 memory）
     expect(rec.objects).toEqual([
       {
@@ -442,30 +447,33 @@ describe('⑥ runRepair 集成：契约化重验证 + 处置执行', () => {
         kind: 'memory',
         contract_id: `repair:${memA}`,
         verdict: 'UNKNOWN',
-        evidence_quality: 0.33,
+        evidence_quality: 0.67,
         disposition: 'keep_suspicious',
         score_eligible: true,
         reason: expect.stringContaining('证据不足'),
+        detail: MEM_DETAIL,
       },
       {
         id: memC,
         kind: 'memory',
         contract_id: `repair:${memC}`,
         verdict: 'UNKNOWN',
-        evidence_quality: 0.33,
+        evidence_quality: 0.67,
         disposition: 'local_regression',
         score_eligible: true,
         reason: expect.stringContaining('环境变化'),
+        detail: MEM_DETAIL,
       },
       {
         id: memE,
         kind: 'memory', // 'experience' → 'memory'（契约化 kind 映射）
         contract_id: `repair:${memE}`,
         verdict: 'UNKNOWN',
-        evidence_quality: 0.33,
+        evidence_quality: 0.67,
         disposition: 'keep_suspicious',
         score_eligible: true,
         reason: expect.stringContaining('证据不足'),
+        detail: MEM_DETAIL,
       },
     ]);
     expect(rec.missing).toEqual([{ id: memGone, kind: 'memory' }]); // missing 语义不变（跳过留痕）
@@ -477,14 +485,17 @@ describe('⑥ runRepair 集成：契约化重验证 + 处置执行', () => {
     expect((await runtime.memory.getById(memE))!.lifecycle).toBe('Suspicious');
   });
 
-  it('PASS 路径（judgeChecks 补缺）→ clear_suspicious → lifecycle 恢复 Active', async () => {
+  it('judgeChecks 注入面（P2.5 搁置）：无矛盾权威 unknown → 补充证据不能覆盖权威 unknown → 诚实 UNKNOWN（保持 Suspicious）', async () => {
     const root = await tmpRoot();
     const runtime = trackRuntime(createCognitiveRuntime({ root }));
     const memB = await runtime.memory.ingest(makeMemory('受影响对象 B'));
     await runtime.memory.update(memB, { lifecycle: 'Suspicious' });
     await writeDecay(root, 'b.json', { affected_objects: [{ id: memB, kind: 'memory' }] });
 
-    // judgeChecks 注入面（P3 语义补充验证器证据——真实 LLM judge 调用留待注记）
+    // judgeChecks 注入面（P3 语义补充验证器证据——真实 LLM judge 生产调用搁置（P2.5），注入面保留）。
+    // P3.5 后 memory 契约三项检查均由确定性执行器产证据：对象可检索 pass + 检索一致性 pass + 无矛盾
+    // unknown（语义面需 P3.6/judge）；decideVerdict P1 规则：权威 unknown 不能被补充证据覆盖（不强行裁决）
+    // → 即使 judgeChecks 对无矛盾判 pass，verdict 仍诚实 UNKNOWN（judge 仅兜底「权威无覆盖」缺口）。
     const rec = await runtime.runRepair([
       { name: '检索一致性（同查询同结果）', result: 'pass', detail: '同查询同结果' },
       { name: '无矛盾（contradiction 检查通过）', result: 'pass', detail: '无矛盾' },
@@ -494,17 +505,19 @@ describe('⑥ runRepair 集成：契约化重验证 + 处置执行', () => {
         id: memB,
         kind: 'memory',
         contract_id: `repair:${memB}`,
-        verdict: 'PASS',
-        evidence_quality: 1,
-        disposition: 'clear_suspicious',
+        verdict: 'UNKNOWN',
+        evidence_quality: 0.67,
+        disposition: 'keep_suspicious',
         score_eligible: true,
-        reason: expect.stringContaining('PASS'),
+        reason: expect.stringContaining('证据不足'),
+        detail:
+          '对象可检索（getById 命中）=pass；检索一致性（同查询同结果）=pass；无矛盾（contradiction 检查通过）=unknown',
       },
     ]);
-    expect(rec.reverified).toEqual([{ id: memB, kind: 'memory' }]); // PASS = 契约化重验证通过
+    expect(rec.reverified).toEqual([]); // UNKNOWN 不属通过
     expect(rec.missing).toEqual([]);
-    // 处置执行：clear_suspicious → lifecycle 恢复 Active（清除存疑）
-    expect((await runtime.memory.getById(memB))!.lifecycle).toBe('Active');
+    // 处置执行：keep_suspicious → 保持 Suspicious（lifecycle 不动）
+    expect((await runtime.memory.getById(memB))!.lifecycle).toBe('Suspicious');
   });
 
   it('空任务（无受影响对象）→ 合法完成 + objects 空 + 清债语义不依赖（直接调用幂等）', async () => {
