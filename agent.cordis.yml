@@ -195,6 +195,8 @@
 - id: omb-v2
   name: './lib/runtime/plugin.js?v=6'
   config:
+    # 宿主 DSH 版本（R6 装配注入面：运行时指纹/provenance 的 dsh_version 唯一来源）
+    hostVersion: '0.1.1-rc.1'
     # 相对路径：相对 preset 根解析——迁移可移植，不绑定机器绝对路径
     cognitiveRoot: 'workspace/.omb'
     # 版本激活记录幂等落盘目录（/mode 切换写 completed/<activation_id>.json；pending 先写、完成清 pending；
