@@ -256,10 +256,46 @@ export function buildLayoutFixture(): LayoutFixture {
   return { root, bare, stable, latest, candidate, initialHash, latestHash };
 }
 
-/** 清理 fixture：先 rmSync；若被 ACL 挡住，先 icacls /reset 还原默认 ACL 再删。 */
+/** 目录树清理（Windows 清理竞态硬化）：rmSync recursive+force 只吞 ENOENT，不映射 ENOTEMPTY——全量套件并行时
+ *  rmdir 非空/子项句柄未释放（杀软/进程退出时序）偶发 ENOTEMPTY/EPERM/EBUSY → 短退避重试（最多 attempts 次、
+ *  线性退避 delayMs×n）；非瞬态错误 fail-loud 不重试。仿 tests/m0/sandbox.test.ts removeDirRetry。 */
+function rmSyncRetry(target: string, attempts = 3, delayMs = 100): void {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOTEMPTY' && code !== 'EPERM' && code !== 'EBUSY') throw err;
+      if (attempt < attempts) sleepMs(delayMs * attempt);
+    }
+  }
+  throw lastErr;
+}
+
+/** 异步目录树清理（同 rmSyncRetry 语义；供测试 afterEach 清理 tmpdir，避免全量并行下 rmdir 非空竞态）。 */
+export async function removeDirRetry(target: string, attempts = 3, delayMs = 100): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fs.promises.rm(target, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOTEMPTY' && code !== 'EPERM' && code !== 'EBUSY') throw err;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+/** 清理 fixture：先 rmSyncRetry；若被 ACL 挡住（只读 ACL 可能挡递归删除），先 icacls /reset 还原默认 ACL 再重试删除。 */
 export function teardownLayoutFixture(fx: LayoutFixture): void {
   try {
-    fs.rmSync(fx.root, { recursive: true, force: true });
+    rmSyncRetry(fx.root);
     return;
   } catch {
     // 只读 ACL 可能挡住递归删除 → 还原 ACL 后重试
@@ -268,6 +304,6 @@ export function teardownLayoutFixture(fx: LayoutFixture): void {
     } catch {
       // 还原失败也继续尝试删除
     }
-    fs.rmSync(fx.root, { recursive: true, force: true });
+    rmSyncRetry(fx.root);
   }
 }
