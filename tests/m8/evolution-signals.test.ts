@@ -6,7 +6,7 @@
 //   ③ evolve.policy schema：真实 evolve.yaml 过校验；旧形状（§9.5 三字段）经缺省合法；非法值 fail-loud
 //   ④ 判定纯函数：确定性（同输入同输出）；corrections 触发 → L1/strength 0.9；无触发不演化；
 //      债务 ≥ hard → 限制非必要演化
-//   ⑤ 债务权重映射：repair+20/candidate+8/memory+2/gc+1；priority = EV/C × debt
+//   ⑤ 债务权重映射：repair+20/candidate+8/memory+2（GC 不再常驻入账——turn-finalize 覆盖）；priority = EV/C × debt
 //   ⑥ 生产路径：finalizeTurn 信号 → §10.1 债务入队累计 → debt.json 落盘 → quantum 执行
 //      （真实任务清偿归零；R5：旧布局 candidate_validation → Deferred → 债务保留不清零）
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -28,6 +28,7 @@ import {
 import { EvolvePolicySchema, loadPolicy } from '../../kernel/policy-loader.js';
 import { MaintenanceScheduler } from '../../supervisor/maintenance.js';
 import type { SignalRecord } from '../../kernel/schemas/evolution.js';
+import { buildLayoutFixture, teardownLayoutFixture } from '../helpers/git.js';
 
 const REPO_POLICY_DIR = fileURLToPath(new URL('../../kernel/policy', import.meta.url));
 const SESSION = 'sess-p1c-1';
@@ -214,13 +215,14 @@ describe('⑤ §10.1 债务权重（memory+2/candidate+8/repair+20/GC+1）', () 
     expect(byId.get('repair')!.value).toBe(20);
     expect(byId.get('candidate_validation')!.value).toBe(8);
     expect(byId.get('memory_consolidation')!.value).toBe(2);
-    expect(byId.get('gc')!.value).toBe(1); // 每收尾常驻
+    // GC 不再每收尾常驻入账（2026-08-25：已由 turn-finalize 的 compact 覆盖，避免重复入账+低 ROI 饥饿）
+    expect(byId.has('gc')).toBe(false);
     // priority = EV/C × debt（EV=value、C=estimated_cost、debt=value）
     expect(byId.get('repair')!.priority).toBe(Math.round((20 / 25) * 20));
     expect(byId.get('candidate_validation')!.priority).toBe(Math.round((8 / 10) * 8));
-    // 零计数信号不产生对应债务
+    // 零计数信号不产生对应债务（GC 不再常驻 → 全零信号无任何入账）
     const none = debtAccrualsFromSummary({ window: { from: 0, to: 0 }, counts: {} });
-    expect(none.map((a) => a.task_id)).toEqual(['gc']); // 仅常驻 gc
+    expect(none).toEqual([]);
   });
 
   it('candidateValidationAccrual 单一入账（演化判定触发用）', () => {
@@ -245,54 +247,63 @@ describe('⑤ §10.1 债务权重（memory+2/candidate+8/repair+20/GC+1）', () 
 
 describe('⑥ MaintenanceDebt 生产路径（finalizeTurn 信号 → §10.1 入队累计 → 落盘 → 清偿）', () => {
   it('finalizeTurn 信号 → 债务权重入队累计 → debt.json 落盘（存在且有内容）→ quantum 执行清偿归零', async () => {
-    const debtFile = join(base, 'debt.json');
-    const scheduler = new MaintenanceScheduler({ debtFile });
-    const runtime = track(createCognitiveRuntime({ root, maintenance: scheduler }));
+    // 注入临时新种子布局（2026-08-25 修复后真实 versions.git 已为新种子——默认布局会解析真实
+    // lineSnapshot，测试必须隔离于临时 fixture，避免触碰真实 versions.git）
+    const fx = buildLayoutFixture();
+    try {
+      const debtFile = join(base, 'debt.json');
+      const scheduler = new MaintenanceScheduler({ debtFile });
+      const runtime = track(
+        createCognitiveRuntime({
+          root,
+          maintenance: scheduler,
+          layout: { bareRepo: fx.bare, stableWorktree: fx.stable, latestWorktree: fx.latest },
+        }),
+      );
 
-    // 会话事件：工具调用 → utility_counts.tool_calls = 1（reducer 计数）
-    await runtime.eventStore.append(
-      makeRuntimeEvent('tool/call', SESSION, runtime.snapshotHash, { callId: 'c1', name: 'read' }, ['test']),
-    );
-    const res = await runtime.finalizeTurn({
-      session_id: SESSION,
-      decision: fallbackFinalizeDecision(runtime.snapshotHash),
-      working_state: fallbackWorkingState('P1c 目标'),
-    });
+      // 会话事件：工具调用 → utility_counts.tool_calls = 1（reducer 计数）
+      await runtime.eventStore.append(
+        makeRuntimeEvent('tool/call', SESSION, runtime.snapshotHash, { callId: 'c1', name: 'read' }, ['test']),
+      );
+      const res = await runtime.finalizeTurn({
+        session_id: SESSION,
+        decision: fallbackFinalizeDecision(runtime.snapshotHash),
+        working_state: fallbackWorkingState('P1c 目标'),
+      });
 
-    // ① 信号落盘（finalizeTurn 收尾聚合点 → signals/ JSONL）
-    expect(res.signals_log.appended).toBeGreaterThan(0);
-    expect(res.signals_log.degraded).toBeNull();
-    const sigFile = join(root, '.evolution', 'signals', signalFileName(Date.now()));
-    expect(existsSync(sigFile)).toBe(true);
+      // ① 信号落盘（finalizeTurn 收尾聚合点 → signals/ JSONL）
+      expect(res.signals_log.appended).toBeGreaterThan(0);
+      expect(res.signals_log.degraded).toBeNull();
+      const sigFile = join(root, '.evolution', 'signals', signalFileName(Date.now()));
+      expect(existsSync(sigFile)).toBe(true);
 
-    // ② §10.1 债务权重入队累计（candidate_validation +8 因 tool_calls；gc +1 常驻）
-    const debt = scheduler.debtSnapshot();
-    const byId = new Map(debt.map((d) => [d.task_id, d]));
-    expect(byId.get('candidate_validation')!.value).toBe(8);
-    expect(byId.get('gc')!.value).toBe(1);
-    expect(byId.has('repair')).toBe(false); // 无 corrections → 无 repair 债务
+      // ② §10.1 债务权重入队累计（candidate_validation +8 因 tool_calls；GC 不再常驻入账——turn-finalize 覆盖）
+      const debt = scheduler.debtSnapshot();
+      const byId = new Map(debt.map((d) => [d.task_id, d]));
+      expect(byId.get('candidate_validation')!.value).toBe(8);
+      expect(byId.has('gc')).toBe(false);
+      expect(byId.has('repair')).toBe(false); // 无 corrections → 无 repair 债务
 
-    // ③ debt.json 落盘（存在且有内容，与快照一致）
-    expect(existsSync(debtFile)).toBe(true);
-    const onDisk = JSON.parse(await readFile(debtFile, 'utf8')) as unknown[];
-    expect(onDisk).toEqual(debt);
+      // ③ debt.json 落盘（存在且有内容，与快照一致）
+      expect(existsSync(debtFile)).toBe(true);
+      const onDisk = JSON.parse(await readFile(debtFile, 'utf8')) as unknown[];
+      expect(onDisk).toEqual(debt);
 
-    // ④ 清偿：quantum 逐个执行 → 真实任务（turn-finalize/gc）完成清偿；旧布局 candidate_validation
-    //    → Deferred（R5，评估依据 §13）→ 债务保留不清零（不再空实现假成功清债）
-    const ran: string[] = [];
-    for (let i = 0; i < 10; i++) {
-      const report = await scheduler.requestQuantum();
-      if (report.ran.length === 0) break;
-      ran.push(...report.ran);
+      // ④ 清偿：quantum 逐个执行 → turn-finalize 与 candidate_validation（新种子布局下真实执行
+      //    演化链：tool_calls 无触发 → 链正常完成）→ 债务全部清偿归零
+      const ran: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        const report = await scheduler.requestQuantum();
+        if (report.ran.length === 0) break;
+        ran.push(...report.ran);
+      }
+      expect(ran).toContain(`turn-finalize:${SESSION}`); // 会话收尾先执行（ROI 1 > 债务任务）
+      expect(ran).toContain('candidate_validation'); // 已真实执行（新种子布局，非 Deferred）
+      expect(scheduler.debtSnapshot()).toEqual([]); // 全部清偿
+      scheduler.stop();
+    } finally {
+      teardownLayoutFixture(fx);
     }
-    expect(ran).toContain(`turn-finalize:${SESSION}`); // 会话收尾先执行（ROI 1 > 债务任务）
-    expect(ran).toContain('candidate_validation'); // 已尝试执行（Deferred 出队）
-    expect(ran).toContain('gc');
-    // 测试环境无 versions.git 线快照（旧布局）→ candidate_validation 债务保留（8）；其余真实任务已清偿
-    const remaining = scheduler.debtSnapshot();
-    expect(remaining).toHaveLength(1);
-    expect(remaining[0]).toMatchObject({ task_id: 'candidate_validation', value: 8 });
-    scheduler.stop();
   });
 
   it('enqueue accrueDebt：入队即累计 + 落盘；任务失败不重复双计；成功清偿', async () => {

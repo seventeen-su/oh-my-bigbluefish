@@ -19,6 +19,7 @@ import { clearDegradations } from '../../runtime/loop-hooks.js';
 import { EventTypeSchema, FIXED_EVENT_TYPES } from '../../kernel/schemas/m.js';
 import { MaintenanceScheduler } from '../../supervisor/maintenance.js';
 import { CandidatePool, candidateDirName, type CandidateProvenance, type CandidateRecord } from '../../supervisor/candidates.js';
+import { buildLayoutFixture, teardownLayoutFixture } from '../helpers/git.js';
 
 const SESSION = 'sess-evolve-1';
 
@@ -113,37 +114,48 @@ describe('① /evolve 命令注册面（设计 §6 命令表）', () => {
 
 describe('② /evolve now 触发链路（判定 → 入队 → quantum → 摘要 + 事件入链）', () => {
   it('触发信号（corrections）→ should_evolve=true → 入队 candidate_validation → quantum 执行 → evolution/candidate + maintenance/quantum 事件可查', async () => {
-    const scheduler = new MaintenanceScheduler({ debtFile: join(base, 'debt.json') });
-    const runtime = track(createCognitiveRuntime({ root, maintenance: scheduler }));
-    // 预写触发信号（今日 signals/ JSONL：corrections → repair 演化，L1）
-    await appendSignals(runtime.signalsDir, [{ ts: Date.now(), kind: 'corrections', payload: { count: 2 } }]);
+    // 注入临时新种子布局（2026-08-25 修复后真实 versions.git 已为新种子——默认布局会解析真实
+    // lineSnapshot，测试必须隔离于临时 fixture，避免触碰真实 versions.git）
+    const fx = buildLayoutFixture();
+    try {
+      const scheduler = new MaintenanceScheduler({ debtFile: join(base, 'debt.json') });
+      const runtime = track(
+        createCognitiveRuntime({
+          root,
+          maintenance: scheduler,
+          layout: { bareRepo: fx.bare, stableWorktree: fx.stable, latestWorktree: fx.latest },
+        }),
+      );
+      // 预写触发信号（今日 signals/ JSONL：corrections → repair 演化，L1）
+      await appendSignals(runtime.signalsDir, [{ ts: Date.now(), kind: 'corrections', payload: { count: 2 } }]);
 
-    const { captured, ctx } = makeFakeCtx({ runtime });
-    apply(ctx, { bootstrap: false });
-    const r = await captured.find((c) => c.name === 'evolve')!.handler(makeInvocation('now', SESSION));
+      const { captured, ctx } = makeFakeCtx({ runtime });
+      apply(ctx, { bootstrap: false });
+      const r = await captured.find((c) => c.name === 'evolve')!.handler(makeInvocation('now', SESSION));
 
-    // 摘要：判定结果/入队任务/quantum/debt
-    expect(r.kind).toBe('success');
-    expect(r.text).toContain('should_evolve=true');
-    expect(r.text).toContain('object_layer L1');
-    expect(r.text).toContain('candidate_validation');
-    expect(r.text).toContain('quantum 执行');
-    // 事件入链：evolution/candidate（判定入链）+ maintenance/quantum
-    const { events } = await runtime.eventStore.query({ session_id: SESSION });
-    const cand = events.find((e) => e.type === 'evolution/candidate')!;
-    expect(cand).toBeDefined();
-    const candPayload = cand.payload as Record<string, unknown>;
-    expect(candPayload.stage).toBe('decision');
-    expect(candPayload.should_evolve).toBe(true);
-    expect(candPayload.object_layer).toBe('L1');
-    expect(candPayload.candidate_id).toBeNull(); // P1d 填充真实候选 id
-    expect(events.some((e) => e.type === 'maintenance/quantum')).toBe(true);
-    // R5 清债语义（评估依据 §13）：测试环境无 versions.git 线快照（旧布局）→ candidate_validation
-    // 抛 DeferredMaintenanceError → 债务保留不清零（不再空实现假成功清债；出队 + deferredEvents 记录）
-    const remaining = scheduler.debtSnapshot();
-    expect(remaining).toHaveLength(1);
-    expect(remaining[0]).toMatchObject({ task_id: 'candidate_validation', value: 8 });
-    scheduler.stop();
+      // 摘要：判定结果/入队任务/quantum/debt
+      expect(r.kind).toBe('success');
+      expect(r.text).toContain('should_evolve=true');
+      expect(r.text).toContain('object_layer L1');
+      expect(r.text).toContain('candidate_validation');
+      expect(r.text).toContain('quantum 执行');
+      // 事件入链：evolution/candidate（判定入链）+ maintenance/quantum
+      const { events } = await runtime.eventStore.query({ session_id: SESSION });
+      const cand = events.find((e) => e.type === 'evolution/candidate')!;
+      expect(cand).toBeDefined();
+      const candPayload = cand.payload as Record<string, unknown>;
+      expect(candPayload.stage).toBe('decision');
+      expect(candPayload.should_evolve).toBe(true);
+      expect(candPayload.object_layer).toBe('L1');
+      expect(candPayload.candidate_id).toBeNull(); // P1d 填充真实候选 id
+      expect(events.some((e) => e.type === 'maintenance/quantum')).toBe(true);
+      // 新种子布局：candidate_validation 真实执行演化链（corrections 触发 → 生成/验证/晋升到 fixture
+      // trusted-latest）→ 债务清偿归零（旧布局 Deferred 语义由 maintenance-deferred 测试覆盖）
+      expect(scheduler.debtSnapshot()).toEqual([]);
+      scheduler.stop();
+    } finally {
+      teardownLayoutFixture(fx);
+    }
   });
 
   it('无触发信号 → should_evolve=false 摘要（不造 evolution/candidate 事件）；maintenance/quantum 仍入链', async () => {
