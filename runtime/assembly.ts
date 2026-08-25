@@ -45,6 +45,10 @@ import {
   type RepairDisposition,
 } from '../kernel/repair-contract.js';
 import { decideVerdict, trustGate } from '../kernel/verification.js';
+// P4：Evolution 收敛——候选晋升验证契约门禁（kernel 层 2；runtime(2) → kernel(2) ✓；
+// supervisor 侧经 deps 注入回调消费——本文件为 kernel 逻辑唯一消费方；stablePromotionTrustGate 随
+// P4 stable 晋升信任门禁接线（commit 2）一并引入）
+import { runCandidateGate } from '../kernel/candidate-contract.js';
 import type { Verdict, VerificationEvidence } from '../kernel/schemas/verification.js';
 import { EventStore } from '../supervisor/event-store.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
@@ -2611,6 +2615,22 @@ export class CognitiveRuntime {
         snapshotHash: this.snapshotHash,
         shadowLogPath: join(this.evolutionRoot, 'shadows', 'exposure.log'),
         sourceEvents: [`evolution/candidate:${draft.id}`],
+        // P4：候选验证契约门禁（kernel 纯函数注入——seed → evidence → decideVerdict + trust + 非循环；
+        // DAG：runtime(2) → kernel(2) ✓；supervisor 不 import kernel 逻辑）
+        verificationGate: async (ctx) => {
+          const g = runCandidateGate(ctx.draft, {
+            g1: ctx.validation.gates.g1?.ok === true,
+            g3: ctx.validation.gates.g3?.ok === true,
+            g4: ctx.validation.gates.g4?.ok === true,
+          });
+          return {
+            ok: g.ok,
+            reason: g.reason,
+            verification: g.ok
+              ? { verdict: g.result.verdict, verifier_trust: 'L2', contract_id: g.result.contract_id }
+              : undefined,
+          };
+        },
       });
       outcomes.push(outcome);
       if (outcome.promoted && outcome.commit_hash !== undefined && outcome.object_id !== undefined) {

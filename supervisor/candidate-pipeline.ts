@@ -173,6 +173,8 @@ export interface PromoteDataCandidateDeps {
   sessionId?: string;
   /** 事件/对象 provenance runtime_snapshot */
   snapshotHash?: string;
+  /** P4：验证契约判定 payload（Evolution Object.verification 挂载；可选——未提供 → 对象无验证字段） */
+  verification?: { verdict: string; verifier_trust: string; contract_id: string };
 }
 
 /** 晋升结果 */
@@ -202,6 +204,14 @@ export interface CandidateOutcome {
   reason?: string;
 }
 
+/** P4：候选验证契约门禁结果（deps 注入回调产物；verification 为晋升 Evolution Object 挂载 payload——ok=true 时携带） */
+export interface CandidateVerificationGateResult {
+  ok: boolean;
+  reason: string;
+  /** 契约判定 payload（晋升对象挂载：verdict/verifier_trust/contract_id；ok=true 时通常携带） */
+  verification?: { verdict: string; verifier_trust: string; contract_id: string };
+}
+
 /** 端到端管线依赖 */
 export interface CandidatePipelineDeps extends DataCandidateValidationDeps {
   layout: VersionLayout;
@@ -212,6 +222,15 @@ export interface CandidatePipelineDeps extends DataCandidateValidationDeps {
   /** provenance.source_events（缺省 []） */
   sourceEvents?: string[];
   identity?: { name: string; email: string };
+  /**
+   * P4：候选验证契约门禁（deps 注入回调——supervisor 不 import kernel 逻辑，实现由 runtime 层装配注入
+   * kernel/candidate-contract.ts runCandidateGate；层 DAG 零改动）。validate 通过（passed=true）后、
+   * promoteDataCandidate 前调用；未提供 → 跳过（既有行为不变）；ok=false → 不触碰 versions.git。
+   */
+  verificationGate?: (ctx: {
+    draft: { id: string };
+    validation: DataCandidateValidation;
+  }) => Promise<CandidateVerificationGateResult>;
 }
 
 // ---- git 工具（substrate 风格：非 0 退出抛错带 stderr；Windows 瞬态锁不在此重试——调用频率低） ----
@@ -781,6 +800,8 @@ async function buildEvolutionObject(
     sourceEvents: string[];
     motivation: string;
     snapshotHash?: string;
+    /** P4：验证契约判定 payload（Evolution Object.verification 挂载；可选——无 → 对象无验证字段） */
+    verification?: { verdict: string; verifier_trust: string; contract_id: string };
   },
 ): Promise<EvolutionObject> {
   const ts = new Date().toISOString();
@@ -813,6 +834,10 @@ async function buildEvolutionObject(
     spdx: 'MIT',
     verifications: opts.verifications,
   };
+  // P4：验证契约判定挂载（可选——仅当可用时入 body；undefined 不写键，保证内容寻址 id 与落盘 JSON 一致）
+  if (opts.verification !== undefined) {
+    body.verification = opts.verification;
+  }
   const id = makeImmutableId(canonicalJson(body));
   return { ...body, id };
 }
@@ -922,6 +947,7 @@ export async function promoteDataCandidate(
       sourceEvents: deps.sourceEvents,
       motivation: deps.motivation,
       snapshotHash: deps.snapshotHash,
+      verification: deps.verification,
     });
     const objAbs = join(tmpTree, '.evolution-objects', `${candidateDirName(object.id)}.json`);
     await mkdir(dirname(objAbs), { recursive: true });
@@ -1057,6 +1083,22 @@ export async function runCandidatePipeline(
     return { ...base, validated: false, gates: vr.gates, promoted: false, reason: `验证失败: ${vr.reason}` };
   }
 
+  // P4：验证契约门禁（deps 注入回调——supervisor 不 import kernel 逻辑；未提供 → 跳过，既有行为不变；
+  // ok=false → outcome 记录 promoted=false + degraded 原因，不触碰 versions.git、不注册候选）
+  let gateResult: CandidateVerificationGateResult | undefined;
+  if (deps.verificationGate !== undefined) {
+    gateResult = await deps.verificationGate({ draft: { id: draft.id }, validation: vr });
+    if (!gateResult.ok) {
+      return {
+        ...base,
+        validated: true,
+        gates: vr.gates,
+        promoted: false,
+        reason: `验证契约门禁拒绝（degraded，不触碰版本库）: ${gateResult.reason}`,
+      };
+    }
+  }
+
   // 注册（untrusted + §6.5.2 provenance 清单：来源事件/动机/diff）
   const record: CandidateRecord = {
     id: draft.id,
@@ -1094,6 +1136,8 @@ export async function runCandidatePipeline(
     eventStore: deps.eventStore,
     sessionId: deps.sessionId,
     snapshotHash: deps.snapshotHash,
+    // P4：验证契约判定 payload（门禁结果可用 → Evolution Object.verification 挂载）
+    verification: gateResult?.verification,
   });
   return {
     ...base,
