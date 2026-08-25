@@ -89,7 +89,7 @@ import { retrieve, type RankedMemory, type RetrieveQuery } from '../memory/retri
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput, type ProcessDecisionInfo } from './governor.js';
 import { buildPrompt, type BuiltPrompt, type PromptWorkingState } from './prompt.js';
-import { buildContextProjection, buildExperienceCandidate, experienceToStageEvent, EXPERIENCE_STAGE_PRIORITY, makeRuntimeEvent, MAX_EXPERIENCES_STAGED_PER_TURN, toPromptWorkingState, toProcessSection } from './turn-helpers.js';
+import { buildContextProjection, buildExperienceCandidate, experienceToStageEvent, EXPERIENCE_STAGE_PRIORITY, makeRuntimeEvent, MAX_EXPERIENCES_STAGED_PER_TURN, shouldSampleEpisode, toPromptWorkingState, toProcessSection } from './turn-helpers.js';
 import { ProcessScheduler } from './scheduler.js';
 import type { Experience } from '../kernel/schemas/c.js';
 // R4（P0）：Experience → Memory 长期学习闭环——staging（准入）+ consolidate（dedup/merge/relation/decay）
@@ -240,6 +240,14 @@ function memorySnippet(payload: string, max = 120): string {
  */
 const PROFILE_MEMORY_ID = 'profile:user';
 
+// ---- 专项 D：记忆检索 Episode 采样（评审问题一——采样开关/高价值提升/归因代理） ----
+
+/** 采样率缺省（2%——低成本语义：prepareTurn 检索缺省几乎不记录 episode，既有零记录行为量级不变） */
+export const EPISODE_SAMPLE_RATE_DEFAULT = 0.02;
+/** 高价值提升采样率（working_state.open_questions 或 evidence_gaps 非空 → 生效采样率 ≥ 此值——
+ *  高不确定/缺口任务检索更有学习价值；待标定 §17） */
+export const EPISODE_SAMPLE_RATE_HIGH_VALUE = 0.1;
+
 /**
  * R8：本地发布签名（`git:<signer>:<keyid-hex>:<base64>` 格式，过 share.ts 签名格式门）。
  * keyid 由宿主版本 + 平台派生（本地身份标记，同宿主稳定）；签名体 = `omb-local:<object_id>`
@@ -370,6 +378,10 @@ export interface CognitiveAssemblyOptions {
    *  define→run→invoke→stop→undefine）；未注入/部分缺失 → 管线守卫自动降级受限子进程路径——既有行为
    *  不变，诚实降级） */
   dynamicRunner?: DynamicCordisRunnerLike;
+  /** 专项 D：prepareTurn 检索的 Retrieval Episode 采样率（0~1；缺省 0.02 = 2%——确定性哈希采样，
+   *  见 shouldSampleEpisode；working_state 高价值（open_questions/evidence_gaps 非空）→ 提升到
+   *  EPISODE_SAMPLE_RATE_HIGH_VALUE；kern_memory 显式记忆工具恒记录不受此限；非法值 → fail-loud） */
+  episodeSampleRate?: number;
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -441,6 +453,9 @@ export interface FinalizeTurnResult {
   maintenance: { enqueued: boolean; debt: MaintenanceDebt[] };
   checkpoint: Checkpoint | null;
   events_appended: number;
+  /** 专项 D：记忆检索 Episode 归因代理审计计数（本会话已记录 episode：attributed=外部已归因 /
+   *  pending=outcome 仍 null 保持待归因——不伪造 hit/miss；归因观测面留待） */
+  episode_attribution: { attributed: number; pending: number };
 }
 
 /** P1d：晋升摘要（首个通过者晋升；object/commit 供 /evolve 文本与事件引用） */
@@ -791,12 +806,31 @@ export class CognitiveRuntime {
   private readonly shadowSessions = new Map<string, ShadowRoute>();
   /** S7：per-line WorldModel 视图（worldModelFor——同线同状态 → 同模型；runtime 级 modelCache 不含 shadow 线） */
   private readonly perLineWorldModels = new Map<string, WorldModel>();
+  // ---- 专项 D：记忆检索 Episode 采样与归因（评审问题一） ----
+  /** prepareTurn 检索采样率（opts.episodeSampleRate；缺省 0.02 = 2%；kern_memory 恒记录不受此限） */
+  private readonly episodeSampleRate: number;
+  /** per-session 单调 turn 计数（确定性采样 token——同会话同序 → 同判定；重启后重置可接受，采样非契约） */
+  private readonly sessionTurnCounters = new Map<string, number>();
+  /** 会话 → prepareTurn 采样记录的 episode id 集（finalizeTurn 归因代理的归属面；retrieval_episode 表
+   *  无 session 列，会话归属只能在记录点（prepareTurn）捕获；kern_memory 无会话上下文不入此面） */
+  private readonly sessionEpisodes = new Map<string, Set<string>>();
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
     // provenance 的 dsh_version 全部经 hostVersion() 读取同一值；缺省 DSH_HOST_VERSION）
     if (opts.hostVersion !== undefined) {
       setHostVersion(opts.hostVersion);
+    }
+    // 专项 D：记忆检索 Episode 采样率（缺省 0.02；非法值 fail-loud——显式配置契约违反应显式暴露；
+    // 校验置于构造最前：在任何 db/存储打开之前抛错——不留半构造泄漏的句柄）
+    if (opts.episodeSampleRate !== undefined) {
+      const r = opts.episodeSampleRate;
+      if (!Number.isFinite(r) || r < 0 || r > 1) {
+        throw new Error(`CognitiveRuntime: episodeSampleRate 非法 ${String(r)}（应为 [0,1]）`);
+      }
+      this.episodeSampleRate = r;
+    } else {
+      this.episodeSampleRate = EPISODE_SAMPLE_RATE_DEFAULT;
     }
     const root = opts.root ?? join(HERE, 'workspace', '.omb');
     this.eventStore = new EventStore(opts.eventDb ?? join(root, 'events.db'));
@@ -1107,8 +1141,11 @@ export class CognitiveRuntime {
 
   /**
    * S5：kern_memory 数据源——记忆检索查询（复用 memory/retrieve 六阶段路由：scope 覆盖链/kind 过滤/
-   * 通道选择/价值排序；只读——opts.episode=false 不记录 Retrieval Episode）。scope/kind/limit 非法 →
-   * MemoryQuerySchema fail-loud → ok:false + degraded（不抛）；无匹配 → 空 items（ok:true）。
+   * 通道选择/价值排序；专项 D：显式记忆工具、低频高价值 → **恒记录 Retrieval Episode**
+   * （opts.episode=true，不受 episodeSampleRate 采样限制——每次显式检索都是归因数据；outcome 留待
+   * 归因观测面，见 finalizeTurn 归因代理与 signal-collectors scope_recorded））。
+   * scope/kind/limit 非法 → MemoryQuerySchema fail-loud → ok:false + degraded（不抛）；无匹配 → 空
+   * items（ok:true）。
    */
   async retrieveMemory(input: {
     text?: string;
@@ -1132,7 +1169,7 @@ export class CognitiveRuntime {
       if (input.kind !== undefined && input.kind.length > 0) {
         q.kind = input.kind as MemoryKind;
       }
-      const r = await retrieve(this.memory, q, { episode: false });
+      const r = await retrieve(this.memory, q, { episode: true });
       return {
         ok: true,
         items: r.items.map((it) => ({
@@ -1737,11 +1774,23 @@ export class CognitiveRuntime {
       // 过程引用写入 Working State（next_best_action）：DSH Loop 的下一步 = 执行认知过程
       working_state.next_best_action = `认知过程 ${scheduled.process_id}（${scheduled.method}）`;
     }
+    // 专项 D：记忆检索 Episode 采样（评审问题一）——确定性哈希（session_id + per-session turn 计数，
+    // shouldSampleEpisode 可测）+ 高价值提升（open_questions/evidence_gaps 非空 → 生效采样率提升）；
+    // 命中 → { episode: true } 记录并登记会话归属（finalizeTurn 归因代理面），未命中 → false（缺省
+    // 低成本语义不变——零记录行为与既有 episode:false 完全一致）
+    const sampleEpisode = shouldSampleEpisode(
+      req.session_id,
+      String(this.nextTurnToken(req.session_id)),
+      this.effectiveEpisodeSampleRate(working_state),
+    );
     const retrieved = await retrieve(
       this.memory,
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
-      { episode: false },
+      { episode: sampleEpisode },
     );
+    if (sampleEpisode && retrieved.episode !== undefined) {
+      this.recordSessionEpisode(req.session_id, retrieved.episode.id);
+    }
     // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
     // Process 调度结果 + Artifact 制品索引（S4：queryRecent 最近产物 → {id, payload} 最小形状））；
     // ΔInfoValue（S3）：WorkingState 缺口匹配启发式动态估计（estimateInfoValue）——五来源统一；空闲期反馈修正留待 §17
@@ -1971,6 +2020,12 @@ export class CognitiveRuntime {
       },
     );
 
+    // 专项 D：记忆检索 Episode 归因代理（诚实性约束——绝不伪造 hit/miss）：本会话已记录且 outcome
+    // 为 null 的 episode → 检查诚实可观测代理信号（signal-collectors/utility 语义）——本版本
+    // finalizeTurn 无检索有用性的可观测面 → 保持 null（「已记录待归因」）；检索数据量照常入 L1
+    // 信号（collectGeneralizationSignals 扩展的 scope_recorded 类），归因观测面留待（见方法注释）
+    const episode_attribution = await this.attributePendingEpisodes(input.session_id);
+
     // P1b：请求结束 → 释放快照绑定（未绑定请求 end 为空操作——cleanup 路径幂等安全）
     this.registry.end(input.session_id);
 
@@ -1984,7 +2039,65 @@ export class CognitiveRuntime {
       maintenance,
       checkpoint,
       events_appended: 1,
+      episode_attribution,
     };
+  }
+
+  /**
+   * 专项 D：记忆检索 Episode 归因代理（finalizeTurn 调用；诚实性论证见下）——
+   * 对本会话 prepareTurn 采样记录、outcome 仍为 null 的 episode 做归因检查：
+   *   - 诚实可观测的代理信号（以 signal-collectors/utility 语义为准）：本版本**不存在**——
+   *     hit/miss 需事后使用反馈（reportEpisodeOutcome——§7.4 归因入口），finalizeTurn 收尾点
+   *     没有「本次检索是否被后续使用/注入相关」的观测面，任何在此硬造的 hit/miss 都是伪造归因；
+   *   - 故**保持 null**（已记录待归因），不伪造；「已记录待归因」数据量照常入 L1 信号
+   *     （collectGeneralizationSignals 扩展的 scope_recorded 单独一类——不当作 hit 也不当作 miss）；
+   *   - 归因观测面留待：未来接入事后反馈（如会话内记忆再次被引用/注入相关性判定）后在此填 outcome。
+   * 返回审计计数 { attributed（外部已归因的 episode）, pending（outcome 仍 null 待归因）}。
+   */
+  async attributePendingEpisodes(sessionId: string): Promise<{ attributed: number; pending: number }> {
+    const ids = this.sessionEpisodes.get(sessionId);
+    if (ids === undefined || ids.size === 0) {
+      return { attributed: 0, pending: 0 };
+    }
+    let attributed = 0;
+    let pending = 0;
+    for (const id of ids) {
+      const ep = await this.memory.getEpisode(id);
+      if (ep === undefined) {
+        continue; // 已清理/未知 → 跳过（不臆造）
+      }
+      if (ep.outcome !== null) {
+        attributed++; // 外部已归因（reportEpisodeOutcome）→ 计入已归因
+      } else {
+        pending++; // 无可信代理信号 → 保持 null（已记录待归因）
+      }
+    }
+    return { attributed, pending };
+  }
+
+  // ---- 专项 D：采样辅助（确定性 turn token / 高价值提升 / 会话归属登记） ----
+
+  /** per-session 单调 turn 计数（确定性采样 token——同会话同序 → 同判定；重启后重置可接受，采样非契约） */
+  private nextTurnToken(sessionId: string): number {
+    const n = (this.sessionTurnCounters.get(sessionId) ?? 0) + 1;
+    this.sessionTurnCounters.set(sessionId, n);
+    return n;
+  }
+
+  /** 生效采样率 = 高价值提升（open_questions/evidence_gaps 非空 → max(配置率, 高价值率)；否则配置率） */
+  private effectiveEpisodeSampleRate(workingState: PromptWorkingState): number {
+    const highValue = workingState.open_questions.length > 0 || workingState.evidence_gaps.length > 0;
+    return highValue ? Math.max(this.episodeSampleRate, EPISODE_SAMPLE_RATE_HIGH_VALUE) : this.episodeSampleRate;
+  }
+
+  /** 会话 → 采样记录的 episode id 登记（retrieval_episode 表无 session 列——会话归属只能在记录点捕获） */
+  private recordSessionEpisode(sessionId: string, episodeId: string): void {
+    let set = this.sessionEpisodes.get(sessionId);
+    if (set === undefined) {
+      set = new Set();
+      this.sessionEpisodes.set(sessionId, set);
+    }
+    set.add(episodeId);
   }
 
   /**

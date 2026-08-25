@@ -111,6 +111,8 @@ export const L1_SIGNAL_KINDS = [
   // T8.21 能力向量三维真实化（信号 kind 从 L3 占位改为真实采集路径）：
   'scope_hit', //         generalization：检索 episode 跨 scope 命中（§7.4 归因；来源 retrieval_episode 表）
   'scope_miss', //        generalization：检索 episode 未命中（§7.4 归因）
+  'scope_recorded', //    generalization：检索 episode 已记录待归因（专项 D：outcome null 单独一类——
+  //                      检索数据量照常入信号；不当作 hit 也不当作 miss，归因观测面留待）
   'oracle_pass', //       interpretability：reproduction oracle 判定通过（§9.2，T8.14 执行产物）
   'oracle_fail', //       interpretability：reproduction oracle 判定失败（不可信/复现失败）
   'trusted_object', //    contamination_risk：信任池 trusted 对象（§9.3，T5.1 CandidatePool）

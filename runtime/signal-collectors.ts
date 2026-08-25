@@ -4,7 +4,8 @@
 //
 // 采集器（每维独立事实来源）：
 // - collectGeneralizationSignals：检索 episode 归因统计（跨 scope 命中率）——真实来源 =
-//   retrieval_episode 表（§7.4 recordEpisode/reportEpisodeOutcome 归因数据），产出 L1 scope_hit/scope_miss；
+//   retrieval_episode 表（§7.4 recordEpisode/reportEpisodeOutcome 归因数据），产出 L1 scope_hit/scope_miss
+//   （专项 D：null-outcome「已记录待归因」单独计为 scope_recorded——检索数据量照常入信号）；
 // - collectInterpretabilitySignals：reproduction oracle 可复现性——真实来源 = T8.14
 //   runReproductionOracle 执行产物（OracleVerdict，independent anchor + 沙箱复现 + adversarial validation），
 //   产出 L1 oracle_pass/oracle_fail；
@@ -38,8 +39,11 @@ function countSignal(
 }
 
 /**
- * generalization 采集（跨 scope 检索命中率）：全部 retrieval_episode 行 → 归因（outcome 非 null）
- * 且 created ∈ window 的 episode 分 hit/miss 计数 → L1 scope_hit/scope_miss（target = 被评估对象）。
+ * generalization 采集（跨 scope 检索命中率）：全部 retrieval_episode 行 → created ∈ window 的 episode
+ * 分 hit/miss 计数 → L1 scope_hit/scope_miss（target = 被评估对象）。
+ * 专项 D（评审问题一）：outcome 为 null 的 episode（已记录待归因——采样记录后归因观测面未到）单独计为
+ * L1 scope_recorded——检索数据量照常入信号，且**不当作 hit 也不当作 miss**（诚实分离：归因观测面留待，
+ * evaluate 的 generalization 比率只认 scope_hit/scope_miss，待归因不稀释分母）。
  */
 export async function collectGeneralizationSignals(
   backend: RetrievalBackend,
@@ -49,8 +53,13 @@ export async function collectGeneralizationSignals(
   const episodes = await backend.listEpisodes();
   let hit = 0;
   let miss = 0;
+  let pending = 0;
   for (const ep of episodes) {
-    if (ep.outcome === null || ep.created < window.from || ep.created > window.to) {
+    if (ep.created < window.from || ep.created > window.to) {
+      continue;
+    }
+    if (ep.outcome === null) {
+      pending++; // 已记录待归因（outcome 未归因——不伪造 hit/miss）
       continue;
     }
     if (ep.outcome === 'hit') {
@@ -62,8 +71,10 @@ export async function collectGeneralizationSignals(
   const out: EvaluationSignal[] = [];
   const s1 = countSignal('scope_hit', target, hit, window);
   const s2 = countSignal('scope_miss', target, miss, window);
+  const s3 = countSignal('scope_recorded', target, pending, window);
   if (s1 !== null) out.push(s1);
   if (s2 !== null) out.push(s2);
+  if (s3 !== null) out.push(s3);
   return out;
 }
 
