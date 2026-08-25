@@ -28,6 +28,11 @@ import {
 } from '../../runtime/kern-tools.js';
 import { clearDegradations, degradationLog } from '../../runtime/loop-hooks.js';
 import { memoryRetrievalComponent, type MemoryRetrievalEffect } from '../../memory/memory-retrieval.js';
+import { buildLayoutFixture, teardownLayoutFixture } from '../helpers/git.js';
+
+/** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行时
+ *  git/icacls 饱和（已知 flake 类）→ 放宽防环境超时） */
+const FIXTURE_TIMEOUT = 30000;
 
 let base: string;
 let root: string;
@@ -229,23 +234,40 @@ describe('P2 DSH 工具注册桥（kern_status）', () => {
     expect(typeof def!.output.render).toBe('function');
   });
 
-  it('execute 返回状态摘要：版本线/快照哈希/lineSnapshot/debt 快照/最近信号数/组件健康（纯读取）', async () => {
-    runtime = track(createCognitiveRuntime({ root }));
-    const { ctx, tools } = makeFakeCtx({ runtime });
-    apply(ctx, { bootstrap: false });
-    const def = tools.find((t) => t.name === 'kern_status')!;
-    const summary = (await def.execute({}, {})) as KernStatusSummary;
+  it(
+    'execute 返回状态摘要：版本线/快照哈希/lineSnapshot/debt 快照/最近信号数/组件健康（纯读取）',
+    async () => {
+      // 注入临时 fixture 布局（机器状态解耦——同 evolution-signals ⑥ / evolve-command ②）：
+      // 不注入会解析真实机器的合法线快照（workspace/.omb/lines/stable/...），断言随机器状态漂移
+      const fx = buildLayoutFixture();
+      try {
+        runtime = track(
+          createCognitiveRuntime({
+            root,
+            layout: { bareRepo: fx.bare, stableWorktree: fx.stable, latestWorktree: fx.latest },
+          }),
+        );
+        const { ctx, tools } = makeFakeCtx({ runtime });
+        apply(ctx, { bootstrap: false });
+        const def = tools.find((t) => t.name === 'kern_status')!;
+        const summary = (await def.execute({}, {})) as KernStatusSummary;
 
-    expect(summary.line).toBe('stable'); // 缺省版本线
-    expect(summary.snapshot_hash).toMatch(/^rs:/); // 快照哈希（rs:<16hex> 或全降级 rs:assembly）
-    expect(summary.line_snapshot).toBeNull(); // 测试无 lines 物化快照 → null
-    expect(Array.isArray(summary.debt)).toBe(true); // 维护债务快照（未注入 scheduler → 空数组）
-    expect(typeof summary.recent_signals).toBe('number'); // 最近信号数（无信号目录 → 0）
-    expect(summary.components.registered).toContain('component:memory-retrieval');
-    expect(summary.components.active).toContain('component:memory-retrieval');
-    expect(summary.components.suspicious).toEqual([]);
-    expect(summary.components.health[0]).toMatchObject({ manifest_id: 'component:memory-retrieval', ok: true });
-  });
+        expect(summary.line).toBe('stable'); // 缺省版本线
+        expect(summary.snapshot_hash).toMatch(/^rs:/); // 快照哈希（rs:<16hex> 或全降级 rs:assembly）
+        // fixture 布局注入 → 线快照按 fixture 确定性物化（line='stable'；commit/dir 为 fixture 值，非真实机器状态）
+        expect(summary.line_snapshot).toMatchObject({ line: 'stable' });
+        expect(Array.isArray(summary.debt)).toBe(true); // 维护债务快照（未注入 scheduler → 空数组）
+        expect(typeof summary.recent_signals).toBe('number'); // 最近信号数（无信号目录 → 0）
+        expect(summary.components.registered).toContain('component:memory-retrieval');
+        expect(summary.components.active).toContain('component:memory-retrieval');
+        expect(summary.components.suspicious).toEqual([]);
+        expect(summary.components.health[0]).toMatchObject({ manifest_id: 'component:memory-retrieval', ok: true });
+      } finally {
+        teardownLayoutFixture(fx);
+      }
+    },
+    FIXTURE_TIMEOUT,
+  );
 
   it('kern_status 独立定义：无 runtime.status() → execute 降级返回（ok=false + degraded），不抛', async () => {
     const def = kernStatusTool({ status: undefined });
