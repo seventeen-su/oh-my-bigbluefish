@@ -1,7 +1,8 @@
 // layer 2：组件↔DSH 工具注册桥（设计 §6 平台集成——ctx.tools.register 少量精炼工具，kern_* 命名，
 // 工具数 <10；施工 P2：先落 kern_status 验证桥机制；S5（2026-08-24）：补齐 kern_bench/kern_evolve/
-// kern_switch/kern_memory 四工具——合计 5 个，全部为认知运行时方法（benchV2/runEvolutionNow/
-// switchLine/retrieveMemory）的薄封装，非命令 handler 复用；守卫与降级对齐 kern_status）。
+// kern_switch/kern_memory 四工具——合计 5 个；W1（2026-08-25 未接线审计修复）：新增 kern_profile
+// 画像写入工具——合计 6 个，全部为认知运行时方法（benchV2/runEvolutionNow/switchLine/retrieveMemory/
+// upsertProfile）的薄封装，非命令 handler 复用；守卫与降级对齐 kern_status）。
 //
 // 宿主契约（真实 DSH，不引包——结构最小接口 + 守卫）：
 // - ToolSchema（packages/llm/llm/src/types.ts:333）：{ name, description, parameters }——模型可见面；
@@ -177,6 +178,16 @@ export interface MemoryRetrievalToolResultLike {
   degraded: string | null;
 }
 
+/** W1：kern_profile 结果（runtime.upsertProfile 返回——画像写入摘要；失败 → degraded 非空不抛） */
+export interface ProfileUpsertToolResultLike {
+  id: string;
+  kind: 'Profile';
+  scope: string;
+  created: boolean;
+  updated: boolean;
+  degraded: string | null;
+}
+
 /** kern_* 数据源（认知运行时最小结构面——仅方法签名；结构最小接口，不引 runtime/assembly） */
 export interface KernRuntimeLike {
   status?(): Promise<KernStatusSummary>;
@@ -194,6 +205,8 @@ export interface KernRuntimeLike {
     limit?: number;
     relation?: string;
   }): Promise<MemoryRetrievalToolResultLike>;
+  /** W1：kern_profile 数据源——画像写入（Profile 记忆 Global 作用域；upsert 语义——存在更新/缺省合并） */
+  upsertProfile?(input: { profile: string; replace?: boolean }): Promise<ProfileUpsertToolResultLike>;
 }
 
 /** 从 DSH execute exec 上下文读取会话 id（结构最小面；缺失 → undefined） */
@@ -467,8 +480,70 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
 }
 
 /**
- * 注册 kern_* 工具集（S5：全部 5 个——kern_status/kern_bench/kern_evolve/kern_switch/kern_memory；
- * 工具数 <10 纪律，设计 §6 命名清单齐备）。
+ * W1（未接线审计修复 2026-08-25）：kern_profile 工具定义——登记/更新用户画像。画像 = 单条 Profile
+ * 记忆（确定性 id 'profile:user'，Global 作用域跨项目可检索）；存在 → 更新 payload（replace=true
+ * 覆写 / 缺省合并追加去重）；不存在 → 新建。画像读取面（kern_memory kind=Profile scope=Global）与
+ * 写入面（kern_profile）由此闭合。execute 返回 {ok, text} 风格（降级语义对齐 kern_*）。
+ */
+export function kernProfileTool(runtime: KernRuntimeLike): ToolDefinitionLike {
+  return {
+    name: 'kern_profile',
+    description: '登记/更新用户画像（Profile 记忆，Global 作用域——跨项目可检索；kern_memory kind=Profile scope=Global 读取）',
+    parameters: {
+      type: 'object',
+      properties: {
+        profile: { type: 'string', description: '画像文本（自由格式——用户身份/偏好/背景/约束等）' },
+        replace: { type: 'boolean', description: 'true=覆写既有画像；缺省 false=合并追加（新内容未包含于既有画像时追加）' },
+      },
+      required: ['profile'],
+    },
+    output: {
+      schema: { type: 'object' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      presentationMeta: (_args, value) => value as Record<string, unknown>,
+    },
+    execute: async (args) => {
+      if (typeof runtime.upsertProfile !== 'function') {
+        return { ok: false, text: '认知运行时未提供 upsertProfile()（kern_profile 数据源缺失）' };
+      }
+      const a = (args ?? {}) as { profile?: unknown; replace?: unknown };
+      if (typeof a.profile !== 'string') {
+        return { ok: false, text: 'kern_profile 参数非法：profile 必填且必须为字符串' };
+      }
+      if (a.replace !== undefined && typeof a.replace !== 'boolean') {
+        return { ok: false, text: 'kern_profile 参数非法：replace 必须为布尔值' };
+      }
+      const r = await runtime.upsertProfile({ profile: a.profile, replace: a.replace === true });
+      if (r.degraded !== null) {
+        return {
+          ok: false,
+          text: `用户画像写入失败：${r.degraded}`,
+          id: r.id,
+          kind: r.kind,
+          scope: r.scope,
+          created: r.created,
+          updated: r.updated,
+          degraded: r.degraded,
+        };
+      }
+      const op = r.created ? '已创建' : '已更新';
+      return {
+        ok: true,
+        text: `用户画像${op}：id=${r.id}（kind=${r.kind}/scope=${r.scope}${r.updated ? '——payload 已写入' : ''}）`,
+        id: r.id,
+        kind: r.kind,
+        scope: r.scope,
+        created: r.created,
+        updated: r.updated,
+        degraded: null,
+      };
+    },
+  };
+}
+
+/**
+ * 注册 kern_* 工具集（S5：5 个——kern_status/kern_bench/kern_evolve/kern_switch/kern_memory；
+ * W1（2026-08-25）：新增 kern_profile 画像写入——合计 6 个；工具数 <10 纪律，设计 §6 命名清单齐备）。
  * 守卫：tools.register 缺失/注册失败 → 降级不崩（返回 degraded 由调用方记录）。返回注册清单 + 注销 disposers
  * （真实 DSH register 返回 disposer；P8 注册皆效应——调用方把 disposers 注册进 ctx.effect，关闭时批量注销）。
  */
@@ -486,6 +561,7 @@ export function registerKernTools(tools: ToolsLike, runtime: KernRuntimeLike): {
     kernEvolveTool(runtime),
     kernSwitchTool(runtime),
     kernMemoryTool(runtime),
+    kernProfileTool(runtime),
   ];
   const registered: string[] = [];
   const disposers: Array<() => void> = [];

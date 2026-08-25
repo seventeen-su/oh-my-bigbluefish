@@ -27,7 +27,7 @@ import type { Fingerprint, Scope } from '../kernel/schemas/base.js';
 // R6：宿主版本唯一来源注入面（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
 import { hostVersion, setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
-import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type MemoryKind } from '../kernel/schemas/m.js';
+import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type Memory, type MemoryKind } from '../kernel/schemas/m.js';
 import { StateSchema, type State, type SelfModel, type WorldModel } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type ShadowPolicy } from '../kernel/policy-loader.js';
@@ -222,6 +222,13 @@ function memorySnippet(payload: string, max = 120): string {
   }
   return payload.length > max ? `${payload.slice(0, max)}…` : payload;
 }
+
+/**
+ * W1（未接线审计修复 2026-08-25）：画像记录确定性 id（单条 Profile 记忆——跨会话稳定，
+ * kern_profile 写入 / kern_memory kind=Profile scope=Global 读取共用）。可变对象 id（非 sha256）：
+ * `profile:<用户标识>` 命名空间，当前用户画像固定 'profile:user'（多用户场景按用户标识扩展）。
+ */
+const PROFILE_MEMORY_ID = 'profile:user';
 
 /**
  * R8：本地发布签名（`git:<signer>:<keyid-hex>:<base64>` 格式，过 share.ts 签名格式门）。
@@ -602,6 +609,17 @@ export interface MemoryRetrievalToolResult {
   items: MemoryRetrievalEntry[];
   channel_used: string;
   scope_chain: string[];
+  degraded: string | null;
+}
+
+/** W1（未接线审计修复 2026-08-25）：画像写入数据源结果（kern_profile——Profile 记忆 Global 作用域；
+ *  created=true 新建 / updated=true 更新 / 失败 → degraded 非空（不抛）） */
+export interface ProfileUpsertResult {
+  id: string;
+  kind: 'Profile';
+  scope: string;
+  created: boolean;
+  updated: boolean;
   degraded: string | null;
 }
 
@@ -1112,6 +1130,82 @@ export class CognitiveRuntime {
       };
     } catch (err) {
       return { ok: false, items: [], channel_used: 'lexical', scope_chain: [], degraded: errorDetail(err) };
+    }
+  }
+
+  /**
+   * W1（未接线审计修复 2026-08-25）：画像写入数据源——用户画像 = 单条 Profile 记忆（确定性 id
+   * 'profile:user'，Global 作用域——跨项目可检索）。不存在 → 新建（kind='Profile'，prov_class=
+   * 'User-declared'，scope='Global'）；已存在 → 更新 payload：replace=true 覆写 / 缺省（false/未提供）
+   * 合并追加（新文本未包含于既有 payload 时以换行追加，已包含 → payload 不变仅刷新 updated——去重）。
+   * 校验：profile 非空字符串（空 → degraded 非法输入）；失败 → degraded 字段（不抛，工具面降级语义
+   * 对齐 kern_*）；尽力而为（单条记录 upsert，不触碰其它记忆/事件面）。
+   */
+  async upsertProfile(input: { profile: string; replace?: boolean }): Promise<ProfileUpsertResult> {
+    const profile = typeof input?.profile === 'string' ? input.profile : '';
+    if (profile.trim().length === 0) {
+      return {
+        id: PROFILE_MEMORY_ID,
+        kind: 'Profile',
+        scope: 'Global',
+        created: false,
+        updated: false,
+        degraded: '非法输入：profile 必须为非空字符串',
+      };
+    }
+    try {
+      const existing = await this.memory.getById(PROFILE_MEMORY_ID);
+      if (existing === undefined) {
+        // 不存在 → 新建（单条画像记录；provenance.event = 确定性 id——幂等键防重复 ingest）
+        const now = new Date().toISOString();
+        const record: Memory = {
+          ir_version: '2.0',
+          id: PROFILE_MEMORY_ID,
+          schema: 'omb/M1',
+          scope: 'Global',
+          lifecycle: 'Active',
+          immutable: false,
+          owner: 'kernel',
+          created: now,
+          updated: now,
+          provenance: {
+            source: 'kern_profile',
+            event: PROFILE_MEMORY_ID,
+            actor: 'user',
+            environment: this.fingerprintCollector(),
+            runtime_snapshot: this.snapshotHash,
+            timestamp: now,
+            transformation_chain: [],
+            verification: 'kern_profile',
+          },
+          refs: [],
+          kind: 'Profile',
+          prov_class: 'User-declared',
+          payload: profile,
+          value_score: 0.9, // 用户声明画像高价值（初值占位，§17 标定）
+          utility_counts: { retrieval: 0, hit: 0, miss: 0, inject: 0, decay: 0, promote: 0 },
+        };
+        const id = await this.memory.ingest(record);
+        return { id, kind: 'Profile', scope: 'Global', created: true, updated: false, degraded: null };
+      }
+      // 已存在 → 更新 payload（replace=true 覆写 / 缺省合并追加去重；updated 由 backend.update 刷新）
+      const merged =
+        input.replace === true
+          ? profile
+          : existing.payload.includes(profile)
+            ? existing.payload
+            : `${existing.payload}\n${profile}`;
+      await this.memory.update(PROFILE_MEMORY_ID, { payload: merged });
+      return { id: PROFILE_MEMORY_ID, kind: 'Profile', scope: 'Global', created: false, updated: true, degraded: null };
+    } catch (err) {
+      return {
+        id: PROFILE_MEMORY_ID,
+        kind: 'Profile',
+        scope: 'Global',
+        created: false,
+        updated: false,
+        degraded: errorDetail(err),
+      };
     }
   }
 
