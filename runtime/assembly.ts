@@ -62,6 +62,13 @@ import {
 } from '../supervisor/verification-stores.js';
 // S2：验证债务队列（layer 1 JSONL——shadow/repair 未决验证统一复核面；runtime(2) → supervisor(1) ✓）
 import { VerificationDebt } from '../supervisor/verification-debt.js';
+// S4：Artifact Index（layer 1 JSONL——事件驱动制品索引；装配/发现/查询；runtime(2) → supervisor(1) ✓）
+import {
+  ARTIFACT_DISCOVERY_EVENT_LIMIT,
+  ARTIFACT_DISCOVERY_FETCH_LIMIT,
+  ArtifactIndex,
+  discoverArtifactsFromEvents,
+} from '../supervisor/artifact-index.js';
 // S2：机械评分器（过程质量向量 + 可控性分类——kernel 层 2 纯函数；runtime(2) → kernel(2) ✓）
 import { normalizeProcessQuality, qualityVectorFromSignals } from '../kernel/process-quality.js';
 import { classifyFromText } from '../kernel/controllability.js';
@@ -333,6 +340,8 @@ export interface CognitiveAssemblyOptions {
   /** P3.6：验证数据面根目录（事实库/基线库/任务库；缺省 <root>/.evolution/verification——与
    *  signals/decay/repair 同 .evolution 根系；测试注入临时目录隔离真实 workspace） */
   verificationRoot?: string;
+  /** S4：制品索引根目录（缺省 <evolutionRoot>/artifacts = <root>/.evolution/artifacts；测试注入临时目录隔离） */
+  artifactIndexRoot?: string;
   /** S2：验证债务队列（shadow/repair 未决验证；缺省 <verificationRoot>/debt.jsonl 内部构造——
    *  测试注入隔离队列；消费：writeShadowOutcome/runRepair 入队 + verification_review 复核） */
   verificationDebt?: VerificationDebt;
@@ -693,6 +702,8 @@ export class CognitiveRuntime {
   /** S2：单次结构化 Judge 执行器（装配面注入 spawnJudge；null = 未注入 → judge 不可用，
    *  复核按不可用转人工（诚实降级——不假装判定）） */
   readonly judgeExecutor: JudgeExecutor | null;
+  /** S4：事件驱动制品索引（.evolution/artifacts/index.jsonl——最近产物查询面；装配即用，构造零 I/O） */
+  readonly artifactIndex: ArtifactIndex;
   private policyPromise: Promise<PolicyBundle> | null = null;
   private processesPromise: Promise<readonly ProcessDef[]> | null = null;
   /** P1b：请求级快照注册表（装配期创建；prepareTurn 绑定 / finalizeTurn 释放 / promote 切换，§6.5.7） */
@@ -803,6 +814,11 @@ export class CognitiveRuntime {
     // 测试注入隔离队列；judgeExecutor 未注入 → null = judge 不可用，诚实降级）
     this.verificationDebt = opts.verificationDebt ?? new VerificationDebt({ root: this.verificationRoot });
     this.judgeExecutor = opts.judgeExecutor ?? null;
+    // S4：制品索引装配（缺省 <evolutionRoot>/artifacts = <root>/.evolution/artifacts——与 signals/
+    // decay/repair/verification 同 .evolution 根系；构造零 I/O 首写建目录；测试注入临时目录隔离）
+    this.artifactIndex = new ArtifactIndex({
+      root: opts.artifactIndexRoot ?? join(this.evolutionRoot, 'artifacts'),
+    });
     // P7：环境指纹（Predictive Invalidation）装配——采集器注入（缺省运行时采集）+ 衰减记录落盘目录
     this.fingerprintCollector = opts.environmentFingerprint ?? (() => collectEnvironmentFingerprint());
     this.decayDir = join(this.evolutionRoot, 'decay');
@@ -1596,7 +1612,7 @@ export class CognitiveRuntime {
       { episode: false },
     );
     // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
-    // Process 调度结果；Artifact 缺省空——CognitiveRuntime 未装配 artifact-store，装配方注入后生效）；
+    // Process 调度结果 + Artifact 制品索引（S4：queryRecent 最近产物 → {id, payload} 最小形状））；
     // ΔInfoValue（S3）：WorkingState 缺口匹配启发式动态估计（estimateInfoValue）——五来源统一；空闲期反馈修正留待 §17
     const projection = await buildContextProjection(
       policy,
@@ -1604,7 +1620,15 @@ export class CognitiveRuntime {
       working_state,
       retrieved.items,
       toProcessSection(scheduled),
-      { eventStore: this.eventStore, capabilities: this.capabilities, session_id: req.session_id },
+      {
+        eventStore: this.eventStore,
+        capabilities: this.capabilities,
+        artifacts: (goal, limit) =>
+          this.artifactIndex.queryRecent(limit).then((list) =>
+            list.map((a) => ({ id: a.id, payload: `制品 ${a.type}: ${a.path}` })),
+          ),
+        session_id: req.session_id,
+      },
     );
 
     // S7：shadow 会话首请求 exposure 落盘（尽力而为——失败降级记录不阻塞请求）
@@ -1685,6 +1709,10 @@ export class CognitiveRuntime {
       reason: input.decision.reason,
     }, ['finalizeTurn']);
     await this.eventStore.append(made);
+
+    // S4：事件驱动制品索引——收尾从最近会话 tool/result 事件发现新制品 → 逐条注册（尽力而为：
+    // 失败降级记录不抛——制品索引缺失/不可写不阻塞收尾；无 tool/result → 无发现）
+    await this.discoverAndIndexArtifacts(input.session_id);
 
     const experience = buildExperienceCandidate(input.session_id, input.decision, input.working_state);
 
@@ -1826,6 +1854,38 @@ export class CognitiveRuntime {
       checkpoint,
       events_appended: 1,
     };
+  }
+
+  /**
+   * S4：制品发现与索引（finalizeTurn 收尾调用；尽力而为——失败降级记录不抛，不阻塞收尾）。
+   * 从最近会话事件（拉取窗口 ARTIFACT_DISCOVERY_FETCH_LIMIT、取窗口尾最近 ARTIFACT_DISCOVERY_EVENT_LIMIT 条）
+   * 提取 tool/result 事件 → discoverArtifactsFromEvents（root=仓库根 HERE：路径解析到 root 下且文件存在 →
+   * 读内容 sha256 → manifest restorable:true；幽灵路径跳过；root 下的环境指纹 = 采集器注入面
+   * （缺省 collectEnvironmentFingerprint）→ 逐条 index.register（同 id 覆写）。
+   */
+  private async discoverAndIndexArtifacts(sessionId: string): Promise<void> {
+    try {
+      const { events } = await this.eventStore.query({
+        session_id: sessionId,
+        limit: ARTIFACT_DISCOVERY_FETCH_LIMIT,
+      });
+      // event-store 为 seq ASC 分页——取窗口尾（最近）的 ARTIFACT_DISCOVERY_EVENT_LIMIT 条会话事件
+      const recent = events.slice(-ARTIFACT_DISCOVERY_EVENT_LIMIT);
+      const fingerprint = this.fingerprintCollector();
+      const environment: Record<string, string> = {};
+      for (const [k, v] of Object.entries(fingerprint)) {
+        if (typeof v === 'string') {
+          environment[k] = v; // Fingerprint 可选键（gpu/cuda）缺省 → 过滤非字符串
+        }
+      }
+      const manifests = await discoverArtifactsFromEvents(recent, { root: HERE, environment });
+      for (const m of manifests) {
+        await this.artifactIndex.register(m);
+      }
+    } catch (err) {
+      // 制品发现/索引失败 → 降级记录不抛（尽力而为——制品索引缺失不阻塞事件主链）
+      recordDegradation('artifact/index', `制品发现/索引失败（${errorDetail(err)}）——尽力而为`);
+    }
   }
 
   /**

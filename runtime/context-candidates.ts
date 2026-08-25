@@ -15,7 +15,6 @@ import type { RankedMemory } from '../memory/retrieve.js';
 import { tokenizeForFts } from '../memory/cjk-ngram.js';
 import type { Event } from '../kernel/schemas/m.js';
 import type { CapabilityLike } from '../supervisor/capability.js';
-import type { ArtifactMeta } from '../supervisor/artifact-store.js';
 import {
   estimateTokens,
   renderProcessContent,
@@ -137,16 +136,20 @@ export interface CapabilitySource {
   list(): CapabilityLike[];
 }
 
-/** artifact 来源：制品索引面（最近/关联制品；get 范围恢复为编译面职责，收集只需 meta） */
-export interface ArtifactSource {
-  index(): Promise<Map<string, ArtifactMeta>>;
+/** artifact 来源：制品索引查询面（S4 Artifact Index——goal 为任务关联查询预留；当前索引提供最近 N 条） */
+export interface ArtifactQueryItem {
+  id: string;
+  payload: string;
 }
 
-/** R7 候选来源集（缺省无 artifactStore → artifact 候选空——CognitiveRuntime 未装配 artifact-store） */
+/** artifact 来源函数（goal=当前任务 goal——关联查询预留；limit=封顶；返回 {id, payload} 最小形状） */
+export type ArtifactSource = (goal: string, limit: number) => Promise<ArtifactQueryItem[]>;
+
+/** R7 候选来源集（缺省无 artifacts 来源 → artifact 候选空——未装配 Artifact Index，装配方注入后生效） */
 export interface ContextCandidateSources {
   eventStore: EvidenceEventSource;
   capabilities: CapabilitySource;
-  artifactStore?: ArtifactSource;
+  artifacts?: ArtifactSource;
 }
 
 /** gatherContextCandidates 输入（working_state 被 estimateInfoValue 缺口匹配启发式读取——S3；goal 契约预留） */
@@ -250,35 +253,23 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
     });
   }
 
-  // Artifact：最近制品（created 降序，K 条封顶；缺省空——CognitiveRuntime 未装配 artifact-store，
-  // 装配方注入来源后生效；「关联制品」（按任务/会话）无既有数据面 → 留待 §17）
-  if (runtime.artifactStore !== undefined) {
+  // Artifact：制品索引最近产物（K 条封顶；缺省空——未装配 Artifact Index 时无 artifact 候选，装配方
+  // 注入后生效；「关联制品」（按任务/会话匹配）为查询面预留——S4 索引当前提供最近 N 条，任务关联匹配留待 §17）
+  if (runtime.artifacts !== undefined) {
     try {
-      const index = await runtime.artifactStore.index();
-      const metas = [...index.entries()]
-        .sort((a, b) =>
-          a[1].created === b[1].created
-            ? a[0] < b[0]
-              ? -1
-              : 1
-            : a[1].created < b[1].created
-              ? 1
-              : -1,
-        )
-        .slice(0, ARTIFACT_CANDIDATE_LIMIT);
-      for (const [id, meta] of metas) {
-        const content = `制品：${meta.type}（${meta.scope}）`;
+      const artifacts = await runtime.artifacts(input.goal, ARTIFACT_CANDIDATE_LIMIT);
+      for (const a of artifacts) {
         out.push({
           kind: 'artifact',
-          ref: id,
+          ref: a.id,
           view: 'pointer',
-          content,
-          tokens_est: estimateTokens(content),
-          info_value: valueOf(content),
+          content: a.payload,
+          tokens_est: estimateTokens(a.payload),
+          info_value: valueOf(a.payload),
         });
       }
     } catch {
-      // 制品索引失败 → 无 artifact 候选（尽力而为）
+      // 制品索引查询失败 → 无 artifact 候选（尽力而为）
     }
   }
 
