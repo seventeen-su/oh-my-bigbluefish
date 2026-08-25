@@ -24,7 +24,6 @@ import { ContextProjectionSchema } from '../../kernel/schemas/a.js';
 import type { Event } from '../../kernel/schemas/m.js';
 import type { RankedMemory } from '../../memory/retrieve.js';
 import type { CapabilityLike } from '../../supervisor/capability.js';
-import type { ArtifactMeta } from '../../supervisor/artifact-store.js';
 import { compile, type ProcessSectionInput } from '../../runtime/renderer.js';
 import { buildContextProjection, makeRuntimeEvent } from '../../runtime/turn-helpers.js';
 import { createCognitiveRuntime, type CognitiveRuntime } from '../../runtime/assembly.js';
@@ -106,9 +105,9 @@ function fakeCapabilities(caps: CapabilityLike[]): { list: () => CapabilityLike[
   return { list: () => caps };
 }
 
-/** fake 制品库（index 返回注入 meta 表） */
-function fakeArtifacts(metas: Record<string, ArtifactMeta>): { index: () => Promise<Map<string, ArtifactMeta>> } {
-  return { index: async () => new Map(Object.entries(metas)) };
+/** fake 制品索引来源（S4 artifacts 函数：返回注入条目，limit 截断——排序为索引侧查询面职责） */
+function fakeArtifacts(items: Array<{ id: string; payload: string }>): (goal: string, limit: number) => Promise<Array<{ id: string; payload: string }>> {
+  return async (goal, limit) => items.slice(0, limit);
 }
 
 /** RankedMemory 最小构造（payload/值可注入） */
@@ -258,69 +257,48 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(p!.info_value).toBe(INFO_VALUE_BASE);
   });
 
-  it('artifact：制品索引 → artifact 候选（view=pointer、按 created 降序取 K；ref=制品 id）', async () => {
-    const metas: Record<string, ArtifactMeta> = {
-      'sha256:0000000000000000000000000000000000000000000000000000000000000001': {
-        type: 'report',
-        scope: 'Project',
-        size: 10,
-        created: '2026-08-21T00:00:00.000Z',
-      },
-      'sha256:0000000000000000000000000000000000000000000000000000000000000002': {
-        type: 'log',
-        scope: 'Project',
-        size: 20,
-        created: '2026-08-22T00:00:00.000Z',
-      },
-      'sha256:0000000000000000000000000000000000000000000000000000000000000003': {
-        type: 'code',
-        scope: 'Global',
-        size: 30,
-        created: '2026-08-23T00:00:00.000Z',
-      },
-    };
+  it('artifact：制品索引（S4 artifacts 来源）→ artifact 候选（ref=制品 id、view=pointer、content=payload 透传）', async () => {
+    const items = [
+      { id: 'artifact:a', payload: '制品 report: report.json' },
+      { id: 'artifact:b', payload: '制品 doc: notes.md' },
+      { id: 'artifact:c', payload: '制品 source: src/app.ts' },
+    ];
     const cands = await gatherContextCandidates(
       gatherInput({
         runtime: {
           eventStore: fakeEventStore([]),
           capabilities: fakeCapabilities([]),
-          artifactStore: fakeArtifacts(metas),
+          artifacts: fakeArtifacts(items),
         },
       }),
     );
     const arts = cands.filter((c) => c.kind === 'artifact');
     expect(arts).toHaveLength(3);
-    expect(arts.map((c) => c.ref)).toEqual([
-      'sha256:0000000000000000000000000000000000000000000000000000000000000003', // created 最新优先
-      'sha256:0000000000000000000000000000000000000000000000000000000000000002',
-      'sha256:0000000000000000000000000000000000000000000000000000000000000001',
-    ]);
+    expect(arts.map((c) => c.ref)).toEqual(['artifact:a', 'artifact:b', 'artifact:c']); // 来源序透传（排序=索引侧 queryRecent 职责）
     expect(arts[0]!.view).toBe('pointer');
+    expect(arts[0]!.content).toBe('制品 report: report.json');
   });
 
-  it('artifact 封顶：5 制品 → 恰 ARTIFACT_CANDIDATE_LIMIT 条（最近 K 条）', async () => {
-    const metas: Record<string, ArtifactMeta> = {};
-    for (let i = 1; i <= 5; i++) {
-      metas[`sha256:${String(i).padStart(64, '0')}`] = {
-        type: `t${i}`,
-        scope: 'Project',
-        size: i,
-        created: `2026-08-2${i}T00:00:00.000Z`,
-      };
-    }
+  it('artifact 封顶：artifacts 来源返回 5 条 → 恰 ARTIFACT_CANDIDATE_LIMIT 条（gather 传 K 为 limit）', async () => {
+    const items = Array.from({ length: 5 }, (_, i) => ({ id: `artifact:${i}`, payload: `制品 data: f${i}.json` }));
+    let passedLimit = 0;
     const cands = await gatherContextCandidates(
       gatherInput({
         runtime: {
           eventStore: fakeEventStore([]),
           capabilities: fakeCapabilities([]),
-          artifactStore: fakeArtifacts(metas),
+          artifacts: async (goal, limit) => {
+            passedLimit = limit;
+            return items.slice(0, limit);
+          },
         },
       }),
     );
     expect(cands.filter((c) => c.kind === 'artifact')).toHaveLength(ARTIFACT_CANDIDATE_LIMIT);
+    expect(passedLimit).toBe(ARTIFACT_CANDIDATE_LIMIT);
   });
 
-  it('artifact 缺省空：无 artifactStore 来源（CognitiveRuntime 未装配）→ 无 artifact 候选', async () => {
+  it('artifact 缺省空：无 artifacts 来源（未装配 Artifact Index）→ 无 artifact 候选', async () => {
     const cands = await gatherContextCandidates(
       gatherInput({ runtime: { eventStore: fakeEventStore([]), capabilities: fakeCapabilities([]) } }),
     );
