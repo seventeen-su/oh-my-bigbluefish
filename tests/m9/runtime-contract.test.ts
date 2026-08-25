@@ -5,12 +5,17 @@
 //   ② context 注册：cognitive:contract（order 80，静态文本）+ cognitive:capabilities（order 85，同步文本）
 //      + cognitive:projection（order 90）；无 context 面 → 降级记录不抛
 //   ③ buildCapabilitiesLine 纯函数：capabilities 有/无、judge/runner 真假组合、全未知兜底
+//   ④ SKILL.md：仓库文件存在、frontmatter name/description 非空、正文含命令/工具/过程/债务锚点
 //   ⑤ 技能路径纯函数：OMB_SKILL_REL / skillSourcePath / skillMirrorPath
-// （④ SKILL.md 仓库文件与 ⑥ 镜像三路径测试在提交 2「技能与镜像接线」中补入——见 git 历史）
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+//   ⑥ 镜像：fake dshHome → 首次写入成功（文件内容 = 仓库源）、再次 apply 幂等（内容一致不重写——mtime 不变）、
+//      写失败 → 降级记录不抛（注入坏路径：dshHome 指向文件）
+// 约束：镜像目标一律注入 fake dshHome（mkdtemp）——禁止写真实 ~/.dsh（vitest 环境下未注入 dshHome 时
+// plugin 侧守卫跳过镜像）。
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createCognitiveRuntime, type CognitiveRuntime } from '../../runtime/assembly.js';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
 import { clearDegradations, degradationLog } from '../../runtime/loop-hooks.js';
@@ -21,6 +26,10 @@ import {
   skillMirrorPath,
   skillSourcePath,
 } from '../../runtime/runtime-contract.js';
+
+/** preset 根（tests/m9/ → ../..）——仓库内技能源文件的解析基座 */
+const PRESET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const SKILL_SOURCE = join(PRESET_ROOT, 'skills', 'omb-runtime', 'SKILL.md');
 
 /** 捕获 systemPrompt.context 注册的 fake ctx（与 hook-context 同款） */
 function makeFakeCtx(opts: {
@@ -129,10 +138,77 @@ describe('③ buildCapabilitiesLine 纯函数（第二层动态能力行）', ()
   });
 });
 
-describe('⑤ 技能路径纯函数（第三层 skill 路径基座——镜像接线在提交 2）', () => {
+describe('⑤ 技能路径纯函数（第三层 skill 路径基座）', () => {
   it('OMB_SKILL_REL / skillSourcePath / skillMirrorPath', () => {
     expect(OMB_SKILL_REL).toBe(join('skills', 'omb-runtime', 'SKILL.md'));
     expect(skillSourcePath('/preset')).toBe(join('/preset', 'skills', 'omb-runtime', 'SKILL.md'));
     expect(skillMirrorPath('/dshhome')).toBe(join('/dshhome', 'skills', 'omb-runtime', 'SKILL.md'));
+  });
+});
+
+describe('④ SKILL.md（第三层渐进指导，仓库内版本化）', () => {
+  it('仓库文件存在、frontmatter name/description 非空、正文含命令/工具/过程/债务锚点', async () => {
+    const src = await readFile(SKILL_SOURCE, 'utf8');
+    const fm = src.match(/^---\n([\s\S]*?)\n---/);
+    expect(fm).not.toBeNull();
+    expect(fm![1]!).toContain('name: omb-runtime');
+    expect(fm![1]!).toContain('description:');
+    expect(fm![1]!.trim().split('\n').filter((l) => l.startsWith('description:')).length).toBe(1);
+    const body = src.replace(/^---[\s\S]*?---/, '');
+    for (const anchor of ['/mode', 'kern_memory', '认知过程', '验证债务']) {
+      expect(body).toContain(anchor);
+    }
+  });
+});
+
+describe('⑥ skill 镜像（apply 内，尽力而为，fake dshHome）', () => {
+  it('首次 apply → 镜像写入成功（目标内容 = 仓库源）', async () => {
+    const fakeHome = join(base, 'fake-dsh-1');
+    const { ctx } = makeFakeCtx({ runtime: makeRuntime() });
+    apply(ctx, { bootstrap: false, dshHome: fakeHome });
+    const target = skillMirrorPath(fakeHome);
+    const source = await readFile(SKILL_SOURCE, 'utf8');
+    await vi.waitFor(
+      async () => {
+        expect(await readFile(target, 'utf8').catch(() => null)).toBe(source);
+      },
+      { timeout: 5000, interval: 10 },
+    );
+  });
+
+  it('再次 apply 幂等：内容一致不重写（mtime 不变）', async () => {
+    const fakeHome = join(base, 'fake-dsh-2');
+    const target = skillMirrorPath(fakeHome);
+    const source = await readFile(SKILL_SOURCE, 'utf8');
+    // 第一次 apply → 等待写入完成（文件内容 = 仓库源 → 首次镜像已落地）
+    const { ctx: ctx1 } = makeFakeCtx({ runtime: makeRuntime() });
+    apply(ctx1, { bootstrap: false, dshHome: fakeHome });
+    await vi.waitFor(
+      async () => {
+        expect(await readFile(target, 'utf8').catch(() => null)).toBe(source);
+      },
+      { timeout: 5000, interval: 10 },
+    );
+    const before = await stat(target);
+    // 第二次 apply（新运行时实例）→ 内容一致 → 跳过（不重写）
+    const { ctx: ctx2 } = makeFakeCtx({ runtime: makeRuntime() });
+    apply(ctx2, { bootstrap: false, dshHome: fakeHome });
+    await new Promise((r) => setTimeout(r, 100)); // 让镜像异步路径 settle
+    expect(await readFile(target, 'utf8')).toBe(source);
+    const after = await stat(target);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it('写失败 → 降级记录不抛（注入坏路径：dshHome 指向文件 → mkdir 失败）', async () => {
+    const blocker = join(base, 'blocked');
+    await writeFile(blocker, 'x', 'utf8');
+    const { ctx } = makeFakeCtx({ runtime: makeRuntime() });
+    expect(() => apply(ctx, { bootstrap: false, dshHome: blocker })).not.toThrow();
+    await vi.waitFor(
+      () => {
+        expect(degradationLog().some((r) => r.hook === 'skill/mirror')).toBe(true);
+      },
+      { timeout: 5000, interval: 10 },
+    );
   });
 });

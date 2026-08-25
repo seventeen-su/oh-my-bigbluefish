@@ -36,8 +36,10 @@ import { createJudgeExecutor } from './judge-executor.js';
 import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
 import { ActivationContractSchema, type ActivationContract } from '../kernel/schemas/m.js';
 import { dshEventId, makeDshEvent } from './loop-hooks.js';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { existsSync } from 'node:fs';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import type { ContextProjection } from '../kernel/schemas/a.js';
 import type { Event } from '../kernel/schemas/m.js';
@@ -49,9 +51,9 @@ import type { PromptWorkingState } from './prompt.js';
 // R6：dsh_version 唯一宿主版本来源（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
 import { hostVersion } from '../kernel/schemas/host-version.js';
 // W5：OMB Runtime Contract（三层结构）——第一层固定契约（OMB_RUNTIME_CONTRACT）+ 第二层动态能力行
-//（buildCapabilitiesLine）+ 第三层 skill 路径纯函数（skillSourcePath/skillMirrorPath，提交 2 镜像接线使用）。
+//（buildCapabilitiesLine）+ 第三层 skill 路径纯函数（skillSourcePath/skillMirrorPath——镜像接线）。
 // 层 DAG 合规：runtime-contract.ts 只依赖 node:path 与类型（runtime(2) → runtime(2) ✓）。
-import { buildCapabilitiesLine, OMB_RUNTIME_CONTRACT } from './runtime-contract.js';
+import { buildCapabilitiesLine, OMB_RUNTIME_CONTRACT, skillMirrorPath, skillSourcePath } from './runtime-contract.js';
 
 export const name = 'omb-v2';
 export const inject = ['commands'];
@@ -84,6 +86,10 @@ export interface PluginConfig {
    *  缺省 DSH_HOST_VERSION = '0.1.0-rc.7'（kernel/schemas/host-version.ts，当前宿主）。
    *  升级宿主后经本配置更新，无需改码——所有 Event/Memory/Experience/Snapshot 使用同一值）。 */
   hostVersion?: string;
+  /** W5：skill 镜像目标 DSH 主目录（可注入覆盖——测试注入 fake，禁止写真实 ~/.dsh；
+   *  缺省 process.env.DSH_HOME ?? join(os.homedir(), '.dsh')——DSH skill-filesystem 默认扫描
+   *  <dshHome>/skills（includeDefaultRoots 缺省 true），omb-runtime 技能镜像后被原生发现）。 */
+  dshHome?: string;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -467,6 +473,44 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   let cognitive = readService<CognitiveRuntimeLike>(ctx, 'cognitive');
   let modelAdapter = readService<ModelAdapter>(ctx, 'modelAdapter');
   const systemPrompt = readService<SystemPromptLike>(ctx, 'systemPrompt');
+
+  // W5：第三层（DSH 原生 skill 渐进层）镜像接线——把仓库内版本化技能 skills/omb-runtime/SKILL.md 镜像到
+  // <dshHome>/skills/omb-runtime/SKILL.md（DSH skill-filesystem 默认扫描 <dshHome>/skills；
+  // includeDefaultRoots 缺省 true——~/.dsh/skills 在扫描范围内 → 模型 skill 工具目录可见、按需加载、
+  // 零固定 token 成本；宿主架构研究结论：渐进层零成本宿主，严格优于全塞固定上下文）。
+  // 幂等：目标内容一致 → 跳过；不一致 → 原子写（tmp + rename）；尽力而为：任一步失败 → 降级记录不抛。
+  // dshHome 可注入覆盖（config.dshHome 优先——测试注入 fake，禁止写真实 ~/.dsh；其次 $DSH_HOME）。
+  // 测试守卫：vitest 环境（VITEST/NODE_ENV=test）不写真实用户态，除非显式注入 config.dshHome。
+  const mirrorSkill = async (): Promise<void> => {
+    const dshHome = config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh');
+    const sourcePath = skillSourcePath(PLUGIN_ROOT);
+    const targetPath = skillMirrorPath(dshHome);
+    let source: string;
+    try {
+      source = await readFile(sourcePath, 'utf8');
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('skill/mirror', `技能源读取失败（${detail}）`);
+      return;
+    }
+    try {
+      const existing = await readFile(targetPath, 'utf8').catch(() => null);
+      if (existing === source) {
+        return; // 幂等：内容一致跳过（不重写）
+      }
+      await mkdir(dirname(targetPath), { recursive: true });
+      const tmp = join(dirname(targetPath), `.${basename(targetPath)}.tmp-${process.pid}-${Date.now()}`);
+      await writeFile(tmp, source, 'utf8');
+      await rename(tmp, targetPath); // 原子替换（Windows MoveFileEx REPLACE_EXISTING 语义）
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      recordDegradation('skill/mirror', `镜像写入失败（${detail}）`);
+    }
+  };
+  const isTestEnv = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
+  if (config.dshHome !== undefined || !isTestEnv) {
+    void mirrorSkill();
+  }
 
   // 当前生效版本线（默认 stable，架构 §11.1）；config.line 固定初始版本线（后备/兼容机制
   // deploy-lines 生成的 per-line 预设固定本线用；生产单模式下仅影响启动初值——/mode 运行时切换内部线状态）。
