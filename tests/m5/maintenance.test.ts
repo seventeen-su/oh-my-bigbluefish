@@ -15,7 +15,7 @@
 //   ⑧ 经调度跑 consolidation：M3 consolidate 经 scheduler.enqueue 执行成功（升级兼容验证）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Fingerprint } from '../../kernel/schemas/base.js';
@@ -126,6 +126,27 @@ describe('维护调度（§12.3）', () => {
     const s2 = new MaintenanceScheduler({ debtFile: join(tmpRoot, 'debt.json') });
     schedulers.push(s2);
     expect(s2.debtSnapshot()).toEqual(s.debtSnapshot());
+  });
+
+  it('债务加载剪除：debt.json 中的历史僵尸（turn-finalize:* 与 gc）加载时跳过，健康条目 value 原样保留', async () => {
+    // 预写含僵尸（turn-finalize:ghost/gc）与健康条目的债务文件，再构造调度器（调度只执行 enqueue 队列，
+    // 恢复的债务永不清偿 → 加载即剪除；僵尸为重启后无属主/无人再入队的残留）
+    await writeFile(
+      join(tmpRoot, 'debt.json'),
+      JSON.stringify([
+        { task_id: 'turn-finalize:ghost', value: 999, accumulated_at: 1, priority: 0, estimated_cost: 1, urgency: 'normal' },
+        { task_id: 'gc', value: 555, accumulated_at: 2, priority: 0, estimated_cost: 1, urgency: 'normal' },
+        { task_id: 'candidate_validation', value: 8, accumulated_at: 3, priority: 0, estimated_cost: 1, urgency: 'normal' },
+        { task_id: 'memory_consolidation', value: 2, accumulated_at: 4, priority: 0, estimated_cost: 1, urgency: 'normal' },
+      ]),
+      'utf8',
+    );
+    const s = mkScheduler();
+    const debt = s.debtSnapshot();
+    expect(debt.map((d) => d.task_id)).toEqual(['candidate_validation', 'memory_consolidation']); // 已按 task_id 排序
+    expect(debt.find((d) => d.task_id === 'candidate_validation')!.value).toBe(8); // value 原样保留
+    expect(debt.find((d) => d.task_id === 'memory_consolidation')!.value).toBe(2);
+    expect(debt.some((d) => d.task_id === 'turn-finalize:ghost' || d.task_id === 'gc')).toBe(false);
   });
 
   // ---- ④ soft / hard / critical ----

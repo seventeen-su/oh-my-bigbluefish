@@ -6,6 +6,9 @@
 //   （不视为失败崩溃——队列继续；「未实现/未完成 → debt 保留」不再空实现假成功清债）。
 //   持久化 .evolution/debt.json（原子写 tmp+rename）。soft 限 → quantum 频率提升（tick 间隔减半）；
 //   hard 限 → 非必要（normal）任务跳过；critical → 下一 quantum/tick 优先。
+//   加载剪除（2026-08-25）：加载时剪除不可再服务的历史僵尸（turn-finalize:* 与 gc）——调度只执行
+//   enqueue 队列，恢复的债务永不清偿（gc 债务已随 7701fde 移除入账；turn-finalize 为会话级收尾，
+//   重启后属主会话已不存在）。
 // - Quantum：requestQuantum 每次执行 1 个任务（可中断：外部 AbortSignal 与 stop() 的 inFlight
 //   signal 经 AbortSignal.any 合并后传入 run——abort 抛 AbortError 即让出，任务留队可重试）；
 //   tick 批量（定时器驱动，start() 启动）。
@@ -555,7 +558,15 @@ export class MaintenanceScheduler {
     if (!Array.isArray(raw)) throw new Error(`maintenance debt file invalid: ${this.debtFile}`);
     this.debt = new Map();
     for (const rec of raw as MaintenanceDebt[]) {
-      if (rec && typeof rec.task_id === 'string') this.debt.set(rec.task_id, { ...rec });
+      // 加载时剪除历史僵尸（turn-finalize:* 与 gc）：调度只执行 enqueue 队列，恢复的债务永不清偿
+      if (
+        rec &&
+        typeof rec.task_id === 'string' &&
+        rec.task_id !== 'gc' &&
+        !rec.task_id.startsWith('turn-finalize:')
+      ) {
+        this.debt.set(rec.task_id, { ...rec });
+      }
     }
   }
 
