@@ -275,7 +275,8 @@ describe('S2 维护观测采集（supervisor/maintenance.ts）', () => {
     });
     const byId = new Map(scheduler.debtSnapshot().map((d) => [d.task_id, d]));
     expect(byId.get('candidate_validation')).toMatchObject({ value: 8, estimated_cost: 123 });
-    expect(byId.get('gc')).toMatchObject({ value: 1, estimated_cost: 2 });
+    // 7701fde：GC 不再每收尾常驻入账——事件库 compact 由 turn-finalize 覆盖
+    expect(byId.get('gc')).toBeUndefined();
   });
 
   // ---- ⑥ 债务入账注入 ----
