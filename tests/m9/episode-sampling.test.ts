@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { createCognitiveRuntime, EPISODE_SAMPLE_RATE_DEFAULT, EPISODE_SAMPLE_RATE_HIGH_VALUE, type CognitiveRuntime } from '../../runtime/assembly.js';
 import { shouldSampleEpisode } from '../../runtime/turn-helpers.js';
 import { collectGeneralizationSignals } from '../../runtime/signal-collectors.js';
+import { L1SignalSchema, type L1Signal } from '../../runtime/evaluator.js';
 import { evaluate, getFact } from '../../runtime/evolution-evaluator.js';
 import { recordEpisode, reportEpisodeOutcome } from '../../memory/utility.js';
 
@@ -275,6 +276,27 @@ describe('⑤ finalizeTurn 归因代理（诚实性——不伪造 hit/miss）',
       working_state: req('sess-none').working_state as never,
     });
     expect(res.episode_attribution).toMatchObject({ attributed: 0, pending: 0 });
+  });
+
+  it('计数口径可观测（信号计数口径核对）：L1 采集信号带 cumulative 标记，统计取最大值而非相加', async () => {
+    // 已知问题《采样信号计数口径待核对》：collectGeneralizationSignals 每轮用 {from:0,to:now} 调用，
+    // count 是**窗口内累计值**——同一条 episode 会在其后每轮重复出现，逐轮相加会得到远大于实际记录数的
+    // 数字（观测到 80 vs 22）。签名带 cumulative=true 后，口径可被观测与区分。
+    runtime = track(createCognitiveRuntime({ root, episodeSampleRate: 1 }));
+    await runtime.prepareTurn(req('sess-scope') as never);
+    await runtime.prepareTurn(req('sess-scope') as never); // 2 条 null-outcome episode（待归因）
+    const window = { from: 0, to: Date.now() };
+    const first = await collectGeneralizationSignals(runtime.memory, 'session:sess-scope', window);
+    const second = await collectGeneralizationSignals(runtime.memory, 'session:sess-scope', window);
+    const l1 = (xs: typeof first): L1Signal[] => xs.filter((s): s is L1Signal => s.layer === 'L1');
+    const recorded = l1(first).find((s) => s.kind === 'scope_recorded');
+    expect(recorded?.count).toBe(2);
+    for (const s of l1(first)) {
+      expect(L1SignalSchema.safeParse(s).success).toBe(true);
+      expect(s.cumulative).toBe(true); // 口径标记：累计值 → 统计取最大值
+    }
+    // 同窗口重复采集口径一致（累计值不随采集轮次增长）——多轮相加才是错的
+    expect(l1(second).map((s) => s.count)).toEqual(l1(first).map((s) => s.count));
   });
 });
 

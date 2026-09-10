@@ -124,6 +124,11 @@ export const L1SignalSchema = z.object({
   kind: z.enum(L1_SIGNAL_KINDS),
   target: z.string().min(1),
   count: z.number().int().nonnegative(),
+  /**
+   * 计数口径（已知问题《采样信号计数口径待核对》）：true = 窗口内**累计值**（同一批 episode 会在其后
+   * 每轮的信号里重复出现，统计须取最大值，不可相加）；缺省/false = 本轮增量（可相加）。
+   */
+  cumulative: z.boolean().optional(),
   window: z
     .object({
       from: z.number().int().nonnegative(),

@@ -31,11 +31,13 @@ function countSignal(
   target: string,
   count: number,
   window: SignalWindow,
+  /** 口径标记：true = 窗口内累计值（统计取最大值，不可多轮相加）；缺省 false = 本轮增量 */
+  cumulative = false,
 ): EvaluationSignal | null {
   if (count <= 0) {
     return null;
   }
-  return { layer: 'L1', kind, target, count, window };
+  return { layer: 'L1', kind, target, count, window, ...(cumulative ? { cumulative: true } : {}) };
 }
 
 /**
@@ -44,6 +46,12 @@ function countSignal(
  * 专项 D（评审问题一）：outcome 为 null 的 episode（已记录待归因——采样记录后归因观测面未到）单独计为
  * L1 scope_recorded——检索数据量照常入信号，且**不当作 hit 也不当作 miss**（诚实分离：归因观测面留待，
  * evaluate 的 generalization 比率只认 scope_hit/scope_miss，待归因不稀释分母）。
+ *
+ * **计数口径（已知问题《采样信号计数口径待核对》修复）**：本采集器的 count 是**窗口内累计值**
+ *（cumulative running total），不是本轮新增值——调用方每轮收尾都用 `{from: 0, to: now}` 调用一次，
+ * 故同一条 episode 会在其后每一轮的信号里重复出现。签名里带上 `cumulative: true` 与 `window`，
+ * 使口径**可观测、可区分**：统计时应按 kind 取**最大值**（或末次值），**不可把多轮记录相加**
+ *（相加会得到 80 而实际只有 22 条检索记录——正是这条已知问题的成因）。
  */
 export async function collectGeneralizationSignals(
   backend: RetrievalBackend,
@@ -69,15 +77,14 @@ export async function collectGeneralizationSignals(
     }
   }
   const out: EvaluationSignal[] = [];
-  const s1 = countSignal('scope_hit', target, hit, window);
-  const s2 = countSignal('scope_miss', target, miss, window);
-  const s3 = countSignal('scope_recorded', target, pending, window);
+  const s1 = countSignal('scope_hit', target, hit, window, true);
+  const s2 = countSignal('scope_miss', target, miss, window, true);
+  const s3 = countSignal('scope_recorded', target, pending, window, true);
   if (s1 !== null) out.push(s1);
   if (s2 !== null) out.push(s2);
   if (s3 !== null) out.push(s3);
   return out;
 }
-
 /** interpretability 采集（oracle 可复现率）：T8.14 OracleVerdict 执行产物 → L1 oracle_pass/oracle_fail（纯函数） */
 export function collectInterpretabilitySignals(
   verdicts: readonly OracleVerdict[],
