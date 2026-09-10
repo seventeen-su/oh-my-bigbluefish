@@ -12,6 +12,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { GIT_BIN, defaultLayout, presetRoot, type VersionLayout } from './snapshot.js';
+// 外核平台提供者（已知问题《Windows 绑定面与 Linux 迁移》）：只读机制按平台选择（icacls / POSIX 权限位）
+import { platformProvider } from './platform.js';
 
 export { defaultLayout };
 
@@ -109,63 +111,30 @@ function runGit(lay: VersionLayout, args: string[], opts: GitRunOptions = {}): s
 }
 
 /** 只读 ACL：icacls <dir> /inheritance:r /grant:r "Everyone:RX" /T /C（授权式只读，无 deny ACE/SYNCHRONIZE 副作用）。
- *  SystemRoot 缺失 → 抛错（外层捕获转 degraded）。瞬态锁错误短退避重试（同 runGit）。 */
+ *  SystemRoot 缺失 → 抛错（外层捕获转 degraded）。瞬态锁错误短退避重试（同 runGit）。
+ *  已知问题《Windows 绑定面与 Linux 迁移》：实现已收敛到外核平台提供者（substrate/platform.ts）——
+ *  Windows 走 icacls（调用序列与参数与引入前完全一致），Linux/macOS 走 POSIX 权限位；能力缺失时
+ *  提供者返回 null，本函数按"跳过并标注"处理（见调用点的 degraded 说明）。 */
 function applyReadOnlyAcl(lay: VersionLayout, dir: string): void {
-  const systemRoot = process.env.SystemRoot;
-  if (systemRoot === undefined || systemRoot.length === 0) {
-    throw new Error('icacls 解析失败：环境变量 SystemRoot 缺失（Windows 上恒存在，请检查运行环境）');
+  const mech = platformProvider().readOnly;
+  if (mech === null) {
+    throw new Error(
+      `平台 ${process.platform} 无可用只读机制（${platformProvider().caps.degraded ?? '能力缺失'}）——${dir} 保持可写`,
+    );
   }
-  const icacls = path.join(systemRoot, 'System32', 'icacls.exe');
-  let last: unknown;
-  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
-    try {
-      execFileSync(icacls, [dir, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C'], {
-        encoding: 'utf8',
-        windowsHide: true,
-      });
-      return;
-    } catch (err) {
-      last = err;
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
-        break;
-      }
-      if (attempt < LOCK_RETRY_COUNT - 1) {
-        sleepMs(50 * (attempt + 1));
-      }
-    }
-  }
-  const e = last as { status?: number; stderr?: Buffer | string };
-  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
-  throw new Error(`icacls ${dir} 只读 ACL 施加失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
+  mech.apply(dir);
 }
 
-/** 释放只读 ACL：icacls <dir> /reset /T /C（旧种子迁移删除旧 worktree 前置；与 applyReadOnlyAcl 同款锁重试） */
+/** 释放只读 ACL：icacls <dir> /reset /T /C（旧种子迁移删除旧 worktree 前置；与 applyReadOnlyAcl 同款锁重试）
+ *  平台提供者口径同上（POSIX 为恢复所有者写位）。 */
 function resetReadOnlyAcl(dir: string): void {
-  const systemRoot = process.env.SystemRoot;
-  if (systemRoot === undefined || systemRoot.length === 0) {
-    throw new Error('icacls 解析失败：环境变量 SystemRoot 缺失（Windows 上恒存在，请检查运行环境）');
+  const mech = platformProvider().readOnly;
+  if (mech === null) {
+    throw new Error(
+      `平台 ${process.platform} 无可用只读机制（${platformProvider().caps.degraded ?? '能力缺失'}）——${dir} 无需释放`,
+    );
   }
-  const icacls = path.join(systemRoot, 'System32', 'icacls.exe');
-  let last: unknown;
-  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
-    try {
-      execFileSync(icacls, [dir, '/reset', '/T', '/C'], { encoding: 'utf8', windowsHide: true });
-      return;
-    } catch (err) {
-      last = err;
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === undefined || !LOCK_RETRYABLE.has(code)) {
-        break;
-      }
-      if (attempt < LOCK_RETRY_COUNT - 1) {
-        sleepMs(50 * (attempt + 1));
-      }
-    }
-  }
-  const e = last as { status?: number; stderr?: Buffer | string };
-  const detail = e && e.stderr ? String(e.stderr).trimEnd() : '(无 stderr)';
-  throw new Error(`icacls ${dir} 只读 ACL 释放失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
+  mech.reset(dir);
 }
 
 /**
@@ -174,26 +143,11 @@ function resetReadOnlyAcl(dir: string): void {
  * （ACL 丢失）；EPERM/EACCES = 只读（ACL 有效）。写成功时立即删除探针（幂等，健康路径零残留）。
  */
 function isReadOnlyDir(dir: string): boolean {
-  if (!fs.existsSync(dir)) {
-    return false; // 目录缺失 → 不算只读（由 worktree 修复负责）
+  const mech = platformProvider().readOnly;
+  if (mech === null) {
+    return false; // 无只读机制 → 无法只读（调用方按能力缺失标注降级）
   }
-  const probe = path.join(dir, `.omb-acl-probe-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
-  try {
-    fs.writeFileSync(probe, '');
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EPERM' || code === 'EACCES') {
-      return true; // 写被拒 → 只读（ACL 有效）
-    }
-    return false; // 其他错误（ENOENT 等）→ 目录不可用，保守按可写处理（worktree 修复兜底）
-  }
-  // 可写 → ACL 丢失；删除探针文件（失败不致命，重新施加 ACL 后为只读残留）
-  try {
-    fs.unlinkSync(probe);
-  } catch {
-    // 删除失败 → 忽略
-  }
-  return false;
+  return mech.isReadOnly(dir);
 }
 
 /** worktree 的 .git gitfile 指向的有效 gitdir（不存在/非 gitfile → null） */

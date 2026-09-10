@@ -114,6 +114,21 @@ export interface KernStatusSummary {
    * dim=null 表示尚无任何编码条目（向量通道当前不产生候选——诚实标注，不冒充可用）。
    */
   memory_vector: { encoded: number; pending: number; dim: number | null; embedder: string } | null;
+  /**
+   * 外核安全状态段（已知问题《内核加载失败不得阻塞宿主》/《外核自身也要非阻塞》）：当前是否安全状态、
+   * 原因、发生时间、平台与平台能力降级说明、内核是否已加载。内核未加载时本段仍可读
+   *（状态面尽力保留——"能看到为什么没加载"）。
+   */
+  safe_state?: {
+    ok: boolean;
+    kind: string;
+    reason: string | null;
+    at: number;
+    platform: string;
+    platform_degraded: string | null;
+    kernel_loaded: boolean;
+    details: Record<string, string>;
+  };
   /** S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + observations_degraded） */
   maintenance_observations: {
     date: string;
@@ -740,7 +755,11 @@ export function kernProfileTool(runtime: KernRuntimeLike): ToolDefinitionLike {
  * 守卫：tools.register 缺失/注册失败 → 降级不崩（返回 degraded 由调用方记录）。返回注册清单 + 注销 disposers
  * （真实 DSH register 返回 disposer；P8 注册皆效应——调用方把 disposers 注册进 ctx.effect，关闭时批量注销）。
  */
-export function registerKernTools(tools: ToolsLike, runtime: KernRuntimeLike): {
+export function registerKernTools(
+  tools: ToolsLike,
+  runtime: KernRuntimeLike,
+  opts: { only?: readonly string[] } = {},
+): {
   registered: string[];
   disposers: Array<() => void>;
   degraded: string | null;
@@ -748,7 +767,8 @@ export function registerKernTools(tools: ToolsLike, runtime: KernRuntimeLike): {
   if (typeof tools?.register !== 'function') {
     return { registered: [], disposers: [], degraded: 'ctx.tools.register 不存在——kern_* 工具未注册' };
   }
-  const defs: ToolDefinitionLike[] = [
+  // only：白名单（内核未加载时只注册 kern_status——保证"能看到为什么没加载"，工具数不增加）
+  const all: ToolDefinitionLike[] = [
     kernStatusTool(runtime),
     kernBenchTool(runtime),
     kernEvolveTool(runtime),
@@ -756,6 +776,7 @@ export function registerKernTools(tools: ToolsLike, runtime: KernRuntimeLike): {
     kernMemoryTool(runtime),
     kernProfileTool(runtime),
   ];
+  const defs = opts.only === undefined ? all : all.filter((d) => opts.only!.includes(d.name));
   const registered: string[] = [];
   const disposers: Array<() => void> = [];
   for (const def of defs) {
