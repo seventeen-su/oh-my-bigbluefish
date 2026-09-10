@@ -403,6 +403,11 @@ export interface CognitiveAssemblyOptions {
    *  EPISODE_SAMPLE_RATE_HIGH_VALUE；kern_memory 显式记忆工具恒记录不受此限；非法值 → fail-loud） */
   episodeSampleRate?: number;
   /**
+   * 外核安全状态快照注入（已知问题《内核加载失败不得阻塞宿主》：状态面可查看"内核未加载的原因"）。
+   * 装配面（plugin.ts）提供 → `status()` 附带 `safe_state` 段；缺省 → 段缺省（测试装配不计）。
+   */
+  safeStateView?: () => KernStatusSummary['safe_state'];
+  /**
    * 自迭代开关面（已知问题《开关落在宿主插件配置，不引入界面》——落 agent.cordis.yml 插件配置，
    * 由 plugin.ts 解析后注入；缺省全部启用 = 既有行为不变）。
    */
@@ -858,6 +863,8 @@ export class CognitiveRuntime {
   private readonly attributedMemories = new Map<string, Set<string>>();
   /** 归因观测计数（状态面可读：本次进程内累计 已归因 / 证据不足） */
   private readonly attributionCounts = { attributed: 0, skipped: 0 };
+  /** 外核安全状态视图注入（装配面提供；缺省 → 状态面不带 safe_state 段） */
+  private readonly safeStateViewFn: (() => KernStatusSummary['safe_state']) | undefined;
   /** 自迭代开关面（opts.selfIteration；缺省全启用 = 既有行为不变） */
   private readonly selfIteration: {
     enabled: boolean;
@@ -934,6 +941,7 @@ export class CognitiveRuntime {
     };
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
+    this.safeStateViewFn = opts.safeStateView;
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
     this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
     // P3.6：验证数据面三库装配（JSON 文件注册面；构造不触 I/O——首写建目录；缺省
@@ -1108,6 +1116,7 @@ export class CognitiveRuntime {
       debt_release_audit,
       debt_limits,
       evolution,
+      safe_state: this.safeStateViewFn === undefined ? undefined : this.safeStateViewFn(),
       memory_vector: this.memory.vectorStats(),
       maintenance_observations,
       observations_degraded,

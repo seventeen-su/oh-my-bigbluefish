@@ -1,39 +1,27 @@
-// layer 0（T0.5）：候选临时目录创建/清理 + Windows WRITE_RESTRICTED 受限子进程（koffi FFI）。
-// 只 import node: 内置、koffi（经 win32-ffi）与 substrate 内文件（CONVENTIONS §4）。
+// layer 0（T0.5）：候选临时目录创建/清理 + 平台受限子进程通道（**平台无关门面**）。
 //
-// 设计（task-0.5-brief.md + research-dsh.md §3，API 调用链照抄 DSH sandbox-windows-acl）：
+// 已知问题《Windows 绑定面与 Linux 迁移》/《外核平台抽象设计》修复：
+//   - 本文件**不静态 import 任何 win32 模块**——受限执行实现（substrate/sandbox-win32.ts）在
+//     Windows 上按需**动态 import**，非 Windows 平台完全不加载 win32-*.js 与 koffi；
+//   - 平台能力经外核平台提供者（substrate/platform.ts）**识别**：可用 → 受限通道；不可用 →
+//     显式降级并标注（`sandboxStatus()` 返回 reason），上层（candidate-pipeline G3-exec）记录
+//     degraded 并跳过，门禁语义保持（fail-closed 不变量不变：绝不以完整令牌静默运行候选）。
+//
+// 平台无关部分（本文件保留）：
 // - createCandidateDir：mkdtemp 于 workspace/.omb/.evolution/candidates/<id>-<rand>/；
 //   返回 { dir, cleanup }；cleanup() 删目录树并从进程级兜底注册表移除；
-//   进程退出兜底：模块级 process.on('exit') 同步 rmSync 全部未清理候选目录
-//   （'exit' 覆盖正常退出与 process.exit() 两条路径；rmSync 是同步的，无需 'beforeExit'）。
-// - runRestricted：WRITE_RESTRICTED 受限令牌 spawn node 跑 .cjs 脚本。
-//   写能力 = restricting 列表携带的写 SID 在 writableDirs/私有 temp 上的 ACE（精确集合）；
-//   受限进程内 stdio:'pipe' 会 EPERM（research-dsh.md §3.4）→ 输出走结果文件：
-//   结果文件路径经 OMB_SANDBOX_RESULT_FILE 环境变量传给脚本，脚本写结果到 writableDirs 内路径。
-// - TMP/TEMP 改写到私有 temp（runner 惯例，research-dsh.md §3.4）：经 process.env 改写
-//   （Windows 上 node 的 process.env 写入 = SetEnvironmentVariableW，CreateProcessAsUserW
-//   以 lpEnvironment=NULL 继承调用者环境块——DSH 实测 koffi 显式传环境块会 ERROR_INVALID_PARAMETER）。
-// - fail-closed：任何 Win32 失败抛 Win32Error（含 API 名与精确错误码），绝不静默以完整令牌运行。
-//   writableDirs 的 ACE 常驻（确定性 SID 使重复授权 O(1)，DSH 的 reuse cache 语义）；
-//   私有 temp 的 ACE 每次运行撤销，自建 temp 目录运行后删除。
-// - 降级（P3/D5）：sandboxStatus() 显式探测受限通道可用性（非 Windows / koffi 加载失败 →
-//   { available:false, reason }，不抛不崩）；上层（candidate-pipeline G3-exec）在通道不可用时
-//   记录 degraded 并跳过，门禁语义保持。
+//   进程退出兜底：模块级 process.on('exit') 同步 rmSync 全部未清理候选目录。
+// - sandboxStatus：受限通道可用性（平台识别 + 实现可加载性）——绝不抛。
+// - runRestricted：门面守护（脚本/目录校验 + 通道可用性检查）→ 委派平台实现。
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import * as abi from './win32-abi.js'
-import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, throwWin32, win32Sync } from './win32-ffi.js'
-import type { NativePtr, Win32Bindings } from './win32-ffi.js'
-import { grantWrite, revokeWrite } from './win32-acl.js'
-import { createRestrictedToken, findLogonSid, makeWellKnownSid, openCurrentProcessToken, setTokenDefaultDaclGrant } from './win32-token.js'
-import { readExitCode, spawnRestrictedInherited, terminateJob } from './win32-spawn.js'
-import type { SpawnedRestricted } from './win32-spawn.js'
-import { tempWriteSid, workspaceWriteSid } from './win32-sid.js'
+// 外核平台提供者（识别层）：本文件据此决定"是否有可用受限通道"，不做任何 win32 静态依赖
+import { platformProvider } from './platform.js'
 
 // ---------------------------------------------------------------------------
-// 候选临时目录
+// 候选临时目录（平台无关）
 // ---------------------------------------------------------------------------
 
 /** 真实候选根：<preset>/workspace/.omb/.evolution/candidates/ */
@@ -61,25 +49,20 @@ function ensureExitHandler(): void {
   })
 }
 
-/** 候选 id 白名单：只允许单段文件名（禁止路径分隔符逃逸） */
+/** 候选 id 白名单（防路径穿越；与调用方 candidate_id 形状一致） */
 const CANDIDATE_ID_RE = /^[A-Za-z0-9._-]+$/u
 
 export interface CandidateDir {
-  /** 创建的候选目录绝对路径 */
+  /** 候选目录绝对路径（已创建） */
   dir: string
-  /** 删除目录树并退出兜底注册表（幂等） */
-  cleanup(): void
+  /** 幂等清理（删目录树并从兜底注册表移除；重复调用安全） */
+  cleanup: () => void
 }
 
-/**
- * 创建候选临时目录：mkdtemp 于 <candidates 根>/<id>-<rand>/。
- * @param id - 候选标识（只允许 [A-Za-z0-9._-]；用于目录名前缀）。
- * @param opts.root - 候选根覆盖（缺省真实 workspace/.omb/.evolution/candidates/；
- *   测试在 mkdtemp fixture 上做破坏性操作时传入 fixture 根）。
- */
+/** 创建候选临时目录（<root>/<id>-<rand>/；id 白名单校验 fail-loud） */
 export function createCandidateDir(id: string, opts: { root?: string } = {}): CandidateDir {
   if (!CANDIDATE_ID_RE.test(id)) {
-    throw new Error(`createCandidateDir: 非法候选 id ${JSON.stringify(id)}（只允许 [A-Za-z0-9._-]）`)
+    throw new Error(`createCandidateDir: 非法候选 id: ${id}`)
   }
   const root = opts.root ?? candidatesRoot()
   fs.mkdirSync(root, { recursive: true })
@@ -93,42 +76,66 @@ export function createCandidateDir(id: string, opts: { root?: string } = {}): Ca
       if (cleaned) return
       cleaned = true
       pendingDirs.delete(dir)
-      fs.rmSync(dir, { recursive: true, force: true })
+      try {
+        fs.rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // 清理失败 → 退出兜底与后续清理仍会尝试（尽力而为）
+      }
     },
   }
 }
 
-// ---------------------------------------------------------------------------
-// 受限通道可用性（P3/D5 降级入口）
-// ---------------------------------------------------------------------------
-
 export interface SandboxStatus {
-  /** 受限执行通道是否可用（Windows + koffi/Win32 绑定加载成功） */
+  /** 受限执行通道是否可用（平台有受限机制 + 平台实现可加载） */
   available: boolean;
-  /** 不可用原因（available=false 时非空；机器可读） */
+  /** 不可用原因（available=false 时非空；机器可读，含平台能力降级说明） */
   reason?: string;
+  /** 通道实现标识（available=true 时非空：'win32-restricted-token'） */
+  mechanism?: string;
+  /** 平台标识（排障用） */
+  platform?: string;
 }
 
 /**
- * 受限通道可用性探测（P3/D5）：非 Windows → { available:false, reason:'非 Windows 平台…' }；
- * koffi/Win32 绑定加载失败 → { available:false, reason:'koffi/Win32 绑定加载失败: …' }。
- * 绝不抛（探测本身不崩）；上层（candidate-pipeline G3-exec）据结果记录 degraded 并跳过，
- * 不阻塞门禁语义。win32Sync 绑定为懒加载（首次调用才打开 DLL），探测即触发加载。
+ * 受限通道可用性探测（平台识别 + 实现可加载性）：**绝不抛**。
+ * 顺序：外核平台提供者给出平台能力（read-only / sandbox）→ Windows 上动态加载实现模块
+ * （模块加载失败即视为通道不可用——koffi/DLL 缺失的真实降级面）。
  */
-export function sandboxStatus(): SandboxStatus {
-  if (process.platform !== 'win32') {
-    return { available: false, reason: '非 Windows 平台（WRITE_RESTRICTED 受限令牌仅 Windows 可用）' };
+export async function sandboxStatusAsync(): Promise<SandboxStatus> {
+  const caps = platformProvider().caps
+  if (!caps.sandbox_available) {
+    return {
+      available: false,
+      reason: `平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——安全语义变化已标注`,
+      platform: caps.raw,
+    };
   }
   try {
-    win32Sync();
-    return { available: true };
+    await loadWin32Impl()
+    return { available: true, mechanism: caps.sandbox, platform: caps.raw };
   } catch (err) {
-    return { available: false, reason: `koffi/Win32 绑定加载失败: ${(err as Error).message}` };
+    return { available: false, reason: `平台实现加载失败: ${(err as Error).message}`, platform: caps.raw };
   }
 }
 
+/**
+ * 同步版通道探测（兼容既有调用方）：只依据平台能力判断，不触发实现模块加载。
+ * 需要"实现是否真的可加载"的精确判断时用 `sandboxStatusAsync()`。
+ */
+export function sandboxStatus(): SandboxStatus {
+  const caps = platformProvider().caps
+  if (!caps.sandbox_available) {
+    return {
+      available: false,
+      reason: `平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——安全语义变化已标注`,
+      platform: caps.raw,
+    };
+  }
+  return { available: true, mechanism: caps.sandbox, platform: caps.raw };
+}
+
 // ---------------------------------------------------------------------------
-// 受限子进程
+// 受限子进程（门面 → 平台实现）
 // ---------------------------------------------------------------------------
 
 export interface RunRestrictedOptions {
@@ -155,85 +162,30 @@ export interface RunRestrictedResult {
   timedOut: boolean
 }
 
-const DEFAULT_TIMEOUT_MS = 60_000
-/** GetExitCodeProcess 轮询间隔 */
-const POLL_MS = 25
-/** 超时 kill 后等待真正退出的上限（防 kill 失败挂死） */
-const KILL_DRAIN_MS = 5_000
-
-/** 规范化目录（realpath；失败回退 resolve） */
-function canonicalDir(p: string): string {
-  try {
-    return fs.realpathSync.native(p)
-  } catch {
-    return path.resolve(p)
-  }
+/** 平台实现模块的最小结构面（动态 import；仅 Windows 有实现） */
+interface Win32Impl {
+  runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult>
 }
 
-/** SID 字符串 → 指针（ConvertStringSidToSidW，LocalAlloc，调用方负责 LocalFree） */
-function parseSid(api: Win32Bindings, sid: string): NativePtr {
-  const slot = allocPtrSlot()
-  if (api.convertStringSidToSidW(sid, slot) === 0) throwLastError(api, 'ConvertStringSidToSidW', sid)
-  const ptr = decodePtr(slot)
-  if (ptr === null) throwWin32(api, 'ConvertStringSidToSidW', api.getLastError(), sid)
-  return ptr
-}
+let win32Impl: Promise<Win32Impl> | null = null
 
-/** 改写子进程环境（TMP/TEMP → 私有 temp；结果文件路径）；返回原值快照用于恢复 */
-function rewriteChildEnv(tempDir: string, resultFile: string | undefined): Array<[string, string | undefined]> {
-  const previous: Array<[string, string | undefined]> = [
-    ['TMP', process.env.TMP],
-    ['TEMP', process.env.TEMP],
-  ]
-  process.env.TMP = tempDir
-  process.env.TEMP = tempDir
-  if (resultFile !== undefined) {
-    previous.push(['OMB_SANDBOX_RESULT_FILE', process.env.OMB_SANDBOX_RESULT_FILE])
-    process.env.OMB_SANDBOX_RESULT_FILE = resultFile
-  }
-  return previous
-}
-
-/** 恢复环境（原值回写；原值未设置则删除） */
-function restoreEnv(previous: Array<[string, string | undefined]>): void {
-  for (const [name, value] of previous) {
-    if (value === undefined) {
-      delete process.env[name]
-    } else {
-      process.env[name] = value
+/** 动态加载平台实现（**仅 Windows**；非 Windows 直接失败——调用方已由能力检查挡住） */
+function loadWin32Impl(): Promise<Win32Impl> {
+  if (win32Impl === null) {
+    if (process.platform !== 'win32') {
+      return Promise.reject(new Error(`无平台受限实现（平台 ${process.platform}）`));
     }
+    win32Impl = import('./sandbox-win32.js') as unknown as Promise<Win32Impl>;
   }
-}
-
-/** 轮询退出码；超时 TerminateJobObject 杀 job 树并等真正退出（KILL_DRAIN_MS 上限） */
-async function waitExit(api: Win32Bindings, spawned: SpawnedRestricted, timeoutMs: number): Promise<RunRestrictedResult> {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    const code = readExitCode(api, spawned.process)
-    if (code !== abi.STILL_ACTIVE) return { code, timedOut: false }
-    if (Date.now() >= deadline) {
-      terminateJob(api, spawned.job, spawned.process, 1)
-      const killDeadline = Date.now() + KILL_DRAIN_MS
-      for (;;) {
-        const afterKill = readExitCode(api, spawned.process)
-        if (afterKill !== abi.STILL_ACTIVE) return { code: null, timedOut: true }
-        if (Date.now() >= killDeadline) {
-          throw new Error('sandbox: 子进程在 TerminateJobObject 后仍未退出（kill 失败）')
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS))
-      }
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS))
-  }
+  return win32Impl;
 }
 
 /**
- * 在 WRITE_RESTRICTED 受限令牌下运行脚本（node <script> <args...>，cwd=opts.cwd）。
- * 步骤：writableDirs/temp 授权 ACE → 令牌链（openCurrentProcessToken → findLogonSid →
- * CreateRestrictedToken([logon, Everyone, writeSid, tempSid]) → setTokenDefaultDaclGrant）→
- * 环境改写 → CreateProcessAsUserW（kill-on-close job）→ 轮询退出码/超时杀 → 清理。
- * 失败即抛（fail-closed）；writableDirs ACE 常驻，私有 temp ACE 撤销 + 自建目录删除。
- * 调用方应在执行前经 sandboxStatus() 探测通道可用性（P3/D5：不可用 → 上层降级记录跳过）。
+ * 受限执行（平台无关门面）：
+ *   ① 入参校验（脚本存在、writableDirs/cwd 存在）——fail-loud，与拆分前一致；
+ *   ② 平台通道检查：无可用受限机制 → **拒绝执行**（fail-closed 不变量：绝不以完整令牌静默运行；
+ *      调用方应先经 sandboxStatusAsync() 探测并记录 degraded）；
+ *   ③ 委派平台实现（Windows：动态加载 sandbox-win32.js）。
  */
 export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult> {
   const script = path.resolve(opts.script)
@@ -243,131 +195,32 @@ export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRest
   if (!Array.isArray(opts.writableDirs) || opts.writableDirs.length === 0) {
     throw new Error('runRestricted: 需要至少一个 writableDirs')
   }
-  const writableDirs = opts.writableDirs.map(canonicalDir)
-  for (const dir of writableDirs) {
-    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+  for (const dir of opts.writableDirs) {
+    const resolved = path.resolve(dir)
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
       throw new Error(`runRestricted: writableDir 不存在或不是目录: ${dir}`)
     }
   }
-  const cwd = canonicalDir(opts.cwd)
+  const cwd = path.resolve(opts.cwd)
   if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-    throw new Error(`runRestricted: cwd 不存在或不是目录: ${cwd}`)
+    throw new Error(`runRestricted: cwd 不存在或不是目录: ${opts.cwd}`)
   }
-
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  const selfCreatedTemp = opts.tempDir === undefined
-  const tempDir = opts.tempDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'omb-sandbox-'))
-
-  const api = win32Sync()
-  const writeSidPtr = parseSid(api, workspaceWriteSid(writableDirs))
-  const tempSidPtr = parseSid(api, tempWriteSid(tempDir))
-
-  let currentToken: NativePtr | undefined
-  let restrictedToken: NativePtr | undefined
-  let spawned: SpawnedRestricted | undefined
-  let grantedTemp = false
-
-  const cleanup = (failures: unknown[]): void => {
-    // fail-closed 清理（幂等由单次调用保证）：句柄 → temp 授权撤销 → SID 释放 → 自建 temp 删除。
-    // writableDirs 的 ACE 常驻（确定性 SID reuse cache，DSH 语义），不撤销。
-    if (spawned !== undefined) {
-      try {
-        if (api.closeHandle(spawned.job) === 0) throwLastError(api, 'CloseHandle', 'kill-on-close job')
-      } catch (error) {
-        failures.push(error)
-      }
-      try {
-        if (api.closeHandle(spawned.process) === 0) throwLastError(api, 'CloseHandle', 'restricted child process')
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    if (restrictedToken !== undefined) {
-      try {
-        if (api.closeHandle(restrictedToken) === 0) throwLastError(api, 'CloseHandle', 'restricted token')
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    if (currentToken !== undefined) {
-      try {
-        if (api.closeHandle(currentToken) === 0) throwLastError(api, 'CloseHandle', 'current process token')
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    if (grantedTemp) {
-      try {
-        revokeWrite(api, tempDir, tempSidPtr)
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    try {
-      const freed = api.localFree(writeSidPtr)
-      if (!isNullPtr(freed)) throwLastError(api, 'LocalFree', 'workspace write SID')
-    } catch (error) {
-      failures.push(error)
-    }
-    try {
-      const freed = api.localFree(tempSidPtr)
-      if (!isNullPtr(freed)) throwLastError(api, 'LocalFree', 'temp write SID')
-    } catch (error) {
-      failures.push(error)
-    }
-    if (selfCreatedTemp) {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true })
-      } catch (error) {
-        failures.push(error)
-      }
-    }
+  const caps = platformProvider().caps
+  if (!caps.sandbox_available) {
+    throw new Error(
+      `runRestricted: 平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——fail-closed 拒绝以完整令牌运行候选`,
+    )
   }
+  const impl = await loadWin32Impl()
+  return impl.runRestricted(opts)
+}
 
-  try {
-    // 1. 授权：writableDirs（常驻）+ 私有 temp（可撤销；先记录再授权，grant 抛错也能撤销）
-    for (const dir of writableDirs) {
-      grantWrite(api, dir, writeSidPtr)
-    }
-    grantedTemp = true
-    grantWrite(api, tempDir, tempSidPtr)
+/** 候选目录根（测试/排障可读；平台无关） */
+export function sandboxCandidatesRoot(): string {
+  return candidatesRoot()
+}
 
-    // 2. 令牌链（fail-closed；CreateRestrictedToken 返回主令牌，可直接 CreateProcessAsUserW）
-    currentToken = openCurrentProcessToken(api)
-    const logonSid = findLogonSid(api, currentToken)
-    const worldSid = makeWellKnownSid(api, abi.WinWorldSid)
-    restrictedToken = createRestrictedToken(api, currentToken, logonSid, [writeSidPtr, tempSidPtr], worldSid)
-    // 默认 DACL 并入 temp 写 SID 的全权 ACE：受限进程创建的新对象（匿名管道等）通过写 pass-2
-    setTokenDefaultDaclGrant(api, restrictedToken, tempSidPtr)
-    if (api.closeHandle(currentToken) === 0) throwLastError(api, 'CloseHandle', 'current process token')
-    currentToken = undefined
-
-    // 3. 环境改写（TMP/TEMP → 私有 temp；结果文件路径）+ spawn（lpEnvironment=NULL 继承改写后的环境块）
-    const envSnapshot = rewriteChildEnv(tempDir, opts.resultFile)
-    try {
-      spawned = spawnRestrictedInherited(api, restrictedToken, {
-        command: process.execPath,
-        args: [script, ...(opts.args ?? [])],
-        cwd,
-      })
-    } finally {
-      restoreEnv(envSnapshot) // spawn 返回后立即恢复宿主环境
-    }
-
-    // 4. 等待退出 / 超时杀
-    const result = await waitExit(api, spawned, timeoutMs)
-    const failures: unknown[] = []
-    cleanup(failures)
-    if (failures.length > 0) {
-      throw new AggregateError(failures, `runRestricted 清理完成但 ${failures.length} 项清理失败`)
-    }
-    return result
-  } catch (error) {
-    const failures: unknown[] = []
-    cleanup(failures)
-    if (failures.length > 0) {
-      throw new AggregateError([error, ...failures], `runRestricted 失败且 ${failures.length} 项清理也失败`)
-    }
-    throw error
-  }
+/** 临时目录根候选（平台无关；仅供实现模块复用同一口径） */
+export function sandboxTempRoot(): string {
+  return os.tmpdir()
 }

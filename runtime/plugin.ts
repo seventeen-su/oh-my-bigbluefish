@@ -13,6 +13,10 @@
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, isVersionLine, loadVersion, type VersionLine } from '../substrate/snapshot.js';
 import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
+// 外核安全状态（已知问题《内核加载失败不得阻塞宿主》/《外核自身也要非阻塞》）：拉起内核前的轻量自检
+import { evaluateSafeState, substrateRootOf } from '../substrate/safe-state.js';
+// 外核平台提供者（状态面暴露当前平台与能力；排障用）
+import { platformProvider } from '../substrate/platform.js';
 import { bootStable, type BootOptions, type BootResult } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
@@ -20,7 +24,7 @@ import { loadBenchContractsV2, loadBenchFixturesV2, makeReplayExecutorV2, runBen
 import { makeRealExecutor, makeRealExecutorV2 } from '../supervisor/real-executor.js';
 import { makeJudgeV2 } from '../supervisor/judge.js';
 import { createCognitiveRuntime } from './assembly.js';
-import { registerKernTools, type KernStatusSummary, type ToolsLike } from './kern-tools.js';
+import { registerKernTools, type KernRuntimeLike, type KernStatusSummary, type ToolsLike } from './kern-tools.js';
 import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
@@ -90,8 +94,12 @@ export interface PluginConfig {
    *  缺省 process.env.DSH_HOME ?? join(os.homedir(), '.dsh')——DSH skill-filesystem 默认扫描
    *  <dshHome>/skills（includeDefaultRoots 缺省 true），omb-runtime 技能镜像后被原生发现）。 */
   dshHome?: string;
-  /** 专项 D：prepareTurn 检索的 Retrieval Episode 采样率（0~1；缺省 0.02 = 2%——确定性哈希采样；
-   *  高价值任务（open_questions/evidence_gaps 非空）自动提升；kern_memory 显式工具恒记录不受此限；
+  /**
+   * 观测到的宿主版本（可选；宿主暴露自己版本时传入）。与 `hostVersion` 不一致 → 外核进入安全状态
+   *（契约可能不匹配：不拉起内核、不改动运行数据）。缺省不比较（无从观测时不臆断）。
+   */
+  observedHostVersion?: string;
+  /** 专项 D：prepareTurn 检索的 Retrieval Episode 采样率（0~1；缺省 0.02 = 2%——确定性哈希采样；   *  高价值任务（open_questions/evidence_gaps 非空）自动提升；kern_memory 显式工具恒记录不受此限；
    *  非法值 → 降级记录 + 使用缺省） */
   episodeSampleRate?: number;
   /**
@@ -423,8 +431,31 @@ function isBlankSession(events: ReadonlyArray<{ readonly type?: string }> | unde
 
 /** apply 返回句柄（Cordis 忽略函数插件返回值；装配断言/测试句柄用） */
 export interface ApplyResult {
-  /** 装配出的认知运行时（未提供装配根 → undefined；仅注册命令） */
+  /** 装配出的认知运行时（未提供装配根／安全状态／装配失败 → undefined；仅注册命令） */
   cognitive?: CognitiveRuntimeLike;
+  /** 外核安全状态快照（已知问题《外核自身也要非阻塞》：当前是否安全状态、原因、时间可经状态面查看） */
+  safeState?: {
+    ok: boolean;
+    kind: string;
+    reason: string | null;
+    at: number;
+    platform: string;
+    platform_degraded: string | null;
+    kernel_loaded: boolean;
+    details: Record<string, string>;
+  };
+  /** 平台能力快照（识别层输出；排障与状态面用） */
+  platform?: {
+    platform: string;
+    raw: string;
+    read_only: string;
+    read_only_available: boolean;
+    sandbox: string;
+    sandbox_available: boolean;
+    degraded: string | null;
+  };
+  /** 内核未加载时的状态面兜底数据源（kern_status 用——保证"能看到为什么没加载"） */
+  safeStateRuntime?: KernRuntimeLike;
 }
 
 /**
@@ -434,19 +465,100 @@ export interface ApplyResult {
  */
 export type BootReady = Pick<BootResult, 'ok' | 'line' | 'warnings' | 'rollback'>;
 
-export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {  /**
+   * 外核安全状态视图（已知问题《外核自身也要非阻塞》：当前是否安全状态、原因、发生时间可经状态面与
+   * 日志查看）+ 内核未加载时的状态面兜底数据源。二者都在此就近定义——工具注册与返回值都要用，
+   * 且必须在任何使用点之前完成绑定（TDZ）。
+   */
+  const safeStateView = (): {
+    ok: boolean;
+    kind: string;
+    reason: string | null;
+    at: number;
+    platform: string;
+    platform_degraded: string | null;
+    kernel_loaded: boolean;
+    details: Record<string, string>;
+  } => {
+    const st = evaluateSafeState({
+      configuredHostVersion: config.hostVersion,
+      defaultHostVersion: hostVersion(),
+      observedHostVersion: config.observedHostVersion,
+      substrateRoot: substrateRootOf(PLUGIN_ROOT),
+    });
+    return {
+      ok: st.ok,
+      kind: st.kind,
+      reason: st.reason,
+      at: st.at,
+      platform: st.platform,
+      platform_degraded: st.platform_degraded,
+      kernel_loaded: kernelLoaded,
+      details: st.details,
+    };
+  };
+
+  /** 内核未加载时的状态面兜底数据源（kern_status 用——保证"能看到为什么没加载"） */
+  const safeStateRuntime = (): KernRuntimeLike => ({
+    status: async () => ({
+      line: current,
+      snapshot_hash: 'rs:kernel-not-loaded',
+      line_snapshot: null,
+      line_degraded: '内核未加载（安全状态或装配失败）——无版本线快照',
+      debt: [],
+      debt_sources: null,
+      debt_pending_manual: [],
+      debt_release_audit: [],
+      debt_limits: null,
+      evolution: null,
+      memory_vector: null,
+      maintenance_observations: null,
+      observations_degraded: null,
+      recent_signals: 0,
+      signals_degraded: '内核未加载——无信号面',
+      components: { registered: [], active: [], suspicious: [], health: [] },
+      degraded: '内核未加载（安全状态或装配失败）——详见 safe_state 段',
+      safe_state: safeStateView(),
+    }),
+  });
+
+  /**
+   * 外核安全状态（已知问题《外核自身也要非阻塞（安全状态）》）：拉起内核**之前**做一次极轻量自检
+   * （平台探测 / 宿主版本契约 / 恢复根可读性）。不通过 → **不拉起内核、不改动运行数据、不执行演化与
+   * 维护**，只记录原因与时间；宿主启动与运行完全不受影响（插件"存在但不介入"）。
+   * 自检本身抛错也按安全状态处理（绝不外溢到宿主）；命令面照常注册（可查看"内核未加载的原因"）。
+   */
+  const safeState = evaluateSafeState({
+    configuredHostVersion: config.hostVersion,
+    defaultHostVersion: hostVersion(),
+    observedHostVersion: config.observedHostVersion,
+    substrateRoot: substrateRootOf(PLUGIN_ROOT),
+  });
+  /** 内核是否已成功加载（装配成功才置 true；供安全状态视图报告 kernel_loaded） */
+  let kernelLoaded = false;
+  if (!safeState.ok) {
+    recordDegradation('substrate/safe-state', `外核进入安全状态：${safeState.reason ?? '未知原因'}（不拉起内核，宿主不受影响）`);
+  }
+  // 内核装配是否被跳过由 safeState.ok 决定（安全状态 → 跳过；命令与状态面仍可用）
+
   // 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」）：versions.git/stable/latest
   // 均 gitignored、不随仓库分发 → 项目被分享（clone/拷贝）后布局缺失/损坏/ACL 丢失 →
   // 进程内自动初始化或保守修复。锁安全性：git/icacls 均以短生命周期子进程（execFileSync）运行，
   // DSH 进程不持有 versions.git/stable/latest 的文件句柄（正式 worktree 运行只读）→ 无锁冲突；
   // 布局健康时纯 fs 检查、零 git 子进程（零开销）。degraded → 记录降级（不阻塞挂载，命令仍可用）。
   // 顺序：bootstrap 守卫（ensureThreeLineLayout → 跨进程残留清理）→ bootStable（回退校验依赖布局就绪）。
-  if (config.bootstrap !== false) {
-    const r = ensureThreeLineLayout();
-    if (r.status === 'degraded') {
-      recordDegradation('layout/bootstrap', r.detail);
-    } else if (r.status !== 'ok') {
-      console.info(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
+  // 已知问题《内核加载失败不得阻塞宿主》：整段包裹在守卫内——初始化/修复异常一律降级记录，
+  // 绝不外溢（布局不可用时命令面与状态面仍可用；内核装配见下方 try/catch）。
+  if (config.bootstrap !== false && safeState.ok) {
+    try {
+      const r = ensureThreeLineLayout();
+      if (r.status === 'degraded') {
+        recordDegradation('layout/bootstrap', r.detail);
+      } else if (r.status !== 'ok') {
+        console.info(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
+      }
+    } catch (err) {
+      recordDegradation('layout/bootstrap', `三线布局初始化/修复异常（${err instanceof Error ? err.message : String(err)}）——跳过，命令面仍可用`);
     }
     // 跨进程残留清理：%TEMP%\initial-* 物化 worktree（上一进程遗留；本进程尚未物化 → 安全）。
     // 归属 bootstrap 守卫：bootstrap:false 表示「布局由调用方管理」（测试 fakeCtx 多 worker 并行
@@ -462,6 +574,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       const detail = err instanceof Error ? err.message : String(err);
       recordDegradation('initial/cleanup', `残留清理异常（${detail}）`);
     }
+  } else if (!safeState.ok) {
+    recordDegradation('layout/bootstrap', '安全状态：跳过三线布局初始化/修复（不改动运行数据）');
   }
   // R2（P0）启动顺序竞态修复：恢复根启动完整性校验升级为受控 promise（bootReady）。
   // 背景（ChatGPT 评估 #2）：bootStable 异步后台执行期间 CognitiveRuntime 已按（可能损坏的）
@@ -472,7 +586,12 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   // （一次性认知侧降级记录 'cognitive/boot'），命令仍可用。apply 为同步契约，boot 仍异步后台执行，
   // 但不再 fire-and-forget：bootReady 为受控句柄（resolve 载荷 { ok, line, warnings, rollback? }）。
   const boot = config.bootStableOverride ?? bootStable;
-  const bootReady: Promise<BootReady> = boot().then((r) => {
+  // 已知问题《内核加载失败不得阻塞宿主》：安全状态下**不拉起内核**——boot 校验也跳过（不改动运行数据），
+  // bootReady 直接以"不进入服务"结算（认知 gate 返回 false → 仅命令模式，与既有语义一致）。
+  const bootReady: Promise<BootReady> = (safeState.ok
+    ? boot()
+    : Promise.resolve<BootReady>({ ok: false, line: 'stable', warnings: [], rollback: undefined })
+  ).then((r) => {
     if (r.ok === false) {
       recordDegradation('boot/stable', `启动校验失败：版本线 ${r.line} 无恢复路径（${r.warnings.map((w) => w.kind).join(',')}）`);
     } else if (r.rollback !== undefined) {
@@ -636,7 +755,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     );
   }
 
-  if (cognitive === undefined) {
+  if (cognitive === undefined && safeState.ok) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
     if (root !== undefined) {
@@ -722,33 +841,47 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           `维护定时器启动失败（${err instanceof Error ? err.message : String(err)}）——退化为请求间隙单量子`,
         );
       }
-      cognitive = createCognitiveRuntime({
-        root,
-        modelAdapter,
-        // P1a：按当前版本线加载 policy/processes（lines 物化快照注入；缺失/失败 → 运行时回退仓库默认）
-        line: current,
-        // 专项 D：记忆检索 Episode 采样率（agent.cordis.yml config 可配；缺省不配 → 运行时缺省 0.02；
-        // 非法值 → 降级记录 + 不传（运行时缺省）——配置错误显式留痕不静默）
-        ...(episodeSampleRate !== undefined ? { episodeSampleRate } : {}),
-        // 自迭代开关面（agent.cordis.yml config.selfIteration；缺省全启用）——链路总开关/触发门槛/
-        // 后台模型调用许可/演化节律，全部落在部署配置面，不引入界面或交互开关
-        selfIteration,
-        // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
-        //（turn 收尾入队 + 请求间隙小量子 + 进程内 tick 批量消费；debt 落盘到认知数据根 .evolution/）
-        checkpointDir: join(root, 'checkpoints'),
-        maintenance,
-        // R6：宿主版本唯一来源注入（提供 → 覆写运行时指纹/事件 provenance 的 dsh_version；缺省 DSH_HOST_VERSION）
-        hostVersion: config.hostVersion,
-        // S2：验证债务队列（<root>/.evolution/verification/debt.jsonl——与 assembly 缺省构造同路径，
-        // 显式注入便于装配面审计）+ 空白子代理单次裁判（subagents 缺失 → 不注入 = judge 不可用，
-        // 诚实降级——仅验证债务路径触发、正常任务 0 额外成本）
-        verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
-        ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
-        // W3：dynamicCordisRunner 增强通道注入（宿主面存在 → 候选验证脚本经 runner 通道；未注入 → 管线守卫降级受限子进程路径）
-        ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
-      });
+      try {
+        cognitive = createCognitiveRuntime({
+          root,
+          modelAdapter,
+          // P1a：按当前版本线加载 policy/processes（lines 物化快照注入；缺失/失败 → 运行时回退仓库默认）
+          line: current,
+          // 专项 D：记忆检索 Episode 采样率（agent.cordis.yml config 可配；缺省不配 → 运行时缺省 0.02；
+          // 非法值 → 降级记录 + 不传（运行时缺省）——配置错误显式留痕不静默）
+          ...(episodeSampleRate !== undefined ? { episodeSampleRate } : {}),
+          // 自迭代开关面（agent.cordis.yml config.selfIteration；缺省全启用）——链路总开关/触发门槛/
+          // 后台模型调用许可/演化节律，全部落在部署配置面，不引入界面或交互开关
+          selfIteration,
+          // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
+          //（turn 收尾入队 + 请求间隙小量子 + 进程内 tick 批量消费；debt 落盘到认知数据根 .evolution/）
+          checkpointDir: join(root, 'checkpoints'),
+          maintenance,
+          // R6：宿主版本唯一来源注入（提供 → 覆写运行时指纹/事件 provenance 的 dsh_version；缺省 DSH_HOST_VERSION）
+          hostVersion: config.hostVersion,
+          // S2：验证债务队列（<root>/.evolution/verification/debt.jsonl——与 assembly 缺省构造同路径，
+          // 显式注入便于装配面审计）+ 空白子代理单次裁判（subagents 缺失 → 不注入 = judge 不可用，
+          // 诚实降级——仅验证债务路径触发、正常任务 0 额外成本）
+          verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
+          // 状态面：外核安全状态段（内核未加载的原因可查——已知问题《内核加载失败不得阻塞宿主》）
+          safeStateView,
+          ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
+          // W3：dynamicCordisRunner 增强通道注入（宿主面存在 → 候选验证脚本经 runner 通道；未注入 → 管线守卫降级受限子进程路径）
+          ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
+        });
+        kernelLoaded = true;
+      } catch (err) {
+        // 已知问题《内核加载失败不得阻塞宿主》：**装配期异常外溢是历史故障根因**（Guard 读取错误、
+        // 记忆库缺列两次实测阻塞宿主）。此处兜底：内核不加载 + 记录原因 + 宿主照常启动与运行；
+        // 命令面与状态面仍在（可查看"内核未加载的原因"）。不重抛、不改动已写入的运行数据。
+        cognitive = undefined;
+        recordDegradation(
+          'cognitive/assembly',
+          `内核装配失败（${err instanceof Error ? err.message : String(err)}）——内核不加载，宿主不受影响；命令面与状态面仍可用`,
+        );
+      }
       // P1a：lines 按线加载降级（线快照缺 policy / lines 不可用 → 已回退仓库默认）→ 记录降级（不抛，命令仍可用）
-      if (cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {
+      if (cognitive !== undefined && cognitive.lineDegraded !== undefined && cognitive.lineDegraded !== null) {
         recordDegradation('lines/load', cognitive.lineDegraded);
       }
     }
@@ -767,24 +900,27 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
    */
   const tools = readService<ToolsLike>(ctx, 'tools');
   if (tools !== undefined && typeof tools.register === 'function') {
-    if (cognitive !== undefined) {
-      const r = registerKernTools(tools, cognitive);
-      if (r.degraded !== null) {
-        recordDegradation('kern/tools', r.degraded);
-      }
-      if (typeof ctx.effect === 'function' && r.disposers.length > 0) {
-        ctx.effect(() => () => {
-          for (const d of r.disposers) {
-            try {
-              d(); // 真实 DSH register 返回的 disposer（注销幂等；失败忽略）
-            } catch {
-              // 注销失败幂等忽略（无状态残留）
-            }
+    // 内核已装配 → 完整工具集；内核未加载（安全状态/装配失败）→ **只注册 kern_status**（薄封装到
+    // 安全状态兜底数据源），保证"能看到内核为什么没加载"（已知问题《内核加载失败不得阻塞宿主》：
+    // 命令面与状态面尽力保留）。工具数不增加（仍 6 个），只是数据源不同。
+    const toolRuntime = cognitive !== undefined ? cognitive : safeStateRuntime();
+    const r = registerKernTools(tools, toolRuntime, cognitive === undefined ? { only: ['kern_status'] } : {});
+    if (r.degraded !== null) {
+      recordDegradation('kern/tools', r.degraded);
+    }
+    if (cognitive === undefined) {
+      recordDegradation('kern/tools', '内核未加载——仅注册 kern_status（可查看安全状态与原因）');
+    }
+    if (typeof ctx.effect === 'function' && r.disposers.length > 0) {
+      ctx.effect(() => () => {
+        for (const d of r.disposers) {
+          try {
+            d(); // 真实 DSH register 返回的 disposer（注销幂等；失败忽略）
+          } catch {
+            // 注销失败幂等忽略（无状态残留）
           }
-        });
-      }
-    } else {
-      recordDegradation('kern/tools', '认知运行时未装配——kern_* 工具未注册');
+        }
+      });
     }
   } else {
     recordDegradation('ctx.tools', '接口缺失（ctx.tools 不存在）——kern_* 工具未注册（其余功能不受影响）');
@@ -1402,5 +1538,10 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     },
   });
 
-  return { cognitive };
+  /**
+   * 状态面：安全状态与平台能力（已知问题《外核自身也要非阻塞》：当前是否处于安全状态、原因、发生时间
+   * 可经状态面与日志查看）。内核已装配 → 并入其状态摘要（`safe_state` 段）；内核未装配（安全状态或
+   * 装配失败）→ 仍返回本段（命令面与状态面尽力保留）。
+   */
+  return { cognitive, safeState: safeStateView(), platform: platformProvider().caps, safeStateRuntime: safeStateRuntime() };
 }
