@@ -151,8 +151,18 @@ export interface MaintenanceSchedulerOptions {
   softLimit?: number;
   /** hard 阈值：债务合计 ≥ → 非必要（urgency='normal'）任务跳过 */
   hardLimit?: number;
+  /** critical 阈值：债务合计 ≥ → 状态面报告 critical 档（§6.5.7；展示与判定用，不改变跳过语义） */
+  criticalLimit?: number;
   /** tick 基准间隔（ms）；start() 启动定时器 */
   tickIntervalMs?: number;
+  /**
+   * 单次调用的任务批量上限（tick/requestQuantum）。
+   * 缺省 1 = 每次最多执行 1 个任务（既有单量子语义不变）。
+   * 生产装配传 >1 → 一次 tick 批量消费多个任务，解决「单量子名额导致 ROI 饥饿」：队列里高位任务
+   * （如会话收尾 ROI 1.0）清空后，同一批内继续消费演化判定/晋升检查（ROI 0.5），不必等下一轮请求。
+   * 上限受 MAINTENANCE_BATCH_MAX 约束（防单次调用长时间占用）。
+   */
+  batchSize?: number;
   /** 时钟注入（测试）；缺省 Date.now */
   now?: () => number;
 }
@@ -161,6 +171,20 @@ export interface MaintenanceSchedulerOptions {
 
 export const DEFAULT_SOFT_LIMIT = 10;
 export const DEFAULT_HARD_LIMIT = 50;
+/** critical 阈值缺省（§6.5.7 critical → 请求边界强制插入 quantum；与 evolve.yaml debt_thresholds.critical 对齐） */
+export const DEFAULT_CRITICAL_LIMIT = 100;
+/** 单次调用（tick/requestQuantum）的任务批量硬上限——防 batchSize 配置过大导致单次调用长时间占用 */
+export const MAINTENANCE_BATCH_MAX = 16;
+/** 批量缺省值：1 = 既有单量子语义（每次最多执行 1 个任务）；生产装配显式调高以消除 ROI 饥饿 */
+export const DEFAULT_BATCH_SIZE = 1;
+/**
+ * 生产装配的批量缺省（插件装配传入）：一次 tick 在请求间隙最多消费 4 个维护任务。
+ * 取值依据（已知问题「单量子名额导致 ROI 饥饿」）：队列每轮固定入队「会话收尾 ROI 1.0 +
+ * 演化判定/晋升检查/环境检查 ROI 0.5」→ 单名额时收尾任务恒胜，判定类任务永无名额；批量 4
+ * 使同一批内先清收尾、再依次消费判定/检查类任务，同时受 §9.4「维护量子 ≥ 典型任务耗时」
+ * 约束（真实基准 latency P90 ≈ 2.1s，tick 间隔 60s 余量约 29× → 4 个任务仍远小于间隔）。
+ */
+export const DEFAULT_MAINTENANCE_BATCH = 4;
 /** tick 基准间隔（ms）；start() 启动定时器。§17 标定验证（T8.20，2026-08-21，主会话裁决「仅记录不写回」）：
  *  约束「维护量子 ≥ 典型任务耗时」由 latency_ms 均值 3973ms（workspace/.omb/bench/bench-*.json，数据来源标注
  *  于 task-m8d-report.md）验证：60000 ≥ 3973 满足 → 数值保持初值。
@@ -173,6 +197,33 @@ export const CAPABILITY_DECAY_FACTOR = 0.8;
 /** §4.4 Fingerprint 参与 diff 的字段（固定顺序，保证环境_delta 键序确定性） */
 const FP_FIELDS: (keyof Fingerprint)[] = ['os', 'node', 'dsh_version', 'project', 'gpu', 'cuda'];
 
+/**
+ * 硬限豁免清单（债务合计 ≥ hardLimit 时仍照常执行的任务；其余 urgency='normal' 任务照旧被跳过）：
+ *   - 廉价必要维护（2026-08-25 死亡螺旋修复）：gc / 会话收尾 / 记忆整合 / 环境检查——
+ *     被硬限阻塞则其债务永不清偿、债务合计永不回落，硬限成为永久冻结（实测 turn-finalize 债务
+ *     1163 = 被硬跳过 1163 次）；
+ *   - 检查与判定类（已知问题「债务把检查/判定类任务自身锁死」修复）：evolution_decision /
+ *     promotion_check / verification_review——它们是「债从哪来、能不能释放」的唯一观测与裁决入口，
+ *     把它们一起锁住会让债务永远无法被诊断与清偿。三者都不改版本线：
+ *     evolution_decision 只判定并记录原因（债务门禁仍在 decideEvolution 内独立把关）、
+ *     promotion_check 有独立的三层门禁 + 验证契约 fail-closed、verification_review 只读债 + 复核。
+ * 保护语义不变：**改动类**演化任务（candidate_validation 生成候选、repair 改对象）仍受硬限约束——
+ * 债务高企时不在带病状态下改版本线/改对象。
+ */
+const HARD_LIMIT_EXEMPT = new Set([
+  'gc',
+  'memory_consolidation',
+  'environment_check',
+  'evolution_decision',
+  'promotion_check',
+  'verification_review',
+]);
+
+/** 是否豁免硬限（会话级收尾任务按前缀识别） */
+function isHardLimitExempt(taskId: string): boolean {
+  return HARD_LIMIT_EXEMPT.has(taskId) || taskId.startsWith('turn-finalize:');
+}
+
 // ---- 维护调度器 ----
 
 export class MaintenanceScheduler {
@@ -181,9 +232,11 @@ export class MaintenanceScheduler {
   private readonly observationsDir: string;
   /** S2：维护任务成本注入面（policy.evolve.maintenance_costs；enqueue 缺省成本按 id 查找） */
   private maintenanceCosts: Readonly<Partial<Record<string, number>>>;
-  private readonly softLimit: number;
-  private readonly hardLimit: number;
+  private softLimit: number;
+  private hardLimit: number;
+  private criticalLimit: number;
   private readonly baseTickMs: number;
+  private readonly batchSize: number;
   private readonly nowFn: () => number;
   private queue: MaintenanceTask[] = [];
   private debt = new Map<string, MaintenanceDebt>();
@@ -207,7 +260,14 @@ export class MaintenanceScheduler {
     this.maintenanceCosts = opts.maintenanceCosts ?? {};
     this.softLimit = opts.softLimit ?? DEFAULT_SOFT_LIMIT;
     this.hardLimit = opts.hardLimit ?? DEFAULT_HARD_LIMIT;
+    this.criticalLimit = opts.criticalLimit ?? DEFAULT_CRITICAL_LIMIT;
     this.baseTickMs = opts.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS;
+    // 批量上限：缺省 1（既有单量子语义）；<1 视为 1；> MAINTENANCE_BATCH_MAX 截断（防单次调用过长占用）
+    const batch = Math.floor(opts.batchSize ?? DEFAULT_BATCH_SIZE);
+    this.batchSize = Math.min(
+      Math.max(Number.isFinite(batch) ? batch : DEFAULT_BATCH_SIZE, 1),
+      MAINTENANCE_BATCH_MAX,
+    );
     this.nowFn = opts.now ?? (() => Date.now());
   }
 
@@ -246,8 +306,8 @@ export class MaintenanceScheduler {
     this.resetTimer();
   }
 
-  /** 请求间隙小量子：执行 1 个可执行任务（可中断：调用方 signal ∪ stop() 的 inFlight）；
-   *  hard 限跳过者记录 skipped + 债务累计 */
+  /** 请求间隙小量子：执行至多 batchSize 个可执行任务（缺省 1 = 既有单量子语义；可中断：调用方
+   *  signal ∪ stop() 的 inFlight）；hard 限跳过者记录 skipped + 不累计债务（硬跳过 = 调度延迟非失败） */
   async requestQuantum(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
     if (this.stopped || this.queue.length === 0) return { ran: [], skipped: [] };
     const signal = this.execSignal(opts.signal);
@@ -260,6 +320,7 @@ export class MaintenanceScheduler {
     }
     const report: QuantumReport = { ran: [], skipped: [] };
     for (const t of this.sortedQueue()) {
+      if (report.ran.length >= this.batchSize) break; // 批量上限：本次调用已消费足够的任务
       if (this.hardBlocked(t)) {
         // 硬跳过 = 调度延迟而非失败（2026-08-25 死亡螺旋修复）：不累计债务——
         // 否则债务合计 ≥ 硬限后每次跳过都 +value，债务永不回落（实测 gc/turn-finalize
@@ -272,9 +333,10 @@ export class MaintenanceScheduler {
       report.skipped.push(...r.skipped);
       await this.persistDebt();
       this.resetTimer(); // 债务变化可能改变 tick 频率
-      return report;
+      if (signal.aborted) break; // 中断（调用方 abort / stop）→ 让出，不再取新任务
+      if (report.ran.length >= this.batchSize) break;
     }
-    await this.persistDebt(); // 全部被 hard 跳过
+    await this.persistDebt(); // 全部被 hard 跳过 / 批量已满
     return report;
   }
 
@@ -288,6 +350,7 @@ export class MaintenanceScheduler {
       const report: QuantumReport = { ran: [], skipped: [] };
       for (const t of this.sortedQueue()) {
         if (signal.aborted) break;
+        if (report.ran.length >= this.batchSize) break; // 批量上限
         if (this.hardBlocked(t)) {
           report.skipped.push(t.id);
           continue; // 硬跳过不累计债务（死亡螺旋修复，见 hardBlocked/requestQuantum 注释）
@@ -324,6 +387,63 @@ export class MaintenanceScheduler {
    */
   setMaintenanceCosts(costs: Readonly<Partial<Record<string, number>>>): void {
     this.maintenanceCosts = { ...costs };
+  }
+
+  /**
+   * 债务阈值注入（装配时传 policy.evolve.debt_thresholds——数据即机制：改 evolve.yaml 即生效，
+   * 与 kernel/evolve-decision.ts decideEvolution 的「债务 ≥ hard → 不演化」同源，两处不再各持一套缺省值）。
+   * 幂等：整体替换；非法（非有限数 / 负数 / soft > hard / hard > critical）→ 丢弃该项并返回说明，
+   * 其余照常生效（不静默采用错值；调用方记录降级）。
+   * @returns 被丢弃/异常的项说明（空数组 = 全部合法）
+   */
+  setLimits(limits: { soft?: number; hard?: number; critical?: number }): string[] {
+    const bad: string[] = [];
+    const pick = (v: number | undefined, fallback: number, name: string): number => {
+      if (v === undefined) return fallback;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+        bad.push(`${name}=${String(v)}`);
+        return fallback;
+      }
+      return v;
+    };
+    const soft = pick(limits.soft, this.softLimit, 'soft');
+    const hard = pick(limits.hard, this.hardLimit, 'hard');
+    const critical = pick(limits.critical, this.criticalLimit, 'critical');
+    if (soft > hard) bad.push(`soft(${soft})>hard(${hard})`);
+    if (hard > critical) bad.push(`hard(${hard})>critical(${critical})`);
+    this.softLimit = soft;
+    this.hardLimit = hard;
+    this.criticalLimit = critical;
+    this.resetTimer(); // soft 变化影响 tick 频率
+    return bad;
+  }
+
+  /** 当前生效阈值 + 债务档位 + 批量（状态面可读——观测「为什么停下来了」） */
+  limitsSnapshot(): {
+    soft: number;
+    hard: number;
+    critical: number;
+    total: number;
+    band: 'normal' | 'soft' | 'hard' | 'critical';
+    batch_size: number;
+  } {
+    const total = this.debtTotal();
+    const band: 'normal' | 'soft' | 'hard' | 'critical' =
+      total >= this.criticalLimit
+        ? 'critical'
+        : total >= this.hardLimit
+          ? 'hard'
+          : total >= this.softLimit
+            ? 'soft'
+            : 'normal';
+    return {
+      soft: this.softLimit,
+      hard: this.hardLimit,
+      critical: this.criticalLimit,
+      total,
+      band,
+      batch_size: this.batchSize,
+    };
   }
 
   /**
@@ -444,15 +564,11 @@ export class MaintenanceScheduler {
   }
 
   /** hard 限：债务合计 ≥ hardLimit 时非必要（normal）任务跳过（限制非必要演化）。
-   *  必要维护任务豁免（2026-08-25 死亡螺旋修复）：gc/收尾/记忆整合/环境检查为廉价必要维护——
-   *  若被硬限阻塞则其债务永不清偿、债务合计永不回落，硬限成为永久冻结（实测 turn-finalize 债务
-   *  1163 = 被硬跳过 1163 次）。§10.1「限制非必要 evolution」——仅演化类任务（candidate_validation/
-   *  evolution_decision/promotion_check/repair）受硬限约束。 */
+   *  豁免清单见 HARD_LIMIT_EXEMPT：廉价必要维护（避免债务永不清偿的死亡螺旋）+ 检查与判定类任务
+   *  （避免「债务把检查/判定类任务自身锁死」——否则债务永远无法被诊断与清偿）。
+   *  保护语义保留：改动类演化任务（candidate_validation/repair）仍受硬限约束。 */
   private hardBlocked(t: MaintenanceTask): boolean {
-    if (t.id === 'gc' || t.id === 'memory_consolidation' || t.id === 'environment_check' || t.id.startsWith('turn-finalize:')) {
-      return false;
-    }
-    return this.debtTotal() >= this.hardLimit && t.urgency === 'normal';
+    return this.debtTotal() >= this.hardLimit && t.urgency === 'normal' && !isHardLimitExempt(t.id);
   }
 
   /** 任务执行 signal：stop() 的 inFlight 与调用方 signal 合并（stop 中断在飞任务） */

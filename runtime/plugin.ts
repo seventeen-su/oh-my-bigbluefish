@@ -25,7 +25,7 @@ import { createDshModelAdapter, type LlmStreamLike } from './model-adapter.js';
 import { buildRequestFromSession, fallbackFinalizeDecision, fallbackWorkingState, lastUserMessageText, projectionToText, recordDegradation } from './loop-hooks.js';
 import { initialTraceState, mapLiveToolResult, mapSessionEvent } from './dsh-events.js';
 import { reduce } from '../supervisor/state-reducer.js';
-import { MaintenanceScheduler } from '../supervisor/maintenance.js';
+import { MaintenanceScheduler, DEFAULT_MAINTENANCE_BATCH, DEFAULT_TICK_INTERVAL_MS } from '../supervisor/maintenance.js';
 // S2：验证债务队列（layer 1 JSONL——plugin 装配面显式注入隔离根；与 assembly 缺省同路径语义）
 import { VerificationDebt } from '../supervisor/verification-debt.js';
 // W3（未接线审计修复 2026-08-25）：dynamicCordisRunner 结构最小面（S9 增强通道——候选验证脚本经动态
@@ -607,6 +607,28 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           modelAdapter = createDshModelAdapter(llm, { provider, model });
         }
       }
+      // 生产装配维护调度器（已知问题「维护定时器未启动」「单量子名额导致 ROI 饥饿」修复）：
+      // ① 构造时显式给出 tick 间隔与批量上限（不再依赖代码缺省），② 构造后立即 start() 启动进程内
+      //    定时器——每 tick 在请求间隙批量消费维护队列（收尾压缩/记忆整合/环境检查/演化判定/晋升检查/
+      //    候选验证/修复/验证复核）。仅随 DSH 进程存在：关闭 harness 即停（stop() 经 ctx.effect 清理），
+      //    队列与债务持久在磁盘，队列空时零开销。
+      // ③ 债务阈值 soft/hard/critical 由组合根 ready() 从 policy.evolve.debt_thresholds 注入
+      //    （数据即机制——改 evolve.yaml 即生效，与 decideEvolution 的债务门禁同源，两处不再各持一套缺省）。
+      const maintenance = new MaintenanceScheduler({
+        debtFile: join(root, '.evolution', 'debt.json'),
+        tickIntervalMs: DEFAULT_TICK_INTERVAL_MS,
+        batchSize: DEFAULT_MAINTENANCE_BATCH,
+      });
+      // 定时器启动：仅在 DSH 运行期生效（进程内 setInterval）；stop() 由下方关闭钩子调用。
+      // 启动失败不阻塞装配（认知其余功能照常，降级记录显式留痕）——调度退化为请求间隙单量子。
+      try {
+        maintenance.start();
+      } catch (err) {
+        recordDegradation(
+          'maintenance/start',
+          `维护定时器启动失败（${err instanceof Error ? err.message : String(err)}）——退化为请求间隙单量子`,
+        );
+      }
       cognitive = createCognitiveRuntime({
         root,
         modelAdapter,
@@ -616,9 +638,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         // 非法值 → 降级记录 + 不传（运行时缺省）——配置错误显式留痕不静默）
         ...(episodeSampleRate !== undefined ? { episodeSampleRate } : {}),
         // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
-        //（turn 收尾入队 + 请求间隙小量子；debt 落盘到认知数据根 .evolution/）
+        //（turn 收尾入队 + 请求间隙小量子 + 进程内 tick 批量消费；debt 落盘到认知数据根 .evolution/）
         checkpointDir: join(root, 'checkpoints'),
-        maintenance: new MaintenanceScheduler({ debtFile: join(root, '.evolution', 'debt.json') }),
+        maintenance,
         // R6：宿主版本唯一来源注入（提供 → 覆写运行时指纹/事件 provenance 的 dsh_version；缺省 DSH_HOST_VERSION）
         hostVersion: config.hostVersion,
         // S2：验证债务队列（<root>/.evolution/verification/debt.jsonl——与 assembly 缺省构造同路径，

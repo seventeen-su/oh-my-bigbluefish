@@ -907,6 +907,20 @@ export class CognitiveRuntime {
     // S2：维护成本数据化——装配读取 policy.evolve.maintenance_costs → 注入维护调度器
     //（缺省成本面：enqueue 未给 estimated_cost 且任务 id 命中 → policy 成本；改 evolve.yaml 即生效）
     this.maintenance?.setMaintenanceCosts(policy.evolve.maintenance_costs);
+    // 债务阈值接线（已知问题「债务阈值未与策略接线」）：policy.evolve.debt_thresholds（soft/hard/critical）
+    // → 维护调度器；与 kernel/evolve-decision.ts decideEvolution 的「债务 ≥ hard → 不演化」同源，
+    // 改 evolve.yaml 即同时改变调度器硬限行为与判定门禁（两处不再各持一套缺省值）。
+    // 非法项由调度器丢弃并返回说明 → 记录降级（不静默采用错值）。
+    if (this.maintenance !== null) {
+      const bad = this.maintenance.setLimits({
+        soft: policy.evolve.debt_thresholds.soft,
+        hard: policy.evolve.debt_thresholds.hard,
+        critical: policy.evolve.debt_thresholds.critical,
+      });
+      if (bad.length > 0) {
+        recordDegradation('maintenance/limits', `债务阈值非法项已忽略：${bad.join(', ')}`);
+      }
+    }
     return { policy, processes: await this.processesPromise };
   }
 
