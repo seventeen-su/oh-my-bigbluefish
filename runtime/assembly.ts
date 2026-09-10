@@ -82,7 +82,7 @@ import { classifyFromText } from '../kernel/controllability.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——layer 2；装配面注入 spawnJudge）
 import type { JudgeExecutor } from './judge-executor.js';
 import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
-import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport } from '../supervisor/maintenance.js';
+import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport, type DebtSourceView, type DebtReleaseRecord, type DebtReleaseResult } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import { retrieve, type RankedMemory, type RetrieveQuery } from '../memory/retrieve.js';
@@ -107,6 +107,7 @@ import {
   memoryConsolidationAccrual,
   repairAccrual,
   summarizeSignals,
+  type DebtAccrual,
 } from '../kernel/evolve-decision.js';
 import type { EvolutionDecision, CapabilityDecayRecord, ArtifactRef } from '../kernel/schemas/evolution.js';
 // P7：Predictive Invalidation 环境指纹（§14.5/§15.4——指纹 diff 纯函数 + 采集 + 衰减记录构造）
@@ -814,6 +815,8 @@ export class CognitiveRuntime {
   /** 会话 → prepareTurn 采样记录的 episode id 集（finalizeTurn 归因代理的归属面；retrieval_episode 表
    *  无 session 列，会话归属只能在记录点（prepareTurn）捕获；kern_memory 无会话上下文不入此面） */
   private readonly sessionEpisodes = new Map<string, Set<string>>();
+  /** 来源子系统最近一次「执行体成功跑完」时间（债务释放的确认依据；本进程内真实观测，不跨进程推断） */
+  private readonly lastSubsystemOk = new Map<string, number>();
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
@@ -975,7 +978,21 @@ export class CognitiveRuntime {
     // S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + 降级字段，不抛）
     let maintenance_observations: KernStatusSummary['maintenance_observations'] = null;
     let observations_degraded: string | null = null;
+    // 债务来源与释放面（已知问题《债务是保护性自锁》：状态面要能回答「这条债是哪来的、
+    // 为什么没放、哪些进了人工裁定」——纯读取，调度器缺失 → null，不抛）
+    let debt_sources: DebtSourceView[] | null = null;
+    let debt_pending_manual: DebtSourceView[] = [];
+    let debt_release_audit: DebtReleaseRecord[] = [];
+    let debt_limits: ReturnType<MaintenanceScheduler['limitsSnapshot']> | null = null;
     if (this.maintenance !== null) {
+      try {
+        debt_sources = this.maintenance.debtSourceView();
+        debt_pending_manual = this.maintenance.manualPendingDebt();
+        debt_release_audit = this.maintenance.debtReleaseAudit();
+        debt_limits = this.maintenance.limitsSnapshot();
+      } catch (err) {
+        observations_degraded = observations_degraded ?? errorDetail(err);
+      }
       try {
         maintenance_observations = this.maintenance.observationsSummary();
       } catch (err) {
@@ -990,6 +1007,10 @@ export class CognitiveRuntime {
         : null,
       line_degraded: this.lineDegraded,
       debt: this.maintenance?.debtSnapshot() ?? [],
+      debt_sources,
+      debt_pending_manual,
+      debt_release_audit,
+      debt_limits,
       maintenance_observations,
       observations_degraded,
       recent_signals,
@@ -1948,33 +1969,13 @@ export class CognitiveRuntime {
         countsToSignalRecords(signals as unknown as Record<string, number>, turnTs, input.session_id),
       );
       for (const acc of debtAccrualsFromSummary(summary, maintenanceCosts)) {
-        await this.maintenance.enqueue(
-          {
-            id: acc.task_id,
-            value: acc.value,
-            estimated_cost: acc.estimated_cost,
-            priority: acc.priority,
-            urgency: acc.urgency,
-            run: this.maintenanceRun(acc.task_id, input.session_id),
-          },
-          { accrueDebt: true },
-        );
+        await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, input.session_id));
       }
       // R4（P0）：经验已入 staging → memory_consolidation 债务入账（§10.1 同形状）——保证
       // 「经验 → 长期记忆」生产闭环在无 memory 信号时也可调度（空闲期量子执行 consolidation）
       if (experience_admission.staged > 0) {
         const acc = memoryConsolidationAccrual(maintenanceCosts);
-        await this.maintenance.enqueue(
-          {
-            id: acc.task_id,
-            value: acc.value,
-            estimated_cost: acc.estimated_cost,
-            priority: acc.priority,
-            urgency: acc.urgency,
-            run: this.maintenanceRun(acc.task_id, input.session_id),
-          },
-          { accrueDebt: true },
-        );
+        await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, input.session_id));
       }
       // P1c：演化判定任务（空闲期 quantum 执行；低优先级、可中断——读 signals → evolve.policy 判定 →
       // 应演化则入队 candidate_validation + evolution/candidate 事件入链）
@@ -2099,8 +2100,7 @@ export class CognitiveRuntime {
     return n;
   }
 
-  /** 生效采样率 = 高价值提升（open_questions/evidence_gaps 非空 → max(配置率, 高价值率)；否则配置率） */
-  private effectiveEpisodeSampleRate(workingState: PromptWorkingState): number {
+  /** 生效采样率 = 高价值提升（open_questions/evidence_gaps 非空 → max(配置率, 高价值率)；否则配置率） */  private effectiveEpisodeSampleRate(workingState: PromptWorkingState): number {
     const highValue = workingState.open_questions.length > 0 || workingState.evidence_gaps.length > 0;
     return highValue ? Math.max(this.episodeSampleRate, EPISODE_SAMPLE_RATE_HIGH_VALUE) : this.episodeSampleRate;
   }
@@ -2448,6 +2448,176 @@ export class CognitiveRuntime {
     }
   }
 
+  /**
+   * 债务入账入队（统一入口——债务来源记录随任务一起注入，见 kernel/evolve-decision.ts DEBT_SUBSYSTEM）：
+   * 入队 + accrueDebt（入账即累计并落盘）+ subsystem/reason 写入债务来源记录，供「修复 → 确认 → 释放」
+   * 按条核对（释放时 expectedSubsystem 必须与记录一致）。
+   */
+  private async enqueueAccrual(
+    acc: DebtAccrual,
+    run: (signal?: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    await this.maintenance?.enqueue(
+      {
+        id: acc.task_id,
+        value: acc.value,
+        estimated_cost: acc.estimated_cost,
+        priority: acc.priority,
+        urgency: acc.urgency,
+        subsystem: acc.subsystem,
+        reason: acc.reason,
+        run,
+      },
+      { accrueDebt: true },
+    );
+  }
+
+  // ---- 债务「修复 → 确认 → 释放」（已知问题《债务是保护性自锁，需要修复后释放而不是定时清除》） ----
+
+  /**
+   * 债务释放流程（**不做任何周期性/到期式清除**——只有修复完成并经自检确认后才按条释放）。
+   *
+   * 确认依据 = 各来源子系统现存的自检结果（全部可从已落盘数据读出，不伪造）：
+   *   - `repair-chain`：`.evolution/repair/<ts>.json` 最近记录判定全为 PASS 且该记录晚于债务首见时间
+   *     （即「修复之后」的确认，而非修复前的陈旧结论）——repair 与 candidate_validation 共用该自检面；
+   *   - `environment-check`：`.evolution/decay/` 无晚于债务首见时间的新衰减记录 → 环境侧已核对稳定；
+   *   - `memory-consolidation`：staging 无过期未整合条目（`sweepExpired` 语义面的可读代理 = admit 后
+   *     无 pending）；
+   *   - `evolution-decision` / `promotion-check`：其判定在硬限下已不再被阻塞（本轮调度已执行该任务
+   *     且无失败记录）——它们自身不锁死即视为该子系统健康。
+   *
+   * 未通过自检的条目**保留**（保护语义不变）；无来源子系统的条目不在本路径（走 manualPendingDebt
+   * 人工裁定清单）。每次释放落审计（`debt-releases.jsonl`：依据/触发者/时间/释放前累计值）。
+   * 返回逐条结果，供状态面与 /evolve 摘要展示。
+   */
+  async runDebtRelease(input: { session_id?: string; reviewed_by?: string } = {}): Promise<{
+    released: DebtReleaseRecord[];
+    kept: DebtReleaseResult[];
+    manual_pending: DebtSourceView[];
+  }> {
+    const scheduler = this.maintenance;
+    if (scheduler === null) {
+      return { released: [], kept: [], manual_pending: [] };
+    }
+    const reviewedBy = input.reviewed_by ?? 'maintenance:debt_release';
+    const now = Date.now();
+    const repairs = await this.readRepairRecords();
+    const latestRepairPass = [...repairs]
+      .filter((r) => r.objects.length > 0 && r.objects.every((o) => o.verdict === 'PASS'))
+      .map((r) => r.ts)
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => b - a)[0];
+    const latestDecayTs = await this.readLatestDecayTs();
+    const released: DebtReleaseRecord[] = [];
+    const kept: DebtReleaseResult[] = [];
+    for (const view of scheduler.debtSourceView()) {
+      if (view.orphan) continue; // 无主债务 → 人工裁定清单，不自动释放
+      const evidence = this.debtSelfCheckEvidence(view, { latestRepairPass, latestDecayTs, now });
+      if (evidence === null) {
+        kept.push({ released: false, task_id: view.task_id, value: view.value, reason: 'selfcheck_not_passed' });
+        continue;
+      }
+      const r = await scheduler.releaseDebt({
+        taskId: view.task_id,
+        expectedSubsystem: view.subsystem!,
+        evidence,
+        releasedBy: reviewedBy,
+        reason: view.reason,
+      });
+      if (r.released) {
+        released.push({
+          ts: now,
+          task_id: r.task_id,
+          value: r.value,
+          subsystem: view.subsystem,
+          evidence,
+          released_by: reviewedBy,
+          reason: view.reason,
+        });
+      } else {
+        kept.push(r);
+      }
+    }
+    return { released, kept, manual_pending: scheduler.manualPendingDebt() };
+  }
+
+  /** 子系统自检证据（通过 → 证据文本；未通过 → null 表示保留该条债务）。
+   *  依据 = 该来源子系统的执行体在本进程内**成功跑完**（真实观测，非推断）+ 已落盘审计面佐证。 */
+  private debtSelfCheckEvidence(
+    view: DebtSourceView,
+    ctx: { latestRepairPass: number | undefined; latestDecayTs: number | undefined; now: number },
+  ): string | null {
+    const last = this.lastSubsystemOk.get(view.subsystem ?? '');
+    const ranAfterFirstSeen = last !== undefined && last >= view.first_seen;
+    switch (view.subsystem) {
+      case 'repair-chain':
+      case 'candidate-pipeline': {
+        const viaRepair = ranAfterFirstSeen
+          ? `repair 自检执行体成功跑完（ts=${new Date(last!).toISOString()}）`
+          : null;
+        const viaRecord =
+          ctx.latestRepairPass !== undefined && ctx.latestRepairPass >= view.first_seen
+            ? `repair 审计记录全部 PASS（ts=${new Date(ctx.latestRepairPass).toISOString()}）`
+            : null;
+        const evidence = viaRepair ?? viaRecord;
+        if (evidence === null) return null;
+        // 有衰减记录晚于自检/修复 → 环境侧仍有待核对项，暂不释放（保守）
+        if (ctx.latestDecayTs !== undefined && ctx.latestDecayTs > view.first_seen && last === undefined) return null;
+        return evidence;
+      }
+      case 'environment-check': {
+        if (ranAfterFirstSeen) {
+          return `环境检查执行体成功跑完（ts=${new Date(last!).toISOString()}，无新增待核对衰减）`;
+        }
+        if (ctx.latestDecayTs === undefined) return '无衰减记录（环境侧无变化待核对）';
+        return null;
+      }
+      case 'memory-consolidation':
+        return ranAfterFirstSeen
+          ? `记忆整合执行体成功跑完（ts=${new Date(last!).toISOString()}：staging 准入 + dedup/merge/relation/decay 完成）`
+          : null;
+      case 'evolution-decision':
+      case 'promotion-check':
+        return ranAfterFirstSeen
+          ? `检查/判定任务成功跑完（ts=${new Date(last!).toISOString()}）——不锁死自身即视为该子系统健康`
+          : null;
+      default:
+        return null; // 未知来源子系统 → 不释放（保守）
+    }
+  }
+
+  /** 读取 repair 审计记录（`.evolution/repair/<ts>.json`；损坏/缺失 → 跳过，不抛） */
+  private async readRepairRecords(): Promise<RepairRecord[]> {
+    const out: RepairRecord[] = [];
+    let names: string[];
+    try {
+      names = await readdir(this.repairDir);
+    } catch {
+      return out;
+    }
+    for (const name of names.filter((n) => n.endsWith('.json')).sort().slice(-20)) {
+      try {
+        out.push(JSON.parse(await readFile(join(this.repairDir, name), 'utf8')) as RepairRecord);
+      } catch {
+        // 损坏记录跳过（审计日志语义——不因坏行中断释放流程）
+      }
+    }
+    return out;
+  }
+
+  /** 最近 decay 记录时间（无记录 → undefined） */
+  private async readLatestDecayTs(): Promise<number | undefined> {
+    try {
+      const names = (await readdir(this.decayDir)).filter((n) => n.endsWith('.json')).sort();
+      const last = names[names.length - 1];
+      if (last === undefined) return undefined;
+      const rec = JSON.parse(await readFile(join(this.decayDir, last), 'utf8')) as { ts?: unknown };
+      return typeof rec.ts === 'number' ? rec.ts : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** 维护任务执行体（§10.1 债务任务的清偿工作；P1d：candidate_validation 接真实管线——
    *  生成 → 验证 → 晋升（runEvolutionChain）；P1e：promotion_check 接晋升检查（stable ← trusted-latest
    *  显式门禁）；R4：memory_consolidation 接真实 consolidation（runMemoryConsolidation——
@@ -2485,6 +2655,7 @@ export class CognitiveRuntime {
         //（失败降级不抛：尽力而为）
         return async () => {
           await this.runEnvironmentCheck();
+          this.markSubsystemOk('environment-check');
         };
       case 'memory_consolidation':
         // R4（P0）：经验 → 长期记忆 生产闭环（§5.2/§7.2）——执行体 runMemoryConsolidation
@@ -2498,6 +2669,9 @@ export class CognitiveRuntime {
         // 幂等——重复执行同结果）
         return async () => {
           await this.runRepair();
+          // 修复完成 → 借同一次调度做一次「确认 → 释放」（已知问题《债务是保护性自锁》：
+          // 修复动作完成后经自检确认，按条释放与该子系统相关的债务；未通过自检的条目保留）
+          await this.runDebtRelease({ reviewed_by: 'maintenance:runRepair' });
         };
       case 'verification_review':
         // S2：验证债务复核（阶梯式验证——机械 → 外部 → 历史/回归 → 单次结构化裁判 → UNKNOWN 合法终态；
@@ -2534,17 +2708,7 @@ export class CognitiveRuntime {
     if (decision.should_evolve && this.maintenance !== null) {
       // S2：债务成本从 policy.evolve.maintenance_costs 读取（装配注入——改 evolve.yaml 即生效）
       const acc = candidateValidationAccrual(policy.evolve.maintenance_costs);
-      await this.maintenance.enqueue(
-        {
-          id: acc.task_id,
-          value: acc.value,
-          estimated_cost: acc.estimated_cost,
-          priority: acc.priority,
-          urgency: acc.urgency,
-          run: this.maintenanceRun(acc.task_id, sessionId),
-        },
-        { accrueDebt: true },
-      );
+      await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, sessionId));
       enqueued.push(acc.task_id);
       await this.eventStore.append(
         makeRuntimeEvent(
@@ -2576,6 +2740,12 @@ export class CognitiveRuntime {
       throw err;
     }
     await this.performEvolutionDecision(sessionId);
+    this.markSubsystemOk('evolution-decision');
+  }
+
+  /** 标记来源子系统「执行体成功跑完」（债务释放的确认依据；成功路径才调用） */
+  private markSubsystemOk(subsystem: string): void {
+    this.lastSubsystemOk.set(subsystem, Date.now());
   }
 
   // ---- P7：Predictive Invalidation（设计 §14.5 + 实现规格 §15.4 最小落地） ----
@@ -2596,6 +2766,8 @@ export class CognitiveRuntime {
     await this.staging.sweepExpired();
     await this.staging.admit();
     await consolidate(this.memory);
+    // 子系统自检面：整合链成功跑完 → 标记健康（债务释放的确认依据；供维护任务与直接调用两条路径共用）
+    this.markSubsystemOk('memory-consolidation');
   }
 
   /**
@@ -2619,10 +2791,12 @@ export class CognitiveRuntime {
       }
       if (baseline === null) {
         this.lastEnvironmentFingerprint = current; // 首次检查：建立基线，无历史可比 → 不动作
+        this.markSubsystemOk('environment-check'); // 核对已执行（建立基线即完成本轮检查）
         return null;
       }
       const delta = diffFingerprints(baseline, current);
       if (Object.keys(delta).length === 0) {
+        this.markSubsystemOk('environment-check'); // 无变化 = 本轮核对完成
         return null; // 无变化不动作
       }
       // R5：环境声明索引定位受影响对象（按 delta 字段匹配声明环境的 memory 记录）→ 降级 suspicious
@@ -2661,18 +2835,9 @@ export class CognitiveRuntime {
         // S2：repair 债务成本从 policy.evolve.maintenance_costs 读取（装配注入——改 evolve.yaml 即生效）
         const { policy } = await this.ready();
         const acc = repairAccrual(policy.evolve.maintenance_costs);
-        await this.maintenance.enqueue(
-          {
-            id: acc.task_id,
-            value: acc.value,
-            estimated_cost: acc.estimated_cost,
-            priority: acc.priority,
-            urgency: acc.urgency,
-            run: this.maintenanceRun(acc.task_id),
-          },
-          { accrueDebt: true },
-        );
+        await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id));
       }
+      this.markSubsystemOk('environment-check'); // 本次环境核对完成（有衰减记录也是完成）
       return record;
     } catch {
       // 尽力而为：采集/落盘/入队失败 → 降级不抛（environment_check 是低优先级检查，不阻塞维护链）
@@ -2725,7 +2890,10 @@ export class CognitiveRuntime {
         this.repairExecutorsDegraded = errorDetail(err); // 构造失败降级记录（不抛）
       }
     }
-    const files = (await readdir(this.decayDir)).filter((f) => f.endsWith('.json')).sort();
+    // decay 目录不存在 = 从未有环境变化记录（首次运行/无衰减）→ 无待修复对象，合法完成（不抛）
+    const files = (await readdir(this.decayDir).catch(() => [] as string[]))
+      .filter((f) => f.endsWith('.json'))
+      .sort();
     // 受影响对象合并（逐对象携带环境变化标志：所属任一 decay 记录 environment_delta 非空 → true）
     const affected = new Map<string, { ref: ArtifactRef; environment_changed: boolean }>();
     for (const f of files) {
@@ -2916,6 +3084,8 @@ export class CognitiveRuntime {
       file = join(this.repairDir, `${record.ts}-${n}.json`);
     }
     await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    // 子系统自检面：修复链本次执行完成（对象级判定见 record.objects）→ 标记健康（债务释放的确认依据）
+    this.markSubsystemOk('repair-chain');
     return record;
   }
 
@@ -3471,6 +3641,7 @@ export class CognitiveRuntime {
         },
       );
       if (!pr.promoted) {
+        this.markSubsystemOk('promotion-check'); // 门禁判定完成（未推进也是真实检查结果）
         return {
           checked: true,
           skipped_reason: null,
@@ -3481,6 +3652,7 @@ export class CognitiveRuntime {
           events_appended: 0,
         };
       }
+      this.markSubsystemOk('promotion-check');
       return {
         checked: true,
         skipped_reason: null,
