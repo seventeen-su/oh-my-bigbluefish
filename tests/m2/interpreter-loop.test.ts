@@ -19,7 +19,7 @@ import { ContextProjectionSchema, type ContextProjection } from '../../kernel/sc
 import { makeMutableId } from '../../kernel/schemas/base.js';
 import { reduce, type ReducedState } from '../../supervisor/state-reducer.js';
 import { decide, isSuccessCriteriaCovered, type GovernorInput } from '../../runtime/governor.js';
-import { compile, type CandidateItem, type CompileInput } from '../../runtime/renderer.js';
+import { compile, renderWorkingStateText, type CandidateItem, type CompileInput } from '../../runtime/renderer.js';
 import {
   buildPrompt,
   INTERNAL_MECHANISM_WORDS,
@@ -190,7 +190,7 @@ describe('M1→M2 解释器闭环（事件 → State → Governor → Context Co
     expect(d.snapshot).toBe(state.snapshot_hash);
   });
 
-  it('③④ Context Compiler + prompt 接入：A3 schema 合规、ws verbatim、≤500 token、含 goal、无机制词', () => {
+  it('③④ Context Compiler + prompt 接入：A3 schema 合规、ws 非空字段保真、≤500 token、含 goal、无机制词', () => {
     const { state } = reduce(scenarioAEvents(), { initial: INITIAL });
 
     // T2.3 Context Compiler：working_state（State 派生）+ evidence 候选（confirmed_facts 派生），真实 context.yaml 权重
@@ -198,7 +198,8 @@ describe('M1→M2 解释器闭环（事件 → State → Governor → Context Co
     expect(ContextProjectionSchema.safeParse(projection).success).toBe(true);
     const wsSection = projection.sections.find((s) => s.source_ref === 'working_state');
     expect(wsSection).toBeDefined();
-    expect(wsSection!.content).toBe(JSON.stringify(wsView(state))); // 绝不盲压缩：与输入逐字节一致
+    // 字段级投影（已知问题《每轮注入的构成与浪费点》修复）：非空内容逐字保留、空字段不渲染、超限截断
+    expect(wsSection!.content).toBe(renderWorkingStateText(wsView(state)));
     expect(wsSection!.view).toBe('planning');
     expect(projection.sections.map((s) => s.source_ref)).toEqual(['working_state', 'src:c:1', 'src:c:2']);
 
@@ -240,7 +241,7 @@ describe('M1→M2 解释器闭环（事件 → State → Governor → Context Co
     // confirmed_facts：动态尾部逐项保真（顺序保留、值一致）
     expect(p.system).toContain('已确认事实：c:1；c:2');
     expect(p.system).toContain(state.working.confirmed_facts.join('；'));
-    // State.working 经投影进入 prompt 上下文（working_state section 内容 = 输入视图 JSON）
-    expect(p.system).toContain(JSON.stringify(wsView(state)));
+    // State.working 经投影进入 prompt 上下文（working_state section 内容 = 输入视图的字段级投影）
+    expect(p.system).toContain(renderWorkingStateText(wsView(state)));
   });
 });

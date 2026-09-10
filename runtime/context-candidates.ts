@@ -34,6 +34,55 @@ export const ARTIFACT_CANDIDATE_LIMIT = 3;
 /** evidence 拉取窗口（先取至多 FE 条会话事件、过滤后取最近 N 条——event-store 仅支持 seq ASC 分页；
  * 会话事件数超窗口时只保证窗口内最近 N 条；待标定 §17） */
 const EVIDENCE_FETCH_LIMIT = 200;
+/**
+ * evidence 候选文本上限（已知问题《每轮注入的构成与浪费点》修复）：原实现把 payload 整段
+ * `JSON.stringify` 塞进上下文——tool/result、claim/update 的 payload 与会话中已有内容重复，
+ * 单行可上千字符。改为**紧凑摘要**：只取文本字段，并截断到本上限（常量导出，§17 可标定）。
+ */
+export const EVIDENCE_TEXT_LIMIT = 120;
+/** evidence 摘要取用的文本字段（按序择一——payload 形状多样，命中即用；都不命中 → 结构摘要） */
+const EVIDENCE_TEXT_FIELDS = ['text', 'detail', 'summary', 'message', 'reason'];
+
+/**
+ * evidence payload → 紧凑摘要（确定性纯函数）：
+ *   ① 文本字段（EVIDENCE_TEXT_FIELDS 按序）命中且非空 → 用该字符串；
+ *   ② 否则结构摘要——只列顶层标量/短字段（`k=v` 逗号分隔），数组/对象折叠为计数，
+ *      **不输出原始 JSON 大括号引号堆叠**（与会话内容重复且体量大）；
+ * 统一截断到 EVIDENCE_TEXT_LIMIT（超出加省略号）。
+ */
+export function compactEvidenceText(payload: unknown): string {
+  let text = '';
+  if (typeof payload === 'string') {
+    text = payload;
+  } else if (payload !== null && typeof payload === 'object') {
+    const rec = payload as Record<string, unknown>;
+    for (const f of EVIDENCE_TEXT_FIELDS) {
+      const v = rec[f];
+      if (typeof v === 'string' && v.length > 0) {
+        text = v;
+        break;
+      }
+    }
+    if (text.length === 0) {
+      const parts: string[] = [];
+      for (const [k, v] of Object.entries(rec)) {
+        if (v === null || v === undefined) continue;
+        if (typeof v === 'string') {
+          if (v.length > 0) parts.push(`${k}=${v}`);
+        } else if (typeof v === 'number' || typeof v === 'boolean') {
+          parts.push(`${k}=${String(v)}`);
+        } else if (Array.isArray(v)) {
+          parts.push(`${k}[${v.length}]`); // 数组折叠为计数（不展开内容）
+        } else if (typeof v === 'object') {
+          parts.push(`${k}{${Object.keys(v as object).length}}`); // 对象折叠为字段数
+        }
+      }
+      text = parts.join(', ');
+    }
+  }
+  if (text.length === 0) return '(无文本载荷)';
+  return text.length <= EVIDENCE_TEXT_LIMIT ? text : `${text.slice(0, EVIDENCE_TEXT_LIMIT)}…`;
+}
 
 // ---- ΔInfoValue 缺口匹配启发式（S3：§17 首版承诺——WorkingState 缺口匹配度动态估计，替代来源侧固定值） ----
 // 语义：info_value = 基础值 + gap 命中加权 + question 命中加权 − confirmed_facts 冲突减分（防重复信息）。
@@ -206,7 +255,9 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
       const { events } = await runtime.eventStore.query({ session_id, limit: EVIDENCE_FETCH_LIMIT });
       const evidence = events.filter((e) => EVIDENCE_EVENT_TYPES.includes(e.type)).slice(-EVIDENCE_CANDIDATE_LIMIT);
       for (const e of evidence) {
-        const content = `${e.type}: ${JSON.stringify(e.payload)}`;
+        // 紧凑摘要（已知问题《每轮注入的构成与浪费点》）：type 前缀保留 + 文本字段摘要 + 截断，
+        // 不再整段 JSON.stringify(payload)（与会话内容重复且单行可上千字符）
+        const content = `${e.type}: ${compactEvidenceText(e.payload)}`;
         out.push({
           kind: 'evidence',
           ref: `event:${e.id}`,

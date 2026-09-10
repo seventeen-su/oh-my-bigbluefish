@@ -45,13 +45,15 @@ export function clearDegradations(): void {
 /**
  * ContextProjection → systemPrompt.context 文本（最小充分投影，Planning View；A3 sections 串联）。
  * 空 sections → 空串（DSH PromptContext 语义：空文本不贡献）。
+ * 已知问题《每轮注入的构成与浪费点》修复：投影头去掉"OMB v2"版本强调（三段 section 合并的
+ * 每轮注入总长另由 tests/m9/injection-slimming.test.ts 设上限钉住）。
  */
 export function projectionToText(projection: ContextProjection): string {
   if (projection.sections.length === 0) {
     return '';
   }
   const body = projection.sections.map((s) => s.content).join('\n');
-  return `认知投影（OMB v2，${projection.type}，${projection.total_tokens} tokens）\n${body}`;
+  return `认知投影（${projection.type}，${projection.total_tokens} tokens）\n${body}`;
 }
 
 /** 会话 → CognitiveRequest 合成（T8.26.3 §3.1 输入）：goal 来自 DSH 会话事件（最近人类 user/message） */
