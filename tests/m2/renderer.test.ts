@@ -16,6 +16,7 @@ import { ContextProjectionSchema } from '../../kernel/schemas/a.js';
 import {
   compile,
   marginal,
+  renderWorkingStateText,
   route,
   type CandidateItem,
   type CompileInput,
@@ -228,8 +229,8 @@ describe('⑤ marginal ≤ 0 停止（负边际候选不被选）', () => {
   });
 });
 
-describe('⑥ working_state 绝不盲压缩（原文进入 planning 视图）', () => {
-  it('working_state section content 与输入逐字节一致（确定性序列化），view=planning', () => {
+describe('⑥ working_state 字段级投影（非空逐字保留、空字段不渲染、超限截断）', () => {
+  it('working_state section content = 字段级投影（空字段不渲染；非空字段逐字保留），view=planning', () => {
     const ws = {
       goal: '修复回归',
       confirmed_facts: ['测试全绿是前提'],
@@ -243,9 +244,12 @@ describe('⑥ working_state 绝不盲压缩（原文进入 planning 视图）', 
     const proj = compile(input({ working_state: ws }));
     const wsSection = proj.sections.find((s) => s.source_ref === 'working_state');
     expect(wsSection).toBeDefined();
-    expect(wsSection!.content).toBe(JSON.stringify(ws)); // 逐字节一致：与输入确定性序列化完全相同
+    // 已知问题《每轮注入的构成与浪费点》修复：空数组字段（contradictions/open_questions）不再渲染占位
+    expect(wsSection!.content).toBe(renderWorkingStateText(ws));
+    expect(wsSection!.content).not.toContain('"contradictions"');
+    expect(wsSection!.content).toContain('测试全绿是前提'); // 非空内容逐字保留（不盲压缩）
     expect(wsSection!.view).toBe('planning');
-    expect(wsSection!.tokens).toBe(Math.max(1, Math.ceil(JSON.stringify(ws).length / 4)));
+    expect(wsSection!.tokens).toBe(Math.max(1, Math.ceil(renderWorkingStateText(ws).length / 4)));
   });
 
   it('kind=working_state 候选 → verbatim 路由，content 保留原文', () => {
@@ -444,9 +448,9 @@ describe('⑪ kind 成本参数数据化（机制即数据：改 context.yaml �
   });
 });
 
-describe('⑫ ws 超预算语义（钉死有意语义：ws 绝不压缩，允许超预算）', () => {
-  it('ws 单独超预算 → total_tokens > budget 且 ws 原文仍在、无候选入选', () => {
-    const budget = 4000;
+describe('⑫ working_state 为固定开销（预算先扣它，候选拿剩余；字段级投影有界）', () => {
+  it('ws 吃掉全部预算 → 无候选入选；ws 段仍在且写入序为 working_state 在前', () => {
+    const budget = 5; // 预算小于 working_state 固定开销（字段级投影后仍有界）→ 候选预算 0
     const ws = {
       goal: 'g',
       confirmed_facts: ['x'.repeat(20000)],
@@ -466,9 +470,11 @@ describe('⑫ ws 超预算语义（钉死有意语义：ws 绝不压缩，允许
     );
     const wsSection = proj.sections.find((s) => s.source_ref === 'working_state');
     expect(wsSection).toBeDefined();
-    expect(wsSection!.content).toBe(JSON.stringify(ws)); // 原文逐字节一致
-    expect(proj.total_tokens).toBeGreaterThan(budget); // ws 绝不压缩 → 允许超预算
-    expect(proj.sections.filter((s) => s.source_ref !== 'working_state')).toHaveLength(0); // 候选预算 = max(0, budget − ws) = 0
+    expect(wsSection!.content).toBe(renderWorkingStateText(ws)); // 字段级投影（非空逐字保留、超限截断）
+    // 固定开销先扣：ws tokens ≥ 预算 → 候选预算 0 → 无候选入选（ws 仍在，写入序在前）
+    expect(wsSection!.tokens).toBeGreaterThanOrEqual(budget);
+    expect(proj.sections.filter((s) => s.source_ref !== 'working_state')).toHaveLength(0);
+    expect(proj.sections[0]!.source_ref).toBe('working_state');
     expect(ContextProjectionSchema.safeParse(proj).success).toBe(true);
   });
 });

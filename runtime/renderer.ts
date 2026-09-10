@@ -231,10 +231,65 @@ function projectItem(item: CandidateItem): ProjectionSection {
   };
 }
 
-/** working_state：verbatim 原文（绝不盲压缩）→ planning 视图；tokens 用字符/4 估算（无输入估算） */
+/** working_state：字段级投影（绝不改写非空内容）→ planning 视图；tokens 用字符/4 估算（无输入估算）
+ *
+ * 已知问题《每轮注入的构成与浪费点》修复——原实现 `JSON.stringify(ws)` 整段照渲，实测输出
+ * `"confirmed_facts":[],"active_hypotheses":[],"contradictions":[],"open_questions":[],
+ * "evidence_gaps":[],"next_best_action":""` 全为空仍占位。现规则（渲染层，判定逻辑不变）：
+ *   - **空字段不渲染**（空数组 / 空串 / 缺省——字段语义由「不存在」表达，不再输出空占位）；
+ *   - goal **截断**到 GOAL_LIMIT（完整 goal 在 task_contract 与对话中，此处仅作定位）；
+ *   - 数组字段条目数与单条长度设上限（防超长事实/假设把投影撑爆）；
+ *   - 非空内容逐字保留（不盲压缩——缩写只发生在超限处并带省略号）。
+ */
 function projectWorkingState(ws: WorkingStateView): ProjectionSection {
-  const content = JSON.stringify(ws);
+  const content = renderWorkingStateText(ws);
   return { source_ref: 'working_state', view: 'planning', content, tokens: estimateTokens(content) };
+}
+
+/** goal 注入上限（完整 goal 已在 task_contract 与对话中；§17 可标定） */
+export const GOAL_LIMIT = 200;
+/** 工作状态数组字段条目上限（超出丢弃并在计数尾标注；§17 可标定） */
+export const WORKING_STATE_ITEM_LIMIT = 3;
+/** 工作状态单条文本长度上限（超出截断加省略号；§17 可标定） */
+export const WORKING_STATE_ITEM_CHARS = 80;
+
+/** 文本截断（超长加省略号；不超长原样返回） */
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/** 工作状态文本渲染（确定性纯函数：字段序固定，无时钟/随机；空字段不输出） */
+export function renderWorkingStateText(ws: WorkingStateView): string {
+  const obj: Record<string, unknown> = {};
+  if (typeof ws.goal === 'string' && ws.goal.length > 0) {
+    obj.goal = clip(ws.goal, GOAL_LIMIT);
+  }
+  const arr = (v: readonly string[] | undefined): string[] | undefined => {
+    const items = (v ?? []).filter((x) => typeof x === 'string' && x.length > 0);
+    if (items.length === 0) return undefined;
+    const kept = items.slice(0, WORKING_STATE_ITEM_LIMIT).map((x) => clip(x, WORKING_STATE_ITEM_CHARS));
+    if (items.length > WORKING_STATE_ITEM_LIMIT) {
+      kept.push(`…共 ${items.length} 条`);
+    }
+    return kept;
+  };
+  for (const [key, value] of [
+    ['confirmed_facts', ws.confirmed_facts],
+    ['active_hypotheses', ws.active_hypotheses],
+    ['contradictions', ws.contradictions],
+    ['open_questions', ws.open_questions],
+    ['evidence_gaps', ws.evidence_gaps],
+  ] as const) {
+    const items = arr(value);
+    if (items !== undefined) obj[key] = items;
+  }
+  if (typeof ws.next_best_action === 'string' && ws.next_best_action.length > 0) {
+    obj.next_best_action = clip(ws.next_best_action, WORKING_STATE_ITEM_CHARS);
+  }
+  if (typeof ws.environment === 'string' && ws.environment.length > 0 && ws.environment !== 'unknown') {
+    obj.environment = ws.environment;
+  }
+  return JSON.stringify(obj);
 }
 
 /**

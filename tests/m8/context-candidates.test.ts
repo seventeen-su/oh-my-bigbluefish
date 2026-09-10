@@ -183,7 +183,7 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(m!.tokens_est).toBeGreaterThan(0);
   });
 
-  it('evidence：Observation/decision 类事件 → evidence 候选（ref=event:<id>、view=original、content 含类型与载荷）；非 evidence 类型不入选', async () => {
+  it('evidence：Observation/decision 类事件 → evidence 候选（ref=event:<id>、view=original、content 含类型与紧凑载荷）；非 evidence 类型不入选', async () => {
     const events = [
       fakeEvent('session/start', { goal: 'g' }),
       fakeEvent('decision/made', { chosen: 'Verify' }),
@@ -201,7 +201,10 @@ describe('R7 gatherContextCandidates：各来源候选收集（注入 fake 事�
     expect(evs.map((c) => c.ref)).toEqual(['event:evt:2', 'event:evt:3', 'event:evt:4']);
     expect(evs.every((c) => c.view === 'original')).toBe(true);
     expect(evs[1]!.content).toContain('tool/result');
-    expect(evs[1]!.content).toContain('t:1');
+    // 紧凑摘要（已知问题《每轮注入的构成与浪费点》）：只列标量字段 k=v，不再整段 JSON.stringify
+    expect(evs[1]!.content).toContain('tool_id=t:1');
+    expect(evs[1]!.content).toContain('name=read');
+    expect(evs[1]!.content).not.toContain('{');
   });
 
   it('evidence 封顶：10 条 evidence 事件 → 恰 EVIDENCE_CANDIDATE_LIMIT 条（最近 N 条，确定性）', async () => {
