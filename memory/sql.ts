@@ -24,7 +24,8 @@ export const SCHEMA_SQL = `
     value_score REAL NOT NULL,
     utility_counts TEXT NOT NULL, belief_ref TEXT, lineage_ref TEXT,
     created INTEGER NOT NULL, updated INTEGER NOT NULL, event_id TEXT UNIQUE,
-    environment TEXT, body TEXT NOT NULL
+    environment TEXT, body TEXT NOT NULL,
+    vector BLOB
   );
   CREATE INDEX IF NOT EXISTS idx_memory_scope_kind_lifecycle ON memory(scope, kind, lifecycle);
   CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory(updated);

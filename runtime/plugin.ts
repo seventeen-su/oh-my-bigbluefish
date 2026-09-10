@@ -263,6 +263,8 @@ export interface CognitiveRuntimeLike {
     ok: boolean;
     items: Array<{ id: string; kind: string; scope: string; prov_class: string; updated: string; value: number; snippet: string }>;
     channel_used: string;
+    /** 实际参与召回的通道（双通道融合可观测面：词法 / 向量 / 情景 / 时间） */
+    channels_used?: string[];
     scope_chain: string[];
     degraded: string | null;
   }>;

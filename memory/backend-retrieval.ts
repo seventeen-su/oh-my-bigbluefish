@@ -7,7 +7,8 @@
 import type { Memory } from '../kernel/schemas/m.js';
 import type { EnvironmentFieldDelta } from '../kernel/schemas/evolution.js';
 import type { ArtifactRef } from '../kernel/schemas/evolution.js';
-import { SqliteMemoryBackend } from './backend.js';
+import { DEFAULT_EMBEDDER, type Embedder } from './embeddings.js';
+import { VectorBackend } from './backend-vector.js';
 
 /** retrieval_episode 行（数组列在 DB 中以 JSON 存储，此处为解析后形态，§7.4 Retrieval Episode） */
 export interface EpisodeRow {
@@ -47,8 +48,13 @@ function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
-/** 记忆后端 + 检索域存储操作（T3.4 检索路由/效用反馈用；其余方法继承 SqliteMemoryBackend） */
-export class RetrievalBackend extends SqliteMemoryBackend {
+/** 记忆后端 + 检索域存储操作（T3.4 检索路由/效用反馈用；其余方法继承 SqliteMemoryBackend）。
+ *  向量通道（已知问题《新增向量检索》）：继承 VectorBackend——构造注入嵌入器（缺省 CPU 哈希词袋），
+ *  提供 vectorSearch / encodePendingBatch / vectorStats；词法与向量在 retrieve 的语义检索组内融合。 */
+export class RetrievalBackend extends VectorBackend {
+  constructor(dbPath: string, embedder: Embedder = DEFAULT_EMBEDDER) {
+    super(dbPath, embedder);
+  }
   /**
    * R5：环境声明索引定位受影响对象（Predictive Invalidation §14.5/§15.4）——按指纹 delta 字段
    * 匹配声明环境的 memory 记录（environment 列，ingest 时写入 provenance.environment 的固定字段序 JSON）。
