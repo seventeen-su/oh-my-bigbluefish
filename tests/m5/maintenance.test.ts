@@ -221,20 +221,22 @@ describe('维护调度（§12.3）', () => {
   });
 
   it('critical：markCritical/urgency=critical → 下一 quantum/tick 优先执行（先于 ROI 更高者）', async () => {
-    const s = mkScheduler();
+    const s = mkScheduler({ batchSize: 4 }); // 显式批量：tick 为批量消费路径（缺省单量子语义见 maintenance-scheduling.test.ts）
     const ran: string[] = [];
     s.enqueue(task({ id: 'roi-top', value: 100, estimated_cost: 1, priority: 10, run: async () => { ran.push('roi-top'); } }));
     s.enqueue(task({ id: 'crit', value: 1, estimated_cost: 100, priority: 0, run: async () => { ran.push('crit'); } }));
     s.markCritical('crit');
     const r1 = await s.requestQuantum();
-    expect(r1.ran).toEqual(['crit']); // 强制插入 → 先于 ROI 100 的 roi-top
-    expect(ran).toEqual(['crit']);
+    expect(r1.ran[0]).toBe('crit'); // 强制插入 → 先于 ROI 100 的 roi-top（同批执行，顺序证明优先级）
+    expect(r1.ran).toEqual(['crit', 'roi-top']);
+    expect(ran).toEqual(['crit', 'roi-top']);
     // urgency='critical' 入队自动强制优先（经 tick 路径）
     s.enqueue(task({ id: 'crit2', value: 1, estimated_cost: 100, urgency: 'critical', run: async () => { ran.push('crit2'); } }));
+    s.enqueue(task({ id: 'roi2', value: 50, estimated_cost: 1, run: async () => { ran.push('roi2'); } }));
     const r2 = await s.tick();
-    expect(r2.ran[0]).toBe('crit2'); // tick 批量：crit2 优先（先于 roi-top）
-    expect(r2.ran).toEqual(['crit2', 'roi-top']);
-    expect(ran).toEqual(['crit', 'crit2', 'roi-top']);
+    expect(r2.ran[0]).toBe('crit2'); // tick 批量：crit2 优先（先于 ROI 50 的 roi2）
+    expect(r2.ran).toEqual(['crit2', 'roi2']);
+    expect(ran).toEqual(['crit', 'roi-top', 'crit2', 'roi2']);
   });
 
   // ---- ⑤ 维护量子可中断 ----
