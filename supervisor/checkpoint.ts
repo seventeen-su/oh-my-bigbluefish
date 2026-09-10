@@ -16,7 +16,7 @@
 //   （保证 schema 合规）；checkpoint 自身 hash 与 state 自洽即可，M1 不要求重放校验。
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（IR 契约例外，CONVENTIONS §4）。
 import { createHash } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { canonicalJson, isValidId, makeMutableId, type Provenance } from '../kernel/schemas/base.js';
 import { CheckpointSchema, type Checkpoint } from '../kernel/schemas/m.js';
@@ -25,6 +25,12 @@ import type { State } from '../kernel/schemas/s.js';
 /** 正式 checkpoint 文件名的 uuid 段形状（tmp 残留 <uuid>.json.tmp 不匹配，天然被忽略） */
 const FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const CHECKPOINT_PREFIX = 'checkpoint:';
+/** 轮转：每会话保留最近 N 个（缺省 3；§17 可标定） */
+export const CHECKPOINT_PER_SESSION_KEEP = 3;
+/** 轮转：全局保留上限（缺省 200 个文件——观测面 4636 文件/34MB 的直接治理目标；§17 可标定） */
+export const CHECKPOINT_MAX_FILES = 200;
+/** 轮转：时间上限（缺省 30 天；超龄且不在会话保留位 → 删除；§17 可标定） */
+export const CHECKPOINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** 落盘 Checkpoint：M7 字段 + 内嵌完整 state（文件内容 = 完整 Checkpoint 对象 JSON，含 state 与 hash） */
 export interface StoredCheckpoint extends Checkpoint {
@@ -78,10 +84,12 @@ function parseStored(raw: string, id: string): StoredCheckpoint {
   return s as StoredCheckpoint;
 }
 
-/** 保存：M7 对象 + 内嵌 state → <dir>/<uuid>.json（tmp + rename + fsync 原子写） */
+/** 保存：M7 对象 + 内嵌 state → <dir>/<uuid>.json（tmp + rename + fsync 原子写）。
+ *  opts.session_id（已知问题《工作状态未按会话隔离》修复）：写入会话维度，供读取时按会话取最新；
+ *  hash 仍只覆盖 {state, timestamp, runtime_snapshot}（会话归属不是内容完整性的一部分）。 */
 export async function save(
   state: State,
-  opts: { dir: string; runtime_snapshot?: string; provenance?: Provenance },
+  opts: { dir: string; runtime_snapshot?: string; provenance?: Provenance; session_id?: string },
 ): Promise<Checkpoint> {
   const ts = new Date().toISOString();
   const runtimeSnapshot = opts.runtime_snapshot ?? state.provenance.runtime_snapshot;
@@ -113,6 +121,7 @@ export async function save(
     hash: contentHash(JSON.parse(JSON.stringify(state)) as State, ts, runtimeSnapshot),
     timestamp: ts,
     runtime_snapshot: runtimeSnapshot,
+    ...(opts.session_id !== undefined && opts.session_id.length > 0 ? { session_id: opts.session_id } : {}),
   };
   const parsed = CheckpointSchema.safeParse(checkpoint);
   if (!parsed.success) {
@@ -192,4 +201,98 @@ export async function list(opts: { dir: string }): Promise<Checkpoint[]> {
 export async function latest(opts: { dir: string }): Promise<Checkpoint | null> {
   const all = await list(opts);
   return all[0] ?? null;
+}
+
+/**
+ * 按会话取最新检查点（已知问题《工作状态未按会话隔离》修复）：只认 `session_id` 与请求一致的
+ * 检查点——**不再**返回"目录内最新检查点"（那可能属于别的会话，导致投影显示别的会话的目标/状态）。
+ * 无会话标识的旧检查点（本修复前写入）视为"无归属" → 不被任何会话命中（不误恢复）。
+ */
+export async function latestForSession(sessionId: string, opts: { dir: string }): Promise<Checkpoint | null> {
+  const all = await list(opts);
+  return all.find((cp) => cp.session_id === sessionId) ?? null;
+}
+
+/** 轮转结果（检查点轮转与清理的可观测面） */
+export interface PruneResult {
+  /** 删除的检查点文件数 */
+  removed: number;
+  /** 保留的检查点文件数 */
+  kept: number;
+  /** 删除原因（可读，供观测/审计） */
+  reasons: string[];
+}
+
+/**
+ * 检查点轮转与清理（已知问题《检查点无轮转且自 09-09 起停写》修复判定：保留上限 + 会话维度清理）。
+ * 规则（确定性，先按 timestamp 倒序取全部完好检查点）：
+ *   ① **按会话保留最近 N 个**（`perSessionKeep`，缺省 3）——每个会话的最近状态不受影响；
+ *   ② **全局保留上限**（`maxFiles`，缺省 200）——超出部分按"非各会话最近 N 个"优先删除；
+ *   ③ **时间上限**（`maxAgeMs`，缺省 30 天）——超龄且不属于任何会话保留位的检查点删除；
+ *   ④ 无会话归属的旧检查点（本修复前写入、或确实无从归属）→ 只在超出全局上限时按最旧优先删除
+ *      （不做"无主即删"——它们仍可能是有价值的最后状态）。
+ * 只删除 `.json` 正式文件（tmp 残留与无关文件不碰）；删除失败 → 计入 reasons 不抛（尽力而为）。
+ */
+export async function prune(
+  opts: {
+    dir: string;
+    perSessionKeep?: number;
+    maxFiles?: number;
+    maxAgeMs?: number;
+    now?: () => number;
+  },
+): Promise<PruneResult> {
+  const perSessionKeep = Math.max(1, Math.floor(opts.perSessionKeep ?? CHECKPOINT_PER_SESSION_KEEP));
+  const maxFiles = Math.max(1, Math.floor(opts.maxFiles ?? CHECKPOINT_MAX_FILES));
+  const maxAgeMs = opts.maxAgeMs ?? CHECKPOINT_MAX_AGE_MS;
+  const now = (opts.now ?? (() => Date.now()))();
+  const all = await list({ dir: opts.dir }); // 已按 timestamp 倒序
+  const reasons: string[] = [];
+  // 保留规则（按优先级）：
+  //   ① 每会话最新 perSessionKeep 条保留位（保证每个活跃会话都能恢复最近状态）；
+  //   ② 其余按"最新优先"填满全局名额 maxFiles。
+  // 关键：② 的名额是 **net 保留总量**——扣除已被 ① 占用的名额，否则每会话保留位会额外叠加，
+  // 使实际文件数超过 maxFiles（全局上限形同虚设）。
+  const keep = new Set<string>();
+  const perSession = new Map<string, number>();
+  for (const cp of all) {
+    const sid = cp.session_id;
+    if (sid === undefined) continue;
+    const n = perSession.get(sid) ?? 0;
+    if (n < perSessionKeep) {
+      keep.add(cp.id);
+      perSession.set(sid, n + 1);
+    }
+  }
+  const remainingSlots = Math.max(0, maxFiles - keep.size);
+  let filled = 0;
+  for (const cp of all) {
+    if (filled >= remainingSlots) break;
+    if (keep.has(cp.id)) continue;
+    keep.add(cp.id);
+    filled++;
+  }
+  // 逐个判定删除（在 keep 之外的才可能删；超龄与超限都删，但 keep 内的不动）
+  const toRemove: Checkpoint[] = [];
+  for (const cp of all) {
+    if (keep.has(cp.id)) continue;
+    const ts = Date.parse(cp.timestamp);
+    const aged = Number.isFinite(ts) && now - ts > maxAgeMs;
+    toRemove.push(cp);
+    if (aged) {
+      reasons.push(`超龄删除 ${cp.id.slice(0, 20)}…（timestamp ${cp.timestamp}）`);
+    } else {
+      reasons.push(`超限删除 ${cp.id.slice(0, 20)}…（超出全局保留上限 ${maxFiles}）`);
+    }
+  }
+  let removed = 0;
+  for (const cp of toRemove) {
+    try {
+      await rm(fileFor(opts.dir, cp.id));
+      removed++;
+    } catch (err) {
+      reasons.push(`删除失败 ${cp.id.slice(0, 20)}…：${(err as Error).message}`);
+    }
+  }
+  return { removed, kept: all.length - removed, reasons };
 }

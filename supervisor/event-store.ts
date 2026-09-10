@@ -10,7 +10,7 @@
 //      9 个 IRBase 字段，且 timestamp 字符串经 INTEGER 往返会丢原格式）。
 // node:sqlite 为同步 API；方法签名按 brief 保持 Promise。
 // layer 1（supervisor/）：仅 import node: 内置 + kernel/schemas/（IR 契约例外，主会话裁决 2026-08-21）。
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
 import { EventSchema, type Event } from '../kernel/schemas/m.js';
@@ -87,11 +87,13 @@ export function deriveProjection(event: Event): ProjectionInput {
 
 export class EventStore {
   private readonly db: DatabaseSync;
+  private readonly dbPath: string;
   private readonly insertEvent: StatementSync;
   private readonly insertProjection: StatementSync;
 
   constructor(dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
+    this.dbPath = dbPath;
     this.db = new DatabaseSync(dbPath, { timeout: BUSY_TIMEOUT_MS }); // busy_timeout 兜底（单写者语义）
     this.db.exec('PRAGMA journal_mode=WAL');
     this.db.exec(`
@@ -292,6 +294,29 @@ export class EventStore {
   async count(): Promise<number> {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number };
     return row.n;
+  }
+
+  /** 数据库总占用字节（主库 + WAL + shm 侧车；文件不可读 → 0 诚实缺省） */
+  sizeBytes(): number {
+    let total = 0;
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        total += statSync(`${this.dbPath}${suffix}`).size;
+      } catch {
+        // 侧车文件可能尚未建立（或已合并）→ 跳过
+      }
+    }
+    return total;
+  }
+
+  /**
+   * VACUUM（已知问题《事件库体积增长》修复：压缩只删记录不回收文件页 → 维护期整理回收页）。
+   * 说明：`VACUUM` 不能在事务内执行，且会重写整库；调用方（维护任务）应按体积阈值触发，
+   * 不在关键路径上跑。失败 → 抛（调用方降级记录）。返回回收后的库大小字节。
+   */
+  vacuum(): number {
+    this.db.exec('VACUUM');
+    return this.sizeBytes();
   }
 
   /** compact（批处理入口）：删除 timestamp < now - retentionDays 的原始事件行；投影表永不动；幂等 */

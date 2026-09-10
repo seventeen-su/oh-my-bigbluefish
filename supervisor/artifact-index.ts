@@ -40,7 +40,20 @@ export const ARTIFACT_DISCOVERY_FETCH_LIMIT = 100;
 
 /** 路径样 token 提取正则（文件扩展名白名单：ts/js/tsx/jsx/json/md/yaml/yml/py/txt/log；
  *  交替序最长优先——`js`/`ts` 是 `json`/`tsx` 的前缀，须放其后（"package.js" 会截断 "package.json"）） */
-const ARTIFACT_PATH_TOKEN_RE = /[A-Za-z0-9_\-./\\]+\.(tsx|jsx|json|ts|js|yaml|yml|md|txt|py|log)/g;
+/**
+ * 路径样 token（扩展名白名单）。
+ * 已知问题《制品索引未建立》修复的一部分：原正则不含盘符前缀，且**未考虑 payload 是 JSON 文本**
+ * （`JSON.stringify` 会把路径里的 `\` 变成 `\\`）——Windows 绝对路径因此被截成
+ * `Users\...\report.md`（丢掉 `C:`），resolve 后落在仓库根之外 → 被 `isUnderRoot` 判越界 →
+ * 真实工作文件全被过滤（"制品索引从未生成"的直接原因之一）。现允许：可选盘符前缀 +
+ * 一或两个反斜杠作为分隔符（覆盖真实路径与 JSON 转义路径两种形态）。
+ */
+const ARTIFACT_PATH_TOKEN_RE = /(?:[A-Za-z]:)?[A-Za-z0-9_\-./\\~@]+\.(tsx|jsx|json|ts|js|yaml|yml|md|txt|py|log)/g;
+
+/** token → 真实路径（JSON 转义的 `\\` 归一为单分隔符；盘符形态保持绝对路径） */
+function normalizeTokenPath(token: string): string {
+  return token.replace(/\\{2}/g, '\\');
+}
 
 // ---- 专项 D：产物按任务相关性排序（评审问题二——廉价近似，无 embedding、无新依赖） ----
 
@@ -285,8 +298,15 @@ export class ArtifactIndex {
 /** discoverArtifactsFromEvents 选项 */
 export interface ArtifactDiscoveryOptions {
   /** 解析根（提供时：路径解析到 root 下且文件存在 → 读内容 sha256、restorable:true；
-   *  不存在/越界 → 跳过；未提供 → 仍索引 hash='unavailable'/restorable:false 诚实缺省） */
+   *  不存在 → 跳过；未提供 → 仍索引 hash='unavailable'/restorable:false 诚实缺省） */
   root?: string;
+  /**
+   * 解析根**集合**（已知问题《制品索引未建立》修复：发现根改为会话工作目录或可配置根集合）。
+   * 提供时优先于 `root`：逐根尝试解析，任一命中即读内容；**全部未命中 → 记为不可恢复制品
+   *（restorable:false，path 原样保留）而不是直接丢弃**——只索引实际存在的文件会漏掉"在别的项目
+   * 目录里、本次会话确实产出过"的制品（原实现以仓库根为根，用户真实工作文件全被过滤）。
+   */
+  roots?: readonly string[];
   /** 环境指纹（Record<string,string>——Fingerprint 过滤非字符串键后的落盘面；写入每个 manifest.environment） */
   environment: Record<string, string>;
   /** 时间戳（epoch ms；缺省 Date.now） */
@@ -330,39 +350,48 @@ export async function discoverArtifactsFromEvents(
   }
 }
 
-/** 单 token → manifest；root 提供且文件不存在/越界 → null（跳过幽灵路径） */
+/** 单 token → manifest；根集合逐根尝试；全部未命中 → 不可恢复制品（不再直接丢弃） */
 async function buildDiscoveredManifest(
   token: string,
   eventId: string,
   opts: ArtifactDiscoveryOptions,
   now: number,
 ): Promise<ArtifactManifest | null> {
+  // token 来自 JSON 文本（`JSON.stringify` 会把 `\` 变 `\\`）→ 归一为真实路径形态
+  const pathToken = normalizeTokenPath(token);
   const base = {
-    id: artifactManifestId(token, eventId),
-    type: inferArtifactType(token),
-    path: token,
+    id: artifactManifestId(pathToken, eventId),
+    type: inferArtifactType(pathToken),
+    path: pathToken,
     provenance: eventId,
     producing_event: eventId,
     environment: opts.environment,
     created_at: now,
   };
-  if (opts.root === undefined) {
+  const roots = opts.roots !== undefined && opts.roots.length > 0 ? opts.roots : opts.root === undefined ? [] : [opts.root];
+  if (roots.length === 0) {
     // root 未提供 → 仍索引：hash='unavailable'/restorable=false——诚实缺省（不读文件不臆造可恢复性；
     // 索引「事件提及的路径」这一事实本身，可恢复性留待 root 提供的装配面判定）
     return { ...base, hash: 'unavailable', restorable: false };
   }
-  const resolved = resolve(opts.root, token);
-  if (!isUnderRoot(resolved, opts.root)) {
-    return null; // 解析越出 root（绝对路径/.. 逃逸）→ 跳过（只索引 root 下产物）
+  // 逐根尝试：任一根下存在且可读 → 真实 hash + restorable:true
+  for (const root of roots) {
+    const resolved = resolve(root, pathToken);
+    if (!isUnderRoot(resolved, root)) {
+      continue; // 该根下越界（绝对路径/.. 逃逸）→ 试下一个根
+    }
+    try {
+      const content = await readFile(resolved);
+      return {
+        ...base,
+        hash: createHash('sha256').update(content).digest('hex'),
+        restorable: true,
+      };
+    } catch {
+      // 该根下不存在/不可读 → 试下一个根
+    }
   }
-  try {
-    const content = await readFile(resolved);
-    return {
-      ...base,
-      hash: createHash('sha256').update(content).digest('hex'),
-      restorable: true,
-    };
-  } catch {
-    return null; // 幽灵路径（不存在/不可读/是目录）→ 跳过（不索引幽灵路径）
-  }
+  // 全部根未命中 → **记为不可恢复制品**（已知问题《制品索引未建立》修复：根外路径不直接丢弃）。
+  // 语义：索引保留"本次会话确实提及过该路径"这一事实；restorable:false 诚实标注当前不可恢复。
+  return { ...base, hash: 'unavailable', restorable: false };
 }

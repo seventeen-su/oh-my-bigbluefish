@@ -970,5 +970,10 @@ export class MaintenanceScheduler {
         /* 定时器驱动路径：任务级错误已由 tick 内部转为债务，不向外泄漏 */
       });
     }, this.effectiveTickMs());
+    // unref：维护定时器不得阻止宿主进程退出（Node 事件循环语义）。同时这是测试隔离的必要条件——
+    // 未 unref 的 interval 会在测试结束、临时目录删除之后继续触发 tick（写入 debt.json/观测文件），
+    // 与 rm 竞态产生 ENOTEMPTY 抖动（并在被 kill 时打断收尾）。unref 后定时器仍照常在宿主运行期触发，
+    // 只是不再单独撑住进程。
+    this.timer.unref?.();
   }
 }

@@ -536,6 +536,29 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   });
   /** 内核是否已成功加载（装配成功才置 true；供安全状态视图报告 kernel_loaded） */
   let kernelLoaded = false;
+
+  /**
+   * 会话工作目录（制品发现根，已知问题《制品索引未建立》修复）：从宿主 ctx 守卫式读取。
+   * 宿主形态不确定（workspace / cwd / sandbox 各版本不同）→ 逐个试；都不是字符串 → undefined
+   *（调用方退回"只用仓库根"的既有行为，不臆造路径）。
+   */
+  const readWorkspaceRoot = (c: ContextLike): string | undefined => {
+    for (const name of ['workspace', 'cwd', 'workingDirectory'] as const) {
+      try {
+        const v = readService<unknown>(c, name);
+        if (typeof v === 'string' && v.length > 0) return v;
+        const obj = v as { root?: unknown; path?: unknown; cwd?: unknown } | null | undefined;
+        if (obj !== null && obj !== undefined && typeof obj === 'object') {
+          for (const k of ['root', 'path', 'cwd'] as const) {
+            if (typeof obj[k] === 'string' && (obj[k] as string).length > 0) return obj[k] as string;
+          }
+        }
+      } catch {
+        // 未注入/读取抛错 → 试下一个
+      }
+    }
+    return undefined;
+  };
   if (!safeState.ok) {
     recordDegradation('substrate/safe-state', `外核进入安全状态：${safeState.reason ?? '未知原因'}（不拉起内核，宿主不受影响）`);
   }
@@ -865,6 +888,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
           // 状态面：外核安全状态段（内核未加载的原因可查——已知问题《内核加载失败不得阻塞宿主》）
           safeStateView,
+          // 制品发现根集合（已知问题《制品索引未建立》修复）：会话工作目录优先 + 仓库根兜底。
+          // ctx.get('workspace')/cwd 形状不确定 → 守卫式读取（缺失 → 只用仓库根，行为不变）
+          ...(readWorkspaceRoot(ctx) !== undefined ? { workspaceRoot: readWorkspaceRoot(ctx)! } : {}),
           ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
           // W3：dynamicCordisRunner 增强通道注入（宿主面存在 → 候选验证脚本经 runner 通道；未注入 → 管线守卫降级受限子进程路径）
           ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
