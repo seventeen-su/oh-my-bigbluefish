@@ -130,13 +130,19 @@ export const ActivationContractSchema = irBase({
 });
 export type ActivationContract = z.infer<typeof ActivationContractSchema>;
 
-/** M7 Checkpoint { working_state, hash, timestamp, runtime_snapshot, provenance } */
+/** M7 Checkpoint { working_state, hash, timestamp, runtime_snapshot, provenance, session_id? } */
 export const CheckpointSchema = irBase({
   working_state: z.string().min(1),
   hash: z.string().min(1),
   timestamp: z.string().min(1),
   runtime_snapshot: z.string().min(1),
   provenance: ProvenanceSchema,
+  /**
+   * 会话标识（已知问题《工作状态未按会话隔离》修复）：检查点带会话维度，读取时按会话取最新——
+   * 否则任意会话都会加载"目录内最新检查点"（属于别的会话）的工作状态与目标。
+   * 可选字段：既有检查点无此字段 → 视为无会话归属（读取时忽略该文件），不破坏既有文件的可恢复性。
+   */
+  session_id: z.string().min(1).optional(),
 });
 export type Checkpoint = z.infer<typeof CheckpointSchema>;
 

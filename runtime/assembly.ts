@@ -81,7 +81,7 @@ import { normalizeProcessQuality, qualityVectorFromSignals } from '../kernel/pro
 import { classifyFromText } from '../kernel/controllability.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——layer 2；装配面注入 spawnJudge）
 import type { JudgeExecutor } from './judge-executor.js';
-import { latest as latestCheckpoint, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
+import { latestForSession as latestCheckpointForSession, prune as pruneCheckpoints, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport, type DebtSourceView, type DebtReleaseRecord, type DebtReleaseResult } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
@@ -408,6 +408,13 @@ export interface CognitiveAssemblyOptions {
    */
   safeStateView?: () => KernStatusSummary['safe_state'];
   /**
+   * 制品发现根集合（已知问题《制品索引未建立》修复）：除仓库根外的真实工作根（如会话工作目录）。
+   * 逐根尝试解析；全部未命中 → 记为不可恢复制品（不再直接丢弃）。缺省只有仓库根。
+   */
+  artifactRoots?: readonly string[];
+  /** 会话工作目录（DSH 装配面注入；优先于 artifactRoots——最常见的真实制品所在） */
+  workspaceRoot?: string;
+  /**
    * 自迭代开关面（已知问题《开关落在宿主插件配置，不引入界面》——落 agent.cordis.yml 插件配置，
    * 由 plugin.ts 解析后注入；缺省全部启用 = 既有行为不变）。
    */
@@ -607,6 +614,11 @@ export interface RepairRecord {
   /** P3：逐对象契约化验证结果（id/kind/contract_id/verdict/evidence_quality/disposition/score_eligible/reason） */
   objects: RepairObjectOutcome[];
 }
+
+/** 事件库整理阈值（已知问题《事件库体积增长》修复：超此体积才触发 VACUUM——避免频繁重写整库；§17 可标定） */
+export const EVENT_STORE_VACUUM_THRESHOLD_BYTES = 64 * 1024 * 1024;
+/** 数据清理任务入队间隔（已知问题《数据体积与清理》：轮转/整理/合并按此节流，不每轮重复入队；§17 可标定） */
+export const HYGIENE_ENQUEUE_INTERVAL_MS = 60 * 60 * 1000;
 
 /** 按线解析结果（policy/processes 目录 + 快照信息 + 降级原因） */
 interface LineDirResolution {
@@ -863,8 +875,16 @@ export class CognitiveRuntime {
   private readonly attributedMemories = new Map<string, Set<string>>();
   /** 归因观测计数（状态面可读：本次进程内累计 已归因 / 证据不足） */
   private readonly attributionCounts = { attributed: 0, skipped: 0 };
+  /** 数据清理任务节流：上次入队时间（避免每轮重复入队；缺省每小时一次） */
+  private lastHygieneEnqueueAt = 0;
   /** 外核安全状态视图注入（装配面提供；缺省 → 状态面不带 safe_state 段） */
   private readonly safeStateViewFn: (() => KernStatusSummary['safe_state']) | undefined;
+  /**
+   * 制品发现根集合（已知问题《制品索引未建立》修复：发现根不再只有仓库根）。
+   * 缺省 = [仓库根 HERE]；装配面可注入会话工作目录等真实工作根（逐根尝试解析，全部未命中 →
+   * 记为不可恢复制品而非丢弃）。去重保序。
+   */
+  readonly artifactRoots: string[];
   /** 自迭代开关面（opts.selfIteration；缺省全启用 = 既有行为不变） */
   private readonly selfIteration: {
     enabled: boolean;
@@ -942,6 +962,11 @@ export class CognitiveRuntime {
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
     this.safeStateViewFn = opts.safeStateView;
+    // 制品发现根集合（会话工作目录优先，仓库根兜底；去重保序）
+    const roots = [opts.workspaceRoot, ...(opts.artifactRoots ?? []), HERE].filter(
+      (r): r is string => typeof r === 'string' && r.length > 0,
+    );
+    this.artifactRoots = [...new Set(roots)];
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
     this.evolutionRoot = opts.evolutionRoot ?? join(root, '.evolution');
     // P3.6：验证数据面三库装配（JSON 文件注册面；构造不触 I/O——首写建目录；缺省
@@ -2244,12 +2269,61 @@ export class CognitiveRuntime {
         urgency: 'normal',
         run: this.maintenanceRun('environment_check', input.session_id),
       });
+      // 数据体积与清理（已知问题《数据体积与清理》三条）：
+      //   ① 检查点轮转与清理（checkpoint_prune）——按「每会话保留最近 N + 全局上限 + 时间上限」；
+      //   ② 事件库整理（event_store_vacuum）——按体积阈值触发（低于阈值零开销）；
+      //   ③ 事实库分片合并（fact_store_compact）——小文件 → 分片（键仍可寻址）。
+      // 三者都是"维护收益型"任务（纯本地 I/O、无模型调用、可中断），按节流窗口入队（默认每小时一次），
+      // 避免每轮重复入队；harvest 在维护量子里批量消费。
+      if (this.shouldEnqueueHygiene()) {
+        await this.maintenance.enqueue({
+          id: 'checkpoint_prune',
+          value: 1,
+          estimated_cost: 2,
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'checkpoint-rotation',
+          reason: '检查点目录轮转与清理（保留上限 + 会话维度）',
+          run: async () => {
+            await this.runCheckpointPrune();
+          },
+        });
+        await this.maintenance.enqueue({
+          id: 'event_store_vacuum',
+          value: 1,
+          estimated_cost: 4,
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'event-store',
+          reason: '事件库按体积阈值整理（回收文件页）',
+          run: async () => {
+            await this.runEventStoreVacuum();
+          },
+        });
+        await this.maintenance.enqueue({
+          id: 'fact_store_compact',
+          value: 1,
+          estimated_cost: 4,
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'verification-stores',
+          reason: '事实库小文件分片合并（键仍可寻址）',
+          run: async () => {
+            await this.runFactStoreCompact();
+          },
+        });
+      }
       maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
     }
 
     let checkpoint: Checkpoint | null = null;
     if (this.checkpointDir !== undefined && input.state !== undefined) {
-      checkpoint = await saveCheckpoint(input.state, { dir: this.checkpointDir, runtime_snapshot: snapshot });
+      // 会话维度（已知问题《工作状态未按会话隔离》）：写入 session_id，读取时按会话取最新
+      checkpoint = await saveCheckpoint(input.state, {
+        dir: this.checkpointDir,
+        runtime_snapshot: snapshot,
+        session_id: input.session_id,
+      });
     }
 
     // S7：shadow 会话收尾回写 outcome（P2 验证契约判定：success/degraded/unknown——契约种子 = 会话
@@ -2382,6 +2456,64 @@ export class CognitiveRuntime {
     return { ...this.attributionCounts };
   }
 
+  /** 数据清理任务节流判定（每小时一次；§17 可标定）——避免每轮重复入队同一批清理任务 */
+  private shouldEnqueueHygiene(): boolean {
+    const now = Date.now();
+    if (now - this.lastHygieneEnqueueAt < HYGIENE_ENQUEUE_INTERVAL_MS) {
+      return false;
+    }
+    this.lastHygieneEnqueueAt = now;
+    return true;
+  }
+
+  /** 数据体积与清理（已知问题《数据体积与清理》三条：检查点轮转 / 事件库整理 / 事实库合并） ---- */
+
+  /**
+   * 检查点轮转与清理（维护任务 checkpoint_prune）：按"每会话保留最近 N 个 + 全局上限 + 时间上限"
+   * 清理（见 supervisor/checkpoint.ts `prune` 的规则与理由）。无 checkpointDir → 空结果（不动作）。
+   * 失败降级不抛（清理是维护收益，不是关键路径）。
+   */
+  async runCheckpointPrune(): Promise<{ removed: number; kept: number; reasons: string[] }> {
+    if (this.checkpointDir === undefined) {
+      return { removed: 0, kept: 0, reasons: [] };
+    }
+    try {
+      return await pruneCheckpoints({ dir: this.checkpointDir });
+    } catch (err) {
+      recordDegradation('checkpoint/prune', `检查点轮转失败（${errorDetail(err)}）——本轮跳过`);
+      return { removed: 0, kept: 0, reasons: [`失败：${errorDetail(err)}`] };
+    }
+  }
+
+  /**
+   * 事件库整理（维护任务 event_store_vacuum）：按体积阈值触发 VACUUM 回收文件页
+   *（已知问题《事件库体积增长》：压缩只删记录不回收文件页）。低于阈值 → 不动作（零开销）。
+   */
+  async runEventStoreVacuum(): Promise<{ vacuumed: boolean; sizeBytes: number; reclaimedBytes: number }> {
+    try {
+      const before = this.eventStore.sizeBytes();
+      if (before < EVENT_STORE_VACUUM_THRESHOLD_BYTES) {
+        return { vacuumed: false, sizeBytes: before, reclaimedBytes: 0 };
+      }
+      this.eventStore.vacuum();
+      const after = this.eventStore.sizeBytes();
+      return { vacuumed: true, sizeBytes: after, reclaimedBytes: Math.max(0, before - after) };
+    } catch (err) {
+      recordDegradation('event-store/vacuum', `事件库整理失败（${errorDetail(err)}）——本轮跳过`);
+      return { vacuumed: false, sizeBytes: 0, reclaimedBytes: 0 };
+    }
+  }
+
+  /** 事实库分片合并（维护任务 fact_store_compact）：一键一文件 → 分片文件，键仍可寻址 */
+  async runFactStoreCompact(): Promise<{ shards: number; records: number; removedFiles: number }> {
+    try {
+      return await this.factStore.compact();
+    } catch (err) {
+      recordDegradation('fact-store/compact', `事实库分片合并失败（${errorDetail(err)}）——本轮跳过`);
+      return { shards: 0, records: 0, removedFiles: 0 };
+    }
+  }
+
   /**
    * S4：制品发现与索引（finalizeTurn 收尾调用；尽力而为——失败降级记录不抛，不阻塞收尾）。   * 从最近会话事件（拉取窗口 ARTIFACT_DISCOVERY_FETCH_LIMIT、取窗口尾最近 ARTIFACT_DISCOVERY_EVENT_LIMIT 条）
    * 提取 tool/result 事件 → discoverArtifactsFromEvents（root=仓库根 HERE：路径解析到 root 下且文件存在 →
@@ -2403,7 +2535,12 @@ export class CognitiveRuntime {
           environment[k] = v; // Fingerprint 可选键（gpu/cuda）缺省 → 过滤非字符串
         }
       }
-      const manifests = await discoverArtifactsFromEvents(recent, { root: HERE, environment });
+      const manifests = await discoverArtifactsFromEvents(recent, {
+        // 发现根集合（已知问题《制品索引未建立》修复）：仓库根 + 会话工作目录（DSH 注入时有值）；
+        // 逐根尝试，全部未命中 → 记为不可恢复制品（不再直接丢弃——真实工作文件多在用户项目目录下）
+        roots: this.artifactRoots,
+        environment,
+      });
       for (const m of manifests) {
         await this.artifactIndex.register(m);
       }
@@ -2582,7 +2719,9 @@ export class CognitiveRuntime {
       return req.working_state;
     }
     try {
-      const cp = await latestCheckpoint({ dir: this.checkpointDir });
+      // 按会话取最新（已知问题《工作状态未按会话隔离》修复：不再取"目录内最新检查点"——
+      // 那可能属于别的会话，会把别的会话的目标/事实/缺口注入本会话投影）
+      const cp = await latestCheckpointForSession(req.session_id, { dir: this.checkpointDir });
       if (cp === null) {
         return req.working_state;
       }
@@ -2932,6 +3071,21 @@ export class CognitiveRuntime {
         // 向量编码（已知问题《新增向量检索》：空闲期批量编码；纯 CPU、不占显卡、无模型调用）
         return async (signal) => {
           await this.runVectorEncode(signal);
+        };
+      case 'checkpoint_prune':
+        // 检查点轮转与清理（已知问题《检查点无轮转且自 09-09 起停写》：保留上限 + 会话维度清理）
+        return async () => {
+          await this.runCheckpointPrune();
+        };
+      case 'event_store_vacuum':
+        // 事件库整理（已知问题《事件库体积增长》：按体积阈值触发 VACUUM 回收文件页）
+        return async () => {
+          await this.runEventStoreVacuum();
+        };
+      case 'fact_store_compact':
+        // 事实库分片合并（已知问题《事实库小文件》：一键一文件 → 分片存储，键仍可寻址）
+        return async () => {
+          await this.runFactStoreCompact();
         };
       case 'repair':
         // R5（P0+P1）+P3：受影响对象契约化重验证（读 decay 记录 → 对象契约 → 最小验证计划 →

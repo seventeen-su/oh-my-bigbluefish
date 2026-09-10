@@ -20,7 +20,7 @@
 // 层 DAG：layer 1（supervisor/）仅 import node: 内置（不 import kernel 逻辑——IR 契约例外仅
 // kernel/schemas，本文件不需要）；消费方 = runtime(2)（assembly/repair-executors）与 tests（豁免）。
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 // ---- 记录类型（版本化字段全量保留） ----
@@ -157,6 +157,181 @@ async function writeRecord(dir: string, key: string, record: unknown, label: str
   }
 }
 
+// ---- 分片存储（已知问题《事实库小文件》修复：一键一文件 → 分片，键仍可寻址） ----
+//
+// 动机：事实库观测到 2,482 个 JSON 小文件（一键一文件）；目录规模随运行增长，读取与备份成本上升。
+// 方案（保持键可寻址 + 向后兼容 + 无新依赖）：
+//   - 分片文件 `<dir>/shard-<NNNNNN>.json`，内容是 `{ "records": { "<fileKey>": <record>, ... } }`；
+//   - 分片归属 = 键的哈希低位（确定性：同键恒落同一分片，**单键寻址仍是一次文件读**）；
+//   - 读取：先查分片（一次读，命中即返回），未命中再查单文件（未合并的写入）；
+//   - 列全量：分片记录 + 单文件记录合并（同键以分片为准——合并时单文件已删，无重复）；
+//   - 合并（compact）：把现有单文件按分片归属并入分片，成功后删单文件；幂等（重复调用无残留）。
+// 与既有语义的关系：对外接口（registerFact/factsFor/all）完全不变；损坏仍 fail-loud。
+
+/** 分片文件名（6 位零填充序号；与 64 位 hex 单文件名不冲突） */
+const SHARD_FILE_RE = /^shard-(\d{6})\.json$/u;
+/** 分片数（256：单文件数降到 1/256；§17 可标定） */
+export const STORE_SHARD_COUNT = 256;
+
+/** 分片序号（键哈希低位；确定性——同键恒同分片） */
+function shardIndex(key: string, shards: number = STORE_SHARD_COUNT): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % shards;
+}
+
+/** 分片文件路径 */
+function shardFile(dir: string, index: number): string {
+  return join(dir, `shard-${String(index).padStart(6, '0')}.json`);
+}
+
+/** 分片内容形态（版本化：格式升级可识别） */
+interface ShardFile {
+  format: 'omb-store-shard/1';
+  records: Record<string, unknown>;
+}
+
+/** 读单个分片（不存在 → null；损坏 → fail-loud） */
+async function readShard(dir: string, index: number, label: string): Promise<ShardFile | null> {
+  const file = shardFile(dir, index);
+  let raw: string;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`${label} shard read failed: ${file}: ${errorText(err)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${label} shard corrupt: ${file}: ${errorText(err)}`);
+  }
+  const obj = parsed as Partial<ShardFile> | null;
+  if (obj === null || typeof obj !== 'object' || obj.records === null || typeof obj.records !== 'object') {
+    throw new Error(`${label} shard invalid: ${file}: 结构非 {records}`);
+  }
+  return { format: 'omb-store-shard/1', records: obj.records as Record<string, unknown> };
+}
+
+/** 读单键（分片优先 → 单文件兜底）：分片归属与分片内键**同一口径**（都用 fileKey——写入侧即如此） */
+async function readRecordSharded<T>(dir: string, key: string, label: string): Promise<T | null> {
+  const shard = await readShard(dir, shardIndex(fileKey(key)), label);
+  const fromShard = shard?.records[fileKey(key)];
+  if (fromShard !== undefined) return fromShard as T;
+  return readRecord<T>(dir, key, label);
+}
+
+/** 列全量（分片 + 单文件；同键以分片为准） */
+async function listRecordsSharded<T>(dir: string, label: string): Promise<T[]> {
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const out = new Map<string, T>();
+  const singles: string[] = [];
+  for (const f of files.sort()) {
+    const m = SHARD_FILE_RE.exec(f);
+    if (m !== null) {
+      const shard = await readShard(dir, Number.parseInt(m[1]!, 10), label);
+      for (const [k, v] of Object.entries(shard?.records ?? {})) {
+        out.set(k, v as T);
+      }
+    } else if (f.endsWith('.json')) {
+      singles.push(f);
+    }
+  }
+  for (const f of singles) {
+    const file = join(dir, f);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(file, 'utf8'));
+    } catch (err) {
+      throw new Error(`${label} file corrupt: ${file}: ${errorText(err)}`);
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`${label} file invalid: ${file}: 记录非对象`);
+    }
+    const key = f.slice(0, -'.json'.length);
+    if (!out.has(key)) {
+      out.set(key, parsed as T);
+    }
+  }
+  return [...out.values()];
+}
+
+/** 分片合并结果（可观测面） */
+export interface ShardCompactResult {
+  /** 写出的分片数 */
+  shards: number;
+  /** 合并进分片的记录数 */
+  records: number;
+  /** 删除的单文件数 */
+  removedFiles: number;
+}
+
+/**
+ * 分片合并（**幂等**）：把目录下的单文件按分片归属并入分片，成功后删单文件。
+ * 失败语义：单文件删除失败 → 保留该文件（下次重试；读路径以分片为准，不产生重复语义）。
+ */
+async function compactShards(dir: string, label: string): Promise<ShardCompactResult> {
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { shards: 0, records: 0, removedFiles: 0 };
+    throw err;
+  }
+  const singles = files.filter((f) => f.endsWith('.json') && SHARD_FILE_RE.exec(f) === null).sort();
+  if (singles.length === 0) return { shards: 0, records: 0, removedFiles: 0 };
+  const byShard = new Map<number, Record<string, unknown>>();
+  const consumed: string[] = [];
+  for (const f of singles) {
+    const file = join(dir, f);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(file, 'utf8'));
+    } catch {
+      continue; // 损坏单文件跳过（读路径本就会 fail-loud；合并不因坏文件中断其余记录）
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      continue;
+    }
+    const key = f.slice(0, -'.json'.length);
+    const idx = shardIndex(key);
+    const recs = byShard.get(idx) ?? {};
+    recs[key] = parsed;
+    byShard.set(idx, recs);
+    consumed.push(f);
+  }
+  let records = 0;
+  for (const [idx, recs] of [...byShard.entries()].sort((a, b) => a[0] - b[0])) {
+    const existing = (await readShard(dir, idx, label))?.records ?? {};
+    const merged: Record<string, unknown> = { ...existing, ...recs };
+    const file = shardFile(dir, idx);
+    const tmp = `${file}.tmp`;
+    await writeFile(tmp, `${JSON.stringify({ format: 'omb-store-shard/1', records: merged }, null, 2)}\n`, 'utf8');
+    await rename(tmp, file);
+    records += Object.keys(recs).length;
+  }
+  let removedFiles = 0;
+  for (const f of consumed) {
+    try {
+      await rm(join(dir, f));
+      removedFiles++;
+    } catch {
+      // 删除失败 → 保留（读路径以分片为准；下次 compact 重试）
+    }
+  }
+  return { shards: byShard.size, records, removedFiles };
+}
+
 // ---- 事实库（FactStore） ----
 
 /** 事实库：已确认 Claim / Provenance / 当前有效性（同 id 覆写——最新观测胜出） */
@@ -180,7 +355,7 @@ export class FactStore {
 
   /** 按 provenance 子串查询（缺省/空对象 → 全量）；损坏 → fail-loud 抛错 */
   async factsFor(query?: { provenanceContains?: string }): Promise<FactRecord[]> {
-    const all = await listRecords<FactRecord>(this.dir, 'facts');
+    const all = await listRecordsSharded<FactRecord>(this.dir, 'facts');
     const needle = query?.provenanceContains;
     if (needle === undefined || needle.length === 0) {
       return all;
@@ -190,7 +365,20 @@ export class FactStore {
 
   /** 全量事实（损坏 → fail-loud 抛错） */
   async all(): Promise<FactRecord[]> {
-    return listRecords<FactRecord>(this.dir, 'facts');
+    return listRecordsSharded<FactRecord>(this.dir, 'facts');
+  }
+
+  /** 按键读取（分片优先 → 单文件兜底；键仍可寻址——已知问题《事实库小文件》修复要求） */
+  async get(id: string): Promise<FactRecord | null> {
+    return readRecordSharded<FactRecord>(this.dir, id, 'facts');
+  }
+
+  /**
+   * 分片合并（维护任务 fact_store_compact 调用；幂等）：一键一文件 → 分片，键仍可寻址。
+   * 已知问题《事实库小文件》修复判定："合并或分片存储（保持键可寻址）"。
+   */
+  async compact(): Promise<ShardCompactResult> {
+    return compactShards(this.dir, 'facts');
   }
 }
 

@@ -347,15 +347,25 @@ describe('S4 ③ discoverArtifactsFromEvents：事件 → Manifest（尽力而�
     expect(rep.restorable).toBe(true);
   });
 
-  it('幽灵路径跳过（root 下不存在/目录）——不索引；越界路径（.. 逃逸）跳过', async () => {
+  it('幽灵路径与越界路径不再丢弃——记为不可恢复制品（root 下真实文件仍为 restorable true）', async () => {
     const root = await tmpRoot('omb-art-3b-');
     await writeFile(join(root, 'real.txt'), 'x', 'utf8');
     const manifests = await discoverArtifactsFromEvents(
       [{ id: 'evt:1', type: 'tool/result', payload: 'real.txt ghost.json sub/../../outside.txt' }],
       { root, environment: {} },
     );
-    expect(manifests).toHaveLength(1);
-    expect(manifests[0]!.path).toBe('real.txt');
+    // 已知问题《制品索引未建立》修复：根外/不存在的路径**不再直接丢弃**——按"事件确实提及过该路径"
+    // 这一事实入索引，restorable:false 诚实标注当前不可恢复；root 下真实文件照旧 hash 真实 + restorable true。
+    expect(manifests).toHaveLength(3);
+    const real = manifests.find((m) => m.path === 'real.txt');
+    expect(real?.restorable).toBe(true);
+    expect(real?.hash).not.toBe('unavailable');
+    for (const ghost of ['ghost.json', 'outside.txt']) {
+      const m = manifests.find((x) => x.path.endsWith(ghost));
+      expect(m).toBeDefined();
+      expect(m?.restorable).toBe(false);
+      expect(m?.hash).toBe('unavailable');
+    }
   });
 
   it('无路径（payload 无扩展名白名单 token）→ []', async () => {
@@ -419,13 +429,18 @@ describe('S4 ③ discoverArtifactsFromEvents：事件 → Manifest（尽力而�
     expect(manifests.map((m) => m.path).sort()).toEqual(['notes.md', 'out.ts']);
   });
 
-  it('尽力而为：根不存在/读取异常 → 返回 []（不抛）', async () => {
+  it('尽力而为：根不存在 → 仍索引为不可恢复制品（不抛；restorable=false）', async () => {
     const root = await tmpRoot('omb-art-3h-');
     const manifests = await discoverArtifactsFromEvents(
       [{ id: 'evt:1', type: 'tool/result', payload: 'gone.ts' }],
       { root: join(root, 'no-such-dir'), environment: {} },
     );
-    expect(manifests).toHaveLength(0);
+    // 已知问题《制品索引未建立》修复：根不存在时"事件提及的路径"仍入索引（restorable:false 诚实标注），
+    // 而不是整条丢弃——丢弃正是"制品索引始终为空"的成因之一。
+    expect(manifests).toHaveLength(1);
+    expect(manifests[0]?.restorable).toBe(false);
+    expect(manifests[0]?.hash).toBe('unavailable');
+    expect(manifests[0]?.path).toBe('gone.ts');
   });
 });
 
