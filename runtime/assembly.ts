@@ -152,6 +152,13 @@ import type { KernStatusSummary } from './kern-tools.js';
 // S1：World/Self 模型运行接线——运行时状态视图 → 模型组装（纯读取、确定性）
 import { degradationLog, recordDegradation } from './loop-hooks.js';
 import { buildSelfModel, buildWorldModel, type RuntimeView } from './models.js';
+// 自迭代状态落盘/读取（已知问题《需要"查看自迭代状态"的快速工具》数据面；runtime(2) → runtime(2) ✓）
+import {
+  evolutionStateFile,
+  readEvolutionState,
+  writeEvolutionState,
+  type EvolutionGateView,
+} from './evolution-state.js';
 
 /** 仓库根候选（本文件 src 布局在 <preset>/runtime/ → 上一级即 preset 根；编译布局 <preset>/lib/runtime/ → 多一层） */
 const HERE_CANDIDATE = fileURLToPath(new URL('..', import.meta.url));
@@ -383,6 +390,20 @@ export interface CognitiveAssemblyOptions {
    *  见 shouldSampleEpisode；working_state 高价值（open_questions/evidence_gaps 非空）→ 提升到
    *  EPISODE_SAMPLE_RATE_HIGH_VALUE；kern_memory 显式记忆工具恒记录不受此限；非法值 → fail-loud） */
   episodeSampleRate?: number;
+  /**
+   * 自迭代开关面（已知问题《开关落在宿主插件配置，不引入界面》——落 agent.cordis.yml 插件配置，
+   * 由 plugin.ts 解析后注入；缺省全部启用 = 既有行为不变）。
+   */
+  selfIteration?: {
+    /** 链路总开关：是否允许演化与晋升（false → 判定不触发候选管线/晋升，仅记账并说明原因） */
+    enabled?: boolean;
+    /** 触发门槛：低于该强度的触发信号不演化（0 = 不设门槛） */
+    minStrength?: number;
+    /** 后台模型调用许可（候选生成/语义裁判等后台路径；false → 后台适配器拒绝调用，降级记录） */
+    backgroundModelCalls?: boolean;
+    /** 演化节律：是否随维护定时器运行（false → 仅显式 /evolve now 触发） */
+    schedule?: boolean;
+  };
 }
 
 /** 请求（最小链输入）：会话事实 + 任务契约 + 工作状态 */
@@ -817,6 +838,15 @@ export class CognitiveRuntime {
   private readonly sessionEpisodes = new Map<string, Set<string>>();
   /** 来源子系统最近一次「执行体成功跑完」时间（债务释放的确认依据；本进程内真实观测，不跨进程推断） */
   private readonly lastSubsystemOk = new Map<string, number>();
+  /** 自迭代开关面（opts.selfIteration；缺省全启用 = 既有行为不变） */
+  private readonly selfIteration: {
+    enabled: boolean;
+    minStrength: number;
+    backgroundModelCalls: boolean;
+    schedule: boolean;
+  };
+  /** 最近一次演化判定的触发来源（写入自迭代状态，便于区分维护定时器与 /evolve now） */
+  private evolutionStateTrigger = 'maintenance:evolution_decision';
 
   constructor(opts: CognitiveAssemblyOptions = {}) {
     // R6：宿主版本唯一来源注入（装配期；提供 → setHostVersion 覆写——运行时指纹采集与事件
@@ -872,6 +902,16 @@ export class CognitiveRuntime {
       this.identityError = errorDetail(err);
     }
     this.modelAdapter = opts.modelAdapter ?? null;
+    // 自迭代开关（agent.cordis.yml 插件配置面；缺省全启用 = 既有行为不变）
+    const si = opts.selfIteration ?? {};
+    this.selfIteration = {
+      enabled: si.enabled !== false,
+      minStrength: typeof si.minStrength === 'number' && Number.isFinite(si.minStrength) && si.minStrength >= 0
+        ? si.minStrength
+        : 0,
+      backgroundModelCalls: si.backgroundModelCalls !== false,
+      schedule: si.schedule !== false,
+    };
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
     this.signalsDir = opts.signalsDir ?? signalsDirOf(root);
@@ -940,8 +980,25 @@ export class CognitiveRuntime {
     return new ProcessScheduler({
       processes,
       generation: effective.budget.generation,
-      modelAdapter: this.modelAdapter ?? undefined,
+      // 后台模型调用许可（并发受限环境：并发 1 时禁止后台模型调用——已知问题《并发能力未知》）。
+      // 不允许时传 undefined：生成阶梯自动降级为纯规则（不发模型调用），不抛错、不阻塞请求路径。
+      modelAdapter: this.selfIteration.backgroundModelCalls ? (this.modelAdapter ?? undefined) : undefined,
     });
+  }
+
+  /** 后台模型调用是否许可（候选生成/语义裁判等后台路径；状态面与装配面共用） */
+  backgroundModelCallsAllowed(): boolean {
+    return this.selfIteration.backgroundModelCalls && this.modelAdapter !== null;
+  }
+
+  /** 自迭代开关面快照（状态面可读——回答「为什么没有演化」时先看开关） */
+  selfIterationConfig(): { enabled: boolean; min_strength: number; background_model_calls: boolean; schedule: boolean } {
+    return {
+      enabled: this.selfIteration.enabled,
+      min_strength: this.selfIteration.minStrength,
+      background_model_calls: this.selfIteration.backgroundModelCalls,
+      schedule: this.selfIteration.schedule,
+    };
   }
 
   /**
@@ -965,6 +1022,16 @@ export class CognitiveRuntime {
    * 字段：当前版本线/快照哈希/lineSnapshot/维护债务快照/最近信号数/组件健康（design §6 kern_status）。
    */
   async status(): Promise<KernStatusSummary> {
+    return this.statusFor();
+  }
+
+  /**
+   * 带可选线参数的状态摘要（已知问题《需要"查看自迭代状态"的快速工具》：扩展现有状态工具，
+   * 不新增工具）——`line` 给出时附带该线状态（提交、与其它线的领先/落后关系）；
+   * `evolution: true`（缺省）附带自迭代状态段：最近判定结论与原因、信号计数、债务快照、
+   * 门禁逐项与开关面（回答"为什么没有演化"）。
+   */
+  async statusFor(input: { line?: VersionLine; evolution?: boolean } = {}): Promise<KernStatusSummary> {
     await this.componentsReady();
     let recent_signals = 0;
     let signals_degraded: string | null = null;
@@ -999,6 +1066,15 @@ export class CognitiveRuntime {
         observations_degraded = errorDetail(err);
       }
     }
+    // 自迭代状态段（缺省附带；读取失败 → null + 降级说明，不抛）
+    let evolution: KernStatusSummary['evolution'] = null;
+    if (input.evolution !== false) {
+      try {
+        evolution = await this.evolutionStateView(input.line);
+      } catch (err) {
+        evolution = { degraded: errorDetail(err) } as KernStatusSummary['evolution'];
+      }
+    }
     return {
       line: this.lineSnapshot?.line ?? 'stable',
       snapshot_hash: this.snapshotHash,
@@ -1011,6 +1087,7 @@ export class CognitiveRuntime {
       debt_pending_manual,
       debt_release_audit,
       debt_limits,
+      evolution,
       maintenance_observations,
       observations_degraded,
       recent_signals,
@@ -1978,17 +2055,23 @@ export class CognitiveRuntime {
         await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, input.session_id));
       }
       // P1c：演化判定任务（空闲期 quantum 执行；低优先级、可中断——读 signals → evolve.policy 判定 →
-      // 应演化则入队 candidate_validation + evolution/candidate 事件入链）
-      await this.maintenance.enqueue({
-        id: 'evolution_decision',
-        value: 1,
-        estimated_cost: maintenanceCosts.evolution_decision,
-        priority: 0,
-        urgency: 'normal',
-        run: async (signal) => {
-          await this.runEvolutionDecision(signal, input.session_id);
-        },
-      });
+      // 应演化则入队 candidate_validation + evolution/candidate 事件入链）。
+      // 演化节律开关（config.selfIteration.schedule=false）→ 不入队（仅显式 /evolve now 触发演化判定）；
+      // 其余维护任务（环境检查/晋升检查/记忆整合）不受此开关影响。
+      if (this.selfIteration.schedule) {
+        await this.maintenance.enqueue({
+          id: 'evolution_decision',
+          value: 1,
+          estimated_cost: maintenanceCosts.evolution_decision,
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'evolution-decision',
+          reason: '演化判定待执行',
+          run: async (signal) => {
+            await this.runEvolutionDecision(signal, input.session_id);
+          },
+        });
+      }
       // P1e：晋升检查任务（低优先级：读 trusted-latest vs stable → 三层信号门禁 → 应晋升则
       // promoteToStable（activation_scope='project' 显式传入）——空闲期 quantum 与 /evolve 共用）
       await this.maintenance.enqueue({
@@ -2688,6 +2771,74 @@ export class CognitiveRuntime {
     }
   }
 
+  // ---- 自迭代状态（已知问题《需要"查看自迭代状态"的快速工具》的数据面） ----
+
+  /**
+   * 自迭代状态视图：最近一次判定结论与原因、信号计数、债务快照、门禁逐项、开关面，
+   * 并在给定 `line` 时附带该线状态与三线相互领先/落后关系（多线自迭代状态）。
+   * 纯读取：无记录 → null 段（诚实缺失），不触发任何演化动作。
+   */
+  private async evolutionStateView(line?: VersionLine): Promise<KernStatusSummary['evolution']> {
+    const rec = await readEvolutionState(evolutionStateFile(this.evolutionRoot));
+    const lines = await this.lineRelations();
+    const target = isVersionLine(line) ? line : undefined;
+    return {
+      enabled: this.selfIteration.enabled,
+      min_strength: this.selfIteration.minStrength,
+      background_model_calls: this.selfIteration.backgroundModelCalls,
+      schedule: this.selfIteration.schedule,
+      last_decision: rec === null ? null : rec.decision,
+      last_decision_ts: rec?.ts ?? null,
+      last_decision_trigger: rec?.trigger ?? null,
+      signals: rec?.signals ?? {},
+      signals_total: rec?.signals_total ?? 0,
+      debt: rec?.debt ?? (this.maintenance?.limitsSnapshot() ?? null),
+      gates: rec?.gates ?? [],
+      lines,
+      line: target === undefined ? null : (lines.find((l) => l.line === target) ?? null),
+      degraded: rec === null ? '尚无演化判定记录（.evolution/evolve-state.json 不存在）' : null,
+    };
+  }
+
+  /** 三线状态与相互领先/落后关系（提交 + ahead/behind 计数；git 不可用 → 空数组诚实缺失） */
+  private async lineRelations(): Promise<
+    Array<{ line: string; commit: string | null; ahead: number; behind: number }>
+  > {
+    const layout = this.assemblyOpts.layout ?? defaultLayout();
+    const commits = new Map<string, string | null>();
+    for (const l of VALID_LINES) {
+      try {
+        commits.set(l, resolveLineCommit(layout, l));
+      } catch {
+        commits.set(l, null);
+      }
+    }
+    const out: Array<{ line: string; commit: string | null; ahead: number; behind: number }> = [];
+    for (const l of VALID_LINES) {
+      const own = commits.get(l) ?? null;
+      let ahead = 0;
+      let behind = 0;
+      for (const other of VALID_LINES) {
+        if (other === l) continue;
+        const theirs = commits.get(other) ?? null;
+        if (own === null || theirs === null) continue;
+        try {
+          const counts = runGit(layout, ['rev-list', '--left-right', '--count', `${own}...${theirs}`]);
+          const [a = 0, b = 0] = counts
+            .trim()
+            .split(/\s+/)
+            .map((n) => Number.parseInt(n, 10) || 0);
+          ahead += a;
+          behind += b;
+        } catch {
+          // 单对比较失败 → 跳过（关系缺失优于错误数字）
+        }
+      }
+      out.push({ line: l, commit: own, ahead, behind });
+    }
+    return out;
+  }
+
   /**
    * 一次演化判定（§6.5.1 数据化）：读 signals → evolve.policy → decideEvolution（纯函数）→
    * 应演化 → 入队 candidate_validation（accrueDebt，债务入账）+ evolution/candidate 事件入链
@@ -2704,8 +2855,101 @@ export class CognitiveRuntime {
     const debtTotal =
       this.maintenance?.debtSnapshot().reduce((acc, d) => acc + d.value, 0) ?? 0;
     const decision = decideEvolution({ summary, policy: policy.evolve, debt: debtTotal });
+    // 自迭代开关门禁（配置面；缺省全启用 → 判定结果不变）：
+    //   ① 总开关关闭 → 不演化（不生成候选、不推进版本线；仍记账 + 状态面说明）
+    //   ② 触发门槛：最高触发强度低于配置门槛 → 不演化（触发条件本身较少满足时的显式调节面）
+    const strongest = decision.triggers.reduce((m, t) => Math.max(m, t.strength), 0);
+    const gated: EvolutionDecision =
+      !decision.should_evolve
+        ? decision
+        : !this.selfIteration.enabled
+          ? { ...decision, should_evolve: false, reason: 'disabled_by_config（selfIteration.enabled=false）' }
+          : strongest < this.selfIteration.minStrength
+            ? {
+                ...decision,
+                should_evolve: false,
+                reason: `strength_below_min:${strongest}<${this.selfIteration.minStrength}`,
+              }
+            : decision;
+    // 自迭代状态落盘（已知问题《需要"查看自迭代状态"的快速工具》）：把「刚判了什么、为什么」留给
+    // 状态面——门禁逐项列出（链路总开关/触发门槛/债务硬限/日预算/后台模型调用许可/线布局）。
+    // 尽力而为：写失败只记录降级，绝不影响判定结果与请求路径。
+    try {
+      const limits = this.maintenance?.limitsSnapshot() ?? null;
+      const debtBand = limits?.band ?? 'unknown';
+      const gates: EvolutionGateView[] = [
+        {
+          gate: '链路总开关',
+          passed: this.selfIteration.enabled,
+          reason: this.selfIteration.enabled ? null : 'config.selfIteration.enabled=false（配置面关闭演化与晋升）',
+        },
+        {
+          gate: '触发门槛',
+          passed: gated.triggers.length > 0,
+          reason: gated.triggers.length > 0 ? null : 'no_trigger（窗口内无 evolve=true 的触发信号）',
+        },
+        {
+          gate: '触发强度门槛',
+          passed: strongest >= this.selfIteration.minStrength,
+          reason:
+            strongest >= this.selfIteration.minStrength
+              ? null
+              : `strength_below_min（最高 ${strongest} < config.selfIteration.minStrength=${this.selfIteration.minStrength}）`,
+        },
+        {
+          gate: '债务硬限',
+          passed: debtTotal < policy.evolve.debt_thresholds.hard,
+          reason:
+            debtTotal < policy.evolve.debt_thresholds.hard
+              ? null
+              : `debt_over_hard:${debtTotal}>=${policy.evolve.debt_thresholds.hard}`,
+        },
+        {
+          gate: '后台模型调用许可',
+          passed: this.selfIteration.backgroundModelCalls,
+          reason: this.selfIteration.backgroundModelCalls
+            ? null
+            : 'background_model_calls_disabled（候选生成/语义裁判不发模型调用）',
+        },
+        {
+          gate: '演化节律',
+          passed: this.selfIteration.schedule,
+          reason: this.selfIteration.schedule ? null : 'schedule_disabled（不随维护定时器运行，仅显式 /evolve now）',
+        },
+        {
+          gate: '线布局',
+          passed: this.lineSnapshot !== null,
+          reason: this.lineSnapshot === null ? '旧布局（版本线快照无 kernel/policy）——候选管线不可执行' : null,
+        },
+      ];
+      await writeEvolutionState(evolutionStateFile(this.evolutionRoot), {
+        ts: Date.now(),
+        trigger: this.evolutionStateTrigger,
+        decision: {
+          should_evolve: gated.should_evolve,
+          strength: gated.strength,
+          object_layer: gated.object_layer,
+          budget_estimate: gated.budget_estimate,
+          triggers: gated.triggers.map((t) => t.kind),
+          reason: gated.reason,
+        },
+        signals: summary.counts,
+        signals_total: Object.values(summary.counts).reduce((a, b) => a + b, 0),
+        debt: {
+          total: debtTotal,
+          band: debtBand,
+          soft: limits?.soft ?? policy.evolve.debt_thresholds.soft,
+          hard: limits?.hard ?? policy.evolve.debt_thresholds.hard,
+          critical: limits?.critical ?? policy.evolve.debt_thresholds.critical,
+        },
+        gates,
+        line: this.lineSnapshot?.line ?? 'stable',
+      });
+    } catch (err) {
+      recordDegradation('evolution/state', `自迭代状态落盘失败（${errorDetail(err)}）——状态段将缺失`);
+    }
     const enqueued: string[] = [];
-    if (decision.should_evolve && this.maintenance !== null) {
+    if (gated.should_evolve && this.maintenance !== null) {
       // S2：债务成本从 policy.evolve.maintenance_costs 读取（装配注入——改 evolve.yaml 即生效）
       const acc = candidateValidationAccrual(policy.evolve.maintenance_costs);
       await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, sessionId));
@@ -2717,19 +2961,19 @@ export class CognitiveRuntime {
           this.snapshotHash,
           {
             stage: 'decision',
-            should_evolve: decision.should_evolve,
-            strength: decision.strength,
-            object_layer: decision.object_layer,
-            budget_estimate: decision.budget_estimate,
-            triggers: decision.triggers,
-            reason: decision.reason,
+            should_evolve: gated.should_evolve,
+            strength: gated.strength,
+            object_layer: gated.object_layer,
+            budget_estimate: gated.budget_estimate,
+            triggers: gated.triggers,
+            reason: gated.reason,
             candidate_id: null, // 判定阶段候选未生成（真实 id 见 runEvolutionChain 的 stage='generated' 事件）
           },
           ['evolution_decision', 'evolution/candidate'],
         ),
       );
     }
-    return { decision, enqueued };
+    return { decision: gated, enqueued };
   }
 
   /** 空闲期演化判定任务执行体（维护量子内；低优先级、可中断——signal.aborted → AbortError 让出留队） */
@@ -2739,6 +2983,7 @@ export class CognitiveRuntime {
       err.name = 'AbortError';
       throw err;
     }
+    this.evolutionStateTrigger = 'maintenance:evolution_decision';
     await this.performEvolutionDecision(sessionId);
     this.markSubsystemOk('evolution-decision');
   }
@@ -3212,6 +3457,7 @@ export class CognitiveRuntime {
     const candidates: CandidateOutcome[] = [];
     let promoted: PromotedInfo | null = null;
     try {
+      this.evolutionStateTrigger = 'evolve-command:now';
       const r = await this.performEvolutionDecision(sessionId);
       decision = r.decision;
       enqueued = r.enqueued;

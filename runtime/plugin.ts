@@ -94,6 +94,36 @@ export interface PluginConfig {
    *  高价值任务（open_questions/evidence_gaps 非空）自动提升；kern_memory 显式工具恒记录不受此限；
    *  非法值 → 降级记录 + 使用缺省） */
   episodeSampleRate?: number;
+  /**
+   * 自迭代开关面（已知问题《开关落在宿主插件配置，不引入界面》）：**不引入任何界面或交互开关**，
+   * 直接用宿主编排文件本行 config 作为部署级策略——见 agent.cordis.yml 的 selfIteration 段。
+   * 缺省（整段不写）→ 全部启用 = 既有行为不变。
+   */
+  selfIteration?: {
+    /** 链路总开关：是否允许演化与晋升（缺省 true；false → 只记账不演化，状态面注明原因） */
+    enabled?: boolean;
+    /** 触发门槛：触发信号最高强度低于该值则不演化（缺省 0 = 不设门槛；取值 0~1） */
+    minStrength?: number;
+    /**
+     * 后台模型调用许可（候选生成/语义裁判等后台路径；缺省 auto——由并发档位决定：
+     * 并发能力 > 1 才许可，并发 = 1（本地小窗模型）自动禁止后台调用以免阻塞主对话）。
+     * 显式 true/false 覆盖自动判定。
+     */
+    backgroundModelCalls?: boolean | 'auto';
+    /** 演化节律：是否随维护定时器运行（缺省 true；false → 仅显式 /evolve now 触发） */
+    schedule?: boolean;
+  };
+  /**
+   * 并发能力声明面（已知问题《并发能力未知（无探测面）》）：宿主 llm 服务暴露元数据时自动读取，
+   * 否则由本配置声明。缺省不声明 = 未知 → 沿用既有行为（后台调用许可，不擅自收紧）。
+   * `maxConcurrentRequests: 1` → 后台模型调用自动禁止（并发 1 时任何后台调用都会阻塞主对话）。
+   */
+  concurrency?: {
+    /** 宿主模型最大并发请求数（1 = 串行；缺省未知） */
+    maxConcurrentRequests?: number;
+    /** 声明来源（仅观测用；缺省 'config'） */
+    source?: string;
+  };
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -543,6 +573,67 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     }
   }
 
+  /**
+   * 并发能力探测或声明（已知问题《并发能力未知（无探测面）》）：先读宿主 llm 服务暴露的元数据
+   * （llm.maxConcurrentRequests / llm.concurrency / llm.metadata.maxConcurrentRequests——形状容错），
+   * 读不到再由 config.concurrency 声明，都没有 → unknown（沿用既有行为，不擅自收紧）。
+   * 运行档位：并发 = 1 → 禁止后台模型调用（任何后台调用都会阻塞主对话）。
+   */
+  const resolveConcurrency = (): { max_concurrent: number | null; source: 'host' | 'config' | 'unknown'; background_model_calls: boolean } => {
+    const readHost = (): number | null => {
+      const llm = readService<Record<string, unknown>>(ctx, 'llm');
+      if (llm === null || llm === undefined || typeof llm !== 'object') return null;
+      const cands: unknown[] = [
+        (llm as { maxConcurrentRequests?: unknown }).maxConcurrentRequests,
+        (llm as { concurrency?: unknown }).concurrency,
+        (llm as { metadata?: { maxConcurrentRequests?: unknown } }).metadata?.maxConcurrentRequests,
+      ];
+      for (const c of cands) {
+        if (typeof c === 'number' && Number.isFinite(c) && c >= 1) return Math.floor(c);
+      }
+      return null;
+    };
+    const declared = config.concurrency?.maxConcurrentRequests;
+    const valid = typeof declared === 'number' && Number.isFinite(declared) && declared >= 1;
+    const host = readHost();
+    const max = host ?? (valid ? Math.floor(declared) : null);
+    const source: 'host' | 'config' | 'unknown' = host !== null ? 'host' : valid ? 'config' : 'unknown';
+    // 缺省语义：未知 → 许可（既有行为不变）；已知并发 1 → 禁止；并发 >1 → 许可
+    return { max_concurrent: max, source, background_model_calls: max === null || max > 1 };
+  };
+  const concurrency = resolveConcurrency();
+  // 并发未知（宿主未暴露元数据且未声明）→ **不记降级**：这是常见且完全正常的部署形态
+  // （沿用既有行为，不擅自收紧），只是观测面标注为 unknown。显式声明与宿主读取才产生确定档位；
+  // 由声明/读取得出「禁止后台调用」时另有显式留痕（见下方 selfIteration/background）。
+  // 自迭代开关面解析（config.selfIteration；缺省全启用 = 既有行为不变）：
+  // 后台模型调用许可缺省 auto → 由并发档位决定（并发 1 自动禁止）
+  const si = config.selfIteration ?? {};
+  if (si.enabled !== undefined && typeof si.enabled !== 'boolean') {
+    recordDegradation('config/selfIteration', `非法 selfIteration.enabled "${String(si.enabled)}"（应为布尔）——按缺省 true 处理`);
+  }
+  if (si.minStrength !== undefined && (typeof si.minStrength !== 'number' || !Number.isFinite(si.minStrength) || si.minStrength < 0)) {
+    recordDegradation('config/selfIteration', `非法 selfIteration.minStrength "${String(si.minStrength)}"（应为 ≥0 数值）——按缺省 0 处理`);
+  }
+  const backgroundModelCalls =
+    si.backgroundModelCalls === true
+      ? true
+      : si.backgroundModelCalls === false
+        ? false
+        : concurrency.background_model_calls; // 'auto' / 缺省
+  const selfIteration = {
+    enabled: si.enabled !== false,
+    minStrength: typeof si.minStrength === 'number' && Number.isFinite(si.minStrength) && si.minStrength >= 0 ? si.minStrength : 0,
+    backgroundModelCalls,
+    schedule: si.schedule !== false,
+  };
+  // 后台调用被禁止时的显式留痕（排障时一眼看出「为什么没有候选生成」）
+  if (!selfIteration.backgroundModelCalls) {
+    recordDegradation(
+      'selfIteration/background',
+      `后台模型调用已禁止（并发档位 ${concurrency.max_concurrent ?? 'unknown'}，来源 ${concurrency.source}；候选生成/语义裁判不发模型调用，生成阶梯降级为纯规则）`,
+    );
+  }
+
   if (cognitive === undefined) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
@@ -637,6 +728,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         // 专项 D：记忆检索 Episode 采样率（agent.cordis.yml config 可配；缺省不配 → 运行时缺省 0.02；
         // 非法值 → 降级记录 + 不传（运行时缺省）——配置错误显式留痕不静默）
         ...(episodeSampleRate !== undefined ? { episodeSampleRate } : {}),
+        // 自迭代开关面（agent.cordis.yml config.selfIteration；缺省全启用）——链路总开关/触发门槛/
+        // 后台模型调用许可/演化节律，全部落在部署配置面，不引入界面或交互开关
+        selfIteration,
         // 生产装配（ChatGPT 修复意见 #3/#4）：持久化检查点目录（finalizeTurn 保存工作状态）+ 维护调度器
         //（turn 收尾入队 + 请求间隙小量子 + 进程内 tick 批量消费；debt 落盘到认知数据根 .evolution/）
         checkpointDir: join(root, 'checkpoints'),
