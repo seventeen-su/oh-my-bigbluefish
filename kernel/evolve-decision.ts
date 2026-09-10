@@ -217,7 +217,7 @@ export function countsToSignalRecords(
 
 /** 采集器 EvaluationSignal 输出面 → 信号记录（layer 并入 payload；count 缺失/零 → 跳过；结构形状避免跨层依赖） */
 export function evaluationSignalsToRecords(
-  signals: ReadonlyArray<{ layer: string; kind: string; count?: number; target?: string }>,
+  signals: ReadonlyArray<{ layer: string; kind: string; count?: number; target?: string; cumulative?: boolean }>,
   ts: number,
   sessionId?: string,
 ): SignalRecord[] {
@@ -229,7 +229,9 @@ export function evaluationSignalsToRecords(
       ts,
       kind: s.kind,
       session_id: sessionId,
-      payload: { layer: s.layer, count, target: s.target ?? null },
+      // 口径标记落盘（已知问题《采样信号计数口径待核对》）：cumulative=true 表示该 count 是
+      // **窗口内累计值**（每轮重复出现的同一批 episode），统计须取最大值而非相加。
+      payload: { layer: s.layer, count, target: s.target ?? null, cumulative: s.cumulative === true },
     });
   }
   return out;
