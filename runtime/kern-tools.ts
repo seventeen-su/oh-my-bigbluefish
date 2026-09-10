@@ -70,6 +70,44 @@ export interface KernStatusSummary {
   line_degraded: string | null;
   /** 维护债务快照（未注入 scheduler → 空数组） */
   debt: Array<{ task_id: string; value: number }>;
+  /** 债务来源视图（来源子系统/原因/首见时间/orphan/manual_pending；调度器缺失 → null） */
+  debt_sources: Array<{
+    task_id: string;
+    value: number;
+    subsystem: string | null;
+    reason: string;
+    first_seen: number;
+    last_failure: number;
+    orphan: boolean;
+    manual_pending: boolean;
+    evolution_mutating: boolean;
+  }> | null;
+  /** 待人工裁决债务（无主且长期未对应到修复动作；**不做自动清除**——只列出给人看） */
+  debt_pending_manual: Array<{
+    task_id: string;
+    value: number;
+    reason: string;
+    manual_pending: boolean;
+  }>;
+  /** 债务释放审计（本次进程内已执行；跨进程历史在 .evolution/debt-releases.jsonl） */
+  debt_release_audit: Array<{
+    ts: number;
+    task_id: string;
+    value: number;
+    subsystem: string | null;
+    evidence: string;
+    released_by: string;
+    reason: string;
+  }>;
+  /** 生效债务阈值与档位（soft/hard/critical/total/band/batch_size；调度器缺失 → null） */
+  debt_limits: {
+    soft: number;
+    hard: number;
+    critical: number;
+    total: number;
+    band: 'normal' | 'soft' | 'hard' | 'critical';
+    batch_size: number;
+  } | null;
   /** S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + observations_degraded） */
   maintenance_observations: {
     date: string;

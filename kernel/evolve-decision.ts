@@ -45,6 +45,32 @@ const ACCRUAL_URGENCY: Record<MaintenanceTaskId, MaintenanceUrgency> = {
   evolution_decision: 'normal',
 };
 
+/**
+ * 债务来源子系统（已知问题「债务是保护性自锁，需要修复后释放」第 1 条：债务带来源记录）——
+ * 每条债务必须能对应到「待修复项」，释放流程按 subsystem 逐条核对（防「修了 A 顺手清掉 B 的债」）。
+ * 取值 = 完成该项修复所需的自检面（release 时 expectedSubsystem 必须与之一致）。
+ */
+const DEBT_SUBSYSTEM: Record<MaintenanceTaskId, string> = {
+  repair: 'repair-chain',
+  candidate_validation: 'candidate-pipeline',
+  memory_consolidation: 'memory-consolidation',
+  environment_check: 'environment-check',
+  evolution_decision: 'evolution-decision',
+  promotion_check: 'promotion-check',
+  gc: 'event-store',
+};
+
+/** 入账原因（可读；写入债务来源记录，供状态面回答「这条债是哪来的」） */
+const ACCRUAL_REASON: Record<MaintenanceTaskId, string> = {
+  repair: '修正/复现失败信号（corrections/oracle_fail）——受影响对象需重验证',
+  candidate_validation: '工具/检索活跃或泛化缺口/信任池污染信号——候选需生成与验证',
+  memory_consolidation: '记忆读写或正向采集信号——经验待整合入长期记忆',
+  environment_check: '环境变化待核对（预测性失效）',
+  evolution_decision: '演化判定待执行',
+  promotion_check: '晋升检查待执行',
+  gc: '事件库待整理',
+};
+
 /** S2：可注入的维护成本表（装配时传 policy.evolve.maintenance_costs；缺省 → 出厂初值） */
 export type MaintenanceCostsLike = Readonly<Partial<Record<MaintenanceTaskId, number>>>;
 
@@ -66,6 +92,10 @@ export interface DebtAccrual {
   /** §10.1 priority = EV/C × debt（EV=value、C=estimated_cost、debt=value） */
   priority: number;
   urgency: MaintenanceUrgency;
+  /** 债务来源子系统（release 时按此逐条核对；见 DEBT_SUBSYSTEM） */
+  subsystem: string;
+  /** 债务原因（可读；写入债务来源记录） */
+  reason: string;
 }
 
 /** 信号摘要 → §10.1 维护债务入账（按实际信号类型累计权重；零计数不产生债务；
@@ -81,6 +111,8 @@ export function debtAccrualsFromSummary(summary: SignalSummary, costs?: Maintena
       estimated_cost: cost,
       priority: Math.round((value / cost) * value),
       urgency: ACCRUAL_URGENCY[taskId],
+      subsystem: DEBT_SUBSYSTEM[taskId],
+      reason: ACCRUAL_REASON[taskId],
     });
   };
   const n = (k: string): number => summary.counts[k] ?? 0;
@@ -124,6 +156,8 @@ export function candidateValidationAccrual(costs?: MaintenanceCostsLike): DebtAc
     estimated_cost: cost,
     priority: Math.round((value / cost) * value),
     urgency: ACCRUAL_URGENCY[taskId],
+    subsystem: DEBT_SUBSYSTEM[taskId],
+    reason: ACCRUAL_REASON[taskId],
   };
 }
 
@@ -140,6 +174,8 @@ export function memoryConsolidationAccrual(costs?: MaintenanceCostsLike): DebtAc
     estimated_cost: cost,
     priority: Math.round((value / cost) * value),
     urgency: ACCRUAL_URGENCY[taskId],
+    subsystem: DEBT_SUBSYSTEM[taskId],
+    reason: ACCRUAL_REASON[taskId],
   };
 }
 
@@ -156,6 +192,8 @@ export function repairAccrual(costs?: MaintenanceCostsLike): DebtAccrual {
     estimated_cost: cost,
     priority: Math.round((value / cost) * value),
     urgency: ACCRUAL_URGENCY[taskId],
+    subsystem: DEBT_SUBSYSTEM[taskId],
+    reason: ACCRUAL_REASON[taskId],
   };
 }
 

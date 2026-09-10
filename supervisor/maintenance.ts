@@ -62,12 +62,16 @@ export interface MaintenanceTask {
   estimated_cost: number;
   priority: number;
   urgency: Urgency;
+  /** 债务来源子系统（债务来源记录；入队方标注——见 DebtSourceView） */
+  subsystem?: string;
+  /** 债务原因（可读；入队方标注） */
+  reason?: string;
   run: (signal?: AbortSignal) => Promise<void>;
 }
 
 /** M3 最小接口形状兼容：{id, run} 必需，其余缺省（value=1/estimated_cost=1/priority=0/urgency='normal'） */
 export type MaintenanceTaskInput = Pick<MaintenanceTask, 'id' | 'run'> &
-  Partial<Pick<MaintenanceTask, 'value' | 'estimated_cost' | 'priority' | 'urgency'>>;
+  Partial<Pick<MaintenanceTask, 'value' | 'estimated_cost' | 'priority' | 'urgency' | 'subsystem' | 'reason'>>;
 
 export interface MaintenanceDebt {
   task_id: string;
@@ -76,6 +80,66 @@ export interface MaintenanceDebt {
   priority: number;
   estimated_cost: number;
   urgency: string;
+  /**
+   * 债务来源子系统（已知问题「债务是保护性自锁，需要修复后释放」修复）——哪一次失败/跳过/异常、
+   * 涉及哪个子系统；由入队方（kernel/evolve-decision.ts 的入账函数）标注，缺省 undefined = 无主债务
+   * （历史条目 / 未知来源），进人工裁定清单而**不做自动清除**。
+   */
+  subsystem?: string;
+  /** 债务原因（可读，来自入账方；如 '信号 corrections/oracle_fail → 受影响对象需重验证'） */
+  reason?: string;
+  /** 该债务首次累计时间（跨多次累计保持不变——用于「长期无主」判定） */
+  first_seen?: number;
+  /** 该债务最近一次累计时间（失败/跳过/异常的发生时间） */
+  last_failure?: number;
+}
+
+/** 债务来源快照（状态面/释放流程可读——回答「这条债是哪来的、现在能不能放」） */
+export interface DebtSourceView {
+  task_id: string;
+  value: number;
+  subsystem: string | null;
+  reason: string;
+  first_seen: number;
+  last_failure: number;
+  /** 无来源子系统（历史条目/未知来源）→ 只能进人工裁定，不自动释放 */
+  orphan: boolean;
+  /** 无主且已超过人工裁定阈值时长 → 进待人工裁决清单 */
+  manual_pending: boolean;
+  /** 是否为「改动类」演化任务债务（受硬限约束者）——保护语义的直接观测面 */
+  evolution_mutating: boolean;
+}
+
+/** 一次债务释放审计记录（`.evolution/debt-releases.jsonl` 每行一条；可回溯依据/触发者/时间） */
+export interface DebtReleaseRecord {
+  ts: number;
+  task_id: string;
+  /** 释放前该条债务累计值 */
+  value: number;
+  subsystem: string | null;
+  /** 释放依据：子系统自检结果（如检查项名/结论） */
+  evidence: string;
+  /** 触发者（谁能证明修好了：如 maintenance:runRepair / evolve:promotion_check） */
+  released_by: string;
+  reason: string;
+}
+
+/** 无法对应到任何修复动作的条目 → 待人工裁决清单条目（不做自动清除） */
+export interface DebtManualPendingRecord {
+  ts: number;
+  task_id: string;
+  value: number;
+  reason: string;
+  /** 触发复核者（构造该清单的调用方） */
+  reviewed_by: string;
+}
+
+/** 债务释放结果（releaseDebt 返回；released=false 时 reason 说明为何不释放） */
+export interface DebtReleaseResult {
+  released: boolean;
+  task_id: string;
+  value: number;
+  reason: string;
 }
 
 // ---- S2：维护观测（§10.1 estimated_cost 标定数据源——真实执行耗时/结果落盘，供观测积累后标定） ----
@@ -224,6 +288,19 @@ function isHardLimitExempt(taskId: string): boolean {
   return HARD_LIMIT_EXEMPT.has(taskId) || taskId.startsWith('turn-finalize:');
 }
 
+/**
+ * 「改动类」演化任务（真正可能改版本线/改对象者）——受硬限约束的集合，与 HARD_LIMIT_EXEMPT 互补。
+ * 保护语义的观测面：债务锁住的正是这一类；检查/判定类不在其中（不被自身存量债务锁死）。
+ */
+const EVOLUTION_MUTATING = new Set(['candidate_validation', 'repair']);
+
+/**
+ * 无主债务进入人工裁定的时长阈值（已知问题「债务是保护性自锁」第 4 条）：
+ * 超过此时长仍无法对应到任何来源子系统的条目 → 进「待人工裁决」清单，**不做自动清除**。
+ * 一周为观测数据下的初值（一次真实修复周期远短于此）；非「到期清零」，只是「转人工」。
+ */
+export const DEBT_MANUAL_REVIEW_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
 // ---- 维护调度器 ----
 
 export class MaintenanceScheduler {
@@ -252,11 +329,16 @@ export class MaintenanceScheduler {
   private readonly inFlight = new AbortController();
   /** R5：Deferred 事件记录（未实现/不可执行任务；见 DeferredMaintenanceError） */
   private deferredLog: DeferredEvent[] = [];
+  /** 债务释放审计落盘文件（<debtFile 同目录>/debt-releases.jsonl——释放依据可回溯） */
+  private readonly releaseLogFile: string;
+  /** 本次进程内已执行的释放记录（审计内存面；权威历史在 JSONL 文件） */
+  private releaseLog: DebtReleaseRecord[] = [];
 
   constructor(opts: MaintenanceSchedulerOptions = {}) {
     this.debtFile = opts.debtFile ?? join(process.cwd(), 'workspace', '.omb', '.evolution', 'debt.json');
     this.observationsDir =
       opts.observationsDir ?? join(dirname(this.debtFile), 'maintenance-observations');
+    this.releaseLogFile = join(dirname(this.debtFile), 'debt-releases.jsonl');
     this.maintenanceCosts = opts.maintenanceCosts ?? {};
     this.softLimit = opts.softLimit ?? DEFAULT_SOFT_LIMIT;
     this.hardLimit = opts.hardLimit ?? DEFAULT_HARD_LIMIT;
@@ -286,6 +368,8 @@ export class MaintenanceScheduler {
       estimated_cost: input.estimated_cost ?? this.maintenanceCosts[input.id] ?? 1,
       priority: input.priority ?? 0,
       urgency: input.urgency ?? 'normal',
+      subsystem: input.subsystem,
+      reason: input.reason,
       run: input.run,
     };
     const idx = this.queue.findIndex((t) => t.id === task.id);
@@ -374,6 +458,93 @@ export class MaintenanceScheduler {
     return [...this.debt.values()]
       .sort((a, b) => a.task_id.localeCompare(b.task_id))
       .map((d) => ({ ...d }));
+  }
+
+  /**
+   * 债务来源视图（已知问题「债务是保护性自锁」第 1/4 条）——回答「这条债是哪来的、现在能不能放」：
+   * 逐条给出来源子系统、原因、首见/最近失败时间，并标出 orphan（无主）与 manual_pending
+   * （无主且超过 DEBT_MANUAL_REVIEW_AFTER_MS → 待人工裁决，不自动清除）。
+   */
+  debtSourceView(): DebtSourceView[] {
+    this.ensureDebtLoaded();
+    const now = this.nowFn();
+    return [...this.debt.values()]
+      .map((d): DebtSourceView => {
+        const first = d.first_seen ?? d.accumulated_at;
+        const orphan = d.subsystem === undefined || d.subsystem.length === 0;
+        return {
+          task_id: d.task_id,
+          value: d.value,
+          subsystem: orphan ? null : d.subsystem!,
+          reason: d.reason ?? '未记录原因（历史条目）',
+          first_seen: first,
+          last_failure: d.last_failure ?? d.accumulated_at,
+          orphan,
+          manual_pending: orphan && now - first >= DEBT_MANUAL_REVIEW_AFTER_MS,
+          evolution_mutating: EVOLUTION_MUTATING.has(d.task_id),
+        };
+      })
+      .sort((a, b) => a.task_id.localeCompare(b.task_id));
+  }
+
+  /** 待人工裁决清单（无主且长期未对应到修复动作的债务；**不做自动清除**——只列出来给人看） */
+  manualPendingDebt(): DebtSourceView[] {
+    return this.debtSourceView().filter((d) => d.manual_pending);
+  }
+
+  /**
+   * **按条释放**债务（已知问题「债务是保护性自锁」第 2/3 条）：修复 → 确认 → 释放。
+   * 只有带来源子系统的条目可释放（`expectedSubsystem` 必须与该条记录的 subsystem 一致——
+   * 防「修了 A 顺手清掉 B 的债」）；无主债务不在此路径，走 manualPendingDebt 人工裁定。
+   * 释放即落审计（`<debtFile 同目录>/debt-releases.jsonl`）：依据（evidence）/触发者（released_by）/
+   * 时间/释放前累计值，可回溯。
+   * 语义边界：**本方法不做任何周期性或到期式清除**——调用方必须先完成修复并给出自检依据。
+   */
+  async releaseDebt(input: {
+    taskId: string;
+    expectedSubsystem: string;
+    evidence: string;
+    releasedBy: string;
+    reason?: string;
+  }): Promise<DebtReleaseResult> {
+    this.ensureDebtLoaded();
+    const rec = this.debt.get(input.taskId);
+    if (rec === undefined) {
+      return { released: false, task_id: input.taskId, value: 0, reason: 'no_debt' };
+    }
+    if (rec.subsystem !== input.expectedSubsystem) {
+      return {
+        released: false,
+        task_id: input.taskId,
+        value: rec.value,
+        reason: `subsystem_mismatch:${rec.subsystem ?? 'none'}!=${input.expectedSubsystem}`,
+      };
+    }
+    const audit: DebtReleaseRecord = {
+      ts: this.nowFn(),
+      task_id: input.taskId,
+      value: rec.value,
+      subsystem: rec.subsystem ?? null,
+      evidence: input.evidence,
+      released_by: input.releasedBy,
+      reason: input.reason ?? rec.reason ?? '',
+    };
+    this.debt.delete(input.taskId);
+    this.accruedAtEnqueue.delete(input.taskId);
+    await this.persistDebt();
+    await this.appendReleaseAudit(audit);
+    this.resetTimer(); // 债务变化可能改变 tick 频率
+    return { released: true, task_id: input.taskId, value: audit.value, reason: 'released' };
+  }
+
+  /** 释放审计快照（本次进程内已执行的释放；跨进程历史读 debt-releases.jsonl） */
+  debtReleaseAudit(): DebtReleaseRecord[] {
+    return [...this.releaseLog];
+  }
+
+  /** 释放审计文件路径（状态面展示 / 外部读取；与 debt.json 同目录） */
+  get debtReleaseLogFile(): string {
+    return this.releaseLogFile;
   }
 
   /** R5：Deferred 事件记录快照（未实现/不可执行任务的出队但债务保留事件；task_id 排序，确定性） */
@@ -681,7 +852,13 @@ export class MaintenanceScheduler {
         rec.task_id !== 'gc' &&
         !rec.task_id.startsWith('turn-finalize:')
       ) {
-        this.debt.set(rec.task_id, { ...rec });
+        // 历史条目（无来源记录）→ 补齐时间字段（来源留空 = 无主债务，进人工裁定清单，不自动清除）
+        const at = typeof rec.accumulated_at === 'number' ? rec.accumulated_at : this.nowFn();
+        this.debt.set(rec.task_id, {
+          ...rec,
+          first_seen: typeof rec.first_seen === 'number' ? rec.first_seen : at,
+          last_failure: typeof rec.last_failure === 'number' ? rec.last_failure : at,
+        });
       }
     }
   }
@@ -693,17 +870,24 @@ export class MaintenanceScheduler {
     return total;
   }
 
-  /** 债务累计：value 累加 + accumulated_at 更新（priority/estimated_cost/urgency 取最新任务值） */
+  /** 债务累计：value 累加 + accumulated_at 更新（priority/estimated_cost/urgency 取最新任务值）；
+   *  来源记录（已知问题「债务是保护性自锁」第 1 条）：subsystem/reason 来自入队方，first_seen 只在
+   *  首次累计时写入（跨多次累计保持不变，供「长期无主」判定）、last_failure 每次更新。 */
   private accumulateDebt(t: MaintenanceTask): void {
     this.ensureDebtLoaded();
     const prev = this.debt.get(t.id);
+    const now = this.nowFn();
     this.debt.set(t.id, {
       task_id: t.id,
       value: (prev?.value ?? 0) + t.value,
-      accumulated_at: this.nowFn(),
+      accumulated_at: now,
       priority: t.priority,
       estimated_cost: t.estimated_cost,
       urgency: t.urgency,
+      subsystem: t.subsystem ?? prev?.subsystem,
+      reason: t.reason ?? prev?.reason,
+      first_seen: prev?.first_seen ?? now,
+      last_failure: now,
     });
   }
 
@@ -732,6 +916,21 @@ export class MaintenanceScheduler {
     const tmp = `${this.debtFile}.tmp`;
     await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
     await rename(tmp, this.debtFile);
+  }
+
+  /**
+   * 债务释放审计落盘（追加写 <debtDir>/debt-releases.jsonl；幂等建目录）。
+   * 尽力而为：写入失败 → 释放已生效、审计缺失（内存面仍可读 debtReleaseAudit()）——不因审计写失败
+   * 回滚已确认的修复结果（回滚会让系统停在「已修好但债还在」的矛盾态）。
+   */
+  private async appendReleaseAudit(rec: DebtReleaseRecord): Promise<void> {
+    this.releaseLog.push(rec);
+    try {
+      await mkdir(dirname(this.releaseLogFile), { recursive: true });
+      await appendFile(this.releaseLogFile, `${JSON.stringify(rec)}\n`, 'utf8');
+    } catch {
+      // 审计写入失败 → 降级（内存面保留；调用方可从 debtReleaseAudit() 读回）
+    }
   }
 
   /**
