@@ -1,6 +1,7 @@
 // OMB v2 记忆整合批处理（架构 §7.2 空闲期 consolidation / §7.4 八算子规则版 / §7.1 更新局部化）：
 // dedup（Condense：同内容保留最新、其余 Frozen）→ merge（Condense：包含关系文本合并为新记忆、
-// payload 拼接 + relation Link，旧项 Frozen）→ relation（Associate：scope+kind 邻接表建边）→
+// payload 拼接 + relation Link，旧项 Frozen）→ relation（Associate：scope+kind 邻接表建边 +
+// 词法/向量相似度驱动建边——已知问题《关系图为空图》）→
 // decay（Decay=Forget 数值机制：Active 超 DORMANT_AFTER_MS → Dormant、超 FROZEN_AFTER_MS → Frozen）。
 // 全部规则化、无 LLM。幂等（中断重跑收敛一致）：各步仅处理前态记忆（非 Frozen/Retired 候选）；
 // 合并新记忆 event_id 由源 id 确定性派生（ingest ON CONFLICT(event_id) no-op）；relation 建边先
@@ -14,7 +15,9 @@
 import { createHash } from 'node:crypto';
 import { makeMutableId, type Scope } from '../kernel/schemas/base.js';
 import type { Memory, MemoryKind, MemoryLifecycle } from '../kernel/schemas/m.js';
+import { asRelationBackend } from './backend-relation.js';
 import type { SqliteMemoryBackend } from './backend.js';
+import { applySimilarityEdges, asVectorSource, planSimilarityEdges } from './relations.js';
 import { contentHash, normalizeText } from './staging-policy.js';
 
 // ---- 最小 MaintenanceScheduler 接口（M5 升级完整实现；收窄为 consolidate 实际使用的形状） ----
@@ -241,8 +244,10 @@ async function mergeStep(b: SqliteMemoryBackend, state: RunState, work: Memory[]
   }
 }
 
-/** relation（Associate）：同 scope 内按邻接表为（Active/Dormant）记忆建边；已存在边跳过（幂等） */
-async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope): Promise<void> {
+/** relation（Associate）：① kind 邻接规则建边（既有路径，权重 1）；② 词法 + 向量相似度建边
+ *  （已知问题《关系图为空图》——规则依赖生产中不存在的记忆类型，故必须补上内容驱动的建边路径）。
+ *  两者都幂等（已存在边跳过 / 相似边按权重 upsert），重跑不放大。 */
+async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope, now: number): Promise<void> {
   const cands = work.filter((m) => m.lifecycle === 'Active' || m.lifecycle === 'Dormant');
   for (const rule of KIND_LINK_RULES) {
     const froms = cands.filter((m) => m.kind === rule.from);
@@ -257,6 +262,17 @@ async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memor
         noteKind(state.relation, scope, rule.to);
       }
     }
+  }
+  // 相似度驱动（词法 + 向量同口径）：无向量面（纯词法后端）→ 只用词法证据，不假装有向量
+  const rb = asRelationBackend(b);
+  if (rb === null) return; // 后端无属性建边能力（纯 SqliteMemoryBackend）→ 仅规则边
+  const vecSrc = asVectorSource(rb);
+  const vectors = vecSrc === null ? new Map<string, Float32Array>() : vecSrc.vectorsFor(cands.map((m) => m.id));
+  const planned = planSimilarityEdges(cands, vectors);
+  const applied = await applySimilarityEdges(rb, planned, now);
+  if (applied.created > 0) {
+    bumpCount(state.relation, scope, applied.created);
+    noteKind(state.relation, scope, 'Semantic');
   }
 }
 
@@ -373,7 +389,7 @@ async function runConsolidation(b: SqliteMemoryBackend, now: number): Promise<Co
       const work = (await readAll(b, scope)).map((m) => ({ ...m }));
       await dedupStep(b, state, work, scope);
       await mergeStep(b, state, work, scope, now);
-      await relationStep(b, state, work, scope);
+      await relationStep(b, state, work, scope, now);
       await decayStep(b, state, work, scope, now);
     }
   });

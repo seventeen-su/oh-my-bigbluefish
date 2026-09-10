@@ -15,6 +15,7 @@
 import { makeMutableId } from '../kernel/schemas/base.js';
 import type { Memory, MemoryKind, MemoryLifecycle, MemoryProvClass } from '../kernel/schemas/m.js';
 import type { Scope } from '../kernel/schemas/base.js';
+import type { RelationBackend, RelationEdge } from './backend-relation.js';
 import type { RetrievalBackend } from './backend-retrieval.js';
 
 /** 合法的记忆类型/生命周期/作用域/来源类别（写入面白名单——非法值 fail-loud，不静默纠正） */
@@ -359,4 +360,76 @@ export async function mergeMemories(
     return { ok: false, target_id: targetId, merged_text: false, degraded: `合并失败：${(err as Error).message}` };
   }
   return { ok: true, target_id: targetId, merged_text: mergedText !== target.payload, degraded: null };
+}
+
+// ---- 关系边治理面（已知问题《关系图为空图》："补边属性与治理面"）----
+
+/** 关系边列举输入（id 给出 → 该记忆的入边 + 出边；type/limit 可选） */
+export interface MemoryRelationListInput {
+  /** 只看与该记忆相连的边（from_id 或 to_id 命中） */
+  id?: string;
+  /** 边类型过滤（informs/constrains/exemplifies/merged/similar/…） */
+  type?: string;
+  limit?: number;
+}
+
+/** 关系边条目（带方向与属性——"这条边从哪来、多重、谁指向谁"可回查） */
+export interface MemoryRelationEntry {
+  from_id: string;
+  to_id: string;
+  type: string;
+  weight: number;
+  created: number | null;
+  source: string | null;
+  /** 相对查询 id 的方向：out=该记忆指出、in=指向该记忆、both=两端都是该记忆（自环不产生） */
+  direction: 'out' | 'in' | 'both';
+}
+
+/** 边列举（治理面读路径；后端不带边属性能力 → ok:false + 明确说明，不静默返回空） */
+export function listRelations(
+  backend: RelationBackend,
+  input: MemoryRelationListInput = {},
+): { ok: boolean; items: MemoryRelationEntry[]; degraded: string | null } {
+  try {
+    const out: MemoryRelationEntry[] = [];
+    const seen = new Set<string>();
+    const push = (edges: readonly RelationEdge[], direction: 'out' | 'in'): void => {
+      for (const e of edges) {
+        const key = `${e.from_id}\u0000${e.to_id}\u0000${e.type}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        out.push({ ...e, direction });
+      }
+    };
+    if (input.id === undefined) {
+      push(backend.relationEdges({ ...(input.type !== undefined ? { type: input.type } : {}), ...(input.limit !== undefined ? { limit: input.limit } : {}) }), 'out');
+    } else {
+      push(backend.relationEdges({ from: input.id, ...(input.type !== undefined ? { type: input.type } : {}), ...(input.limit !== undefined ? { limit: input.limit } : {}) }), 'out');
+      push(backend.relationEdges({ to: input.id, ...(input.type !== undefined ? { type: input.type } : {}), ...(input.limit !== undefined ? { limit: input.limit } : {}) }), 'in');
+    }
+    out.sort((a, b) => b.weight - a.weight || a.from_id.localeCompare(b.from_id) || a.to_id.localeCompare(b.to_id));
+    return { ok: true, items: out, degraded: null };
+  } catch (err) {
+    return { ok: false, items: [], degraded: `关系列举失败：${(err as Error).message}` };
+  }
+}
+
+/** 单条边删除（治理面：错误/噪声边可被人工清除；边不存在 → ok:false 如实报告） */
+export function unlinkRelation(
+  backend: RelationBackend,
+  input: { from: string; to: string; type: string },
+): { ok: boolean; removed: boolean; degraded: string | null } {
+  if (input.from.length === 0 || input.to.length === 0 || input.type.length === 0) {
+    return { ok: false, removed: false, degraded: '删除边失败：from/to/type 三者均为必填' };
+  }
+  try {
+    const removed = backend.unlink(input.from, input.to, input.type);
+    return removed
+      ? { ok: true, removed: true, degraded: null }
+      : { ok: false, removed: false, degraded: `删除边失败：边不存在（${input.from} → ${input.to} / ${input.type}）` };
+  } catch (err) {
+    return { ok: false, removed: false, degraded: `删除边失败：${(err as Error).message}` };
+  }
 }

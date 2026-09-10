@@ -32,7 +32,7 @@ export const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_memory_environment ON memory(environment);
   CREATE TABLE IF NOT EXISTS memory_relation (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
-    type TEXT NOT NULL, UNIQUE(from_id, to_id, type)
+    type TEXT NOT NULL, weight REAL, created INTEGER, source TEXT, UNIQUE(from_id, to_id, type)
   );
   CREATE INDEX IF NOT EXISTS idx_memory_relation_from ON memory_relation(from_id);
   CREATE INDEX IF NOT EXISTS idx_memory_relation_to ON memory_relation(to_id);
