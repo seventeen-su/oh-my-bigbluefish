@@ -218,9 +218,10 @@ describe('Channel 选择（§7.3 阶段 3：Memory Traversal Operator）', () =>
 describe('Expansion（§7.3 阶段 4：结果不足 limit → top-1 关系扩展 depth 1）', () => {
   it('FTS 仅命中 1 条且 limit 更大 → top-1 的 depth-1 邻接记忆补充结果', async () => {
     const b = openBackend(await tmpDb());
+    // 邻接记忆与查询无 bigram 重叠（中文 bigram 重叠会被词法 OR 召回，掩盖"扩展"这条路径本身）
     const seed = makeMemory({ payload: '种子记忆内容' });
-    const nb1 = makeMemory({ payload: '相关记忆乙' });
-    const nb2 = makeMemory({ payload: '相关记忆丙' });
+    const nb1 = makeMemory({ payload: 'ALPHANOTE' });
+    const nb2 = makeMemory({ payload: 'BETANOTE' });
     await b.ingest(seed);
     await b.ingest(nb1);
     await b.ingest(nb2);
@@ -238,8 +239,8 @@ describe('Expansion（§7.3 阶段 4：结果不足 limit → top-1 关系扩展
   it('扩展受 limit 预算约束（limit 2 → 2 条）', async () => {
     const b = openBackend(await tmpDb());
     const seed = makeMemory({ payload: '种子记忆内容' });
-    const nb1 = makeMemory({ payload: '相关记忆乙' });
-    const nb2 = makeMemory({ payload: '相关记忆丙' });
+    const nb1 = makeMemory({ payload: 'ALPHANOTE' });
+    const nb2 = makeMemory({ payload: 'BETANOTE' });
     await b.ingest(seed);
     await b.ingest(nb1);
     await b.ingest(nb2);

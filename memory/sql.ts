@@ -100,23 +100,30 @@ export function environmentJson(fp: {
   return JSON.stringify(obj);
 }
 
-/** FTS5 MATCH 表达式构造：单 token 一律引号化（规避 AND/OR/NOT/NEAR 保留字语法错误）；
- *  含特殊字符（冒号=列过滤语法、括号/星号/^/- 等操作符）→ 整体短语化 + 内部引号加倍转义；
- *  多 token 无特殊字符 → 原样（FTS5 空格 = 隐式 AND）。 */
+/**
+ * FTS5 MATCH 表达式构造（已知问题《中文命中率低与空结果记录》修复）。
+ *
+ * 修复前的口径：多 token 无特殊字符 → 原样（FTS5 空格 = **隐式 AND**）。在 CJK 双侧分词
+ * （`tokenizeForFts` 把中文段切成 bigram、空格连接，见 cjk-ngram.ts）下这会造成系统性漏检：
+ * 查询「契约边界」→ token「契约 约边 边界」→ 要求三条 bigram **同时**命中，而记忆里可能只有
+ * 「契约」——实测该查询 0 命中（长查询比短查询更容易漏，与"中文查询命中极少"的现象一致）。
+ *
+ * 修复后的口径：**token 之间取 OR（各自整体短语化）**，相关度交给 bm25 排序——
+ *   - 命中更多查询 bigram 的记录 bm25 更优 → 排序仍把最相关的排前（精度不丢）；
+ *   - 只命中部分 bigram 的记录也能召回（召回率提升，正是修复目标）；
+ *   - 每个 token 单独短语化 → 规避 AND/OR/NOT/NEAR 保留字与 `:`/`*`/`-` 等语法字符导致的语法错误。
+ * 空 token 串 → 空表达式（调用方不应以此执行 MATCH）。
+ */
 export function ftsMatchExpr(text: string): string {
   const trimmed = text.trim();
   if (trimmed.length === 0) {
     return '';
   }
-  const hasSpace = /\s/.test(trimmed);
-  const hasSpecial = /["():*^\-{}[\]\\]/.test(trimmed);
-  if (!hasSpace && !hasSpecial) {
-    return `"${trimmed}"`;
+  const tokens = trimmed.split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) {
+    return '';
   }
-  if (hasSpecial) {
-    return `"${trimmed.replace(/"/g, '""')}"`;
-  }
-  return trimmed;
+  return tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
 }
 
 /** 复合游标解析：`<updated>:<id>`（updated 为 epoch ms 纯数字，首个 ':' 为分隔） */

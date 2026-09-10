@@ -153,16 +153,21 @@ describe('FTS5 检索（可用性实测 + bm25 rank）', () => {
     expect(r2.items).toHaveLength(0);
   });
 
-  it('多 token text → FTS 隐式 AND（空格分隔）', async () => {
+  it('多 token text → FTS 取 OR（任一 token 命中即召回），相关度由 bm25 排序', async () => {
     const b = openBackend(await tmpDb());
     await b.ingest(makeMemory({ payload: 'memory backend design' }));
     await b.ingest(makeMemory({ payload: 'sqlite backend' }));
     const both = await b.query({ scope: 'Project', text: 'backend', limit: 10, budget: 100 });
     expect(both.total).toBe(2);
-    const and = await b.query({ scope: 'Project', text: 'memory design', limit: 10, budget: 100 });
-    expect(and.items.map((m) => m.payload)).toEqual(['memory backend design']);
-    const none = await b.query({ scope: 'Project', text: 'memory sqlite', limit: 10, budget: 100 });
-    expect(none.total).toBe(0);
+    // 已知问题《中文命中率低与空结果记录》修复：多 token 由隐式 AND 改为 OR——不再要求全部 token 命中
+    const or = await b.query({ scope: 'Project', text: 'memory design', limit: 10, budget: 100 });
+    expect(or.items.map((m) => m.payload)).toEqual(['memory backend design']); // 两个 token 都在 → bm25 最优
+    const partial = await b.query({ scope: 'Project', text: 'memory sqlite', limit: 10, budget: 100 });
+    expect(partial.total).toBe(2); // 各命中一个 token → 都召回（修复前为 0）
+    // 排序交给 bm25（不做跨文档的人为约定）：稀有 token 权重更高，故命中 'sqlite' 的记录可排前
+    expect(partial.items.map((m) => m.payload)).toEqual(expect.arrayContaining(['memory backend design', 'sqlite backend']));
+    const none = await b.query({ scope: 'Project', text: 'postgres oracle', limit: 10, budget: 100 });
+    expect(none.total).toBe(0); // OR 不制造假阳性
   });
 });
 
@@ -350,7 +355,7 @@ describe('幂等键（event_id，§11.3 恢复 = 幂等重跑）', () => {
 describe('update / delete', () => {
   it('update 改 lifecycle + payload → 查询命中新值；updated 刷新；FTS 索引同步', async () => {
     const b = openBackend(await tmpDb());
-    const m = makeMemory();
+    const m = makeMemory({ payload: 'LEGACYONLY 旧内容' });
     await b.ingest(m);
     const before = (await b.query({ scope: 'Project', limit: 10, budget: 100 })).items[0]!;
     await b.update(m.id, { lifecycle: 'Frozen', payload: '更新后的内容' });
@@ -362,7 +367,9 @@ describe('update / delete', () => {
     expect(frozen.items[0]?.updated).not.toBe(before.updated);
     expect((await b.query({ scope: 'Project', lifecycle: 'Active', limit: 10, budget: 100 })).total).toBe(0);
 
-    const oldFts = await b.query({ scope: 'Project', text: m.payload, limit: 10, budget: 100 });
+    // FTS 索引同步：旧 payload 的独有内容不再命中（中文同时以 bigram 建索引；此处用旧/新 payload
+    // 各自独有的英文 token 断言"旧值已从索引移除"——中文子串重叠会被 OR 语义召回，属预期的召回行为）
+    const oldFts = await b.query({ scope: 'Project', text: 'LEGACYONLY', limit: 10, budget: 100 });
     expect(oldFts.total).toBe(0);
     const newFts = await b.query({ scope: 'Project', text: '更新后的内容', limit: 10, budget: 100 });
     expect(newFts.total).toBe(1);
