@@ -19,7 +19,7 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: >-
+    prefix: >-
       你是运行在「大肥鱼模式 v2」（OMB v2 认知增强系统）下的智能体，基于 {{model}} 模型。
       工作目录：{{cwd}}。系统会注入认知投影（governor 决策/记忆检索/工作状态），
       提供 /mode（initial|stable|latest 三线版本切换）与 /bench（冻结基准）命令；
