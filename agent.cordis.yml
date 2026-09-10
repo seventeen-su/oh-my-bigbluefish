@@ -110,6 +110,8 @@
     - id: tool-result-pruner
       name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
       config:
+        # 工具结果裁剪（静态数值，无"按窗口自适应"表达式）。当前与 standard 预设一致（8192 字符阈值）。
+        # 小窗口模型（本地 100K 上下文）建议改档：thresholdChars: 4096 / headChars: 2048 / tailChars: 512
         thresholdChars: 8192
         headChars: 4096
         tailChars: 1024
