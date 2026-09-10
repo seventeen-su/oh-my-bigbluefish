@@ -27,7 +27,7 @@ import type { Fingerprint, Scope } from '../kernel/schemas/base.js';
 // R6：宿主版本唯一来源注入面（kernel/schemas IR 契约层，runtime(2) → kernel/schemas(2) ✓）
 import { hostVersion, setHostVersion } from '../kernel/schemas/host-version.js';
 import type { ContextProjection } from '../kernel/schemas/a.js';
-import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type Memory, type MemoryKind } from '../kernel/schemas/m.js';
+import { EventSchema, type Event, type Checkpoint, type RuntimeSnapshot, type Memory, type MemoryKind, type MemoryLifecycle, type MemoryProvClass } from '../kernel/schemas/m.js';
 import { StateSchema, type State, type SelfModel, type WorldModel } from '../kernel/schemas/s.js';
 import type { ModelAdapter } from '../kernel/schemas/model-adapter.js';
 import { loadPolicy, loadProcesses, type PolicyBundle, type ProcessDef, type ShadowPolicy } from '../kernel/policy-loader.js';
@@ -95,6 +95,18 @@ import type { Experience } from '../kernel/schemas/c.js';
 // R4（P0）：Experience → Memory 长期学习闭环——staging（准入）+ consolidate（dedup/merge/relation/decay）
 import { StagingManager } from '../memory/staging.js';
 import { consolidate } from '../memory/consolidate.js';
+// 归因观测面（已知问题《效用反馈为空》）：不伪造命中/未命中的引用证据归因
+import { attributeEpisode } from '../memory/attribution.js';
+// 记忆写入面与管理面（已知问题《缺少写入面与记忆管理面》）：写入流水 + 列出/查看/编辑/删除/合并
+import {
+  deleteMemory,
+  editMemory,
+  listMemories,
+  mergeMemories,
+  viewMemory,
+  writeMemory,
+  type MemoryManageEntry,
+} from '../memory/manage.js';
 // P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
 import { appendSignals, readSignals, signalsDirOf } from './evolution-signals.js';
 import { collectGeneralizationSignals } from './signal-collectors.js';
@@ -840,6 +852,12 @@ export class CognitiveRuntime {
   private readonly sessionEpisodes = new Map<string, Set<string>>();
   /** 来源子系统最近一次「执行体成功跑完」时间（债务释放的确认依据；本进程内真实观测，不跨进程推断） */
   private readonly lastSubsystemOk = new Map<string, number>();
+  /** 归因观测面：会话 → 上一轮待归因的 episode 与注入集（下一次 prepareTurn 用新人类消息归因） */
+  private readonly sessionAttribution = new Map<string, { episode_id: string; injected_ids: string[] }>();
+  /** 归因观测面：会话 → 已给出结论（hit/miss）的记忆 id（会话内不重复计数） */
+  private readonly attributedMemories = new Map<string, Set<string>>();
+  /** 归因观测计数（状态面可读：本次进程内累计 已归因 / 证据不足） */
+  private readonly attributionCounts = { attributed: 0, skipped: 0 };
   /** 自迭代开关面（opts.selfIteration；缺省全启用 = 既有行为不变） */
   private readonly selfIteration: {
     enabled: boolean;
@@ -1303,6 +1321,96 @@ export class CognitiveRuntime {
       };
     } catch (err) {
       return { ok: false, items: [], channel_used: 'lexical', channels_used: [], scope_chain: [], degraded: errorDetail(err) };
+    }
+  }
+
+  /**
+   * 记忆管理面数据源（已知问题《缺少写入面与记忆管理面》修复）：写入 / 列出 / 查看 / 编辑 / 删除 / 合并。
+   * 全部薄封装 `memory/manage.ts`（写入流水：去重 → 污染标记 → 落库 → 同步编码）；
+   * 失败 → ok:false + degraded（不抛——工具面降级语义对齐 kern_*）。
+   */
+  async manageMemory(input: {
+    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge';
+    text?: string;
+    id?: string;
+    target_id?: string;
+    kind?: string;
+    scope?: string;
+    lifecycle?: string;
+    prov_class?: string;
+    polluted?: boolean;
+    limit?: number;
+  }): Promise<{
+    ok: boolean;
+    op: string;
+    id: string | null;
+    deduplicated: boolean;
+    encoded: boolean;
+    items: MemoryManageEntry[];
+    total: number;
+    item: MemoryManageEntry | null;
+    degraded: string | null;
+  }> {
+    const empty = {
+      ok: false,
+      op: input.op,
+      id: null,
+      deduplicated: false,
+      encoded: false,
+      items: [] as MemoryManageEntry[],
+      total: 0,
+      item: null as MemoryManageEntry | null,
+      degraded: null as string | null,
+    };
+    try {
+      switch (input.op) {
+        case 'write': {
+          const r = await writeMemory(this.memory, {
+            text: input.text ?? '',
+            ...(input.kind !== undefined ? { kind: input.kind as MemoryKind } : {}),
+            ...(input.scope !== undefined ? { scope: input.scope as Scope } : {}),
+            ...(input.lifecycle !== undefined ? { lifecycle: input.lifecycle as MemoryLifecycle } : {}),
+            ...(input.prov_class !== undefined ? { prov_class: input.prov_class as MemoryProvClass } : {}),
+            ...(input.polluted !== undefined ? { polluted: input.polluted } : {}),
+          });
+          return { ...empty, ok: r.ok, id: r.id, deduplicated: r.deduplicated, encoded: r.encoded, degraded: r.degraded };
+        }
+        case 'list': {
+          const r = await listMemories(this.memory, {
+            ...(input.scope !== undefined ? { scope: input.scope as Scope } : {}),
+            ...(input.kind !== undefined ? { kind: input.kind as MemoryKind } : {}),
+            ...(input.lifecycle !== undefined ? { lifecycle: input.lifecycle as MemoryLifecycle } : {}),
+            ...(input.text !== undefined ? { text: input.text } : {}),
+            ...(input.limit !== undefined ? { limit: input.limit } : {}),
+          });
+          return { ...empty, ok: r.ok, items: r.items, total: r.total, degraded: r.degraded };
+        }
+        case 'view': {
+          const r = await viewMemory(this.memory, input.id ?? '');
+          return { ...empty, ok: r.ok, id: input.id ?? null, item: r.item, degraded: r.degraded };
+        }
+        case 'edit': {
+          const r = await editMemory(this.memory, input.id ?? '', {
+            ...(input.text !== undefined ? { text: input.text } : {}),
+            ...(input.lifecycle !== undefined ? { lifecycle: input.lifecycle as MemoryLifecycle } : {}),
+            ...(input.kind !== undefined ? { kind: input.kind as MemoryKind } : {}),
+            ...(input.scope !== undefined ? { scope: input.scope as Scope } : {}),
+          });
+          return { ...empty, ok: r.ok, id: r.id, encoded: r.encoded, degraded: r.degraded };
+        }
+        case 'delete': {
+          const r = await deleteMemory(this.memory, input.id ?? '');
+          return { ...empty, ok: r.ok, id: input.id ?? null, degraded: r.degraded };
+        }
+        case 'merge': {
+          const r = await mergeMemories(this.memory, input.id ?? '', input.target_id ?? '');
+          return { ...empty, ok: r.ok, id: r.target_id, degraded: r.degraded };
+        }
+        default:
+          return { ...empty, degraded: `未知 op: ${String(input.op)}（合法值：write|list|view|edit|delete|merge）` };
+      }
+    } catch (err) {
+      return { ...empty, degraded: errorDetail(err) };
     }
   }
 
@@ -1904,8 +2012,21 @@ export class CognitiveRuntime {
       { scope: 'Project', text: req.goal, limit: 3, budget: 1000 },
       { episode: sampleEpisode },
     );
+    // 归因观测面（已知问题《效用反馈为空》修复）：用**本轮人类消息**归因上一轮注入的记忆
+    //（引用证据 = 注入内容的独占特征词是否出现在后续人类消息中；证据不足 → 不归因，保持诚实空缺）。
+    // 放在检索之后、记录本轮 episode 之前：此时 req.goal 即本轮人类消息，可作上一轮的引用观测窗口。
+    await this.attributeInjectedMemories(req.session_id, req.goal);
     if (sampleEpisode && retrieved.episode !== undefined) {
       this.recordSessionEpisode(req.session_id, retrieved.episode.id);
+      const injected = (
+        await this.memory.getEpisode(retrieved.episode.id).catch(() => undefined)
+      )?.injected_ids;
+      if (injected !== undefined && injected.length > 0) {
+        this.sessionAttribution.set(req.session_id, {
+          episode_id: retrieved.episode.id,
+          injected_ids: injected,
+        });
+      }
     }
     // R7：Context 候选来源扩展——全来源收集（Memory 检索 + Evidence 会话事件 + Capability 注册表 +
     // Process 调度结果 + Artifact 制品索引（专项 D：queryRelevant 按任务目标相关性排序最近产物
@@ -2164,20 +2285,19 @@ export class CognitiveRuntime {
   }
 
   /**
-   * 专项 D：记忆检索 Episode 归因代理（finalizeTurn 调用；诚实性论证见下）——
-   * 对本会话 prepareTurn 采样记录、outcome 仍为 null 的 episode 做归因检查：
-   *   - 诚实可观测的代理信号（以 signal-collectors/utility 语义为准）：本版本**不存在**——
-   *     hit/miss 需事后使用反馈（reportEpisodeOutcome——§7.4 归因入口），finalizeTurn 收尾点
-   *     没有「本次检索是否被后续使用/注入相关」的观测面，任何在此硬造的 hit/miss 都是伪造归因；
-   *   - 故**保持 null**（已记录待归因），不伪造；「已记录待归因」数据量照常入 L1 信号
-   *     （collectGeneralizationSignals 扩展的 scope_recorded 单独一类——不当作 hit 也不当作 miss）；
-   *   - 归因观测面留待：未来接入事后反馈（如会话内记忆再次被引用/注入相关性判定）后在此填 outcome。
-   * 返回审计计数 { attributed（外部已归因的 episode）, pending（outcome 仍 null 待归因）}。
+   * 专项 D：记忆检索 Episode 归因代理（finalizeTurn 调用）——统计本会话采样 episode 的归因状态。
+   *
+   * 归因本身已接线（已知问题《效用反馈为空》修复）：`attributeInjectedMemories` 在**下一次
+   * prepareTurn** 用新的人类消息作引用观测窗口，对上一轮注入的记忆给出 hit/miss 或"证据不足"，
+   * 结论经 `reportEpisodeOutcome` 回灌六计数器与 utility_score。本方法只做**审计统计**：
+   *   - attributed：outcome 已落（命中/否证，或外部显式归因）；
+   *   - pending：outcome 仍 null（"已记录待归因"——证据不足时保持诚实空缺，绝不硬造结论）；
+   *   - skipped：本进程内因证据不足而未归因的条数（`attributionSummary`）。
    */
-  async attributePendingEpisodes(sessionId: string): Promise<{ attributed: number; pending: number }> {
+  async attributePendingEpisodes(sessionId: string): Promise<{ attributed: number; pending: number; skipped: number }> {
     const ids = this.sessionEpisodes.get(sessionId);
     if (ids === undefined || ids.size === 0) {
-      return { attributed: 0, pending: 0 };
+      return { attributed: 0, pending: 0, skipped: 0 };
     }
     let attributed = 0;
     let pending = 0;
@@ -2187,12 +2307,12 @@ export class CognitiveRuntime {
         continue; // 已清理/未知 → 跳过（不臆造）
       }
       if (ep.outcome !== null) {
-        attributed++; // 外部已归因（reportEpisodeOutcome）→ 计入已归因
+        attributed++; // 已归因（引用观测面或外部 reportEpisodeOutcome）
       } else {
-        pending++; // 无可信代理信号 → 保持 null（已记录待归因）
+        pending++; // 证据不足 → 保持 null（已记录待归因）
       }
     }
-    return { attributed, pending };
+    return { attributed, pending, skipped: this.attributionCounts.skipped };
   }
 
   // ---- 专项 D：采样辅助（确定性 turn token / 高价值提升 / 会话归属登记） ----
@@ -2209,7 +2329,7 @@ export class CognitiveRuntime {
     return highValue ? Math.max(this.episodeSampleRate, EPISODE_SAMPLE_RATE_HIGH_VALUE) : this.episodeSampleRate;
   }
 
-  /** 会话 → 采样记录的 episode id 登记（retrieval_episode 表无 session 列——会话归属只能在记录点捕获） */
+  /** 会话 → 采样记录的 episode id 集（retrieval_episode 表无 session 列——会话归属只能在记录点捕获） */
   private recordSessionEpisode(sessionId: string, episodeId: string): void {
     let set = this.sessionEpisodes.get(sessionId);
     if (set === undefined) {
@@ -2220,8 +2340,41 @@ export class CognitiveRuntime {
   }
 
   /**
-   * S4：制品发现与索引（finalizeTurn 收尾调用；尽力而为——失败降级记录不抛，不阻塞收尾）。
-   * 从最近会话事件（拉取窗口 ARTIFACT_DISCOVERY_FETCH_LIMIT、取窗口尾最近 ARTIFACT_DISCOVERY_EVENT_LIMIT 条）
+   * 归因观测面（已知问题《效用反馈为空》修复）：用后续人类消息归因上一轮注入的记忆。
+   * 证据 = 注入内容的**独占特征词**是否出现在后续人类消息中（见 memory/attribution.ts 的诚实性说明）；
+   * 证据不足（无对照消息 / 特征词不足）→ **不归因**，episode.outcome 保持 null（诚实空缺）。
+   * 会话内每条记忆只归因一次（避免重复计数把 utility 灌水）；episode 级结论经 reportEpisodeOutcome
+   * 回灌六计数器与 utility_score（价值排序 ④ 的闭环）。
+   * 尽力而为：任一步失败 → 记录降级不进结果（不影响 prepareTurn 主链）。
+   */
+  private async attributeInjectedMemories(sessionId: string, humanText: string): Promise<void> {
+    const pending = this.sessionAttribution.get(sessionId);
+    if (pending === undefined) return;
+    this.sessionAttribution.delete(sessionId); // 每轮只归因一次（本轮已消费）
+    if (humanText.trim().length === 0) return; // 无对照文本 → 保持待归因
+    const decided = this.attributedMemories.get(sessionId) ?? new Set<string>();
+    this.attributedMemories.set(sessionId, decided);
+    try {
+      const r = await attributeEpisode(this.memory, pending.episode_id, humanText, { skip_ids: decided });
+      for (const o of r.outcomes) {
+        if (o.verdict !== 'skipped') {
+          decided.add(o.memory_id);
+        }
+      }
+      this.attributionCounts.attributed += r.attributed;
+      this.attributionCounts.skipped += r.skipped;
+    } catch (err) {
+      recordDegradation('memory/attribution', `归因失败（${errorDetail(err)}）——保持待归因，不伪造结论`);
+    }
+  }
+
+  /** 归因观测摘要（状态面可读：本次进程内累计归因条数 / 证据不足条数） */
+  attributionSummary(): { attributed: number; skipped: number } {
+    return { ...this.attributionCounts };
+  }
+
+  /**
+   * S4：制品发现与索引（finalizeTurn 收尾调用；尽力而为——失败降级记录不抛，不阻塞收尾）。   * 从最近会话事件（拉取窗口 ARTIFACT_DISCOVERY_FETCH_LIMIT、取窗口尾最近 ARTIFACT_DISCOVERY_EVENT_LIMIT 条）
    * 提取 tool/result 事件 → discoverArtifactsFromEvents（root=仓库根 HERE：路径解析到 root 下且文件存在 →
    * 读内容 sha256 → manifest restorable:true；幽灵路径跳过；root 下的环境指纹 = 采集器注入面
    * （缺省 collectEnvironmentFingerprint）→ 逐条 index.register（同 id 覆写）。

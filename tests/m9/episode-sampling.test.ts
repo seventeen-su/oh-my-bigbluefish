@@ -235,7 +235,7 @@ describe('④ kern_memory 恒记录（显式记忆工具不受采样率限制）
 });
 
 describe('⑤ finalizeTurn 归因代理（诚实性——不伪造 hit/miss）', () => {
-  it('本会话已记录 null-outcome episode → 保持 null + pending 计数（不硬造归因）', async () => {
+  it('本会话已记录 null-outcome episode → 保持 null + pending 计数（证据不足则不归因）', async () => {
     runtime = track(createCognitiveRuntime({ root, episodeSampleRate: 1 }));
     await runtime.prepareTurn(req('sess-attr') as never);
     const res = await runtime.finalizeTurn({
@@ -243,8 +243,9 @@ describe('⑤ finalizeTurn 归因代理（诚实性——不伪造 hit/miss）',
       decision,
       working_state: req('sess-attr').working_state as never,
     });
-    // 归因代理：finalizeTurn 无检索有用性观测面 → 无可信 hit/miss 信号 → 保持 null（待归因），不伪造
-    expect(res.episode_attribution).toEqual({ attributed: 0, pending: 1 });
+    // 归因代理：finalizeTurn 只做审计统计；归因本身在**下一次 prepareTurn** 用新人类消息作引用窗口
+    //（证据不足 → 保持 null「待归因」，绝不硬造结论）。skipped 为证据不足计数（进程内累计）。
+    expect(res.episode_attribution).toMatchObject({ attributed: 0, pending: 1 });
     const episodes = await runtime.memory.listEpisodes();
     expect(episodes).toHaveLength(1);
     expect(episodes[0]!.outcome).toBeNull(); // outcome 仍 null（未硬造）
@@ -263,7 +264,7 @@ describe('⑤ finalizeTurn 归因代理（诚实性——不伪造 hit/miss）',
       decision,
       working_state: req('sess-attr2').working_state as never,
     });
-    expect(res.episode_attribution).toEqual({ attributed: 1, pending: 1 });
+    expect(res.episode_attribution).toMatchObject({ attributed: 1, pending: 1 });
   });
 
   it('无采样记录的会话 → 归因代理空结果（attributed 0 / pending 0）', async () => {
@@ -273,7 +274,7 @@ describe('⑤ finalizeTurn 归因代理（诚实性——不伪造 hit/miss）',
       decision,
       working_state: req('sess-none').working_state as never,
     });
-    expect(res.episode_attribution).toEqual({ attributed: 0, pending: 0 });
+    expect(res.episode_attribution).toMatchObject({ attributed: 0, pending: 0 });
   });
 });
 

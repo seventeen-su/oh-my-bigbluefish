@@ -283,6 +283,29 @@ export interface KernRuntimeLike {
   }): Promise<MemoryRetrievalToolResultLike>;
   /** W1：kern_profile 数据源——画像写入（Profile 记忆 Global 作用域；upsert 语义——存在更新/缺省合并） */
   upsertProfile?(input: { profile: string; replace?: boolean }): Promise<ProfileUpsertToolResultLike>;
+  /** 记忆写入面与管理面数据源（kern_memory 的 write/list/view/edit/delete/merge 走本方法；缺失 → 降级） */
+  manageMemory?(input: {
+    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge';
+    text?: string;
+    id?: string;
+    target_id?: string;
+    kind?: string;
+    scope?: string;
+    lifecycle?: string;
+    prov_class?: string;
+    polluted?: boolean;
+    limit?: number;
+  }): Promise<{
+    ok: boolean;
+    op: string;
+    id: string | null;
+    deduplicated: boolean;
+    encoded: boolean;
+    items: Array<{ id: string; kind: string; scope: string; lifecycle: string; prov_class: string; updated: string; payload: string }>;
+    total: number;
+    item: { id: string; kind: string; scope: string; lifecycle: string; prov_class: string; updated: string; payload: string } | null;
+    degraded: string | null;
+  }>;
 }
 
 /** 从 DSH execute exec 上下文读取会话 id（结构最小面；缺失 → undefined） */
@@ -512,22 +535,49 @@ export function kernSwitchTool(runtime: KernRuntimeLike): ToolDefinitionLike {
 }
 
 /**
- * S5：kern_memory 工具定义——记忆检索查询（复用运行时 retrieve 路由：scope 覆盖链/kind 过滤/通道选择/
- * 价值排序；只读——不记录 Retrieval Episode）。参数 query/scope/kind/limit/relation；
- * 返回条目摘要（id/kind/scope/value/snippet）。execute 返回 {ok, text} 风格。
+ * S5：kern_memory 工具定义——记忆面统一入口（**扩展而非新增工具**，已知问题《缺少写入面与记忆管理面》
+ * 与工具面精简纪律）：
+ *   - `op` 缺省或 `retrieve`：检索查询（复用运行时 retrieve 路由：scope 覆盖链/kind 过滤/通道选择/
+ *     价值排序；只读——不记录 Retrieval Episode），参数 query/scope/kind/limit/relation；
+ *   - `op=write`：写入一条记忆（写入流水：去重 → 污染标记 → 落库 → 同步编码），参数 text/kind/scope/
+ *     lifecycle/prov_class/polluted；
+ *   - `op=list | view | edit | delete | merge`：管理面（列出 / 查看 / 编辑 / 删除 / 合并），
+ *     以 id 定位（merge 另需 target_id）。
+ * execute 返回 {ok, text} 风格；参数非法 → 明确文本（不抛）。
  */
 export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
   return {
     name: 'kern_memory',
-    description: '记忆检索查询（retrieve 路由：scope 覆盖链/kind 过滤/通道选择/价值排序）——返回条目摘要（id/kind/scope/value/snippet）',
+    description:
+      '记忆面统一入口。缺省 op=retrieve：检索记忆（scope 覆盖链/kind 过滤/词法与向量双通道融合/价值排序），' +
+      '返回条目摘要。op=write 写入一条记忆；op=list/view/edit/delete/merge 为管理面（以 id 定位）。',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '检索文本（FTS 命中）' },
-        scope: { type: 'string', enum: ['Session', 'Project', 'Global'], description: '检索范围（缺省 Project；覆盖链 Session→Project→Global）' },
-        kind: { type: 'string', enum: ['Semantic', 'Episodic', 'Procedural', 'Profile', 'Constraint', 'Decision'], description: '记忆类型过滤（可选）' },
-        limit: { type: 'integer', minimum: 0, description: '返回条数上限（缺省 5）' },
-        relation: { type: 'string', description: '关系类型遍历（可选；relation 通道）' },
+        op: {
+          type: 'string',
+          enum: ['retrieve', 'write', 'list', 'view', 'edit', 'delete', 'merge'],
+          description: '操作（缺省 retrieve；write 写入；list/view/edit/delete/merge 管理面）',
+        },
+        query: { type: 'string', description: 'op=retrieve：检索文本（词法 + 向量双通道）' },
+        text: { type: 'string', description: 'op=write/edit：记忆正文' },
+        id: { type: 'string', description: 'op=view/edit/delete 的目标 id；op=merge 为 source id' },
+        target_id: { type: 'string', description: 'op=merge：保留者 id（source 内容并入其中后删除 source）' },
+        scope: { type: 'string', enum: ['Session', 'Project', 'Global'], description: '作用域（缺省 Project）' },
+        kind: {
+          type: 'string',
+          enum: ['Semantic', 'Episodic', 'Procedural', 'Profile', 'Constraint', 'Decision'],
+          description: '记忆类型（retrieve 为过滤；write/edit 为写入值）',
+        },
+        lifecycle: {
+          type: 'string',
+          enum: ['Active', 'Dormant', 'Suspicious', 'Frozen', 'Retired'],
+          description: 'op=write/list/edit：生命周期（缺省 Active；write 时 polluted=true 强制 Suspicious）',
+        },
+        prov_class: { type: 'string', description: 'op=write：来源类别（缺省 User-declared）' },
+        polluted: { type: 'boolean', description: 'op=write：污染标记（true → Suspicious，检索侧扣权）' },
+        limit: { type: 'integer', minimum: 0, description: '返回条数上限（retrieve 缺省 5；list 缺省 20）' },
+        relation: { type: 'string', description: 'op=retrieve：关系类型遍历（可选）' },
       },
     },
     output: {
@@ -536,12 +586,10 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
       presentationMeta: (_args, value) => value as Record<string, unknown>,
     },
     execute: async (args) => {
-      if (typeof runtime.retrieveMemory !== 'function') {
-        return { ok: false, text: '认知运行时未提供 retrieveMemory()（kern_memory 数据源缺失）' };
-      }
       const a = (args ?? {}) as Record<string, unknown>;
-      // 参数守卫（工具面）：类型非法 → 明确文本；枚举取值由运行时 MemoryQuerySchema fail-loud 兜底
-      for (const key of ['query', 'scope', 'kind', 'relation'] as const) {
+      const op = typeof a.op === 'string' ? a.op : 'retrieve';
+      // 参数类型守卫（工具面）：非字符串/非数字 → 明确文本（不抛）
+      for (const key of ['op', 'query', 'text', 'id', 'target_id', 'scope', 'kind', 'lifecycle', 'prov_class', 'relation'] as const) {
         if (a[key] !== undefined && typeof a[key] !== 'string') {
           return { ok: false, text: `kern_memory 参数非法：${key} 必须为字符串` };
         }
@@ -549,18 +597,70 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
       if (a.limit !== undefined && typeof a.limit !== 'number') {
         return { ok: false, text: 'kern_memory 参数非法：limit 必须为数字' };
       }
-      const query = typeof a.query === 'string' && a.query.length > 0 ? a.query : undefined;
+      const str = (k: string): string | undefined => (typeof a[k] === 'string' && (a[k] as string).length > 0 ? (a[k] as string) : undefined);
+
+      // ---- 管理面（write/list/view/edit/delete/merge）----
+      if (op !== 'retrieve') {
+        if (typeof runtime.manageMemory !== 'function') {
+          return { ok: false, text: '认知运行时未提供 manageMemory()（kern_memory 管理面数据源缺失）' };
+        }
+        const r = await runtime.manageMemory({
+          op: op as 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge',
+          ...(str('text') !== undefined ? { text: str('text')! } : {}),
+          ...(str('id') !== undefined ? { id: str('id')! } : {}),
+          ...(str('target_id') !== undefined ? { target_id: str('target_id')! } : {}),
+          ...(str('kind') !== undefined ? { kind: str('kind')! } : {}),
+          ...(str('scope') !== undefined ? { scope: str('scope')! } : {}),
+          ...(str('lifecycle') !== undefined ? { lifecycle: str('lifecycle')! } : {}),
+          ...(str('prov_class') !== undefined ? { prov_class: str('prov_class')! } : {}),
+          ...(typeof a.polluted === 'boolean' ? { polluted: a.polluted } : {}),
+          ...(typeof a.limit === 'number' ? { limit: a.limit } : {}),
+        });
+        const lines: string[] = [];
+        if (!r.ok) {
+          lines.push(`记忆管理（${r.op}）失败：${r.degraded ?? '未知原因'}`);
+        } else if (r.op === 'write') {
+          lines.push(
+            r.deduplicated
+              ? `记忆未新增（同 scope+kind 内容已存在）→ 既有 id ${r.id ?? '（未知）'}`
+              : `已写入记忆 ${r.id ?? ''}${r.encoded ? '（已同步编码）' : '（待空闲期编码）'}`,
+          );
+        } else if (r.op === 'list') {
+          lines.push(`记忆列表（${r.items.length}/${r.total}）：`);
+          lines.push(
+            ...r.items.map((it) => `[${it.kind}/${it.scope}/${it.lifecycle}] ${it.id.slice(0, 12)}… ${it.payload}`),
+          );
+        } else if (r.op === 'view') {
+          lines.push(r.item === null ? '记忆不存在' : `[${r.item.kind}/${r.item.scope}/${r.item.lifecycle}] ${r.item.id}`);
+          if (r.item !== null) lines.push(r.item.payload);
+        } else if (r.op === 'edit') {
+          lines.push(`已编辑记忆 ${r.id ?? ''}${r.encoded ? '（payload 已重新编码）' : ''}`);
+        } else if (r.op === 'delete') {
+          lines.push(`已删除记忆 ${r.id ?? ''}`);
+        } else {
+          lines.push(`已合并：source 并入 ${r.id ?? ''}（source 已删除）`);
+        }
+        if (r.degraded !== null && r.ok) lines.push(`（降级说明：${r.degraded}）`);
+        return { ok: r.ok, text: lines.join('\n') };
+      }
+
+      // ---- 检索面（既有行为不变）----
+      if (typeof runtime.retrieveMemory !== 'function') {
+        return { ok: false, text: '认知运行时未提供 retrieveMemory()（kern_memory 数据源缺失）' };
+      }
+      const query = str('query');
       const r = await runtime.retrieveMemory({
         text: query,
-        scope: typeof a.scope === 'string' ? a.scope : undefined,
-        kind: typeof a.kind === 'string' ? a.kind : undefined,
+        scope: str('scope'),
+        kind: str('kind'),
         limit: typeof a.limit === 'number' ? a.limit : undefined,
-        relation: typeof a.relation === 'string' && a.relation.length > 0 ? a.relation : undefined,
+        relation: str('relation'),
       });
       if (!r.ok) {
         return { ok: false, text: `记忆检索失败：${r.degraded ?? '未知原因'}` };
       }
-      const header = `记忆检索（channel=${r.channel_used}，scope_chain=${r.scope_chain.join('→') || '（空）'}）：${r.items.length} 条`;
+      const channels = r.channels_used !== undefined && r.channels_used.length > 0 ? r.channels_used.join('+') : r.channel_used;
+      const header = `记忆检索（channel=${channels}，scope_chain=${r.scope_chain.join('→') || '（空）'}）：${r.items.length} 条`;
       const body =
         r.items.length === 0
           ? ['无匹配记忆']

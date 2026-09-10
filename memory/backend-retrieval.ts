@@ -164,9 +164,15 @@ export class RetrievalBackend extends VectorBackend {
       .get(id) as StatsRow | undefined;
   }
 
+  /** inboundRelationIds：入边查询（管理面合并用——relation 表 to_id 索引；按 id 升序确定性） */
+  inboundRelationIds(toId: string): { from_id: string; type: string }[] {
+    return this.db
+      .prepare('SELECT from_id, type FROM memory_relation WHERE to_id = ? ORDER BY id')
+      .all(toId) as unknown as { from_id: string; type: string }[];
+  }
+
   /** listEpisodes：全量 retrieval_episode 行（T8.21 generalization 采集源——跨 scope episode 归因统计；
-   *  数组列 JSON 解析；created ASC, id ASC 确定性排序） */
-  async listEpisodes(): Promise<EpisodeRow[]> {
+   *  数组列 JSON 解析；created ASC, id ASC 确定性排序） */  async listEpisodes(): Promise<EpisodeRow[]> {
     const rows = this.db
       .prepare(
         'SELECT id, query, scope, candidate_ids, ranked_ids, injected_ids, outcome, created FROM retrieval_episode ORDER BY created ASC, id ASC',
