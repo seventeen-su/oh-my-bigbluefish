@@ -12,7 +12,7 @@
 // layer 2（memory/）：仅 node: 内置 + 同层模块 + kernel/schemas/。
 import type { Memory } from '../kernel/schemas/m.js';
 import { blobToVector, cosineSimilarity, vectorToBlob, type Embedder } from './embeddings.js';
-import { SqliteMemoryBackend } from './backend.js';
+import { RelationBackend } from './backend-relation.js';
 
 /** 单条向量检索命中（score = 余弦相似度，越大越相近） */
 export interface VectorHit {
@@ -35,7 +35,10 @@ export interface VectorStats {
 /** 批量编码上限（单次空闲期调用最多处理条数——防一次维护占用过久；§17 可标定） */
 export const VECTOR_ENCODE_BATCH_LIMIT = 200;
 
-export class VectorBackend extends SqliteMemoryBackend {
+/** 向量读取批大小（单条 SQL 的 IN 占位上限；关系建图按批取向量） */
+export const VECTOR_READ_CHUNK = 100;
+
+export class VectorBackend extends RelationBackend {
   /** 嵌入器（唯一替换点；缺省 CPU 哈希词袋——见 embeddings.ts 的选型说明） */
   private readonly embedder: Embedder;
 
@@ -143,6 +146,26 @@ export class VectorBackend extends SqliteMemoryBackend {
   /** 待编码条数（同步只读——入队判断用；状态面亦可读） */
   pendingEncodeCount(): number {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM memory WHERE vector IS NULL').get() as { n: number }).n;
+  }
+
+  /**
+   * 批量读取已存向量（关系建图的向量证据来源；未编码/未知 id 不在结果里——诚实缺失，
+   * 建图侧据此退回纯词法证据，不假装有向量）。分块 IN 查询，避免单条 SQL 占位过多。
+   */
+  vectorsFor(ids: readonly string[]): Map<string, Float32Array> {
+    const out = new Map<string, Float32Array>();
+    const uniq = [...new Set(ids)];
+    for (let i = 0; i < uniq.length; i += VECTOR_READ_CHUNK) {
+      const chunk = uniq.slice(i, i + VECTOR_READ_CHUNK);
+      const rows = this.db
+        .prepare(`SELECT id, vector FROM memory WHERE id IN (${chunk.map(() => '?').join(', ')})`)
+        .all(...chunk) as unknown as { id: string; vector: unknown }[];
+      for (const r of rows) {
+        const v = blobToVector(r.vector);
+        if (v !== null) out.set(r.id, v);
+      }
+    }
+    return out;
   }
 
   /** 编码缺口统计（状态面：向量通道是否可用、还差多少条没编码） */

@@ -115,6 +115,21 @@ export interface KernStatusSummary {
    */
   memory_vector: { encoded: number; pending: number; dim: number | null; embedder: string } | null;
   /**
+   * 关系图状态（已知问题《关系图为空图》观测面）：边总数 / 类型分布 / 来源分布 / 权重统计 /
+   * 记忆总数 / 是否还需要建图。edges=0 且 memories≥2 → 图仍是空的（`needs_build` 会为 true，
+   * 空闲期 memory_relation_build 任务负责补边）；`bySource` 里的 unknown = 属性迁移前的历史行。
+   */
+  relations?: {
+    edges: number;
+    byType: Record<string, number>;
+    bySource: Record<string, number>;
+    weighted: number;
+    maxWeight: number | null;
+    meanWeight: number | null;
+    memories: number;
+    needs_build: boolean;
+  } | null;
+  /**
    * 外核安全状态段（已知问题《内核加载失败不得阻塞宿主》/《外核自身也要非阻塞》）：当前是否安全状态、
    * 原因、发生时间、平台与平台能力降级说明、内核是否已加载。内核未加载时本段仍可读
    *（状态面尽力保留——"能看到为什么没加载"）。
@@ -298,9 +313,10 @@ export interface KernRuntimeLike {
   }): Promise<MemoryRetrievalToolResultLike>;
   /** W1：kern_profile 数据源——画像写入（Profile 记忆 Global 作用域；upsert 语义——存在更新/缺省合并） */
   upsertProfile?(input: { profile: string; replace?: boolean }): Promise<ProfileUpsertToolResultLike>;
-  /** 记忆写入面与管理面数据源（kern_memory 的 write/list/view/edit/delete/merge 走本方法；缺失 → 降级） */
+  /** 记忆写入面与管理面数据源（kern_memory 的 write/list/view/edit/delete/merge/relations/unlink
+   *  走本方法；缺失 → 降级） */
   manageMemory?(input: {
-    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge';
+    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge' | 'relations' | 'unlink';
     text?: string;
     id?: string;
     target_id?: string;
@@ -310,6 +326,7 @@ export interface KernRuntimeLike {
     prov_class?: string;
     polluted?: boolean;
     limit?: number;
+    type?: string;
   }): Promise<{
     ok: boolean;
     op: string;
@@ -319,6 +336,15 @@ export interface KernRuntimeLike {
     items: Array<{ id: string; kind: string; scope: string; lifecycle: string; prov_class: string; updated: string; payload: string }>;
     total: number;
     item: { id: string; kind: string; scope: string; lifecycle: string; prov_class: string; updated: string; payload: string } | null;
+    relations: Array<{
+      from_id: string;
+      to_id: string;
+      type: string;
+      weight: number;
+      created: number | null;
+      source: string | null;
+      direction: string;
+    }>;
     degraded: string | null;
   }>;
 }
@@ -565,19 +591,20 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
     name: 'kern_memory',
     description:
       '记忆面统一入口。缺省 op=retrieve：检索记忆（scope 覆盖链/kind 过滤/词法与向量双通道融合/价值排序），' +
-      '返回条目摘要。op=write 写入一条记忆；op=list/view/edit/delete/merge 为管理面（以 id 定位）。',
+      '返回条目摘要。op=write 写入一条记忆；op=list/view/edit/delete/merge 为管理面（以 id 定位）；' +
+      'op=relations 列出关系边（含权重/来源/方向），op=unlink 删除一条边（id + target_id + type）。',
     parameters: {
       type: 'object',
       properties: {
         op: {
           type: 'string',
-          enum: ['retrieve', 'write', 'list', 'view', 'edit', 'delete', 'merge'],
-          description: '操作（缺省 retrieve；write 写入；list/view/edit/delete/merge 管理面）',
+          enum: ['retrieve', 'write', 'list', 'view', 'edit', 'delete', 'merge', 'relations', 'unlink'],
+          description: '操作（缺省 retrieve；write 写入；list/view/edit/delete/merge 管理面；relations/unlink 关系边治理）',
         },
         query: { type: 'string', description: 'op=retrieve：检索文本（词法 + 向量双通道）' },
         text: { type: 'string', description: 'op=write/edit：记忆正文' },
-        id: { type: 'string', description: 'op=view/edit/delete 的目标 id；op=merge 为 source id' },
-        target_id: { type: 'string', description: 'op=merge：保留者 id（source 内容并入其中后删除 source）' },
+        id: { type: 'string', description: 'op=view/edit/delete 的目标 id；op=merge 为 source id；op=relations 为所查记忆；op=unlink 为 from' },
+        target_id: { type: 'string', description: 'op=merge：保留者 id（source 内容并入其中后删除 source）；op=unlink：to' },
         scope: { type: 'string', enum: ['Session', 'Project', 'Global'], description: '作用域（缺省 Project）' },
         kind: {
           type: 'string',
@@ -593,6 +620,7 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
         polluted: { type: 'boolean', description: 'op=write：污染标记（true → Suspicious，检索侧扣权）' },
         limit: { type: 'integer', minimum: 0, description: '返回条数上限（retrieve 缺省 5；list 缺省 20）' },
         relation: { type: 'string', description: 'op=retrieve：关系类型遍历（可选）' },
+        type: { type: 'string', description: 'op=relations/unlink：边类型过滤 / 待删边类型' },
       },
     },
     output: {
@@ -620,7 +648,7 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
           return { ok: false, text: '认知运行时未提供 manageMemory()（kern_memory 管理面数据源缺失）' };
         }
         const r = await runtime.manageMemory({
-          op: op as 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge',
+          op: op as 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge' | 'relations' | 'unlink',
           ...(str('text') !== undefined ? { text: str('text')! } : {}),
           ...(str('id') !== undefined ? { id: str('id')! } : {}),
           ...(str('target_id') !== undefined ? { target_id: str('target_id')! } : {}),
@@ -628,6 +656,7 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
           ...(str('scope') !== undefined ? { scope: str('scope')! } : {}),
           ...(str('lifecycle') !== undefined ? { lifecycle: str('lifecycle')! } : {}),
           ...(str('prov_class') !== undefined ? { prov_class: str('prov_class')! } : {}),
+          ...(str('type') !== undefined ? { type: str('type')! } : {}),
           ...(typeof a.polluted === 'boolean' ? { polluted: a.polluted } : {}),
           ...(typeof a.limit === 'number' ? { limit: a.limit } : {}),
         });
@@ -652,6 +681,17 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
           lines.push(`已编辑记忆 ${r.id ?? ''}${r.encoded ? '（payload 已重新编码）' : ''}`);
         } else if (r.op === 'delete') {
           lines.push(`已删除记忆 ${r.id ?? ''}`);
+        } else if (r.op === 'relations') {
+          lines.push(`关系边（${r.relations.length} 条${r.id === null ? '' : `，与 ${r.id.slice(0, 12)}… 相连`}）：`);
+          lines.push(
+            ...r.relations.map(
+              (e) =>
+                `[${e.type}/${e.direction}] ${e.from_id.slice(0, 12)}… → ${e.to_id.slice(0, 12)}… 权重 ${e.weight}` +
+                `（来源 ${e.source ?? '未标注'}${e.created === null ? '' : `，建于 ${new Date(e.created).toISOString()}`}）`,
+            ),
+          );
+        } else if (r.op === 'unlink') {
+          lines.push(`已删除关系边（from ${r.id ?? ''}）`);
         } else {
           lines.push(`已合并：source 并入 ${r.id ?? ''}（source 已删除）`);
         }

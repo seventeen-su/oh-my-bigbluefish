@@ -85,6 +85,8 @@ import { latestForSession as latestCheckpointForSession, prune as pruneCheckpoin
 import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport, type DebtSourceView, type DebtReleaseRecord, type DebtReleaseResult } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
+import type { RelationStats } from '../memory/backend-relation.js';
+import { applySimilarityEdges, planSimilarityEdges, relationNeedsBuild, RELATION_BUILD_BATCH, type RelationBuildOutcome } from '../memory/relations.js';
 import { retrieve, type RankedMemory, type RetrieveQuery } from '../memory/retrieve.js';
 import { assessApplicability, type WorkingState } from './generator-ops.js';
 import { decide, type GovernorDecision, type GovernorInput, type ProcessDecisionInfo } from './governor.js';
@@ -98,14 +100,18 @@ import { consolidate } from '../memory/consolidate.js';
 // 归因观测面（已知问题《效用反馈为空》）：不伪造命中/未命中的引用证据归因
 import { attributeEpisode } from '../memory/attribution.js';
 // 记忆写入面与管理面（已知问题《缺少写入面与记忆管理面》）：写入流水 + 列出/查看/编辑/删除/合并
+// + 关系边治理面（已知问题《关系图为空图》：列举 / 单条删除）
 import {
   deleteMemory,
   editMemory,
   listMemories,
+  listRelations,
   mergeMemories,
+  unlinkRelation,
   viewMemory,
   writeMemory,
   type MemoryManageEntry,
+  type MemoryRelationEntry,
 } from '../memory/manage.js';
 // P1c：演化信号落盘 + 判定/债务纯函数 + L1 采集器输出面（层 DAG：runtime(2) → kernel(2)/runtime(2) ✓）
 import { appendSignals, readSignals, signalsDirOf } from './evolution-signals.js';
@@ -1143,6 +1149,7 @@ export class CognitiveRuntime {
       evolution,
       safe_state: this.safeStateViewFn === undefined ? undefined : this.safeStateViewFn(),
       memory_vector: this.memory.vectorStats(),
+      relations: this.relationStats(),
       maintenance_observations,
       observations_degraded,
       recent_signals,
@@ -1364,7 +1371,7 @@ export class CognitiveRuntime {
    * 失败 → ok:false + degraded（不抛——工具面降级语义对齐 kern_*）。
    */
   async manageMemory(input: {
-    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge';
+    op: 'write' | 'list' | 'view' | 'edit' | 'delete' | 'merge' | 'relations' | 'unlink';
     text?: string;
     id?: string;
     target_id?: string;
@@ -1374,6 +1381,7 @@ export class CognitiveRuntime {
     prov_class?: string;
     polluted?: boolean;
     limit?: number;
+    type?: string;
   }): Promise<{
     ok: boolean;
     op: string;
@@ -1383,6 +1391,7 @@ export class CognitiveRuntime {
     items: MemoryManageEntry[];
     total: number;
     item: MemoryManageEntry | null;
+    relations: MemoryRelationEntry[];
     degraded: string | null;
   }> {
     const empty = {
@@ -1394,6 +1403,7 @@ export class CognitiveRuntime {
       items: [] as MemoryManageEntry[],
       total: 0,
       item: null as MemoryManageEntry | null,
+      relations: [] as MemoryRelationEntry[],
       degraded: null as string | null,
     };
     try {
@@ -1440,8 +1450,22 @@ export class CognitiveRuntime {
           const r = await mergeMemories(this.memory, input.id ?? '', input.target_id ?? '');
           return { ...empty, ok: r.ok, id: r.target_id, degraded: r.degraded };
         }
+        case 'relations': {
+          // 关系边治理面（已知问题《关系图为空图》）：列出与某条记忆相连的边（含权重/来源/方向）
+          const r = listRelations(this.memory, {
+            ...(input.id !== undefined ? { id: input.id } : {}),
+            ...(input.type !== undefined ? { type: input.type } : {}),
+            ...(input.limit !== undefined ? { limit: input.limit } : {}),
+          });
+          return { ...empty, ok: r.ok, id: input.id ?? null, relations: r.items, total: r.items.length, degraded: r.degraded };
+        }
+        case 'unlink': {
+          // 单条边删除（from=input.id、to=input.target_id、type=input.type）
+          const r = unlinkRelation(this.memory, { from: input.id ?? '', to: input.target_id ?? '', type: input.type ?? '' });
+          return { ...empty, ok: r.ok, id: input.id ?? null, degraded: r.degraded };
+        }
         default:
-          return { ...empty, degraded: `未知 op: ${String(input.op)}（合法值：write|list|view|edit|delete|merge）` };
+          return { ...empty, degraded: `未知 op: ${String(input.op)}（合法值：write|list|view|edit|delete|merge|relations|unlink）` };
       }
     } catch (err) {
       return { ...empty, degraded: errorDetail(err) };
@@ -2227,6 +2251,23 @@ export class CognitiveRuntime {
           reason: '存在未编码记忆——向量通道待补齐（空闲期批量编码）',
           run: async (signal) => {
             await this.runVectorEncode(signal);
+          },
+        });
+      }
+      // 关系建图（已知问题《关系图为空图》：规则边依赖生产中不存在的记忆类型 → 关系表恒 0 行）。
+      // 图稀疏（edges < memories/2）才入队 memory_relation_build——纯 CPU、无模型调用、可中断；
+      // 图稠密后不再入队（不空转）；失败 → 任务失败并留痕（不吞错）。
+      if (relationNeedsBuild(this.memory.edgeCount(), this.memory.memoryCount())) {
+        await this.maintenance.enqueue({
+          id: 'memory_relation_build',
+          value: 1,
+          estimated_cost: 2, // 与检查类同档（纯 CPU 单批建图；§17 可标定）
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'memory-relation',
+          reason: '关系图稀疏——词法/向量相似边待建立（空闲期批量建图）',
+          run: async (signal) => {
+            await this.runRelationBuild(signal);
           },
         });
       }
@@ -3072,6 +3113,11 @@ export class CognitiveRuntime {
         return async (signal) => {
           await this.runVectorEncode(signal);
         };
+      case 'memory_relation_build':
+        // 关系建图（已知问题《关系图为空图》：词法 + 向量相似边；纯 CPU、无模型调用、幂等）
+        return async (signal) => {
+          await this.runRelationBuild(signal);
+        };
       case 'checkpoint_prune':
         // 检查点轮转与清理（已知问题《检查点无轮转且自 09-09 起停写》：保留上限 + 会话维度清理）
         return async () => {
@@ -3349,6 +3395,35 @@ export class CognitiveRuntime {
     const r = await this.memory.encodePendingBatch();
     this.markSubsystemOk('memory-vector');
     return r;
+  }
+
+  /**
+   * 关系建图执行体（维护任务 memory_relation_build；已知问题《关系图为空图》）。
+   * 取一批记忆（Active/Dormant，Project 优先）→ 词法（FTS 同口径 token 的 Jaccard）+ 向量（库内余弦）
+   * 合成强度 → 幂等 upsert `similar` 边（权重 = 强度，来源 = lexical/vector/both）。
+   * **纯 CPU、无模型调用**、可中断（signal.aborted → 让出留队，重跑幂等）；返回本轮统计。
+   */
+  async runRelationBuild(signal?: AbortSignal): Promise<RelationBuildOutcome> {
+    if (signal?.aborted === true) {
+      const err = new Error('memory_relation_build aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    const page = await this.memory.query({ scope: 'Project', limit: RELATION_BUILD_BATCH, budget: Number.MAX_SAFE_INTEGER });
+    const memories = page.items;
+    const vectors = this.memory.vectorsFor(memories.map((m) => m.id));
+    const planned = planSimilarityEdges(memories, vectors);
+    const applied = await applySimilarityEdges(this.memory, planned, Date.now());
+    const stats = this.memory.relationStats();
+    this.markSubsystemOk('memory-relation');
+    return { ...applied, planned: planned.length, scanned: memories.length, edges: stats.edges };
+  }
+
+  /** 关系图观测面（状态工具/测试用：边统计 + 是否还需要建图） */
+  relationStats(): RelationStats & { memories: number; needs_build: boolean } {
+    const stats = this.memory.relationStats();
+    const memories = this.memory.memoryCount();
+    return { ...stats, memories, needs_build: relationNeedsBuild(stats.edges, memories) };
   }
 
   // ---- P7：Predictive Invalidation（设计 §14.5 + 实现规格 §15.4 最小落地） ----

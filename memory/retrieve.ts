@@ -40,6 +40,8 @@ export const FUSION_WEIGHT_VECTOR = 0.4;
 export const RELATION_DECAY = 0.5;
 /** 融合候选池上限（每通道取多少条参与融合；§17 可标定） */
 export const FUSION_POOL_LIMIT = 30;
+/** 单种子参与扩展的出边上限（边属性化后按权重而非全量入池；§17 可标定） */
+export const RELATION_EXPAND_EDGE_LIMIT = 20;
 
 /** RankedMemory：rank = 序位（0 起），value = Memory Value（§7.4 统一价值模型） */
 export interface RankedMemory {
@@ -393,7 +395,9 @@ function fusionScore(c: FusedCandidate): number {
 
 /**
  * 关系图扩展与重排（语义检索组的第二阶段）：以融合候选为种子做 depth-1 关系扩展，
- * 邻接节点以 RELATION_DECAY × 种子融合分入池（`relation` 分量），随后统一按融合分重排。
+ * 邻接节点以 `RELATION_DECAY × 边权重 × 种子融合分` 入池（`relation` 分量），随后统一按融合分重排。
+ * 边权重（已知问题《关系图为空图》新增的边属性）：规则/谱系边权重恒为 1 → 与既有数值完全一致；
+ * 相似度边权重即「词法 + 向量」合成强度（弱相似 → 弱扩展，不再与强规则边同权）。
  * 只在结果不足 limit 时扩展（预算守卫；与既有 §7.3 阶段 4 同语义）。
  */
 async function expandRelations(
@@ -409,18 +413,22 @@ async function expandRelations(
   const added: FusedCandidate[] = [];
   for (const seed of seeds) {
     if (added.length >= maxAdd) break;
-    const walk = await backend.relationTraverse(seed.memory.id, [], 1);
-    for (const node of walk.nodes) {
+    const edges = backend
+      .relationEdges({ from: seed.memory.id, limit: RELATION_EXPAND_EDGE_LIMIT })
+      .slice()
+      .sort((a, b) => b.weight - a.weight || a.to_id.localeCompare(b.to_id)); // 权重优先（同权按 id 确定性）
+    for (const edge of edges) {
       if (added.length >= maxAdd) break;
-      if (node.depth !== 1 || known.has(node.id)) continue;
-      const m = await backend.getById(node.id);
+      if (known.has(edge.to_id)) continue;
+      const m = await backend.getById(edge.to_id);
       if (m === undefined) continue;
-      known.add(node.id);
+      known.add(edge.to_id);
+      const weight = edge.weight > 0 && edge.weight <= 1 ? edge.weight : 1;
       added.push({
         memory: m,
         lexical: 0,
         vector: 0,
-        relation: RELATION_DECAY * fusionScore(seed),
+        relation: RELATION_DECAY * weight * fusionScore(seed),
       });
     }
   }

@@ -194,8 +194,11 @@ describe('T8.21 generalization 真实化（跨 scope 检索 episode 统计 → L
 
     // 专项 D（评审问题一）：null-outcome「已记录待归因」单独计为 scope_recorded（检索数据量照常入信号，
     // 不当作 hit 也不当作 miss——归因观测面留待；generalization 比率只认 scope_hit/scope_miss → 事实仍 null）
+    // 口径标记（已知问题《采样信号计数口径待核对》）：generalization 计数为窗口内累计值 → cumulative: true
     const signals = await collectGeneralizationSignals(backend, TARGET, WINDOW);
-    expect(signals).toEqual([{ layer: 'L1', kind: 'scope_recorded', target: TARGET, count: 1, window: WINDOW }]);
+    expect(signals).toEqual([
+      { layer: 'L1', kind: 'scope_recorded', target: TARGET, count: 1, window: WINDOW, cumulative: true },
+    ]);
     expect(getFact(evaluate(signals, TARGET), 'generalization')).toBeNull();
   });
 });
