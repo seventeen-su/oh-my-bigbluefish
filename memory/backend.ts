@@ -85,6 +85,13 @@ export class SqliteMemoryBackend implements MemoryBackend {
     } catch {
       // 新库（表不存在）或列已存在 → no-op
     }
+    // 向量列迁移（已知问题《新增向量检索》）：旧库补 vector BLOB 列（新库由 SCHEMA_SQL 建列）。
+    // 同 R5 迁移的理由：先补列再跑 SCHEMA_SQL，避免旧库在索引/查询语句处抛 no such column。
+    try {
+      this.db.exec('ALTER TABLE memory ADD COLUMN vector BLOB');
+    } catch {
+      // 新库（表不存在）或列已存在 → no-op
+    }
     this.db.exec(SCHEMA_SQL);
     this.insertMemory = this.db.prepare(
       `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
@@ -139,8 +146,7 @@ export class SqliteMemoryBackend implements MemoryBackend {
 
   /** query：text 存在 → FTS（bm25 rank，rank 升序=相关度降序；分页用 page）；否则四维过滤 + (updated,id) 排序。
    *  分页：cursor = 上一页末项 (updated):(id) 复合游标（keyset）；relation/budget 字段接收暂不执行（语义待 T3.4 检索算子定）。 */
-  async query(q: MemoryQuery, opts: QueryOpts = {}): Promise<MemoryPageResult> {
-    const parsed = MemoryQuerySchema.safeParse(q);
+  async query(q: MemoryQuery, opts: QueryOpts = {}): Promise<MemoryPageResult> {    const parsed = MemoryQuerySchema.safeParse(q);
     if (!parsed.success) {
       throw new Error(`SqliteMemoryBackend.query: 查询校验失败 — ${parsed.error.message}`);
     }
@@ -254,15 +260,20 @@ export class SqliteMemoryBackend implements MemoryBackend {
         throw new Error(`SqliteMemoryBackend.update: 记忆不存在: ${id}`);
       }
       const merged = this.validateMemory({ ...(JSON.parse(row.body) as Memory), ...clean, updated: new Date().toISOString() });
+      // 向量列与 payload 同步（已知问题《新增向量检索》写入流水：落库 → 同步编码）：
+      // payload 变化 → 清空向量，交由空闲期批量编码（`encodePendingBatch`）重编码；
+      // payload 未变 → 保留既有向量（不因 lifecycle/utility 更新而丢失编码，避免无谓重算）。
+      const payloadChanged = merged.payload !== (JSON.parse(row.body) as Memory).payload;
       this.db.prepare(
         `UPDATE memory SET scope = ?, kind = ?, lifecycle = ?, prov_class = ?, payload = ?, payload_fts = ?,
-                           value_score = ?, utility_counts = ?, belief_ref = ?, lineage_ref = ?, updated = ?, body = ?
+                           value_score = ?, utility_counts = ?, belief_ref = ?, lineage_ref = ?, updated = ?, body = ?,
+                           vector = CASE WHEN ? THEN NULL ELSE vector END
          WHERE id = ?`,
       ).run(
         merged.scope, merged.kind, merged.lifecycle, merged.prov_class, merged.payload,
         tokenizeForFts(merged.payload),
         merged.value_score, JSON.stringify(merged.utility_counts), merged.belief_ref ?? null,
-        merged.lineage_ref ?? null, Date.parse(merged.updated), JSON.stringify(merged), id,
+        merged.lineage_ref ?? null, Date.parse(merged.updated), JSON.stringify(merged), payloadChanged ? 1 : 0, id,
       );
       this.endIfNeeded(outer);
     } catch (err) {

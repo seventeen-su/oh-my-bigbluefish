@@ -110,8 +110,7 @@ describe('组合根债务释放（修复 → 确认 → 释放）', () => {
     expect(scheduler.debtSnapshot()).toEqual([]);
   });
 
-  it('状态面暴露债务来源、释放审计与阈值档位', async () => {
-    await seedDebt([
+  it('状态面暴露债务来源、释放审计与阈值档位', async () => {    await seedDebt([
       {
         task_id: 'repair',
         value: 20,

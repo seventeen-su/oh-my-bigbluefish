@@ -660,6 +660,8 @@ export interface MemoryRetrievalToolResult {
   ok: boolean;
   items: MemoryRetrievalEntry[];
   channel_used: string;
+  /** 实际参与召回的通道（双通道融合可观测面：如 ['lexical','vector']；时序组为 ['episode']） */
+  channels_used: string[];
   scope_chain: string[];
   degraded: string | null;
 }
@@ -1088,6 +1090,7 @@ export class CognitiveRuntime {
       debt_release_audit,
       debt_limits,
       evolution,
+      memory_vector: this.memory.vectorStats(),
       maintenance_observations,
       observations_degraded,
       recent_signals,
@@ -1294,11 +1297,12 @@ export class CognitiveRuntime {
           snippet: memorySnippet(it.memory.payload),
         })),
         channel_used: r.channel_used,
+        channels_used: r.channels_used,
         scope_chain: r.scope_chain,
         degraded: null,
       };
     } catch (err) {
-      return { ok: false, items: [], channel_used: 'lexical', scope_chain: [], degraded: errorDetail(err) };
+      return { ok: false, items: [], channel_used: 'lexical', channels_used: [], scope_chain: [], degraded: errorDetail(err) };
     }
   }
 
@@ -2054,6 +2058,23 @@ export class CognitiveRuntime {
         const acc = memoryConsolidationAccrual(maintenanceCosts);
         await this.enqueueAccrual(acc, this.maintenanceRun(acc.task_id, input.session_id));
       }
+      // 向量编码（已知问题《新增向量检索》：编码放空闲期批量执行，不入主对话路径）：
+      // 有未编码记忆时入队 memory_vector_encode（纯 CPU、无模型调用、可中断；成功清偿自身债务）。
+      // 只在确有缺口时入队（队列空时不产生任何开销）。
+      if (this.memory.pendingEncodeCount() > 0) {
+        await this.maintenance.enqueue({
+          id: 'memory_vector_encode',
+          value: 1,
+          estimated_cost: 2, // 与检查类同档（纯 CPU 批量编码；§17 可标定）
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'memory-vector',
+          reason: '存在未编码记忆——向量通道待补齐（空闲期批量编码）',
+          run: async (signal) => {
+            await this.runVectorEncode(signal);
+          },
+        });
+      }
       // P1c：演化判定任务（空闲期 quantum 执行；低优先级、可中断——读 signals → evolve.policy 判定 →
       // 应演化则入队 candidate_validation + evolution/candidate 事件入链）。
       // 演化节律开关（config.selfIteration.schedule=false）→ 不入队（仅显式 /evolve now 触发演化判定）；
@@ -2593,8 +2614,7 @@ export class CognitiveRuntime {
     const latestDecayTs = await this.readLatestDecayTs();
     const released: DebtReleaseRecord[] = [];
     const kept: DebtReleaseResult[] = [];
-    for (const view of scheduler.debtSourceView()) {
-      if (view.orphan) continue; // 无主债务 → 人工裁定清单，不自动释放
+    for (const view of scheduler.debtSourceView()) {      if (view.orphan) continue; // 无主债务 → 人工裁定清单，不自动释放
       const evidence = this.debtSelfCheckEvidence(view, { latestRepairPass, latestDecayTs, now });
       if (evidence === null) {
         kept.push({ released: false, task_id: view.task_id, value: view.value, reason: 'selfcheck_not_passed' });
@@ -2745,6 +2765,11 @@ export class CognitiveRuntime {
         //（失败 → 任务抛错 → 债务不清零——R5 清债语义）
         return async (signal) => {
           await this.runMemoryConsolidation(signal);
+        };
+      case 'memory_vector_encode':
+        // 向量编码（已知问题《新增向量检索》：空闲期批量编码；纯 CPU、不占显卡、无模型调用）
+        return async (signal) => {
+          await this.runVectorEncode(signal);
         };
       case 'repair':
         // R5（P0+P1）+P3：受影响对象契约化重验证（读 decay 记录 → 对象契约 → 最小验证计划 →
@@ -2991,6 +3016,23 @@ export class CognitiveRuntime {
   /** 标记来源子系统「执行体成功跑完」（债务释放的确认依据；成功路径才调用） */
   private markSubsystemOk(subsystem: string): void {
     this.lastSubsystemOk.set(subsystem, Date.now());
+  }
+
+  /**
+   * 向量编码执行体（维护任务 memory_vector_encode；已知问题《新增向量检索》）。
+   * 批量编码未编码记忆（`RetrievalBackend.encodePendingBatch` 继承自 VectorBackend）——
+   * **纯 CPU、不占显卡、无模型调用**，可中断（signal.aborted → 让出留队）。
+   * @returns 编码结果 { encoded, remaining }（供摘要与测试断言）
+   */
+  async runVectorEncode(signal?: AbortSignal): Promise<{ encoded: number; remaining: number }> {
+    if (signal?.aborted === true) {
+      const err = new Error('memory_vector_encode aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    const r = await this.memory.encodePendingBatch();
+    this.markSubsystemOk('memory-vector');
+    return r;
   }
 
   // ---- P7：Predictive Invalidation（设计 §14.5 + 实现规格 §15.4 最小落地） ----

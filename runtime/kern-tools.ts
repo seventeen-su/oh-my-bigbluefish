@@ -108,6 +108,12 @@ export interface KernStatusSummary {
     band: 'normal' | 'soft' | 'hard' | 'critical';
     batch_size: number;
   } | null;
+  /**
+   * 记忆向量通道状态（已知问题《新增向量检索》观测面）：已编码 / 待编码 / 维度 / 嵌入器标识。
+   * 待编码 > 0 说明向量通道尚未覆盖全部记忆（空闲期 memory_vector_encode 任务会补齐）；
+   * dim=null 表示尚无任何编码条目（向量通道当前不产生候选——诚实标注，不冒充可用）。
+   */
+  memory_vector: { encoded: number; pending: number; dim: number | null; embedder: string } | null;
   /** S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + observations_degraded） */
   maintenance_observations: {
     date: string;
@@ -240,6 +246,8 @@ export interface MemoryRetrievalToolResultLike {
   ok: boolean;
   items: MemoryEntryLike[];
   channel_used: string;
+  /** 实际参与召回的通道（双通道融合可观测面；旧运行时可能缺省 → 工具文本按"未知"处理） */
+  channels_used?: string[];
   scope_chain: string[];
   degraded: string | null;
 }
