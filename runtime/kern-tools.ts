@@ -119,6 +119,34 @@ export interface KernStatusSummary {
   /** 最近信号数（.evolution/signals 当日记录数；读取失败 → 0 + signals_degraded） */
   recent_signals: number;
   signals_degraded: string | null;
+  /**
+   * 自迭代状态段（已知问题《需要"查看自迭代状态"的快速工具》）：最近判定结论与原因、信号计数、
+   * 债务快照、门禁逐项（含被拒原因）、开关面、三线相互领先/落后关系。
+   * `evolution:false` 请求（或读取异常）→ null；尚无判定记录 → degraded 说明缺失。
+   */
+  evolution?: {
+    enabled: boolean;
+    min_strength: number;
+    background_model_calls: boolean;
+    schedule: boolean;
+    last_decision: {
+      should_evolve: boolean;
+      strength: number;
+      object_layer: string;
+      budget_estimate: number;
+      triggers: string[];
+      reason: string;
+    } | null;
+    last_decision_ts: number | null;
+    last_decision_trigger: string | null;
+    signals: Record<string, number>;
+    signals_total: number;
+    debt: { total: number; band: string; soft: number; hard: number; critical: number } | null;
+    gates: Array<{ gate: string; passed: boolean; reason: string | null }>;
+    lines: Array<{ line: string; commit: string | null; ahead: number; behind: number }>;
+    line: { line: string; commit: string | null; ahead: number; behind: number } | null;
+    degraded: string | null;
+  } | null;
   /** 组件装配摘要（注册/激活（含 suspicious）/suspicious 清单 + 逐组件健康） */
   components: {
     registered: string[];
@@ -229,6 +257,8 @@ export interface ProfileUpsertToolResultLike {
 /** kern_* 数据源（认知运行时最小结构面——仅方法签名；结构最小接口，不引 runtime/assembly） */
 export interface KernRuntimeLike {
   status?(): Promise<KernStatusSummary>;
+  /** 带可选线参数与自迭代状态段的状态摘要（kern_status 优先走本方法；未提供 → 退回 status()） */
+  statusFor?(input?: { line?: string; evolution?: boolean }): Promise<KernStatusSummary>;
   /** S5：kern_bench 数据源——v2 契约基准（复用 /bench v2 分支同款 runBenchV2 接线；input 可选——运行时缺省当前线） */
   benchV2?(input?: { line?: string; persist?: boolean }): Promise<BenchV2ToolResultLike>;
   /** S5：kern_evolve 数据源——演化全链（判定+候选管线+晋升检查+维护量子） */
@@ -253,18 +283,35 @@ function sessionIdFromExec(exec: unknown): string | undefined {
   return typeof session?.id === 'string' ? session.id : undefined;
 }
 
-/** kern_status 工具定义（无参数；execute 返回状态摘要——纯读取，不触发演化/写入） */
+/** kern_status 工具定义（可选参数 line/evolution；execute 返回状态摘要——纯读取，不触发演化/写入） */
 export function kernStatusTool(runtime: KernRuntimeLike): ToolDefinitionLike {
   return {
     name: 'kern_status',
-    description: '认知运行时状态摘要（当前版本线/快照哈希/lineSnapshot/维护债务/维护观测摘要/最近信号数/组件健康）',
-    parameters: { type: 'object', properties: {} },
+    description:
+      '认知运行时状态摘要（版本线/快照/维护债务与档位/债务来源与待人工裁决/最近信号数/组件健康），' +
+      '并附带自迭代状态段：最近演化判定的结论与原因、门禁逐项与开关面（回答「为什么没有演化」）。' +
+      '可选 line 参数可查指定版本线状态与三线领先/落后关系；可选 evolution=false 只看运行状态。',
+    parameters: {
+      type: 'object',
+      properties: {
+        line: { type: 'string', enum: ['initial', 'stable', 'latest'], description: '只查看指定版本线的状态与关系' },
+        evolution: { type: 'boolean', description: '是否附带自迭代状态段（缺省 true）' },
+      },
+    },
     output: {
       schema: { type: 'object' },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
       presentationMeta: (_args, value) => value as Record<string, unknown>,
     },
-    execute: async () => {
+    execute: async (args) => {
+      const input = (args ?? {}) as { line?: unknown; evolution?: unknown };
+      const line = typeof input.line === 'string' ? input.line : undefined;
+      const evolution = typeof input.evolution === 'boolean' ? input.evolution : undefined;
+      // 优先走 statusFor（带线/状态段能力的运行时）；未提供 → 退回无参 status()（诚实降级：
+      // 参数被忽略而非报错——工具面保持可用）
+      if (typeof runtime.statusFor === 'function') {
+        return runtime.statusFor({ line, evolution });
+      }
       if (typeof runtime.status !== 'function') {
         // 运行时未实现 status()（未装配/版本过旧）→ 降级返回（不抛——工具面保持可用）
         return { ok: false, degraded: '认知运行时未提供 status()（kern_status 数据源缺失）' };

@@ -15,17 +15,21 @@ import { join } from 'node:path';
 /**
  * 第一层固定契约文本（认知层使用方式——静态常量，不随演化变；每次请求注入的极小固定上下文）。
  * 硬约束①：总长 ≤ 500 字符（中文，约 ≤300 token）——tests/m9/runtime-contract.test.ts 钉住。
+ * 措辞纪律：标题不强调版本、不用晦涩术语；每一条都必须是「模型据此能做出正确动作」的信息，
+ * 否则删除（已知问题《每轮注入的构成与浪费点》：契约标题与措辞精简）。
+ * 主动性（已知问题《"AI 从未尝试自迭代"与提示词主动性》）：补一条**按需许可**——涉及自迭代/版本线/
+ * 验证/修复的任务可先看状态、条件满足再触发；同时保留「不主动加载内部机制、不无由触发改动」的边界。
  */
 export const OMB_RUNTIME_CONTRACT =
-  'OMB v2 运行时契约（认知层使用方式）：\n' +
-  '可用面：命令 /mode <initial|stable|latest>（切换版本线）、/bench（冻结基准）、/evolve now|share|absorb（演化/共享）；' +
+  'OMB认知层使用方式：\n' +
+  '可用面：命令 /mode（切版本线）、/bench（基准）、/evolve now|share|absorb；' +
   '工具 kern_status、kern_memory、kern_profile、kern_bench、kern_evolve、kern_switch；' +
   '每轮注入的认知投影含工作状态/记忆候选/认知过程。\n' +
-  '使用时机：需历史信息或用户画像 → kern_memory；登记偏好 → kern_profile；' +
-  '未知/高不确定 → 依投影认知过程推进；需验证 → /bench 或 kern_bench；需切换版本线 → /mode。\n' +
-  '边界：正常任务优先直接完成，不主动加载 OMB 内部机制；未验证候选不视为可信能力；' +
-  '认知层仅观察与注入，不接管 Agent Loop。\n' +
-  '详细使用说明：技能 omb-runtime（按需加载）。';
+  '使用时机：需历史或画像 → kern_memory；登记偏好 → kern_profile；需验证 → /bench；' +
+  '切版本线 → /mode；涉及自迭代、版本线、验证或修复的任务，可先 kern_status 看状态与被拦原因，' +
+  '条件满足再 /evolve 或 kern_evolve 触发。\n' +
+  '边界：正常任务优先直接完成，不主动加载内部机制、不无由触发改动；未验证候选不视为可信能力；' +
+  '认知层仅观察与注入，不接管 Agent Loop。详细说明：技能 omb-runtime（按需加载）。';
 
 /** 第二层动态能力行输入视图（plugin 装配面从认知运行时实例同步提取；全部字段可选——缺省 = 该维度未知） */
 export interface CapabilitiesViewLike {

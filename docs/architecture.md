@@ -42,6 +42,9 @@ OMB v2（大肥鱼模式 v2）是叠加在普通 DSH 会话之上的**认知增�
 | `bootstrap` | true | 三线布局自动初始化/修复 |
 | `benchVersion` | 'v2' | 'v1' 切回 legacy 录制基准 |
 | `line` | stable | 固定初始版本线（后备/兼容机制） |
+| `selfIteration` | 全启用（不写 = 既有行为） | 自迭代开关面（部署级策略，无界面开关）：`enabled` 链路总开关 / `minStrength` 触发门槛 / `backgroundModelCalls` 后台模型调用许可（`auto` → 由并发档位决定）/ `schedule` 演化节律 |
+| `concurrency` | 未知 | 并发能力声明面：`maxConcurrentRequests`（1 → 自动禁止后台模型调用）；宿主 llm 暴露元数据时优先读宿主，未知则不擅自收紧 |
+| `episodeSampleRate` | 0.02 | 记忆检索 Episode 采样率（0~1） |
 
 ---
 
@@ -237,9 +240,11 @@ SnapshotRegistry.promote（新请求用新快照，进行中请求不受影响�
 ### 5.1 cognitive:contract（order 80）——固定契约
 
 - 文本：`OMB_RUNTIME_CONTRACT`（`runtime/runtime-contract.ts`，静态常量、不随演化变）。
-- 硬约束：总长 ≤ 500 字符（`tests/m9/runtime-contract.test.ts` 钉住）。
-- 内容：可用面（命令/工具/投影）、使用时机（kern_memory / kern_profile / /bench / /mode）、
-  边界（认知层仅观察注入、未验证候选不视为可信能力）。
+- 硬约束：总长 ≤ 500 字符（`tests/m9/runtime-contract.test.ts` 钉住；当前 411 字符）。
+- 内容：可用面（命令/工具/投影）、使用时机（kern_memory / kern_profile / /bench / /mode +
+  **自迭代按需许可**：涉及自迭代、版本线、验证或修复的任务可先 `kern_status` 看状态与被拦原因，
+  条件满足再 `/evolve` 或 `kern_evolve` 触发）、边界（不主动加载内部机制、不无由触发改动；
+  认知层仅观察注入、未验证候选不视为可信能力）。标题为「OMB认知层使用方式：」（不强调版本）。
 
 ### 5.2 cognitive:capabilities（order 85）——动态能力行
 
@@ -570,9 +575,30 @@ turn 收尾入队 + 请求间隙小量子 + 进程内 tick）。
 - 队列按 **ROI = value/estimated_cost 降序**（priority tie-break，critical 强制最前）；
   soft 限（合计 ≥10）→ tick 间隔减半；hard 限（≥50）→ 非必要（normal）任务跳过；
   critical → 请求边界强制插入。
-- `requestQuantum`：每次执行 1 个任务（可中断：调用方 signal ∪ stop() inFlight 合并）；
-  tick：定时器驱动（基准 60s——§17 真实基准数据验证 60s ≥ 任务耗时 P90 余量 ~29×）；
-  stop()：清定时器/队列并中断在飞任务。
+- **硬限豁免清单**（`HARD_LIMIT_EXEMPT`）：gc / 会话收尾 / 记忆整合 / 环境检查（廉价必要维护，
+  被阻塞则债务永不清偿）+ **检查与判定类**（`evolution_decision` / `promotion_check` /
+  `verification_review`——它们是「债从哪来、能不能释放」的唯一观测与裁决入口，锁住它们会让债务
+  永远无法被诊断与清偿）。**保护语义保留**：改动类演化任务（`candidate_validation` / `repair`）
+  仍受硬限约束。
+- `requestQuantum`：每次执行至多 `batchSize` 个任务（缺省 1 = 单量子语义；生产装配 4——
+  同一 tick 内先清高位收尾任务再消费判定/检查类，消除「单量子名额 ROI 饥饿」）；
+  可中断：调用方 signal ∪ stop() inFlight 合并；批量执行中中断 → 停止取新任务、剩余留队。
+- tick：定时器驱动（基准 60s），生产装配构造后 `start()`（仅在 DSH 运行期生效）；
+  队列空时零开销（只增计数不产生执行记录）。
+- `stop()`：清定时器/队列并中断在飞任务。
+
+### 9.2.1 债务来源与释放（「修复 → 确认 → 释放」）
+
+- **来源记录**：`MaintenanceDebt` 带 `subsystem / reason / first_seen / last_failure`；
+  入账方（`kernel/evolve-decision.ts` `DEBT_SUBSYSTEM` / `ACCRUAL_REASON`）标注来源子系统与原因。
+  历史条目来源留空 → `debtSourceView().orphan`。
+- **按条释放**：`releaseDebt({taskId, expectedSubsystem, evidence, releasedBy})`——来源子系统自检通过
+  才释放，子系统不匹配 → 拒绝。组合根 `runDebtRelease` 逐条核对（自检依据 = 该子系统执行体在本进程内
+  成功跑完 + 已落盘审计面佐证）；`repair` 维护任务完成后自动接一次释放。
+- **释放审计**：`.evolution/debt-releases.jsonl`（时间/释放前累计值/来源子系统/依据/触发者/原因）。
+- **人工裁定**：无主且超过 `DEBT_MANUAL_REVIEW_AFTER_MS`（7 天）→ `manualPendingDebt()` 清单，
+  **不做自动清除**。
+- **明确不做**：任何周期性/到期式批量清除。
 
 ### 9.3 维护任务表
 
@@ -682,7 +708,7 @@ disposers 集入 ctx.effect（P8 注册皆效应）；全部为认知运行时�
 
 | 工具 | 数据源 | 语义 |
 |---|---|---|
-| `kern_status` | `runtime.status()` | 纯读取状态摘要：版本线/快照哈希/lineSnapshot/维护债务/维护观测/最近信号数/组件健康 |
+| `kern_status` | `runtime.statusFor({line, evolution})` | 纯读取状态摘要：版本线/快照哈希/lineSnapshot/维护债务与档位/债务来源与待人工裁决/维护观测/最近信号数/组件健康 + **自迭代状态段**（最近判定结论与原因、信号计数、债务快照、门禁逐项与被拒原因、开关面、三线领先落后关系）；参数 `line` 指定线、`evolution:false` 只看运行状态 |
 | `kern_bench` | `runtime.benchV2()` | 运行 v2 契约基准（无 modelAdapter → 回放；有 → 真实 + LLM judge 双判；参数 line/persist） |
 | `kern_evolve` | `runtime.runEvolutionNow()` | 触发演化全链（信号判定 → 候选生成/验证/晋升 → 晋升检查 → 维护量子） |
 | `kern_switch` | `runtime.switchLine()` | 切换版本线（校验+快照重建+激活记录；无空白会话守卫） |
