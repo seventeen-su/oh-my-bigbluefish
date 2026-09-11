@@ -120,19 +120,39 @@ export class VectorBackend extends RelationBackend {
     const rows = this.db
       .prepare('SELECT id, payload FROM memory WHERE vector IS NULL ORDER BY updated DESC, id ASC LIMIT ?')
       .all(limit * VECTOR_ENCODE_SCAN_FACTOR) as unknown as { id: string; payload: string }[];
-    let encoded = 0;
-    const update = this.db.prepare('UPDATE memory SET vector = ? WHERE id = ?');
+
+    // ---- 阶段一：编码（**不持有事务**）----
+    // 编码是异步的（神经嵌入只提供 Promise 形态推理）。**不能**把 await 包在 BEGIN…COMMIT 里：
+    // SQLite 的写事务会一直持有到 COMMIT，跨 200 次 await 等于把写锁交给事件循环的调度去决定何时释放
+    //（其它写入者只会撞 busy_timeout）。所以先在事务外把向量算出来。
+    const encoded: Array<{ id: string; blob: Uint8Array }> = [];
     for (const r of rows) {
-      if (encoded >= limit) break; // 本批目标已达成（其余留待下次维护）
+      if (encoded.length >= limit) break; // 本批目标已达成（其余留待下次维护）
       try {
-        update.run(vectorToBlob(await embedder.embed(r.payload)), r.id);
-        encoded++;
+        encoded.push({ id: r.id, blob: vectorToBlob(await embedder.embed(r.payload)) });
       } catch {
         // 单条编码失败 → 跳过（该条保持待编码，状态面可见；不阻塞其余条目）
       }
     }
+
+    // ---- 阶段二：落库（**单事务、无 await**）----
+    // 此前是循环里逐条 autocommit：200 行 = 200 次独立事务 = 200 次 WAL 提交。改为一次事务后
+    // 提交次数从 O(批大小) 降到 O(1)，而事务持有时间只覆盖 200 次同步 UPDATE（毫秒级，不让出事件循环）。
+    // 调用方已在事务内（整合链）时不自行 BEGIN/COMMIT——node:sqlite 嵌套 fail-loud，且我们只是它的参与者。
+    if (encoded.length > 0) {
+      const outer = this.db.isTransaction;
+      if (!outer) this.db.exec('BEGIN');
+      try {
+        const update = this.db.prepare('UPDATE memory SET vector = ? WHERE id = ?');
+        for (const e of encoded) update.run(e.blob, e.id);
+        if (!outer) this.db.exec('COMMIT');
+      } catch (err) {
+        if (!outer && this.db.isTransaction) this.db.exec('ROLLBACK');
+        throw err; // 写库失败与"单条编码失败"不同：整批未落，由调用方按维护任务失败处理
+      }
+    }
     const remaining = (this.db.prepare('SELECT COUNT(*) AS n FROM memory WHERE vector IS NULL').get() as { n: number }).n;
-    return { encoded, remaining };
+    return { encoded: encoded.length, remaining };
   }
 
   /**
