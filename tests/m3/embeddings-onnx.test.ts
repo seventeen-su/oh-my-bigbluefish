@@ -229,4 +229,34 @@ describe.skipIf(!hasModel)('③ 端到端嵌入（需 `pnpm fetch-embedding-mode
     expect(paraphrase).toBeGreaterThan(unrelated + 0.2);
     expect(crossLingual).toBeGreaterThan(unrelated);
   }, 60_000);
+
+  it('候选下限落在实测的两类分布之间（既砍掉正基线，又不漏掉真实跨语言命中）', async () => {
+    // 为什么这条断言重要：稠密模型的余弦**恒为正**，检索侧"score<=0 才丢"的旧判据永不命中
+    // → 任何查询都返回满额候选池。修复引入了 Embedder.minScore；而 minScore 定高了会**静默漏召回**
+    //（第一版取 0.45，实测把 0.433/0.441/0.448 三条真实跨语言命中砍掉了）。
+    // 故这里把"下限必须夹在两类分布之间"钉成断言：换模型/换版本时先红，而不是悄悄少召回。
+    const e = await loadOk();
+    expect(e.minScore).toBeGreaterThan(0); // 未声明下限 = 旧语义，等于没修
+    const cos = async (a: string, b: string): Promise<number> =>
+      cosineSimilarity(await e.embed(a), await e.embed(b));
+    const relevant = [
+      await cos('记忆整合事务有界', 'consolidation runs in bounded transactions'),
+      await cos('验证契约必须成立', 'verification contract must hold'),
+      await cos('记忆检索按作用域覆盖链', 'memory retrieval walks the scope chain'),
+      await cos('候选晋升需要执行验证', 'candidate promotion requires execution verification'),
+      await cos('关停时排空待落盘写入', 'drain pending writes on shutdown'),
+    ];
+    const unrelated = [
+      await cos('记忆整合事务有界', '红烧肉的做法'),
+      await cos('验证契约必须成立', '明天股市开盘时间'),
+      await cos('记忆检索按作用域覆盖链', '这只猫很可爱'),
+      await cos('候选晋升需要执行验证', '地铁末班车几点'),
+      await cos('关停时排空待落盘写入', '巧克力蛋糕配方'),
+    ];
+    const floor = e.minScore!;
+    // 下限必须高于全部无关对（否则等于没过滤）
+    expect(Math.max(...unrelated)).toBeLessThan(floor);
+    // 下限必须低于全部相关对（否则在漏召回——这正是第一版 0.45 的问题）
+    expect(Math.min(...relevant)).toBeGreaterThan(floor);
+  }, 60_000);
 });

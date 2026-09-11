@@ -29,7 +29,7 @@
 ## 安装插件
 
 1. **位置**：克隆到 `$DSH_HOME/.agent-presets/oh-my-bigbluefish/`（目录名即 preset id，须匹配 `^[a-z0-9][a-z0-9-]*$`）。`versions.git/`、`stable/`、`latest/`、`workspace/.omb/` 均 gitignored，首次启动自动初始化三线布局。
-2. **挂载**：仓库根自带全量组合 `agent.cordis.yml`（standard 工具面 + `omb-v2` 认知行，`name: './lib/runtime/plugin.js?v=9'`）；克隆后 `pnpm install && pnpm build`（`lib/` 为编译产物）。修改源码重新 build 后须递增 `?v=N` 或重启宿主。
+2. **挂载**：仓库根自带全量组合 `agent.cordis.yml`（standard 工具面 + `omb-v2` 认知行，`name: './lib/runtime/plugin.js?v=10'`）；克隆后 `pnpm install && pnpm build`（`lib/` 为编译产物）。修改源码重新 build 后须递增 `?v=N` 或重启宿主。
 3. **生效**：重启 DSH，新建会话选择「大肥鱼模式 v2」。验证：
    - `/bench` → 冻结基准（回放或真实执行）；
    - `kern_status` → 版本线/快照哈希/维护债务/信号数/组件健康；
