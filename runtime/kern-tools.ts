@@ -144,6 +144,25 @@ export interface KernStatusSummary {
     kernel_loaded: boolean;
     details: Record<string, string>;
   };
+  /**
+   * 宿主契约哨兵段（已知问题《非阻塞设计不足：插件注册期仍可能阻塞宿主》方向②）：
+   * 逐项列出依赖的宿主面/是否就绪/缺失后果 + 边界声明（覆盖不了"插件行解析失败"）。
+   * 插件未提供（如内核未加载的兜底数据源）→ null。
+   */
+  host_contract?: {
+    degraded: string[];
+    required_ok: boolean;
+    scope_note: string;
+    probes: Array<{
+      service: string;
+      present: boolean;
+      missing_methods: string[];
+      degraded: boolean;
+      purpose: string;
+      onMissing: string;
+      required: boolean;
+    }>;
+  } | null;
   /** S2：维护观测摘要（今日任务数 + 各任务平均耗时；调度器缺失/读取失败 → null + observations_degraded） */
   maintenance_observations: {
     date: string;

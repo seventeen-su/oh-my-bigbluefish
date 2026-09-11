@@ -432,6 +432,13 @@ export interface CognitiveAssemblyOptions {
    */
   safeStateView?: () => KernStatusSummary['safe_state'];
   /**
+   * 宿主契约哨兵视图注入（已知问题《非阻塞设计不足：插件注册期仍可能阻塞宿主》方向②）：
+   * 探测结论由**插件层**持有（那里才知道宿主 ctx 的形状），装配层不重复探测——经本回调并入
+   * `status().host_contract`，使 `kern_status` 能回答"这次宿主升级动了什么面、各自影响什么"。
+   * 缺省 → 该段为 null（测试装配不计）。
+   */
+  hostContractView?: () => KernStatusSummary['host_contract'];
+  /**
    * 制品发现根集合（已知问题《制品索引未建立》修复）：除仓库根外的真实工作根（如会话工作目录）。
    * 逐根尝试解析；全部未命中 → 记为不可恢复制品（不再直接丢弃）。缺省只有仓库根。
    */
@@ -973,8 +980,12 @@ export class CognitiveRuntime {
   private readonly hygieneStateFile: string;
   /** 运行时侧待落盘写入计数（close 排空等待；与维护调度器 pendingWrites 同一纪律） */
   private pendingRuntimeWrites = 0;
+  /** 主机契约哨兵视图注入（插件层持有探测结论；缺省 → 状态面该段为 null） */
+  hostContractView?: () => KernStatusSummary['host_contract'];
   /** 外核安全状态视图注入（装配面提供；缺省 → 状态面不带 safe_state 段） */
   private readonly safeStateViewFn: (() => KernStatusSummary['safe_state']) | undefined;
+  /** 宿主契约哨兵视图注入（插件层持有；缺省 → 状态面该段为 null） */
+  private readonly hostContractViewFn: (() => KernStatusSummary['host_contract']) | undefined;
   /**
    * 制品发现根集合（已知问题《制品索引未建立》修复：发现根不再只有仓库根）。
    * 缺省 = [仓库根 HERE]；装配面可注入会话工作目录等真实工作根（逐根尝试解析，全部未命中 →
@@ -1058,6 +1069,7 @@ export class CognitiveRuntime {
     this.checkpointDir = opts.checkpointDir;
     this.maintenance = opts.maintenance ?? null;
     this.safeStateViewFn = opts.safeStateView;
+    this.hostContractViewFn = opts.hostContractView;
     // 制品发现根集合（会话工作目录优先，仓库根兜底；去重保序）
     const roots = [opts.workspaceRoot, ...(opts.artifactRoots ?? []), HERE].filter(
       (r): r is string => typeof r === 'string' && r.length > 0,
@@ -1262,6 +1274,8 @@ export class CognitiveRuntime {
       debt_limits,
       evolution,
       safe_state: this.safeStateViewFn === undefined ? undefined : this.safeStateViewFn(),
+      // 宿主契约哨兵段由插件层持有（装配层不重复探测）：插件经 deps 注入本回调，状态面据此可读
+      host_contract: this.hostContractViewFn === undefined ? null : this.hostContractViewFn(),
       memory_vector: this.memory.vectorStats(),
       relations: this.relationStats(),
       maintenance_observations,
