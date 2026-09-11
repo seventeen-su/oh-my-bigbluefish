@@ -915,6 +915,13 @@ export class CognitiveRuntime {
   private lastConsolidationReport: ConsolidationReport | null = null;
   /** 最近一次整合的有界执行元数据（"跑了多少"；与报告分开——报告是稳定契约） */
   private lastConsolidationRun: ConsolidationOutcome | null = null;
+  /**
+   * 最近一次候选管线自证回执（已知问题《候选流水线借用 repair 的证据签字》修复）：
+   * `candidate-pipeline` 债务的释放依据必须来自**候选管线自己**的本次运行（时间 + 候选数/通过数/晋升数），
+   * 不得借 repair 的执行体与审计记录签字。
+   */
+  private lastCandidatePipelineRun: { ts: number; candidates: number; validated: number; promoted: number } | null =
+    null;
 
   /**
    * 维护任务重建面（已知问题《债务与"还债的人"不同源》修复）：
@@ -3221,7 +3228,19 @@ export class CognitiveRuntime {
   }
 
   /** 子系统自检证据（通过 → 证据文本；未通过 → null 表示保留该条债务）。
-   *  依据 = 该来源子系统的执行体在本进程内**成功跑完**（真实观测，非推断）+ 已落盘审计面佐证。 */
+   *
+   *  **证据必须来自该来源子系统自己**（已知问题《候选流水线借用 repair 的证据签字 / memory-vector、
+   *  memory-relation 无释放分支》修复）：
+   *    - `repair-chain`：repair 执行体的成功跑完 + 落盘审计（判定全为 PASS / 无待修对象）；
+   *    - `candidate-pipeline`：**候选管线自己**的本次运行证据（`runCandidatePipeline` 回执）——
+   *      不再借 repair 的执行体与审计记录签字（旧实现两者共用同一段证据路由：候选流水线一次没跑过，
+   *      其债务也会被 repair 的"执行体跑完"放掉）；
+   *    - `memory-vector` / `memory-relation`：**新增释放分支**（旧实现落到 `default → null`，
+   *      两条来源的债务既不能清偿也不会被执行，只能停在原地并占用硬限额度）——
+   *      释放依据是各自的运行回执（编码缺口清零 / 建图后稀疏门已满足），全部可从真实状态读出；
+   *    - `memory-consolidation` / `environment-check` / `evolution-decision` / `promotion-check`：
+   *      各自执行体的成功跑完（既有口径）。
+   */
   private debtSelfCheckEvidence(
     view: DebtSourceView,
     ctx: { latestRepairPass: number | undefined; latestDecayTs: number | undefined; now: number },
@@ -3229,8 +3248,7 @@ export class CognitiveRuntime {
     const last = this.lastSubsystemOk.get(view.subsystem ?? '');
     const ranAfterFirstSeen = last !== undefined && last >= view.first_seen;
     switch (view.subsystem) {
-      case 'repair-chain':
-      case 'candidate-pipeline': {
+      case 'repair-chain': {
         const viaRepair = ranAfterFirstSeen
           ? `repair 自检执行体成功跑完（ts=${new Date(last!).toISOString()}）`
           : null;
@@ -3243,6 +3261,47 @@ export class CognitiveRuntime {
         // 有衰减记录晚于自检/修复 → 环境侧仍有待核对项，暂不释放（保守）
         if (ctx.latestDecayTs !== undefined && ctx.latestDecayTs > view.first_seen && last === undefined) return null;
         return evidence;
+      }
+      case 'candidate-pipeline': {
+        // 只认候选管线自己的回执（本轮管线真实跑过），且晚于债务首见时间——不借 repair 的签字
+        const run = this.lastCandidatePipelineRun;
+        if (run === null || run.ts < view.first_seen) {
+          return null;
+        }
+        return (
+          `候选管线自行跑完（ts=${new Date(run.ts).toISOString()}：候选 ${run.candidates} 个，` +
+          `通过 ${run.validated}，晋升 ${run.promoted}）——来源子系统自证，非 repair 代签`
+        );
+      }
+      case 'memory-vector': {
+        // 释放依据：向量编码执行体成功跑完 + **当前已无待编码记忆**（编码缺口清零）；
+        // 仍有缺口 → 不释放（债对应的那件事确实还没做完）
+        if (!ranAfterFirstSeen) return null;
+        let pending: number;
+        try {
+          pending = this.memory.pendingEncodeCount();
+        } catch {
+          return null; // 读不出缺口 → 不释放（保守，不假装已还）
+        }
+        if (pending > 0) {
+          return null;
+        }
+        return `向量编码执行体成功跑完且编码缺口清零（ts=${new Date(last!).toISOString()}，pending=0）`;
+      }
+      case 'memory-relation': {
+        // 释放依据：关系建图执行体成功跑完 + **稀疏门已满足**（不再需要建图）；
+        // 仍稀疏 → 不释放（图还是空的，债对应的那件事没做完）
+        if (!ranAfterFirstSeen) return null;
+        try {
+          const edges = this.memory.edgeCount();
+          const memories = this.memory.memoryCount();
+          if (relationNeedsBuild(edges, memories)) {
+            return null;
+          }
+          return `关系建图执行体成功跑完且稀疏门已满足（ts=${new Date(last!).toISOString()}，edges=${edges}，memories=${memories}）`;
+        } catch {
+          return null;
+        }
       }
       case 'environment-check': {
         if (ranAfterFirstSeen) {
@@ -3316,12 +3375,12 @@ export class CognitiveRuntime {
           assertNotAbortedSignal(signal, 'candidate_validation');
           // 旧布局（线快照无 policy 内容）→ 候选管线不可执行（生产降级记录；不触碰真实 versions.git）——
           // R5：抛 Deferred（不再 return 假成功清债——未实现/不可执行任务 → debt 保留不清零，评估依据 §13）
-          if (sessionId === undefined || this.lineSnapshot === null) {
+          if (sessionId === undefined) {
             throw new DeferredMaintenanceError(
-              'candidate_validation 旧布局（线快照无 kernel/policy）——候选管线不可执行，债务保留',
+              'candidate_validation 缺少会话归属——候选管线不可执行，债务保留',
             );
           }
-          await this.runEvolutionChain(sessionId);
+          await this.runCandidateValidation(sessionId);
         };
       case 'promotion_check':
         return async (signal) => {
@@ -4501,6 +4560,7 @@ export class CognitiveRuntime {
       if (outcome.promoted && outcome.commit_hash !== undefined && outcome.object_id !== undefined) {
         events += 1; // evolution/promoted（pipeline 内入链）
         this.invalidateShadowCaches(); // S7：候选晋升 → trusted-latest 推进/线内容变化 → shadow 路由缓存失效
+        this.recordCandidatePipelineRun(outcomes);
         return {
           outcomes,
           promoted: { candidate_id: outcome.candidate_id, object_id: outcome.object_id, commit_hash: outcome.commit_hash },
@@ -4509,7 +4569,43 @@ export class CognitiveRuntime {
       }
     }
     this.invalidateShadowCaches(); // S7：候选管线跑完（trusted-latest 可能已推进）→ shadow 路由缓存失效
+    this.recordCandidatePipelineRun(outcomes);
     return { outcomes, promoted: null, events_appended: events };
+  }
+
+  /**
+   * 候选管线自证回执（已知问题《候选流水线借用 repair 的证据签字》修复）：
+   * `candidate-pipeline` 债务的释放依据 = **本次管线自己跑过**（时间 + 候选数/通过数/晋升数），
+   * 不借 repair 的执行体与审计记录签字。只有真实执行体跑完才记（旧布局跳过/异常不记）。
+   */
+  private recordCandidatePipelineRun(outcomes: CandidateOutcome[]): void {
+    this.lastCandidatePipelineRun = {
+      ts: Date.now(),
+      candidates: outcomes.length,
+      validated: outcomes.filter((o) => o.validated).length,
+      promoted: outcomes.filter((o) => o.promoted).length,
+    };
+  }
+
+  /**
+   * 候选管线执行体（维护任务 candidate_validation；可公开调用——测试/命令触发）。
+   * 旧布局（线快照无 kernel/policy）→ 抛 Deferred（任务出队但债务保留：未实现/不可执行 ≠ 已完成）。
+   * 成功跑完 → 记**自证回执**（`candidatePipelineRun`）：这是 `candidate-pipeline` 债务释放的唯一依据
+   * （已知问题《候选流水线借用 repair 的证据签字》——不借 repair 的执行体/审计记录签字）。
+   */
+  async runCandidateValidation(sessionId: string): Promise<CandidateOutcome[]> {
+    if (this.lineSnapshot === null) {
+      throw new DeferredMaintenanceError(
+        'candidate_validation 旧布局（线快照无 kernel/policy）——候选管线不可执行，债务保留',
+      );
+    }
+    const chain = await this.runEvolutionChain(sessionId);
+    return chain.outcomes;
+  }
+
+  /** 候选管线自证回执（状态面/测试可读：candidate-pipeline 债务释放的依据来源） */
+  candidatePipelineRun(): { ts: number; candidates: number; validated: number; promoted: number } | null {
+    return this.lastCandidatePipelineRun;
   }
 
   /**
