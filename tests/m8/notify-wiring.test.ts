@@ -253,3 +253,43 @@ describe('② 不该发的边界：默认沉默', () => {
     expect(svc.always).toEqual([]);
   }, 20_000);
 });
+
+describe('③ 白名单每一档都必须真的会响（防"登记了却永远不发"）', () => {
+  it('宿主面缺项 → capability-degraded（能力面变少，与组件健康是两个不同的面）', async () => {
+    // 这条用例的由来：`capability-degraded` 曾在白名单与方法表里都有、单测也覆盖，
+    // 但**生产代码零调用点**——一个永远不会响的通知档。此类"登记了却永远不发"只能靠
+    // "从装配结果往外看"的接线测试发现（桥自身的单测证明不了谁调了它）。
+    const svc = makeNotifyService();
+    // fakeCtx 只提供 commands/systemPrompt/desktopNotify → 其余宿主面必然缺项
+    const { ctx } = makeFakeCtx({ notify: svc });
+    const handle = applyTracked(ctx, { cognitiveRoot });
+
+    const sent = sentOf(handle, 'capability-degraded');
+    expect(sent.length).toBeGreaterThanOrEqual(1);
+    expect(sent[0]!.always).toBe(false); // 普通通知：不绕过宿主聚焦门控
+    const item = svc.pushed.find((p) => p.title.includes('能力'))!;
+    expect(item).toBeDefined();
+    // 文案要说清"少了什么"（服务名 + 缺它的后果），而不是笼统一句"出错"
+    expect(item.message).toMatch(/宿主面缺项/);
+    expect(item.message).toMatch(/tools|llm|subagents|systemPrompt/);
+  }, 20_000);
+
+  it('宿主面全部就绪 → 不发 capability-degraded（不误报）', async () => {
+    const svc = makeNotifyService();
+    const providers: ContextProvider[] = [];
+    // 提供一个"九面齐全"的 ctx（方法形状与 HOST_CONTRACT 的最低要求一致）
+    const full = {
+      commands: { register: () => undefined },
+      tools: { register: () => undefined },
+      systemPrompt: { context: (p: unknown) => providers.push(p as ContextProvider) },
+      on: () => undefined,
+      effect: () => undefined,
+      llm: { stream: () => undefined },
+      subagents: { start: () => undefined },
+      dynamicCordisRunner: {},
+      desktopNotify: svc,
+    } as unknown as ContextLike;
+    const handle = applyTracked(full, { cognitiveRoot });
+    expect(sentOf(handle, 'capability-degraded')).toEqual([]);
+  }, 20_000);
+});

@@ -624,6 +624,23 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
 
 /** 插件主体（所有装配逻辑；对外只经 apply 的 try/catch 包装暴露） */
 function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  /**
+   * 待补发的通知（**必须声明在最早的引用点之前**）：安全状态判定 / 启动校验结算 / 宿主契约哨兵
+   * 都早于通知桥构造，而启动校验是**异步**的（其 `.then` 回调可能在函数体其余部分执行完之前就跑到）——
+   * 真机（Linux）实测过这个 TDZ：`Cannot access 'flushPendingNotifications' before initialization`。
+   * 因此队列与补发函数都提到最前，而不是"就近定义"。
+   */
+  const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
+  /**
+   * 补发已入队的通知（幂等：队列清空后无动作）。**用函数声明**（提升）以免任何调用顺序下的 TDZ。
+   * 调用点：桥就绪后立即一次 + 启动校验结算后一次（boot 的告警/回退在桥就绪之后才产生，
+   * 故必须在它 settle 时再补发一次；否则"启动回退"这类最该告知的事件会静默丢掉）。
+   */
+  function flushPendingNotifications(): void {
+    for (const pending of pendingNotifications.splice(0)) {
+      pending.send(notifyBridge);
+    }
+  }
   // 配置面收敛（已知问题《非阻塞设计不足…》方向①）：插件对 config **宽进**——未知键忽略并记降级，
   // 不因"宿主侧多传/改名"导致插件加载失败。审计结论并入状态面（`host_contract` 段）。
   const configReport = auditPluginConfig(config);
@@ -643,23 +660,17 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
       .map((p) => `${p.service}（${p.onMissing}）`)
       .join('；');
     recordDegradation('host/contract', `宿主面缺项（只降级对应能力，插件照常加载）：${detail}`);
-  }
-  /**
-   * 待补发的通知（**必须声明在最早的引用点之前**）：安全状态判定 / 启动校验结算都早于通知桥构造，
-   * 而启动校验是**异步**的（其 `.then` 回调可能在函数体其余部分执行完之前就跑到）——
-   * 真机（Linux）实测过这个 TDZ：`Cannot access 'flushPendingNotifications' before initialization`。
-   * 因此队列与补发函数都提到最前，而不是"就近定义"。
-   */
-  const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
-  /**
-   * 补发已入队的通知（幂等：队列清空后无动作）。**用函数声明**（提升）以免任何调用顺序下的 TDZ。
-   * 调用点：桥就绪后立即一次 + 启动校验结算后一次（boot 的告警/回退在桥就绪之后才产生，
-   * 故必须在它 settle 时再补发一次；否则"启动回退"这类最该告知的事件会静默丢掉）。
-   */
-  function flushPendingNotifications(): void {
-    for (const pending of pendingNotifications.splice(0)) {
-      pending.send(notifyBridge);
-    }
+    // 能力面降级（专项档）→ 告知主人：宿主面少了，OMB **能做的事变少**——这正是"静默地换个行为继续跑"
+    // 那一类，比崩溃更难发现，故进白名单。与 component-unhealthy 是**两个不同的面**：后者是 OMB 自己的
+    // 组件健康检查打了 suspicious，这里是我们依赖的宿主服务缺失/改名（可能在组件全部健康时发生）。
+    // 此刻通知桥尚未构造（它在下方），故先入队、桥就绪后补发（见 flushPendingNotifications）。
+    pendingNotifications.push({
+      kind: 'capability-degraded',
+      send: (n) =>
+        n.notifyCapabilityDegraded(
+          `宿主面缺项：${detail}（${hostContract.degraded.length}/${hostContract.probes.length} 项）`,
+        ),
+    });
   }
   /**
    * 通知桥（先置 null，装配到"桌面通知服务读取"那一步再赋值）：
