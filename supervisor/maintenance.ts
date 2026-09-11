@@ -49,6 +49,29 @@ export class DeferredMaintenanceError extends Error {
   }
 }
 
+/** 待执行队列的盘上形状（只落元数据：执行体是函数，由 opts.restoreTask 按 id 重建） */
+export interface PendingQueueEntry {
+  id: string;
+  value: number;
+  estimated_cost: number;
+  priority: number;
+  urgency: string;
+  /** 债务来源子系统（重建后仍可对账；缺失 → 无主） */
+  subsystem?: string;
+  reason?: string;
+  /** 该任务债务是否"入队即累计"（重建后恢复防双计标记） */
+  accrued_at_enqueue?: boolean;
+  /** 入队时间（审计：重启后能看出这条任务等了多久） */
+  enqueued_at?: number;
+  /** critical 标记（重建后仍按请求边界强制优先） */
+  critical?: boolean;
+}
+
+/** urgency 形状校验（损坏条目回退 'normal'——不因单个坏字段丢弃整条任务） */
+function isUrgency(v: unknown): v is Urgency {
+  return v === 'normal' || v === 'soft' || v === 'hard' || v === 'critical';
+}
+
 /** Deferred 事件记录（未实现/不可执行任务：task_id + 时间 + 原因；仅可观测，不参与调度） */
 export interface DeferredEvent {
   task_id: string;
@@ -272,6 +295,16 @@ export interface MaintenanceSchedulerOptions {
   batchSize?: number;
   /** 时钟注入（测试）；缺省 Date.now */
   now?: () => number;
+  /**
+   * 任务重建面（已知问题《债务与"还债的人"不同源》修复）：`id → 执行体工厂`。
+   * 队列**跨重启持久化**（`<debtFile 同目录>/queue.json`）；加载时按此面重建可重建的任务，
+   * 使"盘上还有债务"与"负责还债的任务仍在队列里"同源——否则重启后债务只增不减，
+   * 累积到硬限后反而把该修的改动类任务一起锁住。
+   *
+   * 未注册工厂的任务 id（如会话级收尾 `turn-finalize:*`——属主会话重启后已不存在）
+   * → 队列项剪除，对应债务转为**无主债务**（进人工裁定清单，不自动清除）。
+   */
+  restoreTask?: (id: string) => ((signal?: AbortSignal) => Promise<void>) | null;
 }
 
 // ---- 常量（阈值/系数待标定，§17） ----
@@ -356,6 +389,10 @@ export const DEBT_MANUAL_REVIEW_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
 export class MaintenanceScheduler {
   private readonly debtFile: string;
+  /** 待执行队列的持久化文件（<debtFile 同目录>/queue.json；跨重启重建——见 restoreTask） */
+  private readonly queueFile: string;
+  /** 任务重建面（opts.restoreTask；未提供 → 持久化队列在重启后不可重建，记降级而非静默丢失） */
+  private readonly restoreTask: ((id: string) => ((signal?: AbortSignal) => Promise<void>) | null) | null;
   /** S2：维护观测落盘目录（缺省 <debtFile 同目录>/maintenance-observations） */
   private readonly observationsDir: string;
   /** S2：维护任务成本注入面（policy.evolve.maintenance_costs；enqueue 缺省成本按 id 查找） */
@@ -386,6 +423,8 @@ export class MaintenanceScheduler {
   /** 最近一次调度器自身故障（定时器路径兜底：如 debt.json 损坏）；状态面可读，不再静默吞错 */
   private lastSchedulerError: string | null = null;
   private debtLoaded = false;
+  /** 队列懒加载标记（restoreQueueIfNeeded 只做一次） */
+  private queueLoaded = false;
   private tickCountValue = 0;
   private readonly inFlight = new AbortController();
   /** R5：Deferred 事件记录（未实现/不可执行任务；见 DeferredMaintenanceError） */
@@ -405,6 +444,8 @@ export class MaintenanceScheduler {
 
   constructor(opts: MaintenanceSchedulerOptions = {}) {
     this.debtFile = opts.debtFile ?? join(process.cwd(), 'workspace', '.omb', '.evolution', 'debt.json');
+    this.queueFile = join(dirname(this.debtFile), 'queue.json');
+    this.restoreTask = opts.restoreTask ?? null;
     this.observationsDir =
       opts.observationsDir ?? join(dirname(this.debtFile), 'maintenance-observations');
     this.releaseLogFile = join(dirname(this.debtFile), 'debt-releases.jsonl');
@@ -430,6 +471,7 @@ export class MaintenanceScheduler {
    */
   async enqueue(input: MaintenanceTaskInput, opts: { accrueDebt?: boolean } = {}): Promise<void> {
     if (this.stopped) return;
+    this.restoreQueueIfNeeded(); // 首次入队前先把盘上未完成的队列重建回来（不丢还债的人）
     const task: MaintenanceTask = {
       id: input.id,
       value: input.value ?? 1,
@@ -450,6 +492,7 @@ export class MaintenanceScheduler {
       this.accumulateDebt(task);
       await this.persistDebt();
     }
+    await this.persistQueue(); // 队列本身也落盘（跨重启重建——见 restoreTask）
     this.resetTimer(); // 紧急任务挂起可能改变 tick 频率
   }
 
@@ -462,6 +505,7 @@ export class MaintenanceScheduler {
   /** 请求间隙小量子：执行至多 batchSize 个可执行任务（缺省 1 = 既有单量子语义；可中断：调用方
    *  signal ∪ stop() 的 inFlight）；hard 限跳过者记录 skipped + 不累计债务（硬跳过 = 调度延迟非失败） */
   async requestQuantum(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
+    this.restoreQueueIfNeeded(); // 重启后队列在盘上 → 先重建再调度（债与还债的人同源）
     if (this.stopped || this.running || this.queue.length === 0) return { ran: [], skipped: [] };
     // 重入守卫（审查修复）：此前 requestQuantum 不检查也不置位 running，可与定时器 tick 同时在飞 →
     // 两次 sortedQueue() 快照含同一 task id → 同一任务并发执行（如 memory_consolidation 双跑，
@@ -510,6 +554,7 @@ export class MaintenanceScheduler {
   /** tick：批量处理队列（进程内定时器驱动；可手动调用）；执行 signal（调用方 ∪ inFlight）中断时停止取新任务 */
   async tick(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
     this.tickCountValue++;
+    this.restoreQueueIfNeeded(); // 同上：定时器路径也要先重建盘上队列
     if (this.stopped || this.running || this.queue.length === 0) return { ran: [], skipped: [] };
     this.running = true;
     try {
@@ -594,10 +639,13 @@ export class MaintenanceScheduler {
     return this.pendingWrites;
   }
 
-  /** 轮询等待静默点（无界或带超时）；返回是否达成静默 */
+  /**
+   * 轮询等待静默点（无界或带超时）；返回是否达成静默。
+   * 定时器无关：等待用 `setTimeout` 让出事件循环，但**超时判定用真实时钟**（`Date.now`）并在两次
+   * 让出之间做最后判断——这样既不依赖 `nowFn` 注入，也不会在假定时器（测试）下退化成死等。
+   */
   private async waitIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    // 先给已排队的微任务机会完成（running 的 finally 与写入的 finally 都在微任务队列里）
     for (;;) {
       if (this.isIdle) return true;
       if (Date.now() >= deadline) return false;
@@ -620,8 +668,7 @@ export class MaintenanceScheduler {
   }
 
   /** 当前债务快照（深拷贝；task_id 排序，确定性） */
-  debtSnapshot(): MaintenanceDebt[] {    this.ensureDebtLoaded();
-    return [...this.debt.values()]
+  debtSnapshot(): MaintenanceDebt[] {    this.ensureDebtLoaded();    return [...this.debt.values()]
       .sort((a, b) => a.task_id.localeCompare(b.task_id))
       .map((d) => ({ ...d }));
   }
@@ -1033,13 +1080,14 @@ export class MaintenanceScheduler {
       }
       // 出队前记录入账标记（防双计：removeFromQueue 会清除 accruedAtEnqueue）
       const wasAccrued = this.accruedAtEnqueue.has(t.id);
-      this.removeFromQueue(t.id);
+      await this.removeFromQueue(t.id);
       if (err instanceof DeferredMaintenanceError) {
         // R5：未实现/不可执行 → 出队但债务保留（不清债）+ 记录 deferred；不视为失败崩溃
         this.deferredLog.push({ task_id: t.id, at: this.nowFn(), reason: err.message });
         if (!wasAccrued) {
           this.accrueOnNonRun(t); // 未入账任务 → 债务累计（未完成 → debt 保留）
         }
+        await this.persistDebt();
         await this.appendObservation({
           ts: started,
           task_id: t.id,
@@ -1053,6 +1101,7 @@ export class MaintenanceScheduler {
       if (!wasAccrued) {
         this.accrueOnNonRun(t); // 执行失败 → 债务累计（保留；已入账任务保留入账值防双计）
       }
+      await this.persistDebt();
       await this.appendObservation({
         ts: started,
         task_id: t.id,
@@ -1063,8 +1112,9 @@ export class MaintenanceScheduler {
       });
       return { ran: [t.id], skipped: [] };
     }
-    this.removeFromQueue(t.id);
+    await this.removeFromQueue(t.id);
     this.clearDebt(t.id);
+    await this.persistDebt();
     await this.appendObservation({
       ts: started,
       task_id: t.id,
@@ -1076,10 +1126,137 @@ export class MaintenanceScheduler {
     return { ran: [t.id], skipped: [] };
   }
 
-  private removeFromQueue(id: string): void {
+  private async removeFromQueue(id: string): Promise<void> {
     this.queue = this.queue.filter((t) => t.id !== id);
     this.critical.delete(id);
     this.accruedAtEnqueue.delete(id);
+    await this.persistQueue();
+  }
+
+  // ---- 队列持久化与跨重启重建（已知问题《债务与"还债的人"不同源》） ----
+
+  /**
+   * 队列落盘（`<debtDir>/queue.json`，原子写 tmp+rename）。
+   * 只落**元数据**（id/value/cost/priority/urgency/subsystem/reason/enqueued_at）——执行体是函数，
+   * 不能序列化，由 `opts.restoreTask` 在加载时按 id 重建（见 restoreQueueIfNeeded）。
+   * 尽力而为：写失败 → 记降级不抛（队列仍在内存里，本进程照常调度）。
+   */
+  private async persistQueue(): Promise<void> {
+    const settle = this.trackWrite();
+    try {
+      const entries: PendingQueueEntry[] = this.queue.map((t) => ({
+        id: t.id,
+        value: t.value,
+        estimated_cost: t.estimated_cost,
+        priority: t.priority,
+        urgency: t.urgency,
+        ...(t.subsystem !== undefined ? { subsystem: t.subsystem } : {}),
+        ...(t.reason !== undefined ? { reason: t.reason } : {}),
+        accrued_at_enqueue: this.accruedAtEnqueue.has(t.id),
+        enqueued_at: this.nowFn(),
+        critical: this.critical.has(t.id),
+      }));
+      await mkdir(dirname(this.queueFile), { recursive: true });
+      const tmp = `${this.queueFile}.tmp`;
+      await writeFile(tmp, JSON.stringify(entries, null, 2), 'utf8');
+      await rename(tmp, this.queueFile);
+    } catch (err) {
+      this.lastSchedulerError = `维护队列落盘失败：${(err as Error).message}`;
+    } finally {
+      settle();
+    }
+  }
+
+  /**
+   * 队列懒加载 + 跨重启重建（只做一次；由 enqueue/requestQuantum/tick/debtSnapshot 触发）。
+   *
+   * 已知问题《债务与"还债的人"不同源》的核心修复：`debt.json` 落盘、队列不落盘且 `stop()` 清空 →
+   * 重启后债务还在盘上，但负责还债的任务不再被调度（`repair` 的唯一入队条件是"环境指纹再次变化"，
+   * 指纹稳定后永不成立）→ 债务只增不减，累积到硬限后把该修的改动类任务一起锁住。
+   * 现在：队列随元数据落盘，加载时按 `restoreTask` 重建 → **债务与执行体同源**。
+   *
+   * 重建规则：
+   *   - `restoreTask(id)` 返回执行体 → 重建任务（元数据取盘上值；critical 标记一并恢复）；
+   *   - 未注册工厂/工厂返回 null（如 `turn-finalize:*`——属主会话重启后已不存在）→ **剪除队列项**，
+   *     对应债务保留为**无主债务**（`subsystem` 缺失 → 进人工裁定清单，不自动清除、也不假装已还）；
+   *   - 队列文件缺失/损坏 → 空队列 + 记调度器错误（不静默吞掉；下一次入队会重建文件）。
+   */
+  private restoreQueueIfNeeded(): void {
+    if (this.queueLoaded) return;
+    // 重建面尚未就绪（如装配顺序：调度器先于认知运行时构造）→ **不改动队列、不置位标记**，
+    // 下次调度时自然重试。语义边界：只有"重建面已就绪但该 id 不在其中"才判定为不可重建
+    // （否则会把"还债的人"静默丢掉——正是本修复要消除的那种失真）。
+    if (this.restoreTask === null) {
+      return;
+    }
+    this.queueLoaded = true;
+    if (!existsSync(this.queueFile)) {
+      return;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(this.queueFile, 'utf8'));
+    } catch (err) {
+      this.lastSchedulerError = `维护队列文件损坏（${this.queueFile}）：${(err as Error).message}——本次按空队列继续`;
+      return;
+    }
+    if (!Array.isArray(raw)) {
+      this.lastSchedulerError = `维护队列文件形状非法（${this.queueFile}）——本次按空队列继续`;
+      return;
+    }
+    const restored: MaintenanceTask[] = [];
+    const pruned: string[] = [];
+    for (const item of raw as PendingQueueEntry[]) {
+      if (item === null || typeof item !== 'object' || typeof item.id !== 'string' || item.id.length === 0) {
+        continue;
+      }
+      const run = this.restoreTask(item.id);
+      if (run === null) {
+        pruned.push(item.id);
+        continue;
+      }
+      restored.push({
+        id: item.id,
+        value: typeof item.value === 'number' && Number.isFinite(item.value) ? item.value : 1,
+        estimated_cost:
+          typeof item.estimated_cost === 'number' && Number.isFinite(item.estimated_cost) ? item.estimated_cost : 1,
+        priority: typeof item.priority === 'number' && Number.isFinite(item.priority) ? item.priority : 0,
+        urgency: isUrgency(item.urgency) ? item.urgency : 'normal',
+        ...(typeof item.subsystem === 'string' ? { subsystem: item.subsystem } : {}),
+        ...(typeof item.reason === 'string' ? { reason: item.reason } : {}),
+        run,
+      });
+      if (item.accrued_at_enqueue === true) {
+        this.accruedAtEnqueue.add(item.id);
+      }
+      if (item.critical === true) {
+        this.critical.add(item.id);
+      }
+    }
+    for (const t of restored) {
+      const idx = this.queue.findIndex((q) => q.id === t.id);
+      if (idx >= 0) this.queue.splice(idx, 1);
+      this.queue.push(t);
+    }
+    if (pruned.length > 0) {
+      // 剪除项不静默：恢复出的队列里没有它们 → 其债务成为无主债务（manualPendingDebt 可见）
+      this.deferredLog.push({
+        task_id: pruned.join(','),
+        at: this.nowFn(),
+        reason: `重启后无法重建执行体（未注册 restoreTask）——队列项剪除，对应债务转为无主债务：${pruned.join(', ')}`,
+      });
+    }
+  }
+
+  /** 队列持久化文件路径（状态面/测试可读） */
+  get pendingQueueFile(): string {
+    return this.queueFile;
+  }
+
+  /** 盘上待重建的队列项数（状态面：重启后"债与还债的人"是否同源的可观测面） */
+  restoredQueueSize(): number {
+    this.restoreQueueIfNeeded();
+    return this.queue.length;
   }
 
   // ---- 债务 ----
@@ -1102,13 +1279,13 @@ export class MaintenanceScheduler {
     if (!Array.isArray(raw)) throw new Error(`maintenance debt file invalid: ${this.debtFile}`);
     this.debt = new Map();
     for (const rec of raw as MaintenanceDebt[]) {
-      // 加载时剪除历史僵尸（turn-finalize:* 与 gc）：调度只执行 enqueue 队列，恢复的债务永不清偿
-      if (
-        rec &&
-        typeof rec.task_id === 'string' &&
-        rec.task_id !== 'gc' &&
-        !rec.task_id.startsWith('turn-finalize:')
-      ) {
+      // 已知问题《债务与"还债的人"不同源》修复后的加载口径：**不再按任务名硬编码剪除**僵尸债务
+      //（旧实现在此处丢弃 `gc` 与 `turn-finalize:*`——理由是"调度只执行 enqueue 队列，恢复的债务
+      // 永不清偿"）。现在队列随 `queue.json` 落盘、加载时按 `restoreTask` 重建，"还债的人"与债务
+      // 同源：可重建的任务照常被调度并清偿；不可重建的（如属主会话已消失的会话级收尾）由队列重建
+      // 路径剪除并如实留痕，其债务保留为**无主债务**（`subsystem` 缺失 → 进人工裁定清单），
+      // 而不是在这里静默丢掉——静默丢弃正是"债务只增不减却查不出来源"的另一面。
+      if (rec && typeof rec.task_id === 'string' && rec.task_id.length > 0) {
         // 历史条目（无来源记录）→ 补齐时间字段（来源留空 = 无主债务，进人工裁定清单，不自动清除）
         const at = typeof rec.accumulated_at === 'number' ? rec.accumulated_at : this.nowFn();
         this.debt.set(rec.task_id, {

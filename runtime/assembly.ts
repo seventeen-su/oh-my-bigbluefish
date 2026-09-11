@@ -915,6 +915,43 @@ export class CognitiveRuntime {
   private lastConsolidationReport: ConsolidationReport | null = null;
   /** 最近一次整合的有界执行元数据（"跑了多少"；与报告分开——报告是稳定契约） */
   private lastConsolidationRun: ConsolidationOutcome | null = null;
+
+  /**
+   * 维护任务重建面（已知问题《债务与"还债的人"不同源》修复）：
+   * `id → 执行体工厂`，供 MaintenanceScheduler 在**重启后**按盘上队列元数据重建任务
+   * （队列随 `queue.json` 落盘；只落元数据，执行体靠本表重建）。
+   *
+   * 会话归属（重建路径）：`evolution_decision` / `candidate_validation` / `promotion_check` 的执行体
+   * 需要一个 session 归属（事件 provenance）。重启后原会话已不存在 → 用 `anon`：维护任务本身是
+   * **进程级后台工作**（不读会话内容、不改会话状态），事件里如实记 'anon' 比借用已消失的会话 id 更诚实。
+   *
+   * 不在此表者 = 重启后**不可重建**：`turn-finalize:*`（会话级收尾，属主会话已不存在）、
+   * 以及任何未注册 id → 队列项剪除，对应债务转为无主债务（人工裁定清单可见，不自动清除）。
+   */
+  maintenanceTaskFactory(): (id: string) => ((signal?: AbortSignal) => Promise<void>) | null {
+    const known = new Set([
+      'gc',
+      'memory_consolidation',
+      'memory_vector_encode',
+      'memory_relation_build',
+      'checkpoint_prune',
+      'event_store_vacuum',
+      'fact_store_compact',
+      'environment_check',
+      'evolution_decision',
+      'promotion_check',
+      'candidate_validation',
+      'repair',
+      'verification_review',
+    ]);
+    return (id: string) => {
+      // 会话级收尾任务不在重建范围（语义见上）；其余已知 id → 统一走 maintenanceRun
+      if (!known.has(id)) {
+        return null;
+      }
+      return this.maintenanceRun(id, 'anon');
+    };
+  }
   /** 归因观测面：会话 → 上一轮待归因的 episode 与注入集（下一次 prepareTurn 用新人类消息归因） */
   private readonly sessionAttribution = new Map<string, { episode_id: string; injected_ids: string[] }>();
   /** 归因观测面：会话 → 已给出结论（hit/miss）的记忆 id（会话内不重复计数） */
