@@ -465,6 +465,36 @@ export interface ApplyResult {
  */
 export type BootReady = Pick<BootResult, 'ok' | 'line' | 'warnings' | 'rollback'>;
 
+/** 从宿主子代理终局结果中取裁判文本（修复 H1）：`SubagentResult.output: ContentBlock[]` 优先，
+ *  其次兼容旧形状的 finalText/text 字符串；都取不到时退化为空串（调用方按"不可解析"降级，
+ *  不把 `"[object Object]"` 当裁判文本喂给解析器）。 */
+function flattenSubagentText(settled: unknown): string {
+  if (typeof settled === 'string') {
+    return settled;
+  }
+  const s = settled as
+    | { output?: unknown; finalText?: unknown; text?: unknown; result?: { output?: unknown } }
+    | null
+    | undefined;
+  const blocks = s?.output ?? s?.result?.output;
+  if (Array.isArray(blocks)) {
+    const text = blocks
+      .map((b) => (typeof b === 'object' && b !== null && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : ''))
+      .filter((t) => t.length > 0)
+      .join('\n');
+    if (text.length > 0) {
+      return text;
+    }
+  }
+  if (typeof s?.finalText === 'string' && s.finalText.length > 0) {
+    return s.finalText;
+  }
+  if (typeof s?.text === 'string' && s.text.length > 0) {
+    return s.text;
+  }
+  return '';
+}
+
 /** 从宿主服务/环境读取自述版本（缺省 undefined = 无法观测，沿用既有行为）。
  *  目的（第二轮兼容性审查 H2）：让"声明 ≠ 观测"这条安全状态分支在生产中真的可达——否则宿主升级到
  *  0.1.5 时插件照常拉起内核，把旧版本号写进全部事件/记忆/快照 provenance，且无任何提示。
@@ -820,27 +850,41 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       }
       let judgeExecutor: ReturnType<typeof createJudgeExecutor> | undefined;
       if (subagents !== undefined && typeof (subagents as { start?: unknown }).start === 'function') {
+        // 第二轮审查修复 H1：宿主 SubagentStartRequest 的必填面是
+        //   { prompt: ContentBlock[], parent: Agent, signal: AbortSignal }（packages/subagent/subagent/src/types.ts），
+        // 返回的是 **run 句柄**：终局结果在 `run.result` → `SubagentResult.output`（ContentBlock[]），
+        // 且用完必须 `run.dispose()`。此前实现缺 parent、signal 取自不存在的变量、并把句柄当文本
+        // （`String(r)` = "[object Object]"）→ 每次复核必抛 → 被 judge-executor 吞成 null → 视同 UNKNOWN
+        // → 白烧两次尝试，而能力行仍报"语义裁判：可用"。
+        // parent 来源：宿主只在工具调用上下文里给出 Agent（`exec.agent`）——由下方 tools/result 监听捕获最近一个；
+        // 未捕获到之前 `isAvailable()` 为 false → 走"judge 不可用 → 转人工复核"这条既有诚实路径。
         const spawnJudge = async (prompt: string, signal?: AbortSignal): Promise<string> => {
-          const r = await (subagents as {
-            start: (provider: string, opts: Record<string, unknown>) => Promise<unknown>;
-          }).start('spawn', {
-            prompt: [{ type: 'text', text: prompt }],
-            toolFilter: [],
-            signal,
-          });
-          // 宿主形状容错（DSH 0.1.1-rc.1 subagents.start 返回形状以实际为准）：finalText ?? text ?? String(r)
-          const anyR = r as { finalText?: unknown; text?: unknown } | null | undefined;
-          if (anyR !== null && anyR !== undefined) {
-            if (typeof anyR.finalText === 'string' && anyR.finalText.length > 0) {
-              return anyR.finalText;
+          const parent = agentRef;
+          if (parent === undefined) {
+            throw new Error('judge: 尚无可用父 Agent（未观察到工具调用）——judge 暂不可用');
+          }
+          const handle = (await (
+            subagents as {
+              start: (provider: string, req: Record<string, unknown>) => Promise<unknown>;
             }
-            if (typeof anyR.text === 'string' && anyR.text.length > 0) {
-              return anyR.text;
+          ).start('spawn', {
+            prompt: [{ type: 'text', text: prompt }],
+            parent,
+            signal: signal ?? new AbortController().signal,
+            toolFilter: [], // 纯文本裁判：不派发任何工具
+          })) as { result?: Promise<unknown>; dispose?: () => Promise<void> } | null | undefined;
+          try {
+            const settled = handle?.result !== undefined ? await handle.result : handle;
+            return flattenSubagentText(settled);
+          } finally {
+            try {
+              await handle?.dispose?.();
+            } catch {
+              // dispose 失败不覆盖判定结果（子会话残留由宿主回收；不因此判失败）
             }
           }
-          return String(r);
         };
-        judgeExecutor = createJudgeExecutor({ spawnJudge });
+        judgeExecutor = createJudgeExecutor({ spawnJudge, isAvailable: () => agentRef !== undefined });
       }
       // W3（未接线审计修复 2026-08-25）：宿主 dynamicCordisRunner 服务读取（S9 增强通道——候选验证
       // 脚本经动态插件半执行，G3-exec 优先走 runner 通道）。Guard 契约（B3 教训）：宿主服务必须经
@@ -1093,6 +1137,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   // 收尾触发面（§3.3/§4）：session/flush（耐久检查点）→ finalizeTurn；turn/end（turn 事实关闭）→ 标记待收尾；
   // 无 flush 时退化：下一次 prepareTurn 前惰性收尾（计划 §4 finalizeTurn 守卫行，记录降级路径）。
   const preparedTurns = new Map<string, { decision: GovernorDecision; working_state: PromptWorkingState }>();
+  /** 最近观察到的宿主父 Agent（`tools/result` 的 `exec.agent`）——语义裁判 spawn 的必填 parent（审查 H1） */
+  let agentRef: unknown;
   const pendingFinalize = new Set<string>();
   /** 在飞收尾（会话 → promise）：宿主每 step 多次 flush 且回调并发启动，收尾必须按会话串行（审查 F1） */
   const finalizing = new Map<string, Promise<void>>();
@@ -1247,6 +1293,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       // 可用性、dynamicRunner 注入）+ 第三层渐进指导（DSH 原生 skill omb-runtime 按需加载——镜像接线见 apply
       // 上部；order 小者在前：contract(80) → capabilities(85) → projection(90)）。
       systemPrompt.context({ name: 'cognitive:contract', order: 80, text: OMB_RUNTIME_CONTRACT });
+      // 注：能力行在注册时求值一次（既有契约，测试断言"同步文本"）。运行期可能变化的项（如语义裁判
+      // 需捕获父 Agent 才可用）以**行为**保证诚实：不可用时走"转人工复核"，不会假装判定（审查 H1）。
       systemPrompt.context({ name: 'cognitive:capabilities', order: 85, text: buildCapabilitiesLine(capabilitiesViewOf(cognitive)) });
       // S8：context 求值 kick 转交共享预热链（prepareForTurn）——sessionId 提取 + 事件数组兜底（goal 来源）
       const kickPrepare = (assembleCtx: AssembleContextLike): void => {
@@ -1337,6 +1385,12 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         const runtime = cognitive;
         if (runtime === undefined) {
           return;
+        }
+        // 父 Agent 捕获（第二轮审查 H1）：宿主只在工具调用上下文里给出 Agent（`exec.agent`），
+        // 而 subagents.start 的 parent 是必填——就近捕获最近一个，供语义裁判通道使用。
+        const agent = (exec as { agent?: unknown } | undefined)?.agent;
+        if (agent !== undefined && agent !== null) {
+          agentRef = agent;
         }
         const sessionId = (exec as { agent?: { session?: { id?: unknown } } } | undefined)?.agent?.session?.id;
         if (typeof sessionId !== 'string' || sessionId.length === 0) {
