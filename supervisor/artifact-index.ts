@@ -15,6 +15,7 @@
 //   （IR 契约例外——manifest schema 纯契约，无运行时副作用；supervisor → kernel 其他路径仍禁止）。
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
   ArtifactManifestSchema,
@@ -199,7 +200,9 @@ export class ArtifactIndex {
   private async writeAll(manifests: ArtifactManifest[]): Promise<boolean> {
     try {
       await mkdir(dirname(this.file), { recursive: true });
-      const tmp = `${this.file}.tmp`;
+      // 唯一临时名（审查 M4）：固定 `.tmp` 在 register/registerMany 并发时会命中同一路径互相截断，
+      // 而读侧对坏行是"跳过"语义 → 索引内容静默丢失。同仓 lines.ts/activation-log.ts 已是 pid+随机后缀写法。
+      const tmp = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
       await writeFile(tmp, manifests.map((m) => JSON.stringify(m)).join('\n') + (manifests.length > 0 ? '\n' : ''), 'utf8');
       await rename(tmp, this.file);
       this.writeError = null;

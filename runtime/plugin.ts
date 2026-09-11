@@ -970,6 +970,13 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         // 记忆库缺列两次实测阻塞宿主）。此处兜底：内核不加载 + 记录原因 + 宿主照常启动与运行；
         // 命令面与状态面仍在（可查看"内核未加载的原因"）。不重抛、不改动已写入的运行数据。
         cognitive = undefined;
+        // 审查修复 H3：装配失败时维护定时器已 start()（在 createCognitiveRuntime 之前）——此前不会停表，
+        // 旧 interval 会在整个进程生命周期里继续 persistDebt/跑任务（旧实例残留）。此处显式停表。
+        try {
+          maintenance.stop();
+        } catch {
+          // 停表失败不覆盖装配降级原因（调度器内部幂等）
+        }
         recordDegradation(
           'cognitive/assembly',
           `内核装配失败（${err instanceof Error ? err.message : String(err)}）——内核不加载，宿主不受影响；命令面与状态面仍可用`,
@@ -1362,7 +1369,13 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
               recordDegradation('session/event', `observeEvent 失败（${detail}）——事件已记录降级`);
             });
           }
-        })();
+        })().catch((err: unknown) => {
+          // 审查修复 H5：此前这条 fire-and-forget 链没有 .catch（同文件另三处都有）——`await
+          // cognitiveServiceable()` 或映射阶段的异常会变成未处理拒绝（宿主按默认策略会致命，
+          // 装了 handler 则完全静默、观测面看不到"事件采集链已死"）。
+          const detail = err instanceof Error ? err.message : String(err);
+          recordDegradation('session/event', `事件采集链异常（${detail}）——已记录降级`);
+        });
         // T8.26.5：turn/end = turn 事实关闭 → 标记待收尾（flush 或下一次 prepareTurn 触发 finalizeTurn）
         if ((dshEvent as { type?: unknown } | undefined)?.type === 'turn/end') {
           pendingFinalize.add(sessionId);
