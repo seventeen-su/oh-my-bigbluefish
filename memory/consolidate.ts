@@ -215,7 +215,8 @@ const MAX_QUERY_LIMIT = 1_000_000;
  * 库大时 CPU/内存双爆、长时间持有写事务（同进程其它写入撞 busy_timeout）、进程被杀留下超长 WAL。
  *
  * 取向选择（"保持原子但限流" vs "分批但允许部分完成"）：**两者都要，但边界划清**：
- *   - **单次调用仍然原子**（`backend.transaction` 一个事务，要么全提交要么全回滚）——不引入"半整合"状态；
+ *   - 事务边界 = **单个 scope**（2026-09 修订：原为一个调用一个事务；二义"半个 merge"仍不可能出现，
+ *     但跨 scope 的"全或无"已放弃——理由与代价见 `consolidate()` 的"事务边界"段）；
  *   - 但单次调用**只处理预算内的记忆**（默认 2000 条/次，per scope 轮转），超出部分留给下一次量子/
  *     下一次收尾。事务因此有界（内存驻留、锁持有时长、WAL 体积都随预算封顶），而多次调用之间
  *     自然形成"分批推进"——每次调用返回的 report 都自洽（它只描述本次真实改了什么）。
@@ -472,16 +473,27 @@ function buildReport(state: RunState): ConsolidationReport {
 // ---- 入口 ----
 
 /**
- * 空闲期记忆整合批处理（§7.2）：dedup/merge/relation/decay 在一个事务内执行（中断回滚 →
- * 幂等重跑收敛）；经 opts.scheduler.enqueue({id:'memory-consolidation', run}) 入队执行。
+ * 空闲期记忆整合批处理（§7.2）：dedup/merge/relation/decay **按 scope 分事务**执行
+ * （中断/失败只回滚当前 scope → 幂等重跑收敛）；经 opts.scheduler.enqueue({id:'memory-consolidation', run}) 入队执行。
  *
  * 预算与中断（已知问题《记忆整合没有真实批次上限》/《12 个维护任务里只有 1 个真正可被中断》）：
  * `opts.budget.maxMemoriesPerRun` 限制单次读取/处理的记忆条数（缺省 2000），`budget.scopeOffset`
  * 决定本次从哪个 scope 起（轮转，避免库大时后面的 scope 永远轮不到），`budget.signal` 在每个处理
- * 单元之间被检查（abort → AbortError → 事务回滚 → 任务留队可重试）。三者都不改变"单次原子"语义。
+ * 单元之间被检查（abort → AbortError → 当前 scope 回滚 → 任务留队可重试）。
+ *
+ * **事务边界（2026-09 修订，取代原"单次原子"取向）**：原实现把三个 scope 包在一个事务里，
+ * 追求"整次全或无"。但单个事务跨度越长，写锁与 WAL 的持有时间越长（同进程其它写入只会撞
+ * busy_timeout，进程被杀则留超长 WAL），而这个跨越本身**不带来语义收益**——各步只处理前态记忆、
+ * 重跑收敛一致，部分完成同样是合法状态。故改为**每个 scope 一个事务**：
+ *   - scope 内部仍然原子（不会出现"半个 merge"）；
+ *   - scope 之间提交并让出事件循环（锁不跨段持有）；
+ *   - 代价（诚实）：跨 scope 的"全或无"不再成立——先前 scope 的改动会在后续 scope 失败时保留。
+ *     失败**如实登记**在 `outcome.failed_scopes` 并停止推进（同一故障大概率在后续 scope 复现），
+ *     调用方因此能区分"什么都没做"与"做了前几个 scope 后失败"，而不是误读成全无。
  *
  * 返回值：**报告 = "改了什么"**（四个稳定计数 + 受影响作用域/影响域记录）——不掺入"跑了多少"
- * 那类元数据（严格相等断言的外部消费方不受影响）；有界执行的元数据经 `opts.onOutcome` 单独给出。
+ * 那类元数据（严格相等断言的外部消费方不受影响）；有界执行的元数据经 `opts.onOutcome` 单独给出
+ *（**保证**：只要 runConsolidation 产出了结论就回调，含"部分 scope 失败"的情形）。
  */
 export async function consolidate(
   backend: SqliteMemoryBackend,
@@ -511,10 +523,8 @@ export async function consolidate(
   return report ?? emptyReport();
 }
 
-/**
- * 整合结果（runConsolidation 产物）：报告（"改了什么"）+ 有界执行元数据（"跑了多少"）+ 轮转状态。
- * 分开返回的理由：报告的四个计数是稳定契约（既有消费方做严格比较），元数据属于调用方观测面。
- */
+/** 整合结果（runConsolidation 产物）：报告（"改了什么"）+ 有界执行元数据（"跑了多少"）+ 轮转状态。
+ *  分开返回的理由：报告的四个计数是稳定契约（既有消费方做严格比较），元数据属于调用方观测面。 */
 export interface ConsolidationOutcome {
   report: ConsolidationReport;
   /** 本次读取/处理的记忆条数（"整条载入"的那部分——批预算约束的对象） */
@@ -525,6 +535,14 @@ export interface ConsolidationOutcome {
   next_scope_offset: number;
   /** 本次是否有真实改动（供调用方判断"还要不要再跑一次"——收敛判据） */
   dirty: boolean;
+  /**
+   * 本次失败的 scope（`"<scope>（<原因>）"`；空/缺省 = 全部成功）。
+   *
+   * 为什么必须有这个字段：事务改为**按 scope 切分**后，"整次全或无"不再成立——某一 scope 失败时
+   * 先前 scope 的改动**已经提交**。调用方（与状态面）必须能区分"什么都没做"与"做了前几个 scope 后失败"，
+   * 否则会把部分完成误读成全无，进而做出错误的重试/收敛判断。
+   */
+  failed_scopes?: string[];
 }
 
 async function runConsolidation(
@@ -541,42 +559,61 @@ async function runConsolidation(
   const order = [...SCOPES.slice(offset), ...SCOPES.slice(0, offset)];
   // 轮转（每次调用把起点推进一步）：库大时后续 scope 不会因预算耗尽永远轮不到
   state.nextScopeOffset = (offset + 1) % SCOPES.length;
-  await b.transaction(async () => {
-    for (const scope of order) {
-      assertNotAborted(budget.signal, 'scope');
-      if (state.processed >= limit) {
-        state.budgetExhausted = true;
-        break; // 预算耗尽 → 本次到此（单次调用有界；下次调用接着处理）
-      }
-      // ---- ① dedup（有界读取：只读键列，成本正比于"轻量键行数"而非完整记录体积）----
-      // 收敛性要求：跨调用的重复必须能被发现，故 dedup **不占用批预算**——
-      // 它的内存驻留已被键列投影压到很低（不读 body、不解析 JSON），冻结动作只发生在确认重复的
-      // 条目上（代价正比于重复数，不是全库数）。批预算约束的是下文"必须整条载入"的
-      // merge / relation / decay（那才是内存与平方级代价的来源）。
-      const frozen = await dedupStep(b, state, scope, budget.signal);
-      if (frozen > 0) {
-        state.dirty = true;
-      }
-      // ---- ② merge / relation / decay（单次事务**有界**：只处理本次额度内的记忆）----
-      // merge 必须拿到一批记忆做包含关系比对——旧实现全表读取（`limit: 1_000_000`）。
-      // 现在只读本次额度内的一批（超出部分留给下一次调用；scope 轮转 + 冻结收敛保证推进）。
-      const remaining = Math.max(1, limit - state.processed);
-      const page = await b.query({
-        scope,
-        limit: Math.min(remaining, MAX_QUERY_LIMIT),
-        budget: Number.MAX_SAFE_INTEGER,
-      });
-      const work = page.items.map((m) => ({ ...m }));
-      state.processed += work.length;
-      await mergeStep(b, state, work, scope, now, budget.signal);
-      await relationStep(b, state, work, scope, now, budget.signal);
-      await decayStep(b, state, work, scope, now, budget.signal);
-      if (state.processed >= limit) {
-        state.budgetExhausted = true;
-        break;
-      }
+  const failedScopes: string[] = [];
+  for (const scope of order) {
+    assertNotAborted(budget.signal, 'scope');
+    if (state.processed >= limit) {
+      state.budgetExhausted = true;
+      break; // 预算耗尽 → 本次到此（单次调用有界；下次调用接着处理）
     }
-  });
+    // ---- 每个 scope 一个事务（审查修复：此前三 scope 共用一个事务）----
+    // 为什么按 scope 切分（取向下修订，见文件头"事务边界"说明）：单个事务跨度越长，
+    // 写锁与 WAL 的持有时间越长——同进程其它写入者只会撞 busy_timeout，而进程被杀会留下超长 WAL。
+    // 切分后每个事务只覆盖一个 scope 的处理单元，**scope 内部仍然原子**（不会出现"半个 merge"）。
+    // 代价（诚实）：跨 scope 的"整次全或无"不再成立——某一 scope 失败时，先前 scope 的改动已提交。
+    // 这是可接受的，因为各步只处理前态记忆、重跑收敛一致（本文件既有不变量），部分完成仍是合法状态；
+    // 且失败会被如实记进 outcome.failed_scopes，调用方据此推进而不是误以为"什么都没发生"。
+    try {
+      await b.transaction(async () => {
+        // ---- ① dedup（有界读取：只读键列，成本正比于"轻量键行数"而非完整记录体积）----
+        // 收敛性要求：跨调用的重复必须能被发现，故 dedup **不占用批预算**——
+        // 它的内存驻留已被键列投影压到很低（不读 body、不解析 JSON），冻结动作只发生在确认重复的
+        // 条目上（代价正比于重复数，不是全库数）。批预算约束的是下文"必须整条载入"的
+        // merge / relation / decay（那才是内存与平方级代价的来源）。
+        const frozen = await dedupStep(b, state, scope, budget.signal);
+        if (frozen > 0) {
+          state.dirty = true;
+        }
+        // ---- ② merge / relation / decay（单次事务**有界**：只处理本次额度内的记忆）----
+        // merge 必须拿到一批记忆做包含关系比对——旧实现全表读取（`limit: 1_000_000`）。
+        // 现在只读本次额度内的一批（超出部分留给下一次调用；scope 轮转 + 冻结收敛保证推进）。
+        const remaining = Math.max(1, limit - state.processed);
+        const page = await b.query({
+          scope,
+          limit: Math.min(remaining, MAX_QUERY_LIMIT),
+          budget: Number.MAX_SAFE_INTEGER,
+        });
+        const work = page.items.map((m) => ({ ...m }));
+        state.processed += work.length;
+        await mergeStep(b, state, work, scope, now, budget.signal);
+        await relationStep(b, state, work, scope, now, budget.signal);
+        await decayStep(b, state, work, scope, now, budget.signal);
+      });
+    } catch (err) {
+      // 中断不是失败：让 AbortError 继续冒泡（调度器据此留队可重试，语义不变）
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      // 真失败：本 scope 已回滚（事务原子），先前 scope 的改动保留 → 如实登记并**停止推进**
+      //（同一故障很可能在后续 scope 复现，继续跑只是把同一个错误写三遍）
+      failedScopes.push(`${scope}（${err instanceof Error ? err.message : String(err)}）`);
+      break;
+    }
+    // 让出事件循环：三个 scope 之间给宿主一个调度窗口（每段事务已各自提交，锁不跨段持有）
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (state.processed >= limit) {
+      state.budgetExhausted = true;
+      break;
+    }
+  }
   const report = buildReport(state);
   return {
     report,
@@ -589,6 +626,7 @@ async function runConsolidation(
       report.merged > 0 ||
       report.related > 0 ||
       report.decayed > 0,
+    ...(failedScopes.length > 0 ? { failed_scopes: failedScopes } : {}),
   };
 }
 
