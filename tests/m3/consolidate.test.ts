@@ -16,6 +16,7 @@ import { SqliteMemoryBackend } from '../../memory/backend.js';
 import {
   consolidate,
   createDirectScheduler,
+  type ConsolidationOutcome,
   type MaintenanceScheduler,
 } from '../../memory/consolidate.js';
 import { PROV, TS, base } from '../m1/ir-samples.js';
@@ -328,10 +329,66 @@ describe('整合批次上限与可中断（有界事务 / 逐单元中断）', (
         budget: { maxMemoriesPerRun: 100, scopeOffset: 0, signal: controller.signal },
       }),
     ).rejects.toThrow(/interrupt|中断/u);
-    // 事务回滚：没有任何记忆被冻结（"要么全做要么全不做"的单次原子语义保持）
+    // 回滚语义的**适用边界**（2026-09 事务按 scope 切分后必须说清）：本轮数据在 Project，
+    // 而 scope 顺序是 Session → Project → Global —— 中断发生在**第一个 scope 的事务打开之前**，
+    // 因此"没有任何记忆被冻结"仍然成立。若中断发生在某个 scope 处理中，则只有**该 scope** 回滚，
+    // 先前已提交的 scope 会保留（这正是 failed_scopes / 部分完成语义要暴露的事）。
     const page = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
     expect(page.items.filter((m) => m.lifecycle === 'Frozen')).toHaveLength(0);
     expect(page.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(6);
+  });
+
+  it('事务按 scope 切分：预算只够一个 scope 时，该 scope 的改动独立提交并保留', async () => {
+    // 为什么这条重要：三 scope 共用一个事务时，"预算截断"的可见结果只有"本批处理了 N 条"；
+    // 切分后**已处理 scope 的改动必须真的落盘**（这是切分的目的：锁不跨段持有，段间可让出）。
+    // 断言的是"已落盘"这一事实，而不是报告数字——报告数字在两种实现下都可能相同。
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 4, 'Session');
+    await seedDuplicates(b, 4, 'Project');
+    // 预算 4：Session 的 4 条恰好用尽额度 → Project 本轮完全没被碰
+    const report = await consolidate(b, { now: NOW, budget: { maxMemoriesPerRun: 4, scopeOffset: 0 } });
+    expect(report.deduped).toBe(3); // Session 内 4 条重复 → 冻结 3 条
+    const session = await b.query({ scope: 'Session', limit: 50, budget: 1000 });
+    const project = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
+    // Session 已提交（3 冻 1 活）；Project 一条未动（仍是 4 活）——证明段间提交真实发生
+    expect(session.items.filter((m) => m.lifecycle === 'Frozen')).toHaveLength(3);
+    expect(session.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(1);
+    expect(project.items.filter((m) => m.lifecycle === 'Frozen')).toHaveLength(0);
+    expect(project.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(4);
+  });
+
+  it('正常成功不报失败段：failed_scopes 缺省（不误报"有段没跑成"）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 3);
+    let outcome: ConsolidationOutcome | null = null;
+    await consolidate(b, {
+      now: NOW,
+      budget: { maxMemoriesPerRun: 100 },
+      onOutcome: (o) => {
+        outcome = o;
+      },
+    });
+    expect(outcome).not.toBeNull();
+    expect(outcome!.failed_scopes).toBeUndefined();
+    expect(outcome!.dirty).toBe(true);
+    expect(outcome!.next_scope_offset).toBe(1); // 轮转照常推进
+  });
+
+  it('onOutcome 在产出结论时必被回调（含部分完成；调用方据此推进轮转）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 3, 'Session');
+    const seen: ConsolidationOutcome[] = [];
+    await consolidate(b, {
+      now: NOW,
+      budget: { maxMemoriesPerRun: 1, scopeOffset: 0 }, // 预算极小 → 必然 budget_exhausted
+      onOutcome: (o) => seen.push(o),
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.budget_exhausted).toBe(true);
+    expect(seen[0]!.next_scope_offset).toBe(1);
   });
 
   it('中断后重跑收敛一致：幂等不变量不受中断影响（重跑得到与从未中断相同的终态）', async () => {
