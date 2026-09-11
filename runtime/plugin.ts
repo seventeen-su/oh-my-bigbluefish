@@ -38,6 +38,8 @@ import { VerificationDebt } from '../supervisor/verification-debt.js';
 import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面注入 spawnJudge）
 import { createJudgeExecutor } from './judge-executor.js';
+// S2：桌面通知桥（已知问题《待实现：与 dsh-desktop-notify 的兼容》——宿主面存在才接线，未装全静默）
+import { isDesktopNotifyLike, NotifyBridge, type DesktopNotifyLike } from './notify.js';
 import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
 import { ActivationContractSchema, type ActivationContract } from '../kernel/schemas/m.js';
 import { dshEventId, makeDshEvent } from './loop-hooks.js';
@@ -133,6 +135,13 @@ export interface PluginConfig {
     /** 声明来源（仅观测用；缺省 'config'） */
     source?: string;
   };
+  /**
+   * 桌面通知（已知问题《待实现：与 dsh-desktop-notify 的兼容》）：宿主装了 `dsh-desktop-notify`
+   * 时，OMB 通过它的推送管线发"值得打扰主人"的少数通知（内核未加载/启动回退/晋升回退/债务 critical/
+   * 组件健康异常）。缺省 'auto' = 宿主面存在即启用；false = 全关（一条都不发）。
+   * 节流与总量上限见 runtime/notify.ts 的 NotifyPolicy（缺省同 kind 30 分钟一次、全会话上限 5 条）。
+   */
+  desktopNotify?: boolean | 'auto';
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -185,6 +194,8 @@ export interface CognitiveRuntimeLike {
     requestQuantum(opts?: { signal?: unknown }): Promise<unknown>;
     debtSnapshot(): unknown;
     stop?(): void;
+    /** 债务档位快照（通知桥用：critical 档 → 告知主人"演化被保护性拦住"） */
+    limitsSnapshot?(): { total: number; band: string; critical: number };
   } | null;
   /** P1a：已注入的线快照（按线加载成功 → 快照信息；否则 null/undefined） */
   lineSnapshot?: { line: string; commit: string; dir: string } | null;
@@ -307,6 +318,12 @@ export interface CognitiveRuntimeLike {
   /** R8：/evolve share——发布机制级 Evolution Object（trusted-latest 演化链头 → GitRegistry 本地 registry；
    *  生产默认不自动发布（隐私原则），显式命令始终可用；无对象/失败 → ok:false + 明确文本，不崩） */
   shareEvolutionObject?(input: { session_id: string }): Promise<ShareCommandResultLike>;
+  /**
+   * error 池计数（只读观测面；桌面通知桥用）：`{组件: 条数}`。
+   * 条目增加 = 晋升后的对象线上退化并已回退归档（"修好的东西又退回去了"）——主人该知道，且天然低频。
+   * 缺失/失败 → 通知面不发（宁可漏报也不误报）。
+   */
+  errorPoolCounts?(): Promise<Record<string, number>>;
   /** R8：/evolve absorb <id>——显式从本地 registry 吸收（本地验证 → share-pipeline absorb 管线 → 共识回传） */
   absorbEvolutionObject?(input: { session_id: string; object_id: string }): Promise<ShareCommandResultLike>;
   close(): Promise<void>;
@@ -593,6 +610,21 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   });
 
   /**
+   * 待补发的通知（构造顺序：安全状态判定早于通知桥构造——TDZ 约束下的诚实做法：
+   * 先入队，桥就绪后立即补发，而不是为了顺序把桥提前声明成一堆 let）。
+   */
+  const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
+  /**
+   * 内核未加载的补发闸门（只发一次）：安全状态与"认知装配失败"是两条路径，任一命中即已告知主人，
+   * 不重复打扰（去重也由 NotifyBridge 兜底，这里是显式的一次性语义）。
+   */
+  let kernelNotLoadedNotified = false;
+  /** error 池基线上次读到的总数（"晋升被回退"通知的增量判据；首次读入不算新发生） */
+  let lastErrorPoolTotal = 0;
+  /** error 池基线是否已建立（首读只记基线，不把既有归档当成"刚发生"） */
+  let errorPoolBaselineSet = false;
+
+  /**
    * 外核安全状态（已知问题《外核自身也要非阻塞（安全状态）》）：拉起内核**之前**做一次极轻量自检
    * （平台探测 / 宿主版本契约 / 恢复根可读性）。不通过 → **不拉起内核、不改动运行数据、不执行演化与
    * 维护**，只记录原因与时间；宿主启动与运行完全不受影响（插件"存在但不介入"）。
@@ -631,8 +663,17 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   };
   if (!safeState.ok) {
     recordDegradation('substrate/safe-state', `外核进入安全状态：${safeState.reason ?? '未知原因'}（不拉起内核，宿主不受影响）`);
-  }
-  // 内核装配是否被跳过由 safeState.ok 决定（安全状态 → 跳过；命令与状态面仍可用）
+    // 安全状态是"最该让主人知道"的一类故障（OMB 整体不工作）——但通知桥构造在后（避免 TDZ），
+    // 故先入队，桥就绪后立即补发（见 notifyBridgeReady）
+    pendingNotifications.push({
+      kind: 'kernel-not-loaded',
+      send: (n) => {
+        if (kernelNotLoadedNotified) return;
+        kernelNotLoadedNotified = true;
+        n.notifyKernelNotLoaded(safeState.reason ?? '未知原因');
+      },
+    });
+  }  // 内核装配是否被跳过由 safeState.ok 决定（安全状态 → 跳过；命令与状态面仍可用）
 
   // 分享后自动初始化三线布局与只读 ACL（专项「进程内自动初始化」）：versions.git/stable/latest
   // 均 gitignored、不随仓库分发 → 项目被分享（clone/拷贝）后布局缺失/损坏/ACL 丢失 →
@@ -687,16 +728,35 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   ).then((r) => {
     if (r.ok === false) {
       recordDegradation('boot/stable', `启动校验失败：版本线 ${r.line} 无恢复路径（${r.warnings.map((w) => w.kind).join(',')}）`);
+      pendingNotifications.push({
+        kind: 'kernel-not-loaded',
+        send: (n) => {
+          if (kernelNotLoadedNotified) return;
+          kernelNotLoadedNotified = true;
+          n.notifyKernelNotLoaded(`启动校验失败（版本线 ${r.line} 无恢复路径：${r.warnings.map((w) => w.kind).join(',')}）`);
+        },
+      });
     } else if (r.rollback !== undefined) {
       recordDegradation('boot/stable', `启动自动回退：${r.rollback.previous_head.slice(0, 8)} → ${r.rollback.new_head.slice(0, 8)}（worktree ${r.rollback.worktree_status}）`);
+      // 启动自动回退 = 恢复根损坏过 → 主人该知道（数据安全相关，非高频）
+      pendingNotifications.push({
+        kind: 'startup-rollback',
+        send: (n) =>
+          n.notifyStartupRollback(
+            `恢复根校验未过（${r.warnings.map((w) => w.kind).join(',') || '未知告警'}），已回退 ${r.rollback!.previous_head.slice(0, 8)} → ${r.rollback!.new_head.slice(0, 8)}`,
+          ),
+      });
     }
     return { ok: r.ok, line: r.line, warnings: r.warnings, rollback: r.rollback };
-  }).catch((err) => {
+  }).catch((err): BootReady => {
     const detail = err instanceof Error ? err.message : String(err);
     recordDegradation('boot/stable', `启动校验异常（${detail}）——跳过自动回退`);
     return { ok: false, line: 'stable', warnings: [], rollback: undefined };
+  }).then((settled: BootReady): BootReady => {
+    // boot 是异步的：它的告警/回退（最该告知主人的一类事件）在通知桥就绪之后才产生 → settle 时补发
+    flushPendingNotifications();
+    return settled;
   });
-
   /**
    * R2 boot gate：恢复完成前认知运行时不得进入可服务状态——认知服务入口统一 await 本 gate。
    * boot settle 前 → 等待（事件/请求暂存，恢复完成后处理）；boot 失败（无恢复路径）→ 返回 false
@@ -848,6 +908,43 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     );
   }
 
+  /**
+   * 桌面通知桥（已知问题《待实现：与 dsh-desktop-notify 的兼容》）：
+   * 宿主装了 `dsh-desktop-notify` 时经其推送管线发"值得打扰主人"的少数通知；未装 → 全静默（零痕迹）。
+   * 只在白名单事件上出声（见 runtime/notify.ts 的"什么算值得打扰"），并做同 kind 节流 + 内容去重 +
+   * 会话内总量上限——**默认沉默**是这套机制的第一纪律。
+   */
+  const desktopNotifyService = ((): DesktopNotifyLike | null => {
+    if (config.desktopNotify === false) {
+      return null;
+    }
+    try {
+      const svc = readService<unknown>(ctx, 'desktopNotify');
+      if (isDesktopNotifyLike(svc)) {
+        return svc;
+      }
+      if (svc !== undefined && config.desktopNotify === true) {
+        // 显式要求但形状不对 → 留痕（部署声明与实际不符，属于要能查的配置问题）
+        recordDegradation('notify/service', 'desktopNotify 服务形状不符（缺少 push/pushAlways）——通知面未接线');
+      }
+      return null;
+    } catch {
+      return null; // 未注入/读取抛错 → 静默（宿主没装这个插件不是故障）
+    }
+  })();
+  const notify = new NotifyBridge({ service: desktopNotifyService });
+  /**
+   * 补发已入队的通知（幂等：队列清空后无动作）。
+   * 调用点：桥就绪后立即一次 + 启动校验结算后一次（boot 是异步的——它的告警/回退在桥就绪之后才产生，
+   * 故必须在它 settle 时再补发一次；否则"启动回退"这类最该告知的事件会静默丢掉）。
+   */
+  const flushPendingNotifications = (): void => {
+    for (const pending of pendingNotifications.splice(0)) {
+      pending.send(notify);
+    }
+  };
+  flushPendingNotifications();
+
   if (cognitive === undefined && safeState.ok) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
     const root = resolveConfigPath(config.cognitiveRoot);
@@ -933,8 +1030,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       //    队列与债务持久在磁盘，队列空时零开销。
       // ③ 债务阈值 soft/hard/critical 由组合根 ready() 从 policy.evolve.debt_thresholds 注入
       //    （数据即机制——改 evolve.yaml 即生效，与 decideEvolution 的债务门禁同源，两处不再各持一套缺省）。
-      // ④ 任务重建面（已知问题《债务与"还债的人"不同源》修复）：队列跨重启持久化（queue.json），
-      //    加载时经 restoreTask 按 id 重建执行体 → 债务与"负责还债的任务"同源。装配顺序上运行时在
+      // ④ 任务重建面（已知问题《债务与"还债的人"不同源》修复）：队列跨重启持久化（queue.json），      //    加载时经 restoreTask 按 id 重建执行体 → 债务与"负责还债的任务"同源。装配顺序上运行时在
       //    调度器之后创建 → restoreTask 走闭包延迟取（未就绪时调度器不改动队列、下次调度重试；
       //    见 MaintenanceScheduler.restoreQueueIfNeeded 的就绪语义）。
       const maintenance = new MaintenanceScheduler({
@@ -989,6 +1085,21 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
         // 队列重建面就绪（已知问题《债务与"还债的人"不同源》）：此后调度器再次进入时会把盘上
         // 未完成队列按 id 重建回来（运行时未就绪期间调度器不改动队列——见 restoreQueueIfNeeded）
         maintenanceTaskFactory = (id) => cognitive?.maintenanceTaskFactory?.()(id) ?? null;
+        // 组件健康异常（健康检查打 suspicious = 能力面受损）→ 告知主人；检查只读状态面、无副作用，
+        // 且由 NotifyBridge 去重（同内容不重复发）
+        void (async () => {
+          try {
+            const st = await cognitive?.status?.();
+            const unhealthy = (st?.components?.health ?? []).filter((h) => !h.ok);
+            if (unhealthy.length > 0) {
+              notify.notifyComponentUnhealthy(
+                unhealthy.map((h) => `${h.manifest_id}（${h.detail}）`).join('；'),
+              );
+            }
+          } catch {
+            // 状态面不可读 → 不打扰（不发比发错好）
+          }
+        })();
       } catch (err) {
         // 已知问题《内核加载失败不得阻塞宿主》：**装配期异常外溢是历史故障根因**（Guard 读取错误、
         // 记忆库缺列两次实测阻塞宿主）。此处兜底：内核不加载 + 记录原因 + 宿主照常启动与运行；
@@ -1287,6 +1398,45 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           const detail = err instanceof Error ? err.message : String(err);
           recordDegradation('maintenance/quantum', `请求间隙维护执行失败（${detail}）`);
         });
+        // 债务堆到 critical 档 → 保护性自锁已生效（演化/晋升被硬限拦住），主人该知道。
+        // 检查点放在维护量子之后（债务刚变化）+ 由 NotifyBridge 节流（同 kind 30 分钟一次），
+        // 故不会随轮次刷屏；判定只读状态面，零副作用。
+        try {
+          const limits = m.limitsSnapshot?.();
+          if (limits !== undefined && limits.band === 'critical') {
+            notify.notifyDebtCritical(limits.total, limits.critical, { sessionId });
+          }
+        } catch {
+          // 状态面读取失败 → 不打扰（不发比发错好）
+        }
+        // error 池条目增加 = 晋升后的对象线上退化并已回退归档（"修好的东西又退回去了"）。
+        // 观测面：error 池计数（只读）；频次天然很低，且由 NotifyBridge 去重兜底。
+        void (async () => {
+          try {
+            const counts = await cognitive?.errorPoolCounts?.();
+            if (counts === undefined) {
+              return;
+            }
+            const total = Object.values(counts).reduce((a, b) => a + b, 0);
+            if (!errorPoolBaselineSet) {
+              // 首读只记基线：启动时把历史归档当成"刚刚回退"是误报
+              errorPoolBaselineSet = true;
+              lastErrorPoolTotal = total;
+              return;
+            }
+            if (total > lastErrorPoolTotal) {
+              lastErrorPoolTotal = total;
+              notify.notifyPromotionRollback(
+                `error 池新增归档（组件：${Object.entries(counts)
+                  .map(([c, n]) => `${c}=${n}`)
+                  .join(', ')}）`,
+                { sessionId },
+              );
+            }
+          } catch {
+            // 观测面不可读 → 不打扰
+          }
+        })();
       }
       // T8.26.5 惰性收尾（无 flush 触发时的退化路径）：先收尾上一 turn，再准备本 turn
       if (pendingFinalize.has(sessionId)) {

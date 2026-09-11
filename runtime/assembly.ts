@@ -4603,6 +4603,23 @@ export class CognitiveRuntime {
     return chain.outcomes;
   }
 
+  /**
+   * error 池计数（P1e/S6 错误分支池的只读观测面：`{组件: 条数}`）。
+   * 消费方 = 桌面通知桥（已知问题《待实现：与 dsh-desktop-notify 的兼容》）：error 池条目增加
+   * 意味着"晋升后的对象线上退化 → 已回退并归档为负样本"——这是主人该知道的事，且天然低频。
+   * 只读（读路径不建目录）；失败 → 返回空（通知面据此不发，宁可漏报也不误报）。
+   */
+  async errorPoolCounts(): Promise<Record<string, number>> {
+    try {
+      // S6 error 池计数读在 supervisor 侧（layer 1）；runtime 只做只读汇总（不 import kernel 逻辑）
+      const { CandidatePool } = await import('../supervisor/candidates.js');
+      const pool = new CandidatePool(this.evolutionRoot);
+      return await pool.errorCounts();
+    } catch {
+      return {};
+    }
+  }
+
   /** 候选管线自证回执（状态面/测试可读：candidate-pipeline 债务释放的依据来源） */
   candidatePipelineRun(): { ts: number; candidates: number; validated: number; promoted: number } | null {
     return this.lastCandidatePipelineRun;
