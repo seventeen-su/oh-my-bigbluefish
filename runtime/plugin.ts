@@ -17,6 +17,7 @@ import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
 import { evaluateSafeState, substrateRootOf } from '../substrate/safe-state.js';
 // 外核平台提供者（状态面暴露当前平台与能力；排障用）
 import { platformProvider } from '../substrate/platform.js';
+import { sandboxStatusAsync } from '../substrate/sandbox.js';
 import { bootStable, type BootOptions, type BootResult } from '../substrate/boot.js';
 import { modeCommandHandler } from '../substrate/mode-command.js';
 import { loadBenchTasks, makeReplayExecutor, runBench, BENCH_REPORTS_DIR } from '../supervisor/bench.js';
@@ -444,7 +445,9 @@ export interface ApplyResult {
     kernel_loaded: boolean;
     details: Record<string, string>;
   };
-  /** 平台能力快照（识别层输出；排障与状态面用） */
+  /** 平台能力快照（识别层输出；排障与状态面用）。sandbox_* 字段来自 substrate/sandbox.ts 的
+   *  **通道自检**（sandboxStatusAsync）：`sandbox_reachable` 才是「候选验证能不能真的跑起来」的答案——
+   *  known issue《Linux 适配不完整》派生条：只看机制类别会把"机制在但自检不过"误报成可用。 */
   platform?: {
     platform: string;
     raw: string;
@@ -452,6 +455,12 @@ export interface ApplyResult {
     read_only_available: boolean;
     sandbox: string;
     sandbox_available: boolean;
+    /** 受限通道自检结论（true = 授权目录写成功 + 非授权目录写被拒，真实探针跑过） */
+    sandbox_reachable: boolean;
+    /** 实际通道标识（自检可用时；如 win32-restricted-token / posix-bwrap / posix-node-permission） */
+    sandbox_mechanism: string | null;
+    sandbox_reason: string | null;
+    sandbox_self_test: string | null;
     degraded: string | null;
   };
   /** 内核未加载时的状态面兜底数据源（kern_status 用——保证"能看到为什么没加载"） */
@@ -1681,5 +1690,33 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
    * 可经状态面与日志查看）。内核已装配 → 并入其状态摘要（`safe_state` 段）；内核未装配（安全状态或
    * 装配失败）→ 仍返回本段（命令面与状态面尽力保留）。
    */
-  return { cognitive, safeState: safeStateView(), platform: platformProvider().caps, safeStateRuntime: safeStateRuntime() };
+  // 受限通道自检（sandboxStatusAsync：平台机制 + 真实探针"授权目录写成功 + 非授权目录写被拒"）——
+  // 与候选验证 G3-exec 使用同一判定入口，避免"状态面说可用、门禁处却降级"的口径分叉。
+  // 自检异步且带子进程，故不阻塞 apply：先给同步能力面，自检完成后并入（命令面/状态面均已就绪）。
+  const platformCaps = platformProvider().caps;
+  const platformView: NonNullable<ApplyResult['platform']> = {
+    platform: platformCaps.platform,
+    raw: platformCaps.raw,
+    read_only: platformCaps.read_only,
+    read_only_available: platformCaps.read_only_available,
+    sandbox: platformCaps.sandbox,
+    sandbox_available: platformCaps.sandbox_available,
+    sandbox_reachable: false,
+    sandbox_mechanism: null,
+    sandbox_reason: null,
+    sandbox_self_test: null,
+    degraded: platformCaps.degraded,
+  };
+  void sandboxStatusAsync()
+    .then((st) => {
+      platformView.sandbox_reachable = st.available;
+      platformView.sandbox_mechanism = st.mechanism ?? null;
+      platformView.sandbox_reason = st.reason ?? null;
+      platformView.sandbox_self_test = st.self_test_note ?? null;
+    })
+    .catch(() => {
+      platformView.sandbox_reason = '受限通道自检异常（按不可用处理）';
+    });
+
+  return { cognitive, safeState: safeStateView(), platform: platformView, safeStateRuntime: safeStateRuntime() };
 }

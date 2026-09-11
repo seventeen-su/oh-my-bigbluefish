@@ -17,6 +17,8 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
+// 路径比较口径单一裁决点（大小写按平台 + 分隔符边界；已知问题《路径大小写被无条件放大》）
+import { isPathUnder } from '../substrate/paths.js';
 import {
   ArtifactManifestSchema,
   artifactManifestId,
@@ -127,13 +129,14 @@ function payloadText(payload: unknown): string {
   }
 }
 
-/** resolved 路径是否在 root 之下（含 root 自身；Windows 大小写不敏感比较） */
+/**
+ * resolved 路径是否在 root 之下（含 root 自身）。
+ * 已知问题《路径大小写被无条件放大》修复：大小写口径按平台（Windows/macOS 不敏感，Linux 敏感）
+ * + 以分隔符为边界（`/srv/app/workspace` 不吃 `/srv/app/Workspace`，`/tmp` 不吃 `/tmp2`）——
+ * 此前无条件 `toLowerCase()` + 无边界前缀会把根之外的文件判成"可恢复"（读取声明根之外的文件）。
+ */
 function isUnderRoot(resolved: string, root: string): boolean {
-  const r = resolve(root);
-  const prefix = r.endsWith('/') || r.endsWith('\\') ? r : r + (process.platform === 'win32' ? '\\' : '/');
-  const a = resolved.toLowerCase();
-  const b = prefix.toLowerCase();
-  return a === r.toLowerCase() || a.startsWith(b);
+  return isPathUnder(resolved, resolve(root));
 }
 
 // ---- Artifact Index（layer 1 JSONL；构造零 I/O——首写建目录；幂等） ----

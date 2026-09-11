@@ -28,7 +28,7 @@ import { basename, dirname, join } from 'node:path';
 import { load as parseYaml } from 'js-yaml';
 import { GIT_BIN, type VersionLayout } from '../substrate/snapshot.js';
 import { resolveLineCommit } from '../substrate/lines.js';
-import { createCandidateDir, runRestricted, sandboxStatus, type SandboxStatus } from '../substrate/sandbox.js';
+import { createCandidateDir, runRestricted, sandboxStatusAsync, type SandboxStatus } from '../substrate/sandbox.js';
 // S9：dynamicCordisRunner 候选验证增强通道（宿主面存在 → 候选验证脚本经 runner 动态定义/运行/回退；
 // 缺失/部分缺失/通道失败 → 降级回退受限子进程路径——接口守卫与通道见 dynamic-runner.ts）
 import { inspectDynamicRunner, runCandidateViaRunner, type DynamicCordisRunnerLike } from './dynamic-runner.js';
@@ -98,6 +98,16 @@ export interface G3ExecGateResult extends GateResult {
   degraded?: string;
   /** 受限执行结果（kind='exec' 且走受限子进程路径时；code/timedOut） */
   exec?: { code: number | null; timedOut: boolean };
+  /**
+   * 本次执行是否**真实发生**（kind='exec'）——即「候选带着验证脚本真的在受限通道里跑过一次」。
+   * 已知问题《Linux 适配不完整》派生条的观测位：kind='degraded'/'na' → false。
+   * 消费方（候选记录/Evolution Object/promotion gate）据此区分「验过」与「没验」。
+   */
+  strict: boolean;
+  /** 实际使用的受限通道标识（kind='exec' 时；排障与审计用） */
+  channel?: string;
+  /** 通道机制说明（可用性口径/限制面；kind='exec' 时记录） */
+  channel_note?: string;
   /** S9：dynamicCordisRunner 通道执行详情（kind='exec' 且经 runner 通道时；受限子进程路径无此字段） */
   runner?: {
     pluginId: string;
@@ -129,6 +139,14 @@ export interface DataCandidateValidation {
   reason: string;
   /** G3 冻结基准对照（晋升 Evolution Object.bench 用；未跑 G3 → undefined） */
   bench?: BenchCompare;
+  /**
+   * 执行型验证完整性（晋升与审计的可读结论）：
+   *   - `exec`：候选附验证脚本且**真实执行通过**（受限通道跑过）；
+   *   - `na`：候选未附执行型验证脚本（L0 数据候选；无内容可执行——非「跳过」）；
+   *   - `degraded`：候选附了脚本但受限通道不可用/异常 → **没跑过**（旧实现把它当通过，是已知问题）；
+   *   - `rejected`：脚本执行了但报告失败/裁决问题 → 候选不通过。
+   */
+  execution_verification: 'exec' | 'na' | 'degraded' | 'rejected';
 }
 
 /** 验证依赖（baselinePolicyDir = 当前线生效策略目录；bench 目录缺省冻结基准 v2） */
@@ -143,12 +161,18 @@ export interface DataCandidateValidationDeps {
   shadowLogPath?: string;
   /** 候选验证临时目录根（P3 标准化：createCandidateDir；缺省 substrate 默认 candidates 根；测试注入 fixture 根） */
   candidateRoot?: string;
-  /** 受限通道可用性探测（P3/D5 降级注入：缺省真实 sandboxStatus；测试注入不可用模拟） */
-  sandboxStatus?: () => SandboxStatus;
+  /** 受限通道可用性探测（P3/D5 降级注入：缺省真实 sandboxStatusAsync——**带通道自检**的精确判定；
+   *  测试注入不可用模拟） */
+  sandboxStatus?: () => Promise<SandboxStatus>;
   /** S9：dynamicCordisRunner 注入面（宿主 ctx.dynamicCordisRunner 结构最小面；缺失/部分缺失 → 守卫降级受限子进程路径） */
   dynamicRunner?: DynamicCordisRunnerLike;
   /** S9：会话归属（runner 通道 define.sessionId/agent.id 契约；缺省 'anon'） */
   sessionId?: string;
+  /**
+   * 附执行型验证脚本的候选是否必须真实执行通过（evolve.policy.candidate_gate.require_execution_verification；
+   * 缺省 true = fail-closed）。见 runG3Exec 的降级语义段。
+   */
+  requireExecutionVerification?: boolean;
 }
 
 /** 晋升依赖（§3.2 事务 + §6.5.4 对象 + 实现规格 §10 幂等） */
@@ -202,6 +226,8 @@ export interface CandidateOutcome {
   commit_hash?: string;
   object_id?: string;
   reason?: string;
+  /** 执行型验证完整性（'exec' 真实跑过 / 'na' 无脚本 / 'degraded' 没跑成 / 'rejected' 跑失败） */
+  execution_verification?: DataCandidateValidation['execution_verification'];
 }
 
 /** P4：候选验证契约门禁结果（deps 注入回调产物；verification 为晋升 Evolution Object 挂载 payload——ok=true 时携带） */
@@ -490,20 +516,32 @@ async function runG3(draft: CandidateDraft, deps: DataCandidateValidationDeps): 
  *      host 半 harness.handle('verify', handler)）→ stop（回退 dispose）→ undefine（先停后忘）。
  *      verdict.ok=false（脚本报告失败）≠ 通道失败——按受限路径同语义拒绝候选。
  *      通道失败（define/run/invoke 抛错或拒绝）→ 记录 runnerFallback → 回退受限子进程路径。
- *   2. 受限子进程路径（既有行为，零变化）：候选验证环境（createCandidateDir：基线 policy 物化副本 +
- *      候选覆盖 + verify.cjs 宿主写入——白名单固定名，仅候选目录内）→ WRITE_RESTRICTED 受限通道执行
- *      （cwd=候选目录，writableDirs=[结果目录]，结果文件经 OMB_SANDBOX_RESULT_FILE 回传——受限进程
- *      不能管道捕获孙进程输出 → 结果文件方案）→ 宿主读结果 JSON 判定（{ok, detail} 契约）+ 沙盒语义
- *      验证（脚本尝试写候选目录必须被拒；宿主侧执行前后快照比对——候选目录被改 → 沙盒失效 fail-closed 拒绝）。
- * 降级（D5）：两通道均不可用（runner 缺失/部分缺失/通道失败 + 受限通道不可用（sandboxStatus 注入/真实）
- * 或受限执行异常）→ kind='degraded' 记录跳过，不阻塞 G1/G3-replay 判定，门禁语义保持。
+ *   2. 受限子进程路径（平台无关：Windows 受限令牌 / POSIX bwrap 或 Node 权限模型）：候选验证环境
+ *      （createCandidateDir：基线 policy 物化副本 + 候选覆盖 + verify.cjs 宿主写入——白名单固定名，
+ *      仅候选目录内）→ WRITE_RESTRICTED 受限通道执行（cwd=候选目录，writableDirs=[结果目录]，
+ *      结果文件经 OMB_SANDBOX_RESULT_FILE 回传——受限进程不能管道捕获孙进程输出 → 结果文件方案）
+ *      → 宿主读结果 JSON 判定（{ok, detail} 契约）+ 沙盒语义验证（脚本尝试写候选目录必须被拒；
+ *      宿主侧执行前后快照比对——候选目录被改 → 沙盒失效 fail-closed 拒绝）。
+ *
+ * **降级语义（已知问题《Linux 适配不完整》派生条，本次修复的核心）**：
+ * `opts.requireExecution`（缺省 true，来自 evolve.policy.candidate_gate.require_execution_verification）
+ * 决定「带脚本的候选在通道不可用/抛错时」的走向：
+ *   - true（缺省，fail-closed）：`ok=false` + `kind='degraded'` → 候选**不通过**，不入晋升。
+ *     旧实现在此处返回 `ok=true`，且晋升门禁不读降级位 → 无沙盒的机器上候选可能一次真实执行都没跑
+ *     就晋级。现在「没验过」不再等于「验过了」。
+ *   - false（部署方显式接受降级）：`ok=true` + `kind='degraded'`（既有 D5 语义），但 `strict=false`
+ *     随候选记录/演化学对象一路留痕（谁在什么通道下验的，可审计）。
+ * 无论哪种取向：已经跑过的脚本报失败（verdict.ok=false / 非零退出 / 结果文件缺失 / 沙盒语义失效 /
+ * 超时）一律**拒绝**——降级策略只放宽「没跑成」，绝不放宽「跑失败」。
  */
 async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDeps): Promise<G3ExecGateResult> {
+  const requireExecution = deps.requireExecutionVerification ?? true;
   if (draft.verify === undefined) {
     return {
       gate: 'G3',
       ok: true,
       kind: 'na',
+      strict: false,
       detail:
         'G3-exec N/A（L0 数据候选无执行型验证脚本——受限执行通道就绪，候选未附带验证内容；L1 代码候选未来复用）',
     };
@@ -537,6 +575,9 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
               gate: 'G3',
               ok: true,
               kind: 'exec',
+              strict: true,
+              channel: 'dynamic-cordis-runner',
+              channel_note: 'dynamicCordisRunner 通道（define→run→invoke verify→stop→undefine）',
               runner: runnerDetail,
               detail: `G3-exec 通过: dynamicCordisRunner 通道执行 OK（define→run→invoke verify→stop→undefine；verdict=${detailText}）`,
             };
@@ -546,6 +587,8 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
             gate: 'G3',
             ok: false,
             kind: 'exec',
+            strict: true,
+            channel: 'dynamic-cordis-runner',
             runner: runnerDetail,
             detail: `G3-exec 拒绝: 验证脚本报告失败（${detailText}）——dynamicCordisRunner 通道`,
           };
@@ -560,15 +603,32 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
     }
   }
 
-  // ---- 受限子进程路径（既有行为；runner 通道缺失/失败时回退至此） ----
-  const status = (deps.sandboxStatus ?? sandboxStatus)();
+  // ---- 受限子进程路径（平台无关；runner 通道缺失/失败时回退至此） ----
+  const status = await (deps.sandboxStatus ?? sandboxStatusAsync)();
   if (!status.available) {
+    // D5 降级记录 + 门禁语义按配置取舍：缺省 fail-closed（没验过 ≠ 验过了）
+    const degradedReason = [status.reason ?? '受限通道不可用', runnerFallback].filter(Boolean).join('；');
+    if (requireExecution) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'degraded',
+        strict: false,
+        degraded: degradedReason,
+        detail:
+          `G3-exec 拒绝: 候选附有执行型验证脚本但受限通道不可用（${status.reason ?? '未知原因'}` +
+          `${runnerFallback !== undefined ? `；${runnerFallback}` : ''}）——` +
+          'require_execution_verification=true（fail-closed）：没有真实执行过的候选不进入晋升；' +
+          '如需在无沙盒环境接受降级跳过，请显式设置 evolve.policy.candidate_gate.require_execution_verification=false',
+      };
+    }
     return {
       gate: 'G3',
       ok: true,
       kind: 'degraded',
-      degraded: [status.reason ?? '受限通道不可用', runnerFallback].filter(Boolean).join('；'),
-      detail: `G3-exec 跳过（受限通道不可用：${status.reason ?? '未知原因'}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+      strict: false,
+      degraded: degradedReason,
+      detail: `G3-exec 跳过（受限通道不可用：${status.reason ?? '未知原因'}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，部署方已显式接受降级跳过；strict=false 随候选留痕）`,
     };
   }
   const name = candidateDirName(draft.id);
@@ -591,12 +651,15 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
       resultFile,
       timeoutMs: G3_EXEC_TIMEOUT_MS,
     });
+    const channelInfo = { channel: status.mechanism, channel_note: status.mechanism_note };
     const tampered = diffSnapshot(before, await snapshotDir(cand.dir));
     if (tampered !== null) {
       return {
         gate: 'G3',
         ok: false,
         kind: 'exec',
+        strict: true,
+        ...channelInfo,
         exec,
         detail: `G3-exec 拒绝: 沙盒语义失效——受限进程改写了候选目录（${tampered}），WRITE_RESTRICTED 未生效`,
       };
@@ -606,8 +669,10 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
         gate: 'G3',
         ok: false,
         kind: 'exec',
+        strict: true,
+        ...channelInfo,
         exec,
-        detail: 'G3-exec 拒绝: 验证脚本超时（受限进程被 TerminateJobObject 终止，结果文件未回传）',
+        detail: 'G3-exec 拒绝: 验证脚本超时（受限进程被终止，结果文件未回传）',
       };
     }
     if (exec.code !== 0) {
@@ -615,6 +680,8 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
         gate: 'G3',
         ok: false,
         kind: 'exec',
+        strict: true,
+        ...channelInfo,
         exec,
         detail: `G3-exec 拒绝: 验证脚本非零退出（code=${exec.code}）`,
       };
@@ -628,6 +695,8 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
         gate: 'G3',
         ok: false,
         kind: 'exec',
+        strict: true,
+        ...channelInfo,
         exec,
         detail: `G3-exec 拒绝: 验证脚本未写合法结果文件（结果文件方案失败：${(err as Error).message}）`,
       };
@@ -637,6 +706,8 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
         gate: 'G3',
         ok: false,
         kind: 'exec',
+        strict: true,
+        ...channelInfo,
         exec,
         detail: `G3-exec 拒绝: 验证脚本报告失败（${typeof verdict.detail === 'string' ? verdict.detail : '无 detail'}）`,
       };
@@ -646,17 +717,34 @@ async function runG3Exec(draft: CandidateDraft, deps: DataCandidateValidationDep
       gate: 'G3',
       ok: true,
       kind: 'exec',
+      strict: true,
+      ...channelInfo,
       exec,
-      detail: `G3-exec 通过: 受限通道执行 OK（code=${exec.code}）+ 结果文件回传（${detailText}）+ 沙盒语义验证（候选目录写拒绝）${runnerFallback !== undefined ? `；${runnerFallback}` : ''}`,
+      detail: `G3-exec 通过: 受限通道（${status.mechanism ?? 'unknown'}）执行 OK（code=${exec.code}）+ 结果文件回传（${detailText}）+ 沙盒语义验证（候选目录写拒绝）${runnerFallback !== undefined ? `；${runnerFallback}` : ''}`,
     };
   } catch (err) {
-    // D5：受限执行异常（Win32 失败等）→ 降级记录，不阻塞门禁语义
+    // 受限执行异常（Win32/POSIX 通道失败、koffi 缺失等）→ 与「通道不可用」同一取舍（requireExecution）
+    const degradedReason = [(err as Error).message, runnerFallback].filter(Boolean).join('；');
+    if (requireExecution) {
+      return {
+        gate: 'G3',
+        ok: false,
+        kind: 'degraded',
+        strict: false,
+        degraded: degradedReason,
+        detail:
+          `G3-exec 拒绝: 受限执行异常（${(err as Error).message}` +
+          `${runnerFallback !== undefined ? `；${runnerFallback}` : ''}）——` +
+          'require_execution_verification=true（fail-closed）：没有真实执行过的候选不进入晋升',
+      };
+    }
     return {
       gate: 'G3',
       ok: true,
       kind: 'degraded',
-      degraded: [(err as Error).message, runnerFallback].filter(Boolean).join('；'),
-      detail: `G3-exec 跳过（受限执行异常：${(err as Error).message}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，不阻塞 G1/G3-replay 判定）`,
+      strict: false,
+      degraded: degradedReason,
+      detail: `G3-exec 跳过（受限执行异常：${(err as Error).message}${runnerFallback !== undefined ? `；${runnerFallback}` : ''}——D5 降级记录，部署方已显式接受降级跳过；strict=false 随候选留痕）`,
     };
   } finally {
     cand.cleanup();
@@ -691,8 +779,8 @@ async function runG4(draft: CandidateDraft, deps: DataCandidateValidationDeps): 
 
 /**
  * 数据候选验证生产路径（§6.5.3 G1-G4）：G1 静态 → G2 skipped → G3-replay 冻结基准回放 fitness →
- * G3-exec 执行型验证（受限通道 + 结果文件方案；无脚本 N/A / 通道不可用降级 D5）→ G4 shadow。
- * G1/G3-replay 任一失败 → passed=false + reason（门禁短路：后续门不跑在失败后）。
+ * G3-exec 执行型验证（受限通道 + 结果文件方案；无脚本 N/A / 通道不可用按 requireExecutionVerification
+ * 取舍）→ G4 shadow。G1/G3-replay 任一失败 → passed=false + reason（门禁短路：后续门不跑在失败后）。
  */
 export async function validateDataCandidate(
   draft: CandidateDraft,
@@ -700,7 +788,7 @@ export async function validateDataCandidate(
 ): Promise<DataCandidateValidation> {
   const g1 = runG1(draft);
   if (!g1.ok) {
-    return { passed: false, gates: { g1, g2: G2_SKIPPED }, reason: `验证失败: ${g1.detail}` };
+    return { passed: false, gates: { g1, g2: G2_SKIPPED }, reason: `验证失败: ${g1.detail}`, execution_verification: 'na' };
   }
   const g3 = await runG3(draft, deps);
   if (!g3.ok) {
@@ -709,16 +797,19 @@ export async function validateDataCandidate(
       gates: { g1, g2: G2_SKIPPED, g3 },
       reason: `验证失败: ${g3.detail}`,
       bench: g3.bench,
+      execution_verification: 'na',
     };
   }
   const g3Exec = await runG3Exec(draft, deps);
   if (!g3Exec.ok) {
-    // G3-exec 执行型验证拒绝（脚本报告失败 / 结果文件方案失败 / 沙盒语义失效）→ 候选不通过
+    // G3-exec 拒绝：脚本报告失败 / 结果文件方案失败 / 沙盒语义失效 / 降级且 require_execution_verification
+    // → 候选不通过（后者 = 已知问题《Linux 适配不完整》派生条的修复点：没验过不再等于验过了）
     return {
       passed: false,
       gates: { g1, g2: G2_SKIPPED, g3, g3Exec },
       reason: `验证失败: ${g3Exec.detail}`,
       bench: g3.bench,
+      execution_verification: g3Exec.kind === 'degraded' ? 'degraded' : 'rejected',
     };
   }
   const g4 = await runG4(draft, deps);
@@ -729,7 +820,23 @@ export async function validateDataCandidate(
     gates: { g1, g2: G2_SKIPPED, g3, g3Exec, g4 },
     reason: `验证通过（G1+G3-replay${g3ExecNote}；G2 skipped；G4 shadow 已标记）`,
     bench: g3.bench,
+    execution_verification: g3Exec.kind === 'exec' ? 'exec' : g3Exec.kind === 'degraded' ? 'degraded' : 'na',
   };
+}
+
+/** 执行型验证完整性 → 候选记录 gates_passed 的留痕条目（跨进程可审计：谁在什么通道下验的） */
+export function executionVerificationGateNote(v: DataCandidateValidation): string {
+  const exec = v.gates.g3Exec;
+  switch (v.execution_verification) {
+    case 'exec':
+      return `G3-exec:strict${exec?.channel !== undefined ? `(${exec.channel})` : ''}`;
+    case 'degraded':
+      return 'G3-exec:degraded(no-channel)';
+    case 'rejected':
+      return 'G3-exec:rejected';
+    default:
+      return 'G3-exec:na(no-script)';
+  }
 }
 
 // ---- Evolution Object（§6.5.4：parent/diff/provenance/compat/bench/verifications → git） ----
@@ -1076,11 +1183,21 @@ export async function runCandidatePipeline(
     contractsDir: deps.contractsDir,
     fixturesDir: deps.fixturesDir,
     shadowLogPath: deps.shadowLogPath,
+    candidateRoot: deps.candidateRoot,
+    sandboxStatus: deps.sandboxStatus,
+    requireExecutionVerification: deps.requireExecutionVerification,
     dynamicRunner: deps.dynamicRunner,
     sessionId: deps.sessionId,
   });
   if (!vr.passed) {
-    return { ...base, validated: false, gates: vr.gates, promoted: false, reason: `验证失败: ${vr.reason}` };
+    return {
+      ...base,
+      validated: false,
+      gates: vr.gates,
+      promoted: false,
+      reason: `验证失败: ${vr.reason}`,
+      execution_verification: vr.execution_verification,
+    };
   }
 
   // P4：验证契约门禁（deps 注入回调——supervisor 不 import kernel 逻辑；未提供 → 跳过，既有行为不变；
@@ -1095,6 +1212,7 @@ export async function runCandidatePipeline(
         gates: vr.gates,
         promoted: false,
         reason: `验证契约门禁拒绝（degraded，不触碰版本库）: ${gateResult.reason}`,
+        execution_verification: vr.execution_verification,
       };
     }
   }
@@ -1106,7 +1224,8 @@ export async function runCandidatePipeline(
     status: 'untrusted',
     parent: null,
     lineage: [],
-    gates_passed: ['G1', 'G3'],
+    // 执行型验证完整性一并留痕（跨进程可审计：候选是靠真实执行通过的，还是靠降级跳过/无脚本通过的）
+    gates_passed: ['G1', 'G3', executionVerificationGateNote(vr)],
     created: Date.now(),
     provenance: 'evolution/generator',
   };
@@ -1119,7 +1238,14 @@ export async function runCandidatePipeline(
     });
   } catch (err) {
     if (err instanceof Error && /已注册/.test(err.message)) {
-      return { ...base, validated: false, gates: vr.gates, promoted: false, reason: 'duplicate（候选已注册）' };
+      return {
+        ...base,
+        validated: false,
+        gates: vr.gates,
+        promoted: false,
+        reason: 'duplicate（候选已注册）',
+        execution_verification: vr.execution_verification,
+      };
     }
     throw err;
   }
@@ -1129,7 +1255,7 @@ export async function runCandidatePipeline(
     evolutionRoot: deps.evolutionRoot,
     record,
     bench: vr.bench ?? { baseline: { passed: 0, total: 0 }, candidate: { passed: 0, total: 0 }, cost_degradation_ratio: 0 },
-    verifications: ['G1', 'G3'],
+    verifications: ['G1', 'G3', executionVerificationGateNote(vr)],
     sourceEvents: deps.sourceEvents ?? [],
     motivation: draft.motivation,
     identity: deps.identity,
@@ -1147,5 +1273,6 @@ export async function runCandidatePipeline(
     commit_hash: pr.commit_hash,
     object_id: pr.object_id,
     reason: pr.reason,
+    execution_verification: vr.execution_verification,
   };
 }

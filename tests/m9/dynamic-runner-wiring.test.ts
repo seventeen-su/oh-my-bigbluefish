@@ -337,10 +337,11 @@ describe('W3 端到端 ④：候选验证增强通道（参照 m8 dynamic-runner
           baselinePolicyDir: await baselinePolicyDirOf(fx),
           candidateRoot,
           dynamicRunner: runner,
-          sandboxStatus: () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          requireExecutionVerification: false,
         },
       );
-      expect(r.passed).toBe(true); // 降级不阻塞门禁语义（G1/G3-replay 照常）
+      expect(r.passed).toBe(true); // 部署方显式接受降级时不阻塞门禁语义（G1/G3-replay 照常）
       expect(r.gates.g3Exec?.kind).toBe('degraded');
       expect(r.gates.g3Exec?.ok).toBe(true);
       // runnerFallback 记录：通道失败 → 回退受限子进程路径
@@ -365,7 +366,8 @@ describe('W3 端到端 ④：候选验证增强通道（参照 m8 dynamic-runner
           baselinePolicyDir: await baselinePolicyDirOf(fx),
           candidateRoot,
           dynamicRunner: runner,
-          sandboxStatus: () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          requireExecutionVerification: false,
         },
       );
       expect(r.passed).toBe(true);

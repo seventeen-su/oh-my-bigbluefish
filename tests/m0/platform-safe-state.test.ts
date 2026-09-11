@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { platformProvider, resetPlatformProviderCache } from '../../substrate/platform.js';
+import { sandboxStatus, sandboxStatusAsync } from '../../substrate/sandbox.js';
 import { evaluateSafeState } from '../../substrate/safe-state.js';
 import { defaultLayout } from '../../substrate/snapshot.js';
 import type { CognitiveRuntime } from '../../runtime/assembly.js';
@@ -43,7 +44,9 @@ describe('① 识别：平台类别与能力（能力缺失 → 显式降级标�
     expect(['windows', 'posix', 'unknown']).toContain(p.caps.platform);
     expect(p.caps.raw).toBe(process.platform);
     expect(['icacls', 'posix-mode', 'none']).toContain(p.caps.read_only);
-    expect(['win32-restricted-token', 'none']).toContain(p.caps.sandbox);
+    expect(['win32-restricted-token', 'posix-bwrap', 'posix-node-permission', 'none']).toContain(
+      p.caps.sandbox,
+    );
     // 能力缺失必须带可读说明（不静默）
     if (!p.caps.read_only_available || !p.caps.sandbox_available) {
       expect(p.caps.degraded).not.toBeNull();
@@ -59,14 +62,44 @@ describe('① 识别：平台类别与能力（能力缺失 → 显式降级标�
     expect(b.caps).toEqual(a.caps);
   });
 
-  it('Windows 平台 → 沙盒机制为受限令牌；非 Windows → none 且说明安全语义变化', () => {
+  it('Windows → 受限令牌；POSIX → bwrap 或 Node 权限模型（已知问题《Linux 适配不完整》主条）；未知平台 → none 且标注', () => {
     const caps = platformProvider().caps;
     if (caps.platform === 'windows') {
       expect(caps.sandbox).toBe('win32-restricted-token');
+    } else if (caps.platform === 'posix') {
+      // 此前 POSIX 恒 none（候选验证 G3-exec 恒降级 → 候选可能一次都没跑就晋级）——
+      // 现在 POSIX 有真实受限通道（可用性由 substrate/sandbox.ts 的通道自检确认）
+      expect(['posix-bwrap', 'posix-node-permission']).toContain(caps.sandbox);
+      expect(caps.sandbox_available).toBe(true);
     } else {
       expect(caps.sandbox).toBe('none');
       expect(caps.sandbox_available).toBe(false);
       expect(caps.degraded ?? '').toMatch(/受限执行通道|沙盒机制/);
+    }
+  });
+});
+
+describe('①b 受限通道可用性：自检结论为唯一权威（不乐观假设）', () => {
+  it('sandboxStatusAsync 给出机制/隔离强度/自检结论；可用时必须经真实自检', async () => {
+    const st = await sandboxStatusAsync();
+    expect(typeof st.available).toBe('boolean');
+    if (st.available) {
+      expect(st.verified).toBe(true);
+      expect(st.isolation).toBe('write-restricted');
+      expect(typeof st.mechanism).toBe('string');
+      expect(st.self_test_note ?? '').toMatch(/自检通过/);
+    } else {
+      expect((st.reason ?? '').length).toBeGreaterThan(0);
+      expect(st.verified).toBe(false);
+    }
+  });
+
+  it('同步版只读能力面（不谎称已自检）', () => {
+    const st = sandboxStatus();
+    expect(typeof st.available).toBe('boolean');
+    if (st.available) {
+      expect(st.verified).toBe(false); // 同步版不触发自检 → 不得声称已确认
+      expect(st.self_test_note ?? '').toMatch(/未探测|sandboxStatusAsync/);
     }
   });
 });

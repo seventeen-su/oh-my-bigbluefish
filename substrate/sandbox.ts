@@ -96,20 +96,55 @@ export function createCandidateDir(id: string, opts: { root?: string } = {}): Ca
 }
 
 export interface SandboxStatus {
-  /** 受限执行通道是否可用（平台有受限机制 + 平台实现可加载） */
+  /** 受限执行通道是否可用（平台有受限机制 + 平台实现可加载 + **通道自检通过**） */
   available: boolean;
   /** 不可用原因（available=false 时非空；机器可读，含平台能力降级说明） */
   reason?: string;
-  /** 通道实现标识（available=true 时非空：'win32-restricted-token'） */
+  /** 通道实现标识（available=true 时非空：'win32-restricted-token' | 'posix-bwrap' | 'posix-node-permission'） */
   mechanism?: string;
   /** 平台标识（排障用） */
   platform?: string;
+  /** 隔离强度（available=true 时：'write-restricted' = 写能力精确覆盖 writableDirs） */
+  isolation?: SandboxIsolation;
+  /** 机制说明（可用性口径/限制面；排障与诚实标注用） */
+  mechanism_note?: string;
+  /** 可用性是否经**真实自检**确认（true 时上方 available 为自检结论，而非"二进制存在"的乐观推断） */
+  verified?: boolean;
+  /** 自检结论说明（verified=true 时含授权/非授权写判定结果；false 时含跳过原因） */
+  self_test_note?: string;
+}
+
+/** 通道隔离强度（与 Windows 受限令牌同一契约：写能力精确覆盖目标目录集合） */
+export type SandboxIsolation = 'write-restricted';
+
+/**
+ * 平台受限执行通道（平台无关面；实现分别见 sandbox-win32.ts / sandbox-posix.ts，**按平台惰性加载**）。
+ * `selfTest()` 是可用性的唯一权威判据：用一个真实探针跑一次「授权目录写成功 + 非授权目录写被拒」，
+ * 两条都成立才算可用——「有二进制/模块能加载」不等于「写限制真的生效」。
+ */
+export interface SandboxChannel {
+  /** 通道实现标识（与 PlatformCapabilities.sandbox 枚举同值域） */
+  mechanism: string;
+  isolation: SandboxIsolation;
+  /** 机制说明（能力面/限制面；写入状态面，供使用者判断该通道的语义边界） */
+  mechanism_note: string;
+  selfTest(): Promise<SandboxSelfTest>;
+  runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult>;
+}
+
+/** 通道自检结论 */
+export interface SandboxSelfTest {
+  ok: boolean;
+  /** 结论说明（通过 → 授权/非授权写判定结果；不通过 → 具体原因） */
+  note: string;
 }
 
 /**
- * 受限通道可用性探测（平台识别 + 实现可加载性）：**绝不抛**。
- * 顺序：外核平台提供者给出平台能力（read-only / sandbox）→ Windows 上动态加载实现模块
- * （模块加载失败即视为通道不可用——koffi/DLL 缺失的真实降级面）。
+ * 受限通道可用性探测（平台识别 + 实现可加载性 + **真实自检**）：**绝不抛**。
+ * 顺序：外核平台提供者给出平台能力（read-only / sandbox）→ 取该平台的通道实现（Windows 动态加载
+ * win32 模块；POSIX 选 bwrap/Node 权限模型）→ 自检一次（进程内缓存）。
+ * 这是门禁侧（G3-exec）**应当使用**的探测入口：`sandboxStatus()`（同步版）只报平台能力面，
+ * 不确认写限制是否真的生效。
  */
 export async function sandboxStatusAsync(): Promise<SandboxStatus> {
   const caps = platformProvider().caps
@@ -118,19 +153,58 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
       available: false,
       reason: `平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——安全语义变化已标注`,
       platform: caps.raw,
+      verified: false,
+      self_test_note: '未探测（平台能力面已判定无通道）',
     };
   }
+  let channel: SandboxChannel | null
   try {
-    await loadWin32Impl()
-    return { available: true, mechanism: caps.sandbox, platform: caps.raw };
+    channel = await loadSandboxChannel()
   } catch (err) {
-    return { available: false, reason: `平台实现加载失败: ${(err as Error).message}`, platform: caps.raw };
+    return {
+      available: false,
+      reason: `平台实现加载失败: ${(err as Error).message}`,
+      platform: caps.raw,
+      verified: false,
+      self_test_note: '未探测（实现模块不可加载）',
+    }
+  }
+  if (channel === null) {
+    return {
+      available: false,
+      reason: `平台 ${caps.raw} 未找到可用受限执行实现（POSIX：bwrap 缺失且 Node 版本不支持权限模型）`,
+      platform: caps.raw,
+      verified: false,
+      self_test_note: '未探测（无实现可加载）',
+    }
+  }
+  const selfTest = await channel.selfTest()
+  if (!selfTest.ok) {
+    return {
+      available: false,
+      reason: `受限通道自检不通过：${selfTest.note}`,
+      platform: caps.raw,
+      mechanism: channel.mechanism,
+      isolation: channel.isolation,
+      mechanism_note: channel.mechanism_note,
+      verified: true,
+      self_test_note: selfTest.note,
+    }
+  }
+  return {
+    available: true,
+    mechanism: channel.mechanism,
+    platform: caps.raw,
+    isolation: channel.isolation,
+    mechanism_note: channel.mechanism_note,
+    verified: true,
+    self_test_note: selfTest.note,
   }
 }
 
 /**
- * 同步版通道探测（兼容既有调用方）：只依据平台能力判断，不触发实现模块加载。
- * 需要"实现是否真的可加载"的精确判断时用 `sandboxStatusAsync()`。
+ * 同步版通道探测（兼容既有调用方）：只依据平台能力判断，不触发实现模块加载与自检。
+ * 需要"写限制是否真的生效"的精确判断时用 `sandboxStatusAsync()`（门禁侧用后者）。
  */
 export function sandboxStatus(): SandboxStatus {
   const caps = platformProvider().caps
@@ -139,9 +213,18 @@ export function sandboxStatus(): SandboxStatus {
       available: false,
       reason: `平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——安全语义变化已标注`,
       platform: caps.raw,
-    };
+      verified: false,
+      self_test_note: '未探测（同步版只读平台能力面）',
+    }
   }
-  return { available: true, mechanism: caps.sandbox, platform: caps.raw };
+  return {
+    available: true,
+    mechanism: caps.sandbox,
+    platform: caps.raw,
+    isolation: 'write-restricted',
+    verified: false,
+    self_test_note: '未探测（同步版只读平台能力面；精确判定请用 sandboxStatusAsync）',
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,41 +244,54 @@ export interface RunRestrictedOptions {
   tempDir?: string
   /** 结果文件路径：经 OMB_SANDBOX_RESULT_FILE 环境变量传给子进程（脚本写结果到 writableDirs 内路径） */
   resultFile?: string
-  /** 超时毫秒（缺省 60000）；超时后 TerminateJobObject 杀整棵进程树 */
+  /** 超时毫秒（缺省 60000）；超时后杀整棵进程树（Windows：TerminateJobObject；POSIX：SIGKILL + 命名空间回收） */
   timeoutMs?: number
 }
 
 export interface RunRestrictedResult {
   /** 退出码；timedOut 时恒为 null（被超时杀掉，退出码无意义） */
   code: number | null
-  /** true = 超时被杀（TerminateJobObject 杀 job 树） */
+  /** true = 超时被杀（杀整棵进程树） */
   timedOut: boolean
 }
 
-/** 平台实现模块的最小结构面（动态 import；仅 Windows 有实现） */
-interface Win32Impl {
-  runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult>
+let channelPromise: Promise<SandboxChannel | null> | null = null
+
+/**
+ * 取当前平台的受限执行通道（**按平台惰性加载**；进程内缓存）：
+ *   - Windows：动态 import `sandbox-win32.js`（非 Windows 平台完全不加载 win32-*.js 与 koffi）；
+ *   - POSIX：`sandbox-posix.js`（bwrap → Node 权限模型；Windows 上不加载）。
+ * 无可用实现 → null（调用方按能力缺失处理）。
+ */
+function loadSandboxChannel(): Promise<SandboxChannel | null> {
+  if (channelPromise === null) {
+    channelPromise = (async (): Promise<SandboxChannel | null> => {
+      if (process.platform === 'win32') {
+        const impl = (await import('./sandbox-win32.js')) as unknown as {
+          win32SandboxChannel(): SandboxChannel
+        }
+        return impl.win32SandboxChannel()
+      }
+      const impl = (await import('./sandbox-posix.js')) as unknown as {
+        posixSandboxChannel(): SandboxChannel | null
+      }
+      return impl.posixSandboxChannel()
+    })()
+  }
+  return channelPromise
 }
 
-let win32Impl: Promise<Win32Impl> | null = null
-
-/** 动态加载平台实现（**仅 Windows**；非 Windows 直接失败——调用方已由能力检查挡住） */
-function loadWin32Impl(): Promise<Win32Impl> {
-  if (win32Impl === null) {
-    if (process.platform !== 'win32') {
-      return Promise.reject(new Error(`无平台受限实现（平台 ${process.platform}）`));
-    }
-    win32Impl = import('./sandbox-win32.js') as unknown as Promise<Win32Impl>;
-  }
-  return win32Impl;
+/** 清空通道缓存与自检缓存（仅测试用：同一进程内模拟不同平台/机制） */
+export function resetSandboxChannelCache(): void {
+  channelPromise = null
 }
 
 /**
  * 受限执行（平台无关门面）：
  *   ① 入参校验（脚本存在、writableDirs/cwd 存在）——fail-loud，与拆分前一致；
- *   ② 平台通道检查：无可用受限机制 → **拒绝执行**（fail-closed 不变量：绝不以完整令牌静默运行；
+ *   ② 平台通道检查：无可用受限机制 → **拒绝执行**（fail-closed 不变量：绝不以完整权限静默运行；
  *      调用方应先经 sandboxStatusAsync() 探测并记录 degraded）；
- *   ③ 委派平台实现（Windows：动态加载 sandbox-win32.js）。
+ *   ③ 委派平台实现（Windows：sandbox-win32.js；POSIX：sandbox-posix.js）。
  */
 export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult> {
   const script = path.resolve(opts.script)
@@ -218,11 +314,14 @@ export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRest
   const caps = platformProvider().caps
   if (!caps.sandbox_available) {
     throw new Error(
-      `runRestricted: 平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——fail-closed 拒绝以完整令牌运行候选`,
+      `runRestricted: 平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——fail-closed 拒绝以完整权限运行候选`,
     )
   }
-  const impl = await loadWin32Impl()
-  return impl.runRestricted(opts)
+  const channel = await loadSandboxChannel()
+  if (channel === null) {
+    throw new Error(`runRestricted: 平台 ${caps.raw} 未找到可用受限执行实现——fail-closed 拒绝以完整权限运行候选`)
+  }
+  return channel.runRestricted(opts)
 }
 
 /** 候选目录根（测试/排障可读；平台无关） */
