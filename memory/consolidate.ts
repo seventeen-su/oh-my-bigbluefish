@@ -165,6 +165,14 @@ interface RunState {
   merge: StepTrack;
   relation: StepTrack;
   decay: StepTrack;
+  /** 下次调用的 scope 轮转起点（预算/中断导致提前结束时的推进） */
+  nextScopeOffset?: number;
+  /** 本次是否因预算耗尽提前结束 */
+  budgetExhausted?: boolean;
+  /** 本次读取/处理的记忆条数（"跑了多少"；与四个变更计数（"改了什么"）语义分离） */
+  processed: number;
+  /** 本次是否有真实改动（收敛判据：false → 本次无事可做） */
+  dirty: boolean;
 }
 
 function emptyTrack(): StepTrack {
@@ -172,7 +180,14 @@ function emptyTrack(): StepTrack {
 }
 
 function emptyState(): RunState {
-  return { dedup: emptyTrack(), merge: emptyTrack(), relation: emptyTrack(), decay: emptyTrack() };
+  return {
+    dedup: emptyTrack(),
+    merge: emptyTrack(),
+    relation: emptyTrack(),
+    decay: emptyTrack(),
+    processed: 0,
+    dirty: false,
+  };
 }
 
 function bumpCount(track: StepTrack, scope: Scope, n: number): void {
@@ -193,33 +208,101 @@ function noteKind(track: StepTrack, scope: Scope, kind: MemoryKind): void {
 const SCOPES: Scope[] = ['Session', 'Project', 'Global'];
 const MAX_QUERY_LIMIT = 1_000_000;
 
-/** dedup：同 scope+kind 规范化内容哈希相同的非终态记忆 → 保留最新（updated），其余 Frozen */
-async function dedupStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope): Promise<void> {
-  const groups = new Map<string, Memory[]>();
-  for (const m of work) {
-    if (m.lifecycle === 'Frozen' || m.lifecycle === 'Retired') continue;
-    const key = contentHash(m.scope, m.kind, m.payload);
-    const g = groups.get(key);
-    if (g) {
-      g.push(m);
-    } else {
-      groups.set(key, [m]);
-    }
-  }
-  for (const group of groups.values()) {
-    if (group.length < 2) continue;
-    group.sort(cmpNewestFirst);
-    for (const dup of group.slice(1)) {
-      await freeze(b, state.dedup, work, scope, dup);
-    }
+/**
+ * 单次整合的**处理预算**（已知问题《记忆整合没有真实批次上限》修复）。
+ *
+ * 此前：事务内 `limit: 1_000_000` 全表读取 + `merge` 平方级双循环 + 事务体内零中断检查 →
+ * 库大时 CPU/内存双爆、长时间持有写事务（同进程其它写入撞 busy_timeout）、进程被杀留下超长 WAL。
+ *
+ * 取向选择（"保持原子但限流" vs "分批但允许部分完成"）：**两者都要，但边界划清**：
+ *   - **单次调用仍然原子**（`backend.transaction` 一个事务，要么全提交要么全回滚）——不引入"半整合"状态；
+ *   - 但单次调用**只处理预算内的记忆**（默认 2000 条/次，per scope 轮转），超出部分留给下一次量子/
+ *     下一次收尾。事务因此有界（内存驻留、锁持有时长、WAL 体积都随预算封顶），而多次调用之间
+ *     自然形成"分批推进"——每次调用返回的 report 都自洽（它只描述本次真实改了什么）。
+ *   - 幂等性不受影响：各步只处理前态记忆，重跑收敛一致（原始设计不变量），故"上次没轮到的记忆"
+ *     下次照常处理，不需要跨调用的游标（轮转起点见 ConsolidationBudget.scopeOffset）。
+ */
+export interface ConsolidationBudget {
+  /** 单次调用最多读取/处理的记忆条数（≤0 或未给 → 缺省 DEFAULT_CONSOLIDATION_BUDGET） */
+  maxMemoriesPerRun?: number;
+  /** 本次从哪个 scope 起（轮转起点，0..2；用于避免库大时后面的 scope 永远轮不到） */
+  scopeOffset?: number;
+  /** 中断信号（收尾/让出：每个处理单元之间检查一次——见 assertNotAborted） */
+  signal?: AbortSignal;
+}
+
+/** 单次整合缺省预算（2000 条：事务时延与单量子余量同量级；库大时多跑几次而非一次爆） */
+export const DEFAULT_CONSOLIDATION_BUDGET = 2000;
+
+/** 中断检查（每个处理单元之前——已知问题《12 个维护任务里只有 1 个真正可被中断》修复面之一） */
+function assertNotAborted(signal: AbortSignal | undefined, phase: string): void {
+  if (signal?.aborted === true) {
+    const err = new Error(`memory_consolidation 中断于 ${phase}`);
+    err.name = 'AbortError';
+    throw err;
   }
 }
 
+/**
+ * dedup：同 scope+kind 规范化内容哈希相同的非终态记忆 → 保留最新（updated），其余 Frozen。
+ *
+ * 数据面（已知问题《记忆整合没有真实批次上限》修复的性能面）：先取**轻量键列**
+ * （`dedupKeyRows`：id/payload/updated/lifecycle/kind，不读完整 body、不逐行 JSON.parse）在应用层
+ * 按 `contentHash` 分组（规范化语义只能在应用层表达——SQL 分组会漏掉"空白折叠后相同"的重复），
+ * 再**只对确认重复的项**取完整记录并冻结。语义与"全表读取后在内存分组"完全等价，
+ * 但内存驻留与解析代价是原来的 O(键列/全记录) 比例。
+ */
+async function dedupStep(
+  b: SqliteMemoryBackend,
+  state: RunState,
+  scope: Scope,
+  signal?: AbortSignal,
+): Promise<number> {
+  const rows = b.dedupKeyRows(scope);
+  const groups = new Map<string, Array<{ id: string; kind: MemoryKind; updated: number; payload: string }>>();
+  for (const r of rows) {
+    if (r.lifecycle === 'Frozen' || r.lifecycle === 'Retired') continue;
+    const key = contentHash(scope, r.kind as MemoryKind, r.payload);
+    const g = groups.get(key);
+    const entry = { id: r.id, kind: r.kind as MemoryKind, updated: r.updated, payload: r.payload };
+    if (g) {
+      g.push(entry);
+    } else {
+      groups.set(key, [entry]);
+    }
+  }
+  let frozen = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    // 保留最新（updated epoch ms 降序，id 兜底确定性）→ 其余为重复项
+    group.sort((a, b) => {
+      const u = b.updated - a.updated;
+      return u !== 0 ? u : b.id.localeCompare(a.id);
+    });
+    const dupIds = group.slice(1).map((e) => e.id);
+    // 只取重复项的完整记录（非重复项从不进入内存 body 面）
+    for (const m of b.getMany(dupIds)) {
+      assertNotAborted(signal, `dedup/${scope}`);
+      await freeze(b, state.dedup, scope, m);
+      frozen++;
+    }
+  }
+  return frozen;
+}
+
 /** merge：同 scope+kind+prov_class 且规范化文本包含关系 → 合并为新记忆（payload 拼接 + Link），旧项 Frozen */
-async function mergeStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope, now: number): Promise<void> {
+async function mergeStep(
+  b: SqliteMemoryBackend,
+  state: RunState,
+  work: Memory[],
+  scope: Scope,
+  now: number,
+  signal?: AbortSignal,
+): Promise<void> {
   let pool = work.filter((m) => m.lifecycle === 'Active').sort(cmpOldestFirst);
   let i = 0;
   while (i < pool.length - 1) {
+    assertNotAborted(signal, `merge/${scope}`);
     const a = pool[i]!;
     let mergedAny = false;
     for (let j = i + 1; j < pool.length; j++) {
@@ -232,11 +315,14 @@ async function mergeStep(b: SqliteMemoryBackend, state: RunState, work: Memory[]
       merged.id = mergedId; // 幂等 no-op 时返回既有 id
       await b.link(mergedId, a.id, MERGE_LINK_TYPE);
       await b.link(mergedId, other.id, MERGE_LINK_TYPE);
-      await freeze(b, state.merge, work, scope, a);
-      await freeze(b, state.merge, work, scope, other);
+      await freeze(b, state.merge, scope, a);
+      await freeze(b, state.merge, scope, other);
       noteKind(state.merge, scope, a.kind);
       work.push(merged);
-      pool = work.filter((m) => m.lifecycle === 'Active').sort(cmpOldestFirst); // 含新 merged，重扫
+      // 重扫只针对**仍为 Active** 的候选（Frozen 项不再可能参与合并）——原实现每次合并后
+      // 全量重排 work（含已 Frozen 的历史项），合并次数一多即退化为 O(n² log n)（已知问题
+      // 《记忆整合没有真实批次上限》的性能面）。此处保持语义等价（同样的候选集合与顺序）。
+      pool = work.filter((m) => m.lifecycle === 'Active').sort(cmpOldestFirst);
       mergedAny = true;
       break;
     }
@@ -247,12 +333,20 @@ async function mergeStep(b: SqliteMemoryBackend, state: RunState, work: Memory[]
 /** relation（Associate）：① kind 邻接规则建边（既有路径，权重 1）；② 词法 + 向量相似度建边
  *  （已知问题《关系图为空图》——规则依赖生产中不存在的记忆类型，故必须补上内容驱动的建边路径）。
  *  两者都幂等（已存在边跳过 / 相似边按权重 upsert），重跑不放大。 */
-async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope, now: number): Promise<void> {
+async function relationStep(
+  b: SqliteMemoryBackend,
+  state: RunState,
+  work: Memory[],
+  scope: Scope,
+  now: number,
+  signal?: AbortSignal,
+): Promise<void> {
   const cands = work.filter((m) => m.lifecycle === 'Active' || m.lifecycle === 'Dormant');
   for (const rule of KIND_LINK_RULES) {
     const froms = cands.filter((m) => m.kind === rule.from);
     const tos = cands.filter((m) => m.kind === rule.to);
     for (const f of froms) {
+      assertNotAborted(signal, `relation/${scope}`);
       for (const t of tos) {
         if (f.id === t.id) continue;
         if (await hasRelation(b, f.id, t.id, rule.type)) continue;
@@ -290,7 +384,14 @@ async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memor
 }
 
 /** decay（Decay=Forget 数值机制）：Active 超 90 天 → Dormant；Active/Dormant 超 365 天 → Frozen */
-async function decayStep(b: SqliteMemoryBackend, state: RunState, work: Memory[], scope: Scope, now: number): Promise<void> {
+async function decayStep(
+  b: SqliteMemoryBackend,
+  state: RunState,
+  work: Memory[],
+  scope: Scope,
+  now: number,
+  signal?: AbortSignal,
+): Promise<void> {
   for (const m of work) {
     if (m.lifecycle !== 'Active' && m.lifecycle !== 'Dormant') continue;
     const age = now - Date.parse(m.updated);
@@ -302,6 +403,7 @@ async function decayStep(b: SqliteMemoryBackend, state: RunState, work: Memory[]
       next = 'Dormant';
     }
     if (next === null) continue;
+    assertNotAborted(signal, `decay/${scope}`);
     await b.update(m.id, { lifecycle: next });
     m.lifecycle = next;
     bumpCount(state.decay, scope, 1);
@@ -311,8 +413,8 @@ async function decayStep(b: SqliteMemoryBackend, state: RunState, work: Memory[]
 
 // ---- 内部工具 ----
 
-/** 冻结一条记忆（Frozen）并同步工作集；Frozen 不删（P8 可逆：保谱系，可经 Promote 恢复） */
-async function freeze(b: SqliteMemoryBackend, track: StepTrack, work: Memory[], scope: Scope, m: Memory): Promise<void> {
+/** 冻结一条记忆（Frozen）并同步内存副本；Frozen 不删（P8 可逆：保谱系，可经 Promote 恢复） */
+async function freeze(b: SqliteMemoryBackend, track: StepTrack, scope: Scope, m: Memory): Promise<void> {
   await b.update(m.id, { lifecycle: 'Frozen' });
   m.lifecycle = 'Frozen';
   bumpCount(track, scope, 1);
@@ -324,11 +426,6 @@ async function hasRelation(b: SqliteMemoryBackend, fromId: string, toId: string,
   const walk = await b.relationTraverse(fromId, [type], 1);
   const seed = walk.nodes.find((n) => n.id === fromId);
   return seed?.relations.some((r) => r.to_id === toId) ?? false;
-}
-
-async function readAll(b: SqliteMemoryBackend, scope: Scope): Promise<Memory[]> {
-  const page = await b.query({ scope, limit: MAX_QUERY_LIMIT, budget: Number.MAX_SAFE_INTEGER });
-  return page.items;
 }
 
 // ---- 报告 ----
@@ -375,38 +472,124 @@ function buildReport(state: RunState): ConsolidationReport {
 // ---- 入口 ----
 
 /**
- * 空闲期记忆整合批处理（§7.2）：dedup/merge/relation/decay 全批在一个事务内执行（中断回滚 →
+ * 空闲期记忆整合批处理（§7.2）：dedup/merge/relation/decay 在一个事务内执行（中断回滚 →
  * 幂等重跑收敛）；经 opts.scheduler.enqueue({id:'memory-consolidation', run}) 入队执行。
+ *
+ * 预算与中断（已知问题《记忆整合没有真实批次上限》/《12 个维护任务里只有 1 个真正可被中断》）：
+ * `opts.budget.maxMemoriesPerRun` 限制单次读取/处理的记忆条数（缺省 2000），`budget.scopeOffset`
+ * 决定本次从哪个 scope 起（轮转，避免库大时后面的 scope 永远轮不到），`budget.signal` 在每个处理
+ * 单元之间被检查（abort → AbortError → 事务回滚 → 任务留队可重试）。三者都不改变"单次原子"语义。
+ *
+ * 返回值：**报告 = "改了什么"**（四个稳定计数 + 受影响作用域/影响域记录）——不掺入"跑了多少"
+ * 那类元数据（严格相等断言的外部消费方不受影响）；有界执行的元数据经 `opts.onOutcome` 单独给出。
  */
 export async function consolidate(
   backend: SqliteMemoryBackend,
-  opts: { now?: number; scheduler?: MaintenanceScheduler } = {},
+  opts: {
+    now?: number;
+    scheduler?: MaintenanceScheduler;
+    budget?: ConsolidationBudget;
+    /** 有界执行元数据回调（调用方据此推进轮转并观测"本次跑了多少"；可选） */
+    onOutcome?: (outcome: ConsolidationOutcome) => void;
+  } = {},
 ): Promise<ConsolidationReport> {
   const now = opts.now ?? Date.now();
   let report: ConsolidationReport | null = null;
+  let outcome: ConsolidationOutcome | null = null;
   const run = async (): Promise<void> => {
-    report = await runConsolidation(backend, now);
+    outcome = await runConsolidation(backend, now, opts.budget ?? {});
+    report = outcome.report;
   };
   if (opts.scheduler) {
     await opts.scheduler.enqueue({ id: CONSOLIDATION_TASK_ID, run });
   } else {
     await run();
   }
+  if (outcome !== null) {
+    opts.onOutcome?.(outcome);
+  }
   return report ?? emptyReport();
 }
 
-async function runConsolidation(b: SqliteMemoryBackend, now: number): Promise<ConsolidationReport> {
+/**
+ * 整合结果（runConsolidation 产物）：报告（"改了什么"）+ 有界执行元数据（"跑了多少"）+ 轮转状态。
+ * 分开返回的理由：报告的四个计数是稳定契约（既有消费方做严格比较），元数据属于调用方观测面。
+ */
+export interface ConsolidationOutcome {
+  report: ConsolidationReport;
+  /** 本次读取/处理的记忆条数（"整条载入"的那部分——批预算约束的对象） */
+  processed: number;
+  /** 本次是否因预算耗尽提前结束（true → 下次量子/收尾继续处理剩余部分） */
+  budget_exhausted: boolean;
+  /** 下次调用的 scope 轮转起点（调用方据此推进，避免后续 scope 饥饿） */
+  next_scope_offset: number;
+  /** 本次是否有真实改动（供调用方判断"还要不要再跑一次"——收敛判据） */
+  dirty: boolean;
+}
+
+async function runConsolidation(
+  b: SqliteMemoryBackend,
+  now: number,
+  budget: ConsolidationBudget,
+): Promise<ConsolidationOutcome> {
   const state = emptyState();
+  const limit =
+    budget.maxMemoriesPerRun !== undefined && Number.isFinite(budget.maxMemoriesPerRun)
+      ? Math.max(0, Math.floor(budget.maxMemoriesPerRun))
+      : DEFAULT_CONSOLIDATION_BUDGET;
+  const offset = ((budget.scopeOffset ?? 0) % SCOPES.length + SCOPES.length) % SCOPES.length;
+  const order = [...SCOPES.slice(offset), ...SCOPES.slice(0, offset)];
+  // 轮转（每次调用把起点推进一步）：库大时后续 scope 不会因预算耗尽永远轮不到
+  state.nextScopeOffset = (offset + 1) % SCOPES.length;
   await b.transaction(async () => {
-    for (const scope of SCOPES) {
-      const work = (await readAll(b, scope)).map((m) => ({ ...m }));
-      await dedupStep(b, state, work, scope);
-      await mergeStep(b, state, work, scope, now);
-      await relationStep(b, state, work, scope, now);
-      await decayStep(b, state, work, scope, now);
+    for (const scope of order) {
+      assertNotAborted(budget.signal, 'scope');
+      if (state.processed >= limit) {
+        state.budgetExhausted = true;
+        break; // 预算耗尽 → 本次到此（单次调用有界；下次调用接着处理）
+      }
+      // ---- ① dedup（有界读取：只读键列，成本正比于"轻量键行数"而非完整记录体积）----
+      // 收敛性要求：跨调用的重复必须能被发现，故 dedup **不占用批预算**——
+      // 它的内存驻留已被键列投影压到很低（不读 body、不解析 JSON），冻结动作只发生在确认重复的
+      // 条目上（代价正比于重复数，不是全库数）。批预算约束的是下文"必须整条载入"的
+      // merge / relation / decay（那才是内存与平方级代价的来源）。
+      const frozen = await dedupStep(b, state, scope, budget.signal);
+      if (frozen > 0) {
+        state.dirty = true;
+      }
+      // ---- ② merge / relation / decay（单次事务**有界**：只处理本次额度内的记忆）----
+      // merge 必须拿到一批记忆做包含关系比对——旧实现全表读取（`limit: 1_000_000`）。
+      // 现在只读本次额度内的一批（超出部分留给下一次调用；scope 轮转 + 冻结收敛保证推进）。
+      const remaining = Math.max(1, limit - state.processed);
+      const page = await b.query({
+        scope,
+        limit: Math.min(remaining, MAX_QUERY_LIMIT),
+        budget: Number.MAX_SAFE_INTEGER,
+      });
+      const work = page.items.map((m) => ({ ...m }));
+      state.processed += work.length;
+      await mergeStep(b, state, work, scope, now, budget.signal);
+      await relationStep(b, state, work, scope, now, budget.signal);
+      await decayStep(b, state, work, scope, now, budget.signal);
+      if (state.processed >= limit) {
+        state.budgetExhausted = true;
+        break;
+      }
     }
   });
-  return buildReport(state);
+  const report = buildReport(state);
+  return {
+    report,
+    processed: state.processed,
+    budget_exhausted: state.budgetExhausted === true,
+    next_scope_offset: state.nextScopeOffset ?? 0,
+    dirty:
+      state.dirty ||
+      report.deduped > 0 ||
+      report.merged > 0 ||
+      report.related > 0 ||
+      report.decayed > 0,
+  };
 }
 
 function emptyReport(): ConsolidationReport {

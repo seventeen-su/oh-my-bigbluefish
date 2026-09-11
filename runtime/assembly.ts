@@ -82,7 +82,7 @@ import { classifyFromText } from '../kernel/controllability.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——layer 2；装配面注入 spawnJudge）
 import type { JudgeExecutor } from './judge-executor.js';
 import { latestForSession as latestCheckpointForSession, prune as pruneCheckpoints, restore as restoreCheckpoint, save as saveCheckpoint } from '../supervisor/checkpoint.js';
-import { MaintenanceScheduler, DeferredMaintenanceError, type MaintenanceDebt, type QuantumReport, type DebtSourceView, type DebtReleaseRecord, type DebtReleaseResult } from '../supervisor/maintenance.js';
+import { MaintenanceScheduler, DeferredMaintenanceError, DEFAULT_DRAIN_TIMEOUT_MS, type MaintenanceDebt, type QuantumReport, type DebtSourceView, type DebtReleaseRecord, type DebtReleaseResult } from '../supervisor/maintenance.js';
 import { reduce, type ClaimView, type Projections, type ReducedState, type UtilityCounts } from '../supervisor/state-reducer.js';
 import { RetrievalBackend } from '../memory/backend-retrieval.js';
 import type { RelationStats } from '../memory/backend-relation.js';
@@ -96,7 +96,12 @@ import { ProcessScheduler } from './scheduler.js';
 import type { Experience } from '../kernel/schemas/c.js';
 // R4（P0）：Experience → Memory 长期学习闭环——staging（准入）+ consolidate（dedup/merge/relation/decay）
 import { StagingManager } from '../memory/staging.js';
-import { consolidate } from '../memory/consolidate.js';
+import {
+  consolidate,
+  DEFAULT_CONSOLIDATION_BUDGET,
+  type ConsolidationOutcome,
+  type ConsolidationReport,
+} from '../memory/consolidate.js';
 // 归因观测面（已知问题《效用反馈为空》）：不伪造命中/未命中的引用证据归因
 import { attributeEpisode } from '../memory/attribution.js';
 // 记忆写入面与管理面（已知问题《缺少写入面与记忆管理面》）：写入流水 + 列出/查看/编辑/删除/合并
@@ -211,6 +216,19 @@ const DEGRADED_COMPONENTS: ComponentHashes = {
 
 function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 中断检查（可中断维护任务的共用判据——已知问题《12 个维护任务里只有 1 个真正可被中断》）：
+ * signal 已 abort → 抛 AbortError（调度器 runOne 识别该错误名 → 任务留队、不累计债务、记为 interrupted）。
+ * 用于长任务的阶段边界（每阶段/每批之间调用一次），让关停与让出不再"照跑到底"。
+ */
+function assertNotAbortedSignal(signal: AbortSignal | undefined, phase: string): void {
+  if (signal?.aborted === true) {
+    const err = new Error(`maintenance task interrupted at ${phase}`);
+    err.name = 'AbortError';
+    throw err;
+  }
 }
 
 /**
@@ -626,6 +644,16 @@ export const EVENT_STORE_VACUUM_THRESHOLD_BYTES = 64 * 1024 * 1024;
 /** 数据清理任务入队间隔（已知问题《数据体积与清理》：轮转/整理/合并按此节流，不每轮重复入队；§17 可标定） */
 export const HYGIENE_ENQUEUE_INTERVAL_MS = 60 * 60 * 1000;
 
+/**
+ * 关停排空超时（已知问题《关停不是真正排空》：旧实现 20×50ms=1s，单个整合任务在数据量大时远超）。
+ * 缺省沿用维护调度器的 DEFAULT_DRAIN_TIMEOUT_MS（10s）；环境变量可覆盖（部署侧按需收紧/放宽）。
+ */
+function closeDrainTimeoutMs(): number {
+  const raw = process.env.OMB_SHUTDOWN_DRAIN_MS;
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DRAIN_TIMEOUT_MS;
+}
+
 /** 按线解析结果（policy/processes 目录 + 快照信息 + 降级原因） */
 interface LineDirResolution {
   policyDir: string;
@@ -875,14 +903,32 @@ export class CognitiveRuntime {
   private readonly sessionEpisodes = new Map<string, Set<string>>();
   /** 来源子系统最近一次「执行体成功跑完」时间（债务释放的确认依据；本进程内真实观测，不跨进程推断） */
   private readonly lastSubsystemOk = new Map<string, number>();
+  /**
+   * 记忆整合单次调用预算（已知问题《记忆整合没有真实批次上限》：旧实现事务内全表读取
+   * `limit: 1_000_000` + 平方级 merge + 零中断检查 → 库大时 CPU/内存双爆、长持写事务、超长 WAL）。
+   * 缺省 DEFAULT_CONSOLIDATION_BUDGET（2000 条/次）；单次原子语义不变，超出部分下次量子继续。
+   */
+  private readonly consolidationBudget: number = DEFAULT_CONSOLIDATION_BUDGET;
+  /** 记忆整合 scope 轮转起点（跨调用推进——库大于预算时后续 scope 不会饿死） */
+  private consolidationScopeOffset = 0;
+  /** 最近一次整合报告（状态面/测试可读：本次"改了什么"） */
+  private lastConsolidationReport: ConsolidationReport | null = null;
+  /** 最近一次整合的有界执行元数据（"跑了多少"；与报告分开——报告是稳定契约） */
+  private lastConsolidationRun: ConsolidationOutcome | null = null;
   /** 归因观测面：会话 → 上一轮待归因的 episode 与注入集（下一次 prepareTurn 用新人类消息归因） */
   private readonly sessionAttribution = new Map<string, { episode_id: string; injected_ids: string[] }>();
   /** 归因观测面：会话 → 已给出结论（hit/miss）的记忆 id（会话内不重复计数） */
   private readonly attributedMemories = new Map<string, Set<string>>();
   /** 归因观测计数（状态面可读：本次进程内累计 已归因 / 证据不足） */
   private readonly attributionCounts = { attributed: 0, skipped: 0 };
-  /** 数据清理任务节流：上次入队时间（避免每轮重复入队；缺省每小时一次） */
+  /** 数据清理任务节流：上次入队时间（避免每轮重复入队；节流窗口 = HYGIENE_ENQUEUE_INTERVAL_MS） */
   private lastHygieneEnqueueAt = 0;
+  /** 清理节流基线是否已从盘上加载（进程内懒加载一次；见 shouldEnqueueHygiene） */
+  private hygieneBaselineLoaded = false;
+  /** 清理节流状态落盘路径（<evolutionRoot>/hygiene.json；跨进程持久化"上次清理时间"） */
+  private readonly hygieneStateFile: string;
+  /** 运行时侧待落盘写入计数（close 排空等待；与维护调度器 pendingWrites 同一纪律） */
+  private pendingRuntimeWrites = 0;
   /** 外核安全状态视图注入（装配面提供；缺省 → 状态面不带 safe_state 段） */
   private readonly safeStateViewFn: (() => KernStatusSummary['safe_state']) | undefined;
   /**
@@ -998,6 +1044,8 @@ export class CognitiveRuntime {
     this.decayDir = join(this.evolutionRoot, 'decay');
     // R5：repair 重验证记录落盘目录（受影响对象重验证审计；与 decay 同根）
     this.repairDir = join(this.evolutionRoot, 'repair');
+    // 清理任务节流基线（跨进程：避免每次进程启动都把三个清理任务重跑一遍；见 shouldEnqueueHygiene）
+    this.hygieneStateFile = join(this.evolutionRoot, 'hygiene.json');
   }
 
   /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等 */
@@ -1131,7 +1179,9 @@ export class CognitiveRuntime {
         observations_degraded = observations_degraded ?? errorDetail(err);
       }
       try {
-        maintenance_observations = this.maintenance.observationsSummary();
+        // 异步入口（已知问题《观测摘要同步读当日日志》修复）：kern_status 可被模型随时调用，
+        // 同步读全文件 + 逐行解析会阻塞事件循环；异步版走同一缓存，且不阻塞
+        maintenance_observations = await this.maintenance.observationsSummaryAsync();
       } catch (err) {
         observations_degraded = errorDetail(err);
       }
@@ -2543,14 +2593,59 @@ export class CognitiveRuntime {
     return { ...this.attributionCounts };
   }
 
-  /** 数据清理任务节流判定（每小时一次；§17 可标定）——避免每轮重复入队同一批清理任务 */
+  /**
+   * 数据清理任务节流判定（节流窗口见 HYGIENE_ENQUEUE_INTERVAL_MS；§17 可标定）。
+   *
+   * 已知问题《清理任务"每进程第一次必跑"》修复（选"改行为"而非"改口径"）：
+   * 此前基线是进程内初值 0 → **每个新进程的第一次收尾必然入队三个清理任务**，与"每小时一次、
+   * 避免每轮重复入队"的口径不符；频繁重启的部署里清理任务会被反复入队（白跑 + 观测噪声）。
+   *
+   * 现在基线**跨进程持久化**（`.evolution/hygiene.json`）：读盘取上次入队时间，未到窗口不入队。
+   * 保留的语义：**从未清理过的部署（无状态文件）第一次收尾一定清一次账**——不是取消开局清理，
+   * 而是让"开局"只发生一次（而不是每次进程启动都算一次）。
+   * 尽力而为：状态文件不可读 → 视为无记录（行为退回旧口径，宁可多清一次也不误锁）；写失败 →
+   * 降级记录不抛（本轮清理照常入队，下轮重新判定）。
+   */
   private shouldEnqueueHygiene(): boolean {
     const now = Date.now();
+    if (this.hygieneBaselineLoaded === false) {
+      this.hygieneBaselineLoaded = true;
+      this.lastHygieneEnqueueAt = this.readHygieneBaseline();
+    }
     if (now - this.lastHygieneEnqueueAt < HYGIENE_ENQUEUE_INTERVAL_MS) {
       return false;
     }
     this.lastHygieneEnqueueAt = now;
+    // 落盘（异步、尽力而为）：关停排空会等这次写（见 scheduler.idle）
+    const settle = this.trackPendingWrite();
+    void writeFile(this.hygieneStateFile, `${JSON.stringify({ last_enqueue_at: now })}\n`, 'utf8')
+      .catch((err: unknown) => {
+        recordDegradation('hygiene/state', `清理节流状态落盘失败（${errorDetail(err)}）——本轮清理照常`);
+      })
+      .finally(settle);
     return true;
+  }
+
+  /** 读清理节流基线（.evolution/hygiene.json；缺失/损坏 → 0 = 从未清理过，开局清一次账） */
+  private readHygieneBaseline(): number {
+    try {
+      const raw = JSON.parse(readFileSync(this.hygieneStateFile, 'utf8')) as { last_enqueue_at?: unknown };
+      const v = raw.last_enqueue_at;
+      return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** close 排空等待的待落盘写入登记（与维护调度器同一纪律：关库前必须落地） */
+  private trackPendingWrite(): () => void {
+    this.pendingRuntimeWrites += 1;
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.pendingRuntimeWrites -= 1;
+    };
   }
 
   /** 数据体积与清理（已知问题《数据体积与清理》三条：检查点轮转 / 事件库整理 / 事实库合并） ---- */
@@ -2560,12 +2655,12 @@ export class CognitiveRuntime {
    * 清理（见 supervisor/checkpoint.ts `prune` 的规则与理由）。无 checkpointDir → 空结果（不动作）。
    * 失败降级不抛（清理是维护收益，不是关键路径）。
    */
-  async runCheckpointPrune(): Promise<{ removed: number; kept: number; reasons: string[] }> {
+  async runCheckpointPrune(signal?: AbortSignal): Promise<{ removed: number; kept: number; reasons: string[] }> {
     if (this.checkpointDir === undefined) {
       return { removed: 0, kept: 0, reasons: [] };
     }
     try {
-      return await pruneCheckpoints({ dir: this.checkpointDir });
+      return await pruneCheckpoints({ dir: this.checkpointDir, ...(signal !== undefined ? { signal } : {}) });
     } catch (err) {
       recordDegradation('checkpoint/prune', `检查点轮转失败（${errorDetail(err)}）——本轮跳过`);
       return { removed: 0, kept: 0, reasons: [`失败：${errorDetail(err)}`] };
@@ -2575,9 +2670,14 @@ export class CognitiveRuntime {
   /**
    * 事件库整理（维护任务 event_store_vacuum）：按体积阈值触发 VACUUM 回收文件页
    *（已知问题《事件库体积增长》：压缩只删记录不回收文件页）。低于阈值 → 不动作（零开销）。
+   *
+   * 可中断面（已知问题《12 个维护任务里只有 1 个真正可被中断》）：VACUUM 是同步全库操作，
+   * **事务中途无法让出**——故中断点设在它之前（`assertNotAbortedSignal`）：关停/让出时不再
+   * 把事件循环占住数秒、也不留下未回收的 WAL 侧车（Windows 上表现为临时目录清理失败）。
    */
-  async runEventStoreVacuum(): Promise<{ vacuumed: boolean; sizeBytes: number; reclaimedBytes: number }> {
+  async runEventStoreVacuum(signal?: AbortSignal): Promise<{ vacuumed: boolean; sizeBytes: number; reclaimedBytes: number }> {
     try {
+      assertNotAbortedSignal(signal, 'event_store_vacuum');
       const before = this.eventStore.sizeBytes();
       if (before < EVENT_STORE_VACUUM_THRESHOLD_BYTES) {
         return { vacuumed: false, sizeBytes: before, reclaimedBytes: 0 };
@@ -2586,16 +2686,26 @@ export class CognitiveRuntime {
       const after = this.eventStore.sizeBytes();
       return { vacuumed: true, sizeBytes: after, reclaimedBytes: Math.max(0, before - after) };
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw err; // 中断让出（任务留队可重试；不计失败债务）
+      }
       recordDegradation('event-store/vacuum', `事件库整理失败（${errorDetail(err)}）——本轮跳过`);
       return { vacuumed: false, sizeBytes: 0, reclaimedBytes: 0 };
     }
   }
 
-  /** 事实库分片合并（维护任务 fact_store_compact）：一键一文件 → 分片文件，键仍可寻址 */
-  async runFactStoreCompact(): Promise<{ shards: number; records: number; removedFiles: number }> {
+  /** 事实库分片合并（维护任务 fact_store_compact）：一键一文件 → 分片文件，键仍可寻址。
+   *  可中断面：合并前检查 signal（同步 I/O 密集操作，事务中途无法让出——同 VACUUM 的取舍）。 */
+  async runFactStoreCompact(
+    signal?: AbortSignal,
+  ): Promise<{ shards: number; records: number; removedFiles: number }> {
     try {
+      assertNotAbortedSignal(signal, 'fact_store_compact');
       return await this.factStore.compact();
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw err;
+      }
       recordDegradation('fact-store/compact', `事实库分片合并失败（${errorDetail(err)}）——本轮跳过`);
       return { shards: 0, records: 0, removedFiles: 0 };
     }
@@ -2712,20 +2822,54 @@ export class CognitiveRuntime {
     };
   }
 
-  /** 关闭存储连接（Windows WAL 收尾先 close；幂等）。P2：先组件批量 dispose 回滚（P8 注册皆效应）再关库。
-   *  审查修复：先停维护定时器并**等在飞任务落地**——否则关闭瞬间在跑的任务会继续写已关闭的 SQLite
-   *  （database is not open），错误还会被 runOne 记成一条虚假债务。 */
+  /**
+   * 关闭存储连接（Windows WAL 收尾先 close；幂等）。P2：先组件批量 dispose 回滚（P8 注册皆效应）再关库。
+   *
+   * 关停顺序（已知问题《关停不是真正排空》修复）：
+   *   ① `stop()`——停表 + 清队列 + 中断在飞 signal（可中断执行体立刻让出）；
+   *   ② `drain()`——等待静默点（无在飞任务 + 无在飞任务体 + 无待落盘写入；缺省上限 10s）；
+   *   ③ 等本运行时侧的待落盘写入（清理节流状态等）；
+   *   ④ 才关库。
+   * 旧实现只轮询 `running` 标志、上限 1 秒，也不等待已发出的落盘写入 → 关库后长任务继续写会撞
+   * `database is not open`，被记成"任务失败"并产生**假债务**。
+   * 排空超时（任务体不检查 signal 的少数情况）→ 记降级并如实说明"库在可能仍在写入的状态下关闭"，
+   * 不静默假称已排空。
+   */
   async close(): Promise<void> {
     try {
       this.maintenance?.stop?.();
-      await this.maintenance?.drain?.();
-    } catch {
+      const drainResult = await this.maintenance?.drain?.({ timeoutMs: closeDrainTimeoutMs() });
+      if (drainResult !== undefined && !drainResult.drained) {
+        recordDegradation(
+          'maintenance/shutdown',
+          `${drainResult.reason ?? '维护排空未完成'}——仍按顺序关库（残余写入错误由各自降级路径留痕）`,
+        );
+      }
+    } catch (err) {
       // 停表/排空失败不阻塞关闭（库仍会被关；残余任务错误由各自降级路径留痕）
+      recordDegradation('maintenance/shutdown', `维护停表/排空异常（${errorDetail(err)}）——继续关库`);
     }
+    // 运行时侧待落盘写入（清理节流状态等）：同一纪律——不等会写进已关闭的库/目录
+    await this.waitRuntimeWrites();
     await this.components.disposeAll();
     await this.eventStore.close();
     await this.staging.close();
     await this.memory.close();
+  }
+
+  /** 等运行时侧待落盘写入落地（有界；超时记降级不抛） */
+  private async waitRuntimeWrites(): Promise<void> {
+    const deadline = Date.now() + closeDrainTimeoutMs();
+    while (this.pendingRuntimeWrites > 0) {
+      if (Date.now() >= deadline) {
+        recordDegradation(
+          'runtime/shutdown',
+          `运行时待落盘写入未在期限内完成（pending=${this.pendingRuntimeWrites}）——继续关库`,
+        );
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   /**
@@ -3124,11 +3268,15 @@ export class CognitiveRuntime {
   private maintenanceRun(taskId: string, sessionId?: string): (signal?: AbortSignal) => Promise<void> {
     switch (taskId) {
       case 'gc':
-        return async () => {
+        // 可中断面：compact 是同步全表操作，事务中途无法让出——中断点设在它之前
+        //（已知问题《12 个维护任务里只有 1 个真正可被中断》：关停时不再占住事件循环数秒）
+        return async (signal) => {
+          assertNotAbortedSignal(signal, 'gc');
           await this.eventStore.compact(Date.now());
         };
       case 'candidate_validation':
-        return async () => {
+        return async (signal) => {
+          assertNotAbortedSignal(signal, 'candidate_validation');
           // 旧布局（线快照无 policy 内容）→ 候选管线不可执行（生产降级记录；不触碰真实 versions.git）——
           // R5：抛 Deferred（不再 return 假成功清债——未实现/不可执行任务 → debt 保留不清零，评估依据 §13）
           if (sessionId === undefined || this.lineSnapshot === null) {
@@ -3139,7 +3287,8 @@ export class CognitiveRuntime {
           await this.runEvolutionChain(sessionId);
         };
       case 'promotion_check':
-        return async () => {
+        return async (signal) => {
+          assertNotAbortedSignal(signal, 'promotion_check');
           // 旧布局（无线快照）→ 晋升检查跳过（生产降级记录；不触碰真实 versions.git）——
           // checked:false + skipped_reason 是真实检查结果（可审计），非空实现假成功；且该任务
           // 不 accrueDebt（无债务可清），保持既有 return 语义
@@ -3152,12 +3301,13 @@ export class CognitiveRuntime {
         // P7：Predictive Invalidation——指纹 diff → 衰减记录落盘 + 受影响对象降级/重新验证入队
         //（失败降级不抛：尽力而为）。审查修复 M4：不再在此无条件标记子系统健康——成功路径由
         // runEnvironmentCheck 内部标记（失败会被 catch 吞成"完成"，从而给出 untrue 的债务释放证据）。
-        return async () => {
+        return async (signal) => {
+          assertNotAbortedSignal(signal, 'environment_check');
           await this.runEnvironmentCheck();
         };
       case 'memory_consolidation':
         // R4（P0）：经验 → 长期记忆 生产闭环（§5.2/§7.2）——执行体 runMemoryConsolidation
-        //（失败 → 任务抛错 → 债务不清零——R5 清债语义）
+        //（失败 → 任务抛错 → 债务不清零——R5 清债语义；可中断：整合链内部逐单元检查 signal）
         return async (signal) => {
           await this.runMemoryConsolidation(signal);
         };
@@ -3172,26 +3322,28 @@ export class CognitiveRuntime {
           await this.runRelationBuild(signal);
         };
       case 'checkpoint_prune':
-        // 检查点轮转与清理（已知问题《检查点无轮转且自 09-09 起停写》：保留上限 + 会话维度清理）
-        return async () => {
-          await this.runCheckpointPrune();
+        // 检查点轮转与清理（已知问题《检查点无轮转且自 09-09 起停写》：保留上限 + 会话维度清理；
+        // 逐文件提交、文件之间可中断——删除不可回退，故中断如实上报已删数而非异常回滚）
+        return async (signal) => {
+          await this.runCheckpointPrune(signal);
         };
       case 'event_store_vacuum':
         // 事件库整理（已知问题《事件库体积增长》：按体积阈值触发 VACUUM 回收文件页）
-        return async () => {
-          await this.runEventStoreVacuum();
+        return async (signal) => {
+          await this.runEventStoreVacuum(signal);
         };
       case 'fact_store_compact':
         // 事实库分片合并（已知问题《事实库小文件》：一键一文件 → 分片存储，键仍可寻址）
-        return async () => {
-          await this.runFactStoreCompact();
+        return async (signal) => {
+          await this.runFactStoreCompact(signal);
         };
       case 'repair':
         // R5（P0+P1）+P3：受影响对象契约化重验证（读 decay 记录 → 对象契约 → 最小验证计划 →
         // 执行验证器 → 损坏分类 → 处置语义 → 成功清债；无待 repair 对象 = 合法完成清债；
         // 幂等——重复执行同结果）
-        return async () => {
-          await this.runRepair();
+        return async (signal) => {
+          assertNotAbortedSignal(signal, 'repair');
+          await this.runRepair(undefined, signal);
           // 修复完成 → 借同一次调度做一次「确认 → 释放」（已知问题《债务是保护性自锁》：
           // 修复动作完成后经自检确认，按条释放与该子系统相关的债务；未通过自检的条目保留）
           await this.runDebtRelease({ reviewed_by: 'maintenance:runRepair' });
@@ -3503,6 +3655,13 @@ export class CognitiveRuntime {
    * → consolidate（dedup/merge/relation/decay，backend.transaction 独占写事务——§7.2 单写者语义）。
    * 失败语义（R5 DeferredMaintenanceError 最小版）：任一步抛错 → 任务失败 → maintenance 债务不清零
    * （不再「空实现假成功」清债）；中断（signal.aborted）→ 抛 AbortError 让出留队（可重试）。
+   *
+   * 有界与可中断（已知问题《记忆整合没有真实批次上限》/《12 个维护任务里只有 1 个真正可被中断》）：
+   * ① 单次调用只处理预算内的记忆（`consolidationBudget`，缺省 2000），事务因此有界——内存驻留、
+   *   写锁持有时长、WAL 体积都封顶，超量部分留给下一次量子/收尾，而不是一次爆掉整个库；
+   * ② scope 轮转起点跨调用推进（`consolidationScopeOffset`）——库大于预算时后面的 scope 不会饿死；
+   * ③ signal 在整合链的**每个处理单元之间**被检查（dedup/merge/relation/decay 全覆盖），
+   *   关停/让出时不再"照跑到底"。
    */
   async runMemoryConsolidation(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted === true) {
@@ -3511,10 +3670,33 @@ export class CognitiveRuntime {
       throw err;
     }
     await this.staging.sweepExpired();
+    assertNotAbortedSignal(signal, 'staging.admit');
     await this.staging.admit();
-    await consolidate(this.memory);
+    const report = await consolidate(this.memory, {
+      budget: {
+        maxMemoriesPerRun: this.consolidationBudget,
+        scopeOffset: this.consolidationScopeOffset,
+        ...(signal !== undefined ? { signal } : {}),
+      },
+      // 有界执行元数据（报告只描述"改了什么"，元数据描述"跑了多少"）：推进轮转起点 + 留观测面
+      onOutcome: (o) => {
+        this.consolidationScopeOffset = o.next_scope_offset;
+        this.lastConsolidationRun = o;
+      },
+    });
+    this.lastConsolidationReport = report;
     // 子系统自检面：整合链成功跑完 → 标记健康（债务释放的确认依据；供维护任务与直接调用两条路径共用）
     this.markSubsystemOk('memory-consolidation');
+  }
+
+  /** 最近一次整合报告（状态面/测试可读：本次"改了什么"） */
+  consolidationReport(): ConsolidationReport | null {
+    return this.lastConsolidationReport;
+  }
+
+  /** 最近一次整合的有界执行元数据（"跑了多少"：处理量/是否被预算截断/下次轮转起点） */
+  consolidationRun(): ConsolidationOutcome | null {
+    return this.lastConsolidationRun;
   }
 
   /**
@@ -3614,6 +3796,7 @@ export class CognitiveRuntime {
    */
   async runRepair(
     judgeChecks?: Array<{ name: string; result: 'pass' | 'fail' | 'unknown'; detail?: string }>,
+    signal?: AbortSignal,
   ): Promise<RepairRecord> {
     // P3.5：真实验证执行器懒构造（实例字段缓存——重复执行幂等；构造失败降级记录不抛——
     // 执行器不可用 → 全检查 unknown → 诚实 UNKNOWN，不阻塞 repair）。检索以 episode=false 只读语义注入。
@@ -3665,6 +3848,10 @@ export class CognitiveRuntime {
     const objects: RepairObjectOutcome[] = [];
     const missing: ArtifactRef[] = [];
     for (const [id, entry] of affected) {
+      // 可中断面（已知问题《12 个维护任务里只有 1 个真正可被中断》）：逐对象之间检查——
+      // repair 的对象级验证是逐个独立提交的（审计记录在末尾一次落盘），中断 → AbortError 留队可重试
+      //（已完成的判定不落盘，重跑幂等重算，不产生半截审计记录）。
+      assertNotAbortedSignal(signal, `repair/${id}`);
       // kind 映射：ArtifactRef 'experience' → 'memory'；其余原样传入（seedRepairContract generic 兜底）
       const kind = entry.ref.kind === 'experience' ? 'memory' : entry.ref.kind;
       const m = await this.memory.getById(id);

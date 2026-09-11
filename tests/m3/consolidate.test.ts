@@ -242,3 +242,123 @@ describe('consolidate（§7.2 空闲期批处理）', () => {
     expect(report).toEqual({ deduped: 0, merged: 0, related: 0, decayed: 0, affected_scopes: [], impact: [] });
   });
 });
+
+/**
+ * 批次上限与可中断（已知问题《记忆整合没有真实批次上限》/《12 个维护任务里只有 1 个真正可被中断》）。
+ * 取向：**保持单次调用原子**（一个事务、要么全提交要么全回滚），但单次处理量受预算封顶
+ * （超出部分留给下一次），且整合链的每个处理单元之间检查中断信号。
+ */
+describe('整合批次上限与可中断（有界事务 / 逐单元中断）', () => {
+  /** 构造 N 条需要 dedup 的同内容重复记忆（每条都可独立观测是否被处理） */
+  async function seedDuplicates(b: SqliteMemoryBackend, n: number, scope: Scope = 'Project'): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      await b.ingest(
+        makeMemory({
+          payload: `重复内容-批次`,
+          updated: new Date(NOW - (n - i) * DAY).toISOString(),
+          scope,
+        }),
+      );
+    }
+  }
+
+  it('预算生效：单次只处理预算内的记忆（有界事务），被截断时如实上报', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 6);
+    const outcome: Array<{ processed: number; budget_exhausted: boolean; dirty: boolean }> = [];
+    const report = await consolidate(b, {
+      now: NOW,
+      budget: { maxMemoriesPerRun: 2, scopeOffset: 0 },
+      onOutcome: (o) =>
+        outcome.push({ processed: o.processed, budget_exhausted: o.budget_exhausted, dirty: o.dirty }),
+    });
+    // 预算 2 → 本次"整条载入"最多 2 条（Project），超出的留给下一次调用；被截断 → 如实上报
+    expect(outcome).toHaveLength(1);
+    expect(outcome[0]!.processed).toBe(2);
+    expect(outcome[0]!.budget_exhausted).toBe(true);
+    // dedup 走轻量键列（不占批预算，且是收敛所必需的）→ 本次把 6 条里的 5 条重复冻结
+    expect(report.deduped).toBe(5);
+    expect(outcome[0]!.dirty).toBe(true);
+    // 报告形状仍是稳定契约（不含预算元数据）
+    expect(Object.keys(report).sort()).toEqual(
+      ['affected_scopes', 'decayed', 'deduped', 'impact', 'merged', 'related'].sort(),
+    );
+  });
+
+  it('预算截断后继续推进：反复调用收敛到终态（不永停在一批，也不重复计数）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 6);
+    let offset = 0;
+    let processedTotal = 0;
+    let dedupedTotal = 0;
+    // 预算小于库容 → 单次只能看到一部分；反复调用（轮转推进）直到不再产生新改动
+    for (let round = 0; round < 10; round++) {
+      const report = await consolidate(b, {
+        now: NOW,
+        budget: { maxMemoriesPerRun: 3, scopeOffset: offset },
+        onOutcome: (o) => {
+          offset = o.next_scope_offset;
+          processedTotal += o.processed;
+          if (!o.dirty) return;
+        },
+      });
+      dedupedTotal += report.deduped;
+      if (report.deduped === 0 && report.merged === 0) break;
+    }
+    // 全部 6 条都被读到过（轮转 + 预算不导致饿死）
+    expect(processedTotal).toBeGreaterThanOrEqual(6);
+    const page = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
+    // 收敛终态：同内容只留最新 1 条 Active，其余 Frozen（不会重复冻结同一条）
+    expect(page.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(1);
+    expect(dedupedTotal).toBe(5);
+  });
+
+  it('可中断：整合链中途 abort → 抛 AbortError 且事务回滚（不留半整合状态）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 6);
+    const controller = new AbortController();
+    // 一进入整合就中断（在 scope 循环的第一个断言点触发）
+    controller.abort();
+    await expect(
+      consolidate(b, {
+        now: NOW,
+        budget: { maxMemoriesPerRun: 100, scopeOffset: 0, signal: controller.signal },
+      }),
+    ).rejects.toThrow(/interrupt|中断/u);
+    // 事务回滚：没有任何记忆被冻结（"要么全做要么全不做"的单次原子语义保持）
+    const page = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
+    expect(page.items.filter((m) => m.lifecycle === 'Frozen')).toHaveLength(0);
+    expect(page.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(6);
+  });
+
+  it('中断后重跑收敛一致：幂等不变量不受中断影响（重跑得到与从未中断相同的终态）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 6);
+    const controller = new AbortController();
+    controller.abort();
+    await consolidate(b, {
+      now: NOW,
+      budget: { maxMemoriesPerRun: 100, signal: controller.signal },
+    }).catch(() => undefined);
+    // 重跑（无 signal）→ 收敛到应有终态
+    const report = await consolidate(b, { now: NOW, budget: { maxMemoriesPerRun: 100 } });
+    expect(report.deduped).toBe(5);
+    const page = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
+    expect(page.items.filter((m) => m.lifecycle === 'Frozen')).toHaveLength(5);
+    expect(page.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(1);
+  });
+
+  it('无预算参数 → 缺省预算（2000）下的行为与旧实现一致（小库不受影响）', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    await seedDuplicates(b, 4);
+    const report = await consolidate(b, { now: NOW });
+    expect(report.deduped).toBe(3);
+    const page = await b.query({ scope: 'Project', limit: 50, budget: 1000 });
+    expect(page.items.filter((m) => m.lifecycle === 'Active')).toHaveLength(1);
+  });
+});

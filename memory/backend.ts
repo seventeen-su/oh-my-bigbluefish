@@ -11,7 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
 import { z } from 'zod';
-import { ScopeEnum } from '../kernel/schemas/base.js';
+import { ScopeEnum, type Scope } from '../kernel/schemas/base.js';
 import {
   MemoryQuerySchema,
   type MemoryBackend,
@@ -234,6 +234,51 @@ export class SqliteMemoryBackend implements MemoryBackend {
       }
     }
     return { items, cursor: nextCursor, total };
+  }
+
+  /**
+   * 轻量投影行（已知问题《记忆整合没有真实批次上限》修复的性能面）：`dedup` 需要"同 scope+kind
+   * 规范化后内容相同"的整组记录——而"规范化"是应用层语义（折叠空白/大小写等，见 staging-policy），
+   * **SQL 分组无法表达**（`GROUP BY payload` 会把 `'重复 内容'` 与 `'重复  内容'` 分成两组，
+   * 漏掉真正的重复）。
+   *
+   * 故此处只做"读得轻"的那一半：返回 `id/payload/updated/lifecycle/kind` 五个**小列**供应用层分组，
+   * 不读 `body`（完整 JSON 记录，含 provenance/utility_counts 等大字段），也不逐行 `JSON.parse`。
+   * 内存与解析代价从 O(全库 body) 降到 O(全库 键列)；确认重复后再按 id 取 body（只取重复项）。
+   */
+  dedupKeyRows(
+    scope: Scope,
+  ): Array<{ id: string; kind: string; payload: string; updated: number; lifecycle: string }> {
+    return this.db
+      .prepare(
+        `SELECT id, kind, payload, updated, lifecycle FROM memory
+         WHERE scope = ? AND lifecycle IN ('Active','Dormant','Suspicious')
+         ORDER BY updated DESC, id DESC`,
+      )
+      .all(scope) as unknown as Array<{
+      id: string;
+      kind: string;
+      payload: string;
+      /** epoch ms（表列为 INTEGER；Memory.updated 的 ISO 字符串在 body 内） */
+      updated: number;
+      lifecycle: string;
+    }>;
+  }
+
+  /** 按 id 批量取完整记录（不存在/损坏 → 跳过；保持入参顺序） */
+  getMany(ids: readonly string[]): Memory[] {
+    if (ids.length === 0) {
+      return [];
+    }
+    const stmt = this.db.prepare('SELECT body FROM memory WHERE id = ?');
+    const out: Memory[] = [];
+    for (const id of ids) {
+      const row = stmt.get(id) as { body: string } | undefined;
+      if (row !== undefined) {
+        out.push(JSON.parse(row.body) as Memory);
+      }
+    }
+    return out;
   }
 
   /** update：白名单字段补丁（MemoryPatchSchema 校验）→ 合并 + updated 刷新 + 全量再校验；FTS 由触发器同步；未知 id fail-loud */
