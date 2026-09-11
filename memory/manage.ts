@@ -16,6 +16,7 @@ import { makeMutableId } from '../kernel/schemas/base.js';
 import type { Memory, MemoryKind, MemoryLifecycle, MemoryProvClass } from '../kernel/schemas/m.js';
 import type { Scope } from '../kernel/schemas/base.js';
 import type { RelationBackend, RelationEdge } from './backend-relation.js';
+import { RELATION_EDGE_LIMIT_MAX } from './backend-relation.js';
 import type { RetrievalBackend } from './backend-retrieval.js';
 
 /** 合法的记忆类型/生命周期/作用域/来源类别（写入面白名单——非法值 fail-loud，不静默纠正） */
@@ -341,21 +342,29 @@ export async function mergeMemories(
     ? target.payload
     : `${target.payload}\n${source.payload}`;
   try {
-    if (mergedText !== target.payload) {
-      await backend.update(targetId, { payload: mergedText });
-      backend.encodeOne(targetId);
-    }
-    // 关系迁移：source 的入边改指 target（保留"谁指向这条知识"的结构信息）。
-    // 入边查询走 memory_relation 的 to_id 索引（relationTraverse 是出边 BFS，取不到入边）。
-    const inbound = backend.inboundRelationIds(sourceId);
-    for (const edge of inbound) {
-      try {
-        await backend.link(edge.from_id, targetId, edge.type);
-      } catch {
-        // 重复边（UNIQUE 冲突）→ 跳过（目标语义已满足：入边指向保留者）
+    await backend.transaction(async () => {
+      if (mergedText !== target.payload) {
+        await backend.update(targetId, { payload: mergedText });
+        backend.encodeOne(targetId);
       }
-    }
-    await backend.delete(sourceId);
+      // 关系迁移：source 的入边改指 target（保留"谁指向这条知识"的结构信息）。
+      // 入边查询走 memory_relation 的 to_id 索引（relationTraverse 是出边 BFS，取不到入边）。
+      // 审查修复：① 迁移**保留原边的权重/时间/来源**（此前用 link 三参 → 弱相似边被静默抬成满权、
+      // 来源被改写成 'rule'）；② 排除 from === target（否则当 T<S 时已存在 T→S，再建 T→T 自环——
+      // 幽灵边会抬高关系度数与 Memory Value）；③ 幂等 upsert 取代"UNIQUE 冲突静默丢弃"。
+      const inbound = backend.relationEdges({ to: sourceId, limit: RELATION_EDGE_LIMIT_MAX });
+      for (const edge of inbound) {
+        if (edge.from_id === targetId) {
+          continue; // 自环不产生（与 listRelations 的 direction 契约一致）
+        }
+        await backend.upsertRelation(edge.from_id, targetId, edge.type, {
+          weight: edge.weight,
+          ...(edge.source !== null ? { source: edge.source } : {}),
+          ...(edge.created !== null ? { created: edge.created } : {}),
+        });
+      }
+      await backend.delete(sourceId);
+    });
   } catch (err) {
     return { ok: false, target_id: targetId, merged_text: false, degraded: `合并失败：${(err as Error).message}` };
   }

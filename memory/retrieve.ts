@@ -60,6 +60,8 @@ export interface RetrievalResult {
   channels_used: ChannelName[];
   /** Retrieval Episode（opts.episode=false 时无） */
   episode?: RetrievalEpisode;
+  /** 通道级降级说明（如"向量通道故障（已退回纯词法）：…"）——仅在实际降级时出现 */
+  degraded?: string;
 }
 
 // ---- 偏好/权重常量表（初值，待标定 §17） ----
@@ -349,6 +351,7 @@ async function collectSemanticGroup(
   kindFilter: MemoryKind[] | null,
   scope: Scope,
   channels: Set<ChannelName>,
+  notes: string[],
 ): Promise<FusedCandidate[]> {
   const fused = new Map<string, FusedCandidate>();
   const upsert = (m: Memory): FusedCandidate => {
@@ -373,6 +376,10 @@ async function collectSemanticGroup(
       const hits = await backend.vectorSearch(query.text ?? '', {
         scope,
         ...(kindFilter !== null ? { kinds: kindFilter } : {}),
+        // 过滤面与词法通道对齐（审查修复）：lifecycle / prov_class 也要透传，否则词法侧被过滤掉的
+        // Frozen/Suspicious 记忆仍会经向量侧进入融合池并被注入
+        ...(query.lifecycle !== undefined ? { lifecycles: [query.lifecycle] } : {}),
+        ...(query.prov_class !== undefined ? { provClasses: [query.prov_class] } : {}),
         topK: FUSION_POOL_LIMIT,
       });
       if (hits.length > 0) channels.add('vector');
@@ -380,8 +387,10 @@ async function collectSemanticGroup(
         const c = upsert(h.memory);
         c.vector = Math.max(0, Math.min(1, h.score)); // 余弦 ∈ [-1,1]；负值已被 vectorSearch 过滤
       }
-    } catch {
-      // 向量通道不可用/失败 → 降级为纯词法（诚实降级，不影响其余通道）
+    } catch (err) {
+      // 向量通道故障（非"无候选"）：降级为纯词法，但**必须留痕**（审查修复 H1：此前空 catch 吞掉
+      // 维度不一致等 fail-loud 错误 → 通道静默消失、状态面只看到 lexical，故障不可观测也不可自愈）。
+      notes.push(`向量通道故障（已退回纯词法）：${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -413,10 +422,12 @@ async function expandRelations(
   const added: FusedCandidate[] = [];
   for (const seed of seeds) {
     if (added.length >= maxAdd) break;
+    // 审查修复：把权重排序下推到 SQL（此前先按 id 截断再在 JS 排序 → 高权重强边可能落在 LIMIT 之外，
+    // 弱相似边反而占满窗口；测试用"20 条弱边 + 2 条满权边"证明过该形态）
     const edges = backend
-      .relationEdges({ from: seed.memory.id, limit: RELATION_EXPAND_EDGE_LIMIT })
+      .relationEdges({ from: seed.memory.id, limit: RELATION_EXPAND_EDGE_LIMIT, order: 'weight_desc' })
       .slice()
-      .sort((a, b) => b.weight - a.weight || a.to_id.localeCompare(b.to_id)); // 权重优先（同权按 id 确定性）
+      .sort((a, b) => b.weight - a.weight || a.to_id.localeCompare(b.to_id)); // 同权按 id 确定性
     for (const edge of edges) {
       if (added.length >= maxAdd) break;
       if (known.has(edge.to_id)) continue;
@@ -481,11 +492,13 @@ export async function retrieve(
   /** 融合分（语义组；时序组为空——时序组按通道自然序，再由 Memory Value 排序） */
   const fusedScores = new Map<string, number>();
   let channel: ChannelName = group === 'semantic' ? 'lexical' : group === 'episode' ? 'episode' : group === 'relation' ? 'relation' : 'temporal';
+  /** 通道级降级说明（向量通道故障等——如实进结果，不静默） */
+  const notes: string[] = [];
 
   for (const scope of chain) {
     consulted.push(scope);
     if (group === 'semantic') {
-      const fused = await collectSemanticGroup(backend, parsed.data, kindFilter, scope, channels);
+      const fused = await collectSemanticGroup(backend, parsed.data, kindFilter, scope, channels, notes);
       for (const c of fused) {
         if (!seen.has(c.memory.id)) {
           seen.set(c.memory.id, c.memory);
@@ -574,6 +587,8 @@ export async function retrieve(
     channel_used: channel,
     channels_used: [...channels].sort(),
     scope_chain: consulted,
+    // 通道级降级说明（仅在有故障时出现——不改变无故障时的结果形状）
+    ...(notes.length > 0 ? { degraded: notes.join('；') } : {}),
   };
   if (opts.episode !== false) {
     const ep = await recordEpisode(backend, {
@@ -604,7 +619,7 @@ async function rebuildFused(
   }
   for (const scope of chain) {
     const scratch = new Set<ChannelName>();
-    const fused = await collectSemanticGroup(backend, query, kindFilter, scope, scratch);
+    const fused = await collectSemanticGroup(backend, query, kindFilter, scope, scratch, []);
     for (const c of fused) {
       const hit = byId.get(c.memory.id);
       if (hit !== undefined) {
