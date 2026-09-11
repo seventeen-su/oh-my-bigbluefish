@@ -407,6 +407,125 @@ describe('维护调度（§12.3）', () => {
       await b.close();
     }
   });
+
+  // ---- ⑨ 关停真正排空（已知问题《关停不是真正排空》） ----
+
+  it('drain：等长任务真正跑完（不是只等 running 标志回落）——任务体完成前不返回', async () => {
+    const s = mkScheduler();
+    let done = false;
+    await s.enqueue(
+      task({
+        id: 'long',
+        run: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          done = true;
+        },
+      }),
+    );
+    const q = s.requestQuantum();
+    s.stop(); // 关停：中断在飞 signal（任务体不检查 → 照跑到底）
+    const d = await s.drain({ timeoutMs: 3000 });
+    await q;
+    expect(done).toBe(true); // 长任务体已真正结束（旧实现只轮询 running，可能提前返回）
+    expect(d.drained).toBe(true);
+    expect(s.isIdle).toBe(true);
+  });
+
+  it('drain：等待已发出的落盘写入（观测 JSONL/债务快照落完才算静默）', async () => {
+    const s = mkScheduler();
+    await s.enqueue(task({ id: 'quick', run: async () => {} }));
+    await s.requestQuantum();
+    // 任务已跑完，但观测/债务写入可能仍在飞——drain 必须等到它们落完
+    const d = await s.drain({ timeoutMs: 3000 });
+    expect(d.drained).toBe(true);
+    expect(s.pendingWriteCount).toBe(0);
+    expect(s.isIdle).toBe(true);
+  });
+
+  it('drain：任务体不检查 signal 且超时 → drained=false + 可读原因（不静默假称已排空）', async () => {
+    const s = mkScheduler();
+    await s.enqueue(
+      task({
+        id: 'stuck',
+        run: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+        },
+      }),
+    );
+    const q = s.requestQuantum();
+    s.stop();
+    const d = await s.drain({ timeoutMs: 50 });
+    expect(d.drained).toBe(false);
+    expect(d.reason ?? '').toMatch(/排空超时|在飞任务/);
+    await q; // 收尾（避免悬挂）
+  });
+
+  it('idle()：静默点判据 = 无在飞任务 + 无在飞任务体 + 无待落盘写入', async () => {
+    const s = mkScheduler();
+    expect(s.isIdle).toBe(true);
+    await s.idle(); // 已静默 → 立即返回（不挂起）
+    await s.enqueue(task({ id: 'x', run: async () => {} }));
+    expect(s.isIdle).toBe(true); // 有队列任务但未执行 → 仍属静默（无人写盘）
+    await s.requestQuantum();
+    expect(s.isIdle).toBe(true);
+  });
+});
+
+// ---- ⑩ 观测摘要缓存（已知问题《观测摘要同步读当日日志》） ----
+
+describe('观测摘要缓存（kern_status 可读入口不再每次同步读全文件）', () => {
+  it('文件未变的重复调用命中缓存（读盘次数不再随调用次数增长）', async () => {
+    const s = mkScheduler();
+    await s.enqueue(task({ id: 'gc', value: 1, estimated_cost: 1, run: async () => {} }));
+    await s.requestQuantum(); // 产生一条观测记录
+    const first = await s.observationsSummaryAsync();
+    expect(first.total).toBe(1);
+    const stats1 = s.observationCacheStats();
+    // 重复调用（文件未变）→ 全部命中缓存
+    for (let i = 0; i < 25; i++) {
+      const again = await s.observationsSummaryAsync();
+      expect(again).toEqual(first);
+    }
+    const stats2 = s.observationCacheStats();
+    expect(stats2.reads_avoided).toBeGreaterThanOrEqual(25);
+    expect(stats2.cached).toBe(true);
+    expect(stats2.reads_avoided).toBeGreaterThan(stats1.reads_avoided);
+  });
+
+  it('同步入口与异步入口共用缓存与口径（同一摘要对象，不产生两条分叉路径）', async () => {
+    const s = mkScheduler();
+    await s.enqueue(task({ id: 'gc', value: 1, estimated_cost: 1, run: async () => {} }));
+    await s.requestQuantum();
+    const a = await s.observationsSummaryAsync();
+    const b = s.observationsSummary();
+    expect(b).toEqual(a);
+  });
+
+  it('观测文件变化 → 缓存失效重新读取（摘要不陈旧）', async () => {
+    const s = mkScheduler();
+    const first = await s.observationsSummaryAsync();
+    expect(first.total).toBe(0);
+    // 追加一条观测（模拟维护任务落盘）→ 摘要必须反映新数据
+    const date = new Date().toISOString().slice(0, 10);
+    const dir = join(tmpRoot, 'maintenance-observations');
+    await writeFile(
+      join(dir, `${date}.jsonl`),
+      `${JSON.stringify({ ts: Date.now(), task_id: 'gc', duration_ms: 100, result: 'success', debt_before: 0, debt_after: 0 })}\n`,
+      'utf8',
+    ).catch(async (err: NodeJS.ErrnoException) => {
+      if (err.code !== 'ENOENT') throw err;
+      const { mkdir } = await import('node:fs/promises');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, `${date}.jsonl`),
+        `${JSON.stringify({ ts: Date.now(), task_id: 'gc', duration_ms: 100, result: 'success', debt_before: 0, debt_after: 0 })}\n`,
+        'utf8',
+      );
+    });
+    const second = await s.observationsSummaryAsync();
+    expect(second.total).toBe(1);
+    expect(second.per_task[0]).toEqual({ task_id: 'gc', count: 1, avg_duration_ms: 100 });
+  });
 });
 
 /** M1 Memory 工厂（T3.3 同款）：provenance.event 每次唯一（幂等键）；over 覆盖字段 */

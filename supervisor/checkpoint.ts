@@ -232,6 +232,11 @@ export interface PruneResult {
  *   ④ 无会话归属的旧检查点（本修复前写入、或确实无从归属）→ 只在超出全局上限时按最旧优先删除
  *      （不做"无主即删"——它们仍可能是有价值的最后状态）。
  * 只删除 `.json` 正式文件（tmp 残留与无关文件不碰）；删除失败 → 计入 reasons 不抛（尽力而为）。
+ *
+ * 可中断（已知问题《12 个维护任务里只有 1 个真正可被中断》修复，且这是**不可回退**的删除操作）：
+ * 检查点删除按文件逐个提交——每个文件之间检查 `opts.signal`，中断则**就地停止并如实返回**
+ * （已完成删除不撤销、不假装全部完成：reasons 记 `中断于第 n/M 个`，removed 为真实删除数）。
+ * 这条设计是刻意的：把"删了一半"变成**可观测的上报**，而不是异常回滚（文件删除无法回滚）。
  */
 export async function prune(
   opts: {
@@ -240,6 +245,8 @@ export async function prune(
     maxFiles?: number;
     maxAgeMs?: number;
     now?: () => number;
+    /** 中断信号（每个文件删除之间检查；中断 → 停止并如实返回已删除数） */
+    signal?: AbortSignal;
   },
 ): Promise<PruneResult> {
   const perSessionKeep = Math.max(1, Math.floor(opts.perSessionKeep ?? CHECKPOINT_PER_SESSION_KEEP));
@@ -290,7 +297,14 @@ export async function prune(
     }
   }
   let removed = 0;
+  let index = 0;
   for (const cp of toRemove) {
+    if (opts.signal?.aborted === true) {
+      // 可中断且**不撤销已完成的删除**（文件删除无法回滚）：如实标注中断位置与真实删除数
+      reasons.push(`中断于第 ${index}/${toRemove.length} 个（已删除 ${removed} 个，剩余下次量子继续）`);
+      break;
+    }
+    index++;
     try {
       await rm(fileFor(opts.dir, cp.id));
       removed++;

@@ -26,8 +26,8 @@
 //   成本注入面 maintenanceCosts/setMaintenanceCosts（装配时传 policy.evolve.maintenance_costs——§10.1
 //   estimated_cost 数据化；enqueue 未给 cost 且 id 命中 → 用 policy 成本，未列出 id 仍 M3 缺省 1）。
 // layer 1（supervisor/）：仅 node: 内置 + kernel/schemas/（契约例外）+ supervisor/ 内文件。
-import { existsSync, readFileSync } from 'node:fs';
-import { appendFile, mkdir, rename, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { appendFile, mkdir, readFile as readFileAsync, rename, stat as statFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Fingerprint } from '../kernel/schemas/base.js';
 import type { MaintenanceUrgency } from '../kernel/schemas/evolution.js';
@@ -172,6 +172,49 @@ function utcDay(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
+/** 观测文件身份（缓存键：日期 + mtime + 大小——任一变化即重新读取，保证摘要不陈旧） */
+interface ObservationCacheIdentity {
+  date: string;
+  mtimeMs: number;
+  size: number;
+}
+
+/** 文件身份比对（无 stat 信息时（-1/-1）视为不一致 → 重新读取，宁可多读也不错报） */
+function sameIdentity(a: ObservationCacheIdentity, b: { mtimeMs: number; size: number }): boolean {
+  return a.mtimeMs >= 0 && a.size >= 0 && a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+/**
+ * 当日观测 JSONL → 摘要（纯函数：损坏行跳过、按 task_id 聚合、确定性排序）。
+ * 抽成纯函数后同步/异步两条路径共用同一口径（避免"缓存命中与未命中给不同结果"这类隐蔽分叉）。
+ */
+function summarizeObservations(raw: string, date: string): MaintenanceObservationSummary {
+  const perTask = new Map<string, { count: number; totalMs: number }>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const obs = JSON.parse(trimmed) as MaintenanceObservation;
+      if (typeof obs.task_id !== 'string') continue;
+      const agg = perTask.get(obs.task_id) ?? { count: 0, totalMs: 0 };
+      agg.count++;
+      agg.totalMs += typeof obs.duration_ms === 'number' ? obs.duration_ms : 0;
+      perTask.set(obs.task_id, agg);
+    } catch {
+      // 损坏观测行跳过（观测为审计日志——不因坏行崩摘要）
+    }
+  }
+  const per_task = [...perTask.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([task_id, agg]) => ({
+      task_id,
+      count: agg.count,
+      avg_duration_ms: agg.count > 0 ? Math.round(agg.totalMs / agg.count) : 0,
+    }));
+  const total = per_task.reduce((acc, p) => acc + p.count, 0);
+  return { date, total, per_task };
+}
+
 export interface QuantumReport {
   ran: string[];
   skipped: string[];
@@ -239,6 +282,14 @@ export const DEFAULT_HARD_LIMIT = 50;
 export const DEFAULT_CRITICAL_LIMIT = 100;
 /** 单次调用（tick/requestQuantum）的任务批量硬上限——防 batchSize 配置过大导致单次调用长时间占用 */
 export const MAINTENANCE_BATCH_MAX = 16;
+/**
+ * 关停排空超时缺省（ms）：`stop()` 已中断在飞 signal（可中断任务会立刻让出），此上限只兜住
+ * "任务体不检查 signal"的少数情况——够长以覆盖正常长任务（记忆整合/事件库 VACUUM），
+ * 又不至于让宿主退出长时间挂住。超时 → drain 返回 drained=false 由调用方如实记录。
+ */
+export const DEFAULT_DRAIN_TIMEOUT_MS = 10_000;
+/** 静默点轮询间隔（ms；只在非静默时轮询，静默时零开销） */
+const IDLE_POLL_MS = 25;
 /** 批量缺省值：1 = 既有单量子语义（每次最多执行 1 个任务）；生产装配显式调高以消除 ROI 饥饿 */
 export const DEFAULT_BATCH_SIZE = 1;
 /**
@@ -323,6 +374,14 @@ export class MaintenanceScheduler {
   private stopped = false;
   private started = false;
   private running = false;
+  /**
+   * 已发出但尚未落完的落盘写入计数（已知问题《关停不是真正排空》修复）：
+   * `drain()` 的静默点判据之一——只等 running 标志回落会漏掉"任务函数已返回、写入还在飞"的窗口，
+   * 关库后这些写入抛 `database is not open` 并被记成任务失败（假债务）。
+   */
+  private pendingWrites = 0;
+  /** 在飞任务体计数（任务函数真正执行中；与 running 分开——批量循环退出后任务体可能仍在跑） */
+  private inflight = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** 最近一次调度器自身故障（定时器路径兜底：如 debt.json 损坏）；状态面可读，不再静默吞错 */
   private lastSchedulerError: string | null = null;
@@ -335,6 +394,14 @@ export class MaintenanceScheduler {
   private readonly releaseLogFile: string;
   /** 本次进程内已执行的释放记录（审计内存面；权威历史在 JSONL 文件） */
   private releaseLog: DebtReleaseRecord[] = [];
+  /**
+   * 观测摘要缓存（已知问题《观测摘要同步读当日日志》修复）：键 = 当日文件身份（mtime+size）。
+   * kern_status 可被模型随时调用——此前每次都同步读全文件并逐行解析，一天几千条维护任务时阻塞事件循环；
+   * 现在文件未变的重复调用零读盘、零解析（返回同一摘要对象）。
+   */
+  private observationCache: { identity: ObservationCacheIdentity; summary: MaintenanceObservationSummary } | null = null;
+  /** 因缓存命中而省掉的读盘次数（状态面可读；证明重复调用不再同步读全文件） */
+  private observationReadsAvoided = 0;
 
   constructor(opts: MaintenanceSchedulerOptions = {}) {
     this.debtFile = opts.debtFile ?? join(process.cwd(), 'workspace', '.omb', '.evolution', 'debt.json');
@@ -469,15 +536,87 @@ export class MaintenanceScheduler {
   }
 
   /**
-   * 排空：等在飞量子/tick 落地（关闭前调用——见 assembly.close 的审查修复）。
-   * stop() 会中断在飞任务的 signal，但任务体可能不检查 signal（如 turn-finalize 的 compact），
-   * 故以"running 标志回落 + 一个宏任务让出"作为静默点：仍在跑的写入有机会完成/失败留痕，
-   * 而不是在库关闭后抛 database is not open。有界（最多等 50ms 轮的 20 次），不阻塞宿主退出。
+   * 排空：等在飞量子/tick 落地**且已发出的落盘写入完成**（关闭前调用——见 assembly.close）。
+   *
+   * 已知问题《关停不是真正排空》修复：此前只轮询 `running` 标志（上限 1 秒），既不等待
+   * runOne 内部仍在跑的长任务（单个整合任务在数据量大时远超 1 秒），也不等待已发出的
+   * 落盘写入（观测 JSONL / 债务快照 / 释放审计）——关库后这些写入会撞 `database is not open`，
+   * 被记成"任务失败"并产生**假债务**（测试侧表现为临时目录清理竞态 ENOTEMPTY）。
+   *
+   * 现在：
+   *   ① `idle()` 的判据 = 无在飞任务（running=false 且无在飞派发）**且**待落盘写入集合已清空；
+   *   ② 等待有界（`drainTimeoutMs`，缺省 10s——覆盖正常长任务；`stop()` 已中断在飞 signal，
+   *      可中断任务会很快让出）；③ 超时→返回 `{ drained:false, reason }`，由调用方如实记录降级
+   *      （不静默假称已排空）。
    */
-  async drain(): Promise<void> {
-    for (let i = 0; i < 20 && this.running; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+  async drain(opts: { timeoutMs?: number } = {}): Promise<{ drained: boolean; waited_ms: number; reason?: string }> {
+    const timeout = opts.timeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
+    const started = this.nowFn();
+    const settled = await this.waitIdle(timeout);
+    const waited = this.nowFn() - started;
+    if (settled) {
+      return { drained: true, waited_ms: waited };
     }
+    return {
+      drained: false,
+      waited_ms: waited,
+      reason:
+        `排空超时（${waited}ms ≥ ${timeout}ms）：` +
+        `${this.running ? '仍有在飞任务' : '无在飞任务但仍有待落盘写入'}` +
+        `（pending_writes=${this.pendingWrites}）——库将以"可能仍在写入"的状态关闭`,
+    };
+  }
+
+  /**
+   * 静默点（idle）：无在飞任务且无待落盘写入时立即 resolve；否则等下一次状态变化（有界轮询）。
+   * 供 drain 与测试使用（`maintenanceIdle()` 是"能不能安全关库"的唯一判据）。
+   */
+  async idle(): Promise<void> {
+    await this.waitIdle(Number.POSITIVE_INFINITY);
+  }
+
+  /**
+   * 当前是否处于静默点（无在飞任务 + 无在飞任务体 + 无待落盘写入）。
+   * 三个条件缺一不可：running=false 只说明"批量循环已退出"，任务体（inflight）与已发出的写入
+   * （pendingWrites）都可能还在跑——这正是旧实现关库撞 `database is not open` 的窗口。
+   */
+  get isIdle(): boolean {
+    return !this.running && this.inflight === 0 && this.pendingWrites === 0;
+  }
+
+  /** 在飞任务体数（状态面/测试可读） */
+  get inflightTaskCount(): number {
+    return this.inflight;
+  }
+
+  /** 待落盘写入数（状态面/测试可读；>0 表示"现在关库会丢/报错"） */
+  get pendingWriteCount(): number {
+    return this.pendingWrites;
+  }
+
+  /** 轮询等待静默点（无界或带超时）；返回是否达成静默 */
+  private async waitIdle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    // 先给已排队的微任务机会完成（running 的 finally 与写入的 finally 都在微任务队列里）
+    for (;;) {
+      if (this.isIdle) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, IDLE_POLL_MS));
+    }
+  }
+
+  /**
+   * 登记一次"已发出的落盘写入"：返回结算函数（幂等）。所有 async 落盘（债务快照/观测 JSONL/
+   * 释放审计）都经此登记，使 drain 能等到它们真正落完，而不是等到任务函数返回就走。
+   */
+  private trackWrite(): () => void {
+    this.pendingWrites += 1;
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.pendingWrites -= 1;
+    };
   }
 
   /** 当前债务快照（深拷贝；task_id 排序，确定性） */
@@ -650,42 +789,109 @@ export class MaintenanceScheduler {
   /**
    * S2：观测摘要（kern_status 可读入口）——今日（UTC）任务数 + 各任务平均耗时（per_task 按 task_id 排序，确定性）。
    * 无观测目录/文件 → 全零（安全降级）；文件不可读 → 抛错（调用方降级字段记录，不静默吞错）。
+   *
+   * 同步版（保留给既有调用方/测试）：已知问题《观测摘要同步读当日日志》——`kern_status`（模型可随时调用的
+   * 工具）走这条路径，每次调用都 readFileSync 当日 JSONL 并逐行 JSON.parse，一天几千条维护任务时
+   * **同步阻塞事件循环**。现在走 `observationCache`（文件身份未变的重复调用零读盘、零解析）；
+   * 异步入口请用 `observationsSummaryAsync()`（同样的缓存，但不阻塞事件循环）。
    */
   observationsSummary(): MaintenanceObservationSummary {
     const date = utcDay(this.nowFn());
-    const file = join(this.observationsDir, `${date}.jsonl`);
-    const perTask = new Map<string, { count: number; totalMs: number }>();
-    if (existsSync(file)) {
-      let raw: string;
-      try {
-        raw = readFileSync(file, 'utf8');
-      } catch (err) {
-        throw new Error(`maintenance observations unreadable: ${file}: ${(err as Error).message}`);
-      }
-      for (const line of raw.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) continue;
-        try {
-          const obs = JSON.parse(trimmed) as MaintenanceObservation;
-          if (typeof obs.task_id !== 'string') continue;
-          const agg = perTask.get(obs.task_id) ?? { count: 0, totalMs: 0 };
-          agg.count++;
-          agg.totalMs += typeof obs.duration_ms === 'number' ? obs.duration_ms : 0;
-          perTask.set(obs.task_id, agg);
-        } catch {
-          // 损坏观测行跳过（观测为审计日志——不因坏行崩摘要）
-        }
-      }
+    const cached = this.cachedObservationSummary(date);
+    if (cached !== null) {
+      return cached;
     }
-    const per_task = [...perTask.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([task_id, agg]) => ({
-        task_id,
-        count: agg.count,
-        avg_duration_ms: agg.count > 0 ? Math.round(agg.totalMs / agg.count) : 0,
-      }));
-    const total = per_task.reduce((acc, p) => acc + p.count, 0);
-    return { date, total, per_task };
+    return this.observationsSummaryBlocking(date);
+  }
+
+  /** 异步观测摘要（kern_status 首选入口：不阻塞事件循环；失败 → 抛错由调用方降级） */
+  async observationsSummaryAsync(): Promise<MaintenanceObservationSummary> {
+    const date = utcDay(this.nowFn());
+    const cached = this.cachedObservationSummary(date);
+    if (cached !== null) {
+      return cached;
+    }
+    const file = join(this.observationsDir, `${date}.jsonl`);
+    let stat: { mtimeMs: number; size: number } | null = null;
+    try {
+      const s = await statFile(file);
+      stat = { mtimeMs: s.mtimeMs, size: s.size };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return this.storeObservationSummary(date, { date, total: 0, per_task: [] }, null);
+      }
+      throw new Error(`maintenance observations unreadable: ${file}: ${(err as Error).message}`);
+    }
+    if (this.observationCache?.identity.date === date && sameIdentity(this.observationCache.identity, stat)) {
+      this.observationReadsAvoided += 1;
+      return this.observationCache.summary;
+    }
+    let raw: string;
+    try {
+      raw = await readFileAsync(file, 'utf8');
+    } catch (err) {
+      throw new Error(`maintenance observations unreadable: ${file}: ${(err as Error).message}`);
+    }
+    return this.storeObservationSummary(date, summarizeObservations(raw, date), stat);
+  }
+
+  /** 观测缓存命中判定（文件身份未变 → 直接返回；null = 需要重新读取） */
+  private cachedObservationSummary(date: string): MaintenanceObservationSummary | null {
+    const c = this.observationCache;
+    if (c === null || c.identity.date !== date) {
+      return null;
+    }
+    // 文件身份比对需要 stat——同步路径下同样只做一次 stat（远廉于读全文件 + 逐行解析）
+    try {
+      const s = statSync(this.observationsFileFor(date));
+      if (sameIdentity(c.identity, { mtimeMs: s.mtimeMs, size: s.size })) {
+        this.observationReadsAvoided += 1;
+        return c.summary;
+      }
+    } catch {
+      // stat 失败 → 回落到重新读取（行为与旧实现一致）
+    }
+    return null;
+  }
+
+  /** 同步读取（缓存未命中的回落路径；语义与旧实现逐字一致——损坏行跳过、读取失败抛错） */
+  private observationsSummaryBlocking(date: string): MaintenanceObservationSummary {
+    const file = this.observationsFileFor(date);
+    if (!existsSync(file)) {
+      return this.storeObservationSummary(date, { date, total: 0, per_task: [] }, null);
+    }
+    let raw: string;
+    let identity: ObservationCacheIdentity;
+    try {
+      const s = statSync(file);
+      identity = { date, mtimeMs: s.mtimeMs, size: s.size };
+      raw = readFileSync(file, 'utf8');
+    } catch (err) {
+      throw new Error(`maintenance observations unreadable: ${file}: ${(err as Error).message}`);
+    }
+    return this.storeObservationSummary(date, summarizeObservations(raw, date), identity);
+  }
+
+  private observationsFileFor(date: string): string {
+    return join(this.observationsDir, `${date}.jsonl`);
+  }
+
+  /** 写入缓存并返回摘要（缓存是纯优化：任何身份变化都会导致重新读取，不影响正确性） */
+  private storeObservationSummary(
+    date: string,
+    summary: MaintenanceObservationSummary,
+    stat: { mtimeMs: number; size: number } | null,
+  ): MaintenanceObservationSummary {
+    this.observationCache = {
+      identity: { date, mtimeMs: stat?.mtimeMs ?? -1, size: stat?.size ?? -1 },
+      summary,
+    };
+    return summary;
+  }
+
+  /** 观测摘要缓存观测面（状态面/测试可读：省掉的读盘次数——证明"重复调用不再同步读全文件"） */
+  observationCacheStats(): { reads_avoided: number; cached: boolean } {
+    return { reads_avoided: this.observationReadsAvoided, cached: this.observationCache !== null };
   }
 
   /** Predictive Invalidation（§9.1）：Fingerprint diff → markSuspicious + 最小回归子集 + 衰减记录 */
@@ -793,6 +999,22 @@ export class MaintenanceScheduler {
     // S2 观测：任务开始时间 + 执行前债务（accrueDebt 任务入队即累计；未入账 → 0）
     const started = this.nowFn();
     const debtBefore = this.debt.get(t.id)?.value ?? 0;
+    this.inflight += 1;
+    try {
+      return await this.runOneBody(t, signal, started, debtBefore);
+    } finally {
+      // 任务体退场（含抛错/中断路径）：关停排空的静默点判据据此收敛（见 isIdle/drain）
+      this.inflight -= 1;
+    }
+  }
+
+  /** runOne 主体（执行 + 结果结算；在飞计数由 runOne 的 try/finally 持有） */
+  private async runOneBody(
+    t: MaintenanceTask,
+    signal: AbortSignal | undefined,
+    started: number,
+    debtBefore: number,
+  ): Promise<QuantumReport> {
     try {
       await t.run(signal);
     } catch (err) {
@@ -948,10 +1170,15 @@ export class MaintenanceScheduler {
   /** 原子写：tmp + rename（.evolution/debt.json）；无债务且无文件 → 不写 */
   private async persistDebt(): Promise<void> {
     if (this.debt.size === 0 && !existsSync(this.debtFile)) return;
-    await mkdir(dirname(this.debtFile), { recursive: true });
-    const tmp = `${this.debtFile}.tmp`;
-    await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
-    await rename(tmp, this.debtFile);
+    const settle = this.trackWrite(); // 关停排空据此等待（见 drain/idle）
+    try {
+      await mkdir(dirname(this.debtFile), { recursive: true });
+      const tmp = `${this.debtFile}.tmp`;
+      await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
+      await rename(tmp, this.debtFile);
+    } finally {
+      settle();
+    }
   }
 
   /**
@@ -961,11 +1188,14 @@ export class MaintenanceScheduler {
    */
   private async appendReleaseAudit(rec: DebtReleaseRecord): Promise<void> {
     this.releaseLog.push(rec);
+    const settle = this.trackWrite();
     try {
       await mkdir(dirname(this.releaseLogFile), { recursive: true });
       await appendFile(this.releaseLogFile, `${JSON.stringify(rec)}\n`, 'utf8');
     } catch {
       // 审计写入失败 → 降级（内存面保留；调用方可从 debtReleaseAudit() 读回）
+    } finally {
+      settle();
     }
   }
 
@@ -974,11 +1204,14 @@ export class MaintenanceScheduler {
    * 尽力而为：写入失败 → 降级不阻塞调度（观测为审计日志——缺观测不中断维护链）。
    */
   private async appendObservation(obs: MaintenanceObservation): Promise<void> {
+    const settle = this.trackWrite();
     try {
       await mkdir(this.observationsDir, { recursive: true });
       await appendFile(join(this.observationsDir, `${utcDay(obs.ts)}.jsonl`), `${JSON.stringify(obs)}\n`, 'utf8');
     } catch {
       // 观测写入失败 → 降级（不抛：调度照常；观测缺失由摘要面诚实呈现）
+    } finally {
+      settle();
     }
   }
 
