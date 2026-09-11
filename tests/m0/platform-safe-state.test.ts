@@ -10,9 +10,10 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { platformProvider, resetPlatformProviderCache } from '../../substrate/platform.js';
 import { evaluateSafeState } from '../../substrate/safe-state.js';
+import { defaultLayout } from '../../substrate/snapshot.js';
 import type { CognitiveRuntime } from '../../runtime/assembly.js';
 import { apply, type ContextLike } from '../../runtime/plugin.js';
 const bases: string[] = [];
@@ -162,12 +163,18 @@ describe('⑤ 非阻塞：装配期异常不外溢（内核不加载，宿主不
     const base = await tmpBase();
     const root = join(base, '.omb');
     const ctx: ContextLike = { commands: { register: () => {} } };
+    // 审查修复（第二轮）：原断言 `existsSync(join(base,'versions.git'))` 是**恒真**的——
+    // 真实布局根来自 defaultLayout()（<preset>/versions.git），与测试的 base 是两个不同目录，
+    // 因此"安全状态不改动运行数据"这一核心承诺此前零验证。改为直接观察**真实布局根**在 apply 前后不变。
+    const layoutRoot = dirname(defaultLayout().bareRepo);
+    const beforeEntries = fs.existsSync(layoutRoot) ? fs.readdirSync(layoutRoot).sort() : null;
     // bootstrap 默认 true：安全状态下必须被跳过（不改动运行数据）
     const handle = apply(ctx, { cognitiveRoot: root, hostVersion: 'bad-version' });
     expect(handle.cognitive).toBeUndefined(); // 内核未加载
     expect(handle.safeState?.ok).toBe(false);
     expect(handle.safeState?.kind).toBe('host_version_malformed');
-    expect(fs.existsSync(join(base, 'versions.git'))).toBe(false); // 未初始化三线布局（不改动运行数据）
+    const afterEntries = fs.existsSync(layoutRoot) ? fs.readdirSync(layoutRoot).sort() : null;
+    expect(afterEntries).toEqual(beforeEntries); // 真实布局根未被改动（未建 bare/worktree/指针）
     // 状态面仍可用：兜底数据源可读，且写明内核未加载
     const st = await handle.safeStateRuntime!.status!();
     expect(st.degraded).toContain('内核未加载');

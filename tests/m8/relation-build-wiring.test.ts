@@ -83,21 +83,31 @@ describe('关系建图闭环（入库 → 空闲期建图 → 关系通道有源
     expect(second.edges).toBe(first.edges);
   });
 
-  it('建图路径零模型调用（纯 CPU；不占显卡、不阻塞主对话）', async () => {
+  it('建图路径零模型调用（纯 CPU；不占显卡、不阻塞主对话）且确实建出边', async () => {
     const rt = createCognitiveRuntime({ root });
     runtimes.push(rt);
     let calls = 0;
-    // 观测面：任何模型调用都会经过注入的适配器（此处仅建图，不该被调用）
-    (rt as unknown as { modelAdapter?: unknown }).modelAdapter = {
+    // 观测面：任何模型调用都会经过注入的适配器（此处仅建图，不该被调用）。
+    // 审查修复：契约方法是 `generate`（kernel/schemas/model-adapter.ts），此前桩只实现 `complete` →
+    // calls 结构性不可能自增，`expect(calls).toBe(0)` 退化成"没抛异常"。两处方法名都覆盖。
+    const stub = {
+      generate: async () => {
+        calls++;
+        return { text: '' };
+      },
       complete: async () => {
         calls++;
         return { text: '' };
       },
     };
+    (rt as unknown as { modelAdapter?: unknown }).modelAdapter = stub;
     await rt.memory.ingest(memory('00000000-0000-4000-8000-000000000011', '验证契约的边界说明'));
     await rt.memory.ingest(memory('00000000-0000-4000-8000-000000000012', '验证契约的边界与口径'));
-    await rt.runRelationBuild();
+    const r = await rt.runRelationBuild();
     expect(calls).toBe(0);
+    // 同时钉住"建图真的发生"（否则把 runRelationBuild 掏空成 return 0 也能通过——正是本测试要防的回归）
+    expect(r.created).toBeGreaterThan(0);
+    expect(rt.relationStats().edges).toBeGreaterThan(0);
   });
 
   it('kern_memory op=relations 列出边、op=unlink 删除边（治理面工具接线）', async () => {
