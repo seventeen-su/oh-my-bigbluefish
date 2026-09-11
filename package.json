@@ -12,7 +12,8 @@
     "replay-recorder": "tsx scripts/replay-recorder.ts",
     "retrieval-bench": "tsx scripts/retrieval-bench.ts",
     "init-three-line": "tsx scripts/init-three-line.ts",
-    "deploy-lines": "tsx scripts/deploy-lines.ts"
+    "deploy-lines": "tsx scripts/deploy-lines.ts",
+    "fetch-embedding-model": "tsx scripts/fetch-embedding-model.ts"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
@@ -28,5 +29,8 @@
     "js-yaml": "^5.3.0",
     "koffi": "^3.1.5",
     "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node": "1.29.0"
   }
 }

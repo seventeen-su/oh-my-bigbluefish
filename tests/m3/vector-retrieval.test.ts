@@ -69,9 +69,9 @@ function makeMemory(over: Record<string, unknown> = {}): Memory {
 
 describe('① 嵌入：确定性 CPU 哈希词袋', () => {
   it('同文本 → 同向量；不同文本 → 不同向量；维度固定；L2 归一化', () => {
-    const a1 = HASH_BOW_EMBEDDER.embed('长期记忆系统的双通道检索');
-    const a2 = HASH_BOW_EMBEDDER.embed('长期记忆系统的双通道检索');
-    const b = HASH_BOW_EMBEDDER.embed('完全无关的天气话题');
+    const a1 = HASH_BOW_EMBEDDER.embedSync!('长期记忆系统的双通道检索');
+    const a2 = HASH_BOW_EMBEDDER.embedSync!('长期记忆系统的双通道检索');
+    const b = HASH_BOW_EMBEDDER.embedSync!('完全无关的天气话题');
     expect(a1.length).toBe(EMBEDDING_DIM);
     expect([...a1]).toEqual([...a2]);
     expect([...a1]).not.toEqual([...b]);
@@ -81,9 +81,9 @@ describe('① 嵌入：确定性 CPU 哈希词袋', () => {
   });
 
   it('空文本 → 零向量（余弦按 0 处理，不参与检索）', () => {
-    const z = HASH_BOW_EMBEDDER.embed('');
+    const z = HASH_BOW_EMBEDDER.embedSync!('');
     expect([...z].every((v) => v === 0)).toBe(true);
-    expect(cosineSimilarity(z, HASH_BOW_EMBEDDER.embed('任意内容'))).toBe(0);
+    expect(cosineSimilarity(z, HASH_BOW_EMBEDDER.embedSync!('任意内容'))).toBe(0);
   });
 
   it('嵌入器标识与维度（可替换点契约）', () => {
@@ -94,7 +94,7 @@ describe('① 嵌入：确定性 CPU 哈希词袋', () => {
 
 describe('② 余弦与序列化', () => {
   it('同向量 1、正交 0、维度不一致 fail-loud', () => {
-    const a = HASH_BOW_EMBEDDER.embed('记忆检索');
+    const a = HASH_BOW_EMBEDDER.embedSync!('记忆检索');
     expect(cosineSimilarity(a, a)).toBeCloseTo(1, 6);
     const x = new Float32Array([1, 0]);
     const y = new Float32Array([0, 1]);
@@ -103,7 +103,7 @@ describe('② 余弦与序列化', () => {
   });
 
   it('Float32 ↔ BLOB 往返一致；非法 BLOB → null（视为未编码）', () => {
-    const v = HASH_BOW_EMBEDDER.embed('往返测试');
+    const v = HASH_BOW_EMBEDDER.embedSync!('往返测试');
     const blob = vectorToBlob(v);
     const back = blobToVector(blob);
     expect(back).not.toBeNull();
@@ -137,9 +137,9 @@ describe('③ 存储与编码流水', () => {
     const b = openBackend(await tmpDb());
     const m = makeMemory({ payload: '立即编码的记忆' });
     await b.ingest(m);
-    expect(b.encodeOne(m.id)).toBe(true);
+    expect(await b.encodeOne(m.id)).toBe(true);
     expect(b.vectorStats()).toMatchObject({ encoded: 1, pending: 0 });
-    expect(b.encodeOne('no-such-id')).toBe(false);
+    expect(await b.encodeOne('no-such-id')).toBe(false);
   });
 
   it('批量编码分页：limit 限制单次处理量（remaining 如实报告）', async () => {

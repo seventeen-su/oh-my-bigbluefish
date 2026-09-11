@@ -118,9 +118,48 @@ describe('③ 配置面收敛：宽进、未知键忽略并上报', () => {
 
   it('认识的键清单覆盖插件全部公开配置面（防"新增键忘了登记 → 被当成未知键"）', () => {
     // 与 PluginConfig 的公开键对齐（新增配置键时必须同步登记本清单）
-    for (const key of ['cognitiveRoot', 'model', 'benchVersion', 'selfIteration', 'desktopNotify', 'line']) {
+    for (const key of [
+      'cognitiveRoot',
+      'model',
+      'benchVersion',
+      'selfIteration',
+      'desktopNotify',
+      'line',
+      'episodeSampleRate',
+      'concurrency',
+      'embeddingModelDir',
+      'embeddingThreads',
+    ]) {
       expect(KNOWN_PLUGIN_CONFIG_KEYS).toContain(key);
     }
+  });
+
+  it('整份公开配置面交给审计 → 零未知键（登记与实际接线同步的可观测判据）', () => {
+    // 比"清单里有没有某个键"更强的契约：清单登记了但 apply 不认识，宿主配了也白配，
+    // 而且会被当成未知键记降级。这里把**全量**公开键喂给审计，未知键必须为空。
+    const fullConfig = {
+      cognitiveRoot: 'C:/tmp/omb',
+      model: 'test-model',
+      benchPersistDir: 'C:/tmp/bench',
+      benchVersion: 'v2',
+      activationLogDir: 'C:/tmp/act',
+      bootstrap: false,
+      line: 'stable',
+      bootStableOverride: false,
+      hostVersion: '0.0.0-test',
+      dshHome: 'C:/tmp/dsh',
+      observedHostVersion: '0.0.0-test',
+      episodeSampleRate: 0.01,
+      selfIteration: { enabled: false },
+      concurrency: { maxConcurrentRequests: 1 },
+      desktopNotify: false,
+      embeddingModelDir: 'C:/tmp/models/bge-small-zh-v1.5',
+      embeddingThreads: 1,
+    };
+    const r = auditPluginConfig(fullConfig);
+    expect(r.unknown_keys).toEqual([]);
+    // 登记清单与喂进去的键一一对应（多登记 = 有键其实没人认；少登记 = 合法的键会被误报）
+    expect([...r.known_keys_present].sort()).toEqual(Object.keys(fullConfig).sort());
   });
 });
 

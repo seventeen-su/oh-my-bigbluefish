@@ -145,13 +145,13 @@ describe('② 建图纯函数（词法 + 向量共同驱动）', () => {
     expect(planned[0]!.weight).toBeGreaterThanOrEqual(0.45);
   });
 
-  it('向量证据参与：有向量时强度被抬高并标注 both；无向量时不虚构向量证据', () => {
+  it('向量证据参与：有向量时强度被抬高并标注 both；无向量时不虚构向量证据', async () => {
     const a = memory('a', 'alpha payload one');
     const b = memory('b', 'alpha payload two');
     const vec = HASH_BOW_EMBEDDER;
     const vectors = new Map([
-      [a.id, vec.embed(a.payload)],
-      [b.id, vec.embed(b.payload)],
+      [a.id, await vec.embed(a.payload)],
+      [b.id, await vec.embed(b.payload)],
     ]);
     const plan = { threshold: 0.05 } as const;
     const withVec = planSimilarityEdges([a, b], vectors, plan);

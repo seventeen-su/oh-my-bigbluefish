@@ -186,9 +186,9 @@ export async function writeMemory(
   let encoded = false;
   let degraded: string | null = null;
   try {
-    encoded = backend.encodeOne(id);
+    encoded = await backend.encodeOne(id);
   } catch (err) {
-    degraded = `写入成功但同步编码失败（${(err as Error).message}）——待空闲期 memory_vector_encode 补齐`;
+    degraded = `写入成功但编码失败（${(err as Error).message}）——待空闲期 memory_vector_encode 补齐`;
   }
   return { ok: true, id, deduplicated: false, encoded, degraded };
 }
@@ -290,11 +290,11 @@ export async function editMemory(
   } catch (err) {
     return { ok: false, id, encoded: false, degraded: `编辑失败：${(err as Error).message}` };
   }
-  // payload 变化 → 向量清空；此处同步补齐（失败降级不阻塞编辑结果）
+  // payload 变化 → 向量清空；此处补齐（失败降级不阻塞编辑结果）
   let encoded = false;
   if (clean.payload !== undefined) {
     try {
-      encoded = backend.encodeOne(id);
+      encoded = await backend.encodeOne(id);
     } catch {
       encoded = false;
     }
@@ -345,7 +345,13 @@ export async function mergeMemories(
     await backend.transaction(async () => {
       if (mergedText !== target.payload) {
         await backend.update(targetId, { payload: mergedText });
-        backend.encodeOne(targetId);
+        // 编码是异步的（神经嵌入的运行时只有 Promise 形态）；放在事务内会把写锁多持一次推理时长
+        // （实测 1.5ms 量级，可接受）。失败降级不阻塞合并：向量清空后由空闲期任务补齐。
+        try {
+          await backend.encodeOne(targetId);
+        } catch {
+          // 降级：保持待编码（pendingEncodeCount 可见）
+        }
       }
       // 关系迁移：source 的入边改指 target（保留"谁指向这条知识"的结构信息）。
       // 入边查询走 memory_relation 的 to_id 索引（relationTraverse 是出边 BFS，取不到入边）。

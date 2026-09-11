@@ -49,7 +49,7 @@ export const VECTOR_READ_CHUNK = 100;
 
 export class VectorBackend extends RelationBackend {
   /** 嵌入器（唯一替换点；缺省 CPU 哈希词袋——见 embeddings.ts 的选型说明） */
-  private readonly embedder: Embedder;
+  private embedder: Embedder;
 
   constructor(dbPath: string, embedder: Embedder) {
     super(dbPath);
@@ -59,6 +59,20 @@ export class VectorBackend extends RelationBackend {
   /** 当前生效的嵌入器标识（状态面/观测面） */
   get embedderId(): string {
     return this.embedder.id;
+  }
+
+  /**
+   * 装配期替换嵌入器（已知问题《小向量模型未接入》落地需要）：
+   * 神经嵌入的装载是**异步**的（ONNX 会话创建 + 词表装载），而 backend 构造是同步的——
+   * 故先以哈希词袋（或上一次的嵌入器）构造，装配就绪后再装入真模型。
+   *
+   * 换嵌入器的**可观测后果**（不是静默切换）：
+   *   - 维度变化（256 → 512）→ 存量向量维度不匹配 → `vectorStats().mismatched` 如实报条数，
+   *     检索侧跳过异维行；维护任务 `memory_vector_encode` 逐批重编码补齐；
+   *   - `embedder` 字段随之变化，状态面能看出"当前用的哪个嵌入器"。
+   */
+  setEmbedder(embedder: Embedder): void {
+    this.embedder = embedder;
   }
 
   /**
@@ -89,7 +103,7 @@ export class VectorBackend extends RelationBackend {
     for (const r of rows) {
       if (encoded >= limit) break; // 本批目标已达成（其余留待下次维护）
       try {
-        update.run(vectorToBlob(embedder.embed(r.payload)), r.id);
+        update.run(vectorToBlob(await embedder.embed(r.payload)), r.id);
         encoded++;
       } catch {
         // 单条编码失败 → 跳过（该条保持待编码，状态面可见；不阻塞其余条目）
@@ -99,11 +113,19 @@ export class VectorBackend extends RelationBackend {
     return { encoded, remaining };
   }
 
-  /** 立即编码单条记忆（写入面同步编码用：新写入即编码，避免等待空闲期；未知 id → false） */
-  encodeOne(id: string): boolean {
+  /**
+   * 立即编码单条记忆（写入面编码用；未知 id → false）。
+   *
+   * 真机/实测取向下**改为异步**（已知问题《小向量模型未接入》落地）：神经嵌入的运行时只提供
+   * Promise 形态推理（其原生绑定是"同步执行 + Promise 外壳"），无法在不阻塞事件循环的前提下同步返回；
+   * 故这里如实变成 async，而不是把阻塞藏进同步签名。哈希词袋（纯 JS）仍可经 `embedSync` 同步走，
+   * 调用方若需同步语义可自行判断（`embedder.embedSync !== undefined`）。
+   */
+  async encodeOne(id: string): Promise<boolean> {
     const row = this.db.prepare('SELECT payload FROM memory WHERE id = ?').get(id) as { payload: string } | undefined;
     if (row === undefined) return false;
-    this.db.prepare('UPDATE memory SET vector = ? WHERE id = ?').run(vectorToBlob(this.embedder.embed(row.payload)), id);
+    const vec = await this.embedder.embed(row.payload);
+    this.db.prepare('UPDATE memory SET vector = ? WHERE id = ?').run(vectorToBlob(vec), id);
     return true;
   }
 
@@ -133,7 +155,7 @@ export class VectorBackend extends RelationBackend {
       topK?: number;
     } = {},
   ): Promise<VectorHit[]> {
-    const query = embedder.embed(text);
+    const query = await embedder.embed(text);
     let norm = 0;
     for (let i = 0; i < query.length; i++) norm += (query[i] ?? 0) * (query[i] ?? 0);
     if (norm === 0) return []; // 空/无 token 查询 → 无向量候选

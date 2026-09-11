@@ -148,6 +148,15 @@ export interface PluginConfig {
    * 节流与总量上限见 runtime/notify.ts 的 NotifyPolicy（缺省同 kind 30 分钟一次、全会话上限 5 条）。
    */
   desktopNotify?: boolean | 'auto';
+  /**
+   * 神经嵌入模型目录（已知问题《小向量模型未接入》）：BGE-small-zh-v1.5（ONNX）权重目录。
+   * 缺省按 `OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5/` 探测；都不存在 →
+   * 诚实降级到纯 JS 哈希词袋（向量通道仍可用，只是语义能力弱），状态面 `embeddingStatus()` 可见原因。
+   * 权重不进仓库，用 `pnpm fetch-embedding-model` 获取。
+   */
+  embeddingModelDir?: string;
+  /** ONNX 推理线程数（缺省由运行时决定；本地小机可设 1 避免与主对话抢核） */
+  embeddingThreads?: number;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -946,6 +955,30 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   }
 
   /**
+   * 神经嵌入（已知问题《小向量模型未接入》）：模型目录与线程数的解析。
+   * `embeddingModelDir` 必须是绝对路径字符串（相对路径语义不明——数据根随部署变化，猜不如不猜）；
+   * `embeddingThreads` 必须是 1~64 的整数。非法 → 降级记录 + 不传（运行时按缺省探测），不静默吞。
+   */
+  let embeddingModelDir: string | undefined;
+  if (config.embeddingModelDir !== undefined) {
+    const d = config.embeddingModelDir;
+    if (typeof d === 'string' && d.trim().length > 0) {
+      embeddingModelDir = d.trim();
+    } else {
+      recordDegradation('config/embeddingModelDir', `非法 embeddingModelDir 配置 "${String(d)}"（应为非空字符串）——按缺省探测`);
+    }
+  }
+  let embeddingThreads: number | undefined;
+  if (config.embeddingThreads !== undefined) {
+    const t = config.embeddingThreads;
+    if (typeof t === 'number' && Number.isInteger(t) && t >= 1 && t <= 64) {
+      embeddingThreads = t;
+    } else {
+      recordDegradation('config/embeddingThreads', `非法 embeddingThreads 配置 "${String(t)}"（应为 1~64 整数）——按运行时缺省`);
+    }
+  }
+
+  /**
    * 并发能力探测或声明（已知问题《并发能力未知（无探测面）》）：先读宿主 llm 服务暴露的元数据
    * （llm.maxConcurrentRequests / llm.concurrency / llm.metadata.maxConcurrentRequests——形状容错），
    * 读不到再由 config.concurrency 声明，都没有 → unknown（沿用既有行为，不擅自收紧）。
@@ -1183,6 +1216,9 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
           ...(judgeExecutor !== undefined ? { judgeExecutor } : {}),
           // W3：dynamicCordisRunner 增强通道注入（宿主面存在 → 候选验证脚本经 runner 通道；未注入 → 管线守卫降级受限子进程路径）
           ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
+          // 神经嵌入（已知问题《小向量模型未接入》）：模型目录/推理线程数（缺省 → 运行时按 env → 数据根探测）
+          ...(embeddingModelDir !== undefined ? { embeddingModelDir } : {}),
+          ...(embeddingThreads !== undefined ? { embeddingThreads } : {}),
         });
         kernelLoaded = true;
         // 队列重建面就绪（已知问题《债务与"还债的人"不同源》）：此后调度器再次进入时会把盘上

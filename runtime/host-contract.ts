@@ -218,6 +218,8 @@ export const KNOWN_PLUGIN_CONFIG_KEYS: readonly string[] = [
   'selfIteration',
   'concurrency',
   'desktopNotify',
+  'embeddingModelDir',
+  'embeddingThreads',
 ];
 
 /** 新旧键双读别名表（新键优先 → 旧键兜底 → 缺省）。表为空 = 当前无历史键。 */

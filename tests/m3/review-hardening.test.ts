@@ -181,7 +181,7 @@ describe('⑤⑥⑦ 向量通道加固', () => {
     const dim64: Embedder = {
       id: 'probe-dim64',
       dim: 64,
-      embed: () => new Float32Array(64).fill(0.1),
+      embed: async () => new Float32Array(64).fill(0.1),
     };
     const hits = await b.vectorSearchWith(dim64, '验证契约');
     expect(hits).toHaveLength(0);
@@ -211,12 +211,12 @@ describe('⑤⑥⑦ 向量通道加固', () => {
     const flaky: Embedder = {
       id: 'flaky',
       dim: 256,
-      embed: (text: string) => {
+      embed: async (text: string) => {
         calls++;
         if (calls <= 2) {
           throw new Error('模拟编码失败'); // 最新的两条失败
         }
-        return HASH_BOW_EMBEDDER.embed(text);
+        return await HASH_BOW_EMBEDDER.embed(text);
       },
     };
     const r = await b.encodePending(flaky, { limit: 2 });
