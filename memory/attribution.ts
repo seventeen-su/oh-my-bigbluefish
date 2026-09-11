@@ -66,6 +66,11 @@ const WORD_SPLIT_RE = /\s+/;
  *   - CJK 段 → 滑动窗口 bigram（'候选召回' → 候选/选召/召回）；单字段 → 单字；
  *   - 非 CJK 段 → 空白分词单词。
  * 同口径的意义：可被词法检索到的内容 = 可被观测到"被引用"的内容，两者不会各说一套。
+ *
+ * **大小写折叠**（第二路审查 H2）：检索侧 FTS5 `unicode61` 分词器默认折叠大小写，而此处此前精确比较
+ * → 记忆写 `SQLite FTS5`、人类消息写 `sqlite fts5` 时"检索命中却归因 miss"，miss 权重（−0.03）持续
+ * 压低该记忆 utility，排序系统性劣化。故在 token 出口统一 `toLowerCase()`（两侧同源，集合比较等价于
+ * FTS 的大小写不敏感语义）。CJK token 不受影响。
  */
 function tokensOf(text: string): string[] {
   const out: string[] = [];
@@ -86,7 +91,7 @@ function tokensOf(text: string): string[] {
       let j = i;
       while (j < text.length && !CJK_RE.test(text[j]!)) j++;
       for (const w of text.slice(i, j).split(WORD_SPLIT_RE)) {
-        if (w.length > 0) out.push(w);
+        if (w.length > 0) out.push(w.toLowerCase());
       }
       i = j;
     }

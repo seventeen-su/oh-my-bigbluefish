@@ -126,7 +126,11 @@ export function planSimilarityEdges(
       if (a.payload === b.payload) continue; // 完全重复属 dedup 的职责，不建相似边
       const lex = jaccard(ta, tokens.get(b.id)!);
       const vb = vectors.get(b.id) ?? null;
-      const vec = va !== null && vb !== null ? cosineSimilarity(va, vb) : null;
+      // 维度守卫（第二路审查 H3）：换过嵌入器时库内会混有异维向量——检索侧对同情形是"跳过该行"，
+      // 此处此前直接调 cosineSimilarity（维度不等即抛）→ 异常冒到整合事务 → dedup/merge/relation/decay
+      // 全部回滚且每轮重复失败。故与检索侧同策略：异维视同"无向量证据"（只用词法，不中止整批）。
+      const vec =
+        va !== null && vb !== null && va.length === vb.length ? cosineSimilarity(va, vb) : null;
       const weight = relationStrength(lex, vec);
       if (weight < threshold) continue;
       mine.push({ to: b.id, weight: Number(weight.toFixed(4)), source: relationSource(lex, vec) });
