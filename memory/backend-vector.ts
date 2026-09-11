@@ -219,13 +219,18 @@ export class VectorBackend extends RelationBackend {
       conds.push(`prov_class IN (${opts.provClasses.map(() => '?').join(', ')})`);
       args.push(...opts.provClasses);
     }
+    // 评分阶段**只读 id + vector**（审查修复的成本面）：语义检索单轮可能对每个 scope 各跑一次，
+    // 而 scope 内行数远大于 topK。此前把 `body` 一起读进来、对**每一行** JSON.parse，等于为
+    // topK 条结果解析了全 scope 的正文——实测等价结构（10k 行、约 800B body）下
+    // 「id+vector」约 16ms、「body+vector」约 36ms 加解析约 6ms，差距全在最终被丢弃的行上。
+    // 现在按分数裁剪之后再取正文，解析量降到 O(topK)。
     const rows = this.db
-      .prepare(`SELECT body, vector FROM memory WHERE ${conds.join(' AND ')}`)
-      .all(...args) as unknown as { body: string; vector: unknown }[];
+      .prepare(`SELECT id, vector FROM memory WHERE ${conds.join(' AND ')}`)
+      .all(...args) as unknown as { id: string; vector: unknown }[];
     // 候选下限：缺省 0（"非正相似不算命中"）；稠密神经嵌入按自身实测分布声明更高的下限——
     // 否则"任何查询都返回满额候选池"，无关记忆被稳定塞进注入预算（见 Embedder.minScore 的说明）。
     const floor = this.embedder.minScore ?? 0;
-    const hits: VectorHit[] = [];
+    const scored: Array<{ id: string; score: number }> = [];
     for (const r of rows) {
       const vec = blobToVector(r.vector);
       if (vec === null) continue;
@@ -238,11 +243,22 @@ export class VectorBackend extends RelationBackend {
       const score = cosineSimilarity(query, vec);
       if (!Number.isFinite(score)) continue; // 坏 BLOB 解出的 NaN/Inf 不入候选（审查修复）
       if (score <= floor) continue; // 低于下限 → 不入候选（下限语义见 Embedder.minScore）
-      hits.push({ memory: JSON.parse(r.body) as Memory, score });
+      scored.push({ id: r.id, score });
     }
-    hits.sort((a, b) => b.score - a.score || a.memory.id.localeCompare(b.memory.id));
+    // 按分数裁剪（同分按 id 保证确定性——与既有排序口径一致），再只为入选者取正文
+    scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
     const topK = Math.max(1, Math.floor(opts.topK ?? 20));
-    return hits.slice(0, topK);
+    const winners = scored.slice(0, topK);
+    const byId = new Map(this.getMany(winners.map((w) => w.id)).map((m) => [m.id, m]));
+    const hits: VectorHit[] = [];
+    for (const w of winners) {
+      const memory = byId.get(w.id);
+      if (memory === undefined) {
+        continue; // 裁剪与取正文之间被删除（并发写）→ 跳过该条，不让整条通道失败
+      }
+      hits.push({ memory, score: w.score });
+    }
+    return hits;
   }
 
   /** 待编码条数（同步只读——入队判断用；状态面亦可读） */

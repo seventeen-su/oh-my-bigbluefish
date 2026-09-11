@@ -20,6 +20,7 @@ import {
   cosineSimilarity,
   blobToVector,
   vectorToBlob,
+  type Embedder,
 } from '../../memory/embeddings.js';
 import { RetrievalBackend } from '../../memory/backend-retrieval.js';
 import { retrieve } from '../../memory/retrieve.js';
@@ -150,6 +151,30 @@ describe('③ 存储与编码流水', () => {
     expect(await b.encodePendingBatch({ limit: 2 })).toEqual({ encoded: 2, remaining: 3 });
     expect(await b.encodePendingBatch({ limit: 10 })).toEqual({ encoded: 3, remaining: 0 });
   });
+
+  it('批量编码：失败条目不占额度、其余照常编码（扫描窗口语义不变）', async () => {
+    // 回归护栏：把"逐条 autocommit"改成"编码在事务外、落库一次事务"时，必须保持失败条目的处理语义——
+    // 单条编码失败只跳过它自己，不阻塞其后条目（否则失败行占住批头，后面的记忆永远编不上）。
+    const b = openBackend(await tmpDb());
+    for (let i = 0; i < 4; i++) {
+      await b.ingest(makeMemory({ payload: `编码容错 ${i}` }));
+    }
+    let calls = 0;
+    const flaky: Embedder = {
+      id: 'flaky-batch',
+      dim: EMBEDDING_DIM,
+      embed: async (text: string) => {
+        calls++;
+        if (calls === 1) throw new Error('模拟首条编码失败');
+        return HASH_BOW_EMBEDDER.embed(text);
+      },
+    };
+    const r = await b.encodePending(flaky, { limit: 3 });
+    // 首条失败被跳过，其余 3 条成功（额度按"成功数"计，不被失败行占用）
+    expect(r.encoded).toBe(3);
+    expect(r.remaining).toBe(1); // 失败的那条仍待编码（状态面可见）
+    expect(calls).toBe(4); // 4 条都被尝试过（失败行不阻断后续）
+  });
 });
 
 describe('④ 向量检索', () => {
@@ -180,6 +205,31 @@ describe('④ 向量检索', () => {
     const rAll = await b.vectorSearch('检索链路与融合排序', { topK: 1 });
     expect(rAll).toHaveLength(1);
     expect(rAll[0]!.score).toBeGreaterThan(0.9); // 同文本 → 余弦近 1
+  });
+
+  it('检索结果返回**完整** Memory（裁剪后才取正文，形状不缩水）', async () => {
+    // 回归护栏：为降低成本，评分阶段只读 `id + vector`，正文只为入选者取（getMany）。
+    // 消费方（融合、排序、注入）拿到的必须是完整 Memory——若某次改成"只返回部分字段"，
+    // 这里立刻红，而不是等到注入时字段莫名缺失。
+    const b = openBackend(await tmpDb());
+    const m = makeMemory({
+      payload: '完整记录形状校验',
+      scope: 'Project',
+      kind: 'Semantic',
+      prov_class: 'User-declared',
+    });
+    await b.ingest(m);
+    await b.encodeOne(m.id);
+    const r = await b.vectorSearch('完整记录形状校验', { scope: 'Project', topK: 5 });
+    expect(r).toHaveLength(1);
+    const got = r[0]!.memory;
+    // 与入库时的完整记录逐字段一致（不是只对 id/payload 抽查）
+    expect(got).toEqual(m);
+    // 显式钉住几个消费方真正依赖的字段（防"部分投影"回归）。
+    // 注意 `body` **不在** Memory 里——它是 DB 列（存序列化后的完整记录），领域模型没有这个字段。
+    for (const k of ['id', 'scope', 'kind', 'lifecycle', 'prov_class', 'payload', 'value_score', 'utility_counts'] as const) {
+      expect(got[k]).toBeDefined();
+    }
   });
 
   it('词序与改写：高重叠文本相似度高于低重叠文本', async () => {
