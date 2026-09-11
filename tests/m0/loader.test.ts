@@ -12,8 +12,8 @@ const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it
 import { loadVersion, type VersionLine, type VersionSnapshot } from '../../substrate/snapshot.js';
 import {
   buildLayoutFixture,
+  resetReadOnly,
   runGit,
-  runIcacls,
   teardownLayoutFixture,
   type LayoutFixture,
 } from '../helpers/git.js';
@@ -96,7 +96,7 @@ describe('loadVersion 三模式加载（独立临时 fixture）', () => {
   fixtureIt('initial 内容锚定 initial tag：stable 分支推进后 initial 仍读到 initial 基线', async () => {
     fx = buildLayoutFixture();
     // 1. 移除 stable worktree（先还原 ACL 才能删），解除 stable 分支的 checkout 锁
-    runIcacls([fx.stable, '/reset', '/T', '/C']);
+    resetReadOnly(fx.stable);
     runGit(['worktree', 'remove', fx.stable, '--force'], { cwd: fx.bare });
     // 2. 在 bare 上直接为 stable 分支造一个分叉提交（manifest line=stable-advanced）
     const seed = path.join(fx.root, '_seed-stable-adv');

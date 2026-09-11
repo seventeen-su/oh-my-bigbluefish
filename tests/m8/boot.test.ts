@@ -10,8 +10,8 @@ import { bootStable } from '../../substrate/boot.js';
 import { loadVersion } from '../../substrate/snapshot.js';
 import {
   buildLayoutFixture,
+  resetReadOnly,
   runGit,
-  runIcacls,
   teardownLayoutFixture,
   type LayoutFixture,
 } from '../helpers/git.js';
@@ -22,7 +22,7 @@ const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it
 
 /** 解除 fixture stable worktree 的只读 ACL（checkout 同步需要可写） */
 function makeStableWritable(fx: LayoutFixture): void {
-  runIcacls([fx.stable, '/reset', '/T', '/C']);
+  resetReadOnly(fx.stable);
 }
 
 /** 解析 bare 上某分支当前 head */

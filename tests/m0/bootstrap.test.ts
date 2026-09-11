@@ -9,8 +9,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   MANIFEST_INITIAL,
   MANIFEST_LATEST,
+  applyReadOnlyAcl,
+  resetReadOnly,
   runGit,
-  runIcacls,
 } from '../helpers/git.js';
 import { ensureThreeLineLayout, type LayoutBootstrapResult } from '../../substrate/bootstrap.js';
 import { loadVersion, type VersionLayout } from '../../substrate/snapshot.js';
@@ -41,7 +42,7 @@ function teardownRoot(root: string): void {
     return;
   } catch {
     try {
-      runIcacls([root, '/reset', '/T', '/C']);
+      resetReadOnly(root);
     } catch {
       // 还原失败也继续尝试删除
     }
@@ -105,8 +106,8 @@ function buildLegacySeed(root: string, layout: VersionLayout): { initialHash: st
   const latestHash = runGit(['rev-parse', 'HEAD'], { cwd: bare });
   runGit(['worktree', 'add', layout.stableWorktree, 'stable'], { cwd: bare });
   runGit(['worktree', 'add', layout.latestWorktree, 'main'], { cwd: bare });
-  runIcacls([layout.stableWorktree, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C']);
-  runIcacls([layout.latestWorktree, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C']);
+  applyReadOnlyAcl(layout.stableWorktree);
+  applyReadOnlyAcl(layout.latestWorktree);
   return { initialHash, latestHash };
 }
 
@@ -174,7 +175,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     const layout = makeLayout(root);
     expect(ensureThreeLineLayout(layout).status).toBe('initialized');
     // 删除 stable worktree（先释放 ACL 才能删）
-    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    resetReadOnly(layout.stableWorktree);
     fs.rmSync(layout.stableWorktree, { recursive: true, force: true });
     expect(fs.existsSync(layout.stableWorktree)).toBe(false);
     // 修复重建
@@ -191,7 +192,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     // 构造旧机器残留：释放 ACL → 清空 stable 内容（含 kernel/，P1a 种子升级后 worktree 含 policy/processes；
     // 保留 .git 指针）→ 删注册项 → gitfile 指向不存在 gitdir。注意：git 创建的 .git 带 Hidden 属性，
     // Node writeFileSync（O_TRUNC）对其 EPERM（libuv 已知行为）→ 先删除再重建指针文件（rm 不受 Hidden 影响）。
-    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    resetReadOnly(layout.stableWorktree);
     fs.rmSync(path.join(layout.stableWorktree, 'manifest.json'));
     fs.rmSync(path.join(layout.stableWorktree, 'README.md'));
     fs.rmSync(path.join(layout.stableWorktree, 'kernel'), { recursive: true, force: true });
@@ -213,8 +214,8 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     const layout = makeLayout(root);
     expect(ensureThreeLineLayout(layout).status).toBe('initialized');
     // 模拟 ACL 丢失：/reset 恢复继承 ACL（目录重新可写）
-    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
-    runIcacls([layout.latestWorktree, '/reset', '/T', '/C']);
+    resetReadOnly(layout.stableWorktree);
+    resetReadOnly(layout.latestWorktree);
     expect(captureWriteError(path.join(layout.stableWorktree, 'probe.txt')).error).toBeNull(); // 确认 ACL 确实丢失
     // 修复 → 重新施加只读 ACL
     const r = ensureThreeLineLayout(layout);
@@ -325,7 +326,7 @@ describe('ensureThreeLineLayout（独立临时 fixture）', () => {
     const layout = makeLayout(root);
     expect(ensureThreeLineLayout(layout).status).toBe('initialized');
     // 构造：释放 ACL → 删除 .git 指针 → 留下用户内容
-    runIcacls([layout.stableWorktree, '/reset', '/T', '/C']);
+    resetReadOnly(layout.stableWorktree);
     fs.rmSync(path.join(layout.stableWorktree, '.git'));
     fs.writeFileSync(path.join(layout.stableWorktree, 'user-data.txt'), 'keep me');
     const r = ensureThreeLineLayout(layout);

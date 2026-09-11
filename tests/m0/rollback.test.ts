@@ -10,8 +10,8 @@ import { rollbackTo } from '../../substrate/rollback.js';
 import {
   applyReadOnlyAcl,
   buildLayoutFixture,
+  resetReadOnly,
   runGit,
-  runIcacls,
   teardownLayoutFixture,
   type LayoutFixture,
 } from '../helpers/git.js';
@@ -26,7 +26,7 @@ const REAL_BARE = path.join(PRESET_ROOT, 'versions.git');
 
 /** 解除 fixture stable worktree 的只读 ACL（回滚的 checkout 同步需要可写） */
 function makeStableWritable(fx: LayoutFixture): void {
-  runIcacls([fx.stable, '/reset', '/T', '/C']);
+  resetReadOnly(fx.stable);
 }
 
 /** 读取 worktree 下 manifest.json 的 line 字段 */
