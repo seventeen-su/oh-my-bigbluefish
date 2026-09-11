@@ -7,7 +7,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsx scripts/copy-assets.ts",
     "bench-report": "tsx scripts/bench-report.ts",
     "replay-recorder": "tsx scripts/replay-recorder.ts",
     "retrieval-bench": "tsx scripts/retrieval-bench.ts",
