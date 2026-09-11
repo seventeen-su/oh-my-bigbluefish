@@ -39,10 +39,13 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers(); // 先恢复真实定时器（假定时器下「让出事件循环」的等待不会前进）
+  // 关停 + 排空：队列/观测/债务写入落完再删临时目录（否则 ENOTEMPTY 抖动——
+  // 与已知问题《关停不是真正排空》的测试侧表现同源；排空接口即 drain）
   for (const s of schedulers.splice(0)) {
     s.stop();
+    await s.drain({ timeoutMs: 2000 }).catch(() => undefined);
   }
-  vi.useRealTimers();
   await rm(tmpRoot, { recursive: true, force: true });
 });
 
@@ -128,9 +131,12 @@ describe('维护调度（§12.3）', () => {
     expect(s2.debtSnapshot()).toEqual(s.debtSnapshot());
   });
 
-  it('债务加载剪除：debt.json 中的历史僵尸（turn-finalize:* 与 gc）加载时跳过，健康条目 value 原样保留', async () => {
-    // 预写含僵尸（turn-finalize:ghost/gc）与健康条目的债务文件，再构造调度器（调度只执行 enqueue 队列，
-    // 恢复的债务永不清偿 → 加载即剪除；僵尸为重启后无属主/无人再入队的残留）
+  it('债务加载不再按任务名硬编码剪除：无队列的僵尸债务保留为无主债务（人工裁定可见，不静默丢）', async () => {
+    // 预写含"无队列项"的僵尸（turn-finalize:ghost/gc）与健康条目的债务文件，再构造调度器。
+    // 旧实现在此处按任务名剪除（调度只执行 enqueue 队列，恢复的债务永不清偿 → 丢失）。
+    // 已知问题《债务与"还债的人"不同源》修复后：队列随 queue.json 落盘、按 restoreTask 重建——
+    // 可重建者被调度清偿；不可重建者由**队列重建路径**剪除并留痕，其债务保留为无主债务
+    //（subsystem 缺失 → 人工裁定清单），不再在加载时静默丢弃。
     await writeFile(
       join(tmpRoot, 'debt.json'),
       JSON.stringify([
@@ -143,10 +149,18 @@ describe('维护调度（§12.3）', () => {
     );
     const s = mkScheduler();
     const debt = s.debtSnapshot();
-    expect(debt.map((d) => d.task_id)).toEqual(['candidate_validation', 'memory_consolidation']); // 已按 task_id 排序
+    expect(debt.map((d) => d.task_id)).toEqual([
+      'candidate_validation',
+      'gc',
+      'memory_consolidation',
+      'turn-finalize:ghost',
+    ]); // 已按 task_id 排序；无队列项者不再被静默丢弃
     expect(debt.find((d) => d.task_id === 'candidate_validation')!.value).toBe(8); // value 原样保留
     expect(debt.find((d) => d.task_id === 'memory_consolidation')!.value).toBe(2);
-    expect(debt.some((d) => d.task_id === 'turn-finalize:ghost' || d.task_id === 'gc')).toBe(false);
+    // 无来源子系统的历史条目 → 无主债务（进人工裁定清单，不自动清除）
+    const ghost = s.debtSourceView().find((d) => d.task_id === 'turn-finalize:ghost')!;
+    expect(ghost.orphan).toBe(true);
+    expect(s.debtSourceView().find((d) => d.task_id === 'gc')!.orphan).toBe(true);
   });
 
   // ---- ④ soft / hard / critical ----
@@ -471,8 +485,98 @@ describe('维护调度（§12.3）', () => {
   });
 });
 
-// ---- ⑩ 观测摘要缓存（已知问题《观测摘要同步读当日日志》） ----
+// ---- ⑩b 队列跨重启重建（已知问题《债务与"还债的人"不同源》） ----
 
+describe('队列跨重启重建（债与还债的人同源）', () => {
+  it('重启后队列按 restoreTask 重建：盘上债务仍在 → 负责还债的任务仍在队列并被调度', async () => {
+    const debtFile = join(tmpRoot, 'debt.json');
+    let repaired = 0;
+    const restore = (id: string): ((signal?: AbortSignal) => Promise<void>) | null =>
+      id === 'repair' ? async () => { repaired++; } : null;
+
+    // 进程 1：入队 repair（accrueDebt）→ 债务与队列双双落盘
+    const s1 = new MaintenanceScheduler({ debtFile, restoreTask: restore });
+    schedulers.push(s1);
+    await s1.enqueue(
+      task({
+        id: 'repair',
+        value: 20,
+        estimated_cost: 25,
+        subsystem: 'repair-chain',
+        reason: '修正/复现失败信号——受影响对象需重验证',
+        run: async () => { repaired++; },
+      }),
+      { accrueDebt: true },
+    );
+    expect(s1.debtSnapshot().map((d) => d.task_id)).toEqual(['repair']);
+    s1.stop(); // 关停：内存队列清空（旧实现下"还债的人"就此消失）
+    expect(existsSync(join(tmpRoot, 'queue.json'))).toBe(true); // 队列已落盘
+
+    // 进程 2（新实例，同 debtFile）：债务从盘上恢复 + 队列按 restoreTask 重建 → 任务可被调度
+    const s2 = new MaintenanceScheduler({ debtFile, restoreTask: restore });
+    schedulers.push(s2);
+    expect(s2.debtSnapshot().map((d) => d.task_id)).toEqual(['repair']); // 债还在
+    const r = await s2.requestQuantum();
+    expect(r.ran).toEqual(['repair']); // 还债的人也在（旧实现：队列空 → 永不被调度）
+    expect(repaired).toBe(1);
+    expect(s2.debtSnapshot()).toEqual([]); // 成功执行 → 债务清偿（债与还债同源，债务不再只增不减）
+  });
+
+  it('不可重建的队列项被剪除且不静默：改为无主债务（人工裁定清单可见），不假装已还', async () => {
+    const debtFile = join(tmpRoot, 'debt.json');
+    const s1 = new MaintenanceScheduler({ debtFile, restoreTask: () => async () => {} });
+    schedulers.push(s1);
+    await s1.enqueue(
+      task({
+        id: 'turn-finalize:sess-gone',
+        value: 3,
+        estimated_cost: 1,
+        run: async () => {},
+      }),
+      { accrueDebt: true },
+    );
+    s1.stop();
+
+    // 进程 2：restoreTask 不认识该 id（属主会话已不存在）→ 剪除队列项；债务保留为无主债务
+    const s2 = new MaintenanceScheduler({ debtFile, restoreTask: () => null });
+    schedulers.push(s2);
+    const r = await s2.requestQuantum();
+    expect(r.ran).toEqual([]); // 不可重建 → 不执行（不假装完成）
+    const debt = s2.debtSnapshot();
+    expect(debt.map((d) => d.task_id)).toEqual(['turn-finalize:sess-gone']); // 债务保留（不自动清除）
+    expect(debt[0]!.subsystem).toBeUndefined(); // 无来源 → orphan
+    expect(s2.debtSourceView()[0]!.orphan).toBe(true);
+    // 剪除不静默：deferredEvents 留痕（为什么这条债没有"还债的人"）
+    expect(s2.deferredEvents().some((e) => /无法重建/.test(e.reason))).toBe(true);
+  });
+
+  it('重建面未就绪时不改动队列（装配顺序：调度器先构造、运行时后注入）', async () => {
+    const debtFile = join(tmpRoot, 'debt.json');
+    const s1 = new MaintenanceScheduler({ debtFile, restoreTask: () => async () => {} });
+    schedulers.push(s1);
+    await s1.enqueue(task({ id: 'repair', value: 5, run: async () => {} }), { accrueDebt: true });
+    s1.stop();
+
+    // 进程 2：先构造（无 restoreTask）→ 调度不丢队列（不剪除、不置位已加载标记）
+    const s2 = new MaintenanceScheduler({ debtFile });
+    schedulers.push(s2);
+    expect((await s2.requestQuantum()).ran).toEqual([]);
+    expect(s2.restoredQueueSize()).toBe(0); // 未就绪 → 队列视图为空（但盘上仍在）
+    expect(existsSync(join(tmpRoot, 'queue.json'))).toBe(true);
+  });
+
+  it('队列文件损坏 → 记调度器错误并按空队列继续（不静默吞错、不崩）', async () => {
+    const debtFile = join(tmpRoot, 'debt.json');
+    await writeFile(join(tmpRoot, 'queue.json'), '{ not json', 'utf8');
+    const s = new MaintenanceScheduler({ debtFile, restoreTask: () => async () => {} });
+    schedulers.push(s);
+    const r = await s.requestQuantum();
+    expect(r).toEqual({ ran: [], skipped: [] });
+    expect(s.limitsSnapshot().scheduler_error ?? '').toMatch(/队列文件损坏/);
+  });
+});
+
+// ---- ⑩ 观测摘要缓存（已知问题《观测摘要同步读当日日志》） ----
 describe('观测摘要缓存（kern_status 可读入口不再每次同步读全文件）', () => {
   it('文件未变的重复调用命中缓存（读盘次数不再随调用次数增长）', async () => {
     const s = mkScheduler();

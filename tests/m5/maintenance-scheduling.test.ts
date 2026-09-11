@@ -28,8 +28,13 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const s of schedulers.splice(0)) s.stop();
-  vi.useRealTimers();
+  vi.useRealTimers(); // 先恢复真实定时器（假定时器下「让出事件循环」的等待不会前进）
+  // 关停 + 排空：队列/观测/债务写入落完再删临时目录（否则 ENOTEMPTY 抖动——
+  // 与已知问题《关停不是真正排空》的测试侧表现同源；排空接口即 drain）
+  for (const s of schedulers.splice(0)) {
+    s.stop();
+    await s.drain({ timeoutMs: 2000 }).catch(() => undefined);
+  }
   await rm(tmpRoot, { recursive: true, force: true });
 });
 

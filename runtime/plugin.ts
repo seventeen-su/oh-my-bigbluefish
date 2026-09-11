@@ -296,8 +296,14 @@ export interface CognitiveRuntimeLike {
   components?: { list(): Array<{ manifest_id?: string }> };
   /** W5：语义裁判执行器（null = 未注入 → judge 不可用；available 布尔——动态能力行「语义裁判」段） */
   judgeExecutor?: { available: boolean } | null;
-  /** W5：dynamicCordisRunner 增强通道注入面（存在 → 候选验证通道 = runner；缺失 → 受限子进程） */
+  /** W3：dynamicCordisRunner 增强通道注入面（存在 → 候选验证通道 = runner；缺失 → 受限子进程） */
   dynamicRunner?: DynamicCordisRunnerLike | undefined;
+  /**
+   * 维护任务重建面（已知问题《债务与"还债的人"不同源》修复）：`id → 执行体工厂`，
+   * 供跨重启队列重建（MaintenanceScheduler.restoreTask）。缺失 → 队列不重建，
+   * 债务转为人工裁定清单（不静默丢失）。
+   */
+  maintenanceTaskFactory?(): (id: string) => ((signal?: AbortSignal) => Promise<void>) | null;
   /** R8：/evolve share——发布机制级 Evolution Object（trusted-latest 演化链头 → GitRegistry 本地 registry；
    *  生产默认不自动发布（隐私原则），显式命令始终可用；无对象/失败 → ok:false + 明确文本，不崩） */
   shareEvolutionObject?(input: { session_id: string }): Promise<ShareCommandResultLike>;
@@ -927,11 +933,17 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       //    队列与债务持久在磁盘，队列空时零开销。
       // ③ 债务阈值 soft/hard/critical 由组合根 ready() 从 policy.evolve.debt_thresholds 注入
       //    （数据即机制——改 evolve.yaml 即生效，与 decideEvolution 的债务门禁同源，两处不再各持一套缺省）。
+      // ④ 任务重建面（已知问题《债务与"还债的人"不同源》修复）：队列跨重启持久化（queue.json），
+      //    加载时经 restoreTask 按 id 重建执行体 → 债务与"负责还债的任务"同源。装配顺序上运行时在
+      //    调度器之后创建 → restoreTask 走闭包延迟取（未就绪时调度器不改动队列、下次调度重试；
+      //    见 MaintenanceScheduler.restoreQueueIfNeeded 的就绪语义）。
       const maintenance = new MaintenanceScheduler({
         debtFile: join(root, '.evolution', 'debt.json'),
         tickIntervalMs: DEFAULT_TICK_INTERVAL_MS,
         batchSize: DEFAULT_MAINTENANCE_BATCH,
+        restoreTask: (id) => maintenanceTaskFactory?.(id) ?? null,
       });
+      let maintenanceTaskFactory: ((id: string) => ((signal?: AbortSignal) => Promise<void>) | null) | null = null;
       // 定时器启动：仅在 DSH 运行期生效（进程内 setInterval）；stop() 由下方关闭钩子调用。
       // 启动失败不阻塞装配（认知其余功能照常，降级记录显式留痕）——调度退化为请求间隙单量子。
       try {
@@ -974,6 +986,9 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           ...(dynamicRunner !== undefined ? { dynamicRunner } : {}),
         });
         kernelLoaded = true;
+        // 队列重建面就绪（已知问题《债务与"还债的人"不同源》）：此后调度器再次进入时会把盘上
+        // 未完成队列按 id 重建回来（运行时未就绪期间调度器不改动队列——见 restoreQueueIfNeeded）
+        maintenanceTaskFactory = (id) => cognitive?.maintenanceTaskFactory?.()(id) ?? null;
       } catch (err) {
         // 已知问题《内核加载失败不得阻塞宿主》：**装配期异常外溢是历史故障根因**（Guard 读取错误、
         // 记忆库缺列两次实测阻塞宿主）。此处兜底：内核不加载 + 记录原因 + 宿主照常启动与运行；
