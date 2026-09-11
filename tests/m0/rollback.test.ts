@@ -250,7 +250,19 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
   });
 });
 
-describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () => {
+/**
+ * 真实布局是否存在（`versions.git/` + `stable/` 都是 gitignored 的运行时产物）。
+ * 新鲜克隆/CI 里不存在 → 显式跳过并说明原因，而不是让"没测到"表现成"测挂了"（同 git-layout 的守卫）。
+ */
+const HAS_REAL_LAYOUT = fs.existsSync(REAL_BARE) && fs.existsSync(path.join(PRESET_ROOT, 'stable'));
+if (!HAS_REAL_LAYOUT) {
+  console.info(
+    `[rollback] 跳过「真实布局只读冒烟」：本机无三线布局（${REAL_BARE}）——` +
+      '它们是 gitignored 的运行时产物，需先启动过宿主或跑 `pnpm init-three-line`。',
+  );
+}
+
+describe.skipIf(!HAS_REAL_LAYOUT)('真实布局只读冒烟（绝不切换真实 stable 引用）', () => {
   it('真实 versions.git 的 refs/heads/stable 存在且可解析为 commit（只读）', () => {
     const refs = runGit(['for-each-ref', '--format=%(refname)'], { cwd: REAL_BARE });
     expect(refs).toContain('refs/heads/stable');
@@ -260,7 +272,7 @@ describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () =>
     expect(stableHead).toMatch(/^[0-9a-f]{40}$/);
   });
 
-  it('真实 stable worktree 内容可读且与线引用一致（只读冒烟，不做任何切换）', () => {
+  it('真实 stable worktree 内容可读且与其自身 HEAD 一致（只读冒烟，不做任何切换）', () => {
     const stableWt = path.join(PRESET_ROOT, 'stable');
     // manifest 存在且可解析
     expect(fs.existsSync(path.join(stableWt, 'manifest.json'))).toBe(true);
@@ -268,10 +280,14 @@ describe('真实布局只读冒烟（绝不切换真实 stable 引用）', () =>
       name: string;
     };
     expect(manifest.name).toBe('omb-v2');
-    // 真实冒烟语义：worktree 的 line 与权威线引用（versions.git refs/heads/stable）一致，而非假设某个固定线
-    const refManifest = JSON.parse(
-      runGit(['show', 'refs/heads/stable:manifest.json'], { cwd: REAL_BARE }),
-    ) as { line?: string };
-    expect(manifestLine(stableWt)).toBe(refManifest.line ?? '');
+    // 冒烟语义修正（审查发现）：正式 worktree 是初始化时按当时分支尖端 add 出的**只读**目录，
+    // 之后不再原地更新（`substrate/lines.ts` 禁止对运行目录 checkout/worktree/archive；演化只推进
+    // versions.git 引用并另物化快照）→ 与 `refs/heads/stable` 分叉是**正常**的，比它必然误报。
+    // 正确的冒烟对象是工作树自己的 HEAD：内容与自称提交一致 = 内容没被破坏。
+    const wtHead = runGit(['rev-parse', 'HEAD'], { cwd: stableWt });
+    const headManifest = JSON.parse(runGit(['show', `${wtHead}:manifest.json`], { cwd: REAL_BARE })) as {
+      line?: string;
+    };
+    expect(manifestLine(stableWt)).toBe(headManifest.line ?? '');
   });
 });

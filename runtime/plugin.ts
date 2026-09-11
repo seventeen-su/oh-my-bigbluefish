@@ -96,7 +96,8 @@ export interface PluginConfig {
    *  缺省真实 bootStable）。语义等同 bootStable(opts)：ok:true / ok:false（无恢复路径）/ rollback。 */
   bootStableOverride?: (opts?: BootOptions) => Promise<BootResult>;
   /** R6：宿主 DSH 版本覆写（可选；提供 → 覆写运行时指纹/事件 provenance 的 dsh_version 唯一来源；
-   *  缺省 DSH_HOST_VERSION = '0.1.0-rc.7'（kernel/schemas/host-version.ts，当前宿主）。
+   *  缺省 = `kernel/schemas/host-version.ts` 的 `DSH_HOST_VERSION`（出厂默认值，随该文件走——
+   *  这里不写死具体版本号，避免与部署侧 `agent.cordis.yml` 的覆写值混淆而显得"两处不一致"）。
    *  升级宿主后经本配置更新，无需改码——所有 Event/Memory/Experience/Snapshot 使用同一值）。 */
   hostVersion?: string;
   /** W5：skill 镜像目标 DSH 主目录（可注入覆盖——测试注入 fake，禁止写真实 ~/.dsh；
@@ -145,7 +146,7 @@ export interface PluginConfig {
    * 桌面通知（已知问题《待实现：与 dsh-desktop-notify 的兼容》）：宿主装了 `dsh-desktop-notify`
    * 时，OMB 通过它的推送管线发"值得打扰主人"的少数通知（内核未加载/启动回退/晋升回退/债务 critical/
    * 组件健康异常）。缺省 'auto' = 宿主面存在即启用；false = 全关（一条都不发）。
-   * 节流与总量上限见 runtime/notify.ts 的 NotifyPolicy（缺省同 kind 30 分钟一次、全会话上限 5 条）。
+   * 节流与总量上限见 runtime/notify.ts 的 NotifyPolicy（缺省同 kind 30 分钟一次、全会话上限 10 条）。
    */
   desktopNotify?: boolean | 'auto';
   /**
@@ -155,7 +156,7 @@ export interface PluginConfig {
    * 权重不进仓库，用 `pnpm fetch-embedding-model` 获取。
    */
   embeddingModelDir?: string;
-  /** ONNX 推理线程数（缺省由运行时决定；本地小机可设 1 避免与主对话抢核） */
+  /** ONNX 推理线程数（1~64；**缺省 2**——单条 1.5ms 量级，本地小机可设 1 避免与主对话抢核） */
   embeddingThreads?: number;
   /**
    * 维护调度器注入（**仅测试/装配替换用**，正常部署不配）。
@@ -981,7 +982,10 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   if (config.embeddingModelDir !== undefined) {
     const d = config.embeddingModelDir;
     if (typeof d === 'string' && d.trim().length > 0) {
-      embeddingModelDir = d.trim();
+      const t = d.trim();
+      // 相对路径语义不明（是相对 preset 根还是进程 CWD？）——猜不如不猜：按 preset 根解析，
+      // 与 cognitiveRoot/activationLogDir 的既有口径一致（组合文件随项目走，绝对路径会指向旧机器）。
+      embeddingModelDir = resolveConfigPath(t);
     } else {
       recordDegradation('config/embeddingModelDir', `非法 embeddingModelDir 配置 "${String(d)}"（应为非空字符串）——按缺省探测`);
     }

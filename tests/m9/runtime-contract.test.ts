@@ -148,7 +148,11 @@ describe('⑤ 技能路径纯函数（第三层 skill 路径基座）', () => {
 
 describe('④ SKILL.md（第三层渐进指导，仓库内版本化）', () => {
   it('仓库文件存在、frontmatter name/description 非空、正文含命令/工具/过程/债务锚点', async () => {
-    const src = await readFile(SKILL_SOURCE, 'utf8');
+    // 行尾归一：`skills/omb-runtime/SKILL.md` 入库的 blob 本身就是 CRLF（`git cat-file` 实测 36 CR），
+    // 且仓库无 .gitattributes → 任何平台、任何 core.autocrlf 的克隆都会拿到 CRLF。
+    // 此前正则只认 `\n` → `---\r\n` 不匹配 → 该用例在**所有平台所有克隆**上恒失败
+    //（不是环境问题）。归一后对 LF/CRLF 都成立，同时断言不受行尾影响。
+    const src = (await readFile(SKILL_SOURCE, 'utf8')).replace(/\r\n/g, '\n');
     const fm = src.match(/^---\n([\s\S]*?)\n---/);
     expect(fm).not.toBeNull();
     expect(fm![1]!).toContain('name: omb-runtime');

@@ -136,8 +136,23 @@ describe('三线 git 布局（独立临时 fixture 完整复现）', () => {
   });
 });
 
-describe('真实布局只读冒烟', () => {
-  it('真实 stable/manifest.json 可读且与线引用一致', () => {
+/**
+ * 真实布局是否存在（`versions.git/` + `stable/` 都是 gitignored 的运行时产物）。
+ *
+ * 为什么需要这个守卫：这组用例读的是**本机运行环境**而非仓库内容——新鲜克隆/CI 里两者都不存在，
+ * 此前会硬失败（与被测性质无关的红）。缺布局时显式跳过并说明"先启动一次以初始化三线布局"，
+ * 而不是让"没测到"表现成"测挂了"。布局在时断言照常、一条不减。
+ */
+const HAS_REAL_LAYOUT = fs.existsSync(path.join(PRESET_ROOT, 'versions.git')) && fs.existsSync(REAL_STABLE);
+if (!HAS_REAL_LAYOUT) {
+  console.info(
+    `[git-layout] 跳过「真实布局只读冒烟」：本机无三线布局（${path.join(PRESET_ROOT, 'versions.git')} / ${REAL_STABLE}）` +
+      '——它们是 gitignored 的运行时产物，需先启动过宿主或跑 `pnpm init-three-line`。',
+  );
+}
+
+describe.skipIf(!HAS_REAL_LAYOUT)('真实布局只读冒烟', () => {
+  it('真实 stable/manifest.json 可读且与**自身 worktree HEAD** 一致', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(REAL_STABLE, 'manifest.json'), 'utf8')) as {
       name: string;
       version: string;
@@ -145,13 +160,17 @@ describe('真实布局只读冒烟', () => {
     };
     // 身份锚点：产品名固定
     expect(manifest.name).toBe('omb-v2');
-    // 真实冒烟语义：工作树内容与权威线引用（versions.git refs/heads/stable）一致，而非假设某个固定线
-    const refManifest = JSON.parse(
-      runGit(['show', 'refs/heads/stable:manifest.json'], {
-        cwd: path.join(PRESET_ROOT, 'versions.git'),
-      }),
+    // 冒烟语义修正（审查发现）：此前拿工作树内容去比 `refs/heads/stable` 处的树——**这条断言在设计上就不成立**：
+    // 正式 worktree 是初始化时按当时的分支尖端 add 出来的**只读**目录，之后就再不被原地更新
+    //（`substrate/lines.ts` 明确禁止对运行目录 checkout/worktree/archive，演化只推进 versions.git 的引用
+    //  并另物化快照）。于是 stable 分支一旦前进，工作树内容与它天然分叉 → 断言必然失败，
+    // 且失败原因（"布局坏了"）与真因（"只读目录本来就不跟随引用"）相反。
+    // 正确的冒烟对象是**工作树自己的 HEAD**：内容必须与它自称的提交一致（这才叫"内容没被破坏"）。
+    const wtHead = runGit(['rev-parse', 'HEAD'], { cwd: REAL_STABLE });
+    const headManifest = JSON.parse(
+      runGit(['show', `${wtHead}:manifest.json`], { cwd: path.join(PRESET_ROOT, 'versions.git') }),
     );
-    expect(manifest).toEqual(refManifest);
+    expect(manifest).toEqual(headManifest);
   });
 
   it('真实 stable/ 写被拒且只读语义完整（真实观察到拒绝，不许 mock）', () => {
