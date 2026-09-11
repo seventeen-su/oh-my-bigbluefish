@@ -15,6 +15,8 @@ import {
   teardownLayoutFixture,
   type LayoutFixture,
 } from '../helpers/git.js';
+// 只读机制是否真约束本进程（root + POSIX 权限位时不约束 → 相关断言走另一分支）
+import { readOnlyEnforced } from '../helpers/sandbox-scripts.js';
 
 /** fixture 构建/真实 git 超时（buildLayoutFixture：2 提交 + 3 worktree + 2 icacls；全量套件并行 git/icacls 饱和——P7 flake 放宽 5s → 30s） */
 const FIXTURE_TIMEOUT = 30000;
@@ -40,30 +42,6 @@ function manifestLine(worktree: string): string {
 /** 解析 bare 上某分支当前 head（完整 commit hash） */
 function headOf(fx: LayoutFixture, branch = 'stable'): string {
   return runGit(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`], { cwd: fx.bare });
-}
-
-/**
- * 「只读机制对**本进程**是否真的构成约束」——真机暴露的环境差异：
- * POSIX 权限位只读对 root 无效（`CAP_DAC_OVERRIDE`，平台提供者已如实标注该降级），而 Linux 容器里
- * 测试通常以 root 跑 → 施加只读后 `git checkout` 仍能改写 worktree，于是"worktree 同步应当失败"
- * 这类断言在真机上会把**正确行为**判成失败。
- *
- * 判据不用"是不是 root"（那是平台的实现细节），而是**直接探测可写性**：写成功了就说明机制没约束到
- * 本进程，此时相关用例应显式跳过该断言而不是假装失败。
- */
-function readOnlyEnforced(dir: string): boolean {
-  const probe = path.join(dir, `.omb-ro-probe-${process.pid}-${Date.now().toString(36)}`);
-  try {
-    fs.writeFileSync(probe, 'x');
-  } catch {
-    return true; // 写被拒 → 只读对本进程生效
-  }
-  try {
-    fs.rmSync(probe, { force: true });
-  } catch {
-    // 探测文件删除失败 → 忽略（只读刚被证明不生效，删除应当成功）
-  }
-  return false;
 }
 
 /**

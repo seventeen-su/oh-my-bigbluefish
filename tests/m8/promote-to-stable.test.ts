@@ -170,8 +170,16 @@ describe('① promoteToStable：门禁通过 → stable ← trusted-latest + Act
 
   fixtureIt('竞态守卫：stable 已前进（≠ 预期 predecessor）→ 拒绝（不覆盖已分叉状态）', async () => {
     fx = buildLayoutFixture();
-    // 制造第三 commit（commit-tree 孤儿提交，不挂任何分支）→ stable 推进到它（模拟另一晋升者已推进）
-    const raceTarget = runGit(['commit-tree', `${fx.latestHash}^{tree}`, '-m', 'race-target'], { cwd: fx.bare });
+    // 制造第三 commit（commit-tree 孤儿提交，不挂任何分支）→ stable 推进到它（模拟另一晋升者已推进）。
+    // 身份**显式**给出：commit-tree 不读仓库局部配置，缺身份会在"没有全局 git 身份"的机器上
+    // exit=128 `Author identity unknown`（真机 Linux 容器实测；Windows 开发机有全局身份才掩盖了它）。
+    const raceTarget = runGit(
+      [
+        '-c', 'user.name=OMB', '-c', 'user.email=omb@local',
+        'commit-tree', `${fx.latestHash}^{tree}`, '-m', 'race-target',
+      ],
+      { cwd: fx.bare },
+    );
     runGit(['update-ref', 'refs/heads/stable', raceTarget], { cwd: fx.bare });
     const r = await promoteToStable(mkInput(fx), mkDeps(fx)); // stable_commit 输入仍 = initialHash（过期）
     expect(r.promoted).toBe(false);

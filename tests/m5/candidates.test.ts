@@ -17,6 +17,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CandidatePool, candidateDirName, type CandidateRecord } from '../../supervisor/candidates.js';
+// 只读机制是否真约束本进程（root + 权限位时不约束 → 相关断言跳过而非误判失败）
+import { readOnlyEnforced } from '../helpers/sandbox-scripts.js';
 
 // ---- 测试工具 ----
 
@@ -278,10 +280,20 @@ describe('候选信任池与污染隔离（§9.3 / P11，supervisor/candidates.t
     await expect(pool.reject(mkRec({ id: T.id }), 'x')).rejects.toThrow(/revoke/);
 
     // —— trusted/ 消费方只读 ——
-    // OS 级只读（模拟 T0.2 正式 worktree 的 OS 只读语义）：trusted 记录置只读属性后写入被拒
+    // OS 级只读（模拟 T0.2 正式 worktree 的 OS 只读语义）：trusted 记录置只读属性后写入被拒。
+    // 环境差异（真机暴露，非缺陷）：`0o444` 对 **root 无效**（CAP_DAC_OVERRIDE，Linux 容器常以 root 跑）
+    // → 此时"写被拒"这一断言不适用：跳过它，但**先还原文件内容**，否则后面的目录树快照断言会被污染。
     const recFile = zoneFile('trusted', T.id, 'record.json');
+    const originalRecord = await readFile(recFile, 'utf8');
+    const enforced = readOnlyEnforced(dirname(recFile));
     await chmod(recFile, 0o444);
-    await expect(writeFile(recFile, '{"polluted":true}')).rejects.toThrow();
+    if (enforced) {
+      await expect(writeFile(recFile, '{"polluted":true}')).rejects.toThrow();
+    } else {
+      // 只读不约束本进程 → 显式还原（不把"能写"当成通过，也不留下被改写的记录）
+      await chmod(recFile, 0o644);
+      await writeFile(recFile, originalRecord);
+    }
     await chmod(recFile, 0o644); // 还原以便清理
     // 守卫层只读：消费方读路径（load + assertTrusted）零写入（目录树快照前后一致）
     const before = await snapshotTree(evo);
