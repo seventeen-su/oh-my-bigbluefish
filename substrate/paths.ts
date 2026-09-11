@@ -12,8 +12,7 @@
 //      等大小写敏感文件系统）→ 敏感比较。不再在 Linux 上"无条件放大"大小写。
 //   2. **边界按分隔符**：`under` 判定以分隔符为界（`/tmp` 不吃 `/tmp2/omb`），根自身单独判等。
 //
-// 层 DAG（CONVENTIONS §4）：仅 node: 内置；被 supervisor/ 与 substrate/ 共用。
-import path from 'node:path';
+// 层 DAG（CONVENTIONS §4）：仅 node: 内置（本模块是纯字符串判定，不需要任何 import）。
 
 /**
  * 该平台的文件系统路径是否大小写不敏感（判定删除/越界安全时使用）。

@@ -25,7 +25,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadPolicy } from '../../kernel/policy-loader.js';
 import { ensureLineSnapshot } from '../../substrate/lines.js';
 import type { VersionLayout } from '../../substrate/snapshot.js';
-import { sandboxStatusAsync, resetSandboxChannelCache } from '../../substrate/sandbox.js';
+import { sandboxStatusAsync } from '../../substrate/sandbox.js';
 import { validateDataCandidate, executionVerificationGateNote } from '../../supervisor/candidate-pipeline.js';
 import { executionEvidenceFromVerifications, shouldPromoteToStable } from '../../kernel/promotion-gate.js';
 import type { CandidateDraft } from '../../kernel/schemas/evolution.js';
