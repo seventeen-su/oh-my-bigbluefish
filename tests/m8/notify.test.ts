@@ -151,6 +151,11 @@ describe('④ 事件白名单与审计面', () => {
       'promotion-rollback',
       'debt-critical',
       'component-unhealthy',
+      'line-switch-degraded',
+      'maintenance-scheduler-error',
+      'sandbox-unavailable',
+      'verification-debt-manual',
+      'capability-degraded',
     ]);
   });
 
@@ -176,5 +181,73 @@ describe('④ 事件白名单与审计面', () => {
       expect(item.title.length).toBeGreaterThan(0);
       expect(item.message ?? '').toMatch(/。|：/); // 有完整句子（说清后果），不是干巴巴的内部术语
     }
+  });
+});
+
+/**
+ * 专项提醒（第二批五种）——OMB 特有语义的退化，各有"为什么这值得打扰"的理由：
+ *   - line-switch-degraded：命令说切了、模型却还在旧线上跑（所见非所是）；
+ *   - maintenance-scheduler-error：调度器自身故障（债务视图不可信、自愈链停摆）；
+ *   - sandbox-unavailable：候选验证通道不可用 → 自演化实际被停用（fail-closed 会拒掉带脚本的候选）；
+ *   - verification-debt-manual：无人裁决的验证结论（阶梯式验证已尽力，需要人来下结论）；
+ *   - capability-degraded：能力面比预期少。
+ */
+describe('⑤ 专项提醒：语义与门控', () => {
+  it('版本线切换降级用 pushAlways 且语气点明"仍在旧线跑"（认知行为与预期不符，必须现在知道）', () => {
+    const { service, always, pushed } = fakeService();
+    const bridge = new NotifyBridge({ service });
+    expect(bridge.notifyLineSwitchDegraded('latest', '快照重建失败：物化超时')).toBe(true);
+    expect(always).toHaveLength(1);
+    expect(pushed).toHaveLength(0);
+    expect(always[0]!.title).toContain('latest');
+    expect(always[0]!.message).toMatch(/旧线|未重建/);
+    expect(always[0]!.urgency).toBe('critical');
+    expect(bridge.attempts()[0]).toMatchObject({ kind: 'line-switch-degraded', sent: true, always: true });
+  });
+
+  it('调度器故障提醒 urgency=critical 且指出该去哪儿核对', () => {
+    const { service, pushed } = fakeService();
+    const bridge = new NotifyBridge({ service });
+    expect(bridge.notifyMaintenanceSchedulerError('debt.json 损坏：Unexpected token')).toBe(true);
+    expect(pushed[0]!.urgency).toBe('critical');
+    expect(pushed[0]!.message).toMatch(/\.evolution|核对/);
+  });
+
+  it('候选验证通道不可用：说清后果（自演化被停用）+ 给出可选的显式放宽开关', () => {
+    const { service, pushed } = fakeService();
+    const bridge = new NotifyBridge({ service });
+    expect(bridge.notifySandboxUnavailable('bwrap 自检不通过：未产出结果文件')).toBe(true);
+    expect(pushed[0]!.title).toMatch(/候选验证通道/);
+    expect(pushed[0]!.message).toMatch(/fail-closed|被拒/);
+    // 指向真实的策略键（用户能据此决策，而不是只知道"坏了"）
+    expect(pushed[0]!.message).toContain('require_execution_verification');
+  });
+
+  it('待人工裁决验证债务：报数量并说明"处理前会一直挂着"', () => {
+    const { service, pushed } = fakeService();
+    const bridge = new NotifyBridge({ service });
+    expect(bridge.notifyVerificationDebtManual(3, 'repair:obj-1（UNKNOWN 两次未决）')).toBe(true);
+    expect(pushed[0]!.title).toContain('3');
+    expect(pushed[0]!.message).toMatch(/人工|需要人/);
+    expect(pushed[0]!.message).toContain('repair:obj-1');
+  });
+
+  it('能力面降级：措辞说明"能做的事变少"而非泛泛的"出错"', () => {
+    const { service, pushed } = fakeService();
+    const bridge = new NotifyBridge({ service });
+    expect(bridge.notifyCapabilityDegraded('能力 memory.retrieve 未登记')).toBe(true);
+    expect(pushed[0]!.title).toMatch(/能力/);
+    expect(pushed[0]!.message).toMatch(/能力比预期少|其余功能照常/);
+  });
+
+  it('各专项提醒同样受节流约束（同 kind 30 分钟内只发一次）', () => {
+    const { service, always } = fakeService();
+    let now = 0;
+    const bridge = new NotifyBridge({ service, now: () => now });
+    expect(bridge.notifyLineSwitchDegraded('stable', '第一次')).toBe(true);
+    now += 1000;
+    expect(bridge.notifyLineSwitchDegraded('latest', '第二次')).toBe(false);
+    expect(bridge.attempts()[1]!.skipped).toBe('throttled');
+    expect(always).toHaveLength(1);
   });
 });

@@ -200,8 +200,8 @@ export interface CognitiveRuntimeLike {
     requestQuantum(opts?: { signal?: unknown }): Promise<unknown>;
     debtSnapshot(): unknown;
     stop?(): void;
-    /** 债务档位快照（通知桥用：critical 档 → 告知主人"演化被保护性拦住"） */
-    limitsSnapshot?(): { total: number; band: string; critical: number };
+    /** 债务档位快照（通知桥用：critical 档 → 告知主人"演化被保护性拦住"；scheduler_error → 调度器自身故障） */
+    limitsSnapshot?(): { total: number; band: string; critical: number; scheduler_error?: string | null };
   } | null;
   /** P1a：已注入的线快照（按线加载成功 → 快照信息；否则 null/undefined） */
   lineSnapshot?: { line: string; commit: string; dir: string } | null;
@@ -617,6 +617,29 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
     recordDegradation('host/contract', `宿主面缺项（只降级对应能力，插件照常加载）：${detail}`);
   }
   /**
+   * 待补发的通知（**必须声明在最早的引用点之前**）：安全状态判定 / 启动校验结算都早于通知桥构造，
+   * 而启动校验是**异步**的（其 `.then` 回调可能在函数体其余部分执行完之前就跑到）——
+   * 真机（Linux）实测过这个 TDZ：`Cannot access 'flushPendingNotifications' before initialization`。
+   * 因此队列与补发函数都提到最前，而不是"就近定义"。
+   */
+  const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
+  /**
+   * 补发已入队的通知（幂等：队列清空后无动作）。**用函数声明**（提升）以免任何调用顺序下的 TDZ。
+   * 调用点：桥就绪后立即一次 + 启动校验结算后一次（boot 的告警/回退在桥就绪之后才产生，
+   * 故必须在它 settle 时再补发一次；否则"启动回退"这类最该告知的事件会静默丢掉）。
+   */
+  function flushPendingNotifications(): void {
+    for (const pending of pendingNotifications.splice(0)) {
+      pending.send(notifyBridge);
+    }
+  }
+  /**
+   * 通知桥（先置 null，装配到"桌面通知服务读取"那一步再赋值）：
+   * `flushPendingNotifications` 需要用 late-binding 拿到它，避免又一处 TDZ。
+   */
+  let notifyBridge: NotifyBridge = new NotifyBridge({ service: null });
+
+  /**
    * 外核安全状态视图（已知问题《外核自身也要非阻塞》：当前是否安全状态、原因、发生时间可经状态面与
    * 日志查看）+ 内核未加载时的状态面兜底数据源。二者都在此就近定义——工具注册与返回值都要用，
    * 且必须在任何使用点之前完成绑定（TDZ）。
@@ -679,11 +702,9 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   });
 
   /**
-   * 待补发的通知（构造顺序：安全状态判定早于通知桥构造——TDZ 约束下的诚实做法：
-   * 先入队，桥就绪后立即补发，而不是为了顺序把桥提前声明成一堆 let）。
+   * 待补发的通知队列与补发函数已在函数体最前声明（TDZ 约束，见那里的说明）。
+   * 宿主契约哨兵结论（返回值与状态面可读：宿主面缺了什么、各自影响什么）
    */
-  const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
-  /** 宿主契约哨兵结论（返回值与状态面可读：宿主面缺了什么、各自影响什么） */
   const hostContractView = (): HostContractReport => hostContract;
   /**
    * 内核未加载的补发闸门（只发一次）：安全状态与"认知装配失败"是两条路径，任一命中即已告知主人，
@@ -694,6 +715,12 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   let lastErrorPoolTotal = 0;
   /** error 池基线是否已建立（首读只记基线，不把既有归档当成"刚发生"） */
   let errorPoolBaselineSet = false;
+  /** 已提醒过的调度器故障文本（同一故障只提醒一次） */
+  let lastSchedulerErrorSeen: string | null = null;
+  /** 上次见到的待人工裁决验证债务条数（增量判据；首读即为基线） */
+  let lastManualDebtCount = 0;
+  /** 待人工裁决基线是否已建立 */
+  let manualDebtBaselineSet = false;
 
   /**
    * 外核安全状态（已知问题《外核自身也要非阻塞（安全状态）》）：拉起内核**之前**做一次极轻量自检
@@ -1003,18 +1030,21 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
       return null; // 未注入/读取抛错 → 静默（宿主没装这个插件不是故障）
     }
   })();
-  const notify = new NotifyBridge({ service: desktopNotifyService });
-  /**
-   * 补发已入队的通知（幂等：队列清空后无动作）。
-   * 调用点：桥就绪后立即一次 + 启动校验结算后一次（boot 是异步的——它的告警/回退在桥就绪之后才产生，
-   * 故必须在它 settle 时再补发一次；否则"启动回退"这类最该告知的事件会静默丢掉）。
-   */
-  const flushPendingNotifications = (): void => {
-    for (const pending of pendingNotifications.splice(0)) {
-      pending.send(notify);
-    }
-  };
+  notifyBridge = new NotifyBridge({ service: desktopNotifyService });
   flushPendingNotifications();
+
+  // 受限执行通道自检结论 → 专项提醒（不可用时）：带执行型验证脚本的候选会因 fail-closed 被拒，
+  // 等于自演化实际被停用——主人该知道，而不是从"候选怎么总被拒"里自己推。
+  // 时机：自检是异步的（起子进程），故挂在其结算后；只在**平台声称有通道、自检却判不可用**时出声。
+  void sandboxStatusAsync()
+    .then((st) => {
+      if (!st.available && platformView.sandbox_available) {
+        notifyBridge.notifySandboxUnavailable(st.reason ?? '受限通道自检不通过（候选验证无法真实执行）');
+      }
+    })
+    .catch(() => {
+      // 自检异常 → 不打扰（状态面已如实呈现）
+    });
 
   if (cognitive === undefined && safeState.ok) {
     // 相对路径解析：config 路径相对 preset 根（迁移可移植——组合文件随项目走，绝对路径会指向旧机器）
@@ -1165,7 +1195,7 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
             const st = await cognitive?.status?.();
             const unhealthy = (st?.components?.health ?? []).filter((h) => !h.ok);
             if (unhealthy.length > 0) {
-              notify.notifyComponentUnhealthy(
+              notifyBridge.notifyComponentUnhealthy(
                 unhealthy.map((h) => `${h.manifest_id}（${h.detail}）`).join('；'),
               );
             }
@@ -1477,7 +1507,7 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
         try {
           const limits = m.limitsSnapshot?.();
           if (limits !== undefined && limits.band === 'critical') {
-            notify.notifyDebtCritical(limits.total, limits.critical, { sessionId });
+            notifyBridge.notifyDebtCritical(limits.total, limits.critical, { sessionId });
           }
         } catch {
           // 状态面读取失败 → 不打扰（不发比发错好）
@@ -1499,7 +1529,7 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
             }
             if (total > lastErrorPoolTotal) {
               lastErrorPoolTotal = total;
-              notify.notifyPromotionRollback(
+              notifyBridge.notifyPromotionRollback(
                 `error 池新增归档（组件：${Object.entries(counts)
                   .map(([c, n]) => `${c}=${n}`)
                   .join(', ')}）`,
@@ -1508,6 +1538,43 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
             }
           } catch {
             // 观测面不可读 → 不打扰
+          }
+        })();
+        // 维护调度器自身故障（缺陷档专项提醒）：debt.json 损坏之类会让债务视图不可信、自愈链停摆。
+        // 观测面 = limitsSnapshot().scheduler_error（调度器已在内部记录最近一次自身故障）。
+        try {
+          const err = m.limitsSnapshot?.().scheduler_error;
+          if (typeof err === 'string' && err.length > 0 && err !== lastSchedulerErrorSeen) {
+            lastSchedulerErrorSeen = err;
+            notifyBridge.notifyMaintenanceSchedulerError(err, { sessionId });
+          }
+        } catch {
+          // 状态面读取失败 → 不打扰
+        }
+        // 无人裁决的验证债务（专项提醒）：UNKNOWN 两次未决 / 裁判不可用 → 转人工复核，需要人来下结论。
+        // 观测面 = 状态面的 debt_pending_manual（只读）；数量增长才提醒（避免同一批反复打扰）。
+        void (async () => {
+          try {
+            const st = await cognitive?.status?.();
+            const pending = st?.debt_pending_manual?.length ?? 0;
+            if (!manualDebtBaselineSet) {
+              // 首读即基线：启动时把历史遗留的待裁决条目当成"刚发生"是误报
+              manualDebtBaselineSet = true;
+              lastManualDebtCount = pending;
+              return;
+            }
+            if (pending > lastManualDebtCount) {
+              lastManualDebtCount = pending;
+              notifyBridge.notifyVerificationDebtManual(
+                pending,
+                st?.debt_pending_manual?.map((d) => `${d.task_id}（${d.reason}）`).slice(0, 3).join('；') ?? '',
+                { sessionId },
+              );
+            } else {
+              lastManualDebtCount = pending;
+            }
+          } catch {
+            // 状态面不可读 → 不打扰
           }
         })();
       }
@@ -1701,10 +1768,13 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
                 const r = cognitive.rebuildSnapshotForLine(line);
                 if (r.degraded !== null && r.degraded !== undefined) {
                   recordDegradation('lines/rebuild', r.degraded);
+                  // 专项提醒：命令说切了，模型却仍跑在旧线的策略/过程上——"所见非所是"，必须告知
+                  notifyBridge.notifyLineSwitchDegraded(line, r.degraded, { sessionId });
                 }
               } catch (err) {
                 const detail = err instanceof Error ? err.message : String(err);
                 recordDegradation('lines/rebuild', `快照重建异常（${detail}）——当前快照保持`);
+                notifyBridge.notifyLineSwitchDegraded(line, `快照重建异常（${detail}）`, { sessionId });
               }
             }
           }

@@ -139,11 +139,69 @@ export interface SandboxSelfTest {
   note: string;
 }
 
+/** 候选通道 + 其自检结论缓存（同一进程内自检只真跑一次） */
+interface ChannelCandidate {
+  channel: SandboxChannel;
+  selfTest: SandboxSelfTest | null;
+}
+
+/** 通道候选表缓存（进程内一次；平台 -> 按强度排序的候选） */
+let channelCandidates: Promise<ChannelCandidate[]> | null = null;
+
 /**
- * 受限通道可用性探测（平台识别 + 实现可加载性 + **真实自检**）：**绝不抛**。
- * 顺序：外核平台提供者给出平台能力（read-only / sandbox）→ 取该平台的通道实现（Windows 动态加载
- * win32 模块；POSIX 选 bwrap/Node 权限模型）→ 自检一次（进程内缓存）。
- * 这是门禁侧（G3-exec）**应当使用**的探测入口：`sandboxStatus()`（同步版）只报平台能力面，
+ * 取当前平台的受限执行**候选**通道（按强度顺序；进程内缓存）。
+ *   - Windows：动态 import `sandbox-win32.js`（非 Windows 平台完全不加载 win32-*.js 与 koffi）；
+ *   - POSIX：`sandbox-posix.js`（bwrap → Node 权限模型；Windows 上不加载）。
+ * 真机教训（2026-09，Debian 13）：bwrap 可能"存在却自检不通过"（用户命名空间受限、或参数构造与
+ * 该版本不兼容）——所以这里给的是**候选列表**，由 `resolveSandboxChannel()` 逐个自检并回落，
+ * 而不是"存在即选定、失败即判无通道"。
+ */
+async function loadChannelCandidates(): Promise<ChannelCandidate[]> {
+  if (channelCandidates === null) {
+    channelCandidates = (async (): Promise<ChannelCandidate[]> => {
+      if (process.platform === 'win32') {
+        const impl = (await import('./sandbox-win32.js')) as unknown as {
+          win32SandboxChannel(): SandboxChannel;
+        };
+        return [{ channel: impl.win32SandboxChannel(), selfTest: null }];
+      }
+      const impl = (await import('./sandbox-posix.js')) as unknown as {
+        posixSandboxCandidates(): SandboxChannel[];
+      };
+      return impl.posixSandboxCandidates().map((channel) => ({ channel, selfTest: null }));
+    })();
+  }
+  return channelCandidates;
+}
+
+/**
+ * 选出自检通过的最强通道（自检结论按候选缓存）。
+ * 全部不通过 → 返回最强候选 + 失败结论 + 逐条回落原因，由调用方按不可用处理并**说明为什么**
+ * （保留最强候选是为了报告"机制是哪条"，而不是笼统地说"没有通道"）。
+ */
+async function resolveSandboxChannel(): Promise<{
+  channel: SandboxChannel | null;
+  selfTest: SandboxSelfTest | null;
+  fallbackFrom: string[];
+}> {
+  const candidates = await loadChannelCandidates();
+  const fallbackFrom: string[] = [];
+  let last: { channel: SandboxChannel; selfTest: SandboxSelfTest } | null = null;
+  for (const entry of candidates) {
+    entry.selfTest ??= await entry.channel.selfTest();
+    if (entry.selfTest.ok) {
+      return { channel: entry.channel, selfTest: entry.selfTest, fallbackFrom };
+    }
+    fallbackFrom.push(`${entry.channel.mechanism}（${entry.selfTest.note}）`);
+    last = { channel: entry.channel, selfTest: entry.selfTest };
+  }
+  return { channel: last?.channel ?? null, selfTest: last?.selfTest ?? null, fallbackFrom };
+}
+
+/**
+ * 受限通道可用性探测（平台识别 + 实现可加载性 + **真实自检，失败则回落下一候选**）：**绝不抛**。
+ * 顺序：外核平台提供者给出平台能力（read-only / sandbox）→ 取该平台的候选通道 → 逐个自检取第一个
+ * 通过者。这是门禁侧（G3-exec）**应当使用**的探测入口：`sandboxStatus()`（同步版）只报平台能力面，
  * 不确认写限制是否真的生效。
  */
 export async function sandboxStatusAsync(): Promise<SandboxStatus> {
@@ -157,9 +215,9 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
       self_test_note: '未探测（平台能力面已判定无通道）',
     };
   }
-  let channel: SandboxChannel | null
+  let resolved: Awaited<ReturnType<typeof resolveSandboxChannel>>;
   try {
-    channel = await loadSandboxChannel()
+    resolved = await resolveSandboxChannel();
   } catch (err) {
     return {
       available: false,
@@ -169,6 +227,7 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
       self_test_note: '未探测（实现模块不可加载）',
     }
   }
+  const { channel, selfTest, fallbackFrom } = resolved
   if (channel === null) {
     return {
       available: false,
@@ -178,17 +237,18 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
       self_test_note: '未探测（无实现可加载）',
     }
   }
-  const selfTest = await channel.selfTest()
-  if (!selfTest.ok) {
+  const triedNote = fallbackFrom.length > 0 ? `已尝试：${fallbackFrom.join('；')}` : '（唯一候选）'
+  if (selfTest === null || !selfTest.ok) {
+    const detail = selfTest?.note ?? '自检未产出结论'
     return {
       available: false,
-      reason: `受限通道自检不通过：${selfTest.note}`,
+      reason: `受限通道自检不通过：${detail}——${triedNote}`,
       platform: caps.raw,
       mechanism: channel.mechanism,
       isolation: channel.isolation,
       mechanism_note: channel.mechanism_note,
       verified: true,
-      self_test_note: selfTest.note,
+      self_test_note: `${detail}；${triedNote}`,
     }
   }
   return {
@@ -196,9 +256,13 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
     mechanism: channel.mechanism,
     platform: caps.raw,
     isolation: channel.isolation,
-    mechanism_note: channel.mechanism_note,
+    mechanism_note:
+      fallbackFrom.length > 0
+        ? `${channel.mechanism_note}（自检回落自：${fallbackFrom.join('；')}）`
+        : channel.mechanism_note,
     verified: true,
-    self_test_note: selfTest.note,
+    self_test_note:
+      fallbackFrom.length > 0 ? `${selfTest.note}；已回落（${fallbackFrom.join('；')}）` : selfTest.note,
   }
 }
 
@@ -255,43 +319,20 @@ export interface RunRestrictedResult {
   timedOut: boolean
 }
 
-let channelPromise: Promise<SandboxChannel | null> | null = null
-
-/**
- * 取当前平台的受限执行通道（**按平台惰性加载**；进程内缓存）：
- *   - Windows：动态 import `sandbox-win32.js`（非 Windows 平台完全不加载 win32-*.js 与 koffi）；
- *   - POSIX：`sandbox-posix.js`（bwrap → Node 权限模型；Windows 上不加载）。
- * 无可用实现 → null（调用方按能力缺失处理）。
- */
-function loadSandboxChannel(): Promise<SandboxChannel | null> {
-  if (channelPromise === null) {
-    channelPromise = (async (): Promise<SandboxChannel | null> => {
-      if (process.platform === 'win32') {
-        const impl = (await import('./sandbox-win32.js')) as unknown as {
-          win32SandboxChannel(): SandboxChannel
-        }
-        return impl.win32SandboxChannel()
-      }
-      const impl = (await import('./sandbox-posix.js')) as unknown as {
-        posixSandboxChannel(): SandboxChannel | null
-      }
-      return impl.posixSandboxChannel()
-    })()
-  }
-  return channelPromise
-}
-
 /** 清空通道缓存与自检缓存（仅测试用：同一进程内模拟不同平台/机制） */
 export function resetSandboxChannelCache(): void {
-  channelPromise = null
+  channelCandidates = null
 }
 
 /**
  * 受限执行（平台无关门面）：
  *   ① 入参校验（脚本存在、writableDirs/cwd 存在）——fail-loud，与拆分前一致；
- *   ② 平台通道检查：无可用受限机制 → **拒绝执行**（fail-closed 不变量：绝不以完整权限静默运行；
- *      调用方应先经 sandboxStatusAsync() 探测并记录 degraded）；
- *   ③ 委派平台实现（Windows：sandbox-win32.js；POSIX：sandbox-posix.js）。
+ *   ② 平台通道检查：**自检通过**的通道才可执行 → 无 → 拒绝（fail-closed 不变量：绝不以完整权限静默
+ *      运行候选；调用方应先经 sandboxStatusAsync() 探测并记录 degraded）；
+ *   ③ 委派所选通道（Windows：sandbox-win32.js；POSIX：sandbox-posix.js）。
+ *
+ * 注：这里是"自检通过才跑"而非"存在就跑"——真机教训（bwrap 存在但参数/命名空间不成立）说明
+ * 只看机制存在会让执行以不可预期的方式失败；自检结论同时被 sandboxStatusAsync 复用（缓存）。
  */
 export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult> {
   const script = path.resolve(opts.script)
@@ -317,9 +358,13 @@ export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRest
       `runRestricted: 平台 ${caps.raw} 无受限执行通道（沙盒机制 = none）——fail-closed 拒绝以完整权限运行候选`,
     )
   }
-  const channel = await loadSandboxChannel()
-  if (channel === null) {
-    throw new Error(`runRestricted: 平台 ${caps.raw} 未找到可用受限执行实现——fail-closed 拒绝以完整权限运行候选`)
+  const { channel, selfTest, fallbackFrom } = await resolveSandboxChannel()
+  if (channel === null || selfTest === null || !selfTest.ok) {
+    const tried = fallbackFrom.length > 0 ? fallbackFrom.join('；') : '无候选'
+    throw new Error(
+      `runRestricted: 平台 ${caps.raw} 受限通道自检不通过（${selfTest?.note ?? '未产出结论'}；已尝试：${tried}）` +
+        '——fail-closed 拒绝以完整权限运行候选',
+    )
   }
   return channel.runRestricted(opts)
 }

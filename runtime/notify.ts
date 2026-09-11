@@ -41,6 +41,12 @@ export interface NotifyItem {
 /**
  * 允许打扰的事件种类（**白名单**——不在表内的一律不发）。
  * 命名与「用户会怎么理解这件事」对齐，不用内部术语。
+ *
+ * 分两档（缺省节流窗口不同，见 DEFAULT_NOTIFY_POLICY.perKindIntervalMs）：
+ *   - **故障档**（cognition 整体或关键保证受损）：kernel-not-loaded / startup-rollback /
+ *     promotion-rollback / maintenance-scheduler-error / sandbox-unavailable；
+ *   - **专项档**（OMB 特有语义的退化，不致命但主人该知道）：line-switch-degraded /
+ *     verification-debt-manual / capability-degraded / debt-critical / component-unhealthy。
  */
 export const NOTIFY_KINDS = [
   /** 内核未加载/进入安全状态（宿主升级、契约不符、恢复根不可读）——OMB 整体不工作，主人必须知道 */
@@ -53,6 +59,16 @@ export const NOTIFY_KINDS = [
   'debt-critical',
   /** 组件健康检查发现异常（组件被标记 suspicious）——能力面受损，需要知道 */
   'component-unhealthy',
+  /** 版本线切换已生效但运行时快照未重建（模型仍跑在旧线的策略/过程上）——认知行为与预期不符 */
+  'line-switch-degraded',
+  /** 维护调度器自身故障（如 debt.json 损坏）：债务视图不可信、自愈链停摆 */
+  'maintenance-scheduler-error',
+  /** 受限执行通道不可用：候选验证的执行型门无法真实跑，带脚本的候选将按 fail-closed 被拒 */
+  'sandbox-unavailable',
+  /** 验证债务转人工复核（UNKNOWN 两次未决 / 裁判不可用）——有结论需要人来下 */
+  'verification-debt-manual',
+  /** 能力面降级（能力注册表/组件能力缺失）——OMB 能做的事变少 */
+  'capability-degraded',
 ] as const;
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
 
@@ -60,7 +76,7 @@ export type NotifyKind = (typeof NOTIFY_KINDS)[number];
 export interface NotifyPolicy {
   /** 同一 kind 的最小间隔（ms；缺省 30 分钟——"同类问题别连着弹"） */
   perKindIntervalMs: number;
-  /** 单次会话生命周期内的总推送上限（缺省 5——硬上限，防意外刷屏） */
+  /** 单次会话生命周期内的总推送上限（缺省 10——硬上限，防意外刷屏） */
   maxPerSession: number;
   /** 全局开关（缺省 true；宿主未装 desktopNotify 时无效果） */
   enabled: boolean;
@@ -68,7 +84,7 @@ export interface NotifyPolicy {
 
 export const DEFAULT_NOTIFY_POLICY: NotifyPolicy = {
   perKindIntervalMs: 30 * 60 * 1000,
-  maxPerSession: 5,
+  maxPerSession: 10,
   enabled: true,
 };
 
@@ -237,6 +253,71 @@ export class NotifyBridge {
     return this.notify('component-unhealthy', {
       title: 'OMB 组件健康异常',
       message: `${detail}。相关能力已降级，其余功能照常。`,
+      urgency: 'normal',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+    });
+  }
+
+  /**
+   * 版本线切换已生效但运行时快照未重建（专项档）：命令说切了，模型却仍跑在旧线的策略/过程上——
+   * 这是"所见非所是"的一类静默不一致，必须让主人知道（否则会误以为新策略已生效）。
+   */
+  notifyLineSwitchDegraded(line: string, detail: string, opts: { sessionId?: string } = {}): boolean {
+    return this.notify(
+      'line-switch-degraded',
+      {
+        title: `OMB 版本线已切到 ${line} 但快照未重建`,
+        message: `${detail}。模型仍按旧线的策略与过程运行；重启宿主或重新 /mode 切换可重试。`,
+        urgency: 'critical',
+        ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      },
+      { always: true }, // 认知行为与预期不符，属于"必须现在知道"
+    );
+  }
+
+  /**
+   * 维护调度器自身故障（专项档）：`debt.json` 损坏之类会让债务视图不可信、自愈链停摆——
+   * 与"某个任务失败"完全不同量级，属调度器级故障。
+   */
+  notifyMaintenanceSchedulerError(detail: string, opts: { sessionId?: string } = {}): boolean {
+    return this.notify('maintenance-scheduler-error', {
+      title: 'OMB 维护调度器异常',
+      message: `${detail}。债务统计与自动维护可能失真，需要人工核对 workspace/.omb/.evolution。`,
+      urgency: 'critical',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+    });
+  }
+
+  /**
+   * 受限执行通道不可用（专项档）：候选验证的执行型门（G3-exec）无法真实跑，
+   * 带验证脚本的候选会按 fail-closed 被拒——**自演化实际被停用**，主人需要知道。
+   */
+  notifySandboxUnavailable(reason: string, opts: { sessionId?: string } = {}): boolean {
+    return this.notify('sandbox-unavailable', {
+      title: 'OMB 候选验证通道不可用',
+      message: `${reason}。带执行型验证脚本的候选会因"没验过"被拒绝晋升（require_execution_verification 缺省 fail-closed）；` +
+        '如需在无沙盒环境接受降级，显式设 evolve.policy.candidate_gate.require_execution_verification=false。',
+      urgency: 'normal',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+    });
+  }
+
+  /** 验证债务转人工复核（专项档）：UNKNOWN 两次未决或裁判不可用——有结论需要人来下 */
+  notifyVerificationDebtManual(count: number, detail: string, opts: { sessionId?: string } = {}): boolean {
+    return this.notify('verification-debt-manual', {
+      title: `OMB 有 ${count} 条验证结论待人工裁决`,
+      message: `${detail}。自动裁判已尽力（阶梯式验证），这些条目需要人工给出结论；` +
+        '处理前它们会一直挂在验证债务队列里。',
+      urgency: 'normal',
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+    });
+  }
+
+  /** 能力面降级（专项档）：能力注册表/组件声明的能力缺失——"OMB 能做的事变少了" */
+  notifyCapabilityDegraded(detail: string, opts: { sessionId?: string } = {}): boolean {
+    return this.notify('capability-degraded', {
+      title: 'OMB 能力面降级',
+      message: `${detail}。OMB 可用的能力比预期少，其余功能照常。`,
       urgency: 'normal',
       ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
     });
