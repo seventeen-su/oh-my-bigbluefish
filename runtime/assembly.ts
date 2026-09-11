@@ -102,6 +102,8 @@ import {
   type ConsolidationOutcome,
   type ConsolidationReport,
 } from '../memory/consolidate.js';
+// 中文小嵌入模型（已知问题《小向量模型未接入》落地：BGE-small-zh-v1.5 ONNX，CPU、无模型调用）
+import { loadOnnxEmbedder } from '../memory/embeddings-onnx.js';
 // 归因观测面（已知问题《效用反馈为空》）：不伪造命中/未命中的引用证据归因
 import { attributeEpisode } from '../memory/attribution.js';
 // 记忆写入面与管理面（已知问题《缺少写入面与记忆管理面》）：写入流水 + 列出/查看/编辑/删除/合并
@@ -438,6 +440,13 @@ export interface CognitiveAssemblyOptions {
    * 缺省 → 该段为 null（测试装配不计）。
    */
   hostContractView?: () => KernStatusSummary['host_contract'];
+  /**
+   * 嵌入模型目录（可选；缺省按 `OMB_EMBEDDING_MODEL` → `<root>/models/bge-small-zh-v1.5/` 探测）。
+   * 装载失败 → 诚实降级到哈希词袋（见 loadEmbeddingModelOnce）。
+   */
+  embeddingModelDir?: string;
+  /** 推理线程数（缺省 2；单条 ~1.5ms 量级，调大会抢主对话 CPU） */
+  embeddingThreads?: number;
   /**
    * 制品发现根集合（已知问题《制品索引未建立》修复）：除仓库根外的真实工作根（如会话工作目录）。
    * 逐根尝试解析；全部未命中 → 记为不可恢复制品（不再直接丢弃）。缺省只有仓库根。
@@ -922,6 +931,18 @@ export class CognitiveRuntime {
   private lastConsolidationReport: ConsolidationReport | null = null;
   /** 最近一次整合的有界执行元数据（"跑了多少"；与报告分开——报告是稳定契约） */
   private lastConsolidationRun: ConsolidationOutcome | null = null;
+  /** 神经嵌入装载是否已尝试过（进程内一次；默认嵌入器 = 哈希词袋，装载成功后替换） */
+  private embeddingModelTried = false;
+  /** 神经嵌入器所在模型目录（装载成功时非空；状态面可读） */
+  private embeddingModelDir: string | null = null;
+  /** 神经嵌入降级原因（装载失败/未配置时非空——诚实标注，不静默换语义） */
+  private embeddingDegraded: string | null = null;
+  /** 数据根（模型目录探测基准：`<root>/models/bge-small-zh-v1.5/`） */
+  private readonly rootDir: string;
+  /** 推理线程数（缺省 2；见 embeddings-onnx 的耗时说明） */
+  private readonly embeddingThreads: number;
+  /** 显式模型目录（配置注入；缺省按环境变量/数据根探测） */
+  private readonly embeddingModelDirOpt: string | undefined;
   /**
    * 最近一次候选管线自证回执（已知问题《候选流水线借用 repair 的证据签字》修复）：
    * `candidate-pipeline` 债务的释放依据必须来自**候选管线自己**的本次运行（时间 + 候选数/通过数/晋升数），
@@ -1070,6 +1091,9 @@ export class CognitiveRuntime {
     this.maintenance = opts.maintenance ?? null;
     this.safeStateViewFn = opts.safeStateView;
     this.hostContractViewFn = opts.hostContractView;
+    this.rootDir = opts.root ?? join(HERE, 'workspace', '.omb');
+    this.embeddingThreads = opts.embeddingThreads ?? 2;
+    this.embeddingModelDirOpt = opts.embeddingModelDir;
     // 制品发现根集合（会话工作目录优先，仓库根兜底；去重保序）
     const roots = [opts.workspaceRoot, ...(opts.artifactRoots ?? []), HERE].filter(
       (r): r is string => typeof r === 'string' && r.length > 0,
@@ -1127,7 +1151,55 @@ export class CognitiveRuntime {
         recordDegradation('maintenance/limits', `债务阈值非法项已忽略：${bad.join(', ')}`);
       }
     }
+    // 向量通道：装载中文小嵌入模型（已知问题《小向量模型未接入》落地）。
+    // 一次尝试（幂等：loaded 标记）；失败 → **诚实降级**到哈希词袋并记录可读原因——不静默换语义。
+    await this.loadEmbeddingModelOnce();
     return { policy, processes: await this.processesPromise };
+  }
+
+  /**
+   * 装载神经嵌入器（BGE-small-zh-v1.5 ONNX；进程内仅尝试一次）。
+   *
+   * 为什么放在 `ready()`：装配期已有异步上下文，且此时**尚未开始检索/编码**——换嵌入器不会与在飞的
+   * 编码交叉。失败语义（与全仓一致的"诚实降级"）：
+   *   - 模型目录缺失 / onnxruntime 不可加载 / 形状不符 → 保持哈希词袋 + 记录降级（原因可读，含
+   *     `OMB_EMBEDDING_MODEL` 与默认目录提示），**不抛**、不影响其余装配；
+   *   - 成功 → `setEmbedder` 换入；存量 256 维向量变为"异维"（`vectorStats().mismatched` 可见，
+   *     检索侧跳过），由维护任务 `memory_vector_encode` 逐批重编码补齐。
+   */
+  private async loadEmbeddingModelOnce(): Promise<void> {
+    if (this.embeddingModelTried) {
+      return;
+    }
+    this.embeddingModelTried = true;
+    try {
+      const load = await loadOnnxEmbedder({
+        dataRoot: this.rootDir,
+        threads: this.embeddingThreads,
+        ...(this.embeddingModelDirOpt !== undefined ? { modelDir: this.embeddingModelDirOpt } : {}),
+      });
+      if (!load.ok) {
+        this.embeddingDegraded = load.reason;
+        recordDegradation('memory/embedding', `神经嵌入未启用（${load.reason}）——向量通道回落哈希词袋`);
+        return;
+      }
+      this.memory.setEmbedder(load.embedder);
+      this.embeddingModelDir = load.modelDir;
+      this.embeddingDegraded = null;
+    } catch (err) {
+      this.embeddingDegraded = errorDetail(err);
+      recordDegradation('memory/embedding', `神经嵌入装载异常（${errorDetail(err)}）——向量通道回落哈希词袋`);
+    }
+  }
+
+  /** 嵌入通道状态（状态面可读：当前嵌入器/模型目录/降级原因） */
+  embeddingStatus(): { embedder: string; dim: number; model_dir: string | null; degraded: string | null } {
+    return {
+      embedder: this.memory.embedderId,
+      dim: this.memory.vectorStats().embedder_dim,
+      model_dir: this.embeddingModelDir,
+      degraded: this.embeddingDegraded,
+    };
   }
 
   /**

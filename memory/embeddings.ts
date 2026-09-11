@@ -19,14 +19,29 @@ import { tokenizeForFts } from './cjk-ngram.js';
 /** 向量维度（哈希空间；256 维在 10^4 量级记忆上足够区分，且暴力余弦仍为亚毫秒级；§17 可标定） */
 export const EMBEDDING_DIM = 256;
 
-/** 嵌入接口（唯一替换点：真实中文小嵌入模型按此实现即可接入） */
+/**
+ * 嵌入接口（唯一替换点：真实中文小嵌入模型按此实现即可接入）。
+ *
+ * **为什么是异步**（已知问题《小向量模型未接入》落地的关键取舍，2026-09 真机/实测结论）：
+ * 神经嵌入的推理运行时（onnxruntime-node）**只提供 Promise 形态的 `run`**——其原生绑定在
+ * `setImmediate` 之后同步执行、再 resolve（实测：调用返回 0.02ms、settle 7–8ms，事件循环期间
+ * 不推进），即"同步阻塞 + Promise 外壳"。因此无论怎样包装，真实推理都无法在**不阻塞事件循环**的
+ * 前提下同步返回；把这层伪装成同步只会把"阻塞"藏进调用方看不见的地方。
+ * 故接口显式声明为异步：调用方明确知道自己在等一次推理，编码缺口也在空闲期补齐（见 backend）。
+ * `embedSync` 只对**纯 JS 实现**可用（哈希词袋），供不应阻塞的同步路径与测试使用。
+ */
 export interface Embedder {
-  /** 实现标识（状态面/审计可读，如 'hash-bow-v1'） */
+  /** 实现标识（状态面/审计可读，如 'hash-bow-v1' / 'bge-small-zh-v1.5-onnx'） */
   readonly id: string;
   /** 维度（存储与比较必须一致） */
   readonly dim: number;
   /** 单条编码（确定性：同文本 → 同向量） */
-  embed(text: string): Float32Array;
+  embed(text: string): Promise<Float32Array>;
+  /**
+   * 同步快路径（可选）：只有纯计算实现（哈希词袋）能提供。
+   * 神经嵌入的运行时不允许同步推理（见上方说明）→ 不实现本方法；调用方须回落 `embed`。
+   */
+  embedSync?(text: string): Float32Array;
 }
 
 /** token 的符号哈希（FNV-1a 变体；确定性、无随机种子） */
@@ -40,15 +55,22 @@ function hashToken(token: string): number {
 }
 
 /**
- * 确定性哈希词袋嵌入器（CPU 专用）。
+ * 确定性哈希词袋嵌入器（CPU 专用，**零依赖**）。
  * - token 权重 = 1 + ln(计数)（次线性：重复不主导）；
  * - 桶位 = hash(token) % dim；符号 = 另一比特（带符号哈希减少哈希碰撞的系统性偏置）；
  * - 输出 L2 归一化 → 点积即余弦相似度。
+ *
+ * 定位（诚实口径，勿夸大）：它补的是"改写/近义/词序变化"层面的召回，**不是语义模型**
+ * （同义改写与跨语言无力）。作为神经嵌入不可用时的**确定性兜底**保留——装配面在模型缺失/
+ * 运行时不兼容时回落到它，而不是让向量通道整个失效。
  */
 export const HASH_BOW_EMBEDDER: Embedder = {
   id: 'hash-bow-v1',
   dim: EMBEDDING_DIM,
-  embed(text: string): Float32Array {
+  async embed(text: string): Promise<Float32Array> {
+    return this.embedSync!(text);
+  },
+  embedSync(text: string): Float32Array {
     const vec = new Float32Array(EMBEDDING_DIM);
     const tokens = tokenizeForFts(text).split(' ').filter((t) => t.length > 0);
     if (tokens.length === 0) {

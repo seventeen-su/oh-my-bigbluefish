@@ -19,6 +19,7 @@
 - **制品索引**：事件驱动发现（`tool/result` → 路径提取 → manifest），上下文候选含最近制品。
 - **跨平台受限执行**：候选验证的执行型门（G3-exec）在 Windows 走受限令牌、Linux/macOS 走 bubblewrap 或 Node 权限模型；通道可用性经**真实自检**确认，通道不可用时缺省拒绝该候选晋升（`evolve.policy.candidate_gate.require_execution_verification`）。
 - **桌面通知（可选）**：宿主装了 `dsh-desktop-notify` 时，只对少数"值得打扰"的事件出声（内核未加载/启动回退/晋升回退/债务 critical/组件健康异常），带节流与去重。
+- **神经向量检索（可选）**：接入 BGE-small-zh-v1.5（ONNX，512 维）做中文语义检索——同义改写与跨语言查询能召回哈希词袋召不回的记忆。权重不进仓库，用 `pnpm fetch-embedding-model` 获取；未装权重时**诚实降级**回纯 JS 哈希词袋，状态面写明原因。
 
 ## 架构说明
 
@@ -39,6 +40,20 @@
 
 - `pnpm build`（tsc → `lib/`）、`pnpm test`（vitest）、`pnpm typecheck`、`pnpm lint`。
 - 工具脚本：`pnpm init-three-line`（三线布局初始化/修复兜底）、`pnpm deploy-lines`（部署 per-line 后备预设，可选）。
+- `pnpm fetch-embedding-model`：获取神经嵌入权重（BGE-small-zh-v1.5 ONNX 量化版，约 23MB）到 `<preset>/workspace/.omb/models/`。
+  - 中国大陆网络可加镜像：`OMB_MODEL_MIRROR=https://hf-mirror.com pnpm fetch-embedding-model`。
+  - 幂等：按上游 sha256 校验，已就绪则跳过；下载不完整或校验失败会删除半份文件并报错。
+  - 可选参数：`--dir <目录>`（自定义位置，配合配置项 `embeddingModelDir` 或环境变量 `OMB_EMBEDDING_MODEL`）、`--variant fp32`（未量化版，质量略高、约 90MB）。
+  - 还需要推理运行时 `onnxruntime-node`（**optionalDependency**，解包约 296MB——只想用哈希词袋的部署不必装）：`pnpm add -O onnxruntime-node@1.29.0 --fetch-timeout 1800000 --fetch-retries 5`。脚本结束时会探测并提示。
+
+### 神经嵌入的配置面
+
+| 键 | 作用 | 缺省 |
+| --- | --- | --- |
+| `embeddingModelDir` | 权重目录绝对路径 | 按 `OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5/` 探测 |
+| `embeddingThreads` | ONNX 推理线程数（1~64） | 由运行时决定；本地小机可设 `1` 避免与主对话抢核 |
+
+两个键都可在 `agent.cordis.yml` 的 `config` 下配置；非法值只记降级、不阻断加载。未装权重时向量通道自动回落哈希词袋（功能仍可用，语义能力弱），原因见 `kern_status` 的状态面。
 
 ## 卸载
 
@@ -46,4 +61,4 @@
 
 ## 许可证
 
-**GPL-3.0**，详见 [LICENSE](LICENSE)。
+**GPL-3.0**，详见 [LICENSE](LICENSE)。随仓库分发的第三方文件（中文词表等）与运行期依赖的许可归属见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
