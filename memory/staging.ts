@@ -19,7 +19,7 @@ import {
   type MemoryProvClass,
 } from '../kernel/schemas/m.js';
 import { DEFAULT_MEMORY_DB } from './backend.js';
-import { SCHEMA_SQL } from './sql.js';
+import { SCHEMA_SQL, environmentJson } from './sql.js';
 import { tokenizeForFts } from './cjk-ngram.js';
 import {
   DEFAULT_MIN_PROV_CLASS,
@@ -106,9 +106,14 @@ export class StagingManager {
        ORDER BY priority DESC, created ASC, id ASC`,
     );
     this.insertMemory = this.db.prepare(
+      // 列集必须与 backend.ingest 完全一致（含 environment——第二路审查 H1）：
+      // staging 准入是生产 Experience 记忆的**唯一**入库路径，此前漏写 environment 列 → 这些行
+      // `environment` 恒 NULL，而 findAffectedObjects 的分支带 `environment IS NOT NULL` →
+      // 环境指纹变化时"定位受影响经验并降级/入 repair"整条机制对真实记忆池空转（decay 记录恒空）。
       `INSERT INTO memory (id, scope, kind, lifecycle, prov_class, payload, payload_fts,
-                           value_score, utility_counts, belief_ref, lineage_ref, created, updated, event_id, body)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           value_score, utility_counts, belief_ref, lineage_ref, created, updated, event_id,
+                           environment, body)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO NOTHING`,
     );
     this.insertStats = this.db.prepare('INSERT INTO memory_stats (id) VALUES (?)');
@@ -223,7 +228,10 @@ export class StagingManager {
       // 同列集——补齐分词列，FTS 触发器同步；否则「经验 → 记忆 → 下次检索」闭环在检索端断裂）
       tokenizeForFts(memory.payload),
       memory.value_score, JSON.stringify(memory.utility_counts), memory.belief_ref ?? null,
-      memory.lineage_ref ?? null, created, updated, memory.provenance.event, JSON.stringify(memory),
+      memory.lineage_ref ?? null, created, updated, memory.provenance.event,
+      // environment 列（第二路审查 H1）：与 backend.ingest 同源序列化函数，保证两路写入口径一致
+      environmentJson(memory.provenance.environment),
+      JSON.stringify(memory),
     );
     if (r.changes > 0) {
       this.insertStats.run(memory.id);
