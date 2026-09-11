@@ -83,13 +83,24 @@ export async function recordEpisode(
   return row;
 }
 
-/** reportEpisodeOutcome：更新 episode outcome（'hit' | 'miss'）并对 injected 记忆做六计数器反馈
- *  （retrieval + inject + hit|miss——§7.4 归因与 ranking 学习入口；utility_score 随计数派生变化）。
- *  未知 episode / 非法 outcome → fail-loud。 */
+/**
+ * reportEpisodeOutcome：更新 episode outcome（'hit' | 'miss'）并对**本轮真正得到结论**的注入记忆做六计数器
+ * 反馈（retrieval + inject + hit|miss——§7.4 归因与 ranking 学习入口；utility_score 随计数派生变化）。
+ *
+ * 审查修复（诚实性底线）：
+ *   - `opts.ids` 显式给出本轮判定的记忆集合（缺省 = episode 的全部 injected_ids，保持既有调用语义）。
+ *     归因代理必须传**本轮判 hit/miss 且未被 skip_ids 排除**的子集——否则会把 skipped（证据不足）或被
+ *     跳过（已归因过）的记忆也算成 hit/miss，既伪造证据又重复计数（utility 灌水）。
+ *   - 已不存在的记忆**跳过**（不抛）：先落 outcome 再抛错会留下"outcome 已写、计数器半改"的半成品，
+ *     且 outcome 非 null 后永不重试（调用方把它记成"归因失败——保持待归因"，与磁盘状态相反）。
+ *   - outcome 更新与计数器反馈在同一事务内（要么全成要么全不成）。
+ * 未知 episode / 非法 outcome → fail-loud（语义不变）。
+ */
 export async function reportEpisodeOutcome(
   backend: RetrievalBackend,
   episodeId: string,
   outcome: 'hit' | 'miss',
+  opts: { ids?: readonly string[] } = {},
 ): Promise<void> {
   if (outcome !== 'hit' && outcome !== 'miss') {
     throw new Error(`reportEpisodeOutcome: 非法 outcome: ${String(outcome)}`);
@@ -98,12 +109,19 @@ export async function reportEpisodeOutcome(
   if (!ep) {
     throw new Error(`reportEpisodeOutcome: episode 不存在: ${episodeId}`);
   }
-  await backend.updateEpisodeOutcome(episodeId, outcome);
-  for (const id of ep.injected_ids) {
-    await bumpUtility(backend, id, 'retrieval');
-    await bumpUtility(backend, id, 'inject');
-    await bumpUtility(backend, id, outcome);
-  }
+  const ids = [...new Set(opts.ids ?? ep.injected_ids)];
+  await backend.transaction(async () => {
+    await backend.updateEpisodeOutcome(episodeId, outcome);
+    for (const id of ids) {
+      const mem = await backend.getById(id);
+      if (mem === undefined) {
+        continue; // 记忆已删除/不存在 → 如实跳过（不写半成品、不伪造计数）
+      }
+      await bumpUtility(backend, id, 'retrieval');
+      await bumpUtility(backend, id, 'inject');
+      await bumpUtility(backend, id, outcome);
+    }
+  });
 }
 
 // ---- 反事实抽样（T8.17：Governor 调度——utility 不确定性高 → 反事实 episode 对比 → posterior 更新） ----

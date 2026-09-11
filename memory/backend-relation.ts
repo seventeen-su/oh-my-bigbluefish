@@ -46,6 +46,9 @@ export interface RelationQuery {
   source?: RelationSource;
   minWeight?: number;
   limit?: number;
+  /** 排序：缺省 'id'（插入序，治理面列举语义）；'weight_desc' = 权重优先（检索扩展用——
+   *  否则"先按 id 截断再按权重排序"会让高权重强边落在 LIMIT 之外而永不入选）。 */
+  order?: 'id' | 'weight_desc';
 }
 
 /** 关系图统计（状态面/治理面观测：回答"图是不是还是空的、边都是哪来的"） */
@@ -175,8 +178,9 @@ export class RelationBackend extends SqliteMemoryBackend {
     }
     const limit = Math.min(RELATION_EDGE_LIMIT_MAX, Math.max(1, Math.floor(q.limit ?? RELATION_EDGE_LIMIT_DEFAULT)));
     const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const orderBy = q.order === 'weight_desc' ? 'ORDER BY COALESCE(weight, 1) DESC, id' : 'ORDER BY id';
     const rows = this.db
-      .prepare(`SELECT from_id, to_id, type, weight, created, source FROM memory_relation ${where} ORDER BY id LIMIT ?`)
+      .prepare(`SELECT from_id, to_id, type, weight, created, source FROM memory_relation ${where} ${orderBy} LIMIT ?`)
       .all(...args, limit) as unknown as RawEdge[];
     return rows.map(toEdge);
   }

@@ -272,7 +272,20 @@ async function relationStep(b: SqliteMemoryBackend, state: RunState, work: Memor
   const applied = await applySimilarityEdges(rb, planned, now);
   if (applied.created > 0) {
     bumpCount(state.relation, scope, applied.created);
-    noteKind(state.relation, scope, 'Semantic');
+    // 影响域类型标注（审查修复 M3）：按**实际参与建边的记忆类型**逐个 noteKind——
+    // 此前硬编码 'Semantic'，而生产记忆以 Episodic 为主 → 真正受影响的 Project/Episodic 路由没被标注，
+    // "更新局部化 Contract 四问"的 query_affected 与现实不符。
+    const kindOf = new Map(cands.map((m) => [m.id, m.kind]));
+    const touched = new Set<MemoryKind>();
+    for (const e of planned) {
+      const a = kindOf.get(e.from_id);
+      const b = kindOf.get(e.to_id);
+      if (a !== undefined) touched.add(a);
+      if (b !== undefined) touched.add(b);
+    }
+    for (const k of [...touched].sort()) {
+      noteKind(state.relation, scope, k);
+    }
   }
 }
 

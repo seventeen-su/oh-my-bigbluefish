@@ -159,6 +159,8 @@ export async function attributeEpisode(
   let attributed = 0;
   let skipped = 0;
   let anyHit = false;
+  /** 本轮真正得到结论（hit/miss）的记忆 id——只把这些交给回灌面（绝不含 skipped/被排除者） */
+  const decidedIds: string[] = [];
   for (const id of injected) {
     const payload = payloads.get(id);
     if (payload === undefined) {
@@ -193,13 +195,26 @@ export async function attributeEpisode(
     const matched = distinctive.filter((t) => haystackSet.has(t));
     const verdict: 'hit' | 'miss' = matched.length >= ATTRIBUTION_MIN_MATCHES ? 'hit' : 'miss';
     if (verdict === 'hit') anyHit = true;
-    outcomes.push({ memory_id: id, verdict, matched, distinctive_count: distinctive.length, reason: null });
+    // 证据强度标注（审查修复 C-M9）：同批只有这一条记忆时 others 为空 → "独占"未经对照，任一共通技术词
+    // 都算证据。这不改变判定（命中仍需人类消息里出现该条记忆的字面 token），但必须在观测面标明强度，
+    // 避免把弱证据读成强证据。
+    const isolated = others.length === 0;
+    outcomes.push({
+      memory_id: id,
+      verdict,
+      matched,
+      distinctive_count: distinctive.length,
+      reason: isolated ? '单候选（同批无对照记忆）——独占性未经对照，证据强度较低' : null,
+    });
+    decidedIds.push(id);
     attributed++;
   }
   // episode 级 outcome 汇总（任一命中 → hit；否则有证据的否证 → miss）；
   // 全部 skipped（证据不足）→ **不写 outcome**（保持 null，诚实空缺），也不动六计数器。
+  // 回灌只针对本轮判定的记忆（decidedIds）——skipped（证据不足）与被 skip_ids 排除者绝不计数，
+  // 否则会伪造 hit/miss 并重复计数（审查修复：诚实性底线）。
   if (attributed > 0 && ep.outcome === null) {
-    await reportEpisodeOutcome(backend, episodeId, anyHit ? 'hit' : 'miss');
+    await reportEpisodeOutcome(backend, episodeId, anyHit ? 'hit' : 'miss', { ids: decidedIds });
   }
   return { attributed, skipped, outcomes };
 }
