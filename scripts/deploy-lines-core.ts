@@ -35,7 +35,12 @@ const AGENT_CORDIS = 'agent.cordis.yml';
 const OMB_ROW = '- id: omb-v2';
 /** omb-v2 行 name 锚点前缀（name 行值以实际文件为准；?v= 尾缀原样保留） */
 const PLUGIN_NAME_PREFIX = "name: './lib/runtime/plugin.js";
-/** name 行完整格式（解析 ?v= 尾缀；无尾缀也合法） */
+/**
+ * name 行完整格式（解析 `?v=` 尾缀）。
+ * 尾缀按**可选**匹配是有意的：无尾缀的入口在宿主侧也合法（只是失去缓存失效手段），
+ * 真正的护栏在 `tests/m8/deploy-lines.test.ts`——它断言生成结果里的 `?v=` 与根组合**一致且存在**，
+ * 缺失即红。故此处的 optional 不会静默产出"没有缓存尾缀"的 per-line 预设而不被发现。
+ */
 const PLUGIN_NAME_RE = /^name: '\.\/lib\/runtime\/plugin\.js(\?v=\d+)?'$/;
 
 /** 生成标记注释（文件顶部插入；源 = 主组合路径） */

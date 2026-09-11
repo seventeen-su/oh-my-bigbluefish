@@ -51,7 +51,7 @@
 | 键 | 作用 | 缺省 |
 | --- | --- | --- |
 | `embeddingModelDir` | 权重目录绝对路径 | 按 `OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5/` 探测 |
-| `embeddingThreads` | ONNX 推理线程数（1~64） | 由运行时决定；本地小机可设 `1` 避免与主对话抢核 |
+| `embeddingThreads` | ONNX 推理线程数（1~64） | `2`；本地小机可设 `1` 避免与主对话抢核 |
 
 两个键都可在 `agent.cordis.yml` 的 `config` 下配置；非法值只记降级、不阻断加载。未装权重时向量通道自动回落哈希词袋（功能仍可用，语义能力弱），原因见 `kern_status` 的状态面。
 

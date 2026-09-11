@@ -38,8 +38,12 @@ ONNX 图内部，改名会导致推理会话创建失败——获取脚本因此
 | 包 | 许可 | 说明 |
 | --- | --- | --- |
 | `onnxruntime-node` | MIT | 本地 ONNX 推理运行时（预编译二进制）。声明为 **optionalDependency**（解包约 296MB）：只想用哈希词袋的部署不必付这份体积。仅在启用神经嵌入时被动态 `import`；缺失或不可加载 → 回落纯 JS 哈希词袋，不影响其他功能。 |
-| `onnxruntime-common` | MIT | 上述包的共享类型/接口层（随其安装）。 |
-| `node-llama-cpp` 等其余依赖 | 见各自 `package.json` | 本文件只登记与许可合规直接相关者；完整依赖树见 `pnpm-lock.yaml`。 |
+| `onnxruntime-common` | MIT | 上述包的共享类型/接口层（作为其依赖随装）。 |
+| `js-yaml` / `koffi` / `zod` | 见各自 `package.json` | 运行期直接依赖：YAML 解析、Windows 受限令牌 FFI、schema 校验。 |
+| `tsx` / `vitest` / `typescript` / `typescript-eslint` / `eslint` / `jieba-wasm` / `@types/*` | 见各自 `package.json` | 仅开发/构建/测试期依赖，不进入运行期产物。 |
+
+完整依赖树（含传递依赖及其许可）见 `pnpm-lock.yaml`；如需逐包许可清单，可用
+`pnpm licenses list` 生成（该命令的可用性取决于 pnpm 版本）。
 
 ## 4. 合规要点
 

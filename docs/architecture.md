@@ -1,6 +1,7 @@
 # OMB v2 架构文档（oh-my-bigbluefish）
 
-> 依据仓库实际施工代码编写（HEAD fd9f999，package.json version 1.7.0）。
+> 依据仓库实际施工代码编写；版本基线以 `package.json` 的 `version` 为准（本文头不再写死 HEAD，
+> 因为每次源码提交都会让它过期——需要精确对应时用 `git log -1` 现场取）。
 > 层 DAG：`substrate(0) → supervisor(1) → kernel/runtime/memory(2) → components ABI`。
 > 本文只描述**实际已实现的内容**；设计稿遗留的未接线部分在 §14 列明。
 
@@ -19,7 +20,7 @@ OMB v2（大肥鱼模式 v2）是叠加在普通 DSH 会话之上的**认知增�
 
 ### 1.2 挂载方式
 
-- `agent.cordis.yml` 的 `omb-v2` 行：`name: './lib/runtime/plugin.js?v=6'`；
+- `agent.cordis.yml` 的 `omb-v2` 行：`name: './lib/runtime/plugin.js?v=N'`（当前 N 见该文件；不改写死值以免再次过期）；
   `lib/` 为编译产物（`pnpm build` = `tsc -p tsconfig.build.json`）。
 - `?v=N` 尾缀破除宿主 Node ESM 模块缓存：修改 lib/ 下代码重新 build 后须递增或重启宿主。
 - 预设 id = 目录名 `oh-my-bigbluefish`（须匹配 `^[a-z0-9][a-z0-9-]*$`）。
@@ -800,8 +801,9 @@ disposers 集入 ctx.effect（P8 注册皆效应）；全部为认知运行时�
 
 ## 15. 开放问题解决记录（2026-09）
 
-本地未入库文档 `docs/open-issues.md` 列的 14 条开放问题，本轮逐条落地。此处记录**取向与理由**
-（不是变更日志——提交信息里有；这里回答"为什么这么做，而不是最小改法"）。
+本轮针对一批**本地未入库的开放问题清单**（14 条）逐条落地。此处记录**取向与理由**
+（不是变更日志——提交信息里有；这里回答"为什么这么做，而不是最小改法"）。清单本身是本地工作稿、
+不进仓库，故这里只按条目内容引用，不指向任何仓库内路径。
 
 ### 15.1 Linux 适配与"降级当通过"（高）
 
@@ -867,9 +869,9 @@ disposers 集入 ctx.effect（P8 注册皆效应）；全部为认知运行时�
 - **路径口径**：新增 `substrate/paths.ts` 作为唯一裁决点——大小写按平台（Windows/macOS 不敏感、
   其余敏感）、以分隔符为边界（`/tmp` 不吃 `/tmp2/omb`）。修掉两处 `toLowerCase()` 无条件放大
   （制品索引越界读、线快照清理**误删**）。
-- **桌面通知**：`runtime/notify.ts` 接 `ctx.get('desktopNotify')`，**默认沉默**：白名单五个事件
-  （内核未加载/启动回退/晋升回退/债务 critical/组件健康异常）+ 同 kind 30 分钟节流 + 内容去重 +
-  会话内上限 5 条；未安装则零痕迹（不记降级——宿主没装插件不是故障）。
+- **桌面通知**：`runtime/notify.ts` 接 `ctx.get('desktopNotify')`，**默认沉默**：同 kind 30 分钟节流 +
+  内容去重（去重先于节流）+ 会话内上限 10 条；未安装则零痕迹（不记降级——宿主没装插件不是故障）。
+  白名单见 `NOTIFY_KINDS`（10 项，分故障档与专项档两档），逐条语义与扩展理由见 §17。
 - **插件注册期（issue 14）**：`runtime/host-contract.ts` 提供宿主契约哨兵（逐项探测服务/方法形状，
   只降级缺项）+ 配置面宽进（未知键忽略并上报）。`apply()` 现在**永不抛**（注册期异常 → 降级句柄）。
 
@@ -897,7 +899,7 @@ disposers 集入 ctx.effect（P8 注册皆效应）；全部为认知运行时�
 | --- | --- |
 | 模型 | `BAAI/bge-small-zh-v1.5`（中文小模型，512 维）；ONNX 转换取 `onnx-community/bge-small-zh-v1.5-ONNX` |
 | 运行时 | `onnxruntime-node`（本地推理，不出网、不依赖 Python 栈） |
-| 实测质量 | 同义改写余弦 **0.76**、无关文本 **0.31**、跨语言 **0.42–0.46**（判据写进测试） |
+| 实测质量 | 同义改写余弦 **0.76**、无关文本 **0.31**、跨语言 **0.42–0.46**（一次性实测，2026-09 本机真模型；测试固化的是**判据**而非这三个数，阈值见 `tests/m3/embeddings-onnx.test.ts`，且需权重在盘上才跑） |
 | 实测成本 | 分词 + 推理合计 **≈1.5 ms/次**（含自检）——远低于一次 FTS 查询的量级 |
 | 体积 | 量化权重 23MB（外置数据文件），词表 107KB |
 
