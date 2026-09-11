@@ -24,10 +24,20 @@ import { platformProvider } from './platform.js'
 // 候选临时目录（平台无关）
 // ---------------------------------------------------------------------------
 
-/** 真实候选根：<preset>/workspace/.omb/.evolution/candidates/ */
+/** 真实候选根：<preset>/workspace/.omb/.evolution/candidates/
+ *  布局回退（第二轮审查 H1）：编译部署下本模块位于 `<preset>/lib/substrate/`，`..` 只到 `<preset>/lib`，
+ *  而数据根与 bootstrap 管理的候选目录都在 `<preset>/workspace/...` → 不做回退会把候选目录（含 baseline
+ *  policy 副本与 verify.cjs）写进已部署代码树、且永不被布局迁移/清理覆盖。判定与 PLUGIN_ROOT 同款：
+ *  `<cand>/kernel/policy` 存在 → cand 即 preset 根；否则回退一层。 */
 function candidatesRoot(): string {
-  const presetRoot = fileURLToPath(new URL('..', import.meta.url))
-  return path.join(presetRoot, 'workspace', '.omb', '.evolution', 'candidates')
+  const here = fileURLToPath(new URL('..', import.meta.url))
+  const candidates = [here, path.join(here, '..')]
+  for (const cand of candidates) {
+    if (fs.existsSync(path.join(cand, 'kernel', 'policy'))) {
+      return path.join(cand, 'workspace', '.omb', '.evolution', 'candidates')
+    }
+  }
+  return path.join(here, 'workspace', '.omb', '.evolution', 'candidates')
 }
 
 /** 进程级兜底清理注册表（未显式 cleanup 的候选目录；进程退出时同步删除） */

@@ -727,6 +727,11 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
           : r.items.map(
               (it, i) => `#${i + 1} [${it.kind}/${it.scope}] value=${it.value.toFixed(2)} ${it.id.slice(0, 12)}… ${it.snippet}`,
             );
+      // 通道级降级如实打印（审查 A1）：检索成功但某通道故障（如向量维度不一致被跳过）时必须可见——
+      // 否则"通道静默消失"在工具面与完全正常同形（`channels_used` 只表示"是否召回到东西"）。
+      if (r.degraded !== null && r.degraded !== undefined && r.degraded.length > 0) {
+        body.push(`（降级说明：${r.degraded}）`);
+      }
       return { ok: true, text: [header, ...body].join('\n') };
     },
   };
