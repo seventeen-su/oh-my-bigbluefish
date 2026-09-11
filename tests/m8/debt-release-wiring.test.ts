@@ -216,7 +216,10 @@ describe('债务释放证据按来源子系统分流', () => {
     expect(r.released.map((x) => x.task_id)).toEqual(['candidate_validation']);
     expect(r.released[0]!.evidence).toMatch(/候选管线自行跑完/);
     expect(r.released[0]!.evidence).toMatch(/非 repair 代签/);
-  });
+    // 显式超时（默认 5s 在全量套件并行下会超）：本用例建真布局 fixture（2 提交 + 3 worktree + ACL）
+    // 且候选管线做真 git 操作——耗时随机器负载波动，与被测语义无关。同族用例（line-snapshot/
+    // boot/txn-capability）早已用同一手法放宽，这里补齐以免偶发红被误读成功能回归。
+  }, 20_000);
 
   it('memory-vector 有释放分支：编码缺口清零才放行，仍有缺口则保留', async () => {
     await seedDebt([
