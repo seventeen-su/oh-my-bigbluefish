@@ -25,12 +25,19 @@ ssh $OMB_LINUX_HOST "bash -s 9001" < scripts/linux-test/pve-provision.sh
 ssh $OMB_LINUX_HOST "pct push 9001 /root/ct-node.sh /root/ct-node.sh && pct exec 9001 -- bash /root/ct-node.sh 24"
 
 # 3. 把仓库同步进容器（git clone 或 tar 增量；容器内 /root/omb）
+#    ★ 关键一步：初始化三线布局 —— 缺了它，认知运行时会**永久停在 boot gate**
+#      （"仅命令模式"），于是所有走 prepareTurn 的用例（hook-*/smoke-session/no-double-loop）
+#      全部以 5s 超时告终，看起来像"Linux 挂了"，其实是**测试夹具缺运行产物**。
+ssh $OMB_LINUX_HOST "pct exec 9001 -- env PATH=/usr/local/bin:/usr/bin:/bin bash -c 'cd /root/omb && pnpm init-three-line'"
+
 # 4. 平台层探针（通道自检 / 只读施加 / 真实受限执行）
 ssh $OMB_LINUX_HOST "pct push 9001 /root/linux-probe.sh /root/linux-probe.sh --perms 755 && \
   pct exec 9001 -- env PATH=/usr/local/bin:/usr/bin:/bin bash /root/linux-probe.sh"
 
 # 5. 全量测试套件
-ssh $OMB_LINUX_HOST "pct exec 9001 -- env PATH=/usr/local/bin:/usr/bin:/bin bash -c 'cd /root/omb && pnpm exec vitest run'"
+ssh $OMB_LINUX_HOST "pct exec 9001 -- bash /root/run-suite.sh"
+#    单文件/子集：pct exec 9001 -- bash /root/sub-suite.sh tests/m8/hook-context.test.ts
+#    失败归因：  pct exec 9001 -- bash /root/analyze.sh
 
 # 6. 收尾：销毁容器（不污染宿主）
 ssh $OMB_LINUX_HOST "pct stop 9001 --skiplock 1; pct destroy 9001 --purge 1"

@@ -202,8 +202,11 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     for (const t of ['session/start', 'claim/update', 'context/injected', 'tool/call', 'tool/result', 'decision/made']) {
       expect(types).toContain(t);
     }
-    // happy path 无降级记录（三钩子全接线 + 全成功）
-    expect(degradationLog()).toHaveLength(0);
+    // happy path 无**功能性**降级（三钩子全接线 + 全成功）。
+    // `host/contract` 是宿主契约哨兵的**预期留痕**（fakeCtx 只提供本用例需要的那几个面，
+    // 哨兵如实报告"effect/llm/subagents/… 不存在"）——它不是本用例断言的对象，故排除。
+    const functional = degradationLog().filter((d) => d.hook !== 'host/contract');
+    expect(functional).toHaveLength(0);
 
     // 验收③ 维护队列语义（scheduler 注入）——行为变更（审查修复，非"过关"）：中断量子只让任务**留队**，
     // 不累计债务（未执行 ≠ 失败）；债务由真实执行失败决定。执行成功同样不产生债务。
