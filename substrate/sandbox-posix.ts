@@ -100,12 +100,21 @@ export function bwrapPresent(): boolean {
 }
 
 /**
- * bwrap 参数构造（新增：整机只读绑定 + 仅 writableDirs 可写绑定 + 私有 temp + 命名空间隔离）。
+ * bwrap 参数构造（整机只读绑定 + 仅 writableDirs 可写绑定 + 私有 temp；命名空间隔离）。
  * 顺序纪律：`--ro-bind / /` 必须在所有 `--bind` 之前（后写的绑定覆盖先写的挂载）。
+ *
+ * ⚠️ **不要**在这里加 `--tmpfs /tmp`（真机实测踩过的坑：Debian 13 / bwrap 0.12.0）。
+ * 私有 temp 目录建在 `os.tmpdir()` 下（Linux 上就是 `/tmp/omb-sandbox-XXXX`），而 `--tmpfs /tmp`
+ * 会把 `/tmp` 换成**空 tmpfs** → `--bind` 的**绑定源**在命名空间里不存在 → bwrap 直接失败
+ * （实测脚本根本没跑起来：`Cannot find module '/tmp/.../verify.cjs'`），自检因此不通过、
+ * 整条 bwrap 通道静默失效（回落到较弱的权限模型通道）。
+ * 去掉它之后：`/tmp` 继承 `--ro-bind / /` 的只读绑定，而 `--bind <私有temp> <私有temp>` 是显式覆盖
+ * → 私有 temp 仍可写；实测 `allowed=ALLOW, denied=EROFS`，正是我们要的写限制语义。
+ *
  * 网络安全语义：**不**加 `--unshare-net`——与 Windows 通道（受限令牌不拦网络）保持同一契约，
  * 不擅自收紧候选验证脚本的能力面（收紧会让原本合法的验证脚本无故失败）。
  */
-function bwrapArgs(opts: {
+export function bwrapArgs(opts: {
   writableDirs: string[];
   tempDir: string;
   resultFile: string | undefined;
@@ -117,8 +126,6 @@ function bwrapArgs(opts: {
     '--ro-bind', '/', '/',
     '--dev', '/dev',
     '--proc', '/proc',
-    // 空的 /tmp 实例：宿主 /tmp 不进候选视野（避免读到其它进程的临时文件；私有 temp 随后挂上）
-    '--tmpfs', '/tmp',
     '--unshare-user',
     '--unshare-pid',
     '--unshare-ipc',
@@ -126,15 +133,18 @@ function bwrapArgs(opts: {
     '--new-session',
     '--die-with-parent',
   ];
+  // 脚本所在目录：`--ro-bind / /` 已让它只读可见，**不要**再单独 ro-bind 一次。
+  // ⚠️ 真机实测踩过的第二个坑：如果在下面的可写绑定**之后**再 `--ro-bind <scriptDir> <scriptDir>`，
+  // 后写的挂载会覆盖先写的 —— 当脚本目录是 writableDirs/私有 temp 的祖先时（候选目录与结果目录
+  // 同在一个 mkdtemp 根下就是这种形态），它会**把可写绑定重新挂成只读**，
+  // 于是候选脚本写结果文件直接 EROFS（实测 `errno: -30, code: 'EROFS'`），
+  // 而自检只会笼统报"未产出结果文件"——这种"自己把自己的写权限抹掉"的失败极难从现象反推。
+  // 挂载顺序纪律：**只读绑定一律在前，可写绑定一律在后**。
   for (const dir of opts.writableDirs) {
     a.push('--bind', dir, dir);
   }
+  // 私有 temp 显式可写绑定（覆盖 `--ro-bind / /` 给它的只读；绑定源在宿主上真实存在即可）
   a.push('--bind', opts.tempDir, opts.tempDir);
-  // 脚本所在目录只读可见（脚本本体由宿主写入候选目录；`/` 已只读，此处只保证目录存在）
-  const scriptDir = path.dirname(opts.script);
-  if (scriptDir !== '/' && !opts.writableDirs.includes(scriptDir)) {
-    a.push('--ro-bind', scriptDir, scriptDir);
-  }
   a.push('--chdir', opts.cwd);
   if (opts.resultFile !== undefined) {
     a.push('--setenv', 'OMB_SANDBOX_RESULT_FILE', opts.resultFile);
@@ -473,30 +483,34 @@ function nodePermissionProbe(fx: { allowed: string; denied: string; script: stri
 // 导出：机制选择（强度顺序：bwrap → Node 权限模型）
 // ---------------------------------------------------------------------------
 
-let cached: SandboxChannel | null | undefined;
-
 /**
- * POSIX 受限执行通道（探测一次；进程内缓存）。
- * 选择顺序与理由：bwrap 的写限制由 mount 命名空间强制（无绕过面）> Node 权限模型（零依赖、限制面窄）。
- * 都不可用 → null（调用方按平台能力缺失显式降级，fail-closed 拒绝以完整权限运行候选）。
+ * 候选通道（**按强度顺序**；可用性由调用方经 `selfTest()` 决定）。
+ *
+ * 为什么是"候选列表"而不是"选一个返回"：真机实测发现 bwrap **存在但自检不通过**是常见形态
+ * （例如用户命名空间被策略限制、或参数构造与该版本 bwrap 不兼容）——此时正确的行为是
+ * **继续尝试下一个候选**，而不是直接判"平台无沙箱"。旧实现只看 `bwrapPresent()` 就返回 bwrap，
+ * 自检失败后整条 POSIX 通道变成不可用，较弱的权限模型兜底通道被白白浪费。
  */
-export function posixSandboxChannel(): SandboxChannel | null {
-  if (cached !== undefined) {
-    return cached;
-  }
+export function posixSandboxCandidates(): SandboxChannel[] {
+  const out: SandboxChannel[] = [];
   if (bwrapPresent()) {
-    cached = bwrapChannel();
-    return cached;
+    out.push(bwrapChannel());
   }
   if (nodePermissionPresent()) {
-    cached = nodePermissionChannel();
-    return cached;
+    out.push(nodePermissionChannel());
   }
-  cached = null;
-  return cached;
+  return out;
 }
 
-/** 清空通道缓存（仅测试用） */
+/**
+ * POSIX 受限执行通道（**兼容入口**）：返回强度最高的候选，其可用性仍需调用方自检确认。
+ * 新代码请用 `posixSandboxCandidates()`（支持自检失败后回落下一个候选）。
+ */
+export function posixSandboxChannel(): SandboxChannel | null {
+  return posixSandboxCandidates()[0] ?? null;
+}
+
+/** 清空通道缓存（仅测试用）——通道改为"每次新建候选 + 门面层缓存自检"后，本函数只保留兼容语义 */
 export function resetPosixSandboxCache(): void {
-  cached = undefined;
+  // 无进程内缓存需要清（候选在每次调用时按存在性重新构造；自检结论缓存由 substrate/sandbox.ts 持有）
 }
