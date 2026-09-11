@@ -137,8 +137,9 @@ describe('P3 G3-exec 执行型验证门（WRITE_RESTRICTED 受限通道 + 结果
       expect(r.passed).toBe(true);
       expect(r.gates.g3Exec?.kind).toBe('exec');
       expect(r.gates.g3Exec?.ok).toBe(true);
-      // 结果文件回传内容（脚本报告写拒绝码 → 沙盒语义验证成立）
-      expect(r.gates.g3Exec?.detail).toMatch(/EPERM|EACCES/);
+      // 结果文件回传内容（脚本报告写拒绝码 → 沙盒语义验证成立）；
+      // 拒绝码随通道而异：Windows EPERM/EACCES、Linux bwrap EROFS、权限模型 ERR_ACCESS_DENIED
+      expect(r.gates.g3Exec?.detail).toMatch(/EPERM|EACCES|EROFS|ERR_ACCESS_DENIED/);
       expect(r.gates.g3Exec?.exec?.code).toBe(0);
       expect(r.gates.g3Exec?.exec?.timedOut).toBe(false);
     } finally {
