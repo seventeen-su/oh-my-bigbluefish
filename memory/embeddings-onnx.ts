@@ -384,7 +384,14 @@ export async function loadOnnxEmbedder(
   }
   let ort: OrtLike;
   try {
-    ort = (await import('onnxruntime-node')) as unknown as OrtLike;
+    // **非字面量说明符**（故意的，不要"优化"成 `import('onnxruntime-node')`）：
+    // onnxruntime-node 是 optionalDependency（解包约 296MB，只想用哈希词袋的部署不装它）。
+    // 一旦写成字面量，`tsc` 会在**构建期**尝试解析它，未安装即报 TS2307 → 构建失败——
+    // 那等于把一个"可选"依赖变成了"必须安装才能构建"。而本模块的整个设计前提是"运行时缺失就
+    // 诚实降级"。用变量拼接可让 tsc 不解析（模块类型由本文件的 OrtLike 结构面承担），
+    // 运行时若真缺失，下面的 catch 会给出可读原因。
+    const pkg = 'onnxruntime-node';
+    ort = (await import(pkg)) as unknown as OrtLike;
   } catch (err) {
     return { ok: false, reason: `onnxruntime-node 不可加载（${(err as Error).message}）` };
   }
