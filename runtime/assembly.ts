@@ -1132,12 +1132,29 @@ export class CognitiveRuntime {
     this.hygieneStateFile = join(this.evolutionRoot, 'hygiene.json');
   }
 
-  /** 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等 */
+  /**
+   * 装配就绪（策略/过程懒加载——机制即数据，改 YAML 即生效；P2：组件激活 + health check）；幂等。
+   *
+   * 并发/拒绝纪律（审查修复，与 loadShadowBundle 同源的第二处同类缺陷）：
+   * `??=` 在这里创建**两个** promise，但只能**依次** await。若先 await 的那个 reject，而进程/测试
+   * 在轮到第二个之前退出（拆除临时目录、关库），第二个的拒绝就永远没人接 → unhandled rejection
+   *（真机表现：测试套件报 `ENOENT …/kernel/processes/*.yaml` 的 unhandled rejection，且归因到
+   * 一条与它无关的用例）。修法：`Promise.all` 保证两个 promise **在同一同步时刻**都被接上拒绝；
+   * catch 里把 promise 清回 null（`??=` 不会因失败而重试，旧行为会让一次瞬时失败变成永久降级），
+   * 并如实记录原因后重抛（调用方语义不变：ready 仍然 fail-loud）。
+   */
   async ready(): Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] }> {
     this.policyPromise ??= loadPolicy(this.policyDir);
     this.processesPromise ??= loadProcesses(this.processesDir);
+    // 两个都在同一同步时刻接上拒绝处理（见上方说明）；失败结论不缓存（清回 null 允许重试）
+    const bundles = Promise.all([this.policyPromise, this.processesPromise]).catch((err: unknown) => {
+      this.policyPromise = null;
+      this.processesPromise = null;
+      recordDegradation('assembly/ready', `策略/过程加载失败（${errorDetail(err)}）——已清空缓存，下次调用重试`);
+      throw err;
+    });
     await this.componentsReady(); // P2：组件激活 + 健康检查（幂等；失败降级不阻塞请求路径）
-    const policy = await this.policyPromise;
+    const [policy, processes] = await bundles;
     // S2：维护成本数据化——装配读取 policy.evolve.maintenance_costs → 注入维护调度器
     //（缺省成本面：enqueue 未给 estimated_cost 且任务 id 命中 → policy 成本；改 evolve.yaml 即生效）
     this.maintenance?.setMaintenanceCosts(policy.evolve.maintenance_costs);
@@ -1158,7 +1175,7 @@ export class CognitiveRuntime {
     // 向量通道：装载中文小嵌入模型（已知问题《小向量模型未接入》落地）。
     // 一次尝试（幂等：loaded 标记）；失败 → **诚实降级**到哈希词袋并记录可读原因——不静默换语义。
     await this.loadEmbeddingModelOnce();
-    return { policy, processes: await this.processesPromise };
+    return { policy, processes };
   }
 
   /**
