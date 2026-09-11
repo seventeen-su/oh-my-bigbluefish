@@ -15,7 +15,8 @@ description: OMB v2 认知层使用说明——命令/工具语义、记忆与�
 
 ## 工具请求格式
 
-- `kern_memory {query, scope: session|project|global, kind?, limit?}`：记忆检索（缺省 project/5 条）。
+- `kern_memory {op: "retrieve", query, scope: "Session"|"Project"|"Global", kind?, limit?}`：记忆检索（`op` 缺省即 retrieve；`scope` 缺省 project、`limit` 缺省 5）。
+  **`scope` 取值区分大小写**（首字母大写）：传 `project` 会被 schema 拒绝并返回 `Invalid option: expected one of "Session"|"Project"|"Global"`。
 - `kern_profile {profile, replace?}`：登记/更新用户画像（Global 跨项目可检索）。
 - `kern_status`：运行时状态摘要；`kern_bench`：运行基准；`kern_evolve`：触发演化全链；`kern_switch`：切换版本线。
 
