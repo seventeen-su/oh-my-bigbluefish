@@ -8,8 +8,8 @@
 //
 // 质量判据（本文件的核心断言）：神经嵌入要能证明它**做到了哈希词袋做不到的事**——
 // 同义改写与跨语言的相似度显著高于无关文本；否则引入模型就没有意义（决定论据在 issue 里）。
-import { describe, expect, it } from 'vitest';
-import { existsSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cosineSimilarity } from '../../memory/embeddings.js';
@@ -21,6 +21,7 @@ import {
   resolveModelPair,
   resolveVocabPath,
   VENDORED_VOCAB,
+  vocabCandidates,
   WordPieceTokenizer,
 } from '../../memory/embeddings-onnx.js';
 
@@ -70,32 +71,122 @@ describe('① WordPiece 分词器（自实现；只依赖随仓库分发的词�
   it('词表路径解析：模型目录内的优先，缺失回落随仓库分发的那份', () => {
     expect(resolveVocabPath('/nonexistent-model-dir')).toBe(VENDORED_VOCAB);
   });
+
+  it('词表候选覆盖两种布局（编译产物 lib/ 下也能定位到词表）', () => {
+    // 真实事故回归：插件入口是 `lib/runtime/plugin.js`，而 tsc 不搬 .txt —— 只按
+    // `new URL('./bge-small-zh/vocab.txt', import.meta.url)` 定位时，编译布局下的路径是
+    // `<preset>/lib/memory/bge-small-zh/vocab.txt`（**不存在**）→ 神经嵌入在生产永久回落哈希词袋。
+    // 候选表靠 `../../memory/...` 从 lib/ 退回 preset 根再进 memory，本用例钉住这条回退路径。
+    const cands = vocabCandidates();
+    expect(cands.length).toBeGreaterThanOrEqual(2);
+    const presetMemoryDir = join(PRESET_ROOT, 'memory');
+    expect(cands.some((p) => p.startsWith(presetMemoryDir))).toBe(true);
+    // 回退候选指向的词表必须真实存在（这才是"编译布局可用"的实质）
+    const fallback = cands.find((p) => p.startsWith(presetMemoryDir));
+    expect(fallback !== undefined && existsSync(fallback)).toBe(true);
+    // VENDORED_VOCAB 取第一个存在的候选（本机两种布局都在时取源码布局那份，内容同一份）
+    expect(VENDORED_VOCAB).toBe(cands.find((p) => existsSync(p)));
+  });
+
+  it('超长 token 短路判 [UNK]（贪心匹配对长 token 是 O(n²)）', () => {
+    // 实测缺陷：8KB 无空白文本单次 encode 阻塞事件循环 40 秒（`mergeMemories` 还在写事务内编码）。
+    // 与 HF 的 max_input_chars_per_word=100 同口径 → 超限整词判 [UNK]。
+    const tok = WordPieceTokenizer.fromFile(VENDORED_VOCAB);
+    const long = 'a'.repeat(8000);
+    const t0 = Date.now();
+    const ids = tok.encode(long);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(1000); // 短路后是常数级；不短路则是几十秒
+    // 整词不可分 → [UNK]（长度 = CLS + UNK + SEP）
+    expect(ids).toEqual([tok.clsId, tok.unkId, tok.sepId]);
+  });
+
+  it('换行/制表符折叠为空格而不是被丢弃（避免跨行 token 粘连）', () => {
+    // 实测缺陷：`\t \n \r` 曾被当控制符直接删除 → "a\nb" 变成单词 "ab"，与模型训练口径不一致。
+    // 本仓记忆正文大量是多行文本，影响面广且不可观测。
+    const tok = WordPieceTokenizer.fromFile(VENDORED_VOCAB);
+    const joined = tok.encode('a\nb');
+    expect(joined).not.toEqual(tok.encode('ab'));
+    // 以空格分隔的两段各自成 token（若被丢弃则会粘成一个词）
+    expect(joined.length).toBe(tok.encode('a b').length);
+    expect(tok.encode('contract\r\nboundary')).toEqual(tok.encode('contract boundary'));
+  });
 });
 
 describe('② 模型装载（权重缺失 → 显式降级，不抛）', () => {
   it('模型目录缺失 → ok:false 且原因可读（含指定方式的提示）', async () => {
-    const r = await loadOnnxEmbedder({ modelDir: '/nonexistent-bge-dir-xyz' });
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.reason).toMatch(/未找到模型目录/);
-      expect(r.reason).toMatch(/OMB_EMBEDDING_MODEL|models/);
+    // 必须隔离环境变量：README 指导用户设 OMB_EMBEDDING_MODEL，若本机设了，
+    // 显式传入的不存在目录会被 env 兜底悄悄"救活"→ 用例失去意义。
+    vi.stubEnv('OMB_EMBEDDING_MODEL', '');
+    try {
+      const r = await loadOnnxEmbedder({ modelDir: '/nonexistent-bge-dir-xyz' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toMatch(/未找到模型目录/);
+        expect(r.reason).toMatch(/EMBEDDING_MODEL|models/);
+      }
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 
   it('findModelDir：目录不完整（缺权重）→ null（不假装可用）', () => {
-    // 随仓库分发的是词表，不是完整模型目录 → 必须判为不可用
-    expect(findModelDir({ explicit: VENDORED_DIR })).toBeNull();
+    vi.stubEnv('OMB_EMBEDDING_MODEL', '');
+    try {
+      // 随仓库分发的是词表，不是完整模型目录 → 必须判为不可用
+      expect(findModelDir({ explicit: VENDORED_DIR })).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
-  it('外部权重文件名必须与 ONNX 图内记录一致（改名即失效）', () => {
+  it('外部权重文件名必须与 ONNX 图内记录的一致（真判据：读图，不是读常量表）', () => {
     // 回归护栏：曾经把 `model_quantized.onnx(_data)` 重命名成 `model.onnx(_data)`，
-    // 结果 ONNX Runtime 找不到图里写死的外部数据文件 → 会话创建失败。
-    // 契约是"保留上游文件名"，这里用配对解析把该契约钉住。
-    const pair = resolveModelPair(join(DATA_ROOT, 'models', 'bge-small-zh-v1.5'));
-    if (pair === null) return; // 权重未下载 → 该契约无从校验（端到端用例同理会跳过）
-    expect(pair.data.startsWith(pair.graph.replace(/\.onnx$/u, ''))).toBe(true);
+    // ONNX Runtime 找不到图里写死的外部数据文件名 → 会话创建失败。
+    //
+    // **真判据**：外部数据文件名被记录在图的 initializer.external_data 里（protobuf），
+    // 所以必须**从图里读出来**再与盘上文件比对。此前写的是
+    // `pair.data.startsWith(pair.graph.replace(/\.onnx$/,''))`——两边都来自代码里的常量表，
+    // 任何实现下恒真（把 data 名改成 weights.bin 也照样绿），且权重缺失时直接 return 静默通过。
+    const dir = join(DATA_ROOT, 'models', 'bge-small-zh-v1.5');
+    const pair = resolveModelPair(dir);
+    if (pair === null) return; // 权重未下载 → 无从校验（端到端用例同理会跳过）
+
+    const recorded = externalDataPathsIn(dir, pair.graph);
+    expect(recorded.length).toBeGreaterThan(0); // 图确实用了外部权重（不是自带权重的单文件图）
+    for (const rel of recorded) {
+      // 图内记录的是**相对图文件的路径**；盘上必须存在同名文件
+      expect(existsSync(join(dir, rel))).toBe(true);
+      expect(rel).toBe(pair.data);
+    }
   });
 });
+
+/**
+ * 从 ONNX 图里读出 `initializer.external_data` 记录的 `location`（外部权重文件名）。
+ *
+ * 为什么要读 protobuf 而不是用常量表比：常量表比常量表恒真，测不出"盘上文件名与图内记录不一致"
+ * 这个真实事故。图内的 ExternalDataEntry 是固定线格式：
+ *   field 1 (key)   → tag 0x0a + len + "location"
+ *   field 2 (value) → tag 0x12 + len + <文件名>
+ * 故按字节扫这个三元组即可，无需引入 protobuf 依赖。
+ */
+function externalDataPathsIn(dir: string, graphFile: string): string[] {
+  const buf = readFileSync(join(dir, graphFile));
+  const out = new Set<string>();
+  for (let i = 0; i + 2 < buf.length; i++) {
+    if (buf[i] !== 0x0a) continue;
+    const keyLen = buf[i + 1] ?? 0;
+    if (keyLen !== 8) continue;
+    if (buf.subarray(i + 2, i + 10).toString('latin1') !== 'location') continue;
+    const tagIdx = i + 10;
+    if (buf[tagIdx] !== 0x12) continue;
+    const valLen = buf[tagIdx + 1] ?? 0;
+    if (valLen === 0 || tagIdx + 2 + valLen > buf.length) continue;
+    out.add(buf.subarray(tagIdx + 2, tagIdx + 2 + valLen).toString('utf8'));
+  }
+  return [...out];
+}
 
 const modelDir = findModelDir({ dataRoot: DATA_ROOT });
 const hasModel = modelDir !== null;

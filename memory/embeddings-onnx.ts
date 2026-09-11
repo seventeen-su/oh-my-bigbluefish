@@ -25,10 +25,24 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Embedder } from './embeddings.js';
 
-/** 模型标识（写入状态面/审计；与 `vectorStats().embedder` 同源） */
+/** 嵌入器标识（状态面/审计可读；与 `Embedder.id` 同值） */
 export const BGE_SMALL_ZH_ID = 'bge-small-zh-v1.5-onnx';
 /** BGE-small-zh 的输出维度（CLS 池化后 512 维） */
 export const BGE_SMALL_ZH_DIM = 512;
+
+/**
+ * 候选下限（余弦）：低于此值不算向量命中。
+ *
+ * 实测分布（2026-09，本机真模型）：**无关**中文对 0.25~0.27，**相关**对 0.57~0.80。
+ * 检索侧原先的判据是"`score <= 0` 才丢"——那是按稀疏哈希词袋标定的（无关文本落在 0 附近或负值）。
+ * 稠密模型的余弦**恒为正**，于是该判据永不命中：任何查询都返回满额候选池，无关记忆被稳定塞进
+ * 注入预算，价值模型的"向量命中"分量在所有候选上趋于恒定、排序被压平。
+ *
+ * 取值 0.45：明显高于实测无关带的上沿（0.27），明显低于实测相关带的下沿（0.57）——两侧都留了余量，
+ * 不靠单点过拟合。**它不是"相关性阈值"**，而是"把稠密模型的正值基线抬掉"的噪声地板；
+ * 融合分仍按实际余弦大小排序，故地板之内的区分度不受影响。
+ */
+export const BGE_MIN_SCORE = 0.45;
 
 // ---------------------------------------------------------------------------
 // BERT WordPiece 分词（自实现；只依赖 vocab.txt）
@@ -38,8 +52,17 @@ export const BGE_SMALL_ZH_DIM = 512;
 function isWhitespace(c: string): boolean {
   return /\s/u.test(c);
 }
-/** 控制字符（BERT 的 _is_control 近似） */
+/**
+ * 控制字符（BERT 的 `_is_control` 口径）。
+ * **`\t` / `\n` / `\r` 不算控制符**——HF 的 `_is_control` 对它们显式返回 False，靠 `isspace()` 变成
+ * 单个空格。此前本实现把它们一并判为控制符**直接丢弃**，于是换行两侧的 token 被粘成一个词
+ *（`"a\nb"` → `ab`），与模型训练时的切分口径不一致；本仓记忆正文大量是多行文本，影响面很广
+ * 且完全不可观测（不是 OOV，是切分错）。
+ */
 function isControl(c: string): boolean {
+  if (c === '\t' || c === '\n' || c === '\r') {
+    return false;
+  }
   return /[\u0000-\u001f\u007f-\u009f]/u.test(c);
 }
 /** ASCII 标点 + Unicode 标点（BERT 的 _is_punctuation：ASCII 区间 + P* 类） */
@@ -82,6 +105,9 @@ function cleanText(text: string): string {
   }
   return out;
 }
+
+/** WordPiece 单 token 上限（与 HF `max_input_chars_per_word` 同口径；本模型 tokenizer.json 亦为 100） */
+const MAX_INPUT_CHARS_PER_WORD = 100;
 
 /** WordPiece 分词器（vocab.txt：一行一个 token，行号即 id） */
 export class WordPieceTokenizer {
@@ -144,8 +170,20 @@ export class WordPieceTokenizer {
     return out;
   }
 
-  /** greedy longest-match WordPiece；整词不可分 → [UNK] */
+  /**
+   * greedy longest-match WordPiece；整词不可分 → [UNK]。
+   *
+   * **超长 token 必须短路**（真机实测的灾难级缺陷）：内层从串尾往前扫，对长度 n 的 token 是 O(n²)
+   * 且每步都 `slice`+字符串拼接。一段 8KB 的**无空白**文本（压缩过的代码、长 base64、超长 URL 或
+   * 哈希行——记忆正文完全可能是这些）实测让单次 encode 阻塞事件循环 **40 秒**；而 `mergeMemories`
+   * 是在**写事务内**调用编码的 → 写事务与 WAL 一起挂住。
+   * HF 的 WordPiece 对这种情况有 `max_input_chars_per_word = 100`（本模型 tokenizer.json 里就是 100），
+   * 超过即整词判 [UNK]。这里照同一口径短路，复杂度降到常数。
+   */
   private wordPiece(token: string): number[] {
+    if (token.length > MAX_INPUT_CHARS_PER_WORD) {
+      return [this.unkId];
+    }
     const ids: number[] = [];
     let start = 0;
     while (start < token.length) {
@@ -203,18 +241,51 @@ export const MODEL_PAIRS = [
 export const VOCAB_FILE = 'vocab.txt';
 
 /**
+ * 词表的候选位置（按顺序探测，取第一个存在的）。
+ *
+ * 为什么是候选表而不是单一路径：模块有两种布局，`import.meta.url` 在两种布局下指向不同深度——
+ *   - 源码布局：`<preset>/memory/embeddings-onnx.ts` → 同级 `./bge-small-zh/vocab.txt`；
+ *   - 编译布局：`<preset>/lib/memory/embeddings-onnx.js` → 词表**不在 lib/ 下**，而在
+ *     `<preset>/memory/bge-small-zh/vocab.txt`（`../../` 退回 preset 根再进 memory）。
+ *
+ * 真实事故：`tsc` 不会把 `.txt` 搬进 `lib/`，而插件入口是编译产物 → 单一路径在**生产部署**里
+ * 必然不存在 → 分词器装载抛 ENOENT → 神经嵌入永久回落哈希词袋，降级原因还写成"词表装载失败"
+ *（把"打包丢了资产"误报成"模型资产有问题"）。修复分两层：`pnpm build` 现在会同步资产
+ *（`scripts/copy-assets.ts`），本候选表则保证**即使资产没同步**也能从仓库真实位置找到词表。
+ */
+export function vocabCandidates(): string[] {
+  return [
+    fileURLToPath(new URL('./bge-small-zh/vocab.txt', import.meta.url)), // 源码布局
+    fileURLToPath(new URL('../../memory/bge-small-zh/vocab.txt', import.meta.url)), // 编译布局（lib/ 下）
+  ];
+}
+
+/**
  * 随仓库分发的词表（`memory/bge-small-zh/vocab.txt`，21128 行 / 107KB，MIT）。
  * 权重（约 23MB 量化）**不进仓库**（体积 + git 不适配大二进制），由 `pnpm fetch-embedding-model` 落到数据根。
+ * 取第一个真实存在的候选（见 vocabCandidates）；都不在时回落到源码布局路径，让报错信息指向最可能的位置。
  */
-export const VENDORED_VOCAB = fileURLToPath(new URL('./bge-small-zh/vocab.txt', import.meta.url));
+export const VENDORED_VOCAB = vocabCandidates().find((p) => existsSync(p)) ?? vocabCandidates()[0]!;
 
 /**
  * 解析词表路径：优先模型目录内的（与权重同源，最可靠）→ 回落到随仓库分发的那份。
  * 这样即便权重还没下载，分词器也能独立自检（部署前就能验分词正确性）。
+ * 两端都不存在 → 抛错并把**所有**尝试过的路径列出来（排障不必猜布局）。
  */
 export function resolveVocabPath(modelDir: string): string {
   const inModel = join(modelDir, VOCAB_FILE);
-  return existsSync(inModel) ? inModel : VENDORED_VOCAB;
+  if (existsSync(inModel)) {
+    return inModel;
+  }
+  const candidate = vocabCandidates().find((p) => existsSync(p));
+  if (candidate !== undefined) {
+    return candidate;
+  }
+  throw new Error(
+    `未找到词表 ${VOCAB_FILE}：模型目录 ${modelDir} 内没有，随仓库分发的位置也不存在` +
+      `（已试：${vocabCandidates().join(' / ')}）——` +
+      '源码布局下应为 memory/bge-small-zh/vocab.txt；编译布局请确认 pnpm build 同步了资产',
+  );
 }
 
 /** 在目录内找一组可用的（图 + 外部权重）配对；找不到 → null */
@@ -260,6 +331,13 @@ interface OrtLike {
 interface OrtSessionLike {
   inputNames: readonly string[];
   run(feeds: Record<string, unknown>): Promise<Record<string, { data: Float32Array; dims: readonly number[] }>>;
+  /**
+   * 释放原生会话与其线程池（onnxruntime-node 的 `InferenceSession.release`）。
+   * 可选：接口按结构面定义（不引包），旧版本/形状变化时缺失 → 跳过释放而不是崩。
+   * **必须有这个出口**：装载自检失败时若不放掉会话，原生资源会随进程存活（装配侧只在 ok:true
+   * 时接管嵌入器 → 失败分支的会话成孤儿，且它已占住线程池）。
+   */
+  release?(): Promise<void>;
 }
 
 /** 嵌入器装载结果（诚实降级：失败 → 原因可读，调用方回落到哈希词袋） */
@@ -293,7 +371,8 @@ export async function loadOnnxEmbedder(
     return {
       ok: false,
       reason:
-        '未找到模型目录（需同时含 model.onnx / model.onnx_data / vocab.txt）——' +
+        '未找到模型目录（需含一组「图 + 同名前缀的外部权重」配对，例如 ' +
+        `${MODEL_PAIRS[0].graph} + ${MODEL_PAIRS[0].data}；词表可选，缺失时用随仓库分发的那份）——` +
         '可用 OMB_EMBEDDING_MODEL 指定，或放到 <数据根>/models/bge-small-zh-v1.5/',
     };
   }
@@ -360,13 +439,20 @@ export async function loadOnnxEmbedder(
   try {
     await embed('自检');
   } catch (err) {
+    // 自检失败 → 这个会话不会被任何人接管（装配侧只在 ok:true 时 setEmbedder）→ 主动释放，
+    // 否则原生会话与其线程池会随进程存活。释放本身失败不影响降级结论（如实返回自检原因）。
+    try {
+      await session.release?.();
+    } catch {
+      // 释放失败 → 忽略（进程退出时由宿主回收）
+    }
     return { ok: false, reason: `模型自检失败（${(err as Error).message}）` };
   }
 
   return {
     ok: true,
     modelDir,
-    embedder: { id: BGE_SMALL_ZH_ID, dim: BGE_SMALL_ZH_DIM, embed },
+    embedder: { id: BGE_SMALL_ZH_ID, dim: BGE_SMALL_ZH_DIM, embed, minScore: BGE_MIN_SCORE },
   };
 }
 

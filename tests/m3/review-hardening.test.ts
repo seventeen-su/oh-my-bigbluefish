@@ -190,6 +190,29 @@ describe('⑤⑥⑦ 向量通道加固', () => {
     expect(stats.dim).toBe(256);
   });
 
+  it('换嵌入器（维度变化）→ 异维行被置为待编码，且 mismatched>0 时 dim 如实为 null', async () => {
+    // 此前**零覆盖**的正是这条关键分支：`mismatched > 0 → dim: null`（把"通道对这些行已失效"
+    // 与"尚无任何编码条目"区分开的唯一手段）。把 mismatched 硬编码成 0 也能让旧用例全绿。
+    const b = track(new RetrievalBackend(join(dir, 'f2.db')));
+    await b.ingest(memory('a0000000-0000-4000-8000-000000000055', '第一条待编码内容'));
+    await b.ingest(memory('b0000000-0000-4000-8000-000000000056', '第二条待编码内容'));
+
+    // 用 64 维嵌入器编码（模拟"旧嵌入器写下的存量向量"）
+    const dim64: Embedder = { id: 'probe64', dim: 64, embed: async () => new Float32Array(64).fill(1) };
+    b.setEmbedder(dim64);
+    await b.encodePendingBatch();
+    expect(b.vectorStats()).toMatchObject({ encoded: 2, dim: 64 });
+
+    // 换成 256 维（模拟"接入语义模型"）：异维存量必须被如实报出，且不得把通道报成"正常"
+    const back256: Embedder = { id: 'back-256', dim: 256, embed: async () => new Float32Array(256).fill(0.5) };
+    const invalidated = b.setEmbedder(back256);
+    expect(invalidated).toBe(2); // 两条异维行被作废
+    expect(b.vectorStats().mismatched).toBe(0); // 作废后不再有异维行
+    expect(b.vectorStats().pending).toBe(2); // 但都重新进入了编码队列（这才是关键）
+    await b.encodePendingBatch();
+    expect(b.vectorStats()).toMatchObject({ encoded: 2, pending: 0, dim: 256 });
+  });
+
   it('retrieve 在向量通道抛错时把降级原因带进结果（不再静默）', async () => {
     const b = track(new RetrievalBackend(join(dir, 'g.db')));
     await b.ingest(memory('a0000000-0000-4000-8000-000000000061', '验证契约的边界说明'));

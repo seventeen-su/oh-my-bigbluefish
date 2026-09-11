@@ -66,13 +66,35 @@ export class VectorBackend extends RelationBackend {
    * 神经嵌入的装载是**异步**的（ONNX 会话创建 + 词表装载），而 backend 构造是同步的——
    * 故先以哈希词袋（或上一次的嵌入器）构造，装配就绪后再装入真模型。
    *
-   * 换嵌入器的**可观测后果**（不是静默切换）：
-   *   - 维度变化（256 → 512）→ 存量向量维度不匹配 → `vectorStats().mismatched` 如实报条数，
-   *     检索侧跳过异维行；维护任务 `memory_vector_encode` 逐批重编码补齐；
-   *   - `embedder` 字段随之变化，状态面能看出"当前用的哪个嵌入器"。
+   * **换嵌入器必须同时作废异维存量向量**（审查发现的致命缺口）：编码任务的候选集是
+   * `WHERE vector IS NULL`，而旧嵌入器写下的 256 维向量既不是 NULL、也不计入
+   * `pendingEncodeCount()`——于是"由维护任务逐批重编码补齐"这条承诺**根本不触发**：
+   * 升到 512 维后全部存量记忆对向量通道**永久不可见**（检索侧逐行跳过异维行），
+   * `dim` 永久为 null、`mismatched` 永久大于 0，没有任何自动恢复路径。
+   * 故在这里把异维行显式清成 NULL，让它们重新进入编码队列。
+   *
+   * 返回被作废的行数（可观测：状态面/日志据此说明"有多少条要重编码"，而不是静默重编）。
    */
-  setEmbedder(embedder: Embedder): void {
+  setEmbedder(embedder: Embedder): number {
     this.embedder = embedder;
+    return this.invalidateWrongDimVectors();
+  }
+
+  /**
+   * 把维度与当前嵌入器不符的存量向量清成 NULL（幂等）。
+   * 安全性：清 NULL 只是"重新编码的标记"，正文（payload）不动、不影响词法通道；
+   * 代价是这些行在重编码完成前不参与向量检索（本来它们也已被跳过，故无功能倒退）。
+   */
+  private invalidateWrongDimVectors(): number {
+    try {
+      const info = this.db
+        .prepare('UPDATE memory SET vector = NULL WHERE vector IS NOT NULL AND length(vector) <> ?')
+        .run(this.embedder.dim * 4) as { changes?: number };
+      return typeof info.changes === 'number' ? info.changes : 0;
+    } catch {
+      // 表/列异常不阻断装配（诚实降级：编码任务稍后会按 IS NULL 正常推进）
+      return 0;
+    }
   }
 
   /**
@@ -180,18 +202,22 @@ export class VectorBackend extends RelationBackend {
     const rows = this.db
       .prepare(`SELECT body, vector FROM memory WHERE ${conds.join(' AND ')}`)
       .all(...args) as unknown as { body: string; vector: unknown }[];
+    // 候选下限：缺省 0（"非正相似不算命中"）；稠密神经嵌入按自身实测分布声明更高的下限——
+    // 否则"任何查询都返回满额候选池"，无关记忆被稳定塞进注入预算（见 Embedder.minScore 的说明）。
+    const floor = this.embedder.minScore ?? 0;
     const hits: VectorHit[] = [];
     for (const r of rows) {
       const vec = blobToVector(r.vector);
       if (vec === null) continue;
       if (vec.length !== query.length) {
         // 陈旧/异维向量（换过嵌入器）：跳过该行而不是让整条通道抛错（审查修复 H1）——
-        // 单行不可比不应使向量通道整体消失；缺口由 vectorStats().mismatched 暴露，供人工重编码。
+        // 单行不可比不应使向量通道整体消失；缺口由 vectorStats().mismatched 暴露，
+        // 且换嵌入器时已被置为待编码（setEmbedder → invalidateWrongDimVectors）自动补齐。
         continue;
       }
       const score = cosineSimilarity(query, vec);
       if (!Number.isFinite(score)) continue; // 坏 BLOB 解出的 NaN/Inf 不入候选（审查修复）
-      if (score <= 0) continue; // 非正相似 → 不入候选（负相关不是"相近"）
+      if (score <= floor) continue; // 低于下限 → 不入候选（下限语义见 Embedder.minScore）
       hits.push({ memory: JSON.parse(r.body) as Memory, score });
     }
     hits.sort((a, b) => b.score - a.score || a.memory.id.localeCompare(b.memory.id));

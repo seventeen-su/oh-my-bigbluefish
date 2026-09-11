@@ -83,31 +83,59 @@ function sha256File(path: string): string {
 }
 
 /**
- * 取上游期望的 sha256 与大小。
- * Hugging Face 通过 LFS 指针（`oid sha256:<hex>` / `size <n>`）暴露这两个值，
- * **不需要把 23MB 权重拉下来就能校验**——这是"下载完整性"最省带宽的判据。
- * 镜像不支持 LFS 指针（直接回二进制）→ 返回 undefined，退化为"按实际内容记账"。
+ * 取上游期望的 sha256 与大小（按目录一次拉取，覆盖该目录下所有文件）。
+ *
+ * **为什么不能用 `resolve/...` 的响应体**（前实现即如此，实测是死代码）：Hugging Face 对 LFS 文件在
+ * `resolve/main/<路径>` 上直接返回**二进制本体**（实测 `content-type: application/octet-stream`、
+ * 首字节即 protobuf），不是 `oid sha256:…` 指针文本。于是"响应体小于 4KB 才当指针解析"的分支恒不
+ * 命中 → `sha256` 永远 undefined → 只比大小 → README/架构文档里"按上游 sha256 校验"全是空头承诺
+ *（同尺寸的损坏或被替换的权重会被静默接受，直到 ONNX 会话创建失败才以错误方向暴露）。
+ *
+ * 正确来源是仓库文件列表 API：`GET /api/models/<repo>/tree/main/<dir>`，每项带 `lfs.oid`(sha256)
+ * 与 `lfs.size`。镜像不提供该 API → 返回空表，调用方如实退化为"只校验大小"并打印说明。
  */
-async function upstreamExpectation(url: string): Promise<{ sha256?: string; size?: number }> {
+interface UpstreamExpectations {
+  /** 相对仓库根的路径（如 `onnx/model_quantized.onnx`）→ 期望值 */
+  get(remotePath: string): { sha256?: string; size?: number } | undefined;
+}
+
+async function fetchUpstreamExpectations(dir: string): Promise<UpstreamExpectations> {
+  const map = new Map<string, { sha256?: string; size?: number }>();
   try {
-    const r = await fetch(url, { redirect: 'follow' });
-    if (!r.ok) return {};
-    const len = r.headers.get('content-length');
-    const declared = len === null ? undefined : Number.parseInt(len, 10);
-    // 只有小响应才可能是文本指针；大响应说明镜像直接给了二进制
-    if (declared === undefined || declared > 4096) {
-      return { size: declared };
+    const res = await fetch(`${mirrorBase()}/api/models/${REPO}/tree/main/${dir}`, { redirect: 'follow' });
+    if (res.ok) {
+      const items = (await res.json()) as Array<{
+        path?: unknown;
+        size?: unknown;
+        lfs?: { oid?: unknown; size?: unknown } | null;
+      }>;
+      for (const item of items) {
+        if (typeof item.path !== 'string') continue;
+        const lfs = item.lfs ?? undefined;
+        const oid = typeof lfs?.oid === 'string' && /^[0-9a-f]{64}$/.test(lfs.oid) ? lfs.oid : undefined;
+        const lfsSize = typeof lfs?.size === 'number' ? lfs.size : undefined;
+        const plainSize = typeof item.size === 'number' ? item.size : undefined;
+        map.set(item.path, {
+          ...(oid !== undefined ? { sha256: oid } : {}),
+          ...(lfsSize !== undefined ? { size: lfsSize } : plainSize !== undefined ? { size: plainSize } : {}),
+        });
+      }
     }
-    const text = await r.text();
-    const oid = /oid sha256:([0-9a-f]{64})/.exec(text);
-    const size = /size (\d+)/.exec(text);
-    if (oid === null || oid[1] === undefined) return { size: declared };
-    return {
-      sha256: oid[1],
-      size: size === null || size[1] === undefined ? declared : Number.parseInt(size[1], 10),
-    };
   } catch {
-    return {};
+    // 网络失败/镜像不提供该 API → 空表（调用方按"无内容校验"如实说明）
+  }
+  return { get: (p) => map.get(p) };
+}
+
+/** HEAD 取内容长度（文件列表 API 不可用时的兜底：至少能校验字节数） */
+async function headSize(url: string): Promise<number | undefined> {
+  try {
+    const r = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+    if (!r.ok) return undefined;
+    const len = r.headers.get('content-length');
+    return len === null ? undefined : Number.parseInt(len, 10);
+  } catch {
+    return undefined;
   }
 }
 
@@ -141,17 +169,23 @@ async function fetchFile(
     throw new Error(`下载失败 ${url} → HTTP ${res.status} ${res.statusText}`);
   }
   const out = createWriteStream(tmp);
+  // 磁盘满等落盘错误必须以 Promise 拒绝的形式冒出来，走 main().catch 的清理路径；
+  // 否则 Node 会把无监听者的 'error' 事件当未捕获异常直接终止进程，.part 残留且没有可读原因。
+  const streamError = new Promise<never>((_, reject) => out.once('error', reject));
   const reader = res.body.getReader();
   let written = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), streamError]);
       if (done) break;
       const buf = Buffer.from(value);
       written += buf.byteLength;
-      await new Promise<void>((ok, bad) => out.write(buf, (e) => (e ? bad(e) : ok())));
+      await Promise.race([
+        new Promise<void>((ok, bad) => out.write(buf, (e) => (e ? bad(e) : ok()))),
+        streamError,
+      ]);
     }
-    await new Promise<void>((ok) => out.end(ok));
+    await Promise.race([new Promise<void>((ok) => out.end(ok)), streamError]);
   } catch (err) {
     out.destroy();
     rmSync(tmp, { force: true });
@@ -196,12 +230,32 @@ async function main(): Promise<void> {
   const base = `${mirrorBase()}/${REPO}/resolve/main`;
   console.log(`[fetch-embedding-model] 变体=${args.variant} 目标=${args.dir}`);
   console.log(`[fetch-embedding-model] 来源=${base}（镜像前缀可用 OMB_MODEL_MIRROR 覆盖）`);
+  const expectations = await fetchUpstreamExpectations('onnx');
+  const verified: string[] = [];
+  const sizeOnly: string[] = [];
   for (const remote of VARIANTS[args.variant]) {
     const local = basename(remote); // 不重命名：外部权重文件名被记在图内部
     const url = `${base}/${remote}`;
-    const expect = await upstreamExpectation(url);
+    const fromApi = expectations.get(remote);
+    // API 不可用 → 退回 HEAD 取大小（只能校验长度，如实登记为"未做内容校验"）
+    const expect: { sha256?: string; size?: number } = fromApi ?? { size: await headSize(url) };
+    if (expect.sha256 !== undefined) {
+      verified.push(local);
+    } else {
+      sizeOnly.push(local);
+    }
     const r = await fetchFile(url, join(args.dir, local), expect, args.verify);
     console.log(`  ${remote} → ${local}：${r === 'skipped' ? '已就绪，跳过' : `已下载 ${humanSize(expect.size)}`}`);
+  }
+  if (sizeOnly.length > 0) {
+    // 不谎称校验过：拿不到权威哈希时必须说出来（否则"已就绪"会被读成"内容已核对"）
+    console.warn(
+      `[fetch-embedding-model] 注意：${sizeOnly.join(', ')} 本次**未做内容校验**（上游哈希不可取，` +
+        '可能是镜像不提供文件列表 API）——只按字节数判断完整性。',
+    );
+  }
+  if (verified.length > 0) {
+    console.log(`[fetch-embedding-model] 内容校验（sha256 vs 上游）：${verified.join(', ')} 通过。`);
   }
   console.log('[fetch-embedding-model] 完成。词表随仓库分发（memory/bge-small-zh/vocab.txt），无需下载。');
   console.log(`[fetch-embedding-model] 若目标目录非默认，请设 OMB_EMBEDDING_MODEL=${args.dir} 或配置插件 embeddingModelDir。`);
