@@ -33,13 +33,22 @@ export interface JudgeExecutor {
  * 执行器工厂：opts.spawnJudge 缺省 → available=false（judge 恒 null——未装配 = 诚实不可用，
  * 消费方（runVerificationReview）按不可用转人工复核，不假装判定）。
  */
-export function createJudgeExecutor(opts: { spawnJudge?: SpawnJudge }): JudgeExecutor {
-  const available = typeof opts.spawnJudge === 'function';
+export function createJudgeExecutor(opts: {
+  spawnJudge?: SpawnJudge;
+  /** 运行期可用性（可选）：注入后 available 变为动态判定——例如宿主 subagents.start 需要 parent Agent，
+   *  而 parent 只在观察到工具调用后才有值。不可用 → 消费方走"转人工复核"这条既有诚实路径，
+   *  而不是"调用 → 抛错 → 视同 UNKNOWN → 白烧两次子代理尝试"（第二轮审查 H1）。 */
+  isAvailable?: () => boolean;
+}): JudgeExecutor {
+  const availableNow = (): boolean =>
+    typeof opts.spawnJudge === 'function' && (opts.isAvailable === undefined ? true : opts.isAvailable() === true);
   return {
-    available,
+    get available(): boolean {
+      return availableNow();
+    },
     async judge(task: JudgeTask, signal?: AbortSignal): Promise<JudgeVerdict | null> {
-      if (!available) {
-        return null; // 未装配 → 降级（不调用）
+      if (!availableNow()) {
+        return null; // 未装配 / 运行期不可用 → 降级（不调用）
       }
       try {
         const prompt = buildJudgePrompt(task);
