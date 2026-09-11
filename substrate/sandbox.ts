@@ -147,6 +147,16 @@ interface ChannelCandidate {
 
 /** 通道候选表缓存（进程内一次；平台 -> 按强度排序的候选） */
 let channelCandidates: Promise<ChannelCandidate[]> | null = null;
+/** 最近一次候选表加载失败原因（null = 没失败过）。层 DAG 限制：substrate 不引 runtime 降级面，
+ *  故原因留在这里，由上层 `sandboxStatusAsync()` 读走并计入状态面的降级说明。 */
+let lastChannelLoadError: string | null = null;
+
+/** 读走并清除"候选表加载失败"结论（上层记账用；读一次即清，避免陈旧原因反复上报） */
+export function takeChannelLoadError(): string | null {
+  const e = lastChannelLoadError;
+  lastChannelLoadError = null;
+  return e;
+}
 
 /**
  * 取当前平台的受限执行**候选**通道（按强度顺序；进程内缓存）。
@@ -158,6 +168,11 @@ let channelCandidates: Promise<ChannelCandidate[]> | null = null;
  */
 async function loadChannelCandidates(): Promise<ChannelCandidate[]> {
   if (channelCandidates === null) {
+    // 记忆化 promise 一旦 reject 就需要**立刻**有处理者：否则在"赋值"与"首次 await"之间的窗口里
+    // 会变成 unhandled rejection（污染进程告警、也可能在临时目录被拆后炸出 ENOENT）。
+    // 这里同步吞掉拒绝并把缓存清回 null：失败结论不缓存——下一次调用重新探测，而不是把失败钉死。
+    // 不在此处记降级日志：substrate(0) 不能 import runtime(2) 的降级面（层 DAG），
+    // 故保留原因在模块级 `lastChannelLoadError`，由上层（sandboxStatusAsync）读走并记账。
     channelCandidates = (async (): Promise<ChannelCandidate[]> => {
       if (process.platform === 'win32') {
         const impl = (await import('./sandbox-win32.js')) as unknown as {
@@ -169,7 +184,11 @@ async function loadChannelCandidates(): Promise<ChannelCandidate[]> {
         posixSandboxCandidates(): SandboxChannel[];
       };
       return impl.posixSandboxCandidates().map((channel) => ({ channel, selfTest: null }));
-    })();
+    })().catch((err: unknown) => {
+      channelCandidates = null;
+      lastChannelLoadError = err instanceof Error ? err.message : String(err);
+      return [];
+    });
   }
   return channelCandidates;
 }
@@ -229,12 +248,18 @@ export async function sandboxStatusAsync(): Promise<SandboxStatus> {
   }
   const { channel, selfTest, fallbackFrom } = resolved
   if (channel === null) {
+    // 候选表加载失败也会走到这里（loadChannelCandidates 吞掉拒绝后返回空表）——若不说清，
+    // 原因会被误读成"平台真的没有实现"，而实际是"实现模块没加载起来"。
+    const loadErr = takeChannelLoadError()
     return {
       available: false,
-      reason: `平台 ${caps.raw} 未找到可用受限执行实现（POSIX：bwrap 缺失且 Node 版本不支持权限模型）`,
+      reason:
+        loadErr !== null
+          ? `受限执行实现模块加载失败：${loadErr}——本次按无通道处理`
+          : `平台 ${caps.raw} 未找到可用受限执行实现（POSIX：bwrap 缺失且 Node 版本不支持权限模型）`,
       platform: caps.raw,
       verified: false,
-      self_test_note: '未探测（无实现可加载）',
+      self_test_note: loadErr !== null ? '未探测（实现模块不可加载）' : '未探测（无实现可加载）',
     }
   }
   const triedNote = fallbackFrom.length > 0 ? `已尝试：${fallbackFrom.join('；')}` : '（唯一候选）'
