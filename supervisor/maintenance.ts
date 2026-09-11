@@ -27,7 +27,7 @@
 //   estimated_cost 数据化；enqueue 未给 cost 且 id 命中 → 用 policy 成本，未列出 id 仍 M3 缺省 1）。
 // layer 1（supervisor/）：仅 node: 内置 + kernel/schemas/（契约例外）+ supervisor/ 内文件。
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { appendFile, mkdir, readFile as readFileAsync, rename, stat as statFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile as readFileAsync, rename, rm, stat as statFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Fingerprint } from '../kernel/schemas/base.js';
 import type { MaintenanceUrgency } from '../kernel/schemas/evolution.js';
@@ -342,6 +342,11 @@ export const DEFAULT_TICK_INTERVAL_MS = 60_000;
 /** 每个环境字段变化的归一化能力衰减系数（能力衰减曲线，待标定） */
 export const CAPABILITY_DECAY_FACTOR = 0.8;
 
+/** Windows 瞬态锁重试次数与可重试错误码（与 substrate/lines.ts 的 writeFileRetry 同口径）——
+ *  多个调度器实例并发落盘时，后到的 rename 可能撞上目标正被另一个 rename 持有（EPERM）。 */
+const WRITE_LOCK_RETRY_COUNT = 5;
+const WRITE_LOCK_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
+
 /** §4.4 Fingerprint 参与 diff 的字段（固定顺序，保证环境_delta 键序确定性） */
 const FP_FIELDS: (keyof Fingerprint)[] = ['os', 'node', 'dsh_version', 'project', 'gpu', 'cuda'];
 
@@ -422,6 +427,8 @@ export class MaintenanceScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   /** 最近一次调度器自身故障（定时器路径兜底：如 debt.json 损坏）；状态面可读，不再静默吞错 */
   private lastSchedulerError: string | null = null;
+  /** 原子写临时名的单调序号（保证同毫秒内多次写也不撞名——时钟可能被冻结） */
+  private writeSeq = 0;
   private debtLoaded = false;
   /** 队列懒加载标记（restoreQueueIfNeeded 只做一次） */
   private queueLoaded = false;
@@ -1140,6 +1147,62 @@ export class MaintenanceScheduler {
   // ---- 队列持久化与跨重启重建（已知问题《债务与"还债的人"不同源》） ----
 
   /**
+   * 原子写的临时文件名（**每次写唯一**）。
+   *
+   * 为什么必须唯一（真机实测缺陷）：此前用固定名 `` `${目标}.tmp` ``。同进程里多个调度器实例
+   * （多会话/多子代理并行时各自装配一套认知层，共用同一个 `.evolution` 数据根）会并发落盘：
+   * A 写完 rename 走了临时文件，B 随后 rename 自己的临时文件时**源已不存在** →
+   * `ENOENT: rename '<file>.tmp' -> '<file>'`，落盘静默失败、内存账本与盘面分叉。
+   * 真机上确实观测到这条报错（`scheduler_error` 里可见）。
+   *
+   * 唯一性靠**单调计数器**而非仅靠时间戳：时钟不保证前进（测试里的假时钟会冻结在同一毫秒，
+   * 同毫秒内两次写就会撞名——实测被既有用例 `soft 限` 抓到：撞名后重试在假时钟下永不结算）。
+   * pid/时间戳只用于排障辨认来源（与 `substrate/lines.ts` 的 `.<pid>-<ts>-<rand>.tmp` 同惯例）。
+   */
+  private tempWritePath(target: string): string {
+    this.writeSeq += 1;
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${target}.${process.pid}-${Date.now().toString(36)}-${this.writeSeq}-${rand}.tmp`;
+  }
+
+  /**
+   * 落盘（唯一临时名 + 带重试的 rename）。
+   *
+   * 重试的必要性（并发测试实测）：唯一临时名解决了"源被竞争者 rename 走"的 ENOENT，但 Windows 上
+   * **两个 rename 同时指向同一目标**时后到者会拿到 `EPERM`（目标正被另一个 rename 持有）。这类
+   * 瞬态锁与 `substrate/lines.ts` 的 writeFileRetry / git 锁重试是同一类问题，故沿用同一处理：
+   * 短退避重试，超过次数才抛。失败方最终仍会以 `lastSchedulerError` 如实上报（不静默）。
+   */
+  private async atomicWriteJson(target: string, payload: string): Promise<void> {
+    await mkdir(dirname(target), { recursive: true });
+    const tmp = this.tempWritePath(target);
+    await writeFile(tmp, payload, 'utf8');
+    let last: unknown;
+    for (let attempt = 0; attempt < WRITE_LOCK_RETRY_COUNT; attempt++) {
+      try {
+        await rename(tmp, target);
+        return;
+      } catch (err) {
+        last = err;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === undefined || !WRITE_LOCK_RETRYABLE.has(code)) {
+          break;
+        }
+        if (attempt < WRITE_LOCK_RETRY_COUNT - 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        }
+      }
+    }
+    // 重试耗尽：清理自己的临时文件（不留垃圾），并把原因交回调用方记 scheduler_error
+    try {
+      await rm(tmp, { force: true });
+    } catch {
+      // 清理失败 → 残留随机名临时文件，无害（下次写用新随机名）
+    }
+    throw last instanceof Error ? last : new Error(String(last));
+  }
+
+  /**
    * 队列落盘（`<debtDir>/queue.json`，原子写 tmp+rename）。
    * 只落**元数据**（id/value/cost/priority/urgency/subsystem/reason/enqueued_at）——执行体是函数，
    * 不能序列化，由 `opts.restoreTask` 在加载时按 id 重建（见 restoreQueueIfNeeded）。
@@ -1160,10 +1223,7 @@ export class MaintenanceScheduler {
         enqueued_at: this.nowFn(),
         critical: this.critical.has(t.id),
       }));
-      await mkdir(dirname(this.queueFile), { recursive: true });
-      const tmp = `${this.queueFile}.tmp`;
-      await writeFile(tmp, JSON.stringify(entries, null, 2), 'utf8');
-      await rename(tmp, this.queueFile);
+      await this.atomicWriteJson(this.queueFile, JSON.stringify(entries, null, 2));
     } catch (err) {
       this.lastSchedulerError = `维护队列落盘失败：${(err as Error).message}`;
     } finally {
@@ -1366,10 +1426,7 @@ export class MaintenanceScheduler {
     if (this.debt.size === 0 && !existsSync(this.debtFile)) return;
     const settle = this.trackWrite(); // 关停排空据此等待（见 drain/idle）
     try {
-      await mkdir(dirname(this.debtFile), { recursive: true });
-      const tmp = `${this.debtFile}.tmp`;
-      await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
-      await rename(tmp, this.debtFile);
+      await this.atomicWriteJson(this.debtFile, JSON.stringify(this.debtSnapshot(), null, 2));
     } catch (err) {
       this.lastSchedulerError = `债务落盘失败（${this.debtFile}）：${(err as Error).message}——内存账本保留，下次落盘重试`;
     } finally {

@@ -15,7 +15,7 @@
 //   ⑧ 经调度跑 consolidation：M3 consolidate 经 scheduler.enqueue 执行成功（升级兼容验证）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Fingerprint } from '../../kernel/schemas/base.js';
@@ -487,8 +487,7 @@ describe('维护调度（§12.3）', () => {
 
 // ---- ⑩b 队列跨重启重建（已知问题《债务与"还债的人"不同源》） ----
 
-describe('队列跨重启重建（债与还债的人同源）', () => {
-  it('重启后队列按 restoreTask 重建：盘上债务仍在 → 负责还债的任务仍在队列并被调度', async () => {
+describe('队列跨重启重建（债与还债的人同源）', () => {  it('重启后队列按 restoreTask 重建：盘上债务仍在 → 负责还债的任务仍在队列并被调度', async () => {
     const debtFile = join(tmpRoot, 'debt.json');
     let repaired = 0;
     const restore = (id: string): ((signal?: AbortSignal) => Promise<void>) | null =>
@@ -548,6 +547,34 @@ describe('队列跨重启重建（债与还债的人同源）', () => {
     expect(s2.debtSourceView()[0]!.orphan).toBe(true);
     // 剪除不静默：deferredEvents 留痕（为什么这条债没有"还债的人"）
     expect(s2.deferredEvents().some((e) => /无法重建/.test(e.reason))).toBe(true);
+  });
+
+  it('并发落盘不互相打断：两个实例写同一数据根 → 都不报 scheduler_error', async () => {
+    // 真机实测缺陷：原子写用固定临时名 `${目标}.tmp` 时，两个调度器实例（多会话/多子代理并行，
+    // 共用同一 .evolution 数据根）并发落盘会互相打断——A 把临时文件 rename 走后，B 的 rename
+    // 找不到源 → `ENOENT: rename '<file>.tmp' -> '<file>'`，落盘静默失败。
+    // 修法是每次写用唯一临时名（同 lines.ts 的 .pointer-<pid>-<ts>-<rand>.tmp 惯例）。
+    const debtFile = join(tmpRoot, 'debt.json');
+    const a = new MaintenanceScheduler({ debtFile, restoreTask: () => async () => {} });
+    const b = new MaintenanceScheduler({ debtFile, restoreTask: () => async () => {} });
+    schedulers.push(a, b);
+    // 交替入队（各自 accrueDebt → 各自 persistDebt + persistQueue），并让它们交错在飞
+    await Promise.all([
+      a.enqueue(task({ id: 'repair', value: 1, run: async () => {} }), { accrueDebt: true }),
+      b.enqueue(task({ id: 'memory_consolidation', value: 1, run: async () => {} }), { accrueDebt: true }),
+      a.enqueue(task({ id: 'gc', value: 1, run: async () => {} }), { accrueDebt: true }),
+      b.enqueue(task({ id: 'environment_check', value: 1, run: async () => {} }), { accrueDebt: true }),
+    ]);
+    // 两个实例都没把落盘失败记进 scheduler_error（固定名实现下这里会出现 ENOENT）
+    expect(a.limitsSnapshot().scheduler_error).toBeNull();
+    expect(b.limitsSnapshot().scheduler_error).toBeNull();
+    // 盘面确实是合法 JSON（最后一次 rename 生效，未被半写污染）
+    const onDisk = JSON.parse(await readFile(debtFile, 'utf8')) as unknown[];
+    expect(Array.isArray(onDisk)).toBe(true);
+    expect(onDisk.length).toBeGreaterThan(0);
+    // 无残留临时文件（每个临时名都被自己的 rename 消费掉）
+    const leftovers = (await readdir(tmpRoot)).filter((f) => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
   });
 
   it('重建面未就绪时不改动队列（装配顺序：调度器先构造、运行时后注入）', async () => {
