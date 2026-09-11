@@ -167,7 +167,15 @@ export async function restore(id: string, opts: { dir: string }): Promise<State>
   return stored.state;
 }
 
-/** 列出全部完好 checkpoint，按 timestamp 倒序；只认正式文件，跳过 tmp 残留/无关文件/损坏文件 */
+/**
+ * 列出全部完好 checkpoint，按 `(timestamp 倒序, id 倒序)` 排序；只认正式文件，跳过 tmp 残留/无关文件/损坏文件。
+ *
+ * 排序纪律（真机暴露的隐性缺陷）：此前只按 `timestamp` 倒序 —— 同一毫秒内连续 `save()` 两次时两者
+ * 时间戳相同，比较函数返回 0，**最终顺序取决于文件系统枚举顺序**（`readdir` 在 ext4/tmpfs 与 NTFS 上
+ * 顺序不同）→ 同一份代码在不同平台上给出不同顺序，且测试会在一台机器上通过、另一台上失败。
+ * `latest()` / `latestForSession()` 只取第一个元素，因此这条 tie-break 是它们的正确性前提。
+ * id 为 uuid（同毫秒内仍单调），故 `(timestamp, id)` 是全序。
+ */
 export async function list(opts: { dir: string }): Promise<Checkpoint[]> {
   let entries: string[];
   try {
@@ -194,7 +202,10 @@ export async function list(opts: { dir: string }): Promise<Checkpoint[]> {
       /* 跳过不可读/损坏文件（§11.3 恢复 = 上次完好 checkpoint） */
     }
   }
-  return out.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  return out.sort((a, b) => {
+    const dt = Date.parse(b.timestamp) - Date.parse(a.timestamp);
+    return dt !== 0 ? dt : b.id.localeCompare(a.id);
+  });
 }
 
 /** 最新（时间倒序第一个）完好 checkpoint；无 → null */
