@@ -126,19 +126,43 @@ export function resolveLineCommit(layout: VersionLayout, line: VersionLine): str
  * `git ls-tree -r --name-only <commit>`（-z 原始路径，不经 quoting）→ 逐文件 `git show <commit>:<path>`
  * （原始字节）写相对路径（含子目录 mkdir）。已存在同 commit 目录 → 直接复用（幂等：同 commit 内容
  * 不可变，目录即内容）。返回快照目录路径。
+ *
+ * **原子性（审查修复）**：逐文件写不是原子的——进程被杀、ENOSPC、git 中途失败都会留下**半棵树**，
+ * 而"目录存在即复用"会把这半棵树当成完整快照永久使用：装配侧只看到"版本线 X 快照缺少
+ * kernel/policy/processes"并回退仓库默认，真因（物化残缺）永远不会浮出，且每次启动都这样。
+ * 故改为**写到暂存目录 → 全部写完 → rename 就位**：目标目录一旦存在，其内容必然完整。
+ * 目标已存在（并发赢家）→ 丢弃自己的暂存目录并复用；残留的陈旧暂存目录先清理（幂等重试）。
  */
 export function materializeLineSnapshot(layout: VersionLayout, line: VersionLine, commit: string): string {
   const dir = path.join(linesBase(layout), line, commit);
   if (fs.existsSync(dir)) {
-    return dir; // 幂等复用（同 commit 内容不可变）
+    return dir; // 幂等复用（同 commit 内容不可变 + 只有 rename 才会让它出现，故内容必然完整）
+  }
+  const staging = path.join(linesBase(layout), line, `.staging-${commit}-${process.pid}-${Date.now().toString(36)}`);
+  // 上一次中断可能留下同名暂存目录（pid/时间戳不同则不会撞名；撞上就清掉重来）
+  try {
+    fs.rmSync(staging, { recursive: true, force: true });
+  } catch {
+    // 清理失败不致命：rename 目标若已存在会走"并发赢家"分支
   }
   const names = runGit(layout, ['ls-tree', '-r', '--name-only', '-z', commit])
     .split('\0')
     .filter((n) => n.length > 0);
   for (const name of names) {
-    const target = path.join(dir, name);
+    const target = path.join(staging, name);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     writeFileRetry(target, runGitBytes(layout, ['show', `${commit}:${name}`]));
+  }
+  try {
+    fs.renameSync(staging, dir);
+  } catch (err) {
+    // 并发赢家已把完整快照就位 → 丢弃自己的暂存目录并复用它（内容同 commit，等价）
+    if (fs.existsSync(dir)) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      return dir;
+    }
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw err;
   }
   return dir;
 }

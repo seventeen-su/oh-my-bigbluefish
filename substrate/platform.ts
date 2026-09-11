@@ -127,7 +127,13 @@ function probeWritable(dir: string): boolean | null {
   return true;
 }
 
-/** 可执行文件是否在 PATH 上（零依赖探测；不引子进程） */
+/**
+ * 可执行文件是否在 PATH 上（零依赖探测；不引子进程）。
+ * **必须同时是常规文件**：只查 `X_OK` 会把目录判成可执行——POSIX 上目录的可执行位表示"可进入"，
+ * 且 PATH 里出现同名**目录**完全可能（`bwrap/` 源码目录、构建产物目录等）。漏了这一步，
+ * 平台能力面会报出 `posix-bwrap` 这个**错的机制类别**（随后自检失败 → available:false），
+ * 排障时指向错误的方向。POSIX 侧的同类探测（substrate/sandbox-posix.ts 的 whichFile）已有 isFile 检查。
+ */
 function hasExecutable(name: string): boolean {
   const pathEnv = process.env.PATH ?? '';
   if (pathEnv.length === 0) {
@@ -135,8 +141,10 @@ function hasExecutable(name: string): boolean {
   }
   for (const dir of pathEnv.split(path.delimiter)) {
     if (dir.length === 0) continue;
+    const candidate = path.join(dir, name);
     try {
-      fs.accessSync(path.join(dir, name), fs.constants.X_OK);
+      if (!fs.statSync(candidate).isFile()) continue; // 同名目录/设备 → 不算可执行文件
+      fs.accessSync(candidate, fs.constants.X_OK);
       return true;
     } catch {
       // 不在该目录 → 继续

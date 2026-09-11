@@ -904,6 +904,9 @@ export class CognitiveRuntime {
   private shadowBundle: Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] } | null> | null = null;
   /** S7：latest 线 bundle 加载失败标记（记忆化失败——不重复尝试；rebuild/promote 后重置可重试） */
   private shadowBundleFailed = false;
+  /** S7：bundle 失效代号（每次 invalidateShadowCaches 递增）——在飞的旧加载据此丢弃过期结论，
+   *  不把"旧线的失败"写进失效后的新状态（见 loadShadowBundle 的说明） */
+  private shadowBundleEpoch = 0;
   /** S7：per-line 运行时快照身份（line → RuntimeSnapshot；内容寻址——线 commit/内容变化时失效重建） */
   private readonly shadowSnapshots = new Map<string, RuntimeSnapshot>();
   /** S7：shadow 会话 → 路由信息（exposure 已落盘；finalizeTurn 据此回写 outcome——(session,candidate) 键对齐 L2） */
@@ -932,8 +935,8 @@ export class CognitiveRuntime {
   private lastConsolidationReport: ConsolidationReport | null = null;
   /** 最近一次整合的有界执行元数据（"跑了多少"；与报告分开——报告是稳定契约） */
   private lastConsolidationRun: ConsolidationOutcome | null = null;
-  /** 神经嵌入装载是否已尝试过（进程内一次；默认嵌入器 = 哈希词袋，装载成功后替换） */
-  private embeddingModelTried = false;
+  /** 神经嵌入装载 promise（进程内一次；并发 ready 共享同一次装载，见 loadEmbeddingModelOnce） */
+  private embeddingLoad: Promise<void> | null = null;
   /** 神经嵌入器所在模型目录（装载成功时非空；状态面可读） */
   private embeddingModelDir: string | null = null;
   /** 神经嵌入降级原因（装载失败/未配置时非空——诚实标注，不静默换语义） */
@@ -1164,15 +1167,21 @@ export class CognitiveRuntime {
    * 为什么放在 `ready()`：装配期已有异步上下文，且此时**尚未开始检索/编码**——换嵌入器不会与在飞的
    * 编码交叉。失败语义（与全仓一致的"诚实降级"）：
    *   - 模型目录缺失 / onnxruntime 不可加载 / 形状不符 → 保持哈希词袋 + 记录降级（原因可读，含
-   *     `OMB_EMBEDDING_MODEL` 与默认目录提示），**不抛**、不影响其余装配；
-   *   - 成功 → `setEmbedder` 换入；存量 256 维向量变为"异维"（`vectorStats().mismatched` 可见，
-   *     检索侧跳过），由维护任务 `memory_vector_encode` 逐批重编码补齐。
+   *     `EMBEDDING_MODEL` 配置/环境变量与默认目录提示），**不抛**、不影响其余装配；
+   *   - 成功 → `setEmbedder` 换入；**异维存量向量在同一时刻被清成待编码**（`setEmbedder` 内做），
+   *     故维护任务 `memory_vector_encode` 能真正接上（此前那条承诺并不触发——见 setEmbedder 说明）。
+   *
+   * **必须 await 同一个 promise，而不是"置位后各自跑"**（审查修复的并发竞态）：`ready()` 本身没有
+   * 记忆化，而每个 `prepareTurn` 都会 `await this.ready()`。若用布尔标记"试过了"就返回，第二个会话
+   * 会在装载窗口（会话创建数十毫秒）内**带着哈希词袋**开始检索与编码——把 256 维向量写进正在切 512 维
+   * 的表，而这些行随后既不是 NULL 也不匹配，永久不可见。故改为共享一次装载的 promise。
    */
   private async loadEmbeddingModelOnce(): Promise<void> {
-    if (this.embeddingModelTried) {
-      return;
-    }
-    this.embeddingModelTried = true;
+    this.embeddingLoad ??= this.doLoadEmbeddingModel();
+    await this.embeddingLoad;
+  }
+
+  private async doLoadEmbeddingModel(): Promise<void> {
     try {
       const load = await loadOnnxEmbedder({
         dataRoot: this.rootDir,
@@ -1184,9 +1193,17 @@ export class CognitiveRuntime {
         recordDegradation('memory/embedding', `神经嵌入未启用（${load.reason}）——向量通道回落哈希词袋`);
         return;
       }
-      this.memory.setEmbedder(load.embedder);
+      const invalidated = this.memory.setEmbedder(load.embedder);
       this.embeddingModelDir = load.modelDir;
       this.embeddingDegraded = null;
+      if (invalidated > 0) {
+        // 诚实可见：换了维度就有多少条要重编码（不说的话，运维只看到 dim=null 与 mismatched>0）
+        recordDegradation(
+          'memory/embedding',
+          `嵌入器已切换为 ${load.embedder.id}（${load.embedder.dim} 维）：${invalidated} 条存量向量维度不符已作废，` +
+            '交由维护任务 memory_vector_encode 逐批重编码（在此之前这些行不参与向量检索）',
+        );
+      }
     } catch (err) {
       this.embeddingDegraded = errorDetail(err);
       recordDegradation('memory/embedding', `神经嵌入装载异常（${errorDetail(err)}）——向量通道回落哈希词袋`);
@@ -1350,6 +1367,10 @@ export class CognitiveRuntime {
       // 宿主契约哨兵段由插件层持有（装配层不重复探测）：插件经 deps 注入本回调，状态面据此可读
       host_contract: this.hostContractViewFn === undefined ? null : this.hostContractViewFn(),
       memory_vector: this.memory.vectorStats(),
+      // 嵌入通道**原因**面（审查修复）：`memory_vector` 只给症状（embedder/dim/mismatched）——
+      // 运维看不到"为什么是哈希词袋"（没装权重？没装 onnxruntime？还是词表/资产没同步？）。
+      // embeddingStatus() 此前**全仓无消费者**，这里把它并入状态面，让诚实降级的原因真的可读到。
+      embedding: this.embeddingStatus(),
       relations: this.relationStats(),
       maintenance_observations,
       observations_degraded: debtDegraded === null ? observations_degraded : [observations_degraded, debtDegraded].filter((x): x is string => x !== null).join('；'),
@@ -1988,6 +2009,11 @@ export class CognitiveRuntime {
    * 之间（异步上下文切换、进程退出、测试拆除 fixture）reject 会变成 unhandled rejection——
    * 既污染进程告警，也可能在 `rm -rf` 临时目录后炸出 ENOENT。故在创建的同一同步时刻就吞掉拒绝，
    * 失败结论记忆化在 `null` + `shadowBundleFailed` 上。
+   *
+   * 失效代号（审查修复）：`invalidateShadowCaches()` 会把字段清成 null，但**在飞的旧 promise 的 catch
+   * 仍会执行**——它若无条件写 `shadowBundleFailed = true`，就把"旧线的失败"穿越到新缓存上：一次
+   * `/mode` 切换（或 promote）若恰好与首次 shadow 加载重叠，之后每次 shadow 请求都会**永久**静默回退
+   * 装配线，直到下一次失效事件。故给失效加代号，catch 内先比对：结论只属于它自己那一代。
    */
   private async loadShadowBundle(): Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] } | null> {
     if (this.shadowBundleFailed) {
@@ -1995,6 +2021,7 @@ export class CognitiveRuntime {
     }
     if (this.shadowBundle === null) {
       const line: VersionLine = 'latest';
+      const epoch = this.shadowBundleEpoch;
       this.shadowBundle = (async () => {
         const dirs = resolveLineDirs(this.assemblyOpts, line);
         if (dirs.lineSnapshot === null) {
@@ -2006,6 +2033,10 @@ export class CognitiveRuntime {
         ]);
         return { policy, processes };
       })().catch((err: unknown) => {
+        if (this.shadowBundleEpoch !== epoch) {
+          // 期间发生过失效（/mode 切换 / promote）→ 本结论已过期，丢弃（不污染新缓存状态）
+          return null;
+        }
         this.shadowBundleFailed = true;
         recordDegradation(
           'shadow/route',
@@ -2218,6 +2249,8 @@ export class CognitiveRuntime {
     this.shadowCandidateCache = null;
     this.shadowBundle = null;
     this.shadowBundleFailed = false;
+    // 代号递增：在飞的旧加载据此判定"我的结论已过期"，不再写新状态（否则旧线的失败会穿越过来）
+    this.shadowBundleEpoch++;
     this.shadowSnapshots.clear();
     this.perLineWorldModels.clear();
   }
@@ -2986,10 +3019,26 @@ export class CognitiveRuntime {
     }
     // 运行时侧待落盘写入（清理节流状态等）：同一纪律——不等会写进已关闭的库/目录
     await this.waitRuntimeWrites();
-    await this.components.disposeAll();
-    await this.eventStore.close();
-    await this.staging.close();
-    await this.memory.close();
+    // 关闭顺序与失败隔离（审查修复）：此前 `await this.components.disposeAll()` 是裸 await——
+    // 任一组件 dispose 抛错就会**跳过后面三处关库**（eventStore/staging/memory 的连接与 WAL 侧车
+    // 一起泄漏，且下一次打开可能撞锁）。组件停止属于清理动作，不该有权阻止资源释放。
+    // 故逐项独立结算：全部执行完，失败项汇总记降级（不抛——close 的语义是"尽力释放并如实上报"）。
+    const failures: string[] = [];
+    for (const [label, step] of [
+      ['components', async (): Promise<void> => await this.components.disposeAll()],
+      ['eventStore', async (): Promise<void> => await this.eventStore.close()],
+      ['staging', async (): Promise<void> => await this.staging.close()],
+      ['memory', async (): Promise<void> => await this.memory.close()],
+    ] as const) {
+      try {
+        await step();
+      } catch (err) {
+        failures.push(`${label}（${errorDetail(err)}）`);
+      }
+    }
+    if (failures.length > 0) {
+      recordDegradation('runtime/shutdown', `关闭阶段失败项：${failures.join('；')}——其余资源已照常释放`);
+    }
   }
 
   /** 等运行时侧待落盘写入落地（有界；超时记降级不抛） */

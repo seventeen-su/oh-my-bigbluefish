@@ -109,11 +109,22 @@ export interface KernStatusSummary {
     batch_size: number;
   } | null;
   /**
-   * 记忆向量通道状态（已知问题《新增向量检索》观测面）：已编码 / 待编码 / 维度 / 嵌入器标识。
+   * 记忆向量通道状态（已知问题《新增向量检索》观测面）：已编码 / 待编码 / 维度 / 嵌入器标识 /
+   * 异维陈旧条数 / 当前嵌入器维度。
    * 待编码 > 0 说明向量通道尚未覆盖全部记忆（空闲期 memory_vector_encode 任务会补齐）；
-   * dim=null 表示尚无任何编码条目（向量通道当前不产生候选——诚实标注，不冒充可用）。
+   * **dim=null 有两种含义**，必须靠 `mismatched` 区分：`encoded=0` → 尚无任何编码条目（通道空，
+   * 无害）；`mismatched>0` → 存在维度与当前嵌入器不符的陈旧向量，**通道对这些行已失效**
+   *（检索侧逐行跳过），需等重编码补齐——把后者读成"无害空库"会漏掉整批记忆不可检索的状态。
    */
-  memory_vector: { encoded: number; pending: number; dim: number | null; embedder: string } | null;
+  memory_vector:
+    | { encoded: number; pending: number; dim: number | null; embedder: string; mismatched: number; embedder_dim: number }
+    | null;
+  /**
+   * 嵌入通道**原因**面（诚实降级的可读出口）：当前嵌入器/维度/模型目录/降级原因。
+   * `memory_vector` 只给症状（"现在是哈希词袋"），这里回答"为什么"——没装权重、没装 onnxruntime、
+   * 还是词表/构建资产缺失。degraded 非空即表示神经嵌入未启用（原因原文，含可操作的下一步）。
+   */
+  embedding?: { embedder: string; dim: number; model_dir: string | null; degraded: string | null } | null;
   /**
    * 关系图状态（已知问题《关系图为空图》观测面）：边总数 / 类型分布 / 来源分布 / 权重统计 /
    * 记忆总数 / 是否还需要建图。edges=0 且 memories≥2 → 图仍是空的（`needs_build` 会为 true，
