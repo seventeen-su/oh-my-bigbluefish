@@ -40,6 +40,12 @@ import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 import { createJudgeExecutor } from './judge-executor.js';
 // S2：桌面通知桥（已知问题《待实现：与 dsh-desktop-notify 的兼容》——宿主面存在才接线，未装全静默）
 import { isDesktopNotifyLike, NotifyBridge, type DesktopNotifyLike } from './notify.js';
+// 宿主契约哨兵 + 配置面收敛（已知问题《非阻塞设计不足：插件注册期仍可能阻塞宿主》方向①②）
+import {
+  auditPluginConfig,
+  probeHostContract,
+  type HostContractReport,
+} from './host-contract.js';
 import { writeCompleted, writePending, clearPending } from '../supervisor/activation-log.js';
 import { ActivationContractSchema, type ActivationContract } from '../kernel/schemas/m.js';
 import { dshEventId, makeDshEvent } from './loop-hooks.js';
@@ -488,6 +494,12 @@ export interface ApplyResult {
   };
   /** 内核未加载时的状态面兜底数据源（kern_status 用——保证"能看到为什么没加载"） */
   safeStateRuntime?: KernRuntimeLike;
+  /**
+   * 宿主契约哨兵结论（已知问题《非阻塞设计不足…》方向②）：逐项列出依赖的宿主面、
+   * 是否就绪、缺失后果——回答"这次宿主升级到底动了什么"。同时给出该哨兵的**边界声明**
+   * （覆盖不了"插件行解析失败"——那发生在插件代码之前）。
+   */
+  hostContract?: HostContractReport;
 }
 
 /**
@@ -548,7 +560,63 @@ function probeObservedHostVersion(ctx: ContextLike): string | undefined {
   return fromService('dsh') ?? fromService('harness');
 }
 
-export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {  /**
+/**
+ * 插件入口（已知问题《非阻塞设计不足：插件注册期仍可能阻塞宿主》）：
+ * **本函数永不抛**——任何异常都转成"不加载 + 记录原因"的降级句柄。
+ *
+ * 边界（诚实）：这一层仍发生在**插件代码开始执行之后**。宿主解析 `agent.cordis.yml` 里这一行
+ * 插件（config 键校验 / inject 校验 / 入口解析）失败时，本函数没有机会运行——那一层只能由
+ * preset 组合（可选包含）或宿主策略兜底。见 runtime/host-contract.ts 的 scope_note。
+ */
+export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  try {
+    return applyInner(ctx, config);
+  } catch (err) {
+    // 注册期兜底：装配异常不得外溢（宿主启动与其余插件不受影响）；命令面/状态面尽力保留
+    const detail = err instanceof Error ? err.message : String(err);
+    try {
+      recordDegradation('plugin/apply', `插件注册期异常（${detail}）——插件降级为不加载，宿主不受影响`);
+    } catch {
+      // 降级记录本身失败 → 尽力而为（不因此再抛）
+    }
+    return {
+      safeState: {
+        ok: false,
+        kind: 'plugin_apply_failed',
+        reason: `插件注册期异常：${detail}`,
+        at: Date.now(),
+        platform: process.platform,
+        platform_degraded: null,
+        kernel_loaded: false,
+        details: {},
+      },
+    };
+  }
+}
+
+/** 插件主体（所有装配逻辑；对外只经 apply 的 try/catch 包装暴露） */
+function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
+  // 配置面收敛（已知问题《非阻塞设计不足…》方向①）：插件对 config **宽进**——未知键忽略并记降级，
+  // 不因"宿主侧多传/改名"导致插件加载失败。审计结论并入状态面（`host_contract` 段）。
+  const configReport = auditPluginConfig(config);
+  if (configReport.unknown_keys.length > 0) {
+    recordDegradation(
+      'config/unknown-keys',
+      `插件配置含未知键（已忽略，不影响加载）：${configReport.unknown_keys.join(', ')}——` +
+        '若为宿主侧 schema 变化，请核对 agent.cordis.yml 的 config 段',
+    );
+  }
+  // 宿主契约哨兵（方向②）：逐项探测服务/方法形状，只对缺失项降级（覆盖"服务改名/缺失"，
+  // 覆盖不了"插件行解析失败"——那在插件代码之前，见 host-contract.ts 的 scope_note）
+  const hostContract = probeHostContract(ctx);
+  if (hostContract.degraded.length > 0) {
+    const detail = hostContract.probes
+      .filter((p) => p.degraded)
+      .map((p) => `${p.service}（${p.onMissing}）`)
+      .join('；');
+    recordDegradation('host/contract', `宿主面缺项（只降级对应能力，插件照常加载）：${detail}`);
+  }
+  /**
    * 外核安全状态视图（已知问题《外核自身也要非阻塞》：当前是否安全状态、原因、发生时间可经状态面与
    * 日志查看）+ 内核未加载时的状态面兜底数据源。二者都在此就近定义——工具注册与返回值都要用，
    * 且必须在任何使用点之前完成绑定（TDZ）。
@@ -606,6 +674,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       components: { registered: [], active: [], suspicious: [], health: [] },
       degraded: '内核未加载（安全状态或装配失败）——详见 safe_state 段',
       safe_state: safeStateView(),
+      host_contract: hostContractView(),
     }),
   });
 
@@ -614,6 +683,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
    * 先入队，桥就绪后立即补发，而不是为了顺序把桥提前声明成一堆 let）。
    */
   const pendingNotifications: Array<{ kind: string; send: (n: NotifyBridge) => void }> = [];
+  /** 宿主契约哨兵结论（返回值与状态面可读：宿主面缺了什么、各自影响什么） */
+  const hostContractView = (): HostContractReport => hostContract;
   /**
    * 内核未加载的补发闸门（只发一次）：安全状态与"认知装配失败"是两条路径，任一命中即已告知主人，
    * 不重复打扰（去重也由 NotifyBridge 兜底，这里是显式的一次性语义）。
@@ -1074,6 +1145,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           verificationDebt: new VerificationDebt({ root: join(root, '.evolution', 'verification') }),
           // 状态面：外核安全状态段（内核未加载的原因可查——已知问题《内核加载失败不得阻塞宿主》）
           safeStateView,
+          // 状态面：宿主契约哨兵段（已知问题《非阻塞设计不足…》方向②——宿主面缺项与影响可查）
+          hostContractView,
           // 制品发现根集合（已知问题《制品索引未建立》修复）：会话工作目录优先 + 仓库根兜底。
           // ctx.get('workspace')/cwd 形状不确定 → 守卫式读取（缺失 → 只用仓库根，行为不变）
           ...(readWorkspaceRoot(ctx) !== undefined ? { workspaceRoot: readWorkspaceRoot(ctx)! } : {}),
@@ -1883,5 +1956,11 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
       platformView.sandbox_reason = '受限通道自检异常（按不可用处理）';
     });
 
-  return { cognitive, safeState: safeStateView(), platform: platformView, safeStateRuntime: safeStateRuntime() };
+  return {
+    cognitive,
+    safeState: safeStateView(),
+    platform: platformView,
+    hostContract: hostContractView(),
+    safeStateRuntime: safeStateRuntime(),
+  };
 }
