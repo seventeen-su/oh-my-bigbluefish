@@ -144,7 +144,7 @@ import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 // share-pipeline 既有 absorb 管线；layer 2 → supervisor(1) ✓）
 import { absorb, GitRegistry, type AbsorbDeps } from '../supervisor/share.js';
 // P1e：晋升门禁判定（kernel 纯函数，layer 2 → 2 ✓）+ 晋升执行/回滚契约（supervisor 层 1）+ 基准回放对照
-import { resolvePromotionGate, shouldPromoteToStable } from '../kernel/promotion-gate.js';
+import { executionEvidenceFromVerifications, resolvePromotionGate, shouldPromoteToStable } from '../kernel/promotion-gate.js';
 import {
   promoteToStable,
   readShadowSignals,
@@ -4253,6 +4253,9 @@ export class CognitiveRuntime {
         snapshotHash: this.snapshotHash,
         shadowLogPath: join(this.evolutionRoot, 'shadows', 'exposure.log'),
         sourceEvents: [`evolution/candidate:${draft.id}`],
+        // 执行型验证门禁取舍（evolve.policy.candidate_gate.require_execution_verification；
+        // 缺省 true = fail-closed）：受限通道不可用时候选不得以"降级跳过"通过验证
+        requireExecutionVerification: policy.evolve.candidate_gate.require_execution_verification ?? true,
         // P4：候选验证契约门禁（kernel 纯函数注入——seed → evidence → decideVerdict + trust + 非循环；
         // DAG：runtime(2) → kernel(2) ✓；supervisor 不 import kernel 逻辑）
         verificationGate: async (ctx) => {
@@ -4350,6 +4353,12 @@ export class CognitiveRuntime {
       // L2 统计（.evolution/shadows/——S7 exposure-<date>.jsonl + 既有 exposure.log 一并纳入；
       // 无样本 → 记录不阻塞，以基准门禁为准）
       const shadow = await readShadowSignals(join(this.evolutionRoot, 'shadows'));
+      // 执行型验证证据（已知问题《Linux 适配不完整》派生条）：trusted-latest 链头的 Evolution Object
+      // verifications 留痕（candidate-pipeline 写入 'G3-exec:strict(...)' / ':degraded(...)' / ':na(...)'）
+      // → 门禁据实判定"候选是否真的在受限通道里跑过"。无对象/无留痕 → undefined（缺证据 ≠ 证据为负）。
+      const headObjectId = await latestObjectId(layout, latest);
+      const headObject = headObjectId !== null ? await loadEvolutionObject(layout, latest, headObjectId) : null;
+      const verifyEvidence = executionEvidenceFromVerifications(headObject?.verifications);
       // 三层信号门禁判定（kernel 纯函数；阈值数据化）
       const { policy } = await this.ready();
       const gate = shouldPromoteToStable({
@@ -4358,6 +4367,7 @@ export class CognitiveRuntime {
         cost_degradation_ratio: bench.cost_degradation_ratio,
         shadow_signals: shadow,
         policy: resolvePromotionGate(policy.evolve),
+        ...(verifyEvidence !== undefined ? { verify_evidence: verifyEvidence } : {}),
       });
       if (!gate.ok) {
         return {
@@ -4370,10 +4380,10 @@ export class CognitiveRuntime {
         };
       }
       // 应晋升 → promoteToStable（activation_scope='project' 显式传入；object_id = P1d Evolution Object 链头）
-      const objectId = await latestObjectId(layout, latest);
+      const objectId = headObjectId;
       // P4：验证契约信任门禁需读取的 Evolution Object（loadEvolutionObject 结果传入 promoteToStable；
       // 无对象（旧布局/首个候选前）→ 门禁跳过——既有行为不变）
-      const object = objectId !== null ? await loadEvolutionObject(layout, latest, objectId) : null;
+      const object = headObject;
       const pr = await promoteToStable(
         {
           gate,

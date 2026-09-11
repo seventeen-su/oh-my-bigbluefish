@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 // R1：latest 解析委托 lines.ts（唯一版本线解析源）。ESM 循环 import（lines → snapshot 的
 // runGit/GIT_BIN）安全：两模块仅函数级延迟引用（无模块求值期交叉调用）。
 import { resolveLineCommit } from './lines.js';
+// 路径比较口径单一裁决点（大小写按平台 + 分隔符边界；已知问题《路径大小写被无条件放大》，涉及删除）
+import { isPathUnder } from './paths.js';
 
 /** git 可执行文件解析（迁移可移植；优先级：GIT_BIN 环境变量 → Windows where.exe 发现 → PATH 'git'）。
  *  DSH 沙箱可能拦截 PATH 解析（CONVENTIONS §2）→ 部署可设 GIT_BIN 指向完整路径。 */
@@ -164,6 +166,11 @@ function materializeInitialTree(layout: VersionLayout, commit: string): string {
  * 每次进程启动调用（本进程 materializedInitial 尚为空 → 不会误删本进程物化）：
  * 注册表（<bare>/worktrees/initial-*）的 gitdir 指向系统临时目录即视为上一进程残留 →
  * 删除目录 + 注册项 + worktree prune。返回清理数量（0 = 无残留）。
+ *
+ * 判定口径（已知问题《路径大小写被无条件放大》修复，**涉及删除，必须严格**）：
+ *   - 大小写按平台（Windows/macOS 不敏感，Linux 敏感）——此前在 Linux 上也无条件 toLowerCase；
+ *   - 以分隔符为边界（`/tmp` 不吃 `/tmp2/omb`）——此前无边界前缀匹配会把自定义 initialBase
+ *     （如 `/tmp2/omb`）误判为系统临时目录下的物化 → **误删另一份配置的目录**。
  */
 export function cleanupStaleInitialWorktrees(layout: VersionLayout = defaultLayout()): number {
   const regDir = path.join(layout.bareRepo, 'worktrees');
@@ -173,9 +180,9 @@ export function cleanupStaleInitialWorktrees(layout: VersionLayout = defaultLayo
   } catch {
     return 0; // 注册表不存在 → 无残留
   }
-  const tmpForms: string[] = [path.resolve(os.tmpdir()).toLowerCase()];
+  const tmpRoots: string[] = [path.resolve(os.tmpdir())];
   try {
-    tmpForms.push(path.resolve(fs.realpathSync(os.tmpdir())).toLowerCase());
+    tmpRoots.push(path.resolve(fs.realpathSync(os.tmpdir())));
   } catch {
     // tmpdir realpath 失败 → 仅原始形式比对
   }
@@ -191,15 +198,13 @@ export function cleanupStaleInitialWorktrees(layout: VersionLayout = defaultLayo
     } catch {
       continue; // 注册项不完整 → 留给 worktree prune
     }
-    const targetNorm = path.resolve(path.dirname(target)).toLowerCase();
-    // 系统临时目录判定：git 存长路径、os.tmpdir() 可能报短路径（Windows 8.3）且 realpath 不归一 →
-    // 注册名 initial-* + 路径含 <temp>\initial- 即视为系统临时物化；自定义 initialBase 不匹配
-    const isTemp = tmpForms.some((t) => targetNorm.startsWith(t))
-      || targetNorm.includes('\\temp\\initial-');
+    const wd = path.dirname(target); // <tmp>/initial-XXXX/.git → 物化目录
+    // 系统临时目录判定：目录**在**系统临时根之下（分隔符边界；git 存长路径、os.tmpdir() 可能报
+    // 短路径（Windows 8.3）且 realpath 不归一 → 两种形式都试）。自定义 initialBase 不在此列 → 不动。
+    const isTemp = tmpRoots.some((t) => isPathUnder(wd, t));
     if (!isTemp) {
       continue; // 非系统临时目录物化（如自定义 initialBase）→ 不动
     }
-    const wd = path.dirname(target); // <tmp>/initial-XXXX/.git → 物化目录
     try {
       if (fs.existsSync(wd)) {
         fs.rmSync(wd, { recursive: true, force: true });

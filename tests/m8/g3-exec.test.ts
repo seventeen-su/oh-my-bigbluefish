@@ -8,9 +8,13 @@
 //   ② G3-exec 通过：附脚本候选（脚本写结果文件 JSON ok + 尝试写候选目录被拒 → 沙盒语义验证）→ kind='exec'
 //   ③ G3-exec 拒绝：脚本报告 ok=false → kind='exec' ok=false → validateDataCandidate passed=false
 //   ④ G3-exec 拒绝：脚本未写结果文件（结果文件方案失败）→ ok=false
-//   ⑤ 降级（D5）：sandboxStatus 注入不可用 → G3-exec kind='degraded' 跳过 + degraded 记录，G1/G3-replay 照常
+//   ⑤ 降级（D5）取舍两态：通道不可用 → 缺省（require_execution_verification 未声明，fail-closed）
+//      `passed=false` + kind='degraded'（**没跑过 ≠ 验过了**——已知问题《Linux 适配不完整》派生条），
+//      显式 requireExecutionVerification=false 时回到"降级跳过不阻塞"语义
+//   ⑤b 降级候选不得跨到晋升侧：promotion gate 读候选留痕 → degraded 记录拒绝晋升
 //   ⑥ 临时目录清理：G3-exec / G3-replay 验证后候选验证目录零残留（candidateRoot fixture）
 //   ⑦ 并列记录：gates 同时含 g3（mode='replay'）与 g3Exec
+//   ⑧ 受限通道可用性判定必经真实自检（sandboxStatusAsync：授权目录写成功 + 非授权目录写被拒）
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,7 +25,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadPolicy } from '../../kernel/policy-loader.js';
 import { ensureLineSnapshot } from '../../substrate/lines.js';
 import type { VersionLayout } from '../../substrate/snapshot.js';
-import { validateDataCandidate } from '../../supervisor/candidate-pipeline.js';
+import { sandboxStatusAsync, resetSandboxChannelCache } from '../../substrate/sandbox.js';
+import { validateDataCandidate, executionVerificationGateNote } from '../../supervisor/candidate-pipeline.js';
+import { executionEvidenceFromVerifications, shouldPromoteToStable } from '../../kernel/promotion-gate.js';
 import type { CandidateDraft } from '../../kernel/schemas/evolution.js';
 import { buildLayoutFixture, teardownLayoutFixture, type LayoutFixture } from '../helpers/git.js';
 
@@ -182,7 +188,7 @@ describe('P3 G3-exec 执行型验证门（WRITE_RESTRICTED 受限通道 + 结果
     }
   });
 
-  fixtureIt('⑤ 降级（D5）：sandboxStatus 注入不可用（koffi 缺失模拟）→ G3-exec kind=degraded 跳过 + degraded 记录，G1/G3-replay 照常', async () => {
+  fixtureIt('⑤ 降级（D5）fail-closed 缺省：通道不可用 → 附脚本候选 passed=false + kind=degraded（没跑过 ≠ 验过了）', async () => {
     const candidateRoot = buildCandidateRoot();
     try {
       const r = await validateDataCandidate(
@@ -190,18 +196,101 @@ describe('P3 G3-exec 执行型验证门（WRITE_RESTRICTED 受限通道 + 结果
         {
           baselinePolicyDir,
           candidateRoot,
-          sandboxStatus: () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
         },
       );
-      expect(r.passed).toBe(true); // 降级不阻塞门禁语义
+      // 已知问题《Linux 适配不完整》派生条：旧实现此处 passed=true 且晋升门禁不读降级位 →
+      // 无沙盒机器上候选可能一次真实执行都没跑就晋级。现在缺省 fail-closed。
+      expect(r.passed).toBe(false);
+      expect(r.execution_verification).toBe('degraded');
       expect(r.gates.g3Exec?.kind).toBe('degraded');
-      expect(r.gates.g3Exec?.ok).toBe(true);
+      expect(r.gates.g3Exec?.ok).toBe(false);
+      expect(r.gates.g3Exec?.strict).toBe(false);
       expect(r.gates.g3Exec?.degraded).toMatch(/koffi/);
-      expect(r.gates.g3Exec?.detail).toMatch(/降级|跳过/);
+      expect(r.gates.g3Exec?.detail).toMatch(/require_execution_verification|没有真实执行过/);
+      // G1/G3-replay 本身照常通过（失败点只在执行型验证门）
       expect(r.gates.g1?.ok).toBe(true);
       expect(r.gates.g3?.ok).toBe(true);
     } finally {
       fs.rmSync(candidateRoot, { recursive: true, force: true });
+    }
+  });
+
+  fixtureIt('⑤ 降级（D5）显式接受：requireExecutionVerification=false → kind=degraded 跳过，G1/G3-replay 照常', async () => {
+    const candidateRoot = buildCandidateRoot();
+    try {
+      const r = await validateDataCandidate(
+        draft('kernel/policy/evolve.yaml', await evolveTweakContent(), { verify: SCRIPT_VERIFY_OK }),
+        {
+          baselinePolicyDir,
+          candidateRoot,
+          sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+          requireExecutionVerification: false,
+        },
+      );
+      expect(r.passed).toBe(true); // 部署方显式接受降级
+      expect(r.execution_verification).toBe('degraded');
+      expect(r.gates.g3Exec?.kind).toBe('degraded');
+      expect(r.gates.g3Exec?.ok).toBe(true);
+      expect(r.gates.g3Exec?.strict).toBe(false); // 未真实执行——留痕不撒谎
+      expect(r.gates.g3Exec?.degraded).toMatch(/koffi/);
+      expect(r.gates.g1?.ok).toBe(true);
+      expect(r.gates.g3?.ok).toBe(true);
+    } finally {
+      fs.rmSync(candidateRoot, { recursive: true, force: true });
+    }
+  });
+
+  fixtureIt('⑤b 降级候选不得跨到晋升侧：候选留痕 → promotion gate 拒绝晋升（degraded 不再当通过）', async () => {
+    const candidateRoot = buildCandidateRoot();
+    try {
+      const r = await validateDataCandidate(
+        draft('kernel/policy/evolve.yaml', await evolveTweakContent(), { verify: SCRIPT_VERIFY_OK }),
+        {
+          baselinePolicyDir,
+          candidateRoot,
+          sandboxStatus: async () => ({ available: false, reason: '平台无受限通道（模拟 Linux 无 bwrap）' }),
+          requireExecutionVerification: false, // 候选侧放行（部署方接受降级）
+        },
+      );
+      expect(r.passed).toBe(true);
+      // 但晋升侧默认要求"真实跑过"：候选留痕 degraded → 拒绝（同一取证链，不得自相矛盾）
+      const note = executionVerificationGateNote(r);
+      expect(note).toBe('G3-exec:degraded(no-channel)');
+      const evidence = executionEvidenceFromVerifications(['G1', 'G3', note]);
+      expect(evidence?.kind).toBe('degraded');
+      const verdict = shouldPromoteToStable({
+        baseline: { stable_commit: 'a'.repeat(40), stable_bench: { passed: 20, total: 20 } },
+        candidate: { latest_commit: 'b'.repeat(40), latest_bench: { passed: 20, total: 20 } },
+        cost_degradation_ratio: 0,
+        shadow_signals: { n: 0, failures: 0 },
+        policy: {
+          min_shadow_samples: 0,
+          max_shadow_failure_rate: 0.1,
+          cost_degradation_tolerance: 0.1,
+          require_execution_verification: true,
+        },
+        verify_evidence: evidence,
+      });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.reasons.some((x) => /执行型验证未真实发生/.test(x))).toBe(true);
+    } finally {
+      fs.rmSync(candidateRoot, { recursive: true, force: true });
+    }
+  });
+
+  fixtureIt('⑧ 受限通道可用性判定必经真实自检：sandboxStatusAsync 报自检结论（授权写成功 + 非授权写被拒）', async () => {
+    const st = await sandboxStatusAsync();
+    if (st.available) {
+      expect(st.verified).toBe(true);
+      expect(st.mechanism).toBeDefined();
+      expect(st.isolation).toBe('write-restricted');
+      expect(st.self_test_note ?? '').toMatch(/自检通过/);
+      expect(st.self_test_note ?? '').toMatch(/写成功|ALLOW/);
+    } else {
+      // 无通道环境（无沙盒的 CI）→ 必须给出可读原因且不谎称可用
+      expect(typeof st.reason).toBe('string');
+      expect((st.reason ?? '').length).toBeGreaterThan(0);
     }
   });
 

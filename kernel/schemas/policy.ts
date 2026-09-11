@@ -273,6 +273,17 @@ export const CandidateGateSchema = z.object({
   max_step_ratio: z.number().min(0).max(1),
   /** G3 成本劣化容忍（相对比例；基准报告比较语义——成本代理劣化超此值拒绝，§6.5.3 fitness 不降） */
   cost_degradation_tolerance: z.number().nonnegative(),
+  /**
+   * 附执行型验证脚本的候选是否**必须**真实执行通过才可验证通过（缺省 true，fail-closed）。
+   *
+   * 已知问题《Linux 适配不完整》派生条：受限执行通道不可用时候选走 G3-exec 降级跳过，
+   * 而旧实现把「降级」当作「通过」——在无沙盒的机器上，候选可能一次真实执行都没跑就晋级。
+   * 现在：带脚本的候选在降级时 `passed=false`（验证不通过，不入晋升）；只有显式把本项设为
+   * false 的部署才接受「降级跳过」的候选（安全取舍由部署方显式承担，不再是实现的默认行为）。
+   * 与脚本无关：L0 数据候选无执行型验证脚本（G3-exec N/A）不受本项影响——本项只约束
+   * 「候选声称有验证脚本、却没能真实执行」这一情形。
+   */
+  require_execution_verification: z.boolean().default(true),
 });
 export type CandidateGate = z.infer<typeof CandidateGateSchema>;
 
@@ -281,6 +292,7 @@ export const DEFAULT_CANDIDATE_GATE = {
   max_candidates_per_run: 3,
   max_step_ratio: 0.2,
   cost_degradation_tolerance: 0.1,
+  require_execution_verification: true,
 } as const;
 
 // ---- P1e：晋升门禁数据化（§6.5.3 防退化 / §7 三层信号；stable ← trusted-latest 显式门禁） ----

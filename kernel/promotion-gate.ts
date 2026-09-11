@@ -47,6 +47,32 @@ export interface PromotionGatePolicy {
   max_shadow_failure_rate: number;
   /** L1：成本劣化容忍（相对比例） */
   cost_degradation_tolerance: number;
+  /**
+   * L1：是否要求候选的执行型验证**真实跑过**才可晋升（缺省 true = fail-closed）。
+   * 来源 = evolve.policy.candidate_gate.require_execution_verification（resolvePromotionGate 同源注入，
+   * 与候选门禁同一开关，避免"候选侧 fail-closed、晋升侧放行"的口径分叉）。
+   * 缺省 undefined 亦按 true 判定（无证据不得晋升）——只有显式 false 才接受降级候选。
+   * 注：`verify_evidence` 未提供（旧对象/无留痕）时，本项为 true 会拒绝晋升；早期调用方若只想
+   * 复用 L1 基准/成本判定，须显式传 `require_execution_verification: false` 或在输入里给出证据。
+   */
+  require_execution_verification?: boolean;
+}
+
+/**
+ * 执行型验证证据（候选晋升门禁新增输入；来源 = 候选记录的 gates_passed 留痕，
+ * supervisor/candidate-pipeline 的 executionVerificationGateNote 写入）。
+ * 语义：候选携带执行型验证脚本时，是否在受限通道里**真实跑过并通过**。
+ *   - `verified`：跑过并通过（或候选本无执行型验证内容——L0 数据候选 N/A，无可执行之物）；
+ *   - `degraded`：通道不可用/异常 → 没跑过（旧实现把它当"通过"，是已知问题）；
+ *   - `rejected`/`unknown`：跑失败，或无法判定（旧记录无该留痕 → unknown，按未验证处理）。
+ */
+export type ExecutionEvidenceKind = 'verified' | 'degraded' | 'rejected' | 'unknown';
+
+/** 执行型验证证据（可选输入——未提供时按 unknown 处理，由 require 开关决定是否阻塞） */
+export interface ExecutionEvidence {
+  kind: ExecutionEvidenceKind;
+  /** 证据来源说明（候选记录的 gates_passed 条目；审计用） */
+  detail: string;
 }
 
 /** shouldPromoteToStable 输入（brief 契约：baseline/candidate/shadow_signals/policy；bench 由调用方传入） */
@@ -56,6 +82,11 @@ export interface PromotionGateInput {
   cost_degradation_ratio: number;
   shadow_signals: ShadowSignals;
   policy: PromotionGatePolicy;
+  /**
+   * L1：执行型验证证据（可选——旧调用方/旧对象无此输入 → unknown）。
+   * 与 candidate-pipeline 的 require_execution_verification 同一取舍：缺省 policy 要求"跑过"。
+   */
+  verify_evidence?: ExecutionEvidence;
 }
 
 /** 判定结果（reasons = 三层信号逐条说明；ok=false 时至少一条 reason 为拒绝原因） */
@@ -83,7 +114,64 @@ export function resolvePromotionGate(policy: EvolvePolicy): PromotionGatePolicy 
       pg?.cost_degradation_tolerance ??
       policy.candidate_gate.cost_degradation_tolerance ??
       DEFAULT_PROMOTION_GATE.cost_degradation_tolerance,
+    // 与候选门禁同源（单一开关，避免"候选侧 fail-closed、晋升侧放行"的口径分叉）
+    require_execution_verification: policy.candidate_gate.require_execution_verification ?? true,
   };
+}
+
+/**
+ * 执行型验证证据 → 门禁判定（通过 → null；不通过 → 拒绝理由）。
+ *
+ * **缺证据不等于证据为负**（第一轮实现的修正）：`verify_evidence` 缺失表示「该候选产生于本门禁项
+ * 存在之前」（旧 Evolution Object / 既有 trusted-latest 链）或「调用方未传」——这两种情况下把
+ * 已有信任链上的对象一律拒晋升会造成级联停摆，且并非这套门禁要拦的东西。本门禁拦的是**显式记录**：
+ *   - `kind='degraded'`（候选自己写了「没跑成」）→ 拒绝；
+ *   - `kind='rejected'`（跑了但失败）→ 拒绝；
+ *   - `kind='verified'` → 通过；
+ *   - 未提供/`unknown` → 记录「无留痕，按未验证放行（不阻塞）」，不拒绝。
+ * `require_execution_verification === false` 时降级证据也不阻塞（部署方显式接受），但理由如实标注。
+ */
+function judgeExecutionEvidence(
+  evidence: ExecutionEvidence | undefined,
+  policy: PromotionGatePolicy,
+): string | null {
+  const kind = evidence?.kind ?? 'unknown';
+  const detail = evidence?.detail ?? '候选无执行型验证留痕（本门禁项引入前的旧对象）';
+  if (kind === 'verified' || kind === 'unknown') {
+    return null; // 无留痕不构成拒绝理由（见上方说明）
+  }
+  if (policy.require_execution_verification === false) {
+    return null; // 显式接受降级（理由里如实标注）
+  }
+  switch (kind) {
+    case 'degraded':
+      return `L1 硬门: 执行型验证未真实发生（${detail}）——受限通道不可用/异常时候选没跑过，拒绝晋升`;
+    default:
+      return `L1 硬门: 执行型验证未通过（${detail}）——拒绝晋升`;
+  }
+}
+
+/** 候选记录/Evolution Object 的验证留痕 → 执行型验证证据（无相关条目 → undefined = 无留痕） */
+export function executionEvidenceFromVerifications(
+  verifications: readonly string[] | undefined,
+): ExecutionEvidence | undefined {
+  if (verifications === undefined) {
+    return undefined;
+  }
+  const note = verifications.find((v) => v.startsWith('G3-exec:'));
+  if (note === undefined) {
+    return undefined;
+  }
+  const kind: ExecutionEvidenceKind = note.startsWith('G3-exec:strict')
+    ? 'verified'
+    : note.startsWith('G3-exec:degraded')
+      ? 'degraded'
+      : note.startsWith('G3-exec:rejected')
+        ? 'rejected'
+        : note.startsWith('G3-exec:na')
+          ? 'verified' // 无执行型验证内容（L0 数据候选）——无可执行之物，不构成"没验过"
+          : 'unknown';
+  return { kind, detail: `候选留痕 ${note}` };
 }
 
 /**
@@ -111,6 +199,19 @@ export function shouldPromoteToStable(input: PromotionGateInput): PromotionGateV
       `${(policy.cost_degradation_tolerance * 100).toFixed(1)}%（数据化阈值）` +
       (costOk ? '通过' : '——拒绝'),
   );
+  // L1：执行型验证证据（已知问题《Linux 适配不完整》派生条——"降级也当通过"不得跨到晋升侧）
+  const execReject = judgeExecutionEvidence(input.verify_evidence, policy);
+  const execKind = input.verify_evidence?.kind ?? 'unknown';
+  const execDetail = input.verify_evidence?.detail ?? '候选无执行型验证留痕（本门禁项引入前的旧对象）';
+  reasons.push(
+    execReject ??
+      `L1 硬门: 执行型验证证据 ${execKind}（${execDetail}）` +
+        (execKind === 'verified'
+          ? '通过'
+          : execKind === 'unknown'
+            ? '——无留痕不阻塞（缺证据 ≠ 证据为负）'
+            : '——未真实执行，但 require_execution_verification=false（部署方显式接受）不阻塞'),
+  );
 
   // ---- L2 统计层（shadow/canary exposure；无样本/样本不足不阻塞，基准门禁为准） ----
   let l2Ok = true;
@@ -136,5 +237,5 @@ export function shouldPromoteToStable(input: PromotionGateInput): PromotionGateV
     'L3 语义: judge 旁证接口占位（P4 盲化 judge 接入；judge 仅旁证不作晋升硬信号，§7.1 设计纪律）——不阻塞',
   );
 
-  return { ok: fitOk && costOk && l2Ok, reasons };
+  return { ok: fitOk && costOk && l2Ok && execReject === null, reasons };
 }

@@ -14,11 +14,19 @@
 #   - candidate_gate.max_candidates_per_run：单次 /evolve（与空闲期量子）最多生成+验证候选数 K（预算守卫）
 #   - candidate_gate.max_step_ratio：参数单次调整相对步长上限（strength 绝对/ratio 相对均封顶）
 #   - candidate_gate.cost_degradation_tolerance：G3 成本劣化容忍（基准报告比较语义，超此值拒绝）
+#   - candidate_gate.require_execution_verification：附执行型验证脚本的候选是否**必须真实执行通过**
+#     才可验证通过（缺省 true = fail-closed）。受限执行通道不可用（无沙盒/容器禁用用户命名空间）时，
+#     旧实现把"降级跳过"当作通过 → 候选可能一次真实执行都没跑就晋级（已知问题《Linux 适配不完整》派生条）。
+#     现在缺省拒绝；显式设为 false 才接受降级跳过（安全取舍由部署方显式承担），且该取舍随候选留痕
+#     （gates_passed 写 'G3-exec:degraded(no-channel)'，stable 晋升门禁据此默认拒绝——同一取证链）。
+#     与脚本无关：L0 数据候选本无执行型验证内容（G3-exec N/A）不受本项影响。
 # P1e 晋升门禁（§6.5.3 防退化「只接受通过全部门 + fitness 不降」+ §7 三层信号；stable ← trusted-latest 显式门禁）：
 #   - promotion_gate.min_shadow_samples：L2 shadow exposure 样本纳入判定的最低数
 #     （n ≥ 此值才按失败率判定；n=0 → 无 shadow 数据不阻塞，以基准门禁为准）
 #   - promotion_gate.max_shadow_failure_rate：L2 shadow 失败率上限（n 足够时超此值拒晋升，后验不劣化）
 #   - promotion_gate.cost_degradation_tolerance：L1 成本劣化容忍（缺省回退 candidate_gate 同值——向后兼容）
+#   - 执行型验证证据（L1）：晋升侧读 trusted-latest 链头 Evolution Object 的 verifications 留痕——
+#     候选留痕为 degraded/rejected → 拒晋升；require_execution_verification 与 candidate_gate 同源。
 # P7 金丝雀判定主判开关（§10.3 Anytime-valid Certificate——anytime-valid 为主判，初值规则保留为降级/对照）：
 #   - e_process.mode：'e-process'（自实现 Bernoulli 超鞅主判）| 'rule'（初值规则主判，降级/对照）
 #   - e_process.fallback_to_rule：e-process 判定异常 → 回退初值规则（fail-safe 不静默吞错）
@@ -60,6 +68,8 @@ candidate_gate:
   max_candidates_per_run: 3
   max_step_ratio: 0.2
   cost_degradation_tolerance: 0.1
+  # 附执行型验证脚本的候选必须真实执行通过才可验证通过（fail-closed 缺省；见上方说明）
+  require_execution_verification: true
 
 promotion_gate:
   min_shadow_samples: 0

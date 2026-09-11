@@ -450,9 +450,11 @@ describe('S9 候选验证增强通道（G3-exec deps.dynamicRunner 注入面）'
         baselinePolicyDir,
         candidateRoot,
         dynamicRunner: runner,
-        sandboxStatus: () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+        sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+        // 本用例聚焦"runner 失败 → 回退受限路径"的降级记录（非降级放行语义）
+        requireExecutionVerification: false,
       });
-      expect(r.passed).toBe(true); // 降级不阻塞门禁语义
+      expect(r.passed).toBe(true); // 部署方显式接受降级时不阻塞门禁语义
       expect(r.gates.g3Exec?.kind).toBe('degraded');
       expect(r.gates.g3Exec?.ok).toBe(true);
       // 回退记录：runner 通道失败 → 回退受限子进程路径（受限通道也不可用 → D5 降级）
@@ -496,7 +498,8 @@ describe('S9 候选验证增强通道（G3-exec deps.dynamicRunner 注入面）'
         baselinePolicyDir,
         candidateRoot,
         dynamicRunner: runner,
-        sandboxStatus: () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+        sandboxStatus: async () => ({ available: false, reason: 'koffi 缺失（模拟）' }),
+        requireExecutionVerification: false,
       });
       expect(r.passed).toBe(true);
       expect(r.gates.g3Exec?.kind).toBe('degraded');

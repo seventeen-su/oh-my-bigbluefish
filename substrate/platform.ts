@@ -5,8 +5,11 @@
 //   - 识别（`platformProvider()`）：平台类型 + 能力探测（只读机制 / 沙盒机制）；
 //   - 拉起（`readOnly.apply` / `reset`）：三线工作树只读施加与释放——Windows 用 icacls ACL，
 //     Linux/macOS 用 POSIX 权限位（目录去写位，对目录即"不可增删改条目"）；
-//   - 控制（`caps.sandbox`）：受限执行通道的可用性标注（实现仍在 substrate/sandbox.ts，
-//     该模块的 Win32 原语为**惰性加载**，Linux 上不触碰 win32 模块与 koffi）。
+//   - 控制（`caps.sandbox`）：受限执行通道的**机制类别**标注（实现按平台惰性加载：
+//     substrate/sandbox-win32.ts 用 Win32 原语 + koffi，substrate/sandbox-posix.ts 用
+//     bwrap 命名空间或 Node 权限模型；Linux 上不触碰 win32 模块与 koffi）。
+//     写限制是否**真的生效**由 substrate/sandbox.ts 的通道自检确认（sandboxStatusAsync）——
+//     识别层不假装可用。
 //
 // 三条纪律：
 //   1. **显式降级并标注**：平台能力缺失（如 POSIX 权限位被 ACL/容器覆盖、受限令牌不可用）→ 返回
@@ -21,6 +24,13 @@ import path from 'node:path';
 /** 平台类别（仅区分三类：windows / posix（Linux、macOS）/ 其它未知） */
 export type PlatformKind = 'windows' | 'posix' | 'unknown';
 
+/** 沙盒机制标识（识别面枚举；实现分别见 substrate/sandbox-win32.ts 与 substrate/sandbox-posix.ts） */
+export type SandboxMechanism =
+  | 'win32-restricted-token'
+  | 'posix-bwrap'
+  | 'posix-node-permission'
+  | 'none';
+
 /** 只读机制与沙盒机制的可用性（**识别**面的输出；degraded 非空 = 显式降级并标注） */
 export interface PlatformCapabilities {
   platform: PlatformKind;
@@ -30,8 +40,9 @@ export interface PlatformCapabilities {
   read_only: 'icacls' | 'posix-mode' | 'none';
   /** 只读机制是否可用（false → 只读施加会降级；degraded 说明原因） */
   read_only_available: boolean;
-  /** 沙盒机制：'win32-restricted-token'（Windows 受限令牌）/ 'none'（无可用受限执行通道） */
-  sandbox: 'win32-restricted-token' | 'none';
+  /** 沙盒机制：'win32-restricted-token'（Windows 受限令牌）/ 'posix-bwrap'（bubblewrap 命名空间）/
+   *  'posix-node-permission'（Node 权限模型，零依赖）/ 'none'（无可用受限执行通道） */
+  sandbox: SandboxMechanism;
   /** 沙盒机制是否可用（false → 候选执行走降级通道，安全语义变化已标注） */
   sandbox_available: boolean;
   /** 降级说明（空 = 全部能力可用） */
@@ -87,7 +98,17 @@ function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(shared), 0, 0, ms);
 }
 
-/** 目录真实写探测（写成功 = 可写；EPERM/EACCES = 只读）——两条平台路径共用同一判据 */
+/**
+ * 目录真实写探测（写成功 = 可写；权限拒绝/只读介质 = 只读）——两条平台路径共用同一判据。
+ *
+ * 判定完备性（已知问题《只读介质被判"可写"》）：此前只把 `EPERM`/`EACCES` 当只读，其余错误一律
+ * 「保守按可写」——但**只读介质**给出的不是权限错误而是文件系统错误：`EROFS`（容器只读挂载、
+ * 光盘镜像、写保护分区——最常见）、`ENOSPC`（空间耗尽/配额用尽，表现为"看起来可写、写就失败"）、
+ * `EBUSY`/`ETXTBSY`（介质/文件被占用）。这些一律判"不可写"，让上层走"只读已成立"的分支，
+ * 而不是每次启动都报"只读丢失"并反复施加（反复子进程 + 反复降级）。
+ * 其余错误（路径不存在、名太长等）同样按不可写返回——写能力未被证实就不该当作已证实。
+ * 返回 null 仅保留给「目录缺失」这一语义明确的第三种状态。
+ */
 function probeWritable(dir: string): boolean | null {
   if (!fs.existsSync(dir)) {
     return null; // 目录缺失 → 由调用方按"不可用"处理
@@ -95,28 +116,68 @@ function probeWritable(dir: string): boolean | null {
   const probe = path.join(dir, `.omb-acl-probe-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
   try {
     fs.writeFileSync(probe, '');
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EPERM' || code === 'EACCES') {
-      return false; // 写被拒 → 只读
-    }
-    return true; // 其他错误 → 保守按可写处理（由工作树修复兜底）
+  } catch {
+    return false; // 写失败 = 不可写（权限/只读介质/占用/空间——原因不改变结论）
   }
   try {
     fs.unlinkSync(probe);
   } catch {
-    // 删除失败 → 忽略（重新施加只读后为残留）
+    // 删除失败 → 忽略（重新施加只读后为残留）；写成功本身即证明可写
   }
   return true;
 }
 
-/** Windows：icacls ACL（授权式只读，无 deny ACE/SYNCHRONIZE 副作用）——与引入本提供者前完全同参 */
+/** 可执行文件是否在 PATH 上（零依赖探测；不引子进程） */
+function hasExecutable(name: string): boolean {
+  const pathEnv = process.env.PATH ?? '';
+  if (pathEnv.length === 0) {
+    return false;
+  }
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (dir.length === 0) continue;
+    try {
+      fs.accessSync(path.join(dir, name), fs.constants.X_OK);
+      return true;
+    } catch {
+      // 不在该目录 → 继续
+    }
+  }
+  return false;
+}
+
+/** bwrap（bubblewrap）是否在 PATH 上（POSIX 首选受限通道；真正可用性由 substrate/sandbox.ts 自检确认） */
+function hasBwrap(): boolean {
+  return process.platform === 'linux' && hasExecutable('bwrap');
+}
+
+/** Node 权限模型是否可用（`--permission` 自 Node 20 起；真正生效由自检确认——零系统依赖的兜底通道） */
+function nodePermissionCapable(): boolean {
+  const major = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
+  return Number.isFinite(major) && major >= 20;
+}
+
+/**
+ * 只读 ACL 授予主体（**用 well-known SID 而非账户名**——已知问题《icacls 用 Everyone 而非 SID》）。
+ *
+ * 语义与账户名 `Everyone` 完全等价：icacls 的 SID 形式（`*<SID>`）由系统直接使用，不做名称解析；
+ * 而账户名字符串需要按**系统语言/本地化**解析——德语 `Jeder`、法语 `Tout le monde` 等非英文
+ * Windows 上 `Everyone` 可能解析失败 → 只读施加抛错 → 工作树保持可写（安全语义静默降级）。
+ *
+ * 常量与同仓 `substrate/win32-abi.ts` 的 `WinWorldSid`（= Win32 枚举 WELL_KNOWN_SID_TYPE.WinWorldSid
+ * = 1，用于受限令牌 keep-alive 组）指同一个 SID：该处是**枚举值**（FFI 入参用），本处需要**字符串形式**
+ * （icacls 命令行用），两者不是可互换的表示——故此处以字符串常量声明并交叉标注，不假装复用同一个值。
+ */
+const WORLD_SID_STRING = 'S-1-1-0';
+
+/** Windows：icacls ACL（授权式只读，无 deny ACE/SYNCHRONIZE 副作用）。 */
 function windowsReadOnly(): ReadOnlyMechanism | null {
   const systemRoot = process.env.SystemRoot;
   if (systemRoot === undefined || systemRoot.length === 0) {
     return null; // SystemRoot 缺失 → icacls 不可解析（能力缺失，由调用方标注降级）
   }
   const icacls = path.join(systemRoot, 'System32', 'icacls.exe');
+  // 唯一参数变化：授予主体 'Everyone'（账户名，需本地化解析）→ '*S-1-1-0'（SID，免解析）
+  const grantee = `*${WORLD_SID_STRING}`;
   const run = (args: string[], what: string, dir: string): void => {
     let last: unknown;
     for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
@@ -134,7 +195,7 @@ function windowsReadOnly(): ReadOnlyMechanism | null {
     throw new Error(`icacls ${dir} ${what}失败 (exit=${(e as { status?: number }).status ?? '?'}): ${detail}`);
   };
   return {
-    apply: (dir) => run([dir, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C'], '只读 ACL 施加', dir),
+    apply: (dir) => run([dir, '/inheritance:r', '/grant:r', `${grantee}:RX`, '/T', '/C'], '只读 ACL 施加', dir),
     reset: (dir) => run([dir, '/reset', '/T', '/C'], '只读 ACL 释放', dir),
     isReadOnly: (dir) => probeWritable(dir) === false,
   };
@@ -229,11 +290,17 @@ function detect(): PlatformCapabilities {
   } else {
     notes.push(`未识别的平台 "${raw}"——只读机制不可用，只读施加降级为跳过`);
   }
-  // 沙盒机制：Windows 受限令牌（实现见 substrate/sandbox.ts，Win32 原语惰性加载）；POSIX 无等价实现
-  const sandboxAvailable = platform === 'windows';
-  const sandbox: PlatformCapabilities['sandbox'] = sandboxAvailable ? 'win32-restricted-token' : 'none';
+  // 沙盒机制（**识别层只报机制类别**；写限制是否真的生效由 substrate/sandbox.ts 的通道自检确认）：
+  //   - Windows：受限令牌（实现见 sandbox-win32.ts，Win32 原语惰性加载）；
+  //   - POSIX：bwrap（命名空间 + 只读绑定）优先，其次 Node 权限模型（零系统依赖）——两者都不可用 → none。
+  //     已知问题《Linux 适配不完整》主条：此前 POSIX 恒 none → 候选验证 G3-exec 恒降级 → 候选可能
+  //     一次真实执行都没跑就晋级。现在 POSIX 有真实受限通道（可用性由自检确认），机制缺失时才降级。
+  const posixMech: SandboxMechanism = hasBwrap() ? 'posix-bwrap' : nodePermissionCapable() ? 'posix-node-permission' : 'none';
+  const sandbox: SandboxMechanism =
+    platform === 'windows' ? 'win32-restricted-token' : platform === 'posix' ? posixMech : 'none';
+  const sandboxAvailable = sandbox !== 'none';
   if (!sandboxAvailable) {
-    notes.push(`平台 ${raw} 无受限执行通道（沙盒机制 = none）——候选执行走降级通道，安全语义变化已标注`);
+    notes.push(`平台 ${raw} 无可用受限执行通道（沙盒机制 = none）——候选执行走降级通道，安全语义变化已标注`);
   }
   return {
     platform,

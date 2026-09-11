@@ -17,30 +17,11 @@ import type { SpawnedRestricted } from './win32-spawn.js'
 import { tempWriteSid, workspaceWriteSid } from './win32-sid.js'
 // 受限子进程
 // ---------------------------------------------------------------------------
+// 入参/结果类型由平台无关门面（substrate/sandbox.ts，本文件的调用契约）单点定义——
+// 本文件只 import 类型（**不** import 门面实现：门面动态 import 本文件，反向静态 import 会成环）。
+import type { RunRestrictedOptions, RunRestrictedResult } from './sandbox.js'
 
-export interface RunRestrictedOptions {
-  /** 受限子进程要执行的脚本（绝对路径；node 以 .cjs/.js 运行，宿主写入，子进程只需读） */
-  script: string
-  /** 传给脚本的额外 argv */
-  args?: string[]
-  /** 子进程工作目录（绝对路径） */
-  cwd: string
-  /** 写允许目录集合（绝对路径，须已存在且为调用者所有）；写能力精确覆盖该集合 */
-  writableDirs: string[]
-  /** 私有 temp 目录（缺省自建：os.tmpdir() 下 mkdtemp，运行后删除；提供时须已存在，不删除） */
-  tempDir?: string
-  /** 结果文件路径：经 OMB_SANDBOX_RESULT_FILE 环境变量传给子进程（脚本写结果到 writableDirs 内路径） */
-  resultFile?: string
-  /** 超时毫秒（缺省 60000）；超时后 TerminateJobObject 杀整棵进程树 */
-  timeoutMs?: number
-}
-
-export interface RunRestrictedResult {
-  /** 退出码；timedOut 时恒为 null（被超时杀掉，退出码无意义） */
-  code: number | null
-  /** true = 超时被杀（TerminateJobObject 杀 job 树） */
-  timedOut: boolean
-}
+export type { RunRestrictedOptions, RunRestrictedResult }
 
 const DEFAULT_TIMEOUT_MS = 60_000
 /** GetExitCodeProcess 轮询间隔 */
@@ -120,7 +101,7 @@ async function waitExit(api: Win32Bindings, spawned: SpawnedRestricted, timeoutM
  * CreateRestrictedToken([logon, Everyone, writeSid, tempSid]) → setTokenDefaultDaclGrant）→
  * 环境改写 → CreateProcessAsUserW（kill-on-close job）→ 轮询退出码/超时杀 → 清理。
  * 失败即抛（fail-closed）；writableDirs ACE 常驻，私有 temp ACE 撤销 + 自建目录删除。
- * 调用方应在执行前经 sandboxStatus() 探测通道可用性（P3/D5：不可用 → 上层降级记录跳过）。
+ * 调用方应在执行前经 sandboxStatusAsync() 探测通道可用性（P3/D5：不可用 → 上层降级记录跳过）。
  */
 export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult> {
   const script = path.resolve(opts.script)
@@ -256,5 +237,87 @@ export async function runRestricted(opts: RunRestrictedOptions): Promise<RunRest
       throw new AggregateError([error, ...failures], `runRestricted 失败且 ${failures.length} 项清理也失败`)
     }
     throw error
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 通道自检（与 substrate/sandbox-posix.ts 的自检同一判据；见 substrate/sandbox.ts SandboxSelfTest）
+// ---------------------------------------------------------------------------
+
+/** 自检探针：argv = [allowedDir, deniedDir, resultFile]（与 POSIX 自检同款判定） */
+const SELF_TEST_SCRIPT = `const fs = require('node:fs');
+const path = require('node:path');
+const [allowed, denied, resultFile] = process.argv.slice(2);
+const probe = (dir) => {
+  try {
+    fs.writeFileSync(path.join(dir, '.omb-self-test'), 'x');
+    return 'ALLOW';
+  } catch (err) {
+    return (err && err.code) ? err.code : String(err);
+  }
+};
+fs.writeFileSync(resultFile, JSON.stringify({ allowedResult: probe(allowed), deniedResult: probe(denied) }));
+`
+
+/** Windows 通道（受限令牌）；自检用真实受限执行跑一次写拒绝探针——自检不过即通道不可用（诚实降级） */
+export function win32SandboxChannel(): {
+  mechanism: string
+  isolation: 'write-restricted'
+  mechanism_note: string
+  selfTest(): Promise<{ ok: boolean; note: string }>
+  runRestricted(opts: RunRestrictedOptions): Promise<RunRestrictedResult>
+} {
+  return {
+    mechanism: 'win32-restricted-token',
+    isolation: 'write-restricted',
+    mechanism_note: 'Windows 受限令牌（WRITE_RESTRICTED）：写能力精确覆盖 writableDirs 集合（koffi FFI 直调 Win32）',
+    async selfTest() {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-sandbox-selftest-'))
+      const allowed = path.join(root, 'allowed')
+      const denied = path.join(root, 'denied')
+      fs.mkdirSync(allowed, { recursive: true })
+      fs.mkdirSync(denied, { recursive: true })
+      const script = path.join(root, 'self-test.cjs')
+      fs.writeFileSync(script, SELF_TEST_SCRIPT, 'utf8')
+      const resultFile = path.join(allowed, 'self-test-result.json')
+      try {
+        await runRestricted({
+          script,
+          args: [allowed, denied, resultFile],
+          cwd: allowed,
+          writableDirs: [allowed],
+          resultFile,
+          timeoutMs: 20_000,
+        })
+        if (!fs.existsSync(resultFile)) {
+          return { ok: false, note: '受限令牌自检未产出结果文件（受限进程未跑通或写授权失效）' }
+        }
+        const parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')) as {
+          allowedResult?: unknown
+          deniedResult?: unknown
+        }
+        const allowedResult = String(parsed.allowedResult)
+        const deniedResult = String(parsed.deniedResult)
+        if (allowedResult !== 'ALLOW') {
+          return { ok: false, note: `受限令牌自检失败：授权目录写被拒（${allowedResult}）——通道过紧` }
+        }
+        if (deniedResult === 'ALLOW') {
+          return { ok: false, note: '受限令牌自检失败：非授权目录写成功——写限制未生效（fail-closed 拒绝）' }
+        }
+        return {
+          ok: true,
+          note: `受限令牌自检通过：授权目录写成功 + 非授权目录写被拒（${deniedResult}）`,
+        }
+      } catch (err) {
+        return { ok: false, note: `受限令牌自检异常（${(err as Error).message}）` }
+      } finally {
+        try {
+          fs.rmSync(root, { recursive: true, force: true })
+        } catch {
+          // 自检夹具清理失败 → 残留（无害）
+        }
+      }
+    },
+    runRestricted,
   }
 }
