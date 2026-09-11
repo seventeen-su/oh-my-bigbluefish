@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 只读施加/释放走**生产**的平台提供者（真机暴露：此前测试硬编码 icacls，Linux 上整套 fixture 崩掉）
+import { platformProvider } from '../../substrate/platform.js';
 
 /** git 完整路径（沙箱拦截 PATH 解析，优先完整路径；GIT_BIN 环境变量优先，其次 Windows where.exe 发现，最后 PATH 'git'） */
 export const GIT = ((): string => {
@@ -91,8 +93,12 @@ export function runGit(args: string[], opts: GitRunOptions = {}): string {
   );
 }
 
-/** 运行 icacls（完整路径），返回 stdout（去尾空白）；非 0 退出抛错。瞬态锁错误短退避重试（同 runGit）。 */
+/** 运行 icacls（完整路径），返回 stdout（去尾空白）；非 0 退出抛错。瞬态锁错误短退避重试（同 runGit）。
+ *  **仅 Windows**：非 Windows 上调用即 fail-loud（有意的——避免又一处"只在 Windows 存在的实现"）。 */
 export function runIcacls(args: string[]): string {
+  if (process.platform !== 'win32') {
+    throw new Error(`runIcacls: 仅 Windows 有 icacls（当前平台 ${process.platform}）——请改用 applyReadOnlyAcl/resetReadOnly`)
+  }
   let last: unknown;
   for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
     try {
@@ -134,7 +140,27 @@ export function runIcacls(args: string[]): string {
  *      （写类操作均 EPERM/EACCES）。恢复可写：`icacls <dir> /reset /T /C`（所有者）。
  */
 export function applyReadOnlyAcl(dir: string): void {
-  runIcacls([dir, '/inheritance:r', '/grant:r', 'Everyone:RX', '/T', '/C']);
+  // **走生产同一条路径**（真机暴露的问题）：平台提供者自己决定用 icacls ACL 还是 POSIX 权限位。
+  // 此前这里硬编码 icacls —— 于是"测试从不验证 Linux 只读施加"：真机上 fixture 直接以
+  // `icacls ... 失败` 崩掉，而生产代码其实是好的（同一件事两套实现，测试那套只在 Windows 存在）。
+  const p = platformProvider()
+  if (p.readOnly !== null) {
+    p.readOnly.apply(dir)
+    return
+  }
+  if (process.platform === 'win32') {
+    throw new Error('applyReadOnlyAcl: Windows 上 icacls 不可用（SystemRoot 缺失？）——fixture 需要只读语义')
+  }
+  // 非 Windows 且无只读机制（chmod 不可用等）→ 与生产"能力缺失 → 跳过并标注"一致，不抛
+}
+
+/** 释放只读（平台无关，走生产提供者）；能力缺失/释放失败 → 静默（与生产一致：不阻断清理） */
+export function resetReadOnly(dir: string): void {
+  try {
+    platformProvider().readOnly?.reset(dir)
+  } catch {
+    // 释放失败 → 交给调用方的删除兜底
+  }
 }
 
 /** initial 基线 manifest（正式 stable/ 内容） */
@@ -292,18 +318,15 @@ export async function removeDirRetry(target: string, attempts = 3, delayMs = 100
   throw lastErr;
 }
 
-/** 清理 fixture：先 rmSyncRetry；若被 ACL 挡住（只读 ACL 可能挡递归删除），先 icacls /reset 还原默认 ACL 再重试删除。 */
+/** 清理 fixture：先 rmSyncRetry；若被只读挡住（Windows ACL / POSIX 去写位都可能挡递归删除），
+ *  先经平台提供者释放只读再重试删除。 */
 export function teardownLayoutFixture(fx: LayoutFixture): void {
   try {
     rmSyncRetry(fx.root);
     return;
   } catch {
-    // 只读 ACL 可能挡住递归删除 → 还原 ACL 后重试
-    try {
-      runIcacls([fx.root, '/reset', '/T', '/C']);
-    } catch {
-      // 还原失败也继续尝试删除
-    }
+    // 只读可能挡住递归删除 → 释放后重试（平台无关）
+    resetReadOnly(fx.root);
     rmSyncRetry(fx.root);
   }
 }
