@@ -129,6 +129,7 @@ describe('③ 配置面收敛：宽进、未知键忽略并上报', () => {
       'concurrency',
       'embeddingModelDir',
       'embeddingThreads',
+      'maintenance',
     ]) {
       expect(KNOWN_PLUGIN_CONFIG_KEYS).toContain(key);
     }
@@ -155,6 +156,7 @@ describe('③ 配置面收敛：宽进、未知键忽略并上报', () => {
       desktopNotify: false,
       embeddingModelDir: 'C:/tmp/models/bge-small-zh-v1.5',
       embeddingThreads: 1,
+      maintenance: undefined,
     };
     const r = auditPluginConfig(fullConfig);
     expect(r.unknown_keys).toEqual([]);

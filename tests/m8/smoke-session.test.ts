@@ -203,9 +203,14 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
       expect(types).toContain(t);
     }
     // happy path 无**功能性**降级（三钩子全接线 + 全成功）。
-    // `host/contract` 是宿主契约哨兵的**预期留痕**（fakeCtx 只提供本用例需要的那几个面，
-    // 哨兵如实报告"effect/llm/subagents/… 不存在"）——它不是本用例断言的对象，故排除。
-    const functional = degradationLog().filter((d) => d.hook !== 'host/contract');
+    // 排除两类"环境决定、非本用例断言对象"的留痕：
+    //   - `host/contract`：宿主契约哨兵的**预期留痕**（fakeCtx 只提供本用例需要的那几个面，
+    //     哨兵如实报告"effect/llm/subagents/… 不存在"）；
+    //   - `memory/embedding`：神经嵌入是否可用取决于**盘上有没有权重**（`pnpm fetch-embedding-model`）。
+    //     装了 → 不降级；没装 → 诚实降级到哈希词袋（这是设计行为，不是缺陷）。用例不该因为
+    //     "跑测试的机器下过模型"而变色，故排除——但嵌入本身有专门的 m3 用例钉契约。
+    const ENV_DEPENDENT_HOOKS = new Set(['host/contract', 'memory/embedding']);
+    const functional = degradationLog().filter((d) => !ENV_DEPENDENT_HOOKS.has(d.hook));
     expect(functional).toHaveLength(0);
 
     // 验收③ 维护队列语义（scheduler 注入）——行为变更（审查修复，非"过关"）：中断量子只让任务**留队**，

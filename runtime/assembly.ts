@@ -900,7 +900,8 @@ export class CognitiveRuntime {
   private shadowCandidateCache: { commit: string; id: string } | null = null;
   /** S7：latest 线策略/过程 bundle（per-line 记忆化——首次 shadow 请求加载后缓存；
    *  与 ready() 协调：ready 仍加载装配线，shadow 请求用 per-line bundle；加载失败 → 降级回退装配线 + 记录） */
-  private shadowBundle: Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] }> | null = null;
+  /** latest 线策略/过程 bundle（null 的分量 = 加载失败；失败已在创建的同一同步时刻被吞并记账） */
+  private shadowBundle: Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] } | null> | null = null;
   /** S7：latest 线 bundle 加载失败标记（记忆化失败——不重复尝试；rebuild/promote 后重置可重试） */
   private shadowBundleFailed = false;
   /** S7：per-line 运行时快照身份（line → RuntimeSnapshot；内容寻址——线 commit/内容变化时失效重建） */
@@ -1981,6 +1982,12 @@ export class CognitiveRuntime {
    * S7：latest 线 policy/processes 加载（per-line 记忆化：首次 shadow 请求加载后缓存——与 ready() 的一次性
    * 加载协调：ready 仍加载装配线，shadow 请求用 per-line bundle；加载失败 → 降级回退装配线 + 降级记录
    *（shadowBundleFailed 记忆化失败——不重复尝试；rebuild/promote 后重置可重试））。
+   *
+   * 注意 promise 的接线时机：被记忆化的 promise 一旦 reject，就**立刻**需要一个处理者。
+   * 若只在"某个 await 它的调用点"才 catch，那么在 `this.shadowBundle = (async () => …)()` 与那次 await
+   * 之间（异步上下文切换、进程退出、测试拆除 fixture）reject 会变成 unhandled rejection——
+   * 既污染进程告警，也可能在 `rm -rf` 临时目录后炸出 ENOENT。故在创建的同一同步时刻就吞掉拒绝，
+   * 失败结论记忆化在 `null` + `shadowBundleFailed` 上。
    */
   private async loadShadowBundle(): Promise<{ policy: PolicyBundle; processes: readonly ProcessDef[] } | null> {
     if (this.shadowBundleFailed) {
@@ -1998,18 +2005,16 @@ export class CognitiveRuntime {
           loadProcesses(dirs.processesDir),
         ]);
         return { policy, processes };
-      })();
+      })().catch((err: unknown) => {
+        this.shadowBundleFailed = true;
+        recordDegradation(
+          'shadow/route',
+          `latest 线策略/过程加载失败（${errorDetail(err)}）——shadow 会话降级回退装配线（策略/过程按装配线加载）`,
+        );
+        return null;
+      });
     }
-    try {
-      return await this.shadowBundle;
-    } catch (err) {
-      this.shadowBundleFailed = true;
-      recordDegradation(
-        'shadow/route',
-        `latest 线策略/过程加载失败（${errorDetail(err)}）——shadow 会话降级回退装配线（策略/过程按装配线加载）`,
-      );
-      return null;
-    }
+    return await this.shadowBundle;
   }
 
   /** S7：per-line 运行时快照身份（latest 线 commit + 目录内容 + 组件 → M5 快照；内容寻址记忆化；

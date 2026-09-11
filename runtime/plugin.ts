@@ -39,7 +39,7 @@ import type { DynamicCordisRunnerLike } from '../supervisor/dynamic-runner.js';
 // S2：单次结构化 Judge 执行器（空白子代理同模型裁判——装配面注入 spawnJudge）
 import { createJudgeExecutor } from './judge-executor.js';
 // S2：桌面通知桥（已知问题《待实现：与 dsh-desktop-notify 的兼容》——宿主面存在才接线，未装全静默）
-import { isDesktopNotifyLike, NotifyBridge, type DesktopNotifyLike } from './notify.js';
+import { isDesktopNotifyLike, NotifyBridge, type DesktopNotifyLike, type NotifyAttempt } from './notify.js';
 // 宿主契约哨兵 + 配置面收敛（已知问题《非阻塞设计不足：插件注册期仍可能阻塞宿主》方向①②）
 import {
   auditPluginConfig,
@@ -157,6 +157,14 @@ export interface PluginConfig {
   embeddingModelDir?: string;
   /** ONNX 推理线程数（缺省由运行时决定；本地小机可设 1 避免与主对话抢核） */
   embeddingThreads?: number;
+  /**
+   * 维护调度器注入（**仅测试/装配替换用**，正常部署不配）。
+   * 存在理由：两条通知的触发条件带"时间老化"语义（待人工裁决债务需无主满一周、错误池需计数增长），
+   * 而调度器的时钟与队列状态在插件内部构造——没有注入点就无法在集成测试里驱动这些真实触发条件，
+   * 只能退化成"读代码确认接上了"。有了它，`tests/m8/notify-wiring.test.ts` 能用可控时钟的调度器
+   * 证明**生产路径真的调了桥**。缺省（不配）→ 插件自建调度器，行为完全不变。
+   */
+  maintenance?: MaintenanceScheduler;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -509,6 +517,16 @@ export interface ApplyResult {
    * （覆盖不了"插件行解析失败"——那发生在插件代码之前）。
    */
   hostContract?: HostContractReport;
+  /**
+   * 通知审计**实时视图**（不是快照）：本进程内每一次通知尝试，含未发送原因
+   *（disabled/throttled/duplicate/capped/no-service/invalid）。回答"为什么没弹"。
+   *
+   * 为什么在这里暴露：通知的触发点散布在事件钩子与命令里，单元测试无法证明"生产路径真的接上了"——
+   * 只有从装配结果往外看得到实际尝试记录，接线才算被验证过（而不是只验证了桥本身）。
+   */
+  notifyAudit?: () => readonly NotifyAttempt[];
+  /** 神经嵌入状态（`embeddingStatus()` 的实时视图；未装配 → undefined）——回答"向量通道跑的是模型还是哈希词袋" */
+  embeddingStatus?: () => { embedder: string; dim: number; model_dir: string | null; degraded: string | null };
 }
 
 /**
@@ -1167,13 +1185,19 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
       // ④ 任务重建面（已知问题《债务与"还债的人"不同源》修复）：队列跨重启持久化（queue.json），      //    加载时经 restoreTask 按 id 重建执行体 → 债务与"负责还债的任务"同源。装配顺序上运行时在
       //    调度器之后创建 → restoreTask 走闭包延迟取（未就绪时调度器不改动队列、下次调度重试；
       //    见 MaintenanceScheduler.restoreQueueIfNeeded 的就绪语义）。
-      const maintenance = new MaintenanceScheduler({
-        debtFile: join(root, '.evolution', 'debt.json'),
-        tickIntervalMs: DEFAULT_TICK_INTERVAL_MS,
-        batchSize: DEFAULT_MAINTENANCE_BATCH,
-        restoreTask: (id) => maintenanceTaskFactory?.(id) ?? null,
-      });
+      // 注入面（config.maintenance，仅测试/装配替换用）：缺省自建——行为完全不变。
+      // 注入时 debtFile 由注入者决定（root 只影响其余数据面），故不覆盖其配置。
+      // 变量声明必须在自建分支之前：restoreTask 闭包引用它（TDZ 安全靠"仅延迟调用"，但顺序摆正更清晰）。
       let maintenanceTaskFactory: ((id: string) => ((signal?: AbortSignal) => Promise<void>) | null) | null = null;
+      const ownsMaintenance = config.maintenance === undefined;
+      const maintenance =
+        config.maintenance ??
+        new MaintenanceScheduler({
+          debtFile: join(root, '.evolution', 'debt.json'),
+          tickIntervalMs: DEFAULT_TICK_INTERVAL_MS,
+          batchSize: DEFAULT_MAINTENANCE_BATCH,
+          restoreTask: (id) => maintenanceTaskFactory?.(id) ?? null,
+        });
       // 定时器启动：仅在 DSH 运行期生效（进程内 setInterval）；stop() 由下方关闭钩子调用。
       // 启动失败不阻塞装配（认知其余功能照常，降级记录显式留痕）——调度退化为请求间隙单量子。
       try {
@@ -1246,10 +1270,13 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
         cognitive = undefined;
         // 审查修复 H3：装配失败时维护定时器已 start()（在 createCognitiveRuntime 之前）——此前不会停表，
         // 旧 interval 会在整个进程生命周期里继续 persistDebt/跑任务（旧实例残留）。此处显式停表。
-        try {
-          maintenance.stop();
-        } catch {
-          // 停表失败不覆盖装配降级原因（调度器内部幂等）
+        // 注入的调度器**不属于本插件**（ownsMaintenance=false）→ 不动它：它的生命周期归注入者。
+        if (ownsMaintenance) {
+          try {
+            maintenance.stop();
+          } catch {
+            // 停表失败不覆盖装配降级原因（调度器内部幂等）
+          }
         }
         recordDegradation(
           'cognitive/assembly',
@@ -2068,5 +2095,15 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
     platform: platformView,
     hostContract: hostContractView(),
     safeStateRuntime: safeStateRuntime(),
+    // 通知审计**无条件**暴露：最需要看"为什么没弹"的场景恰恰是认知未装配（内核没起来）。
+    // 实时闭包视图——桥是进程内单例状态，钩子/命令后来又发了通知也能看到。
+    notifyAudit: () => notifyBridge.attempts(),
+    // 嵌入状态同样实时读取（未装配 → 不暴露；调用方按"没有该字段"处理）
+    ...(cognitive === undefined
+      ? {}
+      : {
+          embeddingStatus: (): { embedder: string; dim: number; model_dir: string | null; degraded: string | null } =>
+            (cognitive as unknown as { embeddingStatus(): { embedder: string; dim: number; model_dir: string | null; degraded: string | null } }).embeddingStatus(),
+        }),
   };
 }
