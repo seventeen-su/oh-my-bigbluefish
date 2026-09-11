@@ -324,6 +324,8 @@ export class MaintenanceScheduler {
   private started = false;
   private running = false;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** 最近一次调度器自身故障（定时器路径兜底：如 debt.json 损坏）；状态面可读，不再静默吞错 */
+  private lastSchedulerError: string | null = null;
   private debtLoaded = false;
   private tickCountValue = 0;
   private readonly inFlight = new AbortController();
@@ -393,14 +395,28 @@ export class MaintenanceScheduler {
   /** 请求间隙小量子：执行至多 batchSize 个可执行任务（缺省 1 = 既有单量子语义；可中断：调用方
    *  signal ∪ stop() 的 inFlight）；hard 限跳过者记录 skipped + 不累计债务（硬跳过 = 调度延迟非失败） */
   async requestQuantum(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
+    if (this.stopped || this.running || this.queue.length === 0) return { ran: [], skipped: [] };
+    // 重入守卫（审查修复）：此前 requestQuantum 不检查也不置位 running，可与定时器 tick 同时在飞 →
+    // 两次 sortedQueue() 快照含同一 task id → 同一任务并发执行（如 memory_consolidation 双跑，
+    // 第二次的 transaction 会被 beginIfNeeded 识别为"已在事务中"而并入前一次的事务边界）。
+    this.running = true;
+    try {
+      return await this.requestQuantumInner(opts);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** requestQuantum 主体（running 守卫由外层持有） */
+  private async requestQuantumInner(opts: { signal?: AbortSignal } = {}): Promise<QuantumReport> {
     if (this.stopped || this.queue.length === 0) return { ran: [], skipped: [] };
     const signal = this.execSignal(opts.signal);
     if (signal.aborted) {
-      // 中断（未执行）→ 债务累计，任务留队
-      const top = this.sortedQueue()[0]!;
-      this.accrueOnNonRun(top);
-      await this.persistDebt();
-      return { ran: [], skipped: [top.id] };
+      // 中断（**未执行**）→ 不累计债务：与硬跳过同一条原则（调度延迟 ≠ 失败）。
+      // 审查修复：此前此处 accrueOnNonRun(top)，使"一次都没被 run 过"的队首任务 +value；
+      // 若该任务此后不再被调度，债务既不清偿也不再执行 → 保护性自锁失控（本文件 409-411 所述死亡螺旋）。
+      // 执行中被中断（runOne 内）仍按失败累计——那是真实执行失败，语义不变。
+      return { ran: [], skipped: this.queue.length > 0 ? [this.sortedQueue()[0]!.id] : [] };
     }
     const report: QuantumReport = { ran: [], skipped: [] };
     for (const t of this.sortedQueue()) {
@@ -452,9 +468,20 @@ export class MaintenanceScheduler {
     }
   }
 
+  /**
+   * 排空：等在飞量子/tick 落地（关闭前调用——见 assembly.close 的审查修复）。
+   * stop() 会中断在飞任务的 signal，但任务体可能不检查 signal（如 turn-finalize 的 compact），
+   * 故以"running 标志回落 + 一个宏任务让出"作为静默点：仍在跑的写入有机会完成/失败留痕，
+   * 而不是在库关闭后抛 database is not open。有界（最多等 50ms 轮的 20 次），不阻塞宿主退出。
+   */
+  async drain(): Promise<void> {
+    for (let i = 0; i < 20 && this.running; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   /** 当前债务快照（深拷贝；task_id 排序，确定性） */
-  debtSnapshot(): MaintenanceDebt[] {
-    this.ensureDebtLoaded();
+  debtSnapshot(): MaintenanceDebt[] {    this.ensureDebtLoaded();
     return [...this.debt.values()]
       .sort((a, b) => a.task_id.localeCompare(b.task_id))
       .map((d) => ({ ...d }));
@@ -597,6 +624,8 @@ export class MaintenanceScheduler {
     total: number;
     band: 'normal' | 'soft' | 'hard' | 'critical';
     batch_size: number;
+    /** 调度器自身故障（如债务文件损坏导致加载失败）——非 null 时债务视图不可信，须人工核对 */
+    scheduler_error?: string | null;
   } {
     const total = this.debtTotal();
     const band: 'normal' | 'soft' | 'hard' | 'critical' =
@@ -614,6 +643,7 @@ export class MaintenanceScheduler {
       total,
       band,
       batch_size: this.batchSize,
+      scheduler_error: this.lastSchedulerError,
     };
   }
 
@@ -834,8 +864,13 @@ export class MaintenanceScheduler {
 
   private ensureDebtLoaded(): void {
     if (this.debtLoaded) return;
-    this.debtLoaded = true;
-    if (!existsSync(this.debtFile)) return;
+    // debtLoaded 必须在**解析成功之后**才置位（审查修复）：此前先置位再抛错，损坏的 debt.json 会让
+    // 本进程余下生命周期"债务视图恒空"——debtTotal()=0 → hardBlocked 永假 → 保护性自锁静默失效，
+    // 且下一次 persistDebt 会用空 Map 覆盖掉磁盘上的债务。保持 false 使下次访问重试（可自愈）。
+    if (!existsSync(this.debtFile)) {
+      this.debtLoaded = true;
+      return;
+    }
     let raw: unknown;
     try {
       raw = JSON.parse(readFileSync(this.debtFile, 'utf8'));
@@ -861,6 +896,7 @@ export class MaintenanceScheduler {
         });
       }
     }
+    this.debtLoaded = true; // 解析成功 → 标记已加载（失败路径保持 false，允许下次重试）
   }
 
   private debtTotal(): number {
@@ -966,8 +1002,11 @@ export class MaintenanceScheduler {
     }
     if (this.baseTickMs <= 0) return;
     this.timer = setInterval(() => {
-      void this.tick().catch(() => {
-        /* 定时器驱动路径：任务级错误已由 tick 内部转为债务，不向外泄漏 */
+      void this.tick().catch((err: unknown) => {
+        // 定时器驱动路径：任务级错误已由 tick 内部转为债务；此处只兜住**调度器自身**的异常
+        // （例如 debt.json 损坏 → ensureDebtLoaded 抛错）。审查修复：此前空 catch 会把这类故障
+        // 完全吞掉，使"债务视图恒空 → 硬限失效"不可观测；现在记入 lastSchedulerError 供状态面读取。
+        this.lastSchedulerError = `维护 tick 失败：${err instanceof Error ? err.message : String(err)}`;
       });
     }, this.effectiveTickMs());
     // unref：维护定时器不得阻止宿主进程退出（Node 事件循环语义）。同时这是测试隔离的必要条件——
