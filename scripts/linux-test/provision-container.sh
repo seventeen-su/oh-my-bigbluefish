@@ -1,9 +1,13 @@
 #!/bin/bash
-# OMB Linux 真机测试容器准备脚本（在 PVE 宿主机 root 下执行；用后删除容器）
-# 用途：为「补全 Linux 适配」提供真实 Linux 环境（bwrap + Node 权限模型 + POSIX 只读 + 三线布局）
+# OMB Linux 真机测试容器准备脚本（在**宿主** root 下执行；用后删除容器，不污染宿主）
+# 用途：为 Linux 适配提供真实 Linux 环境（bwrap + Node 权限模型 + POSIX 只读 + 三线布局）
+#
+# 环境无关：不绑定任何具体主机/地址/私钥；容器 ID 取 $CTID 或第一个参数，默认 9001。
+# 调用方式见同目录 README.md（宿主经 ssh 别名给出，脚本本身只认 pct/pveam 是否可用）。
 set -u
-CTID="${1:-9001}"
-TMPL="local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
+CTID="${CTID:-${1:-9001}}"
+# 模板名按需覆盖（不同版本的模板文件名会变）：OMB_CT_TEMPLATE
+TMPL="${OMB_CT_TEMPLATE:-local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst}"
 
 echo "=== 0. 若已存在同名容器先清理（幂等） ==="
 if pct status "$CTID" >/dev/null 2>&1; then
