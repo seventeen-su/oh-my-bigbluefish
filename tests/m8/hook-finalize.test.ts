@@ -154,15 +154,19 @@ describe('T8.26.5 turn 收尾钩子（plugin.ts apply）', () => {
     const restored = await restoreCheckpoint(cps[0]!.id, { dir: cpDir });
     expect(restored.working.goal).toBe(GOAL);
 
-    // ③ MaintenanceDebt 累计（经 scheduler 注入）：中断量子 → 任务留队并累计债务；随后正常量子可执行
+    // ③ MaintenanceDebt 语义（经 scheduler 注入）——行为变更（审查修复，非"过关"）：
+    // 中断量子只让任务**留队**，**不累计债务**（"一次都没被 run 过"= 调度延迟而非失败；旧实现会为它
+    // +value，与调度器自身的"硬跳过不累计债务，否则债务永不回落"原则相矛盾）；真实执行失败才累计。
     const aborted = new AbortController();
     aborted.abort();
     const skipped = await scheduler.requestQuantum({ signal: aborted.signal });
     expect(skipped.skipped).toContain(`turn-finalize:${SESSION}`);
-    const debt = scheduler.debtSnapshot();
-    expect(debt.some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(true);
+    const debtAfterAbort = scheduler.debtSnapshot();
+    expect(debtAfterAbort.some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(false);
     const report = await scheduler.requestQuantum();
     expect(report.ran).toContain(`turn-finalize:${SESSION}`);
+    // 执行成功同样不累计债务（成功 = 清偿）
+    expect(scheduler.debtSnapshot().some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(false);
     scheduler.stop();
 
     // ④ 双 flush 幂等：再次 flush → 不重复 finalize（decision/made 仍 1 条）

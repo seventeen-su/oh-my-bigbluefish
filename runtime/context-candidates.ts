@@ -237,14 +237,22 @@ export async function gatherContextCandidates(input: GatherContextCandidatesInpu
   const out: ContextCandidate[] = [];
   const valueOf = (content: string): number => estimateInfoValue(content, working_state);
 
+  /** 预算口径的记忆投影形态：与 renderer 的 semantic 视图一致（超长截断 + 省略号）——见 tokens_est 注释 */
+  const summarizeForBudget = (content: string): string =>
+    content.length <= EVIDENCE_TEXT_LIMIT ? content : `${content.slice(0, EVIDENCE_TEXT_LIMIT)}…`;
+
   // Memory：既有检索项（kind=memory；info_value 经缺口匹配启发式——统一语义，见函数文档）
+  // tokens_est 口径（审查修复 M5）：按**将被投影的形态**计（memory 走 summary 视图 → 截断到 120 字符），
+  // 而不是按全文计——否则一条 400 字符记忆即使只注入 120 字符摘要，也会因"全文 token 预算"被判负边际
+  // 而永不注入（投影头的 total_tokens 也随之虚高）。
   for (const r of memory_items) {
+    const projected = summarizeForBudget(r.memory.payload);
     out.push({
       kind: 'memory',
       ref: r.memory.id,
       view: 'summary',
       content: r.memory.payload,
-      tokens_est: estimateTokens(r.memory.payload),
+      tokens_est: estimateTokens(projected),
       info_value: valueOf(r.memory.payload),
     });
   }

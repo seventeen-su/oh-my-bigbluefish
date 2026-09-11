@@ -23,11 +23,23 @@ export interface DegradationRecord {
   at: string;
 }
 
+/** 降级日志上限（审查修复 M7）：生产没有转发/清理调用点，而惰性收尾每轮都会记一条
+ *  （如"turn 收尾：无 prepareTurn 记录"）→ 进程内无界增长，且 WorldModel 每次重建都把全部记录
+ *  拷进 limitations（内容哈希随之漂移）。保留最近 N 条环形丢弃，并做同 hook+reason 连续去重。 */
+export const DEGRADATION_LOG_LIMIT = 200;
+
 const degradations: DegradationRecord[] = [];
 
 /** 记录一次守卫降级（接口缺失/运行时缺失/求值失败）；不抛 */
 export function recordDegradation(hook: string, reason: string): void {
+  const last = degradations[degradations.length - 1];
+  if (last !== undefined && last.hook === hook && last.reason === reason) {
+    return; // 同一条降级连续重复（每轮同因）→ 只留首次，避免把日志刷成噪声
+  }
   degradations.push({ hook, reason, at: new Date().toISOString() });
+  if (degradations.length > DEGRADATION_LOG_LIMIT) {
+    degradations.splice(0, degradations.length - DEGRADATION_LOG_LIMIT); // 环形保留最近 N 条
+  }
 }
 
 /** 当前降级日志（只读视图） */

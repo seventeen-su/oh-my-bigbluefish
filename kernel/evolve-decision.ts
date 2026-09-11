@@ -237,14 +237,25 @@ export function evaluationSignalsToRecords(
   return out;
 }
 
-/** 信号记录流 → 摘要（窗口 = 记录 ts 最小/最大；counts 按 kind 累计；空流 → 零窗口空计数） */
+/**
+ * 信号记录流 → 摘要（窗口 = 记录 ts 最小/最大；counts 按 kind 聚合；空流 → 零窗口空计数）。
+ *
+ * **口径（审查修复）**：`cumulative: true` 的记录（每轮以 `{from:0,to:now}` 采全量、同一条 episode 会在
+ * 其后每轮重复出现）按 kind **取最大值**（= 窗口内累计值），**不得跨轮相加**；未标记的增量类记录照常累加。
+ * 此前统一累加，使一个 UTC 日内 40 轮 × 实际 22 条 episode 汇总成 ≈880（文档自述的"80 vs 22"在判定路径
+ * 依然成立），并让 budget_estimate 与状态面 signals 呈现平方级虚高。
+ */
 export function summarizeSignals(records: readonly SignalRecord[]): SignalSummary {
   const counts: Record<string, number> = {};
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
   for (const r of records) {
     const n = typeof r.payload?.count === 'number' ? r.payload.count : 1;
-    counts[r.kind] = (counts[r.kind] ?? 0) + n;
+    if (r.payload?.cumulative === true) {
+      counts[r.kind] = Math.max(counts[r.kind] ?? 0, n); // 累计口径：取最大值
+    } else {
+      counts[r.kind] = (counts[r.kind] ?? 0) + n; // 增量口径：累加
+    }
     if (r.ts < min) min = r.ts;
     if (r.ts > max) max = r.ts;
   }
