@@ -1378,7 +1378,9 @@ export class CognitiveRuntime {
         channel_used: r.channel_used,
         channels_used: r.channels_used,
         scope_chain: r.scope_chain,
-        degraded: null,
+        // 通道级降级（第二路审查 A1）：此前硬编码 null → `retrieve` 内部记下的"向量通道故障"永远
+        // 到不了工具面（模型看不到任何降级迹象）。现在如实透传，由 kern_memory 打印。
+        degraded: r.degraded ?? null,
       };
     } catch (err) {
       return { ok: false, items: [], channel_used: 'lexical', channels_used: [], scope_chain: [], degraded: errorDetail(err) };

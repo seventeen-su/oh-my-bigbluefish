@@ -465,6 +465,27 @@ export interface ApplyResult {
  */
 export type BootReady = Pick<BootResult, 'ok' | 'line' | 'warnings' | 'rollback'>;
 
+/** 从宿主服务/环境读取自述版本（缺省 undefined = 无法观测，沿用既有行为）。
+ *  目的（第二轮兼容性审查 H2）：让"声明 ≠ 观测"这条安全状态分支在生产中真的可达——否则宿主升级到
+ *  0.1.5 时插件照常拉起内核，把旧版本号写进全部事件/记忆/快照 provenance，且无任何提示。
+ *  探测点按可用性依次尝试，任一命中即用；全部缺失 → undefined（不臆断、不降级记录，行为不变）。 */
+function probeObservedHostVersion(ctx: ContextLike): string | undefined {
+  const fromService = (name: string): string | undefined => {
+    const svc = readService<{ version?: unknown; dshVersion?: unknown; harnessVersion?: unknown }>(ctx, name);
+    for (const v of [svc?.version, svc?.dshVersion, svc?.harnessVersion]) {
+      if (typeof v === 'string' && v.length > 0) {
+        return v;
+      }
+    }
+    return undefined;
+  };
+  const fromEnv = process.env.DSH_VERSION ?? process.env.DSH_HOST_VERSION;
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) {
+    return fromEnv;
+  }
+  return fromService('dsh') ?? fromService('harness');
+}
+
 export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {  /**
    * 外核安全状态视图（已知问题《外核自身也要非阻塞》：当前是否安全状态、原因、发生时间可经状态面与
    * 日志查看）+ 内核未加载时的状态面兜底数据源。二者都在此就近定义——工具注册与返回值都要用，
@@ -483,7 +504,11 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     const st = evaluateSafeState({
       configuredHostVersion: config.hostVersion,
       defaultHostVersion: hostVersion(),
-      observedHostVersion: config.observedHostVersion,
+      // 观测版本真探测（第二轮兼容性审查 H2）：此前 observedHostVersion 只从配置读，全仓无任何写入点 →
+      // 安全状态的"声明 ≠ 观测"分支恒不可达（0.1.5 到来时会照常拉起内核并把 0.1.3 写进全部 provenance）。
+      // 现在按可用性探测宿主自述版本（服务 → 环境变量），**探不到就保持 undefined**（行为与既有完全一致）；
+      // 探到且与声明不符 → 走既有 host_version_changed 路径（不拉起内核、只记录原因）。
+      observedHostVersion: config.observedHostVersion ?? probeObservedHostVersion(ctx),
       substrateRoot: substrateRootOf(PLUGIN_ROOT),
     });
     return {
@@ -984,7 +1009,7 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
           source: 'mode-command',
           event: activationId,
           actor: 'kernel',
-          environment: { os: 'windows', node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
+          environment: { os: process.platform, node: process.version, dsh_version: hostVersion(), project: 'omb-v2' }, // R6：唯一宿主版本来源
           runtime_snapshot: cognitive?.snapshotHash ?? 'rs:assembly',
           timestamp: now,
           transformation_chain: ['mode/switch'],
@@ -1069,6 +1094,8 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
   // 无 flush 时退化：下一次 prepareTurn 前惰性收尾（计划 §4 finalizeTurn 守卫行，记录降级路径）。
   const preparedTurns = new Map<string, { decision: GovernorDecision; working_state: PromptWorkingState }>();
   const pendingFinalize = new Set<string>();
+  /** 在飞收尾（会话 → promise）：宿主每 step 多次 flush 且回调并发启动，收尾必须按会话串行（审查 F1） */
+  const finalizing = new Map<string, Promise<void>>();
   // T8.26.4：会话事件追踪（mapper 状态：turn/同 turn 指令 claim/最近 goal——goal 供 prepare 与收尾使用）
   const traces = new Map<string, ReturnType<typeof initialTraceState>>();
 
@@ -1082,40 +1109,58 @@ export function apply(ctx: ContextLike, config: PluginConfig = {}): ApplyResult 
     if (runtime === undefined) {
       return;
     }
-    // R2 boot gate：恢复完成前认知不进入服务——boot 失败 → 收尾跳过（认知降级为仅命令模式）
-    if (!(await cognitiveServiceable())) {
-      return;
+    // 在飞守卫（第二路审查 F1）：宿主 session-checkpoint-policy 在**每次模型请求前 / 每次工具派发前 /
+    // 每个 agent step 前**都 flush（`core/session` 用 allSettled 并发启动回调），而 flush handler 是
+    // `void finalizePendingTurn(...)`（不 await）。此前只查"成员存在"且清除在多个 await 之后 →
+    // 两个触发源可同时通过守卫 → 两次 finalizeTurn：重复 decision/made、债务重复入账（value 翻倍）、
+    // 且可能用 preparedTurns 里**下一轮**的 decision/working_state 收尾（错轮次）。
+    // 现在：同一会话至多一个收尾在飞，后到者复用同一个 promise。
+    const inflight = finalizing.get(sessionId);
+    if (inflight !== undefined) {
+      return inflight;
     }
-    if (!pendingFinalize.has(sessionId) && !preparedTurns.has(sessionId)) {
-      return; // 无收尾状态（无 prepare/无 turn 结束）→ 不虚构收尾
-    }
-    const prepared = preparedTurns.get(sessionId);
-    const decision = prepared?.decision ?? fallbackFinalizeDecision(runtime.snapshotHash);
-    const working = prepared?.working_state ?? fallbackWorkingState(fallbackGoal);
-    let state: State | undefined;
-    try {
-      const sessionEvents = (await runtime.eventStore.query({ session_id: sessionId })).events;
-      const reduced = reduce(sessionEvents).state as unknown as State;
-      // 空流退化：无任何事件 → provenance.event 为空 → checkpoint M7 schema 校验失败 → 不传 state（checkpoint 跳过）
-      if (reduced.provenance.event.length === 0) {
-        state = undefined;
-      } else if (typeof runtime.materializeState === 'function') {
-        // S1：World/Self 运行接线——reduce 产出 State 后填充模型引用（null → 引用；StateSchema 校验，
-        // 事件流直归约的 working 缺省字段不阻塞接线）
-        state = runtime.materializeState(reduced) as State;
-      } else {
-        state = reduced; // 兼容：运行时未实现接线 → 事件流直归约状态
+    const task = (async (): Promise<void> => {
+      // R2 boot gate：恢复完成前认知不进入服务——boot 失败 → 收尾跳过（认知降级为仅命令模式）
+      if (!(await cognitiveServiceable())) {
+        return;
       }
-    } catch {
-      state = undefined; // 不可归约 → 不传 state（checkpoint 跳过，收尾其余照常）
-    }
+      if (!pendingFinalize.has(sessionId) && !preparedTurns.has(sessionId)) {
+        return; // 无收尾状态（无 prepare/无 turn 结束）→ 不虚构收尾
+      }
+      const prepared = preparedTurns.get(sessionId);
+      const decision = prepared?.decision ?? fallbackFinalizeDecision(runtime.snapshotHash);
+      const working = prepared?.working_state ?? fallbackWorkingState(fallbackGoal);
+      let state: State | undefined;
+      try {
+        const sessionEvents = (await runtime.eventStore.query({ session_id: sessionId })).events;
+        const reduced = reduce(sessionEvents).state as unknown as State;
+        // 空流退化：无任何事件 → provenance.event 为空 → checkpoint M7 schema 校验失败 → 不传 state（checkpoint 跳过）
+        if (reduced.provenance.event.length === 0) {
+          state = undefined;
+        } else if (typeof runtime.materializeState === 'function') {
+          // S1：World/Self 运行接线——reduce 产出 State 后填充模型引用（null → 引用；StateSchema 校验，
+          // 事件流直归约的 working 缺省字段不阻塞接线）
+          state = runtime.materializeState(reduced) as State;
+        } else {
+          state = reduced; // 兼容：运行时未实现接线 → 事件流直归约状态
+        }
+      } catch {
+        state = undefined; // 不可归约 → 不传 state（checkpoint 跳过，收尾其余照常）
+      }
+      try {
+        await runtime.finalizeTurn({ session_id: sessionId, decision, working_state: working, state });
+        pendingFinalize.delete(sessionId);
+        preparedTurns.delete(sessionId); // 收尾后清除：双 flush/turn/end 幂等
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        recordDegradation('finalizeTurn', `收尾失败（${detail}）——保留待收尾状态`);
+      }
+    })();
+    finalizing.set(sessionId, task);
     try {
-      await runtime.finalizeTurn({ session_id: sessionId, decision, working_state: working, state });
-      pendingFinalize.delete(sessionId);
-      preparedTurns.delete(sessionId); // 收尾后清除：双 flush/turn/end 幂等
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      recordDegradation('finalizeTurn', `收尾失败（${detail}）——保留待收尾状态`);
+      await task;
+    } finally {
+      finalizing.delete(sessionId);
     }
   };
 
