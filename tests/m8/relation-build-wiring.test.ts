@@ -1,4 +1,4 @@
-// 关系建图装配接线测试（对应 docs/known-issues.md《关系图为空图》修复判定）：
+// 关系建图装配接线测试（对应《关系图为空图》修复判定）：
 //   - 闭环：记忆入库 → 空闲期建图（memory_relation_build 维护任务）→ 关系表非空、状态面可见
 //   - 判据：图稠密（edges ≥ memories/2）→ needs_build 为 false（不空转）；幂等（重跑不新增重复边）
 //   - 工具面：kern_memory op=relations 列出边（含权重/来源/方向）、op=unlink 删边（治理面）
