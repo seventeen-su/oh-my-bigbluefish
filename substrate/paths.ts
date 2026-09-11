@@ -23,9 +23,25 @@ export function pathCaseInsensitive(platform: string = process.platform): boolea
   return platform === 'win32' || platform === 'darwin';
 }
 
-/** 按平台口径归一化（大小写敏感平台原样返回；不敏感平台小写化） */
+/**
+ * 按平台口径归一化：**分隔符折叠 + 大小写**（各自只在对应平台成立时才做）。
+ *
+ * 分隔符折叠的必要性（回归发现）：Windows 上 `\` 与 `/` 都是分隔符（git 会写出正斜杠形式——worktree
+ * 注册表里两种都见过），不折叠的话 `C:/a/b/c.txt` 对 `C:\a\b` 的包含判定会失败——"同一条纪律"在两种
+ * 分隔符形态下给出不同结论，属静默漏判。
+ * **折叠方向按平台**：win32 → `\`，darwin → `/`（macOS 上 `\` 是合法文件名字符，折成 `\` 会制造假包含，
+ * 同 POSIX 的道理）；其余（POSIX）完全不折叠。
+ */
 export function normalizeForCompare(p: string, platform: string = process.platform): string {
-  return pathCaseInsensitive(platform) ? p.toLowerCase() : p;
+  const lower = pathCaseInsensitive(platform);
+  if (platform === 'win32') {
+    return p.replace(/\//g, '\\').toLowerCase();
+  }
+  if (platform === 'darwin') {
+    return p.toLowerCase();
+  }
+  // POSIX（含 linux 与其它）：大小写敏感、分隔符只有 `/` → 原样
+  return lower ? p.toLowerCase() : p;
 }
 
 /** 去尾分隔符（保留根：'/'、'\\'、'C:'、'C:\' 不裁成空串/裸盘符） */
@@ -53,9 +69,13 @@ export function isPathUnder(child: string, root: string, platform: string = proc
   if (c === r) {
     return true;
   }
-  // 同时容忍另一种分隔符形态（Windows 上 git 可能写出 '/'——worktree 注册表里两种都见过）
-  const seps = platform === 'win32' ? ['\\', '/'] : ['/'];
-  return seps.some((s) => r.endsWith(s) || c.startsWith(`${r}${s}`));
+  // 分隔符形态已在 normalizeForCompare 里折叠（Windows → 反斜杠；POSIX 不折叠），
+  // 故这里只需按平台取一种分隔符拼前缀——**不能**写成 `r.endsWith(s) || c.startsWith(r + s)`：
+  // 那样根路径本身以分隔符结尾时（`/`、`C:\`——stripTrailingSeparators 会保留它们，否则 Windows
+  // 盘根会退化成 `C:` 并把盘相对路径 `C:foo` 误判为在 `C:\` 之下）会走前半句而**无条件返回 true**，
+  // 等于对根路径关闭判定。
+  const sep = platform === 'win32' ? '\\' : '/';
+  return c.startsWith(r.endsWith(sep) ? r : `${r}${sep}`);
 }
 
 /**

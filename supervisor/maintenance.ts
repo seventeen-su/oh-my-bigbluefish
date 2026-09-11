@@ -607,7 +607,11 @@ export class MaintenanceScheduler {
       waited_ms: waited,
       reason:
         `排空超时（${waited}ms ≥ ${timeout}ms）：` +
-        `${this.running ? '仍有在飞任务' : '无在飞任务但仍有待落盘写入'}` +
+        // 判据必须与 isIdle 的静默点定义一致：`running=false` 只说明"批量循环已退出"，
+        // 任务体（inflight）与已发出的写入（pendingWrites）都可能还在跑。此前只看 running，
+        // 会在 `running=false, inflight=1` 时打印"无在飞任务但仍有待落盘写入（pending_writes=0）"
+        // ——一句自相矛盾的话，而排空失败的唯一诚实出口就是这句 reason。
+        `${this.running || this.inflight > 0 ? `仍有在飞任务（inflight=${this.inflight}）` : '无在飞任务但仍有待落盘写入'}` +
         `（pending_writes=${this.pendingWrites}）——库将以"可能仍在写入"的状态关闭`,
     };
   }
@@ -1245,6 +1249,11 @@ export class MaintenanceScheduler {
         at: this.nowFn(),
         reason: `重启后无法重建执行体（未注册 restoreTask）——队列项剪除，对应债务转为无主债务：${pruned.join(', ')}`,
       });
+      // 剪除必须**落盘**（审查修复）：此前只写内存日志，于是 queue.json 永远停留在陈旧盘面
+      //（外部读盘仍看到"有还债的人"，而那些项每次启动都被剪一遍），留痕也随重启丢失。
+      // 本方法是同步的（调用点遍布同步路径），故不 await——persistQueue 自带错误处理（记
+      // lastSchedulerError），且关停排空经 trackWrite 会等它落地（见 drain/idle）。
+      void this.persistQueue();
     }
   }
 
@@ -1344,7 +1353,15 @@ export class MaintenanceScheduler {
     this.accruedAtEnqueue.delete(taskId);
   }
 
-  /** 原子写：tmp + rename（.evolution/debt.json）；无债务且无文件 → 不写 */
+  /**
+   * 原子写：tmp + rename（.evolution/debt.json）；无债务且无文件 → 不写。
+   *
+   * 落盘失败**不向上抛**（审查修复）：本方法被"任务成功 → 清偿 → 落盘"路径直接 await，
+   * 抛出去会让整条维护调用链 reject（定时器路径只记 lastSchedulerError，任务实际已成功执行
+   * 却被算成失败；请求间隙路径还会 reject 到 prepareForTurn 的 catch）——而同一个文件里的
+   * `persistQueue` 早已是"记 lastSchedulerError 后继续"的口径。统一到这个口径：内存账本不回滚
+   *（与队列同纪律：账本已改就是已改，落盘失败只影响"跨重启可见性"，由 scheduler_error 如实暴露）。
+   */
   private async persistDebt(): Promise<void> {
     if (this.debt.size === 0 && !existsSync(this.debtFile)) return;
     const settle = this.trackWrite(); // 关停排空据此等待（见 drain/idle）
@@ -1353,6 +1370,8 @@ export class MaintenanceScheduler {
       const tmp = `${this.debtFile}.tmp`;
       await writeFile(tmp, JSON.stringify(this.debtSnapshot(), null, 2), 'utf8');
       await rename(tmp, this.debtFile);
+    } catch (err) {
+      this.lastSchedulerError = `债务落盘失败（${this.debtFile}）：${(err as Error).message}——内存账本保留，下次落盘重试`;
     } finally {
       settle();
     }
