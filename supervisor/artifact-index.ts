@@ -144,6 +144,8 @@ function isUnderRoot(resolved: string, root: string): boolean {
 export class ArtifactIndex {
   private readonly file: string;
   private writeError: string | null = null;
+  /** 最近一次读失败原因（无 → null）。与"文件不存在"区分：非 null 时**禁止**读-改-写覆盖 */
+  private lastReadError: string | null = null;
 
   constructor(opts: { root: string }) {
     // root = 制品索引根目录（.evolution/artifacts）——index.jsonl 与其同目录
@@ -155,8 +157,14 @@ export class ArtifactIndex {
     return this.writeError;
   }
 
-  /** 全量读取：文件不存在 → []；损坏行跳过（审计日志语义——索引不因坏行死亡） */
+  /**
+   * 全量读取：文件不存在 → []；损坏行跳过（审计日志语义——索引不因坏行死亡）。
+   * **可读性标记**：读取异常（权限/IO）与"文件不存在"必须区分——前者把 `lastReadError` 置位，
+   * 写侧（register）据此**拒绝全量覆盖**，否则一次瞬时 EBUSY/EPERM 会把磁盘既有索引整体截断
+   * （读-改-写循环 + 全量原子写 = 数据丢失）。返回 [] 仅表示"本次没读到内容"，不表示"磁盘上没有内容"。
+   */
   private async readAll(): Promise<ArtifactManifest[]> {
+    this.lastReadError = null;
     let raw: string;
     try {
       raw = await readFile(this.file, 'utf8');
@@ -164,7 +172,8 @@ export class ArtifactIndex {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         return []; // 文件不存在 → 空（首写建目录）
       }
-      return []; // 读取异常（权限/IO）→ 视作空（不抛；写侧会重建）——诚实降级
+      this.lastReadError = errorText(err); // 不可读（≠ 空）：写侧必须放弃覆盖
+      return [];
     }
     const out: ArtifactManifest[] = [];
     for (const line of raw.split('\n')) {
@@ -223,9 +232,48 @@ export class ArtifactIndex {
     }
     const m = parsed.data;
     const records = await this.readAll();
+    if (this.lastReadError !== null) {
+      // 读失败 ≠ 空：此刻全量写会把磁盘既有索引整体截断（读-改-写 + 原子覆盖 = 数据丢失）。
+      // 诚实降级：本次写入放弃并留痕（索引短暂落后 = 可恢复；索引被截断 = 不可恢复）。
+      this.writeError = `制品索引读取失败，已跳过本次写入以免覆盖既有索引：${this.lastReadError}`;
+      return;
+    }
     const without = records.filter((r) => r.id !== m.id);
     without.push(m);
     await this.writeAll(this.enforceCap(without));
+  }
+
+  /**
+   * 批量注册（同一批一次读 + 一次写）：单轮发现可达 100 个 manifest，逐条 register 是
+   * N 次全量读 + N 次全量原子写（O(n²) 解析与重写，每轮固定开销）。
+   * 语义与逐条 register 等价（同 id 覆写、批内后者胜出、超限淘汰最旧、schema 非法 fail-loud、
+   * 读失败拒写）；空数组 → 无 I/O。
+   */
+  async registerMany(manifests: readonly ArtifactManifest[]): Promise<void> {
+    if (manifests.length === 0) {
+      return;
+    }
+    const parsed: ArtifactManifest[] = [];
+    for (const manifest of manifests) {
+      const ok = ArtifactManifestSchema.safeParse(manifest);
+      if (!ok.success) {
+        throw new Error(`ArtifactIndex.registerMany: manifest schema 校验失败 — ${ok.error.message}`);
+      }
+      parsed.push(ok.data);
+    }
+    const records = await this.readAll();
+    if (this.lastReadError !== null) {
+      this.writeError = `制品索引读取失败，已跳过本次批量写入以免覆盖既有索引：${this.lastReadError}`;
+      return;
+    }
+    // 批内同 id 去重（后者胜出——与逐条 register 的顺序语义等价）：只留每个 id 的最后一条
+    const batch = new Map<string, ArtifactManifest>();
+    for (const m of parsed) {
+      batch.set(m.id, m);
+    }
+    const merged = records.filter((r) => !batch.has(r.id));
+    merged.push(...batch.values());
+    await this.writeAll(this.enforceCap(merged));
   }
 
   /** 最近制品（created_at 降序——最新优先；同毫秒按 id 稳定排序；limit 截断；缺省全量） */

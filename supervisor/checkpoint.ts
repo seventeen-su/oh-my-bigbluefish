@@ -253,9 +253,13 @@ export async function prune(
   //   ② 其余按"最新优先"填满全局名额 maxFiles。
   // 关键：② 的名额是 **net 保留总量**——扣除已被 ① 占用的名额，否则每会话保留位会额外叠加，
   // 使实际文件数超过 maxFiles（全局上限形同虚设）。
+  // 另一个关键（审查修复）：① 本身也受 maxFiles 约束——会话数增长到 maxFiles/perSessionKeep 以上时，
+  // 若 ① 无上限地占满保留位，则 ② 的名额恒为 0 且 keep 覆盖全部文件 → prune 变成空操作、目录重新无界增长
+  // （实测现场 4751 个文件正是这种形态）。故按"最新优先"逐条保留，保留总量不超过 maxFiles。
   const keep = new Set<string>();
   const perSession = new Map<string, number>();
   for (const cp of all) {
+    if (keep.size >= maxFiles) break; // 全局硬上限：保留总量（含会话保留位）不超过 maxFiles
     const sid = cp.session_id;
     if (sid === undefined) continue;
     const n = perSession.get(sid) ?? 0;
