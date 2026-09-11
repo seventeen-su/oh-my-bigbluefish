@@ -215,10 +215,15 @@ function humanSize(bytes: number | undefined): string {
  * 探测推理运行时是否可加载。
  * `onnxruntime-node` 是 **optionalDependency**（解包约 296MB）：只想用哈希词袋的部署不必付这份体积。
  * 但"下了权重却没装运行时"是个哑失败——运行时只会降级且原因埋在状态面里，所以这里主动提示。
+ *
+ * 说明符用变量（**不要**改回字面量）：本文件在 tsconfig 的 include 里，字面量会让 `tsc` 在构建期
+ * 解析该包，未安装即 TS2307 → 构建失败，等于把"可选依赖"变成"必须安装"。变量形式让构建不依赖它，
+ * 探测本身在运行时照常给出真话。
  */
 async function runtimeAvailable(): Promise<boolean> {
   try {
-    await import('onnxruntime-node');
+    const pkg = 'onnxruntime-node';
+    await import(pkg);
     return true;
   } catch {
     return false;
