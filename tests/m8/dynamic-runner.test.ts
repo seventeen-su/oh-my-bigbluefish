@@ -25,6 +25,8 @@ import {
 } from '../../supervisor/dynamic-runner.js';
 import type { CandidateDraft } from '../../kernel/schemas/evolution.js';
 import { buildLayoutFixture, teardownLayoutFixture, type LayoutFixture } from '../helpers/git.js';
+// 受限验证脚本平台无关化（写拒绝码随通道而异；真机教训见该模块说明）
+import { restrictedVerifyScript } from '../helpers/sandbox-scripts.js';
 
 const FIXTURE_TIMEOUT = 30000;
 const fixtureIt = (name: string, fn: (() => void) | (() => Promise<void>)) => it(name, fn, FIXTURE_TIMEOUT);
@@ -155,21 +157,12 @@ async function evolveTweakContent(): Promise<string> {
 /** runner 通道验证脚本（host 半契约：经 harness.handle('verify', handler) 注册裁决——结果读取契约） */
 const SCRIPT_RUNNER = `harness.handle('verify', (args) => ({ ok: true, detail: 'runner verify ok' })); return { apply(ctx) {} };`;
 
-/** 受限子进程路径合法脚本（文件契约：写 OMB_SANDBOX_RESULT_FILE + 尝试写候选目录被拒） */
-const SCRIPT_RESTRICTED_OK = `const fs = require('node:fs');
-const path = require('node:path');
-const resultFile = process.env.OMB_SANDBOX_RESULT_FILE;
-const candDir = process.argv[2];
-let probe = null;
-try {
-  fs.writeFileSync(path.join(candDir, 'write-probe.txt'), 'x');
-  probe = 'LEAK';
-} catch (e) {
-  probe = e && e.code ? e.code : String(e);
-}
-const ok = probe === 'EPERM' || probe === 'EACCES';
-fs.writeFileSync(resultFile, JSON.stringify({ ok, detail: 'verify ok; write-denied=' + probe }));
-`;
+/**
+ * 受限子进程路径合法脚本（文件契约：写 OMB_SANDBOX_RESULT_FILE + 尝试写候选目录被拒）。
+ * **平台无关**：写拒绝码由通道决定（Windows EPERM/EACCES、Linux bwrap EROFS、权限模型
+ * EACCES/ERR_ACCESS_DENIED）——见 tests/helpers/sandbox-scripts.ts 的真机教训说明。
+ */
+const SCRIPT_RESTRICTED_OK = restrictedVerifyScript();
 
 // ---------------------------------------------------------------------------
 // ① 接口守卫（缺失/部分缺失 → 通道不可用降级）

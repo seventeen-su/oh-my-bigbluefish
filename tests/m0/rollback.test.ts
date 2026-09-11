@@ -43,6 +43,30 @@ function headOf(fx: LayoutFixture, branch = 'stable'): string {
 }
 
 /**
+ * 「只读机制对**本进程**是否真的构成约束」——真机暴露的环境差异：
+ * POSIX 权限位只读对 root 无效（`CAP_DAC_OVERRIDE`，平台提供者已如实标注该降级），而 Linux 容器里
+ * 测试通常以 root 跑 → 施加只读后 `git checkout` 仍能改写 worktree，于是"worktree 同步应当失败"
+ * 这类断言在真机上会把**正确行为**判成失败。
+ *
+ * 判据不用"是不是 root"（那是平台的实现细节），而是**直接探测可写性**：写成功了就说明机制没约束到
+ * 本进程，此时相关用例应显式跳过该断言而不是假装失败。
+ */
+function readOnlyEnforced(dir: string): boolean {
+  const probe = path.join(dir, `.omb-ro-probe-${process.pid}-${Date.now().toString(36)}`);
+  try {
+    fs.writeFileSync(probe, 'x');
+  } catch {
+    return true; // 写被拒 → 只读对本进程生效
+  }
+  try {
+    fs.rmSync(probe, { force: true });
+  } catch {
+    // 探测文件删除失败 → 忽略（只读刚被证明不生效，删除应当成功）
+  }
+  return false;
+}
+
+/**
  * 在 stable 分支上造一个分叉推进提交（child of initialHash）并把 stable 指向它。
  * 返回新 commit hash（即测试中的 rev-A；initialHash 为可回退的上一 revision rev-B）。
  */
@@ -127,19 +151,25 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(fs.readFileSync(refFile, 'utf8').trim()).toBe(fx.initialHash);
   });
 
-  fixtureIt('worktree 同步失败不抛错：只读 ACL worktree 返回 worktree_synced:false，ref 仍已切换', () => {
+  fixtureIt('worktree 同步失败不抛错：只读 worktree 返回 worktree_synced:false，ref 仍已切换', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
-    // 先把 worktree 同步到 rev-A（模拟线上内容），再重新施加只读 ACL（模拟真实布局）
+    // 先把 worktree 同步到 rev-A（模拟线上内容），再重新施加只读（模拟真实布局）
     runGit(['checkout', '--force', revA], { cwd: fx.stable });
     applyReadOnlyAcl(fx.stable);
     expect(manifestLine(fx.stable)).toBe('stable-advanced');
 
-    // 回退到 rev-B：checkout 需把 worktree 内容从 rev-A 改写为 rev-B → 被只读 ACL 拒绝 → 不抛错，返回 worktree_synced:false
+    // 回退到 rev-B：checkout 需把 worktree 内容从 rev-A 改写为 rev-B → 被只读拒绝 → 不抛错，返回 false
     const result = rollbackTo({ bareRepo: fx.bare, revision: fx.initialHash, worktree: fx.stable });
 
-    expect(result.worktree_synced).toBe(false);
+    // 环境差异（真机暴露）：以 root 跑时 POSIX 权限位只读对本进程不构成约束（CAP_DAC_OVERRIDE），
+    // checkout 会成功 → worktree_synced 为 true 是**正确**行为，此时显式跳过该断言（不假装失败）。
+    if (readOnlyEnforced(fx.stable)) {
+      expect(result.worktree_synced).toBe(false);
+    } else {
+      expect(result.worktree_synced).toBe(true);
+    }
     expect(result.new_head).toBe(fx.initialHash);
     expect(headOf(fx)).toBe(fx.initialHash);
   });
@@ -165,9 +195,15 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
 
     const result = rollbackTo({ bareRepo: fx.bare, revision: fx.initialHash, worktree: fx.stable });
 
-    expect(result.worktree_synced).toBe(false);
-    expect(result.worktree_status).toBe('degraded');
-    expect(result.worktree_error).toBeTruthy(); // 机器可读失败原因，非静默告警
+    // 同前一条用例：只读对本进程不生效（root）时 checkout 会成功 → 跳过"应降级"的断言
+    if (readOnlyEnforced(fx.stable)) {
+      expect(result.worktree_synced).toBe(false);
+      expect(result.worktree_status).toBe('degraded');
+      expect(result.worktree_error).toBeTruthy(); // 机器可读失败原因，非静默告警
+    } else {
+      expect(result.worktree_synced).toBe(true);
+      expect(result.worktree_status).toBe('synced');
+    }
     expect(result.new_head).toBe(fx.initialHash);
     expect(headOf(fx)).toBe(fx.initialHash);
   });
@@ -179,16 +215,29 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     runGit(['checkout', '--force', revA], { cwd: fx.stable });
     applyReadOnlyAcl(fx.stable);
 
-    expect(() =>
-      rollbackTo({
+    // 只读对本进程不生效（root）→ 同步不会失败 → strict 策略下不抛错，ref 正常推进到目标
+    const enforced = readOnlyEnforced(fx.stable);
+    if (enforced) {
+      expect(() =>
+        rollbackTo({
+          bareRepo: fx.bare,
+          revision: fx.initialHash,
+          worktree: fx.stable,
+          worktreePolicy: 'strict',
+        }),
+      ).toThrow(/worktree/);
+      // ref 已补偿恢复：仍指向 rev-A，未停留在目标 revision（无半切换态）
+      expect(headOf(fx)).toBe(revA);
+    } else {
+      const r = rollbackTo({
         bareRepo: fx.bare,
         revision: fx.initialHash,
         worktree: fx.stable,
         worktreePolicy: 'strict',
-      }),
-    ).toThrow(/worktree/);
-    // ref 已补偿恢复：仍指向 rev-A，未停留在目标 revision（无半切换态）
-    expect(headOf(fx)).toBe(revA);
+      });
+      expect(r.new_head).toBe(fx.initialHash);
+      expect(r.worktree_status).toBe('synced');
+    }
   });
 
   fixtureIt('T8.23-strict 策略：worktree 同步成功 → 正常返回 worktree_status:"synced"', () => {

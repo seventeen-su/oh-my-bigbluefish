@@ -183,8 +183,11 @@ describe('runRestricted 受限子进程（WRITE_RESTRICTED 令牌，koffi FFI）
 
     expect(r.code).toBe(0); // 脚本捕获了写失败并写入结果标记
     const text = fs.readFileSync(resultFile, 'utf8');
-    // 实测错误码（EPERM/EACCES 均为写拒绝语义；具体值记录进 task-0.5-report.md）
-    expect(text).toMatch(/^WRITE_FAILED:(EPERM|EACCES)/);
+    // 写拒绝的错误码随通道而异（三者都是"写被拒"的语义，不是缺陷）：
+    //   Windows 受限令牌 → EPERM/EACCES；Linux bwrap → EROFS（只读挂载）；
+    //   Node 权限模型 → EACCES / ERR_ACCESS_DENIED。
+    // 真机教训：此前只认 EPERM|EACCES，于是在 Linux 上把"正确拒绝"判成了失败。
+    expect(text).toMatch(/^WRITE_FAILED:(EPERM|EACCES|EROFS|ERR_ACCESS_DENIED)/);
     expect(fs.existsSync(target)).toBe(false);
   });
 
