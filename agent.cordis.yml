@@ -195,7 +195,7 @@
 # ── OMB v2 认知层 ───────────────────────────────────────────────────────────
 
 - id: omb-v2
-  name: './lib/runtime/plugin.js?v=11'
+  name: './lib/runtime/plugin.js?v=12'
   config:
     # 宿主 DSH 版本（R6 装配注入面：运行时指纹/provenance 的 dsh_version 唯一来源）
     # 升级宿主后同步更新本值（配置面即设计入口，无需改码）。
