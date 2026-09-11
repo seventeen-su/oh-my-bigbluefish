@@ -205,7 +205,8 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
     // happy path 无降级记录（三钩子全接线 + 全成功）
     expect(degradationLog()).toHaveLength(0);
 
-    // 验收③ MaintenanceDebt 有数据（scheduler 注入）：中断量子 → 任务留队并累计债务；随后正常量子可执行
+    // 验收③ 维护队列语义（scheduler 注入）——行为变更（审查修复，非"过关"）：中断量子只让任务**留队**，
+    // 不累计债务（未执行 ≠ 失败）；债务由真实执行失败决定。执行成功同样不产生债务。
     await vi.waitFor(
       async () => {
         const aborted = new AbortController();
@@ -215,10 +216,10 @@ describe('T8.26.6 装配冒烟（模拟会话，完整三钩子链端到端）',
       },
       { timeout: 5000, interval: 10 },
     );
-    const debt = scheduler.debtSnapshot();
-    expect(debt.some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(true);
+    expect(scheduler.debtSnapshot().some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(false);
     const report = await scheduler.requestQuantum();
     expect(report.ran).toContain(`turn-finalize:${SESSION}`);
+    expect(scheduler.debtSnapshot().some((d) => d.task_id === `turn-finalize:${SESSION}`)).toBe(false);
     scheduler.stop();
   });
 

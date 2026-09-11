@@ -50,7 +50,9 @@ afterEach(async () => {
     await rt.close();
   }
   runtimes = [];
-  await rm(base, { recursive: true, force: true });
+  // maxRetries：满负载并发下临时目录清理与收尾异步写入存在竞态（ENOTEMPTY——本条为既有已知不稳定项，
+  // 隔离单跑恒通过；加重试不改变任何断言语义，只消除清理噪声）
+  await rm(base, { recursive: true, force: true, maxRetries: 3 });
 });
 
 function track(rt: CognitiveRuntime): CognitiveRuntime {

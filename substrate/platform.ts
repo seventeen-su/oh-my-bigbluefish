@@ -15,6 +15,7 @@
 //   3. **自身永不阻塞宿主**：本模块只做探测与薄封装，任何失败都返回结果对象（不抛穿到宿主）。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /** 平台类别（仅区分三类：windows / posix（Linux、macOS）/ 其它未知） */
@@ -60,6 +61,27 @@ export interface PlatformProvider {
 const LOCK_RETRYABLE = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY', 'EMFILE']);
 const LOCK_RETRY_COUNT = 3;
 
+/**
+ * 子进程失败是否值得短退避重试（审查修复 M1）。
+ * `execFileSync` 在"子进程以非 0 退出"时抛出的错误**只带 `status`/`stderr`，不带 `code`**（code 只在
+ * spawn 级失败如 ENOENT 时存在）——旧判据只看 `code`，使重试分支对真实场景（icacls/chmod 因杀软、
+ * 索引器、网络盘占用而退出 1）永远不可达，把一次性竞态变成长期降级。
+ * 现在：spawn 级可重试码 → 重试；非 0 退出且 stderr 命中锁/占用特征 → 重试；其余 → 立即放弃。
+ */
+function isRetryableFailure(err: unknown): boolean {
+  const e = err as NodeJS.ErrnoException & { status?: number; stderr?: Buffer | string };
+  if (typeof e.code === 'string' && LOCK_RETRYABLE.has(e.code)) {
+    return true;
+  }
+  if (typeof e.status === 'number' && e.status !== 0) {
+    const stderr = e.stderr === undefined ? '' : String(e.stderr);
+    return /access is denied|being used by another process|could not lock|permission denied|resource busy|device or resource busy/i.test(
+      stderr,
+    );
+  }
+  return false;
+}
+
 function sleepMs(ms: number): void {
   const shared = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(shared), 0, 0, ms);
@@ -103,8 +125,7 @@ function windowsReadOnly(): ReadOnlyMechanism | null {
         return;
       } catch (err) {
         last = err;
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === undefined || !LOCK_RETRYABLE.has(code)) break;
+        if (!isRetryableFailure(err)) break;
         if (attempt < LOCK_RETRY_COUNT - 1) sleepMs(50 * (attempt + 1));
       }
     }
@@ -135,8 +156,7 @@ function posixReadOnly(): ReadOnlyMechanism | null {
         return;
       } catch (err) {
         last = err;
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === undefined || !LOCK_RETRYABLE.has(code)) break;
+        if (!isRetryableFailure(err)) break;
         if (attempt < LOCK_RETRY_COUNT - 1) sleepMs(50 * (attempt + 1));
       }
     }
@@ -147,9 +167,24 @@ function posixReadOnly(): ReadOnlyMechanism | null {
   return {
     // a-w：目录去写位（含子项）；不触碰读/执行位
     apply: (dir) => run(['-R', 'a-w', dir], '只读权限施加', dir),
-    // u+w：恢复所有者写位（删除工作树前置；其余位保持）
+    // u+w：仅恢复**所有者**写位（组/其他写位不恢复——审查记录：更彻底的恢复需要 apply 前留存原模式，
+    // 当前实现不保存，故注释如实说明，不宣称"其余位保持"）
     reset: (dir) => run(['-R', 'u+w', dir], '只读权限释放', dir),
-    isReadOnly: (dir) => probeWritable(dir) === false,
+    // 只读判定（审查修复 H1）：**模式位优先**——root（CAP_DAC_OVERRIDE）下真实写探测恒成功，
+    // 仅凭写探测会把"权限位已去写"误判成"可写"，于是每次启动都报"只读 ACL 丢失"并反复 chmod，
+    // 而实际可写性又由 root 自身豁免（机制对该进程本就不构成约束）。模式位判定如实反映施加结果；
+    // 目录缺失/stat 失败 → 回落到写探测（保守）。
+    isReadOnly: (dir) => {
+      try {
+        const mode = fs.statSync(dir).mode;
+        if ((mode & 0o222) === 0) {
+          return true; // 三个写位全清 = 已施加只读（与 Windows ACL 判定等价的可观测口径）
+        }
+      } catch {
+        // stat 失败 → 交给写探测（不存在/不可访问）
+      }
+      return probeWritable(dir) === false;
+    },
   };
 }
 
@@ -169,9 +204,11 @@ function detect(): PlatformCapabilities {
   } else if (platform === 'posix') {
     readOnly = posixReadOnly();
     mech = 'posix-mode';
-    // 探测 chmod 是否真的可用（容器/只读挂载下可能失败；失败 → 显式降级）
+    // 探测 chmod 是否真的可用（容器/只读挂载下可能失败；失败 → 显式降级）。
+    // 审查修复 L1：探测目录改用 os.tmpdir()（不再读 TMPDIR——TMPDIR 指向不可写目录时会把
+    // "临时目录不可用"误报成"chmod 不可用"，从而永久跳过只读施加，原因也是错的）。
     try {
-      const probeDir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? '/tmp', 'omb-chmod-probe-'));
+      const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omb-chmod-probe-'));
       try {
         execFileSync('chmod', ['-R', 'a-w', probeDir], { encoding: 'utf8' });
         execFileSync('chmod', ['-R', 'u+w', probeDir], { encoding: 'utf8' });
@@ -181,6 +218,13 @@ function detect(): PlatformCapabilities {
     } catch (err) {
       readOnly = null;
       notes.push(`chmod 不可用（${(err as Error).message}）——只读权限施加降级为跳过（工作树将保持可写，安全语义变化）`);
+    }
+    // root 运行时的诚实标注（审查修复 H1）：CAP_DAC_OVERRIDE 使权限位对**本进程**不构成约束，
+    // 机制在语义上降级为"对其它进程有效"。不假称"可用即不可写"。
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      notes.push(
+        '以 root 运行：POSIX 权限位只读对本进程不构成约束（CAP_DAC_OVERRIDE）——只读语义降级为"对其它用户/进程有效"，请勿据此断言工作树不可写',
+      );
     }
   } else {
     notes.push(`未识别的平台 "${raw}"——只读机制不可用，只读施加降级为跳过`);

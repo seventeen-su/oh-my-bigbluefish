@@ -1050,6 +1050,15 @@ export class CognitiveRuntime {
     return this.selfIteration.backgroundModelCalls && this.modelAdapter !== null;
   }
 
+  /**
+   * 并发档位是否允许后台模型调用（**只按档位判定**，不看 modelAdapter）。
+   * 用于 judge/空白子代理路径：这类调用的通道是注入的 judgeExecutor（子代理），与 modelAdapter 无关，
+   * 但同样受"并发=1 → 禁止后台模型调用"约束（审查修复 M6）。
+   */
+  backgroundCallsPermittedByTier(): boolean {
+    return this.selfIteration.backgroundModelCalls;
+  }
+
   /** 自迭代开关面快照（状态面可读——回答「为什么没有演化」时先看开关） */
   selfIterationConfig(): { enabled: boolean; min_strength: number; background_model_calls: boolean; schedule: boolean } {
     return {
@@ -1110,6 +1119,8 @@ export class CognitiveRuntime {
     let debt_pending_manual: DebtSourceView[] = [];
     let debt_release_audit: DebtReleaseRecord[] = [];
     let debt_limits: ReturnType<MaintenanceScheduler['limitsSnapshot']> | null = null;
+    /** 债务快照读取失败原因（debt.json 损坏等）——并入 observations_degraded 暴露，不让状态面整体抛错 */
+    let debtDegraded: string | null = null;
     if (this.maintenance !== null) {
       try {
         debt_sources = this.maintenance.debtSourceView();
@@ -1141,7 +1152,16 @@ export class CognitiveRuntime {
         ? { line: this.lineSnapshot.line, commit: this.lineSnapshot.commit, dir: this.lineSnapshot.dir }
         : null,
       line_degraded: this.lineDegraded,
-      debt: this.maintenance?.debtSnapshot() ?? [],
+      // 债务段包 try（审查修复）：debt.json 损坏时 debtSnapshot 会抛，此前会让整个 kern_status 抛错——
+      // 恰好在最需要状态面的时候失效；现在降级为空数组并把原因写进 observations_degraded。
+      debt: (() => {
+        try {
+          return this.maintenance?.debtSnapshot() ?? [];
+        } catch (err) {
+          debtDegraded = errorDetail(err);
+          return [];
+        }
+      })(),
       debt_sources,
       debt_pending_manual,
       debt_release_audit,
@@ -1151,7 +1171,7 @@ export class CognitiveRuntime {
       memory_vector: this.memory.vectorStats(),
       relations: this.relationStats(),
       maintenance_observations,
-      observations_degraded,
+      observations_degraded: debtDegraded === null ? observations_degraded : [observations_degraded, debtDegraded].filter((x): x is string => x !== null).join('；'),
       recent_signals,
       signals_degraded,
       components: {
@@ -2354,6 +2374,30 @@ export class CognitiveRuntime {
           },
         });
       }
+      // 验证债务复核（审查修复：此前该任务只有执行体、**没有任何生产入队路径**——S2 校验闭环断在
+      // 消费端：repair/shadow 写下的 UNKNOWN 债务永远 pending、judge 永不触发、debt.jsonl 只增不减）。
+      // 放在卫生节流窗口之外：待复核债务是"已欠的账"，不该等一小时才被处理；只在确有 pending 时入队
+      //（队列空 → 零开销，同 id enqueue 为替换语义、不累积）。后台模型调用门禁在 runVerificationReview 内判定。
+      let pendingVerification = 0;
+      try {
+        pendingVerification = (await this.verificationDebt.listPending(1)).length;
+      } catch {
+        pendingVerification = 0; // 债务读取失败 → 不入队（runVerificationReview 自身会记降级）
+      }
+      if (pendingVerification > 0) {
+        await this.maintenance.enqueue({
+          id: 'verification_review',
+          value: 1,
+          estimated_cost: maintenanceCosts.promotion_check,
+          priority: 0,
+          urgency: 'normal',
+          subsystem: 'verification-review',
+          reason: '存在待复核验证债务（judge 判定或转人工）',
+          run: async (signal) => {
+            await this.runVerificationReview(signal);
+          },
+        });
+      }
       maintenance = { enqueued: true, debt: this.maintenance.debtSnapshot() };
     }
 
@@ -2582,9 +2626,8 @@ export class CognitiveRuntime {
         roots: this.artifactRoots,
         environment,
       });
-      for (const m of manifests) {
-        await this.artifactIndex.register(m);
-      }
+      // 批量注册（一次读 + 一次写）：单轮最多 100 个 manifest，逐条 register 是 N 次全量读 + N 次全量写
+      await this.artifactIndex.registerMany(manifests);
     } catch (err) {
       // 制品发现/索引失败 → 降级记录不抛（尽力而为——制品索引缺失不阻塞事件主链）
       recordDegradation('artifact/index', `制品发现/索引失败（${errorDetail(err)}）——尽力而为`);
@@ -2667,8 +2710,16 @@ export class CognitiveRuntime {
     };
   }
 
-  /** 关闭存储连接（Windows WAL 收尾先 close；幂等）。P2：先组件批量 dispose 回滚（P8 注册皆效应）再关库。 */
+  /** 关闭存储连接（Windows WAL 收尾先 close；幂等）。P2：先组件批量 dispose 回滚（P8 注册皆效应）再关库。
+   *  审查修复：先停维护定时器并**等在飞任务落地**——否则关闭瞬间在跑的任务会继续写已关闭的 SQLite
+   *  （database is not open），错误还会被 runOne 记成一条虚假债务。 */
   async close(): Promise<void> {
+    try {
+      this.maintenance?.stop?.();
+      await this.maintenance?.drain?.();
+    } catch {
+      // 停表/排空失败不阻塞关闭（库仍会被关；残余任务错误由各自降级路径留痕）
+    }
     await this.components.disposeAll();
     await this.eventStore.close();
     await this.staging.close();
@@ -3097,10 +3148,10 @@ export class CognitiveRuntime {
         };
       case 'environment_check':
         // P7：Predictive Invalidation——指纹 diff → 衰减记录落盘 + 受影响对象降级/重新验证入队
-        //（失败降级不抛：尽力而为）
+        //（失败降级不抛：尽力而为）。审查修复 M4：不再在此无条件标记子系统健康——成功路径由
+        // runEnvironmentCheck 内部标记（失败会被 catch 吞成"完成"，从而给出 untrue 的债务释放证据）。
         return async () => {
           await this.runEnvironmentCheck();
-          this.markSubsystemOk('environment-check');
         };
       case 'memory_consolidation':
         // R4（P0）：经验 → 长期记忆 生产闭环（§5.2/§7.2）——执行体 runMemoryConsolidation
@@ -3409,14 +3460,30 @@ export class CognitiveRuntime {
       err.name = 'AbortError';
       throw err;
     }
-    const page = await this.memory.query({ scope: 'Project', limit: RELATION_BUILD_BATCH, budget: Number.MAX_SAFE_INTEGER });
-    const memories = page.items;
-    const vectors = this.memory.vectorsFor(memories.map((m) => m.id));
-    const planned = planSimilarityEdges(memories, vectors);
-    const applied = await applySimilarityEdges(this.memory, planned, Date.now());
+    // 逐 scope 建图（审查修复：此前只取 Project → Session/Global 记忆永远不可能被建边，而稀疏门的分母
+    // 是全库记忆数 → needs_build 恒真、每轮重复入队并白跑同一批。现在处理范围与判据同口径：
+    // 三个作用域各取一批、各自成图（边不跨 scope——与整合链的按 scope 处理一致）。
+    const applied = { created: 0, updated: 0, unchanged: 0 };
+    let planned = 0;
+    let scanned = 0;
+    for (const scope of ['Session', 'Project', 'Global'] as const) {
+      const page = await this.memory.query({ scope, limit: RELATION_BUILD_BATCH, budget: Number.MAX_SAFE_INTEGER });
+      const memories = page.items;
+      if (memories.length < 2) {
+        continue;
+      }
+      const vectors = this.memory.vectorsFor(memories.map((m) => m.id));
+      const scopePlanned = planSimilarityEdges(memories, vectors);
+      const r = await applySimilarityEdges(this.memory, scopePlanned, Date.now());
+      applied.created += r.created;
+      applied.updated += r.updated;
+      applied.unchanged += r.unchanged;
+      planned += scopePlanned.length;
+      scanned += memories.length;
+    }
     const stats = this.memory.relationStats();
     this.markSubsystemOk('memory-relation');
-    return { ...applied, planned: planned.length, scanned: memories.length, edges: stats.edges };
+    return { ...applied, planned, scanned, edges: stats.edges };
   }
 
   /** 关系图观测面（状态工具/测试用：边统计 + 是否还需要建图） */
@@ -3517,8 +3584,11 @@ export class CognitiveRuntime {
       }
       this.markSubsystemOk('environment-check'); // 本次环境核对完成（有衰减记录也是完成）
       return record;
-    } catch {
-      // 尽力而为：采集/落盘/入队失败 → 降级不抛（environment_check 是低优先级检查，不阻塞维护链）
+    } catch (err) {
+      // 尽力而为：采集/落盘/入队失败 → 降级不抛（environment_check 是低优先级检查，不阻塞维护链）。
+      // 审查修复 M4：此前空 catch 把真实失败变成"检查成功"（观测面记 success、子系统自检面还会给出
+      // "已核对"证据）——现在留降级记录，且**不**标记子系统健康（成功路径各自标记）。
+      recordDegradation('environment-check', `环境检查失败（${errorDetail(err)}）——本轮跳过，不影响维护链`);
       return null;
     }
   }
@@ -3762,8 +3832,12 @@ export class CognitiveRuntime {
       file = join(this.repairDir, `${record.ts}-${n}.json`);
     }
     await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
-    // 子系统自检面：修复链本次执行完成（对象级判定见 record.objects）→ 标记健康（债务释放的确认依据）
-    this.markSubsystemOk('repair-chain');
+    // 子系统自检面（审查修复 M1）：只有"无待修对象（合法完成）"或"至少一个对象 PASS"才算修复链健康。
+    // 此前无条件标记 → 一次全 FAIL/UNKNOWN 的执行也会给出"执行体成功跑完"的内存证据，释放逻辑据此
+    // 把 candidate_validation 的债务一起清掉（修了 A 顺手清掉 B 的债）。
+    if (objects.length === 0 || objects.some((o) => o.verdict === 'PASS')) {
+      this.markSubsystemOk('repair-chain');
+    }
     return record;
   }
 
@@ -3788,6 +3862,14 @@ export class CognitiveRuntime {
       pending = await this.verificationDebt.listPending(3);
     } catch (err) {
       recordDegradation('verification/review', `债务读取失败（${errorDetail(err)}）——复核跳过（债务保留）`);
+      return;
+    }
+    // 并发档位门禁（审查修复 M6）：并发=1 时禁止后台模型调用——judge 走空白子代理（一次模型调用），
+    // 必须与候选生成/语义裁判同一档位约束；禁止时转人工复核（不假装判定、不阻塞主对话）。
+    if (pending.length > 0 && !this.backgroundCallsPermittedByTier()) {
+      for (const rec of pending) {
+        await this.verificationDebt.markPendingManual(rec.key, '后台模型调用被禁用（并发档位受限）——转人工复核');
+      }
       return;
     }
     for (const rec of pending) {

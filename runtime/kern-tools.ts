@@ -632,10 +632,15 @@ export function kernMemoryTool(runtime: KernRuntimeLike): ToolDefinitionLike {
       const a = (args ?? {}) as Record<string, unknown>;
       const op = typeof a.op === 'string' ? a.op : 'retrieve';
       // 参数类型守卫（工具面）：非字符串/非数字 → 明确文本（不抛）
-      for (const key of ['op', 'query', 'text', 'id', 'target_id', 'scope', 'kind', 'lifecycle', 'prov_class', 'relation'] as const) {
+      // 审查修复 L1：`type` 与 `polluted` 此前漏在守卫之外——非字符串 type 会被静默丢弃，导致
+      // "删除边失败：from/to/type 三者均为必填"这类与用户输入不符的归因。
+      for (const key of ['op', 'query', 'text', 'id', 'target_id', 'scope', 'kind', 'lifecycle', 'prov_class', 'relation', 'type'] as const) {
         if (a[key] !== undefined && typeof a[key] !== 'string') {
           return { ok: false, text: `kern_memory 参数非法：${key} 必须为字符串` };
         }
+      }
+      if (a.polluted !== undefined && typeof a.polluted !== 'boolean') {
+        return { ok: false, text: 'kern_memory 参数非法：polluted 必须为布尔值' };
       }
       if (a.limit !== undefined && typeof a.limit !== 'number') {
         return { ok: false, text: 'kern_memory 参数非法：limit 必须为数字' };
