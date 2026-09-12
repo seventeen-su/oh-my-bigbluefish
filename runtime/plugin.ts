@@ -12,6 +12,7 @@
 //（单模式：load 校验 + 空白会话守卫 + onSwitch 记账；不涉及 DSH 预设切换）；注册 /bench（supervisor/bench.ts）。
 // 函数插件契约：apply(ctx, config)——config 为 agent.cordis.yml 行的 config（Cordis Fiber 以第二参传入）。
 import { cleanupStaleInitialWorktrees, disposeMaterializedInitial, isVersionLine, loadVersion, type VersionLine } from '../substrate/snapshot.js';
+import { diag, setDiagnostics } from '../substrate/debug.js';
 import { ensureThreeLineLayout } from '../substrate/bootstrap.js';
 // 外核安全状态（已知问题《内核加载失败不得阻塞宿主》/《外核自身也要非阻塞》）：拉起内核前的轻量自检
 import { evaluateSafeState, substrateRootOf } from '../substrate/safe-state.js';
@@ -166,6 +167,17 @@ export interface PluginConfig {
    * 证明**生产路径真的调了桥**。缺省（不配）→ 插件自建调度器，行为完全不变。
    */
   maintenance?: MaintenanceScheduler;
+  /**
+   * 诊断输出开关（**缺省 false = 静默**）。
+   *
+   * 打开后才会打印布局初始化/修复、旧种子迁移、启动回退时 worktree 同步失败这类诊断行
+   *（含 git 子进程的 stderr 转发）。缺省关闭是刻意的：其中"worktree 同步失败"在当前设计下是
+   * **预期**结果（正式 worktree 只读、回退只切 ref），每次回退都打一遍会被误读成故障。
+   *
+   * **它只控制 console 行**——降级记录与状态面（`kern_status`）不受影响，任何时候都如实暴露。
+   * 等价的环境变量：`OMB_DEBUG=1`（便于不经插件直接跑脚本时排障）。
+   */
+  debug?: boolean;
 }
 
 /** DSH 命令注册的最小结构接口（真实类型见 @deepseek-ai/dsh-commands，不引包） */
@@ -644,6 +656,10 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
   // 配置面收敛（已知问题《非阻塞设计不足…》方向①）：插件对 config **宽进**——未知键忽略并记降级，
   // 不因"宿主侧多传/改名"导致插件加载失败。审计结论并入状态面（`host_contract` 段）。
   const configReport = auditPluginConfig(config);
+  // 诊断输出的总开关必须在**任何诊断打印之前**生效：布局初始化/启动回退都发生在本函数后段，
+  // 而回退诊断在 boot() 内、布局诊断紧随其后。缺省关闭（不污染宿主终端）。
+  // 只影响 console 行；状态面与降级记录与它无关（日志可静音，状态不可静音）。
+  setDiagnostics(config.debug === true);
   if (configReport.unknown_keys.length > 0) {
     recordDegradation(
       'config/unknown-keys',
@@ -826,7 +842,9 @@ function applyInner(ctx: ContextLike, config: PluginConfig = {}): ApplyResult {
       if (r.status === 'degraded') {
         recordDegradation('layout/bootstrap', r.detail);
       } else if (r.status !== 'ok') {
-        console.info(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
+        // 诊断行默认静默（config.debug / OMB_DEBUG=1 才打印）：布局初始化只在首次/修复时发生，
+        // 而它已进状态面，不必每次都往宿主终端刷一行。
+        diag(`[omb-v2] 三线布局自动${r.status === 'initialized' ? '初始化' : '修复'}完成：${r.detail}`);
       }
     } catch (err) {
       recordDegradation('layout/bootstrap', `三线布局初始化/修复异常（${err instanceof Error ? err.message : String(err)}）——跳过，命令面仍可用`);

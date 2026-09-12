@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { GIT_BIN } from './snapshot.js';
+import { diagWarn } from './debug.js';
 
 /** worktree 同步策略：best-effort（缺省，降级语义）| strict（失败即回滚失败，补偿恢复 ref） */
 export type WorktreePolicy = 'best-effort' | 'strict';
@@ -168,7 +169,10 @@ export function rollbackTo(opts: RollbackOptions): RollbackResult {
       worktree_status: 'degraded',
       worktree_error: detail,
     };
-    console.warn(
+    // 诊断行：默认静默（见 substrate/debug.ts）。**注意这里的"降级"在当前设计下是预期的**——
+    // 正式 worktree 只读、回退只切 ref，故 worktree 同步必然失败；把它打到终端会像故障。
+    // 真实状态不受静音影响：返回值的 worktree_status/worktree_error 与调用方的降级记录照常。
+    diagWarn(
       `[rollback] ref 已切换到 ${verified}，但 worktree（${opts.worktree}）同步失败（降级，worktree_status=degraded）：${detail}`,
     );
     return degraded;

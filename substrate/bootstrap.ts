@@ -14,6 +14,7 @@ import path from 'node:path';
 import { GIT_BIN, defaultLayout, presetRoot, type VersionLayout } from './snapshot.js';
 // 外核平台提供者（已知问题《Windows 绑定面与 Linux 迁移》）：只读机制按平台选择（icacls / POSIX 权限位）
 import { platformProvider } from './platform.js';
+import { diag } from './debug.js';
 
 export { defaultLayout };
 
@@ -505,7 +506,7 @@ function isLegacySeed(lay: VersionLayout): boolean {
  * 3. 清理 workspace/.omb/lines/ 旧快照目录与 .evolution/candidates/ 旧候选 worktree
  *    （指向旧 bare 的 gitfile/注册项，重建后旧 commit 快照失效）；
  * 4. 走既有完整初始化流程重建新种子（含 policy/processes 快照 + trusted-latest + 只读 ACL + 候选 worktree）；
- * 5. console.info 中文说明。返回备份目录路径（versions.git.legacy-<ts>）。
+ * 5. 诊断说明（默认静默，见 substrate/debug.ts）。返回备份目录路径（versions.git.legacy-<ts>）。
  */
 function migrateLegacySeed(lay: VersionLayout): string {
   const root = path.dirname(lay.bareRepo);
@@ -551,7 +552,9 @@ function migrateLegacySeed(lay: VersionLayout): string {
     throw new Error(`迁移重建后布局仍不健康：${still}`);
   }
   // 5. 记录（中文说明；插件 apply 另经 status 输出「自动修复完成」）
-  console.info(
+  // 诊断行默认静默（见 substrate/debug.ts）：迁移是一次性事件，且插件已在 status/降级面留痕，
+  // 不必在每次启动时往终端重复打印。
+  diag(
     `[omb-v2] 旧种子已自动迁移重建：versions.git → ${legacy}（数据备份保留；新种子含 policy/processes 快照与 trusted-latest）`,
   );
   return legacy;
