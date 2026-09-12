@@ -299,4 +299,50 @@ describe('⑦ 状态面', () => {
     await b.encodePendingBatch();
     expect(b.vectorStats()).toMatchObject({ encoded: 1, pending: 0, dim: EMBEDDING_DIM });
   });
+
+  it('stored_dims / embedder_mismatch：分清"真的没有向量"与"本进程装错了嵌入器"', async () => {
+    // 这条来自真实排查教训：直接用默认嵌入器（哈希词袋 256 维）打开一个**装着 512 维神经向量**的库时，
+    // dim=null + mismatched=N 外观上与"向量通道全废"完全一样，我因此两次把正常库读成故障。
+    // 新增两项后该情形可机械判定为 embedder-mismatch（假象）。
+    const db = await tmpDb();
+    const b = openBackend(db);
+    // 空库：既没有向量，也没有不同源
+    expect(b.vectorStats()).toMatchObject({ encoded: 0, stored_dims: [], embedder_mismatch: false });
+    expect(b.embeddingStatusView().verdict).toBe('no-vectors');
+
+    // 用 512 维嵌入器写入（模拟真模型写下的向量）
+    const dim512: Embedder = { id: 'probe-512', dim: 512, embed: async () => new Float32Array(512).fill(0.1) };
+    b.setEmbedder(dim512);
+    await b.ingest(makeMemory({ payload: '神经向量样本' }));
+    await b.encodePendingBatch();
+    expect(b.vectorStats()).toMatchObject({ encoded: 1, stored_dims: [512], embedder_mismatch: false, dim: 512 });
+    expect(b.embeddingStatusView().verdict).toBe('ok');
+
+    // 另开一个后端（默认哈希词袋 256 维）打开同一个库 → 这正是"装错嵌入器"的现场
+    const b2 = openBackend(db);
+    const s2 = b2.vectorStats();
+    expect(s2.stored_dims).toEqual([512]); // 盘上真实维度仍然如实报出
+    expect(s2.embedder_dim).toBe(EMBEDDING_DIM);
+    expect(s2.embedder_mismatch).toBe(true); // ← 关键：能识别出"不同源"而非"全废"
+    expect(s2.dim).toBeNull();
+    const view = b2.embeddingStatusView();
+    expect(view.verdict).toBe('embedder-mismatch');
+    expect(view.note).toMatch(/不同源|假象|setEmbedder/);
+  });
+
+  it('混维（真正需要重编码）与不同源（假象）被区分开', async () => {
+    const db = await tmpDb();
+    const b = openBackend(db);
+    // 先写 256 维（默认），再换 512 维写一条 → 盘上出现两种维度，这才是真正的"混维"
+    await b.ingest(makeMemory({ payload: '旧的 256 维' }));
+    await b.encodePendingBatch();
+    const dim512: Embedder = { id: 'probe-512', dim: 512, embed: async () => new Float32Array(512).fill(0.1) };
+    b.setEmbedder(dim512); // 换嵌入器 → 异维行被置为待编码（既有修复），故这里手工再造一条异维行
+    await b.ingest(makeMemory({ payload: '新的 512 维' }));
+    await b.encodePendingBatch();
+    const stats = b.vectorStats();
+    expect(stats.stored_dims).toEqual([512]); // 旧行已被作废重编码成 512，盘上维度统一
+    expect(stats.embedder_mismatch).toBe(false);
+    expect(stats.mismatched).toBe(0);
+  });
 });

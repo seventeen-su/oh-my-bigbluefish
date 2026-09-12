@@ -109,22 +109,45 @@ export interface KernStatusSummary {
     batch_size: number;
   } | null;
   /**
-   * 记忆向量通道状态（已知问题《新增向量检索》观测面）：已编码 / 待编码 / 维度 / 嵌入器标识 /
-   * 异维陈旧条数 / 当前嵌入器维度。
-   * 待编码 > 0 说明向量通道尚未覆盖全部记忆（空闲期 memory_vector_encode 任务会补齐）；
-   * **dim=null 有两种含义**，必须靠 `mismatched` 区分：`encoded=0` → 尚无任何编码条目（通道空，
-   * 无害）；`mismatched>0` → 存在维度与当前嵌入器不符的陈旧向量，**通道对这些行已失效**
-   *（检索侧逐行跳过），需等重编码补齐——把后者读成"无害空库"会漏掉整批记忆不可检索的状态。
+   * 记忆向量通道**计数**面（已知问题《新增向量检索》观测面）：已编码 / 待编码 / 维度 / 嵌入器标识 /
+   * 异维陈旧条数 / 当前嵌入器维度 / 盘上实际维度集合 / 是否不同源。
+   * 待编码 > 0 说明向量通道尚未覆盖全部记忆（空闲期 memory_vector_encode 任务会补齐）。
+   * **`dim=null` 有三种含义**，靠 `mismatched` 与 `embedder_mismatch` 区分：
+   *   - `encoded=0` → 尚无任何编码条目（通道空，无害）；
+   *   - `mismatched>0` 且 `embedder_mismatch=false` → 确有成陈旧向量需重编码（通道对这些行已失效）；
+   *   - `embedder_mismatch=true` → **假象**：本进程装错了嵌入器，盘上向量其实是好的。
+   * 结论性判定见 `embedding.verdict`（状态面首选），这里保留原始计数供审计。
    */
-  memory_vector:
-    | { encoded: number; pending: number; dim: number | null; embedder: string; mismatched: number; embedder_dim: number }
-    | null;
+  memory_vector: {
+    encoded: number;
+    pending: number;
+    dim: number | null;
+    embedder: string;
+    mismatched: number;
+    embedder_dim: number;
+    stored_dims: number[];
+    embedder_mismatch: boolean;
+  } | null;
   /**
-   * 嵌入通道**原因**面（诚实降级的可读出口）：当前嵌入器/维度/模型目录/降级原因。
-   * `memory_vector` 只给症状（"现在是哈希词袋"），这里回答"为什么"——没装权重、没装 onnxruntime、
-   * 还是词表/构建资产缺失。degraded 非空即表示神经嵌入未启用（原因原文，含可操作的下一步）。
+   * 嵌入通道**原因与结论**面（诚实降级的可读出口）：当前嵌入器/维度/模型目录/降级原因 + 判定结论。
+   * `memory_vector` 只给症状（"现在是哈希词袋"或"dim 为 null"），这里回答"为什么"，且用 `verdict`
+   * 区分三种外观相同的情形——真的没有向量 / 换过嵌入器留下陈旧向量 / **本进程嵌入器与盘上不同源**。
+   * degraded 非空即表示神经嵌入未启用（原因原文，含可操作的下一步）。
    */
-  embedding?: { embedder: string; dim: number; model_dir: string | null; degraded: string | null } | null;
+  embedding?: {
+    embedder: string;
+    dim: number;
+    model_dir: string | null;
+    degraded: string | null;
+    /** 判定结论；`embedder-mismatch` 表示"向量通道全废"是假象（本进程没装入真嵌入器） */
+    verdict: 'no-vectors' | 'embedder-mismatch' | 'stale-vectors' | 'ok';
+    /** 结论说明（人话，含下一步） */
+    note: string;
+    /** 盘上实际存在的向量维度集合 */
+    stored_dims: number[];
+    /** 当前嵌入器与盘上向量不同源 */
+    embedder_mismatch: boolean;
+  } | null;
   /**
    * 关系图状态（已知问题《关系图为空图》观测面）：边总数 / 类型分布 / 来源分布 / 权重统计 /
    * 记忆总数 / 是否还需要建图。edges=0 且 memories≥2 → 图仍是空的（`needs_build` 会为 true，

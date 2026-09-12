@@ -1227,13 +1227,35 @@ export class CognitiveRuntime {
     }
   }
 
-  /** 嵌入通道状态（状态面可读：当前嵌入器/模型目录/降级原因） */
-  embeddingStatus(): { embedder: string; dim: number; model_dir: string | null; degraded: string | null } {
+  /**
+   * 嵌入通道状态（状态面可读：当前嵌入器/模型目录/降级原因 + **判定结论**）。
+   *
+   * 加 `verdict` / `stored_dims` / `embedder_mismatch` 的理由（排查中被误导过两次）：`memory_vector`
+   * 那组计数在三种完全不同的情形下外观相同——真的没有向量、换过嵌入器留下陈旧向量、以及
+   * **本进程用错了嵌入器而盘上其实是好的**。只看 `dim: null` + `mismatched: N` 会把第三种假象读成
+   * "向量通道全废"。现在状态面直接给结论，不必靠人记得去比对维度。
+   */
+  embeddingStatus(): {
+    embedder: string;
+    dim: number;
+    model_dir: string | null;
+    degraded: string | null;
+    verdict: 'no-vectors' | 'embedder-mismatch' | 'stale-vectors' | 'ok';
+    note: string;
+    stored_dims: number[];
+    embedder_mismatch: boolean;
+  } {
+    const view = this.memory.embeddingStatusView();
+    const stats = this.memory.vectorStats();
     return {
       embedder: this.memory.embedderId,
-      dim: this.memory.vectorStats().embedder_dim,
+      dim: stats.embedder_dim,
       model_dir: this.embeddingModelDir,
       degraded: this.embeddingDegraded,
+      verdict: view.verdict,
+      note: view.note,
+      stored_dims: stats.stored_dims,
+      embedder_mismatch: stats.embedder_mismatch,
     };
   }
 

@@ -29,7 +29,7 @@
 ## 安装插件
 
 1. **位置**：克隆到 `$DSH_HOME/.agent-presets/oh-my-bigbluefish/`（目录名即 preset id，须匹配 `^[a-z0-9][a-z0-9-]*$`）。`versions.git/`、`stable/`、`latest/`、`workspace/.omb/` 均 gitignored，首次启动自动初始化三线布局。
-2. **挂载**：仓库根自带全量组合 `agent.cordis.yml`（standard 工具面 + `omb-v2` 认知行，`name: './lib/runtime/plugin.js?v=13'`）；克隆后 `pnpm install && pnpm build`（`lib/` 为编译产物）。修改源码重新 build 后须递增 `?v=N` 或重启宿主。
+2. **挂载**：仓库根自带全量组合 `agent.cordis.yml`（standard 工具面 + `omb-v2` 认知行，`name: './lib/runtime/plugin.js?v=14'`）；克隆后 `pnpm install && pnpm build`（`lib/` 为编译产物）。修改源码重新 build 后须递增 `?v=N` 或重启宿主。
 3. **生效**：重启 DSH，新建会话选择「大肥鱼模式 v2」。验证：
    - `/bench` → 冻结基准（回放或真实执行）；
    - `kern_status` → 版本线/快照哈希/维护债务/信号数/组件健康；
@@ -52,8 +52,11 @@
 | --- | --- | --- |
 | `embeddingModelDir` | 权重目录绝对路径 | 按 `OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5/` 探测 |
 | `embeddingThreads` | ONNX 推理线程数（1~64） | `2`；本地小机可设 `1` 避免与主对话抢核 |
+| `debug` | 打印布局初始化/修复、启动回退等诊断行 | `false`（静默）；等价环境变量 `OMB_DEBUG=1` |
 
-两个键都可在 `agent.cordis.yml` 的 `config` 下配置；非法值只记降级、不阻断加载。未装权重时向量通道自动回落哈希词袋（功能仍可用，语义能力弱），原因见 `kern_status` 的状态面。
+三个键都可在 `agent.cordis.yml` 的 `config` 下配置；非法值只记降级、不阻断加载。未装权重时向量通道自动回落哈希词袋（功能仍可用，语义能力弱），原因见 `kern_status` 的状态面。
+
+> `debug` **只控制终端输出**：降级记录与 `kern_status` 状态面任何时候都如实暴露，静音不会让故障变得不可见。之所以默认关闭，是因为"启动回退时 worktree 同步失败"在只读 worktree 的设计下是预期结果，打印出来会被误读成故障。
 
 ## 卸载
 
