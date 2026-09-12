@@ -984,4 +984,39 @@ reject，就产生 unhandled rejection（真机表现：测试拆除临时目录
 前者把失败记成 `null` + `shadowBundleFailed`，后者清空缓存以便重试，并把失败原因交给
 上层 `sandboxStatusAsync()` 记进状态面（substrate 不能引 runtime 的降级面——层 DAG）。
 
+---
+
+## 18. 可观测性修订：两条"只能靠人记得"的坑（2026-09）
+
+### 18.1 诊断输出加闸门（`config.debug`，缺省静默）
+
+布局初始化/修复、旧种子迁移、启动回退时 worktree 同步失败这三类诊断行此前**直写 console**。
+问题不在"有输出"，而在**其中一类是预期结果**：正式 `stable/`、`latest/` 按设计只读，而回退只切 ref
+（`rollbackTo` 的 `worktree` 参数因此必然同步失败）——把它打到终端，看到的像故障，实际是设计。
+真机上确实造成了误读。
+
+修法：`substrate/debug.ts` 提供层中立的闸门（`substrate(0)` 不能引 `runtime(2)` 的降级面），
+由插件在装配**最前**按 `config.debug` 打开（必须早于任何诊断打印），亦可用 `OMB_DEBUG=1`。
+纪律是**日志可静音、状态不可静音**：闸门只管 console 行，`recordDegradation` 与 `kern_status`
+照常如实暴露——所以静音不会让任何故障变得不可见。全仓生产源码 3 处直写 console 已全部走闸门。
+
+### 18.2 `vectorStats()` 分清三种"外观相同"的情形
+
+`dim: null` + `mismatched: N` 这组读数，在三种完全不同的情形下**长得一模一样**：
+
+| 情形 | 真相 |
+| --- | --- |
+| 真的还没有任何向量 | 通道空，无害 |
+| 换过嵌入器，留下陈旧向量 | 通道对这些行失效，需重编码 |
+| **本进程装错了嵌入器**（盘上其实是好的） | 假象：`embedder-mismatch` |
+
+第三种在真实运行时不会稳态出现（装配面会 `setEmbedder`），但**任何直接构造后端的脚本或探针都会踩**：
+默认构造拿到的是 256 维哈希词袋，而盘上可能是神经模型的 512 维。排查中我因此两次把
+一个装着 515 条正常向量的库读成"整个向量通道失效"。
+
+修法不靠"下次记得查维度"，而是把它变成可机械判定的字段：新增 `stored_dims`（盘上实际存在的维度集合）
+与 `embedder_mismatch`（盘上有向量但没有一种维度等于 `embedder_dim`），并在状态面给出
+`embedding.verdict` 四态结论（`no-vectors` / `embedder-mismatch` / `stale-vectors` / `ok`）与人话说明。
+`dim` 的旧语义原样保留（不破坏既有消费方），新字段只做加法。
+
 

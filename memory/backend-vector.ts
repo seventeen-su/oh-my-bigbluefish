@@ -34,6 +34,21 @@ export interface VectorStats {
   mismatched: number;
   /** 当前嵌入器维度（与 dim 对照可判断是否存在陈旧向量） */
   embedder_dim: number;
+  /**
+   * 盘上**实际存在**的向量维度集合（升序去重；无向量 → 空数组）。
+   *
+   * 为什么单列它：`dim` 为 null 时，三种完全不同的情形外观相同——真的没有向量、换过嵌入器留下陈旧
+   * 向量、以及**当前进程用错了嵌入器**（盘上其实是好的）。有了这一项就能机械区分：集合为空 = 情形①；
+   * 集合只有一种且 ≠ `embedder_dim` = 情形③（假象）；其它 = 情形②。排障时不必再猜。
+   */
+  stored_dims: number[];
+  /**
+   * 当前嵌入器与盘上向量**不同源**（盘上有向量，但没有一种维度等于 `embedder_dim`）。
+   *
+   * 置位时"向量通道全废"是**假象**：本进程没装入真正的嵌入器而已（装配面会 `setEmbedder`；
+   * 直接构造后端做脚本/探针的调用方需自行换入）。真实运行时不会出现这一项为 true 的稳态。
+   */
+  embedder_mismatch: boolean;
 }
 
 /** 批量编码上限（单次空闲期调用最多处理条数——防一次维护占用过久；§17 可标定） */
@@ -298,15 +313,64 @@ export class VectorBackend extends RelationBackend {
         .prepare('SELECT COUNT(*) AS n FROM memory WHERE vector IS NOT NULL AND length(vector) <> ?')
         .get(this.embedder.dim * 4) as { n: number }
     ).n;
+    // 盘上实际存在的维度集合（字节长度 / 4 = 维度）。**这是分清三种"外观相同"情形的关键**：
+    //   ① 真的没有向量        → stored_dims 为空
+    //   ② 换过嵌入器/残留混维 → stored_dims 多种，或与 embedder_dim 不同且确实该重编码
+    //   ③ 当前进程用错嵌入器  → stored_dims 只有一种、但 ≠ embedder_dim（典型：直接构造 backend
+    //      拿到的是默认哈希词袋 256 维，而盘上是神经模型的 512 维）——此时"通道全废"是**假象**，
+    //      真实运行时不经过这条路径（装配面会显式 setEmbedder）。
+    // 我在排查中两次被 ③ 误导（把挂载了模型的正常库读成"整个向量通道失效"），故把它变成可机械判定的字段。
+    const dimBytes = (
+      this.db
+        .prepare('SELECT DISTINCT length(vector) AS len FROM memory WHERE vector IS NOT NULL ORDER BY len')
+        .all() as unknown as { len: number }[]
+    ).map((r) => r.len);
+    const storedDims = dimBytes.map((b) => Math.floor(b / 4));
+    const embedderMismatch = storedDims.length > 0 && !storedDims.includes(this.embedder.dim);
     return {
       encoded,
       pending,
       // dim 语义保持既有契约：无编码条目 → null（保持"尚无向量"的既有断言）；有编码但存在异维陈旧向量
-      // → null（不能报告一个与库里内容不符的维度，否则把"通道已失效"读成"通道正常"）
+      // → null（不能报告一个与库里内容不符的维度，否则把"通道已失效"读成"通道正常"）。
+      // **新增字段后可精确取值**（见 EmbeddingStatus）；dim 保留是为了不破坏既有消费方。
       dim: encoded === 0 || mismatched > 0 ? null : this.embedder.dim,
       embedder: this.embedder.id,
       mismatched,
       embedder_dim: this.embedder.dim,
+      stored_dims: storedDims,
+      embedder_mismatch: embedderMismatch,
     };
+  }
+
+  /**
+   * 嵌入通道**可读结论**（在 vectorStats 之上给出"人话判定"，供状态面直接展示；不替代原始计数）。
+   * 判定顺序刻意如此：先排除"根本没有向量"，再判定"当前进程的嵌入器与盘上不同源"（假象），
+   * 最后才是"确实存在陈旧向量需要重编码"。
+   */
+  embeddingStatusView(): {
+    verdict: 'no-vectors' | 'embedder-mismatch' | 'stale-vectors' | 'ok';
+    note: string;
+  } {
+    const s = this.vectorStats();
+    if (s.encoded === 0) {
+      return { verdict: 'no-vectors', note: '尚无已编码向量（向量通道暂无候选——诚实缺失，不是故障）' };
+    }
+    if (s.embedder_mismatch) {
+      return {
+        verdict: 'embedder-mismatch',
+        note:
+          `当前进程的嵌入器（${s.embedder}，${s.embedder_dim} 维）与盘上向量（${s.stored_dims.join('/')} 维）**不同源**——` +
+          `这不是"向量通道失效"，而是本进程没有装入真正的嵌入器（装配面会 setEmbedder；直接构造后端的调用方需自行换入）。`,
+      };
+    }
+    if (s.mismatched > 0) {
+      return {
+        verdict: 'stale-vectors',
+        note:
+          `存在 ${s.mismatched} 条维度与当前嵌入器不符的陈旧向量（检索侧跳过）——` +
+          `换嵌入器时已被置为待编码，由维护任务 memory_vector_encode 逐批补齐`,
+      };
+    }
+    return { verdict: 'ok', note: `向量通道正常（${s.embedder}，${s.embedder_dim} 维，已编码 ${s.encoded} 条）` };
   }
 }
