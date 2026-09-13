@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { GIT_BIN } from './snapshot.js';
 import { diagWarn } from './debug.js';
+import { platformProvider } from './platform.js';
 
 /** worktree 同步策略：best-effort（缺省，降级语义）| strict（失败即回滚失败，补偿恢复 ref） */
 export type WorktreePolicy = 'best-effort' | 'strict';
@@ -137,6 +138,23 @@ export function rollbackTo(opts: RollbackOptions): RollbackResult {
       new_head: verified,
       worktree_synced: true,
       worktree_status: 'skipped',
+    };
+  }
+
+  // **只读工作树不要尝试写**（实测缺陷修复）：正式 stable/latest 按设计只读（ACL），
+  // 对它们跑 `checkout --force` 必然逐文件失败并吐出成片的 git 报错
+  //（`unable to create file …: Permission denied`、`unable to unlink old …: Invalid argument`），
+  // 而且会留下"HEAD 已移动、索引/工作区半残"的部分状态——比不同步更糟。
+  // 回退的**语义只要求 ref 切换生效**（内容由物化快照按 commit 读取，不读这棵工作树），
+  // 故只读时直接跳过并如实说明原因：不跑 git、不报错、不留半状态。
+  const readOnlyMech = platformProvider().readOnly;
+  if (readOnlyMech !== null && fs.existsSync(opts.worktree) && readOnlyMech.isReadOnly(opts.worktree)) {
+    return {
+      previous_head: previousHead,
+      new_head: verified,
+      worktree_synced: false,
+      worktree_status: 'skipped',
+      worktree_error: `worktree 按设计只读（ACL），跳过内容同步——回退语义只要求 ref 切换生效（内容由物化快照读取）`,
     };
   }
 

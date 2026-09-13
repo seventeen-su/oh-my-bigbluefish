@@ -156,7 +156,9 @@ function materializeInitialTree(layout: VersionLayout, commit: string): string {
   const base = layout.initialBase ?? os.tmpdir();
   fs.mkdirSync(base, { recursive: true });
   const dir = fs.mkdtempSync(path.join(base, 'initial-'));
-  runGit(layout, ['worktree', 'add', '--detach', dir, commit]);
+  // `-q`：抑制 git 进度输出（"Preparing worktree (checking out …)" 由 git 直写 stderr，
+  // 不经过本仓库的诊断闸门 → 会在宿主终端刷屏。错误信息不受 -q 影响，仍会抛出）
+  runGit(layout, ['worktree', 'add', '-q', '--detach', dir, commit]);
   materializedInitial.set(layout.bareRepo, dir);
   return dir;
 }
