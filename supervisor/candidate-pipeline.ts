@@ -1040,7 +1040,8 @@ export async function promoteDataCandidate(
   const tmpTree = await mkdtemp(join(tmpdir(), 'omb-promote-'));
   try {
     // 线工作副本：trusted-latest commit 的临时 worktree（可写；不动正式 stable/latest 只读 worktree）
-    git(deps.layout.bareRepo, ['worktree', 'add', '--detach', tmpTree, baseCommit], deps.layout.gitBin);
+    // `-q`：抑制 git 进度输出（"Preparing worktree …" 由 git 直写 stderr，不走本仓库的诊断闸门）
+    git(deps.layout.bareRepo, ['worktree', 'add', '-q', '--detach', tmpTree, baseCommit], deps.layout.gitBin);
 
     // 覆盖式 diff 提交：写候选内容 + Evolution Object（不删除其余文件）
     const policyAbs = join(tmpTree, draft.target);

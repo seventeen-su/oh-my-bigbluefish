@@ -164,7 +164,7 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     expect(headOf(fx, 'main')).toBe(fx.initialHash);
   });
 
-  fixtureIt('T8.23-明确降级：worktree 同步失败 → worktree_status:"degraded" + worktree_error 非空 + ref 已切换（best-effort 缺省）', () => {
+  fixtureIt('T8.23-只读工作树：跳过内容同步并给出可读原因 + ref 已切换（best-effort 缺省）', () => {
     fx = buildLayoutFixture();
     makeStableWritable(fx);
     const revA = advanceStable(fx, 'stable-advanced');
@@ -173,12 +173,17 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
 
     const result = rollbackTo({ bareRepo: fx.bare, revision: fx.initialHash, worktree: fx.stable });
 
-    // 同前一条用例：只读对本进程不生效（root）时 checkout 会成功 → 跳过"应降级"的断言
+    // 语义（2026-09 修订，取代原"跑 checkout 失败 → degraded"）：正式 stable/latest 按设计只读，
+    // 对它们跑 `checkout --force` 必然逐文件失败、吐出成片 git 报错、并留下"HEAD 已动、工作区半残"的
+    // 部分状态——比不同步更糟。回退语义只要求 ref 切换生效（内容由物化快照按 commit 读取），
+    // 故只读时**直接跳过**：不跑 git、不报错、如实给出原因。
     if (readOnlyEnforced(fx.stable)) {
       expect(result.worktree_synced).toBe(false);
-      expect(result.worktree_status).toBe('degraded');
-      expect(result.worktree_error).toBeTruthy(); // 机器可读失败原因，非静默告警
+      expect(result.worktree_status).toBe('skipped');
+      expect(result.worktree_error).toBeTruthy(); // 机器可读原因，非静默
+      expect(result.worktree_error).toMatch(/只读|跳过/);
     } else {
+      // 只读对本进程不生效（root / CAP_DAC_OVERRIDE）→ 走正常同步路径
       expect(result.worktree_synced).toBe(true);
       expect(result.worktree_status).toBe('synced');
     }
@@ -193,19 +198,20 @@ describe('rollbackTo 版本回滚（独立临时 fixture）', () => {
     runGit(['checkout', '--force', revA], { cwd: fx.stable });
     applyReadOnlyAcl(fx.stable);
 
-    // 只读对本进程不生效（root）→ 同步不会失败 → strict 策略下不抛错，ref 正常推进到目标
+    // 只读对本进程不生效（root）→ 同步不会失败 → strict 策略下不抛错，ref 正常推进到目标。
+    // 而**只读生效**时走的是"跳过"分支（不跑 git）：strict 语义是"同步失败即整体失败"，
+    // 而只读跳过不是失败——它是既定设计（worktree 只读）下的确定性行为，故同样不抛错。
     const enforced = readOnlyEnforced(fx.stable);
     if (enforced) {
-      expect(() =>
-        rollbackTo({
-          bareRepo: fx.bare,
-          revision: fx.initialHash,
-          worktree: fx.stable,
-          worktreePolicy: 'strict',
-        }),
-      ).toThrow(/worktree/);
-      // ref 已补偿恢复：仍指向 rev-A，未停留在目标 revision（无半切换态）
-      expect(headOf(fx)).toBe(revA);
+      const r = rollbackTo({
+        bareRepo: fx.bare,
+        revision: fx.initialHash,
+        worktree: fx.stable,
+        worktreePolicy: 'strict',
+      });
+      expect(r.worktree_status).toBe('skipped');
+      expect(r.worktree_error).toMatch(/只读|跳过/);
+      expect(r.new_head).toBe(fx.initialHash);
     } else {
       const r = rollbackTo({
         bareRepo: fx.bare,

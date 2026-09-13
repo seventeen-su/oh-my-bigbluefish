@@ -234,7 +234,9 @@ function addFormalWorktree(lay: VersionLayout, wtDir: string, branch: string): v
   } catch {
     // prune 失败 → 忽略
   }
-  runGit(lay, ['worktree', 'add', wtDir, branch], { cwd: lay.bareRepo });
+  // `-q`：抑制 git 的进度输出（实测：`worktree add` 默认往 stderr 打 "Preparing worktree (checking out …)"，
+  // 那是 git 自己写的，不经过本仓库的诊断闸门，会在宿主终端刷屏。错误信息不受 -q 影响，仍会抛出）。
+  runGit(lay, ['worktree', 'add', '-q', wtDir, branch], { cwd: lay.bareRepo });
 }
 
 /** workspace/.omb/.evolution/ 结构：candidates/ 目录 + README.md + 0000-bootstrap 候选 worktree（--detach @ initialHash）。
@@ -269,7 +271,8 @@ function ensureEvolution(lay: VersionLayout, initialHash: string): void {
       }
     }
   }
-  runGit(lay, ['worktree', 'add', '--detach', candidate, initialHash], { cwd: lay.bareRepo });
+  // `-q`：与 addFormalWorktree 同款——抑制 git 进度输出（候选 worktree 也会打 "Preparing worktree"）
+  runGit(lay, ['worktree', 'add', '-q', '--detach', candidate, initialHash], { cwd: lay.bareRepo });
 }
 
 /**

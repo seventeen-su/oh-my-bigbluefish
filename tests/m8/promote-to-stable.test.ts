@@ -138,8 +138,10 @@ describe('① promoteToStable：门禁通过 → stable ← trusted-latest + Act
     expect(pp.commit).toBe(fx.latestHash);
     expect(pp.predecessor).toBe(fx.initialHash);
 
-    // worktree best-effort：稳定线 worktree 只读 ACL → ref 切换成功 + 降级状态（degraded 常态）或已同步
-    expect(['synced', 'degraded']).toContain(r.worktree_status);
+    // worktree best-effort：稳定线 worktree 只读 ACL → ref 切换成功 + **跳过内容同步**
+    //（2026-09 修订：只读时不再尝试写工作树——那必然逐文件失败、吐 git 报错并留下半状态）
+    // 或已同步（只读对本进程不生效，如 root/CAP_DAC_OVERRIDE）
+    expect(['synced', 'skipped']).toContain(r.worktree_status);
   });
 
   fixtureIt('幂等：同 commit 对重复推进 → 拒绝（duplicate），stable 不再变化', async () => {
