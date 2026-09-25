@@ -17,6 +17,11 @@ export class HealthTable {
     return this.#health.get(id)
   }
 
+  /** 该模块是否已上报过健康。内核据此决定是否补通用值——不得覆盖模块自报的降级原因。 */
+  has(id: string): boolean {
+    return this.#health.has(id)
+  }
+
   remove(id: string): void {
     this.#health.delete(id)
   }

@@ -114,7 +114,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
 
   let disposed = false
   const disposers: (() => void | Promise<void>)[] = []
-
+  
   const kernel: Kernel = {
     provide: (name, service) => {
       if (disposed) throw new Error('内核已注销，不能再注册服务')
@@ -164,14 +164,19 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         logger.warn(`内核：模块 ${blocked.id} 未启动——${blocked.reason}`)
       }
       for (const { id, registration } of plan.ordered) {
-        // 每个模块拿到一个把 report 绑定到自己 id 的内核视图；
+        // 每个模块拿到一个把健康上报绑定到自己 id 的内核视图；
         // 这样健康面无需模块自己报 id（少一个出错点）。
         const scoped: Kernel = { ...kernel, report: health => healthTable.report(id, health) }
         try {
           const config = registration.manifest.configSchema.parse(configs?.get(id))
           const disposer = registration.apply(scoped, config)
           if (typeof disposer === 'function') disposers.push(disposer)
-          healthTable.report(id, { state: 'ok', detail: `模块 ${id} 已启动` })
+          // **只在模块未自报时**补通用值：模块自报的降级原因优先级更高，
+          // 否则"配置被收敛/服务注册失败"这类原因会在启动瞬间被覆盖
+          // （与「无空降级」冲突）。
+          if (!healthTable.has(id)) {
+            healthTable.report(id, { state: 'ok', detail: `模块 ${id} 已启动（未自报健康）` })
+          }
         } catch (error) {
           // 单模块失败不连坐：只记健康面，继续启动其余模块
           const message = error instanceof Error ? error.message : String(error)

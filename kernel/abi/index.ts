@@ -22,6 +22,8 @@ export type {
   Edge,
   ScoredHit,
   LexicalQuery,
+  VectorAttribution,
+  VectorQuery,
   GraphQuery,
   GraphWalk,
   StoreStats,
@@ -61,6 +63,7 @@ export {
   SCOPE_BY_KIND,
   SERVICES,
   STATUS_TOOL,
+  toolsServiceFor,
   validateCatalog,
 } from './catalog.js'
 

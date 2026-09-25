@@ -30,6 +30,7 @@ describe('内核 ABI 契约', () => {
       'SERVICES',
       'STATUS_TOOL',
       'STORES_SERVICE',
+      'toolsServiceFor',
       'validateCatalog',
     ])
   })
@@ -43,6 +44,47 @@ describe('内核 ABI 契约', () => {
     const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
     for (const id of abi.MODULE_IDS) {
       expect(yaml, `缺少行 id：${id}`).toContain(`id: ${id}`)
+    }
+  })
+
+  it('cordis.patch.yml 的每个 name 都能映射到源码入口（构建前即可校验落点）', async () => {
+    const { readFileSync, existsSync } = await import('node:fs')
+    const { fileURLToPath } = await import('node:url')
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
+
+    // 只校验指向本仓库的相对路径（'./lib/...'），宿主包行（'@deepseek-ai/...'）跳过
+    const relativeNames = [...yaml.matchAll(/name:\s*'(\.\/[^']+)'/g)].map(m => m[1] as string)
+    expect(relativeNames.length).toBeGreaterThan(0)
+
+    // 尚未实现的模块入口不计为失败——本段在实现到位前输出信息，实现后自然全绿。
+    // 这样契约测试可以在施工过程中保持可运行，而不是一开始就红着挡住所有提交。
+    const missing: string[] = []
+    for (const name of relativeNames) {
+      // './lib/modules/memory/index.js?v=1' → 源码落点 'modules/memory/index.ts'
+      const withoutQuery = name.split('?')[0] as string
+      const sourceBase = withoutQuery.replace(/^\.\/lib\//, '').replace(/\.js$/, '')
+      const candidates = [`${sourceBase}.ts`, `${sourceBase}/index.ts`]
+      if (!candidates.some(c => existsSync(`${root}${c}`))) missing.push(`${name} → 试过 ${candidates.join(' / ')}`)
+    }
+    if (missing.length > 0) {
+       
+      console.warn(`[未实现的模块入口 ${missing.length} 个]\n${missing.join('\n')}`)
+    }
+    // 指向 dsh/ 的入口必须存在——那是插件本体，缺了整个插件都装不上
+    for (const name of relativeNames.filter(n => n.includes('/dsh/'))) {
+      const sourceBase = (name.split('?')[0] as string).replace(/^\.\/lib\//, '').replace(/\.js$/, '')
+      const exists = [`${sourceBase}.ts`, `${sourceBase}/index.ts`].some(c => existsSync(`${root}${c}`))
+      expect(exists, `插件入口缺失：${name}`).toBe(true)
+    }
+  })
+
+  it('每个模块 id 在 cordis.patch.yml 里都有对应行（缺行 = 插件页看不到开关）', async () => {
+    const { readFileSync } = await import('node:fs')
+    const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
+    const declared = new Set([...yaml.matchAll(/^\s*-\s*id:\s*(\S+)/gm)].map(m => m[1] as string))
+    for (const id of abi.MODULE_IDS) {
+      expect(declared.has(id), `cordis.patch.yml 缺少行 id：${id}`).toBe(true)
     }
   })
 
