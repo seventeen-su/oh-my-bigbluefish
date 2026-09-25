@@ -22,11 +22,13 @@ import {
   type MemoryRecord,
   type MemoryScope,
   type MemoryStore,
+  type SecondaryChannelRegistry,
   type SqliteStatementLike,
   type StorageHostPort,
   type StoreSet,
 } from '../../../kernel/abi/index.js'
 import { asVectorStore, openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
+import { retrieve, type RetrievalChannel } from '../../../modules/memory/retrieve.js'
 import {
   DEFAULT_MAX_PENDING,
   EMBEDDER_SERVICE,
@@ -72,17 +74,13 @@ function memoryPort(userDbPath: string): StorageHostPort {
   }
 }
 
-/** 真实 SQLite 库（`asVectorStore` 只认本实现，所以happy path 必须用它）。 */
-function realStore(): SqliteMemoryStore {
+/** 真实 SQLite 库（`asVectorStore` 只认本实现，所以 happy path 必须用它）。 */
+function realStore(scope: MemoryScope = 'user'): SqliteMemoryStore {
   const dir = tempDir()
+  const dbPath =
+    scope === 'user' ? join(dir, 'knowledge.db') : join(dir, 'proj', '.omb', 'memory', 'session.db')
   const port = memoryPort(join(dir, 'knowledge.db'))
-  return openMemoryStore({
-    scope: 'user',
-    dbPath: port.userDbPath,
-    port,
-    logger,
-    clock,
-  })
+  return openMemoryStore({ scope, dbPath, port, logger, clock })
 }
 
 function storeSetOf(scope: MemoryScope, store: MemoryStore): StoreSet {
@@ -95,10 +93,10 @@ function storeSetOf(scope: MemoryScope, store: MemoryStore): StoreSet {
   }
 }
 
-function recordOf(id: string, text: string): MemoryRecord {
+function recordOf(id: string, text: string, scope: MemoryScope = 'user'): MemoryRecord {
   return {
     id,
-    scope: 'user',
+    scope,
     kind: 'semantic',
     text,
     contentHash: `h-${id}`,
@@ -359,6 +357,91 @@ describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 r
     expect(outcome.reason).toContain('记忆库未就绪')
     expect(instance.encoder()!.pending()).toBe(1)
     dispose()
+  })
+})
+
+describe('全链路（生产接线的四个接点）：写入 → 冲刷 → 登记处 → 检索命中', () => {
+  it('真实库 + 真实通道 + 真实 retrieve：词法与向量两条通道都命中该条', async () => {
+    const store = realStore()
+    await store.put(recordOf('m1', '长期记忆系统与向量通道'))
+    const handle = createKernel()
+    handle.kernel.provide(SERVICES.stores, {
+      status: () => ({ ready: true, detail: '桩：直接给库套件', openProjects: [] }),
+      forSession: async () => undefined,
+      forProject: async () => undefined,
+      rememberCwd: () => {},
+      close: async () => {},
+      snapshot: () => ({ user: storeSetOf('user', store), projects: [] }),
+    })
+    const instance = createVectorModule({
+      loadOnnx: async () => ({ ok: false, reason: '测试：不装载 ONNX（用哈希词袋）' }),
+    })
+    const dispose = instance.apply(handle.kernel, { modelDir: join(tempDir(), '不存在') })
+
+    // ① 写入侧发事件 → 入队（回调里不编码）
+    handle.kernel.emit('memory/written', written('m1'))
+    expect(instance.encoder()!.pending()).toBe(1)
+
+    // ② 回合边界冲刷（dsh 的 `flushVectorEncoder` 走同一个服务）
+    const flushed = await handle.kernel
+      .service<VectorEncoder>(VECTOR_ENCODER_SERVICE)!
+      .encodePending(32)
+    expect(flushed).toEqual({ encoded: 1, skipped: 0, failures: 0 })
+
+    // ③ 检索侧从登记处取通道（`modules/memory/index.ts` 的 ports() 同一路径）
+    const registry = handle.kernel.service<SecondaryChannelRegistry<RetrievalChannel>>(
+      SERVICES.channelRegistry,
+    )!
+    const embedder = handle.kernel.service<Embedder>(EMBEDDER_SERVICE)!
+    expect(registry.list().map(c => c.name)).toEqual(['vector'])
+
+    const result = await retrieve([{ scope: 'user', store }], { text: '长期记忆系统', limit: 5 }, {
+      clock: handle.kernel.clock,
+      embedder,
+      channels: registry.list(),
+    })
+
+    expect(result.items.map(i => i.id)).toEqual(['m1'])
+    expect([...result.stats.channelsUsed].sort()).toEqual(['lexical', 'vector'])
+    expect(result.degraded).toEqual([])
+    dispose()
+  })
+})
+
+describe('库就绪时机：晚到的库不算"记录已删除"', () => {
+  it('项目库尚未预热（作用域没被任何已打开库覆盖）→ **保留队列**，不当作"已删除"', async () => {
+    const user = realStore()
+    const project = realStore('project')
+    let sets: readonly StoreSet[] = [storeSetOf('user', user)]
+    const booted = boot(() => sets)
+
+    // 写入先落项目库（store-dev：项目库的打开可能晚于第一条 memory/written）
+    await project.put(recordOf('p1', '项目情境记忆', 'project'))
+    booted.kernel.emit('memory/written', written('p1', 'project'))
+
+    const beforeReady = await booted.encoder.encodePending()
+    expect(beforeReady.encoded).toBe(0)
+    expect(beforeReady.reason).toContain('库尚未就绪')
+    expect(booted.encoder.pending()).toBe(1) // 关键：保留，不静默丢
+
+    // 项目库预热完成 → 下一次冲刷成功
+    sets = [storeSetOf('user', user), storeSetOf('project', project)]
+    const afterReady = await booted.encoder.encodePending()
+    expect(afterReady).toEqual({ encoded: 1, skipped: 0, failures: 0 })
+    expect(booted.encoder.pending()).toBe(0)
+    expect(await asVectorStore(project)!.getEmbeddings(['p1'])).toHaveLength(1)
+    booted.dispose()
+  })
+
+  it('记录已不存在（作用域被覆盖但库里没有）→ 跳过并出队', async () => {
+    const store = realStore()
+    const booted = boot(() => [storeSetOf('user', store)])
+    booted.kernel.emit('memory/written', written('ghost'))
+
+    const outcome = await booted.encoder.encodePending()
+    expect(outcome).toEqual({ encoded: 0, skipped: 1, failures: 0 })
+    expect(booted.encoder.pending()).toBe(0)
+    booted.dispose()
   })
 })
 
