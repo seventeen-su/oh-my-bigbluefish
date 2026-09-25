@@ -22,36 +22,123 @@
 import type { Kernel, ModuleRegistration } from './abi/index.js'
 import { SERVICES } from './abi/index.js'
 
-/** 宿主 ctx 的最小结构面。 */
+/** `cordis.patch.yml` 的 `name` 指向 `dsh/kernel.ts`。 */
+export const KERNEL_ENTRY_NAME = 'omb-kernel'
+
+/** 宿主 ctx 的最小结构面。**只声明 `get`/`on`**——其余属性一概不摸（Guard 会抛）。 */
 interface HostCtxLike {
   get?(name: string): unknown
+  on?(event: string, fn: unknown): unknown
 }
 
-/** 判断拿到的对象是否"已经是我们的内核"（而不是宿主 ctx）。 */
+/**
+ * 模块入口在宿主 ctx 上等待的"内核就绪"键。
+ *
+ * **为什么需要它**：宿主按行加载，无法保证内核行先完成 `apply`。
+ * 而我们的内核服务注册在**内核自己的服务表**里，宿主 `ctx.get()` 查的是
+ * **宿主的**服务表——两者不通。所以内核行必须把一个**就绪 promise**
+ * 发布到宿主 ctx（`ctx.provide('ombReady', …)`），模块行 `await` 它。
+ *
+ * 实测教训：没有这一层时，8 个模块全部"正常"却什么都没做——
+ * `resolveKernel` 对每一行都返回 undefined，兜底成空 disposer，
+ * 表现为**静默空转**（比报错更难发现）。
+ */
+export const KERNEL_READY_KEY = 'ombReady'
+
+/**
+ * 内核标记。
+ *
+ * **为什么需要显式标记**：不能用"读几个属性看看"来认内核——
+ * 宿主 ctx 是个 **Proxy**，Guard 对未 `inject` 的属性读写直接抛。
+ * 实测：`typeof ctx.service` 会抛 `cannot get property "service" without inject`，
+ * 于是"探测"本身变成了失败原因（这正是本文件上一版踩的坑）。
+ *
+ * 所以：认内核只看一个**自有**标记，其余一律不摸。
+ */
+export const KERNEL_MARKER = '__ombKernel'
+
+/**
+ * 等待内核就绪。
+ *
+ * 内核行会把一个 promise 发布到宿主 ctx 的 `KERNEL_READY_KEY` 上；
+ * 模块行在 `apply` 开头 await 它，然后才解析内核。
+ *
+ * 为什么必须这样：宿主按行加载，**无法保证内核行先完成 `apply`**；
+ * 而我们的内核服务注册在**内核自己的服务表**里，宿主 `ctx.get()` 查的是
+ * **宿主的**服务表——两者不通。所以只能靠内核行主动发布一个就绪 promise。
+ *
+ * @returns 就绪时 true；宿主没提供（内核行被禁用等）时 false——调用方如实跳过。
+ */
+export async function waitForKernel(first: unknown): Promise<boolean> {
+  // 只摸 get 一个属性：宿主 ctx 是 Proxy，其余属性可能触发 Guard 抛错
+  if (typeof first !== 'object' || first === null) return false
+  let get: unknown
+  try {
+    get = (first as { get?: unknown }).get
+  } catch {
+    return false
+  }
+  if (typeof get !== 'function') return false
+  let ready: unknown
+  try {
+    ready = (get as (name: string) => unknown).call(first, KERNEL_READY_KEY)
+  } catch {
+    return false
+  }
+  if (ready === null || ready === undefined) return false
+  try {
+    await (ready as Promise<unknown>)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 给内核打标记（幂等）。`createKernel` 调用一次即可。 */
+export function markKernel(kernel: object): void {
+  try {
+    Object.defineProperty(kernel, KERNEL_MARKER, { value: true, enumerable: false })
+  } catch {
+    // 打不上标记时仍可经宿主 ctx 的 get 路径取用；不抛
+  }
+}
+
+/** 判断拿到的对象是否"已经是我们的内核"。**只读一个自有标记，绝不摸其他属性**。 */
 export function isKernel(value: unknown): value is Kernel {
   if (typeof value !== 'object' || value === null) return false
-  const candidate = value as { service?: unknown; services?: unknown; pressure?: unknown }
-  return typeof candidate.service === 'function'
-    && typeof candidate.services === 'function'
-    && typeof candidate.pressure === 'function'
+  try {
+    return (value as Record<string, unknown>)[KERNEL_MARKER] === true
+  } catch {
+    return false
+  }
 }
 
 /**
  * 解析出真正的内核。
  *
- * @param first `apply` 的第一个参数（可能是内核，也可能是宿主 ctx）。
- * @returns 内核；两条路径都取不到时返回 `undefined`（调用方如实降级，不抛）。
+ * 顺序很重要：**先判宿主 ctx**（只看 `get` 是否可调用），再判内核标记。
+ * 反过来会让 `typeof ctx.service` 触发 Guard 而抛错。
  */
 export function resolveKernel(first: unknown): Kernel | undefined {
-  if (isKernel(first)) return first
-  const ctx = first as HostCtxLike | null | undefined
-  if (ctx === null || ctx === undefined || typeof ctx.get !== 'function') return undefined
+  if (typeof first !== 'object' || first === null) return undefined
+  const asCtx = first as HostCtxLike
+  // ① 宿主 ctx：有可调用的 get → 从服务表取内核
+  let hostGet: unknown
   try {
-    const found = ctx.get(SERVICES.kernel)
-    return isKernel(found) ? found : undefined
+    hostGet = asCtx.get
   } catch {
-    return undefined
+    hostGet = undefined // Guard 拒绝 → 说明这只是个受限代理，不是内核
   }
+  if (typeof hostGet === 'function') {
+    try {
+      const found = (hostGet as (name: string) => unknown).call(first, SERVICES.kernel)
+      return isKernel(found) ? found : undefined
+    } catch {
+      return undefined
+    }
+  }
+  // ② 直接就是内核（内核按依赖顺序启动模块时走这条）
+  return isKernel(first) ? first : undefined
 }
 
 /**
@@ -69,24 +156,43 @@ export function toHostPlugin<T>(registration: ModuleRegistration<T>): {
 } {
   return {
     manifest: registration.manifest,
+    /**
+     * **同步返回 disposer**（宿主契约：`apply` 不得返回 Promise——
+     * 宿主会把它当 disposer 存起来，注销时调用一个 Promise 等于什么都没做）。
+     *
+     * 内核就绪的等待放在**后台微任务**里，满足两个约束：
+     * - `ctx.get()` 查的是**宿主**服务表，而内核行**同步**完成 `provide`
+     *   （`dsh/plugin.ts` 的 `markReady()` 在任何 await 之前），因此解析必然成功；
+     * - 注册发生在 `apply` 返回后的微任务里，但 Cordis 的 fiber 此时仍存活，
+     *   服务与事件订阅照常归属该 fiber。
+     */
     apply(first: unknown, config?: unknown): () => void {
-      const kernel = resolveKernel(first)
-      if (kernel === undefined) {
-        // 不是错误：宿主可能先加载模块行、内核稍后才注册服务。
-        // 如实降级——不提供能力，但绝不抛（抛会让这一行在插件页显示激活失败）。
-        return () => {}
-      }
-      const parsed = config ?? registration.manifest.configSchema.parse(undefined)
-      try {
-        const result = registration.apply(kernel, parsed as T)
-        return typeof result === 'function' ? result : () => {}
-      } catch (error) {
-        // H-1：disposer 与启动路径都不得把异常抛回宿主。
-        // 启动失败记在健康面（内核会捕获并记 failed），这里只保证不逃逸。
-        kernel.logger.warn(
-          `OMB：模块 ${registration.manifest.id} 启动抛异常——${error instanceof Error ? error.message : String(error)}`,
-        )
-        return () => {}
+      let dispose: (() => void) | undefined
+      let cancelled = false
+      void (async (): Promise<void> => {
+        await waitForKernel(first)
+        if (cancelled) return
+        const kernel = resolveKernel(first)
+        if (kernel === undefined) return // 内核行被禁用：如实不提供能力，不抛
+        const parsed = config ?? registration.manifest.configSchema.parse(undefined)
+        try {
+          const result = registration.apply(kernel, parsed as T)
+          if (typeof result === 'function') dispose = result
+        } catch (error) {
+          // H-1：启动路径不得把异常抛回宿主
+          kernel.logger.warn(
+            `OMB：模块 ${registration.manifest.id} 启动抛异常——${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      })()
+      return () => {
+        cancelled = true
+        try {
+          dispose?.()
+        } catch (error) {
+          // H-1：disposer 绝不抛
+          void error
+        }
       }
     },
   }

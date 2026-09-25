@@ -15,9 +15,17 @@ import { MODULE_IDS } from '../../kernel/abi/index.js'
 
 const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
 
-/** 从 YAML 里取指向本仓库模块的相对入口（`./lib/modules/...`）。 */
+/**
+ * 从 YAML 里取指向本仓库模块的相对入口。
+ *
+ * 产物目录名可以是 `lib` 也可以是别的（`build` 等）——**目录名是缓存代标记**：
+ * 宿主 ESM 按 URL 缓存，换目录名 = 换 URL，才能在**不重启宿主**的前提下
+ * 加载新的 JS 代。所以这里不能写死 `lib/`。
+ */
 function moduleEntrySpecs(): readonly string[] {
-  return [...yaml.matchAll(/name:\s*'\.\/lib\/(modules\/[^'?]+)\.js/g)].map(m => m[1] as string)
+  return [...yaml.matchAll(/name:\s*'\.\/(?:lib|build\d*)\/(modules\/[^'?]+)\.js/g)].map(
+    m => m[1] as string,
+  )
 }
 
 describe('模块入口清单与 YAML 一致', () => {
@@ -51,8 +59,10 @@ describe('模块入口清单与 YAML 一致', () => {
   })
 
   it('每个 YAML 模块行的 id 都在 MODULE_IDS 里', () => {
-    // YAML 里模块行的 name 指向 ./lib/modules/，用行 id 与之配对
-    const rows = [...yaml.matchAll(/- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'\.\/lib\/(modules\/[^'?]+)\.js/g)]
+    // YAML 里模块行的 name 指向产物目录，用行 id 与之配对（目录名可为 lib/build）
+    const rows = [
+      ...yaml.matchAll(/- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'\.\/(?:lib|build\d*)\/(modules\/[^'?]+)\.js/g),
+    ]
     expect(rows.length).toBeGreaterThan(0)
     for (const row of rows) {
       const id = row[1] as string

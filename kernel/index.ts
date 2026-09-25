@@ -11,6 +11,7 @@ import { HealthTable } from './health.js'
 import { FocusTable, planModules } from './registry.js'
 import { StatusTable } from './status.js'
 import { adoptContext, type ForeignContextLike } from './adopt.js'
+import { markKernel } from './hostEntry.js'
 import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
@@ -166,6 +167,10 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   return {
     kernel,
     start(modules, configs, hostCtx) {
+      // 打标记：模块入口靠这个**自有标记**认出"这是内核而不是宿主 ctx"。
+      // 不能用"读几个属性看看"来认——宿主 ctx 是 Proxy，Guard 对未 inject 的
+      // 属性读写会抛，于是探测本身会变成失败原因（见 hostEntry.ts 的说明）。
+      markKernel(kernel)
       const plan = planModules(modules)
       for (const blocked of plan.blocked) {
         healthTable.report(blocked.id, { state: 'failed', detail: blocked.reason })

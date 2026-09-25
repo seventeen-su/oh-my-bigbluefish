@@ -30,5 +30,15 @@
     "typescript": "~5.5.4",
     "typescript-eslint": "^8.67.0",
     "vitest": "^3.2.7"
-  }
+  },
+  "main": "./lib/dsh/kernel.js",
+  "exports": {
+    ".": "./lib/dsh/kernel.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "models"
+  ]
 }

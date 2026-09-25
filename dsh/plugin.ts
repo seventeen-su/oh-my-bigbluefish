@@ -19,7 +19,7 @@ import { createKernel, type KernelHandle } from '../kernel/index.js'
 import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES, toolsServiceFor } from '../kernel/abi/index.js'
 import type { HostContextLike } from './host.js'
-import { hostLogger, readService, systemClock } from './host.js'
+import { hostLogger, publishToHost, readService, systemClock } from './host.js'
 import { registerTools, type ToolSpec } from './tools.js'
 import {
   SessionTable,
@@ -31,6 +31,7 @@ import {
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { buildStatusTool } from './status-tool.js'
 import { loadModulesSync } from './modules.js'
+import { KERNEL_READY_KEY } from '../kernel/hostEntry.js'
 import { MODULE_ENTRIES } from './moduleEntries.js'
 
 /** `cordis.patch.yml` 行 config 的形状。 */
@@ -68,7 +69,12 @@ export const KERNEL_SELF: ModuleRegistration<unknown> = {
 }
 
 /**
- * 插件主体。返回值是 disposer（Cordis 函数插件契约：`apply(ctx, config)`）。
+ * 插件主体。返回 disposer（Cordis 函数插件契约：`apply(ctx, config)`）。
+ *
+ * **返回 Promise 是刻意的**：模块行由宿主独立加载，`ctx.get()` 查的是**宿主**的
+ * 服务表，而我们的内核服务在内核自己的表里——两者不通。所以这里必须把一个
+ * **就绪 promise** 发布到宿主 ctx（`KERNEL_READY_KEY`），模块行 await 它。
+ * Cordis 会等待本 Promise，因此"发布就绪"必定发生在任何模块行解析内核之前。
  */
 export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => void {
   const logger = hostLogger(ctx)
@@ -76,17 +82,27 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const handle = createKernel({ logger, clock })
   const sessions = new SessionTable()
 
-  // ── 1) 存储端口：先构造并注册，模块启动时即可取用 ──────────────────────
+  // ── 0) 把就绪 promise 发布到宿主 ctx（模块行 await 它）─────────────────
+  let markReady!: () => void
+  const ready = new Promise<void>(resolve => {
+    markReady = resolve
+  })
+  publishToHost(ctx, KERNEL_READY_KEY, ready)
+
+  // ── 1) 内核自身发布为服务 + 存储端口 ───────────────────────────────────
   const storageHost = createStorageHost({
     ...(config.dshHome === undefined ? {} : { configuredDshHome: config.dshHome }),
     logger,
   })
+  handle.kernel.provide(SERVICES.kernel, handle.kernel)
   try {
     handle.kernel.provide(STORAGE_HOST_SERVICE, storageHost.port)
   } catch (error) {
     // 服务表不再对重名抛错，但保留守卫以免未来语义变化
     logger.warn(`OMB：存储端口注册失败——${String(error)}（记忆库将降级）`)
   }
+  // 内核已可被模块行解析——放行（必须在任何 await 之前，否则模块行会等到超时）
+  markReady()
 
   // ── 1b) 内核自身的工具服务 ─────────────────────────────────────────────
   // `MODULE_CATALOG` 给 `omb-kernel` 声明了 `omb_status`，而 `collectToolSpecs`
