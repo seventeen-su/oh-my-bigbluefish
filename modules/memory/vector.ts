@@ -835,6 +835,18 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     const unprovideEncoder = kernel.provide<VectorEncoder>(VECTOR_ENCODER_SERVICE, encoder)
     installedEncoder = encoder
 
+    // ⑥ 同步登记向量通道（H-2）：检索侧从 `SERVICES.channelRegistry` 取全部第二通道，
+    //    **只有登记了才会被消费**（否则查询向量算完没人用，语义召回静默不发生）。
+    //    登记处缺失或抛错都不致命：检索退化为完整纯词法路径（§5.7）。
+    let unregisterChannel: (() => void) | undefined
+    try {
+      unregisterChannel = kernel
+        .service<SecondaryChannelRegistry<RetrievalChannel>>(SERVICES.channelRegistry)
+        ?.register(channel(kernel))
+    } catch {
+      // 登记失败 → 只有词法通道；健康面/状态面仍写明向量通道状态与待编码队列
+    }
+
     // ③ 是否值得尝试 ONNX：**同步**的文件系统判断（廉价、不进事件循环），
     //    失败原因本身就是状态面要显示的内容。
     const resolved = resolveOnnxModelDir({ modelDir: config.modelDir })
@@ -884,6 +896,11 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         offWritten()
       } catch {
         // 退订失败不得向上传播（事件总线监听器泄漏会让热插拔验收不过）
+      }
+      try {
+        unregisterChannel?.()
+      } catch {
+        // 通道注销失败同上；检索侧下次 list() 就看不到它
       }
       try {
         unregister?.()
