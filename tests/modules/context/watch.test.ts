@@ -131,6 +131,15 @@ describe('healthDetail：杀死判据必须出现在 detail 里', () => {
     )
     expect(healthDetail(summarize(ledger, { views: VIEW_TOOLS }))).toContain('无视图趋近 0')
   })
+
+  it('轮数不足 → 如实说"暂不下结论"，不说成"一切正常"', () => {
+    const snapshot = summarize(ledgerAfter({ omb_recall: 1 }, 3), { views: VIEW_TOOLS })
+    expect(snapshot.settled).toBe(false)
+    expect(snapshot.minTurns).toBe(MIN_TURNS_FOR_VERDICT)
+    const detail = healthDetail(snapshot)
+    expect(detail).toContain('轮数不足')
+    expect(detail).not.toContain('无视图趋近 0')
+  })
 })
 
 describe('cacheHitRate：前缀稳定性的健康度', () => {
