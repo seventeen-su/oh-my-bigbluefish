@@ -10,7 +10,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { MODULE_ENTRIES } from '../../dsh/moduleEntries.js'
-import { loadModulesSync, isModuleEntry, pickRegistrations } from '../../dsh/modules.js'
+import { loadModulesSync, isModuleEntry, pickRegistrations, ambiguousIds } from '../../dsh/modules.js'
 import { MODULE_IDS } from '../../kernel/abi/index.js'
 
 const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
@@ -169,6 +169,45 @@ describe('pickRegistrations：按结构判定，不按导出名', () => {
     const picked = pickRegistrations({ vectorManifest: bare, vectorModule: runnable })
     expect(picked).toHaveLength(1)
     expect(typeof picked[0]?.apply).toBe('function')
+  })
+
+  it('具名注册项优先于 default 宿主包装器（**不依赖命名空间键序**）', () => {
+    // 这条防的是一个只在 Node 原生 ESM 下暴露、vitest 下**假绿**的 bug：
+    // ESM 命名空间的键按**字典序**枚举，`default` 排在 `registration` / `vectorModule`
+    // 等之前；而 `default` 是 `toHostPlugin` 包装器（它**也有** manifest 与 apply，
+    // 所以形状判定认它）。挑中包装器后，内核原生路径（`mount`/`start`）传进去的
+    // 第一参是内核视图而非宿主 ctx → 包装器取不到内核 → **静默失效**。
+    //
+    // vitest 下 Vite 按**源码顺序**建键（`default` 在最后），所以只断言
+    // `pickRegistrations(MODULE_ENTRIES.get(...))` 是抓不住它的——必须手工构造
+    // "default 在前"的命名空间。
+    const real = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
+    const wrapper = { manifest: real.manifest, apply: () => {} }
+    for (const ns of [
+      { default: wrapper, registration: real }, // 字典序（Node ESM）
+      { registration: real, default: wrapper }, // 源码序（Vite）
+    ]) {
+      const picked = pickRegistrations(ns)
+      expect(picked, `键序 ${Object.keys(ns).join(',')} 下应挑中具名注册项`).toHaveLength(1)
+      expect(picked[0]).toBe(real)
+    }
+  })
+
+  it('"具名项 + default 包装器"是正常形态：归 warnings 而非 failures', () => {
+    const real = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
+    const wrapper = { manifest: real.manifest, apply: () => {} }
+    expect(ambiguousIds({ default: wrapper, registration: real })).toEqual(['x'])
+    expect(ambiguousIds({ registration: real })).toEqual([])
+
+    // 真实清单里**每个**入口都同时有具名项与 default 包装器（default 供宿主按行加载，
+    // 具名项供内核原生路径装配）。所以这不能报成失败——但"选了哪个"必须可见，
+    // 否则同一份代码在不同运行时下表现不同而无人察觉。
+    const result = loadModulesSync(new Map([['modules/x/index', { default: wrapper, registration: real }]]))
+    expect(result.modules).toHaveLength(1)
+    expect(result.modules[0]).toBe(real)
+    expect(result.failures).toEqual([])
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0]).toContain('已选具名项')
   })
 
   it('缺少 apply 或 configSchema.parse 的不算模块', () => {

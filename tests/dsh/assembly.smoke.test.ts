@@ -18,21 +18,39 @@ import { createKernel } from '../../kernel/index.js'
 import { MODULE_CATALOG, SERVICES, toolsServiceFor, type StatusRegistry } from '../../kernel/abi/index.js'
 import { MODULE_ENTRIES } from '../../dsh/moduleEntries.js'
 import { loadModulesSync } from '../../dsh/modules.js'
-import { KERNEL_SELF, collectToolSpecs } from '../../dsh/plugin.js'
+import { collectToolSpecs, testHostContext } from '../../dsh/plugin.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 import { SessionTable, collectPromptContributions } from '../../dsh/session.js'
 
-/** 造一个"没有宿主"的内核——足以装配模块（宿主相关能力缺失时模块会诚实降级）。 */
-function assemble(): ReturnType<typeof createKernel> {
+/**
+ * 装配冒烟：复现**真实路径**——宿主 ctx → `ctx.get('omb:kernel')` → 模块 apply。
+ *
+ * **不走内核自己启动模块那条路**：那样会与宿主启动重复（实测状态面出现两条
+ * `omb-context` 段落、计数器各自独立）。模块生命周期归宿主，依赖顺序由
+ * `cordis.patch.yml` 的行级 `inject: ['omb:kernel']` 保证。
+ *
+ * 这条测试的由来：模块入口曾因拿到宿主 ctx（而非内核）而**静默空转**——
+ * 单元测试全绿也发现不了，因为只在"真实清单 + 真实装配"下才出现。
+ */
+async function assemble(): Promise<ReturnType<typeof createKernel>> {
   const handle = createKernel()
+  // 真实路径里由内核行把内核发布到宿主服务表（dsh/plugin.ts 的 publishToHost）。
+  // 这里等价地在测试宿主 ctx 上暴露它。
+  handle.kernel.provide(SERVICES.kernel, handle.kernel)
   const loaded = loadModulesSync(MODULE_ENTRIES)
   expect(loaded.failures, `模块入口未装配：${JSON.stringify(loaded.failures)}`).toEqual([])
-  handle.start([KERNEL_SELF, ...loaded.modules])
+  const host = testHostContext(handle)
+  for (const registration of loaded.modules) {
+    // 与宿主一样：apply 拿到的是宿主 ctx，模块自己经 ctx.get('omb:kernel') 取内核
+    const plugin = toHostPlugin(registration)
+    plugin.apply(host)
+  }
   return handle
 }
 
 describe('装配冒烟：真实清单 + 真实内核', () => {
-  it('没有任何模块被阻断（缺微内核注册项会让几乎所有模块被整体阻断）', () => {
-    const handle = assemble()
+  it('没有任何模块被阻断（缺微内核注册项会让几乎所有模块被整体阻断）', async () => {
+    const handle = await assemble()
     const health = handle.health()
     const failed = Object.entries(health)
       .filter(([, h]) => h.state === 'failed')
@@ -40,16 +58,21 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     expect(failed, `模块启动失败：\n${failed.join('\n')}`).toEqual([])
   })
 
-  it('每个声明的模块都在健康面里（含微内核自身）', () => {
-    const handle = assemble()
+  it('每个"模块"都在健康面里（微内核不是模块，不进模块健康面）', async () => {
+    const handle = await assemble()
     const ids = Object.keys(handle.health()).sort()
     for (const entry of MODULE_CATALOG) {
+      // 微内核豁免：它是插件本体（宿主侧），没有独立模块资源，因此不往**模块**
+      // 健康面里报。它的存在由 MODULE_IDS（可切换行清单）与 omb_status 的
+      // "构建"段体现——健康面只回答"模块好不好"这个问题。
+      if (entry.id === 'omb-kernel') continue
       expect(ids, `模块 ${entry.id} 未出现在健康面`).toContain(entry.id)
     }
+    expect(ids.length).toBeGreaterThan(0)
   })
 
-  it('模块声明的工具服务都真的注册了', () => {
-    const handle = assemble()
+  it('模块声明的工具服务都真的注册了', async () => {
+    const handle = await assemble()
     const names = handle.kernel.services()
     for (const entry of MODULE_CATALOG) {
       if (entry.tools.length === 0) continue
@@ -62,8 +85,8 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     }
   })
 
-  it('工具面能真正收集到工具（含内核自带的 omb_status）', () => {
-    const handle = assemble()
+  it('工具面能真正收集到工具（含内核自带的 omb_status）', async () => {
+    const handle = await assemble()
     const specs = collectToolSpecs(handle, new SessionTable())
     const names = specs.map(s => s.name)
     expect(names).toContain('omb_status')
@@ -74,24 +97,24 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     expect(new Set(names).size).toBe(names.length)
   })
 
-  it('提示贡献能被按前缀收集（模块不必改 dsh/）', () => {
-    const handle = assemble()
+  it('提示贡献能被按前缀收集（模块不必改 dsh/）', async () => {
+    const handle = await assemble()
     const contributions = collectPromptContributions(handle.kernel)
     expect(contributions.length).toBeGreaterThan(0)
     const withResident = contributions.filter(c => typeof c.resident === 'string' && c.resident.length > 0)
     expect(withResident.length, '至少一个模块应提供常驻提示').toBeGreaterThan(0)
   })
 
-  it('状态面登记处可用，且贡献者能自述', () => {
-    const handle = assemble()
+  it('状态面登记处可用，且贡献者能自述', async () => {
+    const handle = await assemble()
     const registry = handle.kernel.service<StatusRegistry>(SERVICES.statusContributor)
     expect(registry).toBeDefined()
     expect(registry?.list().length ?? 0).toBeGreaterThan(0)
     expect(handle.status().length).toBeGreaterThan(0)
   })
 
-  it('第二通道登记处可用（向量模块会把通道推进来，记忆模块读它消费）', () => {
-    const handle = assemble()
+  it('第二通道登记处可用（向量模块会把通道推进来，记忆模块读它消费）', async () => {
+    const handle = await assemble()
     const registry = handle.kernel.service<{ list(): readonly { name: string }[] }>(SERVICES.channelRegistry)
     expect(registry).toBeDefined()
     // 无宿主端口时向量模块可能降级，但登记处本身必须存在——
@@ -99,8 +122,8 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     expect(Array.isArray(registry?.list())).toBe(true)
   })
 
-  it('卸载后服务清空、事件订阅者归零（热插拔不残留）', () => {
-    const handle = assemble()
+  it('卸载后服务清空、事件订阅者归零（热插拔不残留）', async () => {
+    const handle = await assemble()
     expect(handle.kernel.services().length).toBeGreaterThan(0)
     handle.dispose()
     // 服务表由模块自行注销；这里断言 dispose 本身不抛且健康面记下注销
