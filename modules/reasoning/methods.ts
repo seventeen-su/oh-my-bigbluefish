@@ -1,8 +1,12 @@
 /**
  * 八条方法论规则卡（规划 §4.3）。
  *
- * **`text` 就是模型实际看到的东西**——逐字取自规划 §4.3 表格中列，
- * 由 `tests/modules/reasoning/methods.test.ts` 直接读文档逐字校验。
+ * **文本与 `docs/omb-v3-refactor-plan.md` §4.3 保持一致；改动需同时更新规划文档。**
+ * 卡片文本的真源在**本文件**（文档是施工蓝图，不是运行时数据源，测试不读文档）；
+ * `tests/modules/reasoning/methods.test.ts` 用字面量快照把八条文本冻住，
+ * 任何改动都会被看见，而文档的排版自由不受限。
+ *
+ * **`text` 就是模型实际看到的东西**——逐字取自规划 §4.3 表格中列。
  * 措辞是**动作**（"列出至少两个互斥的可能解释"），不是概念解释：
  * 本文件不得出现任何哲学术语，新增文案也必须先过这一条。
  *
@@ -64,10 +68,7 @@ export const METHOD_CARDS: readonly MethodCard[] = [
   {
     id: 'R6',
     title: '失败即换向',
-    // 与规划 §4.3 中列的唯一字符差异：原文"连续失败两次，就…"的逗号被去掉，
-    // 使验收要求的那句动作串「连续失败两次就不再重试第三次」连续出现。
-    // 该差异在 tests/modules/reasoning/methods.test.ts 里显式登记，不是漏抄。
-    text: "同一个方向连续失败两次就不再重试第三次。停下来，说明为什么这个方向不行，换一个方向或问用户。",
+    text: "同一个方向连续失败两次，就不再重试第三次。停下来，说明为什么这个方向不行，换一个方向或问用户。",
     whenToUse: '同一个方向已经失败两次时',
   },
   {
@@ -126,6 +127,10 @@ export function cardsFor(depth: FocusDepth): readonly MethodCard[] {
  * 它进的是逐字节稳定的静态前缀（§6.5），因此必须：
  * ① 不含时间戳/计数/会话 id ② 同一 `maxChars` 下输出逐字节相同。
  *
+ * 内容上有一条硬要求：**它自己就承载 R1 的动作**（"先判断这个问题值多少思考"）。
+ * R1 是最关键的一条（情感陪伴域的过度推理就栽在它上），而标准档不推卡片全文，
+ * 因此常驻提示不能只说"有规则卡可用"。
+ *
  * `maxChars` 只用于**变体选择**：取能装下的最长变体；都装不下才截断
  * （截断仍保留省略号，不产生半句话的假信息）。
  */
@@ -142,11 +147,14 @@ export function residentHint(maxChars: number = RESIDENT_HINT_MAX): string {
   return `${shortest.slice(0, limit - 1)}…`
 }
 
-/** 由长到短：能装下哪条用哪条，保证常驻提示永远在预算内。 */
+/**
+ * 由长到短：能装下哪条用哪条，保证常驻提示永远在预算内。
+ * 三条都含 R1 的动作（"先判断这个问题值多少思考"），也都交代了何时用哪把工具。
+ */
 const RESIDENT_HINT_VARIANTS: readonly string[] = [
-  '方法指导可用 omb_method 拉规则卡（需要时再拉）；推理深浅用 omb_focus 调档（quick/standard/deep）。',
-  '方法指导用 omb_method 拉规则卡；推理深浅用 omb_focus 调档位。',
-  '方法卡：omb_method；深度档位：omb_focus。',
+  '先判断这个问题值多少思考：简单/闲聊直接答，需推导或多方案再展开。方法卡用 omb_method 按需拉，深浅用 omb_focus 调档。',
+  '先判断这个问题值多少思考：简单直接答，复杂再展开。方法卡 omb_method，深度 omb_focus。',
+  '先判断这个问题值多少思考；方法卡 omb_method，深度用 omb_focus。',
 ]
 
 /** 话题别名：让 `omb_method({topic:'失败'})` 也能命中 R6，而不必记编号。 */
