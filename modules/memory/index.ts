@@ -11,6 +11,7 @@
  */
 import { z } from 'zod'
 import type {
+  Embedder,
   Kernel,
   MemoryStore,
   ModuleHealth,
@@ -18,9 +19,13 @@ import type {
   ModuleRegistration,
   StorageHostPort,
   StoreStats,
+  TaggedStore,
+  ToolDefinition,
 } from '../../kernel/abi/index.js'
-import { MODULE_CATALOG, SERVICES } from '../../kernel/abi/index.js'
+import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
+import { createRelateTool } from './graph.js'
+import { createMemoryTools } from './recall.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
 export const MODULE_ID = 'omb-memory'
@@ -186,6 +191,39 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       const off = kernel.provide(SERVICES.stores, service)
       current = service
 
+      // ── 工具面（`tools:omb-memory` → ToolDefinition[]，契约见 SERVICES.toolsPrefix）──
+      // 工具**定义**在 `recall.ts`/`graph.ts`，**装配**在本模块的 apply：
+      // 这是仓库既有模式（reasoning/context/artifact 都这么做），也是 H-2 的要求
+      // （注册必须在 apply 返回前完成，且只有 dsh/ 能接触宿主）。
+      let lastActiveSession: string | null = null
+      const offTurn = kernel.on('turn/start', payload => {
+        lastActiveSession = payload.sessionId
+        // 预热该会话的项目库：打开是异步的，工具执行体只能同步取库（`peek`）。
+        // 失败由服务记入状态面（`status().detail`），这里吞掉是刻意的。
+        void service.forSession(payload.sessionId)
+      })
+      const resolveStores = (): readonly TaggedStore[] | undefined => {
+        const set = lastActiveSession === null ? undefined : service.peek(lastActiveSession)
+        return (set ?? service.snapshot().user)?.stores
+      }
+      const tools: readonly ToolDefinition[] = [
+        ...createMemoryTools({
+          resolveStores,
+          clock: kernel.clock,
+          ports: () => ({
+            clock: kernel.clock,
+            // 向量通道由独立模块提供；关掉它 → undefined → 退化为纯词法（完整可用）
+            ...(kernel.service<Embedder>(SERVICES.embedder) === undefined
+              ? {}
+              : { embedder: kernel.service<Embedder>(SERVICES.embedder) }),
+          }),
+          pressureBand: () =>
+            lastActiveSession === null ? undefined : kernel.pressure(lastActiveSession).band,
+        }),
+        createRelateTool({ resolveStores }),
+      ]
+      const offTools = kernel.provide(toolsServiceFor(MODULE_ID), tools)
+
       // 打开是异步的，但注册已经全部完成——这里只填内部状态（H-2）。
       // `start()` 内部吞掉一切异常，`.catch` 只是防止未来的改动引入 unhandled rejection。
       void service
@@ -209,10 +247,16 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
       return async (): Promise<void> => {
         // H-1：dispose 绝不抛异常。任何一步失败都只记日志。
-        try {
-          off()
-        } catch (error) {
-          kernel.logger.warn(`OMB：注销 "${SERVICES.stores}" 服务失败（已隔离）——${messageOf(error)}`)
+        for (const [label, close] of [
+          ['工具服务', offTools],
+          ['回合订阅', offTurn],
+          ['stores 服务', off],
+        ] as const) {
+          try {
+            close()
+          } catch (error) {
+            kernel.logger.warn(`OMB：注销${label}失败（已隔离）——${messageOf(error)}`)
+          }
         }
         if (current === service) current = undefined
         await service.dispose()

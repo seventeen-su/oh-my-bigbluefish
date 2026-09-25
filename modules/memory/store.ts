@@ -528,8 +528,14 @@ class SqliteStore implements SqliteMemoryStore {
 
       const meta = this.#readEmbeddingMeta()
       if (meta === null) {
-        // 首次写入即声明身份：向量与标签同生共死，不存在"无标签的向量"
-        this.#writeEmbeddingMeta({ modelId: vector.modelId, dim: vector.dim, revision: vector.revision })
+        // 首次写入即声明身份：向量与标签同生共死，不存在"无标签的向量"。
+        // 若 meta 行缺失（库结构损坏），声明会写 0 行——此时必须拒绝写入，
+        // 否则后续每条向量都会被当成"首次写入"而绕过归属校验。
+        if (this.#writeEmbeddingMeta({ modelId: vector.modelId, dim: vector.dim, revision: vector.revision }) !== 1) {
+          throw new VectorAttributionError(
+            'meta 表缺失或为空——无法声明嵌入器身份，拒绝写入向量（库结构已损坏，请重建）',
+          )
+        }
       } else if (meta.modelId !== vector.modelId || meta.dim !== vector.dim) {
         throw new VectorAttributionError(
           `声明 ${vector.modelId}/${vector.dim} 与 meta 记录的当前嵌入器 ${meta.modelId}/${meta.dim} 不一致——` +
@@ -565,7 +571,9 @@ class SqliteStore implements SqliteMemoryStore {
           meta.dim,
         ])?.['c'],
       )
-      this.#writeEmbeddingMeta(meta)
+      if (this.#writeEmbeddingMeta(meta) !== 1) {
+        throw new VectorAttributionError('meta 表缺失或为空——无法声明嵌入器身份（库结构已损坏，请重建）')
+      }
       if (stale > 0) {
         this.#logger.info(
           `OMB：嵌入器切换为 ${meta.modelId}/${meta.dim}（rev ${meta.revision}）；` +
@@ -955,8 +963,9 @@ class SqliteStore implements SqliteMemoryStore {
     return { modelId, dim, revision }
   }
 
-  #writeEmbeddingMeta(meta: EmbeddingMeta): void {
-    this.#run('UPDATE meta SET embedding_model_id = ?, embedding_dim = ?, embedding_revision = ?', [
+  /** 写 `meta` 的嵌入器身份列。@returns 受影响行数（=1 表示成功；0 表示 meta 行缺失）。 */
+  #writeEmbeddingMeta(meta: EmbeddingMeta): number {
+    return this.#run('UPDATE meta SET embedding_model_id = ?, embedding_dim = ?, embedding_revision = ?', [
       meta.modelId,
       meta.dim,
       meta.revision,
@@ -1120,6 +1129,15 @@ export interface MemoryStoresService extends StoresService {
   start(): Promise<void>
   /** 已打开的套件快照（不触发新打开）。 */
   snapshot(): { readonly user: StoreSet | undefined; readonly projects: readonly StoreSet[] }
+  /**
+   * **同步**取"某会话当前可用的库"：已打开才返回，不触发打开、不抛。
+   *
+   * 存在的理由：工具执行体（`ToolDefinition.execute`）的库解析是同步的，
+   * 而 `forSession` 是异步的。会话的项目库在 `turn/start` 预热后即已打开，
+   * 因此 `peek` 在工具路径上总是命中；未命中时返回用户库（`projectScope=null`
+   * 是显式信号：项目库还没打开），调用方据此降级而不是静默当成"没有项目记忆"。
+   */
+  peek(sessionId: string): StoreSet | undefined
   /** 最近一次失败的可读原因（状态面"诚实降级"用）。 */
   failure(): string | undefined
   /** 等价于 ABI 的 `close()`；供模块 disposer 使用。 */
@@ -1431,6 +1449,20 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
 
     snapshot() {
       return { user: userSet, projects: [...projects.values()] }
+    },
+
+    peek(sessionId: string): StoreSet | undefined {
+      if (closing) return undefined
+      const cwd = cwdBySession.get(sessionId)
+      if (cwd !== undefined) {
+        const set = projects.get(projectIdentity(cwd))
+        if (set !== undefined) {
+          projects.delete(projectIdentity(cwd))
+          projects.set(projectIdentity(cwd), set) // LRU 触碰：正在被用的库不该被淘汰
+          return set
+        }
+      }
+      return userSet
     },
 
     failure(): string | undefined {
