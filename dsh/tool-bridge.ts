@@ -14,19 +14,20 @@
  */
 import type { ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
+import { toHostTool, type ToolSpec } from './tools.js'
 
 /** `tools.register` 的最小结构面（宿主提供）。 */
 export interface HostToolsLike {
   register(definition: unknown): unknown
 }
 
-/** 一个待注册的工具：宿主需要的形状。 */
-export interface RegistrableTool {
-  readonly name: string
-  readonly description: string
-  readonly parameters: Record<string, unknown>
-  run(args: unknown): unknown
-}
+/** 一个待注册的工具：**统一用本插件的 `ToolSpec` 形状**。
+ *
+ * 不用宿主形状：`toHostTool` 是唯一补齐宿主契约（`output { schema, render }`）的地方，
+ * 绕过它就会漏字段——实测因此让每个 OMB 工具都被宿主拒绝，
+ * 而异常被 catch 吞成一条 warn，工具面全空、纤维状态却全正常。
+ */
+export type RegistrableTool = ToolSpec
 
 /** 从内核服务表读工具声明的入口。 */
 export interface ToolSource {
@@ -94,12 +95,15 @@ export function createToolBridge(): ToolBridge {
       for (const { tool, origin } of pending) {
         if (registered.has(tool.name)) continue
         try {
-          const off = host.register({
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-            execute: (args: unknown) => tool.run(args),
-          })
+          // **必须经 `toHostTool`**：宿主 `tools.register()` 要求
+          // `output { schema, render }`，缺了会抛
+          // `TypeError: tool "<name>" must declare output { schema, render, presentationMeta? }`
+          // （`packages/core/tools/src/index.ts:1066-1070`）。
+          // 这里曾手搓注册对象、漏了 `output`，于是**每一个 OMB 工具都被拒绝**
+          // 而异常被下面的 catch 吞成一条 warn——工具面全空、纤维状态却全正常。
+          const off = host.register(
+            toHostTool(tool),
+          )
           registered.set(tool.name, typeof off === 'function' ? (off as () => void) : () => {})
         } catch (error) {
           // 单个工具失败不影响其余（宿主对重名/形状非法会抛）
@@ -125,7 +129,7 @@ export function createToolBridge(): ToolBridge {
   return bridge
 }
 
-/** 把模块声明的 `ToolDefinition` 转成宿主可注册的形状；形状不符返回 undefined。 */
+/** 把模块声明的 `ToolDefinition` 转成 `ToolSpec`；形状不符返回 undefined。 */
 export function toRegistrable(definition: ToolDefinition): RegistrableTool | undefined {
   if (typeof definition?.name !== 'string' || definition.name.length === 0) return undefined
   if (typeof definition.description !== 'string') return undefined
@@ -136,6 +140,7 @@ export function toRegistrable(definition: ToolDefinition): RegistrableTool | und
     name: definition.name,
     description: definition.description,
     parameters: parameters ?? { type: 'object', properties: {} },
+    // 模块的 `execute` 契约是"返回 ToolOutcome 或抛"；桥统一成 ToolSpec 的 run
     run: (args: unknown) => definition.execute(args),
   }
 }

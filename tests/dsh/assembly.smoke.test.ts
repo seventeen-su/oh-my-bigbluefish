@@ -93,7 +93,23 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     // 进了工具面，其余 7 个工具**全部消失**，而健康面一切正常。
     // 现在由 `toolBridge` 幂等重放：每挂载完一个模块就同步一次。
     const registered: string[] = []
-    const host = { register: (def: unknown) => { registered.push((def as { name: string }).name); return () => {} } }
+    const missingOutput: string[] = []
+    // 假宿主**复刻真宿主的契约校验**：`tools.register()` 要求
+    // `output { schema, render }`，缺了会抛
+    // （`packages/core/tools/src/index.ts:1066-1070`）。
+    // 不复刻这条校验，测试就会对"每个 OMB 工具都被宿主拒绝"保持全绿——
+    // 实测正是如此：桥手搓注册对象漏了 `output`，工具面全空而测试全过。
+    const host = {
+      register: (def: unknown) => {
+        const d = def as { name: string; output?: { schema?: unknown; render?: unknown } }
+        if (d.output === undefined || typeof d.output.render !== 'function') {
+          missingOutput.push(d.name)
+          throw new TypeError(`tool "${d.name}" must declare output { schema, render }`)
+        }
+        registered.push(d.name)
+        return () => {}
+      },
+    }
     const handle = createKernel()
     handle.kernel.provide(SERVICES.kernel, handle.kernel)
     const bridge = createToolBridge()
@@ -123,6 +139,11 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     }
     // 无重名（宿主对重名会抛，而抛会让整批失败）
     expect(new Set(registered).size).toBe(registered.length)
+    // **每个工具都必须带宿主要求的 output** —— 缺了会被真宿主拒绝
+    expect(
+      missingOutput,
+      `这些工具缺 output { schema, render }，会被宿主拒绝：${missingOutput.join('、')}`,
+    ).toEqual([])
     // 桥是幂等的：再同步几次不会重复注册
     const before = registered.length
     bridge.sync()
