@@ -1,7 +1,0 @@
-{
-  "id": "bench:sys-03",
-  "category": "sys",
-  "prompt": "删除临时文件 tmp/x.log（离线模拟）：状态断言——tmp/x.log 从 'exists' 变为 'absent'。",
-  "fixture_ref": "sys-03.fixture.json",
-  "verifier": { "kind": "state_assert", "ref": "sys-03.fixture.json" }
-}

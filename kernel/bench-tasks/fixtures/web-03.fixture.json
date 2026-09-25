@@ -1,7 +1,0 @@
-{
-  "output": { "results": { "count": 3, "items": ["r1", "r2", "r3"] } },
-  "cost": { "model_tokens": 1780, "tool_calls": 8, "retrieval_calls": 2, "reacquisition": 1, "latency_ms": 5480, "branch_count": 3, "memory_pollution": 0, "corrections": 1 },
-  "predicates": [
-    { "path": "results.count", "equals": 3 }
-  ]
-}

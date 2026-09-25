@@ -1,36 +1,34 @@
 {
-  "name": "@omb/preset-v2",
-  "version": "2.3.0",
-  "type": "module",
+  "name": "@omb/plugin",
+  "version": "3.0.0",
   "private": true,
+  "type": "module",
+  "description": "OMB v3 —— DSH 通用认知增强插件（思维链质量 / 记忆 / 上下文优化）",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json && tsx scripts/copy-assets.ts",
-    "bench-report": "tsx scripts/bench-report.ts",
-    "replay-recorder": "tsx scripts/replay-recorder.ts",
-    "retrieval-bench": "tsx scripts/retrieval-bench.ts",
-    "init-three-line": "tsx scripts/init-three-line.ts",
-    "deploy-lines": "tsx scripts/deploy-lines.ts",
-    "fetch-embedding-model": "tsx scripts/fetch-embedding-model.ts"
-  },
-  "devDependencies": {
-    "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.20.1",
-    "eslint": "^9.39.5",
-    "jieba-wasm": "2.4.0",
-    "tsx": "^4.23.12",
-    "typescript": "~5.5.4",
-    "typescript-eslint": "^8.67.0",
-    "vitest": "^3.2.7"
+    "build": "tsc -p tsconfig.build.json",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "dependencies": {
-    "js-yaml": "^5.3.0",
-    "koffi": "^3.1.5",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
     "onnxruntime-node": "1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "eslint": "^9.39.5",
+    "tsx": "^4.23.12",
+    "typescript": "~5.5.4",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^3.2.7"
   }
 }

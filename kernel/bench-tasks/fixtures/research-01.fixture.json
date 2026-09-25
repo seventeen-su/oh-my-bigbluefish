@@ -1,5 +1,0 @@
-{
-  "output": "本文档涵盖三个部分：首先说明研究动机，其次介绍方法设计，最后给出结论与展望。",
-  "cost": { "model_tokens": 2120, "tool_calls": 4, "retrieval_calls": 3, "reacquisition": 2, "latency_ms": 7240, "branch_count": 2, "memory_pollution": 1, "corrections": 0 },
-  "rubric": { "required_terms": ["动机", "方法", "结论"] }
-}

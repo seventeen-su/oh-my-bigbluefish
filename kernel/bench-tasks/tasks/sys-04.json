@@ -1,7 +1,0 @@
-{
-  "id": "bench:sys-04",
-  "category": "sys",
-  "prompt": "复制目录 src → dst（离线模拟）：状态断言——dst 从 'empty' 变为包含 src 的全部文件。",
-  "fixture_ref": "sys-04.fixture.json",
-  "verifier": { "kind": "state_assert", "ref": "sys-04.fixture.json" }
-}
