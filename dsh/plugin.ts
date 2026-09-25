@@ -42,6 +42,7 @@ import {
   wireSessionEvents,
 } from './session.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
+import { wireArtifactIndex } from './hooks.js'
 import { buildStatusTool } from './status-tool.js'
 import { loadModulesSync } from './modules.js'
 import { MODULE_ENTRIES } from './moduleEntries.js'
@@ -191,6 +192,15 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 
   // ── 5) 会话事件（只观察，不接管 Loop）─────────────────────────────────
   const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, sessions })
+  /**
+   * 制品索引的**生产者**。
+   *
+   * 这条接线曾经不存在（`dsh/hooks.ts` 只是个被注释提及的文件名）：
+   * 于是 `omb_files` 索引恒为 0、健康面全绿、工具可调用——
+   * 每一层单独看都对，只是中间少了一根线。自检报告正确地把它标为
+   * "无法区分『没观察过』与『没在工作』"，实测答案是后者。
+   */
+  const disposeArtifactIndex = wireArtifactIndex({ ctx, kernel: handle.kernel })
 
   // ── 6) 异步阶段：只填内部状态，不再注册任何东西（H-2）─────────────────
   void storageHost
@@ -216,6 +226,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     disposed = true
     const steps: readonly (() => void)[] = [
       disposeEvents,
+      disposeArtifactIndex,
       disposeToolResync,
       disposePrompt,
       () => toolBridge.dispose(),
