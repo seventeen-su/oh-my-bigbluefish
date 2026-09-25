@@ -10,7 +10,20 @@
  */
 import type { FocusDepth } from './kinds.js'
 
-/** 工具的输入 schema——与 `ConfigSchema` 同样只要求 `parse`，对校验库零依赖。 */
+/**
+ * 工具的输入 schema。
+ *
+ * 只要求 `parse`——对校验库零依赖（模块用 zod、schemastery 或手写校验器都行）。
+ *
+ * **但模块必须另外提供 `jsonSchema`**（把同一条工具参数附成
+ * `{ jsonSchema: Record<string, unknown> }`），因为**模型看不到 zod**：
+ * 宿主 `tools.register` 把参数当原始 JSON Schema 用，
+ * 只给 `parse` 会让模型看到一个空参数表（工具"存在但无从填写"）。
+ *
+ * 推荐用 `z.toJSONSchema(sameSchema)` 从**同一份** zod 生成，避免两处漂移。
+ * 缺失 `jsonSchema` 时 `dsh/` 回落到空参数表——**这是降级不是崩溃**，
+ * 且状态面会记录（工具仍可用，只是模型看不到入参说明）。
+ */
 export interface ToolInputSchema {
   parse(input: unknown): unknown
 }
@@ -20,6 +33,11 @@ export interface ToolInputSchema {
  *
  * **执行体绝不抛异常**（热插拔要求）：服务缺失、参数非法、内部错误
  * 一律返回 `ToolOutcome` 的错误分支。模型看到的是可读文本，不是中断的回合。
+ *
+ * **同步或异步都可以，调用方必须 `await`。** 返回类型是
+ * `ToolOutcome | Promise<ToolOutcome>`——写同步实现是合法的（更简单），
+ * 但任何消费方都不得假设拿到的是终值。这条约定写在类型旁边，
+ * 因为"测试按同步值用"是实际发生过的集成错误来源。
  */
 export interface ToolDefinition {
   /** 工具名，`omb_` 前缀。 */
