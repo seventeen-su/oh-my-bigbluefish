@@ -21,6 +21,16 @@ function moduleEntrySpecs(): readonly string[] {
 }
 
 describe('模块入口清单与 YAML 一致', () => {
+  it('YAML 的 name 不得带 ?v= 缓存尾缀（新宿主下会让行加载失败）', () => {
+    // 由来：`?v=N` 是旧 v2 的开发习惯（Node ESM 按 URL 缓存）。
+    // 在 DSH 0.1.7 里它**从原理上不可用**——实测装到 profile 后 8 行全部
+    // "failed to import"，报错 URL 形如 `kernel.js%3Fv=1`：那个 `?v=1`
+    // 被当成**文件名字面量**去找，文件当然不存在。
+    // 新宿主自带 HMR，改代码后重载由宿主负责，不需要这个尾缀。
+    const offenders = [...yaml.matchAll(/name:\s*'([^']*\?v=\d+[^']*)'/g)].map(m => m[1] as string)
+    expect(offenders, `这些行带了 ?v= 尾缀，装到宿主后会加载失败：\n${offenders.join('\n')}`).toEqual([])
+  })
+
   it('cordis.patch.yml 里每个模块入口都在静态清单中', () => {
     const declared = moduleEntrySpecs()
     expect(declared.length).toBeGreaterThan(0)
