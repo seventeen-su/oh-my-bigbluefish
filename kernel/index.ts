@@ -9,6 +9,8 @@ import { EventBus, ServiceTable } from './services.js'
 import { BudgetTable } from './budget.js'
 import { HealthTable } from './health.js'
 import { FocusTable, planModules } from './registry.js'
+import { StatusTable } from './status.js'
+import { SERVICES } from './abi/index.js'
 import type {
   BudgetGrant,
   BudgetKind,
@@ -58,6 +60,10 @@ export interface KernelHandle {
   }[]
   /** 健康面快照，供 `omb_status` 使用。 */
   health(): Readonly<Record<string, ModuleHealth>>
+  /** 状态面贡献汇总（已按 name 排序渲染）。单个贡献者失败被隔离成一行错误。 */
+  status(): readonly string[]
+  /** 已登记的状态面贡献者名（诊断用）。 */
+  statusNames(): readonly string[]
   /** 预算面快照。 */
   budgets(): Readonly<Record<string, { used: number; limit: number }>>
   /** 事件总线订阅者数——热插拔验收用（卸载后应为 0）。 */
@@ -101,6 +107,10 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   const budgetTable = new BudgetTable()
   const healthTable = new HealthTable()
   const focusTable = new FocusTable()
+  const statusTable = new StatusTable()
+
+  // 状态面登记处由内核自己提供：单值服务表装不下 N 个贡献者（见 abi/catalog.ts 的说明）
+  services.provide(SERVICES.statusContributor, statusTable)
 
   let disposed = false
   const disposers: (() => void | Promise<void>)[] = []
@@ -171,6 +181,8 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       return plan.blocked
     },
     health: () => healthTable.snapshot(),
+    status: () => statusTable.render(),
+    statusNames: () => statusTable.list().map(c => c.name),
     budgets: () => budgetTable.snapshot(),
     listenerCount: () => bus.listenerCount(),
     dispose() {

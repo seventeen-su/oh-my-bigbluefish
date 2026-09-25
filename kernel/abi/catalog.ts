@@ -151,6 +151,35 @@ export const SERVICES = {
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
 
 /**
+ * 保留的来源前缀。**离线整合必须跳过这些记录。**
+ *
+ * 为什么需要：画像这类"单文档、确定性 id、整体覆盖写"的记录，
+ * 若被当作经验痕迹参与去重/回响合并/衰减排序，会被错误地塌缩或降权——
+ * 它们不是"经验"，是结构化状态。
+ *
+ * 各模块用 `RESERVED_SOURCE_PREFIX + '<模块 id>'` 作为自己的 `sourceRef` 前缀。
+ */
+export const RESERVED_SOURCE_PREFIX = 'omb-doc:'
+
+/**
+ * 状态面贡献登记处。
+ *
+ * **为什么是登记处而不是单值服务**：单值服务表一个名字只能装一个实现，
+ * 而 `omb-reasoning` 与 `omb-context` 等多个模块都要向 `omb_status` 贡献段落。
+ * 让它们互相覆盖（后注册者胜）会**静默丢掉**前面的段落；让它们各自用
+ * `status:contributor:<id>` 又需要在 `dsh/` 侧逐个探测、且新增模块要改 dsh。
+ * 登记处一次注册、天然支持 N 个、dsh 侧一段代码遍历。
+ *
+ * 由微内核 `provide`（服务名 `SERVICES.statusContributor`），模块 `apply` 里同步 `register`。
+ */
+export interface StatusRegistry {
+  /** 登记一个贡献者。@returns 注销函数（幂等）。 */
+  register(contributor: StatusContributor): () => void
+  /** 当前全部贡献者，按 `name` 稳定排序（输出确定，便于测试与阅读）。 */
+  list(): readonly StatusContributor[]
+}
+
+/**
  * 状态面贡献者。任一模块可实现它，`omb_status` 汇总。
  *
  * `detail` 必填——这是"诚实降级"在类型上的体现：

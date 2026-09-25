@@ -7,13 +7,18 @@ type Disposer = () => void
 export class ServiceTable {
   readonly #services = new Map<string, unknown>()
 
+  /**
+   * 注册一个命名服务。
+   *
+   * **同名重复注册：先注销旧的再装新的，不抛异常。** 两种情形都会发生：
+   * ① 热插拔重载同一模块（旧 fiber 的 disposer 可能晚于新注册执行）
+   * ② 模块自己重建服务实例
+   * 抛异常会把"重载"变成"插件加载失败"，与「开关不该让会话报错」直接冲突。
+   * 返回的 disposer 仍然只移除**本次注册的那个实例**，避免误删后注册者。
+   */
   provide(name: string, service: unknown): Disposer {
-    if (this.#services.has(name)) {
-      throw new Error(`内核：服务 "${name}" 已被注册（同一实例内服务名必须唯一）`)
-    }
     this.#services.set(name, service)
     return () => {
-      // 仅在仍是本次注册的那个实例时移除，避免后注册者被先注销者误删
       if (this.#services.get(name) === service) this.#services.delete(name)
     }
   }
@@ -21,6 +26,11 @@ export class ServiceTable {
   /** 缺失返回 undefined，**不抛**——热插拔下服务可能刚被卸下。 */
   get<T>(name: string): T | undefined {
     return this.#services.get(name) as T | undefined
+  }
+
+  /** 已注册的服务名（诊断与测试用）。 */
+  names(): readonly string[] {
+    return [...this.#services.keys()].sort()
   }
 }
 

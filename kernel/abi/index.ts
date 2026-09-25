@@ -46,8 +46,23 @@ export type {
 } from './storage.js'
 export { STORES_SERVICE, SCHEMA_VERSION } from './storage.js'
 
-export type { ModuleId, CatalogEntry, ServiceName, StatusContributor, ToolFactory } from './catalog.js'
-export { MODULE_IDS, MODULE_CATALOG, SCOPE_BY_KIND, SERVICES, STATUS_TOOL, validateCatalog } from './catalog.js'
+export type {
+  ModuleId,
+  CatalogEntry,
+  ServiceName,
+  StatusContributor,
+  StatusRegistry,
+  ToolFactory,
+} from './catalog.js'
+export {
+  MODULE_IDS,
+  MODULE_CATALOG,
+  RESERVED_SOURCE_PREFIX,
+  SCOPE_BY_KIND,
+  SERVICES,
+  STATUS_TOOL,
+  validateCatalog,
+} from './catalog.js'
 
 export type {
   Kernel,

@@ -83,6 +83,10 @@ export interface StoreStats {
  */
 export interface MemoryStore {
   readonly scope: MemoryScope
+  /**
+   * 写入一条记忆。**按 `id` 是 upsert（覆盖写），不是 INSERT-only。**
+   * 画像等"确定性 id 的单文档"依赖这个语义。
+   */
   put(record: MemoryRecord): Promise<void>
   get(id: string): Promise<MemoryRecord | undefined>
   /** **必须批量**——禁止 N+1（旧实现每 id 一次 SELECT）。 */
