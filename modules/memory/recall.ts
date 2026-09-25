@@ -345,12 +345,16 @@ function validityMark(supersededBy: string | null, validTo: number | null): stri
   return ''
 }
 
-/** 删除回执：删了几条、哪些没找到、有没有降级。 */
+/** 删除回执：删了几条、哪些没找到、磁盘是否清干净。 */
 export function renderForget(ids: readonly string[], outcome: ForgetOutcome): string {
   const parts = outcome.perScope.map(entry => `${entry.scope} ${entry.deleted}`).join(' / ')
   const lines = [
-    `已硬删除 ${outcome.deleted} 条记忆${parts.length > 0 ? `（${parts}）` : ''}。`,
-    '这条路径不可撤销；被删内容与其溯源不再可召回。',
+    `已删除 ${outcome.deleted} 条记忆${parts.length > 0 ? `（${parts}）` : ''}。`,
+    // **措辞按实测改过**：原文案写"硬删除…不再可召回"，而逐字节扫描发现
+    // 被删文本以明文留在 `<库>.db-wal` 里（`secure_delete=0` + 未 checkpoint）。
+    // 现在 `forget` 会截断 WAL，所以这句话才立得住——但立的依据是**做了截断**，
+    // 不是"DELETE 语句看起来像硬删除"。
+    '这条路径不可撤销；被删内容与其溯源不再可召回，且已把 WAL 截断以清除磁盘明文残留。',
   ]
   if (outcome.missing.length > 0) {
     lines.push(`未找到 ${outcome.missing.length} 条（可能已被删除，或 id 拼错）：${outcome.missing.join(', ')}`)
