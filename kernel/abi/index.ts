@@ -46,6 +46,9 @@ export type {
 } from './storage.js'
 export { SCHEMA_VERSION } from './storage.js'
 
+export type { ModuleId, CatalogEntry } from './catalog.js'
+export { MODULE_IDS, MODULE_CATALOG, SCOPE_BY_KIND, STATUS_TOOL, validateCatalog } from './catalog.js'
+
 export type {
   Kernel,
   ModuleEvents,
