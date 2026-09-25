@@ -78,6 +78,15 @@ export interface StoresService {
     readonly openProjects: readonly string[]
   }
   /**
+   * 已打开的库套件快照。**不触发新打开**。
+   *
+   * 存在的理由：向量编码器手上只有 `memory/written` 的 `{id, scope, kind}`，
+   * 而 `forSession`/`forProject` 都要它拿不到的键（会话 id / cwd）。
+   * 没有这个枚举口，落盘侧只能靠猜——或者放弃编码。
+   * 未就绪时 `user` 为 undefined、`projects` 为空（调用方如实降级，不抛）。
+   */
+  snapshot(): { readonly user: StoreSet | undefined; readonly projects: readonly StoreSet[] }
+  /**
    * 取某会话所在项目的库。未就绪或打开失败返回 undefined（**不抛**）。
    * @param sessionId 宿主会话 id（用于把 cwd 映射到项目库）。
    */

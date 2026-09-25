@@ -298,6 +298,14 @@ export function wireSessionEvents(options: {
           ? (data as { turn: number }).turn
           : 0
         kernel.emit('turn/end', { sessionId, turn })
+        // 回合边界冲刷向量编码队列。
+        //
+        // **不驱动的话 `embedding` 表恒空**：写入侧会发 `memory/written`，
+        // 但队列要有人冲——这与"拉取计数不接线则台账恒 0"是同一类失败：
+        // 一条测量/处理链的中间环节没人接，表现为功能"看起来在工作但没有结果"。
+        //
+        // 带 limit 是刻意的：避免单个回合把大批积压一次编码完而卡住事件循环。
+        void flushVectorEncoder(kernel, 32)
         return
       }
       case 'tool/call': {
@@ -391,4 +399,21 @@ export function extractText(result: unknown): string {
 /** 便利：从宿主上下文取系统提示服务。 */
 export function readSystemPrompt(ctx: HostContextLike): SystemPromptLike | undefined {
   return readService<SystemPromptLike>(ctx, 'systemPrompt')
+}
+
+/**
+ * 冲刷向量编码队列。
+ *
+ * 由回合边界调用（见 `wireSessionEvents` 的 `turn/end`）。
+ * **失败绝不抛**：编码是后台增益，不得影响会话；原因进健康面由模块自己报。
+ */
+export async function flushVectorEncoder(kernel: Kernel, limit: number): Promise<void> {
+  try {
+    const encoder = kernel.service<{ encodePending?(n?: number): Promise<unknown> }>(
+      SERVICES.vectorEncoder,
+    )
+    await encoder?.encodePending?.(limit)
+  } catch (error) {
+    kernel.logger.warn(`OMB：向量编码冲刷失败（已隔离）——${String(error)}`)
+  }
 }
