@@ -32,7 +32,7 @@ import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } fr
 import type { MethodCard } from './methods.js'
 import { METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
 import { createReasoningTools } from './tools.js'
-import { toHostPlugin } from '../../kernel/hostEntry.js'
+import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
 export const MODULE_VERSION = '3.0.0'
@@ -213,6 +213,10 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
 
     disposers.push(
       kernel.on('turn/start', payload => {
+        // 诊断：确认订阅端真的收到 `turn/start`。
+        // `omb_focus` 报"取不到会话"时只剩两种可能：①发送端没发（看 `step-start`
+        // 心跳）②订阅端没收到。两条心跳一对，分叉点就唯一了。
+        heartbeat('reasoning-turn', { sessionId: payload.sessionId })
         const state = ensure(payload.sessionId)
         lastActiveSession = payload.sessionId
         state.lastSignal = detectLoop(state.window)
@@ -258,7 +262,13 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     let tools: ReasoningTools = []
     try {
       tools = createReasoningTools({
-        currentSession: () => lastActiveSession ?? '',
+        // 本模块记的"最近活跃会话"是**快路径**，但它有个致命前提：
+        // 模块必须真的收到 `turn/start`。而收养视图的 `on` 优先绑**宿主**事件面，
+        // `dsh/` 却发在内核总线——收不到也不报错。所以必须有内核兜底。
+        currentSession: () =>
+          lastActiveSession
+          ?? kernel.service<{ current(): SessionRef | null }>(SERVICES.activeSession)?.current()
+          ?? '',
         readDepth: target => readFocus(kernel, target).depth,
         applyDepth: (target, depth, reason) => applyFocus(kernel, target, depth, reason),
         loopSignal: target => loopService.signal(target),

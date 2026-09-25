@@ -12,6 +12,7 @@ import { FocusTable, planModules } from './registry.js'
 import { StatusTable } from './status.js'
 import { adoptContext, type ForeignContextLike } from './adopt.js'
 import { markKernel, markKernelHandle } from './hostEntry.js'
+import { ActiveSessionTable } from './activeSession.js'
 import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
@@ -127,13 +128,18 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   const focusTable = new FocusTable()
   const statusTable = new StatusTable()
   const channelTable = new ChannelTable<{ readonly name: string }>()
+  const activeSessions = new ActiveSessionTable()
 
-  // 两个登记处都由内核自己 provide：
+  // 三个登记处都由内核自己 provide：
   // ① 状态面：单值服务表装不下 N 个贡献者（见 abi/catalog.ts 的说明）
   // ② 第二通道：**依赖方向要求"推"而不是"拉"**——`omb-memory-vector` 的 requires
   //    包含 `omb-memory`，所以只能由向量模块把自己的通道注册进来，记忆模块读登记处。
+  // ③ 活跃会话：模块经收养视图订阅事件时订到的是**宿主**事件面，收不到内核对
+  //    `turn/start` 的广播（见 kernel/activeSession.ts）。会话这个全局事实必须由
+  //    内核持有，模块按需读取，不能依赖"模块能不能收到某条事件"。
   services.provide(SERVICES.statusContributor, statusTable)
   services.provide(SERVICES.channelRegistry, channelTable)
+  services.provide(SERVICES.activeSession, activeSessions)
 
   let disposed = false
   const disposers: (() => void | Promise<void>)[] = []
