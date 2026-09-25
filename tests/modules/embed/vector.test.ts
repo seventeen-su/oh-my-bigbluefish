@@ -358,6 +358,9 @@ function fakeStore(record: MemoryRecord): MemoryStore {
     async searchLexical() {
       return [{ id: record.id, score: 1, channel: 'lexical' as const }]
     },
+    async searchVector() {
+      return [] // 本用例只验词法路径：向量通道不参与（§5.7）
+    },
     async upsertEdge(): Promise<void> {},
     async walkGraph() {
       return { nodes: [], edges: [] }
