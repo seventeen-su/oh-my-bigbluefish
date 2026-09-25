@@ -236,14 +236,33 @@ const defaultResolveStoreSets: StoreSetResolver = (kernel) => {
   }
 }
 
-/** 通道的一句话标签（health 与状态面共用，避免两处口径漂移）。 */
+/**
+ * 通道的一句话标签（health 与状态面共用，避免两处口径漂移）。
+ *
+ * **降级路径的措辞经过实测校正**：原来的标签只写"哈希词袋（诚实降级路径）"，
+ * 而用户会自然以为它仍提供语义召回（README 曾写"同义改写能召回哈希词袋召不回的
+ * 记忆"）。实测五组对照后确认：
+ *
+ * | 对照 | 余弦 |
+ * | --- | --- |
+ * | 同义改写（`这个函数太长了需要拆分` ↔ `这个方法篇幅过大应当分解`） | ≈ 0.10 |
+ * | 无关（`这个函数太长了需要拆分` ↔ `今天天气不错适合散步`） | 0.00 |
+ * | **语义相反但字面重合**（`删除记忆` ↔ `添加记忆`） | ≈ 0.33 |
+ *
+ * 它度量的是**哈希字符袋的重合度**，不是语义——同义改写只比噪声高一点点，
+ * 而反义词拿到最高分。所以标签必须说"字符匹配"，否则使用者会拿它当语义通道用。
+ * 判据被 `tests/modules/memory/vector-discrimination.test.ts` 冻结。
+ */
 function channelLabel(state: VectorChannelState, current: Embedder | undefined): string {
   if (state.channel === 'onnx') {
     return `神经嵌入 ${current?.id ?? BGE_EMBEDDER_ID}（${current?.dimensions ?? 0} 维，revision ${current?.revision ?? '?'}）`
   }
   if (state.channel === 'off') return '未启动/已关闭'
   const fallback = current === undefined ? '哈希词袋' : `哈希词袋 ${current.id}（${current.dimensions} 维）`
-  return state.probing ? `${fallback}，ONNX 装载中` : `${fallback}（诚实降级路径）`
+  // **"字符匹配，非语义"这句必须写出来**：实测同义改写只拿到 ≈0.10、反义词拿到 ≈0.33，
+  // 拿它当语义通道用会得到错误的召回预期。
+  const what = '（降级路径：度量字符重合，不是语义——同义改写≈0.10、无关≈0.00、反义词≈0.33）'
+  return state.probing ? `${fallback}，ONNX 装载中` : `${fallback}${what}`
 }
 
 function channelMetrics(

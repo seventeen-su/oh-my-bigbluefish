@@ -538,37 +538,30 @@ class SqliteStore implements SqliteMemoryStore {
         removed += this.#run(`DELETE FROM memory WHERE id IN (${placeholders})`, chunk)
       }
       /**
-       * **删完必须把 WAL 截断**——否则"硬删除"只是措辞。
+       * **删完把明文从磁盘上彻底清掉。**两步，缺一不可：
        *
-       * ## 实测（自检报告追问"物理抹除 vs 逻辑不可召回"，逐字节扫过）
+       * ## ① `secure_delete=ON`（连接建立时已开）
+       * DELETE 当场覆写释放的字节区。所以**这一次**删除的文本从来没进过主库文件。
        *
-       * 删掉一条记忆后：
+       * ## ② 下面的 checkpoint + VACUUM
+       * - `wal_checkpoint(TRUNCATE)`：把已提交页推进主库，并把 WAL 截回零长度。
+       *   不做这步，明文就躺在 `<库>.db-wal` 里，`strings` 直接捞得出来（实测 6 处）。
+       * - `VACUUM`：**重建整库文件**，只保留活数据，空闲页清零。
+       *   它对付的是"加固之前就删掉的那些"——那些行的字节已经在旧文件里，
+       *   `secure_delete` 管不到（它只在删除当下生效）。上一轮我只做了 checkpoint，
+       *   所以那是妥协：明文从 WAL 挪进了主库空闲页，扫字节照样能捞。
        *
-       * | 层 | 被删文本 |
-       * | --- | --- |
-       * | `memory` / `memory_fts` / `embedding` / `edge`（SQL） | 0 ✅ |
-       * | **WAL 原始字节** | **6 处，全文可读** ❌ |
-       *
-       * 三个 PRAGMA 决定了它：`journal_mode=wal`（写入先进 WAL）、
-       * `secure_delete=0`（删除不覆写字节）、`wal_autocheckpoint=1000`（远没到阈值）。
-       * 于是原文以**明文**留在 `<库>.db-wal` 里，`strings` 就能捞出来。
-       *
-       * ## 为什么这条不能只是文档问题
-       *
-       * `forget` 是**隐私擦除**路径（`consolidate.ts` 写明"唯一允许的删除路径"）。
-       * 隐私擦除的语义是"内容不再存在"，而不是"查不到了"。
-       * 对隐私场景，"查不到但字节还在"是不合格的。
-       *
-       * `TRUNCATE` 会 checkpoint 并把 WAL 截回零长度（已提交内容进了主库文件，
-       * 不是丢数据）。整个删除在同一事务边界内完成，代价可接受——
-       * 隐私擦除本来就是低频、显式、可审计的操作。
+       * 两步都包在 try 里：**行已经删了**，清理失败不能把"已删除"变成"删除失败"；
+       * 但必须置位让回执如实说"逻辑已删、磁盘残留未清干净"——
+       * 隐私擦除的失败必须可见。
        */
       try {
         this.#run('PRAGMA wal_checkpoint(TRUNCATE)')
-      } catch {
-        // checkpoint 失败不得让"已经删掉了"变成"删除失败"：行确实已经删了。
-        // 但这条降级必须留声——调用方据此提示"逻辑已删、磁盘可能仍有残留"。
+        this.#run('VACUUM')
+        this.#run('PRAGMA wal_checkpoint(TRUNCATE)')
+      } catch (error) {
         this.#checkpointFailed = true
+        this.#logger.warn(`OMB：隐私擦除的磁盘清理未完成（行已删除）——${messageOf(error)}`)
       }
       return removed
     })
@@ -1145,6 +1138,42 @@ function configureConnection(db: SqliteLike, logger: Logger): void {
   } catch (error) {
     // 某些文件系统（网络盘）不支持 WAL：降级而不是拒绝打开，但必须留下原因
     logger.warn(`OMB：无法启用 WAL（退化为 rollback journal）——${messageOf(error)}`)
+  }
+  /**
+   * **删除时覆写被释放的字节。**
+   *
+   * ## 为什么必须在这里开，而不是在 `forget` 里临时开
+   *
+   * `secure_delete` 控制 **DELETE 当下**是否把释放的字节区清零。它不是一个
+   * "之后清理"的开关——事务已经提交、字节已经落盘之后，再开它没有意义。
+   * 所以必须在**连接建立时**就是 ON，才能保证每一次删除都覆写。
+   *
+   * ## 实测背景
+   *
+   * 上一轮只做了 `wal_checkpoint(TRUNCATE)`，那**只是把明文从 WAL 挪走**：
+   * 被删文本仍会随 checkpoint 进入主库文件的空闲页，逐字节扫描照样能捞出来。
+   * 那是妥协方案，不是修复。
+   *
+   * `secure_delete=ON` 之后：
+   * - `forget` 的 DELETE 当场覆写释放区 → **主库文件里从头到尾没有过明文**
+   * - WAL 里那一份由 `forget` 末尾的 `TRUNCATE` 截掉
+   * - 两者合起来才是"物理抹除"，而不是"查不到了"
+   *
+   * ## 代价与取舍
+   *
+   * 代价是**每次释放字节都要 memset**。对普通表它是 O(释放量)，对本库这种
+   * 短文本记忆可忽略；真正值得在意的是它给所有写路径加了一点常数开销。
+   * 隐私擦除的语义（"内容不再存在"）比这点开销重要，所以默认开。
+   *
+   * 失败不拒绝打开：某些 SQLite 构建可能不认这个 pragma，降级即可，
+   * 但**必须留声**——静默失败会让"已抹除"变成一句无从核实的承诺。
+   */
+  try {
+    db.exec('PRAGMA secure_delete = ON')
+  } catch (error) {
+    logger.warn(
+      `OMB：无法启用 secure_delete（删除的字节将不被覆写，隐私擦除只保证"不可召回"）——${messageOf(error)}`,
+    )
   }
   // WAL 下的标准搭配：崩溃不会损坏库，代价是最后若干事务可能丢失（可接受：记忆不是账本）
   db.exec('PRAGMA synchronous = NORMAL')
