@@ -28,7 +28,7 @@ import type {
 import { RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES, applyFocus, isFocusDepth, projectFocus, readFocus, renderProjection } from './focus.js'
 import type { LoopSignal, TurnFingerprint } from './loop.js'
-import { DEFAULT_WINDOW_SIZE, appendFingerprint, detectLoop, renderLoopSignal } from './loop.js'
+import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } from './loop.js'
 import type { MethodCard } from './methods.js'
 import { METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
 import { createReasoningTools } from './tools.js'
@@ -185,11 +185,12 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     }
 
     // ── 事件：滚动指纹窗口（本组件唯一需要"计算"的部分） ──
+    // 一次工具调用会来两条事件（call + result），因此用 noteObservation 归并成"一步"
     disposers.push(
       kernel.on('evidence/observed', payload => {
         const state = ensure(payload.sessionId)
         lastActiveSession = payload.sessionId
-        state.window = appendFingerprint(
+        state.window = noteObservation(
           state.window,
           { actionHash: payload.actionHash, evidenceHash: payload.evidenceHash, at: payload.at },
           DEFAULT_WINDOW_SIZE,
@@ -306,8 +307,16 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
         try {
           const lines = [healthNow().detail]
           for (const [session, state] of sessions) {
-            if (state.lastSignal === null) continue
-            lines.push(`会话 ${session}：${state.lastSignal.kind}——${state.lastSignal.detail}`)
+            // 只写"有事发生"的会话：显式设过档位（含理由，供事后判断旋钮是否有用）
+            // 或检出过循环信号。安静的会话不占行。
+            const signal = state.lastSignal
+            if (signal === null && state.explicitDepth === undefined) continue
+            const bits: string[] = []
+            if (state.explicitDepth !== undefined) {
+              bits.push(`深度 ${state.explicitDepth}${state.lastReason === '' ? '' : `（理由：${state.lastReason}）`}`)
+            }
+            if (signal !== null) bits.push(`${signal.kind}——${signal.detail}`)
+            lines.push(`会话 ${session}：${bits.join('；')}`)
           }
           if (hint !== '') lines.push(`常驻提示：${hint}`)
           return lines.join('\n')
