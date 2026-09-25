@@ -94,17 +94,39 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     // 现在由 `toolBridge` 幂等重放：每挂载完一个模块就同步一次。
     const registered: string[] = []
     const missingOutput: string[] = []
-    // 假宿主**复刻真宿主的契约校验**：`tools.register()` 要求
-    // `output { schema, render }`，缺了会抛
-    // （`packages/core/tools/src/index.ts:1066-1070`）。
-    // 不复刻这条校验，测试就会对"每个 OMB 工具都被宿主拒绝"保持全绿——
-    // 实测正是如此：桥手搓注册对象漏了 `output`，工具面全空而测试全过。
+    const dirtySchema: string[] = []
+    // 假宿主**复刻真宿主的契约校验**：
+    // ① `tools.register()` 要求 `output { schema, render }`，缺了会抛
+    //    （`packages/core/tools/src/index.ts:1066-1070`）
+    // ② 参数 schema 必须是"只有可枚举字符串键的普通记录"
+    //    （`isJsonSchemaRecord` → `hasOnlyEnumerableStringKeys`）。
+    //    `z.toJSONSchema()` 的返回对象带一个**非枚举**键 `~standard`
+    //    （zod v4 的 Standard Schema 标记），会被这条判据拒绝——
+    //    实测每个走 zod 的工具都因此被拒，而手写 JSON Schema 的恰好通过，
+    //    症状是"有的工具有、有的没有"，极易误判成个别模块的问题。
+    //
+    // 不复刻真宿主的校验，测试就会对"工具全被拒绝"保持全绿（实测如此）。
     const host = {
       register: (def: unknown) => {
-        const d = def as { name: string; output?: { schema?: unknown; render?: unknown } }
+        const d = def as {
+          name: string
+          parameters?: Record<string, unknown>
+          output?: { schema?: unknown; render?: unknown }
+        }
         if (d.output === undefined || typeof d.output.render !== 'function') {
           missingOutput.push(d.name)
           throw new TypeError(`tool "${d.name}" must declare output { schema, render }`)
+        }
+        const params = d.parameters
+        const decorated = params === undefined
+          || Object.getPrototypeOf(params) !== Object.prototype
+          || Object.getOwnPropertySymbols(params).length > 0
+          || Object.getOwnPropertyNames(params).some(
+            k => Object.getOwnPropertyDescriptor(params, k)?.enumerable !== true,
+          )
+        if (decorated) {
+          dirtySchema.push(d.name)
+          throw new TypeError(`tool "${d.name}" parameters must be lossless JSON before schema projection`)
         }
         registered.push(d.name)
         return () => {}
