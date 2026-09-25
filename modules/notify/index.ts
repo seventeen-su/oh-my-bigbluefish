@@ -11,6 +11,7 @@ import type { Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '.
 import { SERVICES } from '../../kernel/abi/index.js'
 import type { DesktopNotifyLike } from './bridge.js'
 import { DEFAULT_NOTIFY_SESSION, NotifyBridge } from './bridge.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const NOTIFY_MODULE_ID = 'omb-notify'
 /** 服务名取 ABI 契约里的 `SERVICES.notify`（不是本地约定）。 */
@@ -144,4 +145,4 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
 
 export const notifyModule = createNotifyModule()
 
-export default notifyModule
+export default toHostPlugin(notifyModule)

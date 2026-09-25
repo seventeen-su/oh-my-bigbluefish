@@ -22,14 +22,19 @@
  */
 import { z } from 'zod'
 import {
+  MEMORY_SCOPES,
   SERVICES,
   type Embedder,
   type Kernel,
+  type MemoryRecord,
+  type MemoryScope,
   type ModuleHealth,
   type ModuleManifest,
   type ModuleRegistration,
   type ScoredHit,
   type StatusRegistry,
+  type StoreSet,
+  type StoresService,
   type VectorAttribution,
 } from '../../kernel/abi/index.js'
 import { HASH_BOW_COSINE_FLOOR, blobDecodeFailureCount, hashBagEmbedder } from './embed.js'
@@ -42,11 +47,22 @@ import {
   type OnnxLoad,
 } from './onnx.js'
 import type { ChannelQuery, RetrievalChannel } from './retrieve.js'
+import { asVectorStore, type VectorStoreApi } from './store.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 /** 模块 id = `cordis.patch.yml` 行 id = 插件页开关 id（`kernel/abi/catalog.ts`）。 */
 export const VECTOR_MODULE_ID = 'omb-memory-vector'
-/** 本模块注册的内核服务名（契约见 `SERVICES`）。 */
+/** 本模块注册的嵌入器服务名（契约见 `SERVICES`）。 */
 export const EMBEDDER_SERVICE = SERVICES.embedder
+/**
+ * 本模块注册的**编码队列**服务名。
+ *
+ * ⚠️ 待 `kernel/abi/catalog.ts` 冻结 `SERVICES.vectorEncoder = 'vectorEncoder'` 后改为引用常量
+ * （字面量临时用，避免 ABI 变更阻塞施工）。
+ */
+export const VECTOR_ENCODER_SERVICE = 'vectorEncoder'
+/** 待编码队列的默认上界（`maxPending` 配置的缺省值）。 */
+export const DEFAULT_MAX_PENDING = 256
 
 /**
  * 配置 schema（缺省值必须完整：`apply` 永远收到完整配置）。
@@ -68,10 +84,58 @@ export const vectorConfigSchema = z.preprocess(
     threads: z.number().int().min(1).default(2),
     /** 哈希兜底维度（默认 256）。 */
     dimensions: z.number().int().positive().default(256),
+    /**
+     * 待编码队列上界（默认 {@link DEFAULT_MAX_PENDING}）。
+     * 写入多、冲刷慢时队列不能无界增长：超界丢**最旧**的并计数（可见，不静默）。
+     */
+    maxPending: z.number().int().positive().default(DEFAULT_MAX_PENDING),
   }),
 )
 
 export type VectorConfig = z.infer<typeof vectorConfigSchema>
+
+/** 一次批量冲刷的结果。**绝不抛**：失败走 `reason`。 */
+export interface VectorEncodeOutcome {
+  readonly encoded: number
+  readonly skipped: number
+  readonly failures: number
+  /** 整批未能编码的原因（队列已保留，下次再试）；成功时缺省。 */
+  readonly reason?: string
+}
+
+/** 编码队列读数（状态面）。 */
+export interface VectorEncoderStats {
+  readonly pending: number
+  readonly encoded: number
+  readonly skipped: number
+  readonly failures: number
+  /** 因超界被丢弃的最旧条目数。 */
+  readonly dropped: number
+  /** 被库拒绝的写入数（如归属不符）——重试不会成功，故出队并计数。 */
+  readonly rejected: number
+  readonly lastReason: string | null
+}
+
+/**
+ * 向量编码队列（内核服务 `VECTOR_ENCODER_SERVICE`）。
+ *
+ * 为什么是"队列 + 冲刷"而不是"写入时同步编码"：嵌入是一次真实推理（ONNX 毫秒级、
+ * 且原生绑定会阻塞事件循环），把它压进写入路径会让每一次记忆写入都变慢。
+ * 因此写入只**入队**（`memory/written`），编码由 `dsh/` 在回合边界调 `encodePending()` 批量做。
+ */
+export interface VectorEncoder {
+  /** 待编码条目数。 */
+  pending(): number
+  /**
+   * 批量冲刷：`getMany` 读文本（**禁 N+1**）→ `embed` **一次批编码** → 逐条落盘。
+   *
+   * 归属标签取**当前嵌入器身份**（`modelId`/`dim`/`revision`），库侧会拒绝不符的写入。
+   * 无嵌入器 / 库不支持向量 / 编码失败 → 返回可读 `reason` 且**保留队列**（下次再试）；
+   * 文本为空或记录已不存在 → 跳过并计数；被库拒绝的单条 → 出队并计数（重试不会成功）。
+   */
+  encodePending(limit?: number): Promise<VectorEncodeOutcome>
+  stats(): VectorEncoderStats
+}
 
 /** 当前通道状态（`health()` 与状态面读它）。 */
 export interface VectorChannelState {
@@ -99,6 +163,8 @@ export type OnnxLoader = (options: OnnxEmbedderOptions) => Promise<OnnxLoad>
 /** 可注入依赖。**生产不传**：默认即真实实现。 */
 export interface VectorModuleDeps {
   readonly loadOnnx?: OnnxLoader
+  /** 库套件解析（编码队列定位"这条 id 在哪个库"）。缺省读 `stores` 服务的 `snapshot()`。 */
+  readonly resolveStoreSets?: StoreSetResolver
 }
 
 /**
@@ -141,6 +207,32 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** 解析"当前已就绪的库套件"（编码队列据此定位某条 id 在哪个库）。 */
+export type StoreSetResolver = (kernel: Kernel) => readonly StoreSet[]
+
+/**
+ * 缺省解析：读内核 `stores` 服务的 `snapshot()`。
+ *
+ * ⚠️ `snapshot()` 目前是 store 实现的**附加**方法（`MemoryStoresService`，尚未进 ABI）。
+ * 已向 lead 申请把它提升进 `StoresService`；在那之前用结构面读取：
+ * 缺失或抛错 → 空数组（上层给可读原因），**绝不抛**。ABI 冻结后应删掉这个 cast。
+ */
+const defaultResolveStoreSets: StoreSetResolver = (kernel) => {
+  const stores = kernel.service<StoresService>(SERVICES.stores) as
+    | (StoresService & { snapshot?: () => { user?: StoreSet; projects?: readonly StoreSet[] } })
+    | undefined
+  if (stores === undefined || typeof stores.snapshot !== 'function') return []
+  try {
+    const snapshot = stores.snapshot()
+    const sets: StoreSet[] = []
+    if (snapshot.user !== undefined) sets.push(snapshot.user)
+    for (const project of snapshot.projects ?? []) sets.push(project)
+    return sets
+  } catch {
+    return []
+  }
+}
+
 /** 通道的一句话标签（health 与状态面共用，避免两处口径漂移）。 */
 function channelLabel(state: VectorChannelState, current: Embedder | undefined): string {
   if (state.channel === 'onnx') {
@@ -154,6 +246,7 @@ function channelLabel(state: VectorChannelState, current: Embedder | undefined):
 function channelMetrics(
   state: VectorChannelState,
   current: Embedder | undefined,
+  enc: VectorEncoderStats,
 ): Record<string, number> {
   return {
     // 通道读数：1 = 向量通道可用（含降级），0 = 不可用。词法路径不受影响。
@@ -163,6 +256,13 @@ function channelMetrics(
     dimensions: current?.dimensions ?? 0,
     // 检索期降级累计（空通道可观测）
     channelErrors: state.channelErrors,
+    // 落盘读数：待编码队列与累计计数（"写入却没向量"必须可见，而不是查表为空却无人知道）
+    pendingEmbeddings: enc.pending,
+    encodedEmbeddings: enc.encoded,
+    encodeSkipped: enc.skipped,
+    encodeFailures: enc.failures,
+    encodeRejected: enc.rejected,
+    encodeDropped: enc.dropped,
     // 损坏 BLOB 计数：让"某条记忆就是搜不到"变成可读数字（旧实现静默返回 null）。
     blobDecodeFailures: blobDecodeFailureCount(),
   }
@@ -289,8 +389,12 @@ export function createVectorChannel(deps: VectorChannelDeps): RetrievalChannel {
 }
 
 /** 把通道状态渲染成健康面。**detail 永远写明当前通道**，降级必须带原因。 */
-function baseHealth(state: VectorChannelState, current: Embedder | undefined): ModuleHealth {
-  const metrics = channelMetrics(state, current)
+function baseHealth(
+  state: VectorChannelState,
+  current: Embedder | undefined,
+  enc: VectorEncoderStats,
+): ModuleHealth {
+  const metrics = channelMetrics(state, current, enc)
 
   if (state.channel === 'onnx') {
     return { state: 'ok', detail: `向量通道：${channelLabel(state, current)}`, metrics }
@@ -331,17 +435,33 @@ function baseHealth(state: VectorChannelState, current: Embedder | undefined): M
 }
 
 /**
- * 健康面 = 装载期状态（`baseHealth`）+ **检索期**降级。
+ * 健康面 = 装载期状态（`baseHealth`）+ **检索期**降级 + **落盘期**读数。
  *
- * 检索期降级要显式呈现（而不是被"通道可用"盖住）：通道选型正常但某次检索返回空，
- * 正是「§5.7 语义召回实际没发生」这类问题的唯一可见处。
+ * 两类运行期问题都必须显式呈现（而不是被"通道可用"盖住）：
+ * ① 通道选型正常但某次检索返回空（语义召回实际没发生）；
+ * ② 待编码队列积压或被拒（记忆写进去了却没有向量 → `searchVector` 结构上查不到）。
  */
-function renderHealth(state: VectorChannelState, current: Embedder | undefined): ModuleHealth {
-  const base = baseHealth(state, current)
-  if (state.lastSearchError === null) return base
+function renderHealth(
+  state: VectorChannelState,
+  current: Embedder | undefined,
+  enc: VectorEncoderStats,
+): ModuleHealth {
+  const base = baseHealth(state, current, enc)
+  const notes: string[] = []
+  let degraded = false
+  if (state.lastSearchError !== null) {
+    notes.push(`最近一次向量检索降级：${state.lastSearchError}`)
+    degraded = true
+  }
+  if (enc.lastReason !== null) {
+    notes.push(`向量落盘：${enc.lastReason}`)
+    degraded = true
+  }
+  if (enc.pending > 0) notes.push(`待编码 ${enc.pending} 条（回合边界由 dsh 冲刷）`)
+  if (notes.length === 0) return base
   return {
-    state: 'degraded',
-    detail: `${base.detail}；最近一次向量检索降级：${state.lastSearchError}`,
+    state: base.state === 'failed' ? 'failed' : degraded ? 'degraded' : base.state,
+    detail: `${base.detail}；${notes.join('；')}`,
     metrics: base.metrics,
   }
 }
@@ -351,7 +471,11 @@ function renderHealth(state: VectorChannelState, current: Embedder | undefined):
  * 为什么需要它：内核 `start()` 在 `apply` 之后会写入一句通用的"模块已启动"，
  * 那会盖掉模块自己的 `report`；状态面登记处才是降级原因稳定的可见位置。
  */
-function renderStatus(state: VectorChannelState, current: Embedder | undefined): string {
+function renderStatus(
+  state: VectorChannelState,
+  current: Embedder | undefined,
+  enc: VectorEncoderStats,
+): string {
   const lines = [`通道：${channelLabel(state, current)}`]
   lines.push(
     `当前嵌入器：${
@@ -366,6 +490,11 @@ function renderStatus(state: VectorChannelState, current: Embedder | undefined):
     `最近一次检索：${state.lastSearchError === null ? '正常' : `降级（${state.lastSearchError}）`}` +
       `；累计降级 ${state.channelErrors} 次`,
   )
+  lines.push(
+    `向量落盘：待编码 ${enc.pending} 条；已编码 ${enc.encoded}；跳过 ${enc.skipped}；` +
+      `失败 ${enc.failures}（其中被拒 ${enc.rejected}）；超界丢弃 ${enc.dropped}`,
+  )
+  if (enc.lastReason !== null) lines.push(`落盘最近原因：${enc.lastReason}`)
   if (current !== undefined) lines.push(`余弦下限：${cosineFloorFor(current)}（按当前嵌入器标定）`)
   lines.push(`损坏 BLOB（解码失败计数）：${blobDecodeFailureCount()}`)
   return lines.join('\n')
@@ -387,6 +516,8 @@ export interface VectorModuleInstance {
    * 注入方式：`retrieve(stores, query, { clock, embedder, channels: [instance.channel(kernel)] })`。
    */
   channel(kernel: Kernel, options?: { readonly minScore?: number }): RetrievalChannel
+  /** 已注册的编码队列（未启动 → undefined）。`dsh/` 在回合边界调它的 `encodePending()`。 */
+  encoder(): VectorEncoder | undefined
 }
 
 /**
@@ -407,6 +538,7 @@ export interface VectorManifest extends ModuleManifest<VectorConfig> {
  */
 export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleInstance {
   const loadOnnx: OnnxLoader = deps.loadOnnx ?? loadOnnxEmbedder
+  const resolveStoreSets: StoreSetResolver = deps.resolveStoreSets ?? defaultResolveStoreSets
 
   let state: VectorChannelState = {
     channel: 'off',
@@ -420,7 +552,216 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
   /** apply 装上的健康上报出口；通道的**检索期**降级也要经它上报。 */
   let reportHealth: (() => void) | undefined
 
-  const health = (): ModuleHealth => renderHealth(state, installed)
+  // ── 向量落盘：待编码队列 ────────────────────────────────────────────────────
+  // `memory/written` 回调里**只入队**；编码在 `encodePending()` 里批量做。
+  // 为什么不在回调里编码：嵌入是一次真实推理（ONNX 毫秒级，且原生绑定阻塞事件循环），
+  // 把它压进写入路径会让每次记忆写入都变慢——而写入路径的正确性并不依赖向量。
+  /** 队列：`Map` 保序 + 去重；值 = 事件声明的作用域（无法识别 → null，冲刷时两个作用域都试）。 */
+  const queue = new Map<string, MemoryScope | null>()
+  let maxPending = DEFAULT_MAX_PENDING
+  let droppedOldest = 0
+  let encodedTotal = 0
+  let skippedTotal = 0
+  let failureTotal = 0
+  let rejectedTotal = 0
+  let lastEncodeReason: string | null = null
+  /** apply 装上的内核句柄（冲刷时解析嵌入器与库）；卸载后置空。 */
+  let kernelRef: Kernel | undefined
+  let installedEncoder: VectorEncoder | undefined
+
+  const health = (): ModuleHealth => renderHealth(state, installed, encoderStats())
+
+  const encoderStats = (): VectorEncoderStats => ({
+    pending: queue.size,
+    encoded: encodedTotal,
+    skipped: skippedTotal,
+    failures: failureTotal,
+    dropped: droppedOldest,
+    rejected: rejectedTotal,
+    lastReason: lastEncodeReason,
+  })
+
+  const isMemoryScope = (value: string): value is MemoryScope =>
+    (MEMORY_SCOPES as readonly string[]).includes(value)
+
+  /**
+   * 入队（去重、保序、超界丢最旧并计数）。
+   * **纯内存操作**：不做 I/O、不编码——这是"写入路径不变慢"的全部机制。
+   */
+  const enqueueWritten = (payload: { readonly id: string; readonly scope: string }): void => {
+    const id = payload.id
+    if (typeof id !== 'string' || id.length === 0) return
+    if (queue.has(id)) return
+    while (queue.size >= maxPending) {
+      const oldest = queue.keys().next().value
+      if (oldest === undefined) break
+      queue.delete(oldest)
+      droppedOldest += 1
+    }
+    queue.set(id, isMemoryScope(payload.scope) ? payload.scope : null)
+  }
+
+  /**
+   * 批量冲刷待编码队列：`getMany`（每库一次）→ `embed`（**一次**，N 条不是 N 次）→ 逐条落盘。
+   *
+   * 归属标签取当前嵌入器身份，库侧会拒绝不符的写入（D2：写入时拒绝无法归属的向量）。
+   * 绝不抛：整批失败给 `reason` 且**保留队列**；单条被库拒绝则出队并计数（重试不会成功）。
+   */
+  const encodePending = async (limit?: number): Promise<VectorEncodeOutcome> => {
+    const kernel = kernelRef
+    const nothing = (reason?: string): VectorEncodeOutcome => ({
+      encoded: 0,
+      skipped: 0,
+      failures: 0,
+      ...(reason !== undefined ? { reason } : {}),
+    })
+    if (kernel === undefined) return nothing('模块未启动或已关闭（无内核句柄）；待编码队列保留')
+    if (queue.size === 0) return nothing()
+    /** 本次调用内产生的可读原因（进 `outcome.reason`）；与跨调用的 `lastEncodeReason` 分开。 */
+    let callReason: string | null = null
+
+    const embedder = kernel.service<Embedder>(EMBEDDER_SERVICE)
+    if (embedder === undefined) {
+      return nothing('嵌入器服务不可用（omb-memory-vector 未启动）；待编码队列保留')
+    }
+    const sets = resolveStoreSets(kernel)
+    if (sets.length === 0) {
+      return nothing('记忆库未就绪（stores.snapshot() 没有可用库）；待编码队列保留')
+    }
+
+    const cap = Number.isFinite(limit) ? Math.max(1, Math.floor(limit as number)) : queue.size
+    const batch = [...queue.entries()].slice(0, cap)
+
+    // ① 批量水合：每个（库套件 × 作用域）一次 `getMany`——禁 N+1
+    const found = new Map<string, { record: MemoryRecord; api: VectorStoreApi | undefined }>()
+    let vectorCapable = false
+    let hydrateError: string | null = null
+    for (const set of sets) {
+      for (const scope of MEMORY_SCOPES) {
+        const target = set.store(scope)
+        if (target === undefined) continue
+        const ids = batch
+          .filter(
+            ([id, queuedScope]) =>
+              !found.has(id) && (queuedScope === null || queuedScope === scope),
+          )
+          .map(([id]) => id)
+        if (ids.length === 0) continue
+        const api = asVectorStore(target)
+        if (api !== undefined) vectorCapable = true
+        try {
+          for (const record of await target.getMany(ids)) {
+            found.set(record.id, { record, api })
+          }
+        } catch (error) {
+          hydrateError = `读取记忆文本失败（${messageOf(error)}）`
+        }
+      }
+    }
+    if (found.size === 0) {
+      if (hydrateError !== null) return nothing(`${hydrateError}；待编码队列保留`)
+      if (!vectorCapable) return nothing('库不支持向量写入（asVectorStore 未命中）；待编码队列保留')
+      // 记录已不存在（被删除）：出队并计数——既不是失败，也不是可重试的状态
+      for (const [id] of batch) queue.delete(id)
+      skippedTotal += batch.length
+      return { encoded: 0, skipped: batch.length, failures: 0 }
+    }
+
+    // ② 分类：空文本 / 无向量口 → 跳过；其余待编码
+    const encodable: { id: string; text: string; api: VectorStoreApi }[] = []
+    let skipped = 0
+    for (const [id] of batch) {
+      const hit = found.get(id)
+      if (hit === undefined) {
+        queue.delete(id) // 库里没有这条（已删除）
+        skipped += 1
+        continue
+      }
+      if (hit.record.text.trim().length === 0) {
+        queue.delete(id) // 空文本没有可编码的内容
+        skipped += 1
+        continue
+      }
+      if (hit.api === undefined) {
+        // 该条所在的库没有向量口（同套件的另一个库有）：跳过并留原因，不无限重试
+        queue.delete(id)
+        skipped += 1
+        callReason = `库不支持向量写入，已跳过 ${id}（asVectorStore 未命中）`
+        lastEncodeReason = callReason
+        continue
+      }
+      encodable.push({ id, text: hit.record.text, api: hit.api })
+    }
+
+    // ③ 一次批编码（N 条 → 一次 embed）
+    let vectors: readonly Float32Array[] = []
+    if (encodable.length > 0) {
+      try {
+        vectors = await embedder.embed(encodable.map((entry) => entry.text))
+      } catch (error) {
+        failureTotal += encodable.length
+        lastEncodeReason = `编码失败（${messageOf(error)}）；待编码队列保留`
+        reportHealth?.()
+        return { encoded: 0, skipped, failures: encodable.length, reason: lastEncodeReason }
+      }
+      if (vectors.length !== encodable.length) {
+        failureTotal += encodable.length
+        lastEncodeReason =
+          `嵌入器 ${embedder.id} 返回 ${vectors.length} 条向量、期望 ${encodable.length} 条；` +
+          '待编码队列保留'
+        reportHealth?.()
+        return { encoded: 0, skipped, failures: encodable.length, reason: lastEncodeReason }
+      }
+    }
+
+    // ④ 逐条落盘（归属标签 = 当前嵌入器身份）
+    let encoded = 0
+    let failures = 0
+    for (let i = 0; i < encodable.length; i++) {
+      const entry = encodable[i]
+      const vector = vectors[i]
+      if (entry === undefined || vector === undefined) {
+        failures += 1 // 长度已校验过，走到这里说明有 bug：计数并保留队列（下次再试）
+        continue
+      }
+      try {
+        await entry.api.putEmbedding({
+          memoryId: entry.id,
+          modelId: embedder.id,
+          dim: embedder.dimensions,
+          revision: embedder.revision,
+          vector,
+        })
+        queue.delete(entry.id)
+        encoded += 1
+      } catch (error) {
+        // 单条被库拒绝（归属不符 / 维度不符）→ 重试不会成功：出队并计数，原因留在状态面
+        queue.delete(entry.id)
+        failures += 1
+        rejectedTotal += 1
+        callReason = `向量写入被拒（${entry.id}）：${messageOf(error)}`
+        lastEncodeReason = callReason
+      }
+    }
+    encodedTotal += encoded
+    skippedTotal += skipped
+    failureTotal += failures
+    if (failures === 0 && callReason === null) lastEncodeReason = null // 本批干净 → 清掉上一次的原因
+    reportHealth?.()
+    return {
+      encoded,
+      skipped,
+      failures,
+      ...(callReason !== null ? { reason: callReason } : {}),
+    }
+  }
+
+  /** 注册到内核的编码队列服务值。 */
+  const encoder: VectorEncoder = {
+    pending: () => queue.size,
+    encodePending,
+    stats: encoderStats,
+  }
 
   /** 换"装载期"状态（通道选型）；**不动**检索期字段——两者语义不同。 */
   const commit = (
@@ -465,8 +806,8 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     try {
       unregister = kernel.service<StatusRegistry>(SERVICES.statusContributor)?.register({
         name: VECTOR_MODULE_ID,
-        render: () => renderStatus(state, installed),
-        metrics: () => channelMetrics(state, installed),
+        render: () => renderStatus(state, installed, encoderStats()),
+        metrics: () => channelMetrics(state, installed, encoderStats()),
       })
     } catch {
       // 状态面登记失败不得影响通道可用性
@@ -482,6 +823,17 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       }
     }
     reportHealth = report
+
+    // ⑤ 编码队列：**同步**注册服务 + 订阅写入事件（H-2）。
+    //    回调里只入队，绝不在这里编码——嵌入是真实推理，不能压进写入路径。
+    kernelRef = kernel
+    maxPending = config.maxPending
+    const offWritten = kernel.on('memory/written', payload => {
+      if (disposed) return
+      enqueueWritten(payload)
+    })
+    const unprovideEncoder = kernel.provide<VectorEncoder>(VECTOR_ENCODER_SERVICE, encoder)
+    installedEncoder = encoder
 
     // ③ 是否值得尝试 ONNX：**同步**的文件系统判断（廉价、不进事件循环），
     //    失败原因本身就是状态面要显示的内容。
@@ -522,14 +874,26 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       if (disposed) return
       disposed = true
       installed = undefined
+      installedEncoder = undefined
+      kernelRef = undefined
       commit(
         { channel: 'off', probing: false, modelDir: null, reason: null },
         { lastSearchError: null, channelErrors: 0 },
       )
       try {
+        offWritten()
+      } catch {
+        // 退订失败不得向上传播（事件总线监听器泄漏会让热插拔验收不过）
+      }
+      try {
         unregister?.()
       } catch {
         // 注销失败不得向上传播（宿主 reconcile 会 await 旧 fiber）
+      }
+      try {
+        unprovideEncoder()
+      } catch {
+        // 同上
       }
       try {
         unprovide()
@@ -569,6 +933,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     state: () => state,
     embedder: () => installed,
     channel,
+    encoder: () => installedEncoder,
   }
 }
 
@@ -595,3 +960,5 @@ export const vectorChannel = (
   kernel: Kernel,
   options?: { readonly minScore?: number },
 ): RetrievalChannel => production.channel(kernel, options)
+
+export default toHostPlugin(vectorModule)

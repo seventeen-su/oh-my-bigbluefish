@@ -28,6 +28,7 @@ import type { ProfileStoresServicePort } from './storage.js'
 import { ProfileStorage } from './storage.js'
 import type { ClearResult } from './clear.js'
 import { clearDeduced as clearDeducedFrom } from './clear.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const PROFILE_MODULE_ID = 'omb-profile'
 /** 服务名取 ABI 契约里的 `SERVICES.profile`（不是本地约定）。 */
@@ -463,4 +464,4 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
 export const profileModule = createProfileModule()
 
 /** 供 `dsh/` 侧直接引用的注册对象。 */
-export default profileModule
+export default toHostPlugin(profileModule)

@@ -56,7 +56,7 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
       'memory.recall.related',
       'memory.recall.multiquery',
     ],
-    tools: ['omb_recall', 'omb_forget', 'omb_relate'],
+    tools: ['omb_recall', 'omb_forget', 'omb_relate', 'omb_remember'],
   },
   {
     id: 'omb-memory-vector',
@@ -120,6 +120,19 @@ export const STATUS_TOOL = 'omb_status'
  * - `*:metrics` / `*:loop` / `*:methods` = 供状态面与 `dsh/` 读取的观测面
  */
 export const SERVICES = {
+  /**
+   * 微内核自身。
+   *
+   * **为什么内核也要是服务**：在 DSH 0.1.7 的加载模型下，`cordis.patch.yml` 的
+   * **每一行都是宿主独立加载的插件**，`apply(ctx, config)` 的 `ctx` 只能由宿主提供。
+   * 因此模块入口不能再假设"第一个参数是我的内核"——它必须先判断拿到的是什么，
+   * 若是宿主 ctx 就从本服务取内核。
+   *
+   * 这条也是实测教训：8 行全部激活失败报
+   * `cannot get property "clock" without inject`，因为 Cordis 的 Guard 拦截了
+   * 模块对宿主 ctx 的未声明属性读取。
+   */
+  kernel: 'omb:kernel',
   /** `StoresService`（见 `storage.ts`）。 */
   stores: 'stores',
   /** `Embedder` 槽（见 `ports.ts`）。 */

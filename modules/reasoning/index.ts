@@ -32,6 +32,7 @@ import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } fr
 import type { MethodCard } from './methods.js'
 import { METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
 import { createReasoningTools } from './tools.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
 export const MODULE_VERSION = '3.0.0'
@@ -388,4 +389,4 @@ function clampHintBudget(requested: unknown, kernel: Kernel, degradations: strin
 /** 目录里登记的模块实例（`dsh/` 直接取用）。 */
 export const reasoningRegistration: ModuleRegistration<ReasoningConfig> = createReasoningModule()
 
-export default reasoningRegistration
+export default toHostPlugin(reasoningRegistration)

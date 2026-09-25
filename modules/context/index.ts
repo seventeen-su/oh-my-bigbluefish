@@ -40,6 +40,7 @@ import {
   summarize,
 } from './watch.js'
 import { buildStatusPanel, createStatusContributor } from './tools.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
 export const MODULE_VERSION = '3.0.0'
@@ -413,4 +414,4 @@ export const CONTEXT_KILL_CRITERIA = {
 /** 目录里登记的模块实例（`dsh/` 直接取用）。 */
 export const contextRegistration: ModuleRegistration<ContextConfig> = createContextModule()
 
-export default contextRegistration
+export default toHostPlugin(contextRegistration)
