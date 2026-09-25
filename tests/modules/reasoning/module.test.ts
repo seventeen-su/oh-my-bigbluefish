@@ -258,6 +258,131 @@ describe('提示贡献：三档行为 + 压力塑形', () => {
   })
 })
 
+/**
+ * 自检报告抓的缺陷：注入是渲染期行为，`catch → return ''` 让"说了要注入却没注入"
+ * 变成静默事实。这一组用**状态面的留痕**把那件事变成可核验的读数。
+ */
+describe('注入可核验：渲染留痕与失败留声', () => {
+  const statusText = (handle: ReturnType<typeof createKernel>): string => handle.status().join('\n')
+
+  it('deep + relaxed：留痕显示真进了 R3/R4/R5 与字符数', () => {
+    const { handle } = start()
+    const render = contributionOf(handle).context!
+    const text = render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
+    expect(text.length).toBeGreaterThan(0)
+    expect(statusText(handle)).toContain('上次注入：成功（R3/R4/R5，')
+    expect(statusText(handle)).toContain(`${text.length} 字符`)
+    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(3)
+    handle.dispose()
+  })
+
+  it('deep + tight：请求了卡却没进上下文——留痕如实说"只给了指令未含卡片"', () => {
+    const { handle } = start()
+    contributionOf(handle).context!({ sessionId: 's', depth: 'deep', band: 'tight' })
+    const line = statusText(handle)
+    expect(line).toContain('上次注入：只给了指令未含卡片')
+    expect(line).toContain('请求 R3/R4/R5')
+    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(0)
+    handle.dispose()
+  })
+
+  it('standard + relaxed：留痕说"空"，且不算失败', () => {
+    const { handle } = start()
+    contributionOf(handle).context!({ sessionId: 's', depth: 'standard', band: 'relaxed' })
+    expect(statusText(handle)).toContain('上次注入：空')
+    expect(statusText(handle)).not.toContain('上次注入：失败')
+    expect(handle.health()[MODULE_ID]?.state).toBe('ok')
+    handle.dispose()
+  })
+
+  it('渲染抛异常：绝不外抛，但失败次数与原因进状态面与健康面（不再静默）', () => {
+    const { handle } = start()
+    const render = contributionOf(handle).context!
+    const exploding = {
+      sessionId: 's',
+      depth: 'deep',
+      get band(): never {
+        throw new Error('渲染输入坏了')
+      },
+    }
+    expect(() => render(exploding as never)).not.toThrow()
+    expect(render(exploding as never)).toBe('')
+    const line = statusText(handle)
+    expect(line).toContain('上次注入：失败（渲染输入坏了）')
+    expect(line).toContain('渲染失败累计 2 次（最近：渲染输入坏了）')
+    const health = handle.health()[MODULE_ID]
+    expect(health?.state).toBe('degraded')
+    expect(health?.detail).toContain('上下文渲染失败 2 次')
+    expect(health?.metrics?.renderFailures).toBe(2)
+    handle.dispose()
+  })
+
+  it('失败之后又成功：成功留痕在，失败历史不被抹掉', () => {
+    const { handle } = start()
+    const render = contributionOf(handle).context!
+    const exploding = {
+      sessionId: 's',
+      depth: 'deep',
+      get band(): never {
+        throw new Error('坏了')
+      },
+    }
+    render(exploding as never)
+    render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
+    const line = statusText(handle)
+    expect(line).toContain('上次注入：成功（R3/R4/R5，')
+    expect(line).toContain('渲染失败累计 1 次（最近：坏了）')
+    // 失败进过健康面就不会自己消失：降级状态保留
+    expect(handle.health()[MODULE_ID]?.state).toBe('degraded')
+    handle.dispose()
+  })
+
+  it('渲染入参档位与内核分歧：按内核渲染，分歧写进状态面', () => {
+    const { handle } = start()
+    handle.kernel.setFocus('s', 'deep', '内核里是 deep')
+    const text = contributionOf(handle).context!({ sessionId: 's', depth: 'standard', band: 'relaxed' })
+    // 内核是档位权威：宿主递来的旧快照不得让 deep 静默降级
+    expect(text).toContain(cardById('R3')?.text ?? '不可能匹配')
+    expect(statusText(handle)).toContain('档位分歧：渲染入参 standard / 内核 deep')
+    handle.dispose()
+  })
+
+  it('还没渲染过时留痕如实说"尚无"，而不是假装成功', () => {
+    const { handle } = start()
+    expect(statusText(handle)).toContain('上次注入：尚无')
+    handle.dispose()
+  })
+})
+
+/** 自检报告的缺口：只证明过"设回 standard 后读到 standard"，deep 缺一次正证。 */
+describe('deep 正证：设 → 读 → 内容含卡号', () => {
+  it('工具设 deep：内核读回 deep，渲染内容含 R3/R4/R5 卡号与正文，状态面写 deep', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 'live', turn: 1 })
+    const focusTool = toolsOf(handle).find(tool => tool.name === 'omb_focus')
+    const outcome = await focusTool?.execute({ depth: 'deep', reason: 'deep 正证' })
+    expect(outcome?.kind).toBe('text')
+    expect(handle.kernel.focus('live')).toBe('deep')
+
+    const text = contributionOf(handle).context!({ sessionId: 'live', depth: 'deep', band: 'relaxed' })
+    for (const id of ['R3', 'R4', 'R5']) {
+      expect(text, `${id} 卡号应出现在注入内容里`).toContain(`【${id} `)
+      expect(text).toContain(cardById(id)?.text ?? '不可能匹配')
+    }
+    expect(handle.status().join('\n')).toContain('深度 deep')
+    handle.dispose()
+  })
+
+  it('配置默认档为 deep：首个回合就落地，渲染即含卡号（写入路径无 deep 专属分支）', () => {
+    const { handle } = start({ defaultDepth: 'deep', residentHintChars: RESIDENT_HINT_MAX })
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    expect(handle.kernel.focus('s')).toBe('deep')
+    const text = contributionOf(handle).context!({ sessionId: 's', depth: 'deep', band: 'relaxed' })
+    for (const id of ['R3', 'R4', 'R5']) expect(text).toContain(`【${id} `)
+    handle.dispose()
+  })
+})
+
 describe('默认档位只在会话首次落地（幂等，不逐轮抖动）', () => {
   it('配置 quick：首个回合落地，模型显式设档后不再被覆盖', () => {
     const { handle } = start({ defaultDepth: 'quick', residentHintChars: RESIDENT_HINT_MAX })

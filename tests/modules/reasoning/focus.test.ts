@@ -13,6 +13,7 @@ import {
   applyFocus,
   describeDepthEffect,
   isFocusDepth,
+  peekFocus,
   projectFocus,
   readFocus,
   renderProjection,
@@ -133,6 +134,50 @@ describe('readFocus / applyFocus：走内核，绝不抛', () => {
     handle.dispose()
   })
 
+  it('deep 正证：写入 → 回读 deep → 回执说"请求注入"，且不承诺结果', () => {
+    const handle = createKernel()
+    const result = applyFocus(handle.kernel, 'sd', 'deep', '多方案权衡')
+    expect(result.ok).toBe(true)
+    expect(result.depth).toBe('deep')
+    expect(handle.kernel.focus('sd')).toBe('deep')
+    expect(readFocus(handle.kernel, 'sd').projection.cards.map(card => card.id)).toEqual(['R3', 'R4', 'R5'])
+    expect(result.text).toContain('已回读核实')
+    expect(result.text).toContain('请求注入')
+    expect(result.text).not.toContain('会带上')
+    handle.dispose()
+  })
+
+  it('内核静默丢弃写入（deep 没落地）：报未生效，不假装成功', () => {
+    const handle = createKernel()
+    const swallowing: Kernel = {
+      ...handle.kernel,
+      setFocus: () => {
+        // 不抛、也不写：这正是"回读核实"要抓的情况
+      },
+    }
+    const result = applyFocus(swallowing, 'sw', 'deep', '试试')
+    expect(result.ok).toBe(false)
+    expect(result.depth).toBe('standard')
+    expect(result.text).toContain('未生效')
+    expect(result.text).toContain('deep')
+    expect(result.text).toContain('standard')
+    handle.dispose()
+  })
+
+  it('写入后读不回档位：如实说无法核实，不假装成功', () => {
+    const handle = createKernel()
+    const unreadable: Kernel = {
+      ...handle.kernel,
+      focus: () => {
+        throw new Error('读不了')
+      },
+    }
+    const result = applyFocus(unreadable, 'ur', 'quick', 'r')
+    expect(result.ok).toBe(true)
+    expect(result.text).toContain('无法核实')
+    handle.dispose()
+  })
+
   it('内核 setFocus 抛异常时返回错误文本（不抛）', () => {
     const handle = createKernel()
     const broken: Kernel = {
@@ -165,8 +210,47 @@ describe('readFocus / applyFocus：走内核，绝不抛', () => {
 
 describe('describeDepthEffect', () => {
   it('三档都有自解释回执', () => {
-    expect(describeDepthEffect('quick')).toContain('直接答案')
+    expect(describeDepthEffect('quick')).toContain('直接回答')
     expect(describeDepthEffect('deep')).toContain('R3')
     expect(describeDepthEffect('standard')).toContain('omb_method')
+  })
+
+  it('deep 回执只说"请求注入"，不承诺结果（注入是下一轮渲染期的事）', () => {
+    const text = describeDepthEffect('deep')
+    expect(text).toContain('请求注入')
+    expect(text).not.toContain('会带上')
+    expect(text).not.toContain('已注入')
+    // 紧张档会降级成索引，回执必须自己交代出口
+    expect(text).toContain('omb_method')
+  })
+
+  it('三档回执都交代"此后每轮"（档位是持续状态，不是一次性动作）', () => {
+    for (const depth of ['quick', 'standard', 'deep'] as const) {
+      expect(describeDepthEffect(depth)).toContain('每轮')
+    }
+  })
+})
+
+describe('peekFocus：不隐藏读取失败', () => {
+  it('正常内核读回当前档；未设置过读回 standard', () => {
+    const handle = createKernel()
+    expect(peekFocus(handle.kernel, 'p1')).toBe('standard')
+    handle.kernel.setFocus('p1', 'deep', '测试')
+    expect(peekFocus(handle.kernel, 'p1')).toBe('deep')
+    handle.dispose()
+  })
+
+  it('内核抛异常 / 读到非法值时返回 null（与 readFocus 的回落分工）', () => {
+    const handle = createKernel()
+    const broken: Kernel = {
+      ...handle.kernel,
+      focus: () => {
+        throw new Error('读不了')
+      },
+    }
+    expect(peekFocus(broken, 'p2')).toBeNull()
+    // readFocus 仍然回落 standard —— 渲染路径要的是能用的档位
+    expect(readFocus(broken, 'p2').depth).toBe('standard')
+    handle.dispose()
   })
 })

@@ -26,11 +26,11 @@ import type {
   ToolDefinition,
 } from '../../kernel/abi/index.js'
 import { RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
-import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES, applyFocus, isFocusDepth, projectFocus, readFocus, renderProjection } from './focus.js'
+import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES, applyFocus, isFocusDepth, peekFocus, projectFocus, readFocus, renderProjection } from './focus.js'
 import type { LoopSignal, TurnFingerprint } from './loop.js'
 import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } from './loop.js'
-import type { MethodCard } from './methods.js'
-import { METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
+import type { MethodCard, RuleId } from './methods.js'
+import { CARDS_BY_DEPTH, METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
 import { createReasoningTools } from './tools.js'
 import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
@@ -99,6 +99,85 @@ function newSessionState(): SessionState {
 }
 
 /**
+ * 上一次 `context` 渲染的留痕。
+ *
+ * **为什么必须有**：注入失败原本只留下一句 `logger.warn`，工具回执照样说
+ * "会带上规则卡全文"——模型侧看不到任何异常，"说了要注入却没注入"只能是静默事实。
+ * 留下这条痕迹后，`omb_status` 能回答"上次渲染到底产出了什么"：
+ * 请求了哪几张卡、真进了上下文几张、多少字符。
+ */
+interface RenderTrace {
+  readonly session: SessionRef
+  readonly depth: FocusDepth
+  readonly band: ContextRenderInput['band']
+  /** 该档位**声明需要**的卡（请求，不保证注入）。 */
+  readonly requested: readonly RuleId[]
+  /** 真的出现在渲染结果里的卡（按正文逐张比对得出，不是照抄请求）。 */
+  readonly delivered: readonly RuleId[]
+  /** 产出的 context 字符数；0 = 本轮确实什么都没注入。 */
+  readonly chars: number
+  /** 渲染入参档位与内核读数的分歧（'' = 一致或无从比较）。 */
+  readonly depthDivergence: string
+}
+
+function idList(ids: readonly RuleId[]): string {
+  return ids.length === 0 ? '无卡' : ids.join('/')
+}
+
+/**
+ * 渲染用档位：三个来源谁说了算。**纯函数**。
+ *
+ * - **模型显式设过档**（本模块亲眼收到过该会话的 `focus/changed`）→ 内核读数是权威。
+ *   只有这一种情况值得压过入参：模型刚要求了 deep，宿主递来的旧快照不得把它压回
+ *   standard——那正是"设了 deep 却没落地"最可能的真实形态。内核读不回时用记下的显式值。
+ * - **没设过** → 入参为准。它是宿主对同一份内核状态的读数（真实接线里就是
+ *   `kernel.focus(sessionId)`），本来就是宿主的契约；入参非法或缺失才回落内核读数，
+ *   最后才用 standard。
+ */
+function resolveRenderDepth(sources: {
+  readonly explicit: FocusDepth | undefined
+  readonly reported: FocusDepth | null
+  readonly kernelDepth: FocusDepth | null
+}): FocusDepth {
+  const { explicit, reported, kernelDepth } = sources
+  if (explicit !== undefined) return kernelDepth ?? explicit
+  return reported ?? kernelDepth ?? 'standard'
+}
+
+/**
+ * 状态面里的一行：上次注入**实际**发生了什么——可核验的事实，不是承诺。
+ *
+ * 三种非失败情形分开写，因为它们回答的问题不同：
+ * - `空`：本轮确实没内容可注入（不是失败）
+ * - `只给了指令未含卡片`：请求了卡却没进上下文（紧张档转拉取，或渲染把卡丢了）
+ * - `成功`：真有几张卡进了上下文
+ */
+function describeLastRender(trace: RenderTrace | null, failures: number, lastFailure: string): string {
+  const bits: string[] = []
+  if (trace === null) {
+    bits.push(failures > 0 ? `上次注入：失败（${lastFailure}）` : '上次注入：尚无（还没有渲染过）')
+  } else if (trace.chars === 0) {
+    bits.push(
+      `上次注入：空（深度 ${trace.depth}，压力 ${trace.band}；请求 ${idList(trace.requested)}，未注入；会话 ${trace.session}）`,
+    )
+  } else if (trace.delivered.length === 0) {
+    bits.push(
+      `上次注入：只给了指令未含卡片（${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；请求 ${idList(trace.requested)}；会话 ${trace.session}）`,
+    )
+  } else {
+    bits.push(
+      `上次注入：成功（${idList(trace.delivered)}，${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；会话 ${trace.session}）`,
+    )
+  }
+  // 失败历史不隐藏：失败过一次、后来又成功，两件事都要在状态面里看得到
+  if (failures > 1 || (failures > 0 && trace !== null)) {
+    bits.push(`渲染失败累计 ${failures} 次（最近：${lastFailure}）`)
+  }
+  if (trace !== null && trace.depthDivergence !== '') bits.push(`档位分歧：${trace.depthDivergence}`)
+  return bits.join('；')
+}
+
+/**
  * 建立模块实例。**每个实例自带状态**——测试可以建两个互不干扰的实例，
  * 热重载时也不会把上一轮的窗口带过来。
  */
@@ -130,6 +209,11 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
      */
     let lastActiveSession: SessionRef | null = null
 
+    /** 渲染留痕与失败计数：状态面据此把"说了要注入"变成可核验的事实。 */
+    let lastRender: RenderTrace | null = null
+    let renderFailures = 0
+    let lastRenderFailure = ''
+
     // ── 常驻提示：apply 内算一次，之后逐字节不变（静态前缀靠它保缓存） ──
     const hintBudget = clampHintBudget(config.residentHintChars, kernel, degradations)
     const hint = residentHint(hintBudget)
@@ -152,15 +236,20 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
         `跟踪会话 ${sessions.size}`,
         withSignal > 0 ? `循环信号 ${withSignal} 个` : '无循环信号',
       ]
+      // 渲染失败必须留声：它是"回执说了要注入、实际没注入"的唯一证据
+      if (renderFailures > 0) parts.push(`上下文渲染失败 ${renderFailures} 次（最近：${lastRenderFailure}）`)
       if (degradations.length > 0) parts.push(`降级：${degradations.join('；')}`)
       return {
-        state: degradations.length > 0 ? 'degraded' : 'ok',
+        state: degradations.length > 0 || renderFailures > 0 ? 'degraded' : 'ok',
         detail: parts.join('；'),
         metrics: {
           cards: METHOD_CARDS.length,
           residentHintChars: hint.length,
           trackedSessions: sessions.size,
           activeLoopSignals: withSignal,
+          renderFailures,
+          lastRenderChars: lastRender?.chars ?? 0,
+          lastRenderCards: lastRender?.delivered.length ?? 0,
         },
       }
     }
@@ -284,14 +373,29 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
      *
      * 易变部分遵守软压力塑形（§6.3）：紧张档只留索引（规则卡转 `omb_method` 拉取），
      * 宽松/适中档在 `deep` 时给规则卡全文——那是模型**显式动作**提出的需求，不是推送。
+     *
+     * 档位来源的裁决见 `resolveRenderDepth`：模型显式设过档时内核读数是权威，
+     * 否则以宿主入参为准。两者分歧**必定留痕**——否则"模型设了 deep、渲染却按
+     * standard 走"又会是静默事实。
      */
     const contribution: PromptContribution = {
       resident: hint,
       context: (input: ContextRenderInput): string => {
         try {
-          const depth = isFocusDepth(input.depth) ? input.depth : readFocus(kernel, input.sessionId).depth
-          const signal = sessions.get(input.sessionId)?.lastSignal ?? null
+          const state = sessions.get(input.sessionId)
+          const reported = isFocusDepth(input.depth) ? input.depth : null
+          const kernelDepth = peekFocus(kernel, input.sessionId)
+          const depth = resolveRenderDepth({ explicit: state?.explicitDepth, reported, kernelDepth })
+          const depthDivergence =
+            reported !== null && kernelDepth !== null && reported !== kernelDepth
+              ? `渲染入参 ${reported} / 内核 ${kernelDepth}（已按 ${depth} 渲染）`
+              : ''
+          if (depthDivergence !== '') kernel.logger.warn(`${MODULE_ID}：${depthDivergence}`)
+
           const parts: string[] = []
+          // 本档位声明需要的卡；真进了上下文几张，由下面的正文比对给出
+          const requested = CARDS_BY_DEPTH[depth] ?? []
+          const candidates = depth === 'deep' && input.band !== 'tight' ? cardsFor('deep') : []
           if (depth === 'quick') {
             parts.push(QUICK_DIRECTIVE)
           } else if (depth === 'deep') {
@@ -301,12 +405,35 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
                 : renderProjection(projectFocus('deep')),
             )
           }
+          const signal = state?.lastSignal ?? null
           const loopLine = renderLoopSignal(signal)
           if (loopLine !== '') parts.push(loopLine)
-          return parts.join('\n')
+          const text = parts.join('\n')
+
+          // 可核验留痕：按正文逐张确认卡真的进了上下文，而不是"我们打算注入"
+          lastRender = {
+            session: input.sessionId,
+            depth,
+            band: input.band,
+            requested,
+            delivered: candidates.filter(card => text.includes(card.text)).map(card => card.id),
+            chars: text.length,
+            depthDivergence,
+          }
+          // 上报一次：否则内核健康面停留在上一次事件的快照，与 omb_status 里的
+          // 实时留痕各说一套——同一模块的两个面不允许互相矛盾
+          report()
+          return text
         } catch (error) {
-          // 提示渲染失败不得影响宿主回合：宁可不注入，也不抛
-          kernel.logger.warn(`${MODULE_ID}：上下文渲染失败（已跳过注入）——${messageOf(error)}`)
+          // 提示渲染失败不得影响宿主回合：宁可不注入，也不抛。
+          // 但**失败必须留声**——计数与原因进健康面与状态面，不再是静默降级。
+          renderFailures += 1
+          lastRenderFailure = messageOf(error)
+          lastRender = null
+          kernel.logger.warn(
+            `${MODULE_ID}：上下文渲染失败 ${renderFailures} 次（已跳过注入，失败记入状态面）——${lastRenderFailure}`,
+          )
+          report()
           return ''
         }
       },
@@ -316,7 +443,9 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
       name: '思维链质量（omb-reasoning）',
       render: (): string => {
         try {
-          const lines = [healthNow().detail]
+          // 第二行是"注入到底发生了没有"的可核验痕迹：回执说会注入的卡，
+          // 在这里必须能看到真进了几张；失败连原因一起留下。
+          const lines = [healthNow().detail, describeLastRender(lastRender, renderFailures, lastRenderFailure)]
           for (const [session, state] of sessions) {
             // 只写"有事发生"的会话：显式设过档位（含理由，供事后判断旋钮是否有用）
             // 或检出过循环信号。安静的会话不占行。

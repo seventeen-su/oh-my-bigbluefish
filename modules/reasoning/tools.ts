@@ -39,7 +39,9 @@ function paramsOf(schema: z.ZodType): ToolParams {
 const methodInput = z.object({
   topic: z
     .string()
-    .describe('规则卡编号（如 R3）、话题（如 备选/失败/冲突）或 all；不传则只返回索引')
+    .describe(
+      '规则卡编号（如 R3）、话题（如 备选/失败/冲突）或 all；不传则返回索引（编号+标题+何时用），不含规则正文',
+    )
     .optional(),
 })
 
@@ -94,14 +96,17 @@ const NO_SESSION = '取不到当前会话标识，本次调用未改变任何状
 /**
  * `omb_method({ topic? })`——按需拉取方法论规则卡。
  *
- * - 不传 `topic`：返回**索引**（编号 + 标题 + 何时用），不返回正文
- * - 传 `topic`：编号（`R3`）、话题（`备选`/`失败`/`冲突`）或 `all`
+ * - **不传 `topic`：只返回索引**（编号 + 标题 + 何时用），不含任何规则正文
+ * - 传 `topic`：编号（`R3`）、话题（`备选`/`失败`/`冲突`）或 `all`，返回完整正文
+ *
+ * 描述里必须把"索引 ≠ 全文"写清：模型若以为不传参数就能拿到全文，
+ * 就会拿到八行标题却以为规则已经读过。
  */
 export function createMethodTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_method',
     description:
-      '按需拉取方法论规则卡。不传 topic 返回索引（编号+标题+何时用）；传 topic 返回全文（如 "R3"、"备选"、"失败"、"冲突"，或 "all"）。',
+      '按需拉取方法论规则卡 R1–R8。不传 topic 只返回索引（编号+标题+何时用），不含规则正文；要正文就传 topic（如 "R3"、"备选"、"失败"、"冲突"，或 "all" 取全部八张）。',
     parameters: methodParams,
     execute(args: unknown): ToolOutcome {
       try {
@@ -139,11 +144,15 @@ export function createMethodTool(ports: ReasoningToolPorts): ToolDefinition {
  * `omb_focus({ depth, reason })`——把推理深度变成一次显式动作（§4.4）。
  *
  * `reason` 建议给（会进审计与状态面）；缺省时记为"模型未给理由"，不因此拒绝调用。
+ *
+ * 描述还要交代**注入的边界**：档位从下一轮起才影响注入，且紧张档会把规则卡
+ * 降级成索引——模型看到回执里"请求注入 R3/R4/R5"时，得知道那不等于已经读到，
+ * 紧张档要自己用 `omb_method` 取全文。
  */
 export function createFocusTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_focus',
-    description: `设定本会话的推理深度档位：${FOCUS_DEPTHS.join(' / ')}。quick=直接回答（简单确认/闲聊），standard=默认，deep=展开备选与可检验性。reason 说明为什么调档（便于事后核对档位是否有用）。`,
+    description: `设定本会话的推理深度档位：${FOCUS_DEPTHS.join(' / ')}。quick=直接回答（简单确认/闲聊），standard=默认，deep=展开备选与可检验性。档位从下一轮起影响注入；上下文紧张时规则卡只给索引，正文用 omb_method 取。reason 说明为什么调档（便于事后核对档位是否有用）。`,
     parameters: focusParams,
     execute(args: unknown): ToolOutcome {
       try {
