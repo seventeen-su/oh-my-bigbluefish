@@ -8,6 +8,13 @@
  *
  * **不接管 Agent Loop**（DSH 硬约束，`docs/cookbook/extension-cookbook.md:100`）：
  * 本层只观察、只注入，不替换也不包装回合。
+ *
+ * ## 「会话 → cwd」这张表**不在这里**
+ *
+ * 它曾经在这里（本文件的 `SessionTable`）、在内核登记处、在记忆模块各存一份，
+ * 三处更新时机不同 → 同一次 `omb_status` 里出现稳定矛盾（模块段 0 条、存储段 1 条）。
+ * 现在唯一存放处是内核的 `ActiveSessionTable`（`SERVICES.activeSession`）：
+ * 本文件只**写**它、状态面只从它**读**、模块按需**查**。
  */
 import { createHash } from 'node:crypto'
 import type { HostContextLike } from './host.js'
@@ -16,7 +23,6 @@ import type {
   ContextRenderInput,
   Kernel,
   PromptContribution,
-  SessionRef,
 } from '../kernel/abi/index.js'
 import { RESIDENT_HINT_MAX, SERVICES } from '../kernel/abi/index.js'
 import { heartbeat } from '../kernel/hostEntry.js'
@@ -41,27 +47,6 @@ export interface SystemPromptLike {
  * 我们用 200 段，落在宿主的内置段之后、保证不插队——插队会改变宿主的提示结构。
  */
 export const CONTEXT_ORDER = 200
-
-/** 记录会话的 cwd 与服务映射。 */
-export class SessionTable {
-  readonly #cwd = new Map<SessionRef, string>()
-
-  remember(session: SessionRef, cwd: string): void {
-    this.#cwd.set(session, cwd)
-  }
-
-  cwdOf(session: SessionRef): string | undefined {
-    return this.#cwd.get(session)
-  }
-
-  forget(session: SessionRef): void {
-    this.#cwd.delete(session)
-  }
-
-  sessions(): readonly SessionRef[] {
-    return [...this.#cwd.keys()].sort()
-  }
-}
 
 /** 从可能的事件载荷里稳取字符串字段（宿主事件形状跨版本可能变）。 */
 function pickString(source: unknown, ...keys: readonly string[]): string | undefined {
@@ -153,20 +138,27 @@ export function cwdOfSession(session: unknown): string | undefined {
 }
 
 /**
- * 登记会话的 cwd 到存储服务。
+ * 把一次会话观测登记到**唯一来源**（内核 `ActiveSessionTable`），并返回解析到的 cwd。
  *
  * 这是"按 cwd 惰性打开项目库"这条设计的**唯一**驱动点：
  * 少了它，项目库永远不会被打开，"记忆随项目走"就不成立。
+ *
+ * 注意只写内核登记处：**不再**同时写一份到别处——同一份事实存两遍必然漂
+ * （曾经就是"模块段 0 条、存储段 1 条"那个稳定矛盾的根因）。
+ *
+ * **没有 cwd 的观测也要写**：它更新"当前活跃会话"（`omb_focus` 一类工具靠这个），
+ * 而 `remember(session, undefined)` 按会话保留已知 cwd、绝不把别的会话的 cwd 记过来。
+ *
+ * @param sessions 唯一来源（`SERVICES.activeSession`）。缺省时只解析不登记。
  */
 export function rememberCwdFrom(
   sessionId: string,
   session: unknown,
-  stores: { rememberCwd(sessionId: string, cwd: string): void } | undefined = undefined,
+  sessions: { remember(session: string, cwd?: string): void } | undefined = undefined,
 ): string | undefined {
   const cwd = cwdOfSession(session)
-  if (cwd === undefined) return undefined
   try {
-    stores?.rememberCwd(sessionId, cwd)
+    sessions?.remember(sessionId, cwd)
   } catch {
     // 登记失败不影响会话；记忆会如实降级为"仅用户库"
   }
@@ -250,16 +242,22 @@ function sessionIdOf(ctx: unknown): string {
 export function wireSessionEvents(options: {
   readonly ctx: HostContextLike
   readonly kernel: Kernel
-  readonly sessions: SessionTable
   readonly onToolResult?: (payload: { sessionId: string; text: string; callId: string | undefined }) => void
 }): () => void {
-  const { ctx, kernel, sessions, onToolResult } = options
+  const { ctx, kernel, onToolResult } = options
   /** 见过的会话事件类型 → 次数（诊断用）。 */
   const sawEventTypes = new Map<string, number>()
   if (typeof ctx.on !== 'function') {
     kernel.logger.warn('OMB：宿主事件订阅不可用，认知层将只做注入不做观察（状态面已记录）')
     return () => {}
   }
+
+  /**
+   * **会话 → cwd 的唯一来源**。读一次拿住引用即可：它是内核自己 provide 的登记处
+   * （`kernel/index.ts`），随内核存活，不是会被换掉的模块服务。
+   */
+  const activeSessions = (): { remember(session: string, cwd?: string): void } | undefined =>
+    kernel.service<{ remember(session: string, cwd?: string): void }>(SERVICES.activeSession)
 
   const offs: (() => void)[] = []
   const safeOn = (event: string, fn: (...args: never[]) => void): void => {
@@ -282,23 +280,18 @@ export function wireSessionEvents(options: {
     //    没有这一步，`stores.forSession()` 永远走"未登记 cwd"分支、
     //    只返回用户库，于是 `<cwd>/.omb/memory/` 在生产里永远不会被打开——
     //    "记忆随项目走"这条设计等于没生效。会话头在 `session/event` 里可取到。
-    const stores = kernel.service<{ rememberCwd(sessionId: string, cwd: string): void }>(SERVICES.stores)
-    const cwd = rememberCwdFrom(sessionId, session, stores)
-    if (cwd !== undefined) sessions.remember(sessionId, cwd)
+    //
+    //    **只写内核登记处**（唯一存放处）：状态面、记忆模块都从这里读，
+    //    因此不存在"两处数字"的可能。这一次写同时更新"当前活跃会话"——
+    //    事件里没带 cwd 时 `remember` 会按会话保留已知 cwd，绝不张冠李戴。
+    //
+    //    为什么必须由 `dsh/` 写进内核（而不是让模块自己订阅事件记）：
+    //    模块经收养视图订阅 `turn/start` 时 `on` 优先绑**宿主**事件面，而下面
+    //    `kernel.emit` 发在**内核总线**——两者永远碰不到且不报错。实测症状就是
+    //    `omb_focus` 报"取不到当前会话标识"（详见 kernel/activeSession.ts）。
+    const cwd = rememberCwdFrom(sessionId, session, activeSessions())
 
     if (type === undefined) return
-    // **会话是内核级事实，观测到就写进内核**，不让模块依赖"能不能收到某条事件"。
-    //
-    // 为什么必要：模块经收养视图订阅 `turn/start` 时，`on` 优先绑的是**宿主**
-    // 事件面，而下面 `kernel.emit` 发在**内核总线**——两者永远碰不到，
-    // 且不报任何错。实测症状就是 `omb_focus` 报"取不到当前会话标识"。
-    //
-    // **cwd 一并交给内核**：模块拿不到会话 cwd（`turn/start` 只有 sessionId/turn），
-    // 只能退回 `process.cwd()`——那是宿主进程的工作目录，不是用户会话的。
-    // 用户在别的目录里干活时，准入核验会把真实存在的文件判成不存在。
-    kernel
-      .service<{ remember(session: string, cwd?: string): void }>(SERVICES.activeSession)
-      ?.remember(sessionId, cwd)
     // 最后一次收到的会话事件类型（诊断）。
     // 用途：`omb_focus` 报"取不到会话"时，需要立刻分清是"事件没到"还是
     // "到了但字段取错"——两者的修法完全不同，而症状一模一样。
@@ -415,7 +408,6 @@ export function wireSessionEvents(options: {
       }
     }
     offs.length = 0
-    void sessions
   }
 }
 

@@ -15,7 +15,6 @@ import { SERVICES } from '../kernel/abi/index.js'
 import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
-import type { SessionTable } from './session.js'
 import { generationFromUrl } from '../kernel/buildInfo.js'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
@@ -27,13 +26,30 @@ const STATE_LABEL: Record<ModuleHealth['state'], string> = {
 export interface StatusToolOptions {
   /** 用 `KernelHandle` 而非模块面的 `Kernel`：全局健康面与预算面**不应**暴露给模块。 */
   readonly handle: KernelHandle
-  readonly sessions: SessionTable
+}
+
+/**
+ * 「会话 → cwd」登记处（**唯一来源**）。
+ *
+ * 这里**不再**接收一个外部传进来的会话表：参数化就等于允许"传进来的那张"
+ * 与"模块读的那张"不是同一个对象——那正是先前"模块段 0 条、存储段 1 条"的成因。
+ * 现在只有内核的 `ActiveSessionTable` 一份，读它就必然与模块看到的一致。
+ */
+interface ActiveSessionsLike {
+  current(): string | null
+  cwd(session?: string): string | null
+  sessions(): readonly string[]
+}
+
+function activeSessionsOf(handle: KernelHandle): ActiveSessionsLike | undefined {
+  return handle.kernel.service<ActiveSessionsLike>(SERVICES.activeSession)
 }
 
 /** 组装 `omb_status` 的输出文本。纯组装，无副作用，便于测试。 */
 export function renderStatus(options: StatusToolOptions, sessionId?: string): string {
-  const { handle, sessions } = options
+  const { handle } = options
   const kernel = handle.kernel
+  const sessions = activeSessionsOf(handle)
   const lines: string[] = ['# OMB 状态', '']
 
   // ── 构建代数 ──────────────────────────────────────────────────────────
@@ -81,6 +97,14 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   }
 
   // ── 存储 ──────────────────────────────────────────────────────────────
+  //
+  // **这一节是"库状态 / 已打开项目库 / 会话→cwd"这三个数字的唯一出处。**
+  //
+  // 为什么必须唯一：模块的 `health().detail` 进的是「模块」段，而内核健康面保存的是
+  // **最近一次上报的快照**——快照里印实时计数，必然与这里的实时读数打架
+  // （实测：同一次 `omb_status` 模块段「项目库 0/16 已打开；会话→cwd 登记 0 条」，
+  // 存储段 1 个 / 1 条，三次调用都一样，不是抖动）。
+  // 因此模块行只报它自有的东西，库与计数一律指向本节。
   const stores = kernel.service<StoresService>(SERVICES.stores)
   lines.push('## 存储', '')
   if (stores === undefined) {
@@ -88,24 +112,25 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   } else {
     const status = stores.status()
     lines.push(`- 就绪：${status.ready ? '是' : '否'}——${status.detail}`)
-    if (status.openProjects.length > 0) {
-      lines.push(`- 已打开项目库：${status.openProjects.length} 个`)
-    }
-    // **内核侧**的会话→cwd 表。与记忆模块自维护的那张**不是同一张**：
-    // 内核这张由 `session/event` 即时登记（内核行观测到的），记忆模块那张是它
-    // 自己按需解析项目库时填的（懒加载），两者时序不同、数量可以不同。
-    //
-    // 它们曾经**同名**（都叫「会话→cwd 映射」），于是一次自检报告把它当成
-    // "同一份输出自相矛盾"记了两遍。名字里带上归属，读者就不必猜。
+    const opened = status.openProjects
     lines.push(
-      `- 内核会话→cwd 登记：${sessions.sessions().length} 条`
-      + '（内核行按 session/event 即时登记；与记忆模块自维护的那张不是同一张表）',
+      `- 已打开项目库：${opened.length} 个（上限 ${status.maxOpenProjects}）`
+      + `${opened.length === 0 ? '' : `：${opened.join('、')}`}`,
+    )
+    // 「会话 → cwd」的唯一来源是内核 `ActiveSessionTable`（`SERVICES.activeSession`）。
+    // dsh/ 观测到会话事件时写它，记忆模块经它解析项目库，**没有任何第二份拷贝**。
+    const known = sessions?.sessions() ?? []
+    lines.push(
+      `- 会话→cwd 登记：${known.length} 条`
+      + '（唯一来源：内核 ActiveSessionTable；dsh/ 观测会话事件时写入，模块按需读取）',
     )
     lines.push('')
   }
 
   // ── 上下文度量（软压力，不是上限）─────────────────────────────────────
-  const activeSession = sessionId ?? sessions.sessions()[0] ?? ''
+  // 会话优先级：显式参数 → 内核登记处的当前会话 → 任一已知会话（诊断兜底）。
+  // 读数只来自 `kernel.pressure/focus`，本文件不自己存会话事实。
+  const activeSession = sessionId ?? sessions?.current() ?? sessions?.sessions()[0] ?? ''
   lines.push('## 上下文', '')
   if (activeSession.length === 0) {
     lines.push(
@@ -180,7 +205,7 @@ function registryLines(registry: StatusRegistry | undefined): readonly string[] 
  * 执行体**绝不抛异常**：任何内部失败都转成一条可读的错误文本，
  * 因为状态面失败时最需要它自己还能说明原因。
  */
-export function buildStatusTool(handle: KernelHandle, sessions: SessionTable): ToolSpec {
+export function buildStatusTool(handle: KernelHandle): ToolSpec {
   return {
     name: 'omb_status',
     description:
@@ -199,7 +224,7 @@ export function buildStatusTool(handle: KernelHandle, sessions: SessionTable): T
         const session = typeof (args as { session?: unknown } | undefined)?.session === 'string'
           ? (args as { session: string }).session
           : undefined
-        return { kind: 'text' as const, text: renderStatus({ handle, sessions }, session) }
+        return { kind: 'text' as const, text: renderStatus({ handle }, session) }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { kind: 'error' as const, text: `状态面渲染失败——${message}` }

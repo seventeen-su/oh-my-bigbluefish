@@ -22,7 +22,7 @@ import { buildStatusTool } from '../../dsh/status-tool.js'
 import { collectToolSpecs, testHostContext } from '../../dsh/plugin.js'
 import { createToolBridge } from '../../dsh/tool-bridge.js'
 import { TOOL_BRIDGE_SERVICE, toHostPlugin } from '../../kernel/hostEntry.js'
-import { SessionTable, collectPromptContributions } from '../../dsh/session.js'
+import { collectPromptContributions } from '../../dsh/session.js'
 
 /**
  * 装配冒烟：复现**真实路径**——宿主 ctx → `ctx.get('omb:kernel')` → 模块 apply。
@@ -155,8 +155,8 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     })
     handle.kernel.provide(TOOL_BRIDGE_SERVICE, bridge)
 
-    // 内核自带工具：由内核行加进桥
-    const statusSpec = buildStatusTool(handle, new SessionTable())
+    // 内核自带工具：由内核行加进桥（状态面自己从内核读会话登记处，不再由外部传表）
+    const statusSpec = buildStatusTool(handle)
     bridge.add([statusSpec], 'omb-kernel')
 
     // 模拟宿主逐行加载：每挂载完一个模块重放一次
@@ -191,7 +191,7 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
 
   it('工具面能真正收集到工具（含内核自带的 omb_status）', async () => {
     const handle = await assemble()
-    const specs = collectToolSpecs(handle, new SessionTable())
+    const specs = collectToolSpecs(handle)
     const names = specs.map(s => s.name)
     expect(names).toContain('omb_status')
     // 至少覆盖记忆与思维链两组工具——否则说明工具服务名拼错了

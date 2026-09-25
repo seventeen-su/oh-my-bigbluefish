@@ -9,16 +9,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   CONTEXT_ORDER,
-  SessionTable,
   collectPromptContributions,
   extractText,
   fingerprint,
   renderContext,
   residentHint,
+  rememberCwdFrom,
   wirePromptInjection,
 } from '../../dsh/session.js'
 import { createKernel } from '../../kernel/index.js'
-import { RESIDENT_HINT_MAX } from '../../kernel/abi/index.js'
+import { ActiveSessionTable } from '../../kernel/activeSession.js'
+import { RESIDENT_HINT_MAX, SERVICES } from '../../kernel/abi/index.js'
 import type { PromptContribution } from '../../kernel/abi/index.js'
 
 describe('residentHint：稳定性与上限', () => {
@@ -178,16 +179,41 @@ describe('wirePromptInjection', () => {
   })
 })
 
-describe('SessionTable', () => {
-  it('记住与取回 cwd；输出排序稳定', () => {
-    const t = new SessionTable()
-    t.remember('b', '/p/b')
-    t.remember('a', '/p/a')
-    expect(t.cwdOf('a')).toBe('/p/a')
-    expect(t.cwdOf('missing')).toBeUndefined()
-    expect(t.sessions()).toEqual(['a', 'b'])
-    t.forget('a')
-    expect(t.sessions()).toEqual(['b'])
+describe('会话 → cwd：唯一来源是内核登记处（dsh 只写它，不再另存一份）', () => {
+  it('rememberCwdFrom 写进内核 ActiveSessionTable；sessions() 输出排序稳定', () => {
+    const kernel = createKernel().kernel
+    const sessions = kernel.service<ActiveSessionTable>(SERVICES.activeSession)
+    expect(sessions).toBeDefined()
+
+    expect(rememberCwdFrom('b', { header: { cwd: '/p/b' } }, sessions)).toBe('/p/b')
+    expect(rememberCwdFrom('a', { header: { cwd: '/p/a' } }, sessions)).toBe('/p/a')
+    expect(sessions?.cwd('a')).toBe('/p/a')
+    expect(sessions?.cwd('missing')).toBeNull()
+    expect(sessions?.sessions()).toEqual(['a', 'b'])
+    // 当前会话 = 最后一次观测；cwd() 省略参数即读它
+    expect(sessions?.current()).toBe('a')
+    expect(sessions?.cwd()).toBe('/p/a')
+
+    sessions?.forget('a')
+    expect(sessions?.sessions()).toEqual(['b'])
+    // 忘掉当前会话的 cwd 后立刻为 null —— 没有第二份可以"记得更久"
+    expect(sessions?.cwd('a')).toBeNull()
+  })
+
+  it('没有 cwd 的会话不会继承上一个会话的 cwd（张冠李戴比"不知道"更坏）', () => {
+    const sessions = new ActiveSessionTable()
+    sessions.remember('s1', '/p/one')
+    sessions.remember('s2') // 这一次观测没带 cwd
+    expect(sessions.current()).toBe('s2')
+    expect(sessions.cwd()).toBeNull()
+    expect(sessions.cwd('s1')).toBe('/p/one') // 老会话自己的 cwd 仍然在
+  })
+
+  it('没有 cwd 的观测也要更新"当前活跃会话"（否则 omb_focus 一类工具会失去会话）', () => {
+    const sessions = new ActiveSessionTable()
+    expect(rememberCwdFrom('s1', { id: 's1' }, sessions)).toBeUndefined()
+    expect(sessions.current()).toBe('s1')
+    expect(sessions.sessions()).toEqual([]) // 没有 cwd → 不进"登记条数"
   })
 })
 

@@ -25,6 +25,7 @@ import {
   readMemoryConfig,
 } from '../../../modules/memory/index.js'
 import { asMemoryStore, type MemoryStoresService } from '../../../modules/memory/store.js'
+import { projectIdentity } from '../../../modules/memory/paths.js'
 import {
   type CapturingLogger,
   capturingLogger,
@@ -81,6 +82,25 @@ function disposerOf(registration: ReturnType<typeof createMemoryRegistration>, k
   const disposer = registration.apply(kernel, MEMORY_CONFIG_DEFAULTS)
   if (typeof disposer !== 'function') throw new Error('apply 必须返回 disposer（热插拔要求）')
   return disposer
+}
+
+/**
+ * 模拟 `dsh/` 观测到会话 cwd：写**唯一来源**（内核 `ActiveSessionTable`）。
+ *
+ * 刻意**不**通过记忆服务写——那个写入口已经删掉了：它正是"同一份事实存两遍"的
+ * 另一半（模块段 0 条、存储段 1 条那个稳定矛盾）。生产里 `dsh/session.ts` 做的
+ * 就是这一句 `remember`。
+ */
+function rememberSessionCwd(
+  handle: ReturnType<typeof createKernel>,
+  sessionId: string,
+  cwd: string,
+): void {
+  const sessions = handle.kernel.service<{ remember(session: string, cwd?: string): void }>(
+    SERVICES.activeSession,
+  )
+  expect(sessions, '内核必须提供活跃会话登记处（SERVICES.activeSession）').toBeDefined()
+  sessions?.remember(sessionId, cwd)
 }
 
 /**
@@ -234,7 +254,7 @@ describe('omb-memory apply（fake Kernel）', () => {
 })
 
 describe('omb-memory 与真实内核', () => {
-  it('start 装配成功；health 写明库路径、行数、schema 版本与迁移结果', async () => {
+  it('start 装配成功；库事实只在「存储」段报，模块行不重复报数', async () => {
     const ws = tempWorkspace()
     const port = testPort(ws.dir)
     const logger = capturingLogger()
@@ -251,13 +271,23 @@ describe('omb-memory 与真实内核', () => {
 
     const health = await registration.manifest.health()
     expect(health.state).toBe('ok')
-    expect(health.detail).toContain('knowledge.db')
-    expect(health.detail).toContain('session.db')
-    expect(health.detail).toContain('行数=1')
-    expect(health.detail).toContain(`schema=v${SCHEMA_VERSION}`)
-    expect(health.detail).toContain('迁移 v0→v1')
+    // 模块行只报自有事实 + 指向「存储」段：它进的是**上报快照**，
+    // 印实时计数必然与「存储」段的实时读数打架（见 index.ts describeHealth 的说明）
+    expect(health.detail).toContain('见「存储」段')
+    expect(health.detail).not.toMatch(/已打开项目库|会话→cwd|行数=|迁移 v/)
+
+    // 库路径/项目库数/schema/迁移由**唯一报数处**给出：存储服务自己的 status()
+    const storeStatus = service?.status()
+    expect(storeStatus?.detail).toContain('knowledge.db')
+    expect(storeStatus?.detail).toContain('迁移 v0→v1')
+    expect(storeStatus?.openProjects).toEqual([projectIdentity(ws.dir)])
+    expect(storeStatus?.maxOpenProjects).toBe(16)
+    expect(storeStatus?.detail).not.toMatch(/已打开项目库|会话→cwd/)
+
+    // metrics 仍是实时统计（不进 omb_status 文本，因此不构成第二个可见数字）
     expect(health.metrics?.['rows.total']).toBe(1)
     expect(health.metrics?.['openProjects']).toBe(1)
+    expect(health.metrics?.['schemaVersion']).toBe(SCHEMA_VERSION)
 
     // 关闭后库确实关了：旧句柄报错而不是继续读写
     handle.dispose()
@@ -336,7 +366,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
 
     const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
     expect(service).toBeDefined()
-    service?.rememberCwd('s1', ws.dir)
+    rememberSessionCwd(handle, 's1', ws.dir)
     handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
 
     const set = await service?.forSession('s1')
@@ -367,7 +397,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
     handle.start([kernelRow, registration])
     const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
-    service?.rememberCwd('s1', ws.dir)
+    rememberSessionCwd(handle, 's1', ws.dir)
     handle.kernel.emit('turn/start', { sessionId: 's1', turn: 3 })
 
     const tools = toolsOf(handle)
@@ -410,7 +440,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
     handle.start([kernelRow, registration])
     const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
-    service?.rememberCwd('s1', ws.dir)
+    rememberSessionCwd(handle, 's1', ws.dir)
     handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
 
     const remember = toolsOf(handle)?.find(tool => tool.name === 'omb_remember')
@@ -467,7 +497,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
     handle.start([kernelRow, registration])
     const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
-    service?.rememberCwd('s1', ws.dir)
+    rememberSessionCwd(handle, 's1', ws.dir)
     handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
     const set = await service?.forSession('s1')
     await set?.store('project')?.put(
