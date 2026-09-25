@@ -12,7 +12,7 @@
  *
  * 保留旧实现里值得留的三条约束（它们防的是"通知变成噪音"）：
  * ① 同 kind 30 分钟一次
- * ② 内容去重（同 kind + 同内容 30 分钟内只发一次）
+ * ② 内容去重（**同会话内**同 kind 同内容只发一次；新会话重新计）
  * ③ 会话内上限 10 条
  *
  * **已删除**的通知种类（那些功能本轮已删除，留着就是死代码）：
@@ -38,9 +38,13 @@ export interface DesktopNotifyLike {
 /**
  * 形状探测：既无 `push` 也无 `pushAlways` → 不是通知服务；
  * 声明了但类型不对（如 `push: 1`）→ 也判否（不猜测、不改写）。
+ *
+ * ⚠️ 数组必须显式排除：`Array.prototype.push` 是函数，光看 `push` 会把
+ * 任意数组误认成通知服务，然后"推送成功"却什么也没发。
  */
 export function isDesktopNotifyLike(value: unknown): value is DesktopNotifyLike {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false
+  if (Array.isArray(value)) return false
   const candidate = value as Record<string, unknown>
   const push = candidate['push']
   const pushAlways = candidate['pushAlways']
@@ -92,7 +96,8 @@ function isThenable(value: unknown): value is Promise<unknown> {
 export class NotifyBridge {
   readonly #deps: NotifyBridgeDeps
   readonly #lastByKind = new Map<string, number>()
-  readonly #lastByContent = new Map<string, number>()
+  /** 会话 → 已发过的内容键。内容去重不随时间失效，只随会话重置。 */
+  readonly #sentContent = new Map<string, Set<string>>()
   readonly #sentPerSession = new Map<string, number>()
   #sent = 0
   #suppressed = 0
@@ -126,9 +131,9 @@ export class NotifyBridge {
       }
 
       const contentKey = `${kind}\u0000${message}`
-      const lastContent = this.#lastByContent.get(contentKey)
-      if (lastContent !== undefined && now - lastContent < NOTIFY_THROTTLE_MS) {
-        this.#suppress('内容重复（同类型同内容已推送过）')
+      const sentContents = this.#sentContent.get(sessionId)
+      if (sentContents?.has(contentKey) === true) {
+        this.#suppress('内容重复（同会话内同类型同内容只发一次）')
         return false
       }
 
@@ -153,7 +158,8 @@ export class NotifyBridge {
       }
 
       this.#lastByKind.set(kind, now)
-      this.#lastByContent.set(contentKey, now)
+      if (sentContents === undefined) this.#sentContent.set(sessionId, new Set([contentKey]))
+      else sentContents.add(contentKey)
       this.#sentPerSession.set(sessionId, sentInSession + 1)
       this.#sent += 1
       return true
@@ -180,7 +186,7 @@ export class NotifyBridge {
     return {
       available: true,
       detail:
-        `已接上宿主 desktopNotify（通道 ${channel}）；节流：同类型 30 分钟 1 条、同内容 30 分钟去重、` +
+        `已接上宿主 desktopNotify（通道 ${channel}）；节流：同类型 30 分钟 1 条、同会话内同内容只发一次、` +
         `单会话上限 ${NOTIFY_SESSION_LIMIT} 条。已发 ${this.#sent} 条、抑制 ${this.#suppressed} 条`,
       sent: this.#sent,
       suppressed: this.#suppressed,
@@ -188,9 +194,10 @@ export class NotifyBridge {
     }
   }
 
-  /** 清空某会话的计数（新会话/测试用）。不影响节流窗口。 */
+  /** 清空某会话的计数与内容去重记录（新会话/测试用）。不影响同 kind 的节流窗口。 */
   resetSession(sessionId: string): void {
     this.#sentPerSession.delete(sessionId)
+    this.#sentContent.delete(sessionId)
   }
 
   #target(): DesktopNotifyLike | undefined {
@@ -226,13 +233,10 @@ export class NotifyBridge {
     // 静默降级：不写 info/debug 噪音，只在需要诊断时经 status() 读到原因。
   }
 
-  /** 清理过期节流记录，防止 Map 无界增长。 */
+  /** 清理过期的节流记录，防止 Map 无界增长。 */
   #prune(now: number): void {
     for (const [key, at] of this.#lastByKind) {
       if (now - at >= NOTIFY_THROTTLE_MS) this.#lastByKind.delete(key)
-    }
-    for (const [key, at] of this.#lastByContent) {
-      if (now - at >= NOTIFY_THROTTLE_MS) this.#lastByContent.delete(key)
     }
   }
 }
