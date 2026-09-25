@@ -8,11 +8,34 @@
  * 就删掉该视图，不要"以防万一"地留着（§6.9）。判定结果进 health 的 detail。
  *
  * 纯函数：台账是不可变值，`recordPull` 返回新台账。
+ *
+ * **一份台账只描述一个会话**。分桶由调用方做（`index.ts` 持有
+ * `Map<SessionRef, PullLedger>`）；本节只负责把一个会话的账算清楚。
+ * 拿不到会话标识的调用进 `UNKNOWN_SESSION_KEY` 桶——**它不是某个会话**，
+ * 并进任何具体会话就等于拿别人的调用给本会话定罪。
  */
-import type { ContextPressure } from '../../kernel/abi/index.js'
+import type { ContextPressure, SessionRef } from '../../kernel/abi/index.js'
 
 /** 规划 §6.4 的五个拉取视图（工具名）。 */
 export const VIEW_TOOLS: readonly string[] = ['omb_recall', 'omb_relate', 'omb_files', 'omb_method', 'omb_focus']
+
+/**
+ * 拿不到会话标识时的归属桶。
+ *
+ * 它**不是**某个具体会话：混进去会让"待删除视图"基于别的会话的噪声下结论
+ * （实测症状：本会话从未调用过的工具出现在待删除列表里）。
+ */
+export const UNKNOWN_SESSION_KEY = '<未知会话>'
+
+/** 会话键归一：空串 / 非串 → `UNKNOWN_SESSION_KEY`。 */
+export function sessionKeyOf(session: SessionRef | null | undefined): SessionRef {
+  return typeof session === 'string' && session.trim() !== '' ? session : UNKNOWN_SESSION_KEY
+}
+
+/** 会话键 → 快照口径：`UNKNOWN_SESSION_KEY` 记作 `null`（状态面写"未知会话"）。 */
+export function sessionOfKey(key: SessionRef): SessionRef | null {
+  return key === UNKNOWN_SESSION_KEY ? null : key
+}
 
 /** 少于这么多轮**不下杀死结论**（诚实：样本不足就不装懂）。 */
 export const MIN_TURNS_FOR_VERDICT = 20
@@ -68,8 +91,25 @@ export interface ViewPullStats {
 }
 
 export interface PullSnapshot {
+  /**
+   * 这份账属于哪个会话；`null` = 拿不到会话标识（"未知会话"桶）。
+   *
+   * 有它才谈得上"本会话口径"：没有这个字段，读者永远不知道
+   * `turns` / `totalPulls` 是谁的数。
+   */
+  readonly session: SessionRef | null
+  /** **本会话**已观察到的回合数（由 `turn/start` 推进，单调不减）。 */
   readonly turns: number
+  /**
+   * 本会话的回合数是否已知。
+   *
+   * `false` ⇒ `pullsPerTurn` 的**分母未知**：此时如实写"轮数未知"，
+   * 不用跨会话或其他会话的数顶替，也不下"该删视图"的结论。
+   */
+  readonly turnsKnown: boolean
+  /** **本会话**的拉取总次数（不含别的会话）。 */
   readonly totalPulls: number
+  /** 本会话的每轮拉取次数；分母未知时为 0（**不要**当成"测得 0"）。 */
   readonly pullsPerTurn: number
   readonly views: readonly ViewPullStats[]
   /** 长期趋近 0、按杀死判据应删除的视图（轮数不足时恒为空）。 */
@@ -93,22 +133,32 @@ export interface WatchOptions {
 }
 
 /**
- * 汇总台账。
+ * 汇总**某一个会话**的台账。
  *
  * 传入 `views` 时，**从未被拉过的视图也会出现在结果里**（拉取 0 次）——
  * 这正是杀死判据要找的对象。
+ *
+ * @param session 这份账属于哪个会话（`null` = 未知会话桶），只影响文案口径，
+ *   不参与计算——**会话隔离由"喂进来的是哪本账"保证**。
  */
-export function summarize(ledger: PullLedger, options: WatchOptions = {}): PullSnapshot {
+export function summarize(ledger: PullLedger, options: WatchOptions = {}, session: SessionRef | null = null): PullSnapshot {
   const base = normalizeLedger(ledger)
   const turns = base.turns
   const minTurns = numberOr(options.minTurns, MIN_TURNS_FOR_VERDICT)
   const deadBelow = numberOr(options.deadBelow, DEAD_VIEW_PULLS_PER_TURN)
 
   const names = new Set<string>(Object.keys(base.views))
+  // 只有**登记的视图**才参与"该删了吗"的判定：台账里可能还有别的工具名
+  // （`dsh/` 把每次工具调用都记进来），而"杀死判据"能删的只有我们自己注册的视图。
+  // 没给 `views` 时退回"台账里出现过的名字"（纯函数调用方的口径）。
+  const judged = new Set<string>()
   for (const name of options.views ?? []) {
     const trimmed = typeof name === 'string' ? name.trim() : ''
-    if (trimmed !== '') names.add(trimmed)
+    if (trimmed === '') continue
+    names.add(trimmed)
+    judged.add(trimmed)
   }
+  const judgedAll = judged.size === 0
 
   const views: ViewPullStats[] = [...names].sort().map(view => {
     const counters = base.views[view] ?? { pulls: 0, firstTurn: null, lastTurn: null }
@@ -122,32 +172,51 @@ export function summarize(ledger: PullLedger, options: WatchOptions = {}): PullS
   })
 
   const totalPulls = views.reduce((sum, item) => sum + item.pulls, 0)
+  // 0 轮 = 本会话还没观察到回合边界（分母**未知**），不是"第 0 轮"。
+  const turnsKnown = turns > 0
   const settled = turns >= minTurns
   const deadViews = settled
-    ? views.filter(item => item.pullsPerTurn < deadBelow).map(item => item.view)
+    ? views.filter(item => (judgedAll || judged.has(item.view)) && item.pullsPerTurn < deadBelow).map(item => item.view)
     : []
+  const pullsPerTurn = ratio(totalPulls, turns)
 
   return {
+    session,
     turns,
+    turnsKnown,
     totalPulls,
-    pullsPerTurn: ratio(totalPulls, turns),
+    pullsPerTurn,
     views,
     deadViews,
     settled,
     minTurns,
-    verdict: verdictOf({ turns, totalPulls, pullsPerTurn: ratio(totalPulls, turns), deadViews, minTurns, deadBelow }),
+    verdict: verdictOf({
+      session,
+      turnsKnown,
+      turns,
+      totalPulls,
+      pullsPerTurn,
+      deadViews,
+      minTurns,
+      deadBelow,
+    }),
   }
 }
 
 /**
  * health().detail 里的一行：拉取率 + 杀死判据结论。
  *
- * 三种情形**必须分开说**：轮数不足 / 有待删除视图 / 无视图趋近 0。
+ * 四种情形**必须分开说**：轮数未知 / 轮数不足 / 有待删除视图 / 无视图趋近 0。
  * 把"样本不够"说成"一切正常"是这类计数器最常见的谎。
+ * 文案一律带口径（"本会话"/"未知会话"），不留"这个数是谁的"的疑问。
  */
 export function healthDetail(snapshot: PullSnapshot): string {
+  const who = snapshot.session === null ? '未知会话' : '本会话'
+  if (!snapshot.turnsKnown) {
+    return `${who}拉取 ${snapshot.totalPulls} 次 / 轮数未知（未观察到回合边界，判定需 ${snapshot.minTurns} 轮），暂不下删除结论`
+  }
   const rate = snapshot.pullsPerTurn.toFixed(2)
-  const head = `拉取 ${snapshot.totalPulls} 次 / ${snapshot.turns} 轮 = ${rate} 次/轮`
+  const head = `${who}拉取 ${snapshot.totalPulls} 次 / ${snapshot.turns} 轮 = ${rate} 次/轮`
   if (!snapshot.settled) {
     return `${head}；轮数不足（判定需 ${snapshot.minTurns} 轮），暂不下删除结论`
   }
@@ -171,6 +240,8 @@ export function cacheHitRate(pressure: ContextPressure | null | undefined): numb
 }
 
 function verdictOf(input: {
+  session: SessionRef | null
+  turnsKnown: boolean
   turns: number
   totalPulls: number
   pullsPerTurn: number
@@ -178,14 +249,18 @@ function verdictOf(input: {
   minTurns: number
   deadBelow: number
 }): string {
+  const who = input.session === null ? '未知会话' : '本会话'
   const rate = input.pullsPerTurn.toFixed(2)
+  if (!input.turnsKnown) {
+    return `${who}拉取 ${input.totalPulls} 次；${who}回合数未知（判定需 ${input.minTurns} 轮），暂不下"该删视图"的结论。`
+  }
   if (input.turns < input.minTurns) {
-    return `已观察 ${input.turns} 轮（判定需 ${input.minTurns} 轮），暂不下"该删视图"的结论；当前拉取 ${input.totalPulls} 次（${rate} 次/轮）。`
+    return `${who}已观察 ${input.turns} 轮（判定需 ${input.minTurns} 轮），暂不下"该删视图"的结论；${who}拉取 ${input.totalPulls} 次（${rate} 次/轮）。`
   }
   if (input.deadViews.length > 0) {
-    return `拉取 ${input.totalPulls} 次 / ${input.turns} 轮 = ${rate} 次/轮；建议删除视图：${input.deadViews.join('、')}（低于 ${input.deadBelow} 次/轮，说明模型不用它）。`
+    return `${who}拉取 ${input.totalPulls} 次 / ${input.turns} 轮 = ${rate} 次/轮；建议删除视图：${input.deadViews.join('、')}（低于 ${input.deadBelow} 次/轮，说明模型不用它）。`
   }
-  return `拉取 ${input.totalPulls} 次 / ${input.turns} 轮 = ${rate} 次/轮；没有视图趋近 0，全部保留。`
+  return `${who}拉取 ${input.totalPulls} 次 / ${input.turns} 轮 = ${rate} 次/轮；没有视图趋近 0，全部保留。`
 }
 
 function normalizeLedger(ledger: PullLedger | undefined | null): PullLedger {

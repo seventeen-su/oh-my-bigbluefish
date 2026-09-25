@@ -285,12 +285,124 @@ describe('拉取台账与杀死判据', () => {
     handle.dispose()
   })
 
-  it('recordPull 传未知会话也不抛（落到全局回合计数）', () => {
+  it('recordPull 拿不到会话 → 落进"未知会话"桶；显式传会话 → 记到该会话名下（都不抛）', () => {
     const { handle } = start()
     const metrics = metricsOf(handle)
     expect(() => metrics.recordPull('omb_files')).not.toThrow()
+    const unknown = metrics.snapshot()
+    expect(unknown.session).toBeNull()
+    expect(unknown.totalPulls).toBe(1)
+    expect(unknown.turnsKnown).toBe(false)
+
     metrics.recordPull('omb_files', '从未见过的会话')
-    expect(metrics.snapshot().totalPulls).toBe(2)
+    expect(metrics.snapshot('从未见过的会话').totalPulls).toBe(1)
+    // 显式会话的账不会被并进"未知会话"桶
+    expect(metrics.snapshot().totalPulls).toBe(1)
+    handle.dispose()
+  })
+})
+
+describe('台账按会话隔离（本会话口径）', () => {
+  it('两个会话各自记账、互不串味；待删除列表只在各自口径下给出', () => {
+    const { handle } = start()
+    const metrics = metricsOf(handle)
+
+    // 会话 A：跑满 20 轮，一次都没拉过任何一个视图
+    for (let turn = 1; turn <= 20; turn += 1) handle.kernel.emit('turn/start', { sessionId: 'A', turn })
+    // 会话 B：只有 1 轮，拉了 3 次 omb_recall
+    handle.kernel.emit('turn/start', { sessionId: 'B', turn: 1 })
+    metrics.recordPull('omb_recall', 'B')
+    metrics.recordPull('omb_recall', 'B')
+    metrics.recordPull('omb_recall', 'B')
+
+    // A 的账：20 轮、0 拉取 → 判据成立，五个视图都在待删除列表里
+    const a = metrics.snapshot('A')
+    expect(a.session).toBe('A')
+    expect(a.turns).toBe(20)
+    expect(a.totalPulls).toBe(0)
+    expect(a.settled).toBe(true)
+    expect(a.deadViews.length).toBe(5)
+    expect(metrics.killList('A')).toContain('omb_recall')
+
+    // B 的账：1 轮、3 拉取 → 轮数不足，**不给待删除列表**；A 的 20 轮不进来
+    const b = metrics.snapshot('B')
+    expect(b.session).toBe('B')
+    expect(b.turns).toBe(1)
+    expect(b.totalPulls).toBe(3)
+    expect(b.settled).toBe(false)
+    expect(b.deadViews).toEqual([])
+    expect(b.verdict).toContain('暂不下')
+    expect(metrics.killList('B')).toEqual([])
+    expect(b.views.find(view => view.view === 'omb_recall')?.pulls).toBe(3)
+
+    // A 那边仍然是 0 次：B 的拉取没有串进 A
+    expect(a.views.find(view => view.view === 'omb_recall')?.pulls).toBe(0)
+    expect(metrics.views('A').find(view => view.view === 'omb_recall')?.pulls).toBe(0)
+
+    // 缺省口径 = 最近活跃会话（B），不是"A + B 的总和"
+    expect(metrics.snapshot().session).toBe('B')
+    expect(metrics.snapshot().totalPulls).toBe(3)
+    const detail = handle.health()[MODULE_ID]?.detail ?? ''
+    expect(detail).toContain('本会话拉取 3 次 / 1 轮')
+    expect(detail).toContain('轮数不足')
+    expect(detail).not.toContain('待删除视图')
+    handle.dispose()
+  })
+
+  it('内核活跃会话登记处优先（模块收不到 turn/start 时也能归属正确）', () => {
+    const { handle } = start()
+    const metrics = metricsOf(handle)
+    // 模块自己订阅到的最近回合是 from-event
+    handle.kernel.emit('turn/start', { sessionId: 'from-event', turn: 1 })
+    // 内核登记处说是 from-kernel（模块经收养视图收不到事件时，这是唯一可信来源）
+    handle.kernel.service<{ remember(session: string): void }>(SERVICES.activeSession)?.remember('from-kernel')
+
+    metrics.recordPull('omb_recall')
+    expect(metrics.snapshot('from-kernel').totalPulls).toBe(1)
+    expect(metrics.snapshot('from-event').totalPulls).toBe(0)
+    expect(metrics.snapshot().session).toBe('from-kernel')
+    handle.dispose()
+  })
+
+  it('拿不到会话时落进"未知会话"桶，并在状态面明说（不混进任何具体会话）', () => {
+    const { handle } = start()
+    const metrics = metricsOf(handle)
+    metrics.recordPull('omb_recall')
+
+    const unknown = metrics.snapshot()
+    expect(unknown.session).toBeNull()
+    expect(unknown.totalPulls).toBe(1)
+    expect(unknown.turnsKnown).toBe(false)
+    expect(unknown.deadViews).toEqual([])
+    expect(unknown.verdict).toContain('回合数未知')
+
+    // 状态面必须说清这个数是谁的
+    const text = handle.status().join('\n')
+    expect(text).toContain('未知会话拉取 1 次')
+    expect(text).toContain('轮数未知')
+    expect(text).toContain('不并入任何具体会话')
+    expect(text).not.toContain('待删除视图')
+
+    // 之后出现了具体会话：未知桶的计数不会被并进去
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    expect(metrics.snapshot('s').totalPulls).toBe(0)
+    expect(metrics.snapshot('s').turns).toBe(1)
+    handle.dispose()
+  })
+
+  it('本会话回合数未知时不下结论（分母未知，不用别的会话的轮数顶替）', () => {
+    const { handle } = start()
+    const metrics = metricsOf(handle)
+    // 别的会话跑满 20 轮
+    for (let turn = 1; turn <= 20; turn += 1) handle.kernel.emit('turn/start', { sessionId: 'other', turn })
+    // 本会话只有一次拉取、没有任何回合边界
+    metrics.recordPull('omb_recall', 'mine')
+    const mine = metrics.snapshot('mine')
+    expect(mine.turns).toBe(0)
+    expect(mine.turnsKnown).toBe(false)
+    expect(mine.pullsPerTurn).toBe(0)
+    expect(mine.deadViews).toEqual([])
+    expect(mine.verdict).toContain('回合数未知')
     handle.dispose()
   })
 })
