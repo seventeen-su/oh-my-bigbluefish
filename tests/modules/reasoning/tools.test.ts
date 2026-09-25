@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
-import type { ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
+import type { Kernel, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
 import { applyFocus, readFocus } from '../../../modules/reasoning/focus.js'
 import type { LoopSignal } from '../../../modules/reasoning/loop.js'
 import { cardById, residentHint } from '../../../modules/reasoning/methods.js'
@@ -112,6 +112,17 @@ describe('omb_method', () => {
     expect((await run(createMethodTool(bad.ports), {})).kind).toBe('text')
     bad.handle.dispose()
   })
+
+  it('描述与参数说明都写清"不传 topic 只给索引、不含正文"', () => {
+    const { handle, ports } = makePorts()
+    const tool = createMethodTool(ports)
+    expect(tool.description).toContain('只返回索引')
+    expect(tool.description).toContain('不含规则正文')
+    const schema = (tool.parameters as unknown as { jsonSchema: { properties: { topic: { description: string } } } })
+      .jsonSchema
+    expect(schema.properties.topic.description).toContain('不含规则正文')
+    handle.dispose()
+  })
 })
 
 describe('omb_focus', () => {
@@ -163,6 +174,41 @@ describe('omb_focus', () => {
     const outcome = await run(createFocusTool(ports), { depth: 'deep' })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('写不进去')
+    handle.dispose()
+  })
+
+  it('deep 回执只说"请求注入"，不承诺结果', async () => {
+    const { handle, ports } = makePorts('s-deep')
+    const outcome = await run(createFocusTool(ports), { depth: 'deep', reason: '多方案权衡' })
+    expect(outcome.kind).toBe('text')
+    expect(outcomeText(outcome)).toContain('请求注入')
+    expect(outcomeText(outcome)).not.toContain('会带上')
+    handle.dispose()
+  })
+
+  it('内核静默丢弃写入：工具回错误分支，而不是"已设置"', async () => {
+    const swallowing = createKernel()
+    const silentKernel: Kernel = {
+      ...swallowing.kernel,
+      setFocus: () => {
+        // 不抛也不写
+      },
+    }
+    const { handle, ports } = makePorts('s6', {
+      applyDepth: (target, depth, reason) => applyFocus(silentKernel, target, depth, reason),
+    })
+    const outcome = await run(createFocusTool(ports), { depth: 'deep' })
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('未生效')
+    handle.dispose()
+    swallowing.dispose()
+  })
+
+  it('描述交代注入边界：下一轮起生效，紧张档要自己用 omb_method 取正文', () => {
+    const { handle, ports } = makePorts()
+    const description = createFocusTool(ports).description
+    expect(description).toContain('下一轮')
+    expect(description).toContain('omb_method')
     handle.dispose()
   })
 })

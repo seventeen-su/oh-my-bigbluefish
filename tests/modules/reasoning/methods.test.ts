@@ -24,14 +24,14 @@ import {
 
 /** 八条正文的字面量快照。改动这里 = 改模型实际看到的东西。 */
 const TEXT_SNAPSHOT: Readonly<Record<string, string>> = {
-  R1: "先判断这个问题值多少思考：简单确认/闲聊/事实问答 → 直接回答；需要推导/多方案权衡/信息不全 → 展开推理。不要为容易的问题展开长篇推理，也不要用一句话回答复杂问题。",
-  R2: "在推理前先明确：什么样的结果算解决了这个问题？如果说不清，先解决这个。",
-  R3: "在确定方案前，列出至少两个**互斥**的可能解释或做法，然后说明为什么选这一个。**但不要为凑数列假备选**——只有一个合理解释时直接说。",
+  R1: "先判断这个问题需要多少推理：简单确认/闲聊/事实问答 → 直接回答；需要推导/多方案权衡/信息不全 → 展开推理。不要为容易的问题展开长篇推理，也不要用一句话回答复杂问题。",
+  R2: "在推理前先明确：什么样的结果算解决了这个问题？如果说不清，先向用户问清楚，别边做边猜。",
+  R3: "在确定方案前，列出至少两个互斥的可能解释或做法，然后说明为什么选这一个。但不要为凑数列假备选——只有一个合理解释时直接说。",
   R4: "每个关键结论要能回答：如果它错了，会看到什么不一样？说不出来的结论，标成'待确认'而不是断言。",
-  R5: "推理要挂在具体事实上：用户原话、文件行号、命令输出、约定。不要用'通常''一般来说'代替你没核实的东西。",
+  R5: "每条事实都要指出出处：用户原话、文件行号、命令输出、约定。指不出来源的不要当事实用——'通常''一般来说'都不是出处。",
   R6: "同一个方向连续失败两次，就不再重试第三次。停下来，说明为什么这个方向不行，换一个方向或问用户。",
-  R7: "不知道就说不知道，不确定就标不确定。**编造一个看起来合理的答案比说'我不确定'代价更高。**",
-  R8: "发现信息互相矛盾（用户前后不一致、文档与代码不符、两个来源冲突）时，**把冲突摆出来**，不要静默选一个。",
+  R7: "不知道就说不知道；缺的信息先去要，不要补出一个看起来合理的答案。编造的代价高于承认不确定。",
+  R8: "发现信息互相矛盾（用户前后不一致、文档与代码不符、两个来源冲突）时，把两条都摆出来，并说明你倾向哪条、为什么；不要静默选一个。",
 }
 
 /** 哲学术语黑名单：规则是**动作**，不是概念解释。 */
@@ -69,11 +69,44 @@ describe('八条方法卡', () => {
   })
 
   it('R3 含"不要为凑数列假备选"这一句', () => {
-    expect(cardById('R3')?.text).toContain('**但不要为凑数列假备选**——只有一个合理解释时直接说')
+    expect(cardById('R3')?.text).toContain('但不要为凑数列假备选——只有一个合理解释时直接说')
   })
 
   it('R6 含"连续失败两次，就不再重试第三次"', () => {
     expect(cardById('R6')?.text).toContain('连续失败两次，就不再重试第三次')
+  })
+
+  it('八张之间不互相重复：标题与正文两两不同，且没有一张的正文是另一张的子串', () => {
+    const texts = METHOD_CARDS.map(card => card.text)
+    const titles = METHOD_CARDS.map(card => card.title)
+    expect(new Set(texts).size).toBe(texts.length)
+    expect(new Set(titles).size).toBe(titles.length)
+    for (const card of METHOD_CARDS) {
+      for (const other of METHOD_CARDS) {
+        if (other.id === card.id) continue
+        expect(card.text.includes(other.text), `${card.id} 的正文整段重复了 ${other.id}`).toBe(false)
+      }
+    }
+  })
+
+  it('R5 与 R7 职责不重叠：出处归 R5，缺信息归 R7', () => {
+    // 这两张曾经都在说"不知道/没核实"——同一句话写在两张卡里，模型只会读到两遍
+    expect(cardById('R5')?.text).toContain('出处')
+    expect(cardById('R5')?.text).not.toContain('不知道')
+    expect(cardById('R7')?.text).toContain('不知道')
+    expect(cardById('R7')?.text).not.toContain('出处')
+  })
+
+  it('正文不含 markdown 强调符（提示词里不渲染，`**` 只是噪声）', () => {
+    for (const card of METHOD_CARDS) {
+      expect(card.text.includes('**'), `${card.id} 正文含 **`).toBe(false)
+    }
+  })
+
+  it('正文不是一句话口号：每条都长到能执行（≥ 25 字符）', () => {
+    for (const card of METHOD_CARDS) {
+      expect(card.text.length, `${card.id} 正文过短`).toBeGreaterThanOrEqual(25)
+    }
   })
 
   it('措辞是动作，不含哲学术语（标题/正文/何时用都查）', () => {
@@ -100,13 +133,31 @@ describe('residentHint 常驻提示', () => {
 
   it('自身承载 R1 的动作，而不是只说"有规则卡可用"', () => {
     const hint = residentHint()
-    expect(hint).toContain('先判断这个问题值多少思考')
+    expect(hint).toContain('先判断这个问题需要多少推理')
+  })
+
+  it('与 R1 正文用同一句动作措辞（压缩与展开不出现两种说法）', () => {
+    const action = '先判断这个问题需要多少推理'
+    expect(cardById('R1')?.text).toContain(action)
+    expect(residentHint()).toContain(action)
   })
 
   it('说明何时用哪把工具（拉取式设计的入口）', () => {
     const hint = residentHint()
     expect(hint).toContain('omb_method')
     expect(hint).toContain('omb_focus')
+  })
+
+  it('不替 omb_method 承诺全文（不传 topic 只给索引）', () => {
+    // 常驻提示曾经写"方法卡用 omb_method 按需拉"，容易被读成"一定会拿到正文"
+    expect(residentHint()).not.toContain('取全文')
+    expect(residentHint()).not.toContain('全文')
+  })
+
+  it('预算再小也先保住 R1 的动作（配置下限 20 字符）', () => {
+    for (const budget of [120, 100, 80, 60, 50, 40, 30, 20]) {
+      expect(residentHint(budget), `预算 ${budget}`).toContain('先判断这个问题需要多少推理')
+    }
   })
 
   it('逐字节稳定：同参数多次调用完全相同（前缀缓存的前提）', () => {

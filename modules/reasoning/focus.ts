@@ -83,17 +83,28 @@ export interface FocusSnapshot {
 }
 
 /**
+ * 内核档位读数（**不回落**）：读不到或读到非法值时返回 `null`。
+ *
+ * 与 `readFocus` 的分工是刻意分开的：`readFocus` 把"读失败"伪装成 `standard`
+ * （渲染路径要的是能用的档位，不是错误），而**写入回读**与**渲染档位裁决**
+ * 必须分清"内核说是 standard"与"内核读不出来"——混为一谈就会把
+ * "档位没落地"变成静默事实。
+ */
+export function peekFocus(kernel: Kernel, session: SessionRef): FocusDepth | null {
+  try {
+    const raw = kernel.focus(session)
+    return isFocusDepth(raw) ? raw : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 读当前档位。**绝不抛**：内核服务异常时回落 `standard`（默认档），
  * 并在 `projection` 里如实反映——降级不隐藏。
  */
 export function readFocus(kernel: Kernel, session: SessionRef): FocusSnapshot {
-  let depth: FocusDepth = 'standard'
-  try {
-    const raw = kernel.focus(session)
-    if (isFocusDepth(raw)) depth = raw
-  } catch {
-    depth = 'standard'
-  }
+  const depth: FocusDepth = peekFocus(kernel, session) ?? 'standard'
   return { depth, projection: projectFocus(depth) }
 }
 
@@ -105,8 +116,15 @@ export interface FocusApplyResult {
 }
 
 /**
- * 设档位。**绝不抛**：非法取值不改变状态并说明可用取值；
- * 内核异常也只回错误文本。
+ * 设档位。**绝不抛**：非法取值不改变状态并说明可用取值；内核异常也只回错误文本。
+ *
+ * 写入后**回读核实**：`setFocus` 不抛不等于档位真的落地（内核可能收敛、丢弃或
+ * 写进了别的会话）。回执照回读值说——三态各自如实：
+ * ① 回读 == 请求：`ok`，并写明已核实
+ * ② 回读 != 请求：`ok=false`，把"请求 X / 读回 Y"都摆出来（模型能自行重试）
+ * ③ 读不回来：不假装成功，明说无法核实
+ *
+ * 自检报告抓的正是这里：写入路径若不回读，"设了 deep 却没生效"就只能靠猜。
  */
 export function applyFocus(
   kernel: Kernel,
@@ -116,13 +134,7 @@ export function applyFocus(
 ): FocusApplyResult {
   const reason = typeof rawReason === 'string' && rawReason.trim() !== '' ? rawReason.trim() : '模型未给理由'
   if (!isFocusDepth(rawDepth)) {
-    let current: FocusDepth = 'standard'
-    try {
-      const seen = kernel.focus(session)
-      if (isFocusDepth(seen)) current = seen
-    } catch {
-      current = 'standard'
-    }
+    const current = peekFocus(kernel, session) ?? 'standard'
     return {
       ok: false,
       depth: current,
@@ -131,7 +143,6 @@ export function applyFocus(
   }
   try {
     kernel.setFocus(session, rawDepth, reason)
-    return { ok: true, depth: rawDepth, text: `已把推理深度设为 ${rawDepth}（理由：${reason}）。${describeDepthEffect(rawDepth)}` }
   } catch (error) {
     return {
       ok: false,
@@ -139,11 +150,40 @@ export function applyFocus(
       text: `设置深度失败：${error instanceof Error ? error.message : String(error)}；本次调用未改变档位。`,
     }
   }
+  const actual = peekFocus(kernel, session)
+  if (actual === null) {
+    return {
+      ok: true,
+      depth: rawDepth,
+      text: `已请求把推理深度设为 ${rawDepth}（理由：${reason}），但内核读不回档位，无法核实是否生效。${describeDepthEffect(rawDepth)}`,
+    }
+  }
+  if (actual !== rawDepth) {
+    return {
+      ok: false,
+      depth: actual,
+      text: `档位未生效：请求 ${rawDepth}，内核读回 ${actual}；本次调用按 ${actual} 继续。可用取值 ${FOCUS_DEPTHS.join(' / ')}。`,
+    }
+  }
+  return {
+    ok: true,
+    depth: actual,
+    text: `已把推理深度设为 ${actual}（理由：${reason}；已回读核实）。${describeDepthEffect(actual)}`,
+  }
 }
 
-/** 一句话说明该档位会带来什么（回执里给模型的自解释）。 */
+/**
+ * 一句话说明该档位**接下来会请求什么**（回执里给模型的自解释）。
+ *
+ * 措辞必须是**意图**，不能是完成态：注入发生在下一轮渲染
+ * `PromptContribution.context` 时，且上下文紧张时规则卡会降级成索引
+ * （见 `index.ts` 的渲染分支）。回执若说"本轮会带上规则卡全文"，
+ * 就是替渲染路径承诺了一件它可能做不到的事——自检报告抓的正是这句。
+ */
 export function describeDepthEffect(depth: FocusDepth): string {
-  if (depth === 'quick') return '本轮只给直接答案，不展开推理。'
-  if (depth === 'deep') return `本轮会带上规则卡全文：${CARDS_BY_DEPTH.deep.join('、')}。`
-  return '默认档：规则卡按需用 omb_method 拉取。'
+  if (depth === 'quick') return '此后每轮请求注入"不要展开、直接回答"的指令。'
+  if (depth === 'deep') {
+    return `此后每轮请求注入规则卡全文 ${CARDS_BY_DEPTH.deep.join('/')}；上下文紧张时只给索引，全文用 omb_method 取。`
+  }
+  return '此后每轮不再主动注入规则卡全文；需要时用 omb_method 取。'
 }
