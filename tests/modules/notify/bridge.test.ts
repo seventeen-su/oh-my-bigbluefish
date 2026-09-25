@@ -55,13 +55,13 @@ describe('isDesktopNotifyLike：形状探测不猜', () => {
 describe('未安装：全静默降级', () => {
   it('push 返回 false、绝不抛，且说明写进 status().detail', () => {
     const bridge = new NotifyBridge({ notify: undefined, clock: clock(), logger: logger() })
-    expect(() => bridge.push('any', '消息')).not.toThrow()
-    expect(bridge.push('any', '消息')).toBe(false)
+    expect(() => bridge.push('any', '标题')).not.toThrow()
+    expect(bridge.push('any', '标题')).toBe(false)
 
     const status = bridge.status()
     expect(status.available).toBe(false)
     expect(status.detail).toContain('宿主未安装 desktopNotify 服务')
-    expect(status.detail).toContain('dsh-desktop-notify 仍在适配新版')
+    expect(status.detail).toContain('未安装 desktopNotify')
     expect(status.detail).toContain('静默降级')
     expect(status.suppressed).toBeGreaterThan(0)
     expect(status.lastReason).not.toBeNull()
@@ -69,7 +69,7 @@ describe('未安装：全静默降级', () => {
 
   it('形状不匹配时原因不同（不把"装错了"说成"没装"）', () => {
     const bridge = new NotifyBridge({ notify: { whatever: true } as never, clock: clock(), logger: logger() })
-    expect(bridge.push('any', '消息')).toBe(false)
+    expect(bridge.push('any', '标题')).toBe(false)
     expect(bridge.status().detail).toContain('形状不匹配')
   })
 
@@ -82,7 +82,7 @@ describe('未安装：全静默降级', () => {
         throw new Error('ctx.get 炸了')
       },
     })
-    expect(() => bridge.push('any', '消息')).not.toThrow()
+    expect(() => bridge.push('any', '标题')).not.toThrow()
     expect(bridge.status().available).toBe(false)
   })
 })
@@ -92,7 +92,7 @@ describe('已安装：节流、去重、上限', () => {
     const sent: string[] = []
     const time = clock()
     const bridge = new NotifyBridge({
-      notify: { push: (message: string) => sent.push(message) },
+      notify: { push: (payload: { title: string }) => { sent.push(payload.title) } },
       clock: time,
       logger: logger(),
     })
@@ -109,30 +109,30 @@ describe('已安装：节流、去重、上限', () => {
   it('同会话内相同内容只发一次；跨会话各自独立，resetSession 可重新放行', () => {
     const sent: string[] = []
     const time = clock()
-    const bridge = new NotifyBridge({ notify: { push: (m: string) => sent.push(m) }, clock: time, logger: logger() })
+    const bridge = new NotifyBridge({ notify: { push: (payload: { title: string }) => { sent.push(payload.title) } }, clock: time, logger: logger() })
     expect(bridge.push('k', '重复内容')).toBe(true)
 
     time.advance(NOTIFY_THROTTLE_MS * 2) // 同 kind 窗口早已过期
     expect(bridge.push('k', '重复内容')).toBe(false) // 仍被内容去重挡住
     expect(bridge.status().lastReason).toContain('内容重复')
 
-    expect(bridge.push('k', '重复内容', 'session-2')).toBe(true) // 另一个会话独立
+    expect(bridge.push('k', '重复内容', undefined, 'session-2')).toBe(true) // 另一个会话独立
     expect(sent).toHaveLength(2)
 
     bridge.resetSession('session-2')
     time.advance(NOTIFY_THROTTLE_MS * 2)
-    expect(bridge.push('k', '重复内容', 'session-2')).toBe(true)
+    expect(bridge.push('k', '重复内容', undefined, 'session-2')).toBe(true)
   })
 
   it('单会话上限 10 条；另一个会话不受影响', () => {
     const sent: string[] = []
-    const bridge = new NotifyBridge({ notify: { push: (m: string) => sent.push(m) }, clock: clock(), logger: logger() })
+    const bridge = new NotifyBridge({ notify: { push: (payload: { title: string }) => { sent.push(payload.title) } }, clock: clock(), logger: logger() })
     for (let i = 0; i < NOTIFY_SESSION_LIMIT; i += 1) {
       expect(bridge.push(`kind-${i}`, `消息 ${i}`)).toBe(true)
     }
     expect(bridge.push('kind-extra', '第十一条')).toBe(false)
     expect(sent).toHaveLength(NOTIFY_SESSION_LIMIT)
-    expect(bridge.push('kind-extra', '第十一条', 'session-2')).toBe(true)
+    expect(bridge.push('kind-extra', '第十一条', undefined, 'session-2')).toBe(true)
     expect(bridge.status().lastReason).toContain('上限')
 
     bridge.resetSession(DEFAULT_NOTIFY_SESSION)
@@ -144,7 +144,7 @@ describe('已安装：节流、去重、上限', () => {
     const pushed: string[] = []
     const always: string[] = []
     const withBoth = new NotifyBridge({
-      notify: { push: (m: string) => pushed.push(m), pushAlways: (m: string) => always.push(m) },
+      notify: { push: (payload: { title: string }) => { pushed.push(payload.title) }, pushAlways: (payload: { title: string }) => { always.push(payload.title) } },
       clock: clock(),
       logger: logger(),
     })
@@ -153,7 +153,7 @@ describe('已安装：节流、去重、上限', () => {
     expect(always).toEqual([])
 
     const onlyAlways = new NotifyBridge({
-      notify: { pushAlways: (m: string) => always.push(m) },
+      notify: { pushAlways: (payload: { title: string }) => { always.push(payload.title) } },
       clock: clock(),
       logger: logger(),
     })
@@ -197,7 +197,7 @@ describe('零改码自动接上', () => {
   it('同一条桥：宿主服务后来才出现 → 下一次推送立刻开始工作', () => {
     // 用可变容器模拟宿主服务表：桥每次推送重新解析，因此不需要重建桥
     const hostSlot: { value: unknown } = { value: undefined }
-    const sent: string[] = []
+    const sent: { title: string; urgency?: string }[] = []
     const bridge = new NotifyBridge({
       notify: undefined, // 建桥时还没有
       clock: clock(),
@@ -209,10 +209,10 @@ describe('零改码自动接上', () => {
     expect(bridge.status().available).toBe(false)
 
     // dsh-desktop-notify 更新后宿主能取到服务 → 桥无需改动、无需重启
-    hostSlot.value = { push: (message: string) => sent.push(message) }
+    hostSlot.value = { push: (payload: { title: string; urgency?: string }) => { sent.push(payload) } }
     expect(bridge.status().available).toBe(true)
     expect(bridge.push('k', '装之后')).toBe(true)
-    expect(sent).toEqual(['装之后'])
+    expect(sent).toEqual([{ title: '装之后', urgency: 'normal' }])
     expect(bridge.status().detail).toContain('已接上宿主 desktopNotify')
   })
 

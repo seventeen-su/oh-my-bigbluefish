@@ -90,7 +90,7 @@ describe('未安装通知服务：全静默 + 原因可读', () => {
     expect(() => service.push('any', '消息')).not.toThrow()
     expect(service.push('any', '消息')).toBe(false)
     expect(service.status().available).toBe(false)
-    expect(service.status().detail).toContain('dsh-desktop-notify 仍在适配新版')
+    expect(service.status().detail).toContain('未安装 desktopNotify')
 
     const health = await module.manifest.health()
     expect(health.state).toBe('ok')
@@ -110,20 +110,20 @@ describe('零改码自动接上', () => {
     const { kernel, service } = start(undefined)
     expect(service.status().available).toBe(false)
 
-    const sent: string[] = []
+    const sent: { title: string; message?: string; urgency?: string }[] = []
     // dsh-desktop-notify 更新后：dsh 层把 ctx.get('desktopNotify') 放进内核服务表
-    kernel.provide(NOTIFY_HOST_SERVICE, { push: (message: string) => sent.push(message) })
+    kernel.provide(NOTIFY_HOST_SERVICE, { push: (payload: { title: string; message?: string; urgency?: string }) => { sent.push(payload) } })
 
     expect(service.status().available).toBe(true)
     expect(service.push('any', '现在能发了')).toBe(true)
-    expect(sent).toEqual(['现在能发了'])
+    expect(sent).toEqual([{ title: '现在能发了', urgency: 'normal' }])
   })
 })
 
 describe('中途失败才打扰', () => {
   it('默认关闭：ok→failed 的转变也不发', async () => {
-    const sent: string[] = []
-    const { kernel, service } = start({ push: (message: string) => sent.push(message) })
+    const sent: { title: string; message?: string; urgency?: string }[] = []
+    const { kernel, service } = start({ push: (payload: { title: string; message?: string; urgency?: string }) => { sent.push(payload) } })
     kernel.emit('kernel/module-health', { id: 'omb-x', health: { state: 'ok', detail: '启动正常' } })
     kernel.emit('kernel/module-health', { id: 'omb-x', health: { state: 'failed', detail: '运行中崩了' } })
     expect(sent).toEqual([])
@@ -131,8 +131,8 @@ describe('中途失败才打扰', () => {
   })
 
   it('开启后：首次健康（启动结果）不报，只报非 failed → failed 的转变', async () => {
-    const sent: string[] = []
-    const { kernel, service } = start({ push: (message: string) => sent.push(message) }, { notifyModuleFailures: true })
+    const sent: { title: string; message?: string; urgency?: string }[] = []
+    const { kernel, service } = start({ push: (payload: { title: string; message?: string; urgency?: string }) => { sent.push(payload) } }, { notifyModuleFailures: true })
 
     // 启动首轮：即便是 failed 也不打扰（管理页已经显示）
     kernel.emit('kernel/module-health', { id: 'omb-broken', health: { state: 'failed', detail: '缺少依赖' } })
@@ -142,8 +142,9 @@ describe('中途失败才打扰', () => {
     kernel.emit('kernel/module-health', { id: 'omb-broken', health: { state: 'ok', detail: '已恢复' } })
     kernel.emit('kernel/module-health', { id: 'omb-broken', health: { state: 'failed', detail: '运行中崩了' } })
     expect(sent).toHaveLength(1)
-    expect(sent[0]).toContain('omb-broken')
-    expect(sent[0]).toContain('运行中崩了')
+    // 标题给人看、正文放细节（宿主对空标题一律拒绝）
+    expect(sent[0]?.title).toContain('omb-broken')
+    expect(sent[0]?.message).toContain('运行中崩了')
     expect(service.status().sent).toBe(1)
 
     // 重复的 failed 不再重复打扰（状态没变）
@@ -153,8 +154,8 @@ describe('中途失败才打扰', () => {
   })
 
   it('自己不报自己（通知模块坏掉时没有可用的桥）', () => {
-    const sent: string[] = []
-    const { kernel } = start({ push: (message: string) => sent.push(message) }, { notifyModuleFailures: true })
+    const sent: { title: string; message?: string; urgency?: string }[] = []
+    const { kernel } = start({ push: (payload: { title: string; message?: string; urgency?: string }) => { sent.push(payload) } }, { notifyModuleFailures: true })
     kernel.emit('kernel/module-health', { id: 'omb-notify', health: { state: 'ok', detail: 'ok' } })
     kernel.emit('kernel/module-health', { id: 'omb-notify', health: { state: 'failed', detail: '崩了' } })
     expect(sent).toEqual([])

@@ -1,16 +1,24 @@
 /**
  * 桌面通知桥：**探测外部服务，探测不到就全部静默降级**。
  *
- * 背景（规划 §1.7 事实）：**DSH 全树没有桌面通知服务**。
- * `dsh-desktop-notify` 是第三方插件，仍在适配新版、**暂未安装**。
+ * **协议对齐 `dsh-desktop-notify` 1.5.4**（其 README「给其它插件调用」一节）。
+ * 该服务在 1.5.x 把对外 API 从 `push(message, options)` 改成了
+ * **对象载荷** `push({ title, message, urgency, sessionId, url })`：
  *
- * 本轮的处置方式就是这座桥：
- * - 探测不到 → `push()` 返回 `false`，**绝不抛**，`status().detail` 如实写明原因
- * - **零改码自动接上**：`dsh-desktop-notify` 更新后，宿主侧 `ctx.get('desktopNotify')`
- *   能取到，`dsh/` 层把它放进内核服务表；桥在**每次推送时重新解析**
- *   （`deps.resolve`），因此不需要改桥、不需要重启插件，下一次推送就开始工作。
+ * | 方法 | 作用 |
+ * | --- | --- |
+ * | `push(payload)` | 走聚焦门控：只有"你正在看的那个会话"会被静默 |
+ * | `pushAlways(payload)` | 绕过门控，始终推送 |
+ * | `notify(payload)` | 同上但返回明细 `{ ok, queued, silenced, reason }` |
  *
- * 保留旧实现里值得留的三条约束（它们防的是"通知变成噪音"）：
+ * 三条硬约束（实测踩过）：
+ * - **`title` 为空一律 `false` 且不推送**。旧签名的桥只传了正文，
+ *   于是每一条都被拒绝——而桥当时不检查返回值，所以**一条都发不出去却毫无察觉**。
+ * - `title` 上限 160 字符、`message` 上限 400 字符，超出由对方截断（不切断代理对）。
+ * - `sessionId` 可传会话对象/id/数组；**传了才按会话门控**，不传则始终推送。
+ *   本桥按 kind 节流，因此门控交给对方，自己不重复实现。
+ *
+ * 保留的三条抗噪约束：
  * ① 同 kind 30 分钟一次
  * ② 内容去重（**同会话内**同 kind 同内容只发一次；新会话重新计）
  * ③ 会话内上限 10 条
@@ -29,15 +37,32 @@ export const NOTIFY_SESSION_LIMIT = 10
 /** 未显式给会话时的默认键（`push(kind, message)` 仍可直接用）。 */
 export const DEFAULT_NOTIFY_SESSION = 'default'
 
+/** 对方接受的紧急度档位。 */
+export type NotifyUrgency = 'low' | 'normal' | 'critical'
+
+/** 通知载荷。字段名与 `dsh-desktop-notify` 的对外 API 一字不差。 */
+export interface NotifyPayload {
+  /** **必填**。为空时对方一律拒绝并返回 false。 */
+  readonly title: string
+  /** 正文，上限 400 字符（对方截断）。缺省时只显示标题。 */
+  readonly message?: string
+  readonly urgency?: NotifyUrgency
+  /** 传了就按会话门控；不传则始终推送。 */
+  readonly sessionId?: string | readonly string[]
+  /** 点击通知要打开的地址（只接受 http/https）。 */
+  readonly url?: string
+}
+
 /** 宿主 `desktopNotify` 服务的最小结构接口（第三方实现只需对上这个形状）。 */
 export interface DesktopNotifyLike {
-  push?(message: string, options?: unknown): unknown
-  pushAlways?(message: string, options?: unknown): unknown
+  push?(payload: NotifyPayload): unknown
+  pushAlways?(payload: NotifyPayload): unknown
+  notify?(payload: NotifyPayload): unknown
 }
 
 /**
- * 形状探测：既无 `push` 也无 `pushAlways` → 不是通知服务；
- * 声明了但类型不对（如 `push: 1`）→ 也判否（不猜测、不改写）。
+ * 形状探测：三个方法至少要有一个是函数。
+ * 声明了但类型不对（如 `push: 1`）→ 判否（不猜测、不改写）。
  *
  * ⚠️ 数组必须显式排除：`Array.prototype.push` 是函数，光看 `push` 会把
  * 任意数组误认成通知服务，然后"推送成功"却什么也没发。
@@ -46,11 +71,12 @@ export function isDesktopNotifyLike(value: unknown): value is DesktopNotifyLike 
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false
   if (Array.isArray(value)) return false
   const candidate = value as Record<string, unknown>
-  const push = candidate['push']
-  const pushAlways = candidate['pushAlways']
-  if (push !== undefined && typeof push !== 'function') return false
-  if (pushAlways !== undefined && typeof pushAlways !== 'function') return false
-  return typeof push === 'function' || typeof pushAlways === 'function'
+  const methods = ['push', 'pushAlways', 'notify'] as const
+  for (const name of methods) {
+    const method = candidate[name]
+    if (method !== undefined && typeof method !== 'function') return false
+  }
+  return methods.some(name => typeof candidate[name] === 'function')
 }
 
 export interface NotifyBridgeDeps {
@@ -109,15 +135,32 @@ export class NotifyBridge {
 
   /**
    * 推送一条通知。
-   * @returns 是否**真的发出**（false = 未安装/节流/去重/超上限，全部静默）
+   *
+   * @param kind 节流与去重用的类型键（不给人看）。
+   * @param title **必填**——对方对空标题一律拒绝。
+   * @param message 正文（可选）。
+   * @returns 是否**真的发出**（false = 未安装/节流/去重/超上限/对方拒绝，全部静默）
    *
    * **绝不抛异常**：没有任何失败路径能把错误带给调用方。
    */
-  push(kind: string, message: string, sessionId: string = DEFAULT_NOTIFY_SESSION): boolean {
+  push(
+    kind: string,
+    title: string,
+    message?: string,
+    sessionId: string = DEFAULT_NOTIFY_SESSION,
+    urgency: NotifyUrgency = 'normal',
+  ): boolean {
     try {
       const target = this.#target()
       if (target === undefined) {
         this.#suppress(this.#unavailableReason())
+        return false
+      }
+
+      // 对方对空标题一律拒绝并返回 false；在这里就拦掉，省一次调用，
+      // 并把原因写清楚（否则会表现成"静默降级"，看不出是标题的问题）。
+      if (title.trim() === '') {
+        this.#suppress('标题为空——宿主通知服务拒绝空标题的推送')
         return false
       }
 
@@ -130,7 +173,7 @@ export class NotifyBridge {
         return false
       }
 
-      const contentKey = `${kind}\u0000${message}`
+      const contentKey = `${kind}\u0000${title}\u0000${message ?? ''}`
       const sentContents = this.#sentContent.get(sessionId)
       if (sentContents?.has(contentKey) === true) {
         this.#suppress('内容重复（同会话内同类型同内容只发一次）')
@@ -143,18 +186,40 @@ export class NotifyBridge {
         return false
       }
 
-      const send = typeof target.push === 'function' ? target.push : target.pushAlways
+      const send = target.push ?? target.pushAlways ?? target.notify
       if (send === undefined) {
-        this.#suppress('宿主 desktopNotify 形状不匹配（无可调用的 push/pushAlways）')
+        this.#suppress('宿主 desktopNotify 形状不匹配（无可调用的 push/pushAlways/notify）')
         return false
       }
 
-      const returned = send.call(target, message, { kind })
+      // 载荷字段名与对方 API 一字不差。`sessionId` 只在确实有会话时传——
+      // 传了才按会话门控，不传则始终推送（本桥的节流是另一回事）。
+      const payload: NotifyPayload = {
+        title,
+        ...(message === undefined || message === '' ? {} : { message }),
+        urgency,
+        ...(sessionId === DEFAULT_NOTIFY_SESSION ? {} : { sessionId }),
+      }
+      const returned = send.call(target, payload)
+
+      // 异步实现：失败不得变成未处理拒绝，成功与否也无法同步判定，按已入队记账。
       if (isThenable(returned)) {
-        // 异步失败不得变成未处理拒绝；桥只记账，不把失败抛回调用方。
-        void returned.catch((error: unknown) => {
-          this.#deps.logger.warn(`通知：异步推送失败（已静默）——${messageOf(error)}`)
-        })
+        void (returned as Promise<unknown>).then(
+          value => {
+            if (value === false) {
+              this.#deps.logger.warn(`通知：宿主拒绝了推送（异步）——kind=${kind}`)
+            }
+          },
+          (error: unknown) => {
+            this.#deps.logger.warn(`通知：异步推送失败（已静默）——${messageOf(error)}`)
+          },
+        )
+      } else if (returned === false) {
+        // **必须检查返回值**：对方在标题为空、聚焦门控静默、1.5 秒同文案去重、
+        // 或当前平台没有通知后端时都返回 false。旧实现不看返回值，
+        // 于是"一条都没发出去"被记成"已发 N 条"，状态面在骗人。
+        this.#suppress('宿主拒绝了推送（返回 false）：标题为空/聚焦门控静默/同文案去重/无通知后端')
+        return false
       }
 
       this.#lastByKind.set(kind, now)
@@ -182,7 +247,7 @@ export class NotifyBridge {
         lastReason: this.#lastReason,
       }
     }
-    const channel = typeof target.push === 'function' ? 'push' : 'pushAlways'
+    const channel = target.push !== undefined ? 'push' : target.pushAlways !== undefined ? 'pushAlways' : 'notify'
     return {
       available: true,
       detail:
@@ -221,10 +286,10 @@ export class NotifyBridge {
       resolved = undefined
     }
     if (resolved === undefined && this.#deps.notify === undefined) {
-      return '宿主未安装 desktopNotify 服务（dsh-desktop-notify 仍在适配新版）；通知全部静默降级，不影响任何功能'
+      return '宿主未安装 desktopNotify 服务；通知全部静默降级，不影响任何功能'
     }
     const seen = resolved !== undefined ? resolved : this.#deps.notify
-    return `宿主 desktopNotify 形状不匹配（既无 push 也无 pushAlways，实际为 ${typeNameOf(seen)}）；通知全部静默降级`
+    return `宿主 desktopNotify 形状不匹配（push/pushAlways/notify 都不可调用，实际为 ${typeNameOf(seen)}）；通知全部静默降级`
   }
 
   #suppress(reason: string): void {

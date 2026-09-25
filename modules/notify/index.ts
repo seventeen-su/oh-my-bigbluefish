@@ -9,7 +9,7 @@
 import { z } from 'zod'
 import type { Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import { SERVICES } from '../../kernel/abi/index.js'
-import type { DesktopNotifyLike } from './bridge.js'
+import type { DesktopNotifyLike, NotifyUrgency } from './bridge.js'
 import { DEFAULT_NOTIFY_SESSION, NotifyBridge } from './bridge.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
@@ -46,8 +46,19 @@ export const notifyConfigSchema = z
   .default(NOTIFY_DEFAULT_CONFIG)
 
 export interface NotifyService {
-  /** 推送一条通知；返回是否真的发出（探测不到就是 false，绝不抛）。 */
-  push(kind: string, message: string, sessionId?: string): boolean
+  /**
+   * 推送一条通知；返回是否真的发出（探测不到/被宿主拒绝就是 false，绝不抛）。
+   * @param kind 节流与去重用的类型键（不给人看）。
+   * @param title **必填**——宿主对空标题一律拒绝。
+   * @param message 正文，可选。
+   */
+  push(
+    kind: string,
+    title: string,
+    message?: string,
+    sessionId?: string,
+    urgency?: NotifyUrgency,
+  ): boolean
   status(): { readonly available: boolean; readonly detail: string; readonly sent: number; readonly suppressed: number }
 }
 
@@ -95,8 +106,8 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
       bridge = created
 
       const service: NotifyService = {
-        push: (kind, message, sessionId = DEFAULT_NOTIFY_SESSION) =>
-          created.push(kind, message, sessionId),
+        push: (kind, title, message, sessionId = DEFAULT_NOTIFY_SESSION, urgency = 'normal') =>
+          created.push(kind, title, message, sessionId, urgency),
         status: () => {
           const status = created.status()
           return {
@@ -122,7 +133,14 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
         if (!config.notifyModuleFailures) return
         if (previous === undefined || previous === 'failed') return
         if (payload.health.state !== 'failed') return
-        created.push(KERNEL_FAILURE_KIND, `模块 ${payload.id} 运行中失败：${payload.health.detail}`)
+        // 标题给人看、正文放细节：宿主对空标题一律拒绝，且标题过短才看得清。
+        created.push(
+          KERNEL_FAILURE_KIND,
+          `OMB 模块 ${payload.id} 运行中失败`,
+          payload.health.detail,
+          undefined,
+          'critical',
+        )
       })
       kernel.report(health())
 
