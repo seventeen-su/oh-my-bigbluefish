@@ -21,7 +21,6 @@ const STAGE = join(ROOT, 'lib-gen', '.stage')
 const BUILD_ROOT = join(ROOT, 'lib-gen')
 const GENERATION_FILE = join(ROOT, 'build-generation.json')
 const PATCH_FILE = join(ROOT, 'cordis.patch.yml')
-const MANIFEST_FILE = join(ROOT, 'package.json')
 
 /** 行名用的包名（来自清单，不硬编码）。 */
 
@@ -144,7 +143,7 @@ function main() {
   // `meta.title`、说明取自 `meta.description`。
   // 用相对路径时拿不到任何元数据，退回显示完整 `file:///` 路径——用户看不出
   // 哪个开关对应哪个组件，也看不出开的是哪一代产物。
-  writeDisplayMetadata(outDir)
+  writeDisplayMetadata()
 
   // 2d) 行名保持**相对路径**，不改成裸包子路径。
   //
@@ -204,23 +203,6 @@ function readComponentDisplay() {
   return entries
 }
 
-/** 每个组件的产物入口（相对仓库根）。 */
-function componentEntry(outDir, rowId) {
-  const map = {
-    'omb-kernel': `${outDir}/dsh/kernel.js`,
-    'omb-memory': `${outDir}/modules/memory/index.js`,
-    'omb-memory-vector': `${outDir}/modules/memory/vector.js`,
-    'omb-profile': `${outDir}/modules/profile/index.js`,
-    'omb-reasoning': `${outDir}/modules/reasoning/index.js`,
-    'omb-context': `${outDir}/modules/context/index.js`,
-    'omb-artifact': `${outDir}/modules/artifact/module.js`,
-    'omb-notify': `${outDir}/modules/notify/index.js`,
-  }
-  const entry = map[rowId]
-  if (entry === undefined) throw new Error(`[build] 组件 ${rowId} 没有产物入口映射`)
-  return entry
-}
-
 /**
  * 生成 `locale/<组件>/{en,zh}.json`。
  *
@@ -233,7 +215,7 @@ function componentEntry(outDir, rowId) {
  * "failed to import"），所以行名保持相对路径。locale 先备好：
  * 一旦找到让宿主认子路径的办法（或在 DSH 侧支持），直接接上即可。
  */
-function writeDisplayMetadata(outDir) {
+function writeDisplayMetadata() {
   const entries = readComponentDisplay()
   for (const entry of entries) {
     const dir = join(ROOT, 'locale', entry.subpath)
