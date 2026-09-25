@@ -27,6 +27,15 @@ export interface LoadModulesResult {
   readonly modules: readonly ModuleRegistration<unknown>[]
   /** 发现但无法识别的入口，附可读原因。 */
   readonly failures: readonly { readonly path: string; readonly reason: string }[]
+  /**
+   * 非致命但**应当可见**的情形。
+   *
+   * 目前装的是"同一入口同时导出具名注册项与 `default` 包装器"——这是本仓库的
+   * **正常形态**（`default` 供宿主按行加载，具名项供内核原生路径装配），
+   * 所以不是失败；但"挑选规则决定了行为"这件事必须可见，否则同一份代码在
+   * 不同运行时下表现不同而无人察觉（Node ESM 字典序 vs Vite 源码顺序，踩过）。
+   */
+  readonly warnings: readonly string[]
 }
 
 /**
@@ -46,17 +55,27 @@ export interface LoadModulesResult {
  */
 export function pickRegistrations(namespace: unknown): readonly ModuleRegistration<unknown>[] {
   if (typeof namespace !== 'object' || namespace === null) return []
-  const byId = new Map<string, { registration: ModuleRegistration<unknown>; hasApply: boolean }>()
+  const byId = new Map<string, Candidate>()
 
-  for (const value of Object.values(namespace as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(namespace as Record<string, unknown>)) {
     if (!isRegistrationShape(value)) continue
     const id = (value as ModuleRegistration<unknown>).manifest.id
     const hasApply = typeof (value as { apply?: unknown }).apply === 'function'
     const existing = byId.get(id)
-    // 同一 id 下：可运行的注册项优先于只有清单的导出
-    if (existing === undefined || (hasApply && !existing.hasApply)) {
-      byId.set(id, { registration: value as ModuleRegistration<unknown>, hasApply })
-    }
+    // 挑选优先级（三条都必要，各自对应一次真实故障）：
+    // ① 可运行的注册项优先于"裸清单"（vector.ts 同时导出 vectorManifest 与 vectorModule）
+    // ② **具名导出优先于 `default`**：`default` 按约定是宿主插件包装器
+    //    （`toHostPlugin`），它只在"第一参是宿主 ctx"时能工作；而本函数的消费者
+    //    （`mount`/`start`）走内核原生路径，必须拿具名注册项。
+    //    这条踩得很深：Node ESM 的命名空间键是**字典序**，`default` 排在
+    //    `registration`/`vectorModule` 等之前 ⇒ 5 个模块被选中包装器后**静默失效**；
+    //    而 vitest（Vite 按源码顺序建键，`default` 在最后）下**不复现**，
+    //    于是 773 个测试全绿地掩盖了它。
+    // ③ 两条都不满足时保留先到的（顺序稳定，便于诊断）
+    const better = existing === undefined
+      || (hasApply && !existing.hasApply)
+      || (key !== DEFAULT_EXPORT_KEY && existing.key === DEFAULT_EXPORT_KEY)
+    if (better) byId.set(id, { registration: value as ModuleRegistration<unknown>, hasApply, key })
   }
 
   return [...byId.values()]
@@ -66,6 +85,46 @@ export function pickRegistrations(namespace: unknown): readonly ModuleRegistrati
       return left < right ? -1 : left > right ? 1 : 0
     })
     .map(entry => entry.registration)
+}
+
+/** ESM 默认导出的键名。它在命名空间里总是存在，且字典序靠前。 */
+const DEFAULT_EXPORT_KEY = 'default'
+
+/**
+ * 找出「同一 id 有多个可运行注册项」的歧义。
+ *
+ * 用途：把"行为由枚举顺序决定"这件事变成一条可见告警。它不是错误
+ * （挑选规则是确定的），但**必须可见**——否则同一份代码在不同运行时下
+ * 表现不同而无人察觉。
+ */
+/** 该命名空间是否导出了 default。 */
+export function hasDefaultExport(namespace: unknown): boolean {
+  if (typeof namespace !== 'object' || namespace === null) return false
+  return (namespace as Record<string, unknown>)[DEFAULT_EXPORT_KEY] !== undefined
+}
+
+/**
+ * 找出「同一 id 有多个可运行注册项」的歧义。
+ *
+ * 用途：把"行为由枚举顺序决定"这件事变成一条可见告警。它不是错误
+ * （挑选规则是确定的），但**必须可见**——否则同一份代码在不同运行时下
+ * 表现不同而无人察觉。
+ */
+export function ambiguousIds(namespace: unknown): readonly string[] {
+  if (typeof namespace !== 'object' || namespace === null) return []
+  const count = new Map<string, number>()
+  for (const value of Object.values(namespace as Record<string, unknown>)) {
+    if (!isRegistrationShape(value)) continue
+    const id = (value as ModuleRegistration<unknown>).manifest.id
+    count.set(id, (count.get(id) ?? 0) + 1)
+  }
+  return [...count.entries()].filter(([, n]) => n > 1).map(([id]) => id).sort()
+}
+
+interface Candidate {
+  readonly registration: ModuleRegistration<unknown>
+  readonly hasApply: boolean
+  readonly key: string
 }
 
 /** 形状判定：有 `manifest.id`、有 `configSchema.parse`、有 `apply`。 */
@@ -105,15 +164,29 @@ export function isModuleEntry(relPath: string): boolean {
  * **同步纯函数**：异步加载由调用方在 `apply` **之前**完成
  * （见 `moduleEntries.ts` 的顶层静态 import），因此这里没有 await，
  * 也就不存在"apply 返回后异步注册"的风险。
+ *
+ * **歧义会被记成失败**：一个入口导出多个同 id 的可运行注册项时（例如同时有
+ * `default` 包装器与具名注册项），挑选规则决定行为——把这件事**说出来**，
+ * 而不是让它靠枚举顺序静默决定。实测就吃过这个亏（Node ESM 字典序 vs
+ * Vite 源码顺序，导致同一份代码在 tsx 下失效、在 vitest 下正常）。
  */
 export function loadModulesSync(entries: ReadonlyMap<string, unknown>): LoadModulesResult {
   const modules: ModuleRegistration<unknown>[] = []
   const failures: { path: string; reason: string }[] = []
+  const warnings: string[] = []
   const seenIds = new Set<string>()
 
   for (const [path, namespace] of entries) {
     if (!isModuleEntry(path)) continue
     const picked = pickRegistrations(namespace)
+    // 一个入口同时有具名注册项与 default 包装器时，挑选规则决定了用哪个。
+    // 记录**选了哪个**——这是排查"模块静默失效"时唯一有用的信息。
+    if (picked.length > 0 && hasDefaultExport(namespace)) {
+      warnings.push(
+        `${path}：同时导出具名注册项与 default 包装器，已选具名项`
+        + `（${picked.map(r => r.manifest.id).join('、')}）——内核原生路径必须用具名项`,
+      )
+    }
     if (picked.length === 0) {
       failures.push({ path, reason: '入口未导出 ModuleRegistration 形状的对象' })
       continue
@@ -133,5 +206,5 @@ export function loadModulesSync(entries: ReadonlyMap<string, unknown>): LoadModu
   // 比较器三态必须完整（相等返回 0）：返回 1 违反排序契约，
   // V8 的 TimSort 会据此产生未定义行为——实测会**静默丢元素**。
   modules.sort((a, b) => (a.manifest.id < b.manifest.id ? -1 : a.manifest.id > b.manifest.id ? 1 : 0))
-  return { modules, failures }
+  return { modules, failures, warnings }
 }

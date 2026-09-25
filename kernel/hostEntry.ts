@@ -19,7 +19,10 @@
  *
  * 这样同一份模块定义在**两条路径**下都成立，且模块实现一行不改。
  */
+import { createRequire } from 'node:module'
 import type { Kernel, ModuleRegistration } from './abi/index.js'
+
+const require = createRequire(import.meta.url)
 import { SERVICES } from './abi/index.js'
 
 /** `cordis.patch.yml` 的 `name` 指向 `dsh/kernel.ts`。 */
@@ -56,6 +59,61 @@ export const KERNEL_READY_KEY = 'ombReady'
  * 所以：认内核只看一个**自有**标记，其余一律不摸。
  */
 export const KERNEL_MARKER = '__ombKernel'
+
+/**
+ * 内核句柄标记。挂在**句柄**上（不是内核上），供 `toHostPlugin` 拿到 `mount`。
+ *
+ * 为什么不把句柄发布到宿主 ctx：多一个公开服务键就多一处冲突面，
+ * 而模块入口只需要"能挂载自己"这一件事。
+ */
+export const HANDLE_MARKER = '__ombKernelHandle'
+
+/**
+ * 给内核句柄打标记：**把句柄自己挂在句柄上**。
+ *
+ * 模块入口（`toHostPlugin`）靠它拿回 `mount`，从而让模块自报的健康绑定到模块 id。
+ * 不把句柄发布到宿主 ctx——多一个公开服务键就多一处冲突面，
+ * 而模块入口只需要"能挂载自己"这一件事。
+ *
+ * 只写一次这个键：`Object.defineProperty` 默认不可配置，重复写会抛
+ * （踩过一次：先写 `true` 再想改成句柄，第二次静默失败）。
+ */
+export function markKernelHandle(handle: object): void {
+  try {
+    Object.defineProperty(handle, HANDLE_MARKER, { value: handle, enumerable: false })
+  } catch {
+    // 打不上标记时模块入口走"直接调用"退路（健康绑定会丢失，状态面如实显示"未自报"）
+  }
+  // **同时挂到内核对象上**：模型入口拿到的是**内核**（`ctx.get('omb:kernel')` 返回的
+  // 是它），而不是句柄。只挂在句柄上会让 `kernelHandleOf(kernel)` 找不到——
+  // 实测就是这么静默失败的（marker 写在了不同对象上）。
+  const kernel = (handle as { kernel?: unknown }).kernel
+  if (typeof kernel === 'object' && kernel !== null) {
+    try {
+      Object.defineProperty(kernel, HANDLE_MARKER, { value: handle, enumerable: false })
+    } catch {
+      // 同上，退路
+    }
+  }
+}
+
+/** 从内核对象取回内核句柄；不是我们的内核或未打标记时返回 undefined。 */
+export function kernelHandleOf(kernel: unknown): KernelHandleLike | undefined {
+  if (typeof kernel !== 'object' || kernel === null) return undefined
+  try {
+    const candidate = (kernel as Record<string, unknown>)[HANDLE_MARKER]
+    if (typeof candidate !== 'object' || candidate === null) return undefined
+    const mount = (candidate as { mount?: unknown }).mount
+    return typeof mount === 'function' ? (candidate as KernelHandleLike) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** `toHostPlugin` 只需要句柄上的这一个能力——不 import `kernel/index.js`，避免环。 */
+export interface KernelHandleLike {
+  mount(registration: ModuleRegistration<unknown>, hostCtx?: unknown): () => void
+}
 
 /**
  * 等待内核就绪。
@@ -110,6 +168,27 @@ export function isKernel(value: unknown): value is Kernel {
     return (value as Record<string, unknown>)[KERNEL_MARKER] === true
   } catch {
     return false
+  }
+}
+
+/**
+ * 心跳日志（诊断用）。
+ *
+ * 为什么保留：宿主按行加载时，"内核行到底有没有把服务发布出去""模块行有没有
+ * 取到内核"这两件事在宿主内部发生，**不写日志就只能靠推断**——本项目已经因为
+ * 推断宿主 ctx 语义而反复返工。心跳把这条链路变成可读事实。
+ *
+ * 写文件失败一律忽略：诊断不得影响功能。
+ */
+export function heartbeat(stage: string, detail: Record<string, unknown> = {}): void {
+  try {
+    // 动态 import 会变成异步，这里用同步写入；路径固定在仓库根，方便直接查看
+    const line = `${JSON.stringify({ at: new Date().toISOString(), stage, ...detail })}\n`
+     
+    const fs = require('node:fs') as { appendFileSync(p: string, d: string): void }
+    fs.appendFileSync('D:/Program/Oh-My-BigBlueFish/.omb-heartbeat.jsonl', line)
+  } catch {
+    // 诊断失败不影响功能
   }
 }
 
@@ -170,14 +249,42 @@ export function toHostPlugin<T>(registration: ModuleRegistration<T>): {
       let dispose: (() => void) | undefined
       let cancelled = false
       void (async (): Promise<void> => {
-        await waitForKernel(first)
+        const ready = await waitForKernel(first)
         if (cancelled) return
         const kernel = resolveKernel(first)
-        if (kernel === undefined) return // 内核行被禁用：如实不提供能力，不抛
-        const parsed = config ?? registration.manifest.configSchema.parse(undefined)
+        heartbeat('module-apply', {
+          id: registration.manifest.id,
+          ready,
+          kernelFound: kernel !== undefined,
+          hasConfig: config !== undefined,
+        })
+        if (kernel === undefined) {
+          // **不静默**：走不到内核时必须留声。这条曾经是无声 `return`，
+          // 结果 5 个模块"挂载成功但什么都没做"，排查了很久。
+          // 用 stderr 而不是 logger：logger 可能还没建立（内核对不上就是这种情形）。
+          process.stderr.write(
+            `OMB：模块 ${registration.manifest.id} 取不到内核`
+            + `（ready=${String(ready)}）——本行不会提供任何能力。`
+            + '常见原因：patch 行缺 `inject: [\'omb:kernel\']`，或入口用错了导出'
+            + '（具名注册项 vs default 宿主包装器）。\n',
+          )
+          return
+        }
         try {
-          const result = registration.apply(kernel, parsed as T)
-          if (typeof result === 'function') dispose = result
+          // 走 `mount`（若这个内核是我们造的）：它绑定健康上报——`kernel.report`
+          // 自动带上本模块 id——并用 schema 缺省值补全配置、把失败记进健康面。
+          //
+          // **不要**直接 `registration.apply(...)`：那样模块自报的健康会落到
+          // 未绑定 id 的兜底实现上，状态面永远是"已启动（未自报健康）"。
+          const handle = kernelHandleOf(kernel)
+          if (handle !== undefined) {
+            dispose = handle.mount(registration as ModuleRegistration<unknown>, first)
+          } else {
+            // 外来内核（测试替身等）：退回直接调用，但**如实说明**放弃了健康绑定
+            const parsed = config ?? registration.manifest.configSchema.parse(undefined)
+            const result = registration.apply(kernel, parsed as T)
+            if (typeof result === 'function') dispose = result
+          }
         } catch (error) {
           // H-1：启动路径不得把异常抛回宿主
           kernel.logger.warn(

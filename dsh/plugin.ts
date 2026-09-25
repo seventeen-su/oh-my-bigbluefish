@@ -26,7 +26,8 @@
 import { createKernel, type KernelHandle } from '../kernel/index.js'
 import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES, toolsServiceFor } from '../kernel/abi/index.js'
-import { KERNEL_READY_KEY } from '../kernel/hostEntry.js'
+import { KERNEL_READY_KEY, heartbeat } from '../kernel/hostEntry.js'
+import { generationFromUrl } from '../kernel/buildInfo.js'
 import type { HostContextLike } from './host.js'
 import { hostLogger, publishToHost, readService, systemClock } from './host.js'
 import { registerTools, type ToolSpec } from './tools.js'
@@ -95,7 +96,12 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const ready = new Promise<void>(resolve => {
     markReady = resolve
   })
-  publishToHost(ctx, KERNEL_READY_KEY, ready)
+  const readyOk = publishToHost(ctx, KERNEL_READY_KEY, ready)
+  const kernelOk = publishToHost(ctx, SERVICES.kernel, handle.kernel)
+  // **不要在这里读 ctx 的其他属性**：宿主 ctx 受 Cordis Guard 管，
+  // 读任何未 `inject` 的属性都会抛——实测连 `typeof ctx.get` 都抛。
+  // 之前的心跳这么干过，直接把内核行打成"激活失败"。
+  heartbeat('kernel-apply', { readyPublished: readyOk, kernelPublished: kernelOk })
 
   // ── 1) 内核自身发布为服务 + 存储端口 ───────────────────────────────────
   const storageHost = createStorageHost({
@@ -126,17 +132,26 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     },
   ])
 
-  // ── 2) 模块装配（同步发现 + 同步启动）──────────────────────────────────
+  // ── 2) 模块由**宿主 Cordis** 启动，内核不再自己启动 ──────────────────────
+  //
+  // 为什么必须这样（实测教训）：`cordis.patch.yml` 的每个模块行都会被宿主**独立加载**
+  // 并调用其 `apply`。先前内核在 `handle.start()` 里又启动了一遍，于是**每个模块
+  // 被启动两次**——表现为状态面出现两条 `omb-context` 段落、计数器各自独立、
+  // 工具与事件订阅重复注册。
+  //
+  // 依赖顺序由行级 `inject: ['omb:kernel']` 保证：Cordis 会等内核把服务发布出来
+  // 才激活模块行（心跳日志已证实：模块行的 `ready:true, kernelFound:true`）。
+  //
+  // 内核因此**不做模块生命周期管理**——这正是"微内核零业务逻辑"应有的样子：
+  // 它只提供服务总线、事件总线、预算、健康面；谁被加载由宿主决定。
+  //
+  // 仅做**清单核对**：静态清单与 YAML 必须一一对应（契约测试也钉住了这一点）。
   const loaded = loadModulesSync(MODULE_ENTRIES)
   for (const failure of loaded.failures) {
     logger.warn(`OMB：模块入口 ${failure.path} 未装配——${failure.reason}`)
   }
-  // **微内核自己也要作为注册项在场**：`planModules` 的判据是"`requires` 里的 id
-  // 必须在本次 start 的注册集合里"，而微内核是插件本体（不在 `moduleEntries` 里）。
-  // 少了这个 stub，所有 `requires: ['omb-kernel']` 的模块会被整体阻断——
-  // 表现为"插件装上了，但几乎所有功能都不在"，且各自报"缺少必需依赖"。
-  const blocked = handle.start([KERNEL_SELF, ...loaded.modules], configMapOf(), ctx)
-  for (const b of blocked) logger.warn(`OMB：模块 ${b.id} 未启动——${b.reason}`)
+  // 微内核自身在健康面留一行，让"内核有没有起来"与模块一样可见
+  handle.kernel.report({ state: 'ok', detail: `微内核已就绪（产物代数 ${generationFromUrl(import.meta.url) ?? '未知'}）` })
 
   // ── 3) 工具注册（同步；单个失败不影响其余）─────────────────────────────
   const toolsService = readService<{ register(definition: unknown): unknown }>(ctx, 'tools')
@@ -193,13 +208,16 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 }
 
 /**
- * 模块配置表。
+ * 供测试与诊断：把内核包成一个"宿主 ctx 形状"的对象。
  *
- * 目前各模块配置都由 `cordis.patch.yml` 的行 config 提供并**逐行**传给各自插件实例，
- * 因此内核不需要集中配置表（`kernel.start` 的 `configs` 可选）。
+ * 测试要复现**真实路径**（宿主 ctx → `ctx.get('omb:kernel')` → 模块 apply），
+ * 而不是让内核自己启动模块——后者与宿主启动会**重复启动**（实测症状：
+ * 状态面出现两条 `omb-context` 段落、计数器各自独立）。
  */
-function configMapOf(): ReadonlyMap<string, unknown> {
-  return new Map()
+export function testHostContext(handle: KernelHandle): { get(name: string): unknown } {
+  return {
+    get: (name: string) => (name === SERVICES.kernel ? handle.kernel : handle.kernel.service(name)),
+  }
 }
 
 /**

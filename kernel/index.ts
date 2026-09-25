@@ -11,7 +11,7 @@ import { HealthTable } from './health.js'
 import { FocusTable, planModules } from './registry.js'
 import { StatusTable } from './status.js'
 import { adoptContext, type ForeignContextLike } from './adopt.js'
-import { markKernel } from './hostEntry.js'
+import { markKernel, markKernelHandle } from './hostEntry.js'
 import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
@@ -62,6 +62,20 @@ export interface KernelHandle {
     readonly id: string
     readonly reason: string
   }[]
+  /**
+   * 挂载**单个**模块，返回其 disposer。
+   *
+   * 与 `start()` 的分工：`start()` 是"内核按依赖顺序启动一批模块"（离线/测试用）；
+   * `mount()` 是"宿主把一个模块交给我挂载"——**真实宿主路径用这个**
+   * （`cordis.patch.yml` 的每行由宿主独立加载，依赖顺序由行级 `inject` 保证）。
+   *
+   * `hostCtx` 传宿主 ctx：模块读宿主服务（`tools` 等）时经它，其余能力落回内核。
+   */
+  mount(registration: ModuleRegistration<unknown>, hostCtx?: unknown): () => void
+  /**
+   * 造一个把健康上报绑定到指定模块 id 的内核视图（诊断与测试用）。
+   */
+  scopedKernel(id: string, hostCtx?: unknown): Kernel
   /** 健康面快照，供 `omb_status` 使用。 */
   health(): Readonly<Record<string, ModuleHealth>>
   /** 状态面贡献汇总（已按 name 排序渲染）。单个贡献者失败被隔离成一行错误。 */
@@ -160,12 +174,98 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
     clock,
   }
 
+  // 建好就打标记：模块入口靠这个**自有标记**认出"这是内核而不是宿主 ctx"
+  // （见 `hostEntry.ts`）。放在创建处而不是 `start()` 里——模块生命周期归宿主，
+  // `start()` 可能根本不被调用，但"内核身份"必须从存在那刻起就成立。
+  markKernel(kernel)
+
   // `report` 需要一个键：模块把自己的 id 放在 health 之外，
   // 因此这里用"最近一次上报的调用栈之外"的显式键不方便，改由 start 包装。
   // 见 start() 中注入的 per-module report。
 
-  return {
+  /**
+   * 造一个把健康上报绑定到指定模块 id 的内核视图。
+   *
+   * **为什么需要它**：模块调用 `kernel.report(health)` 时不该自己带 id——多一个
+   * 出错点，而且模块无法知道宿主怎么称呼它。视图把这层绑定做掉。
+   */
+  function scopedKernel(id: string, hostCtx?: unknown): Kernel {
+    return adoptContext(
+      (hostCtx ?? {}) as ForeignContextLike,
+      {
+        services: {
+          get: <T,>(name: string) => services.get<T>(name),
+          names: () => services.names(),
+          provide: (name, value) => services.provide(name, value),
+        },
+        on: (event, fn) => bus.on(event, fn),
+        emit: (event, payload) => {
+          if (!disposed) bus.emit(event, payload)
+        },
+        budget: (kind, amount) => budgetTable.grant(kind, amount),
+        pressure: session => kernel.pressure(session),
+        focus: session => kernel.focus(session),
+        setFocus: (session, depth, reason) => kernel.setFocus(session, depth, reason),
+        logger,
+        clock,
+      },
+      health => healthTable.report(id, health),
+    )
+  }
+
+  const handle: KernelHandle = {
     kernel,
+    /**
+     * 挂载单个模块，并返回**绑定好健康上报与配置解析**的挂载函数。
+     *
+     * 与 `start()` 的区别：`start()` 是"内核按依赖顺序启动一批模块"（离线/测试用）；
+     * `mount()` 是"宿主把一个模块交给我挂载"——**真实宿主路径用这个**
+     * （`cordis.patch.yml` 的每行由宿主独立加载，依赖顺序由行级 `inject` 保证）。
+     *
+     * 两者都走同一份 `scopedKernel`，因此模块在两条路径下行为一致——
+     * 这正是"同一份模块定义在哪都能成立"的落点。
+     */
+    mount(registration, hostCtx) {
+      const id = registration.manifest.id
+      const scoped = scopedKernel(id, hostCtx)
+      let config: unknown
+      try {
+        // 配置解析失败与 apply 失败要分开报：两者修法完全不同
+        config = registration.manifest.configSchema.parse(undefined)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        healthTable.report(id, { state: 'failed', detail: `配置解析失败：${message}` })
+        logger.warn(`内核：模块 ${id} 配置解析失败——${message}`)
+        return () => {}
+      }
+      try {
+        const result = registration.apply(scoped, config)
+        // **未自报健康**是可疑信号：模块可能在 apply 里提前 return 了
+        // （例如依赖的服务没拿到）。如实标成 degraded，不假装"启动成功"——
+        // 否则状态面显示"已启动（未自报健康）"，把一次静默失效伪装成正常。
+        if (!healthTable.has(id)) {
+          const registered = services.names().filter(n => n.startsWith('tools:'))
+          // 把"为什么提前返回"也记进日志：状态面只放一句可读原因，
+          // 真正的排查需要知道模块看到了什么（它请求了哪个服务、有没有配置）。
+          logger.warn(
+            `内核：模块 ${id} 已挂载但未自报健康（未注册服务）；`
+            + `宿主 ctx 提供的内核服务=${String(services.get(SERVICES.kernel) !== undefined)}`,
+          )
+          healthTable.report(id, {
+            state: 'degraded',
+            detail: `已挂载但未自报健康——通常表示 apply 提前返回（依赖的服务不可用）；`
+              + `当前工具服务：${registered.length === 0 ? '无' : registered.join('、')}`,
+          })
+        }
+        return typeof result === 'function' ? result : () => {}
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        healthTable.report(id, { state: 'failed', detail: `挂载失败：${message}` })
+        logger.warn(`内核：模块 ${id} 挂载失败——${message}`)
+        return () => {}
+      }
+    },
+    scopedKernel,
     start(modules, configs, hostCtx) {
       // 打标记：模块入口靠这个**自有标记**认出"这是内核而不是宿主 ctx"。
       // 不能用"读几个属性看看"来认——宿主 ctx 是 Proxy，Guard 对未 inject 的
@@ -179,31 +279,14 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       for (const { id, registration } of plan.ordered) {
         // **关键**：`apply` 的第一参必须是我们的 `Kernel` 纯对象，而不是宿主 ctx。
         // 宿主 Cordis 会按它自己的契约传 ctx 代理，而 Guard 对未 `inject` 的属性
-        // 读写直接抛（实测："cannot get property \"clock\" without inject" → 4 个模块
+        // 读写直接抛（实测："cannot get property \"clock\" without inject" → 模块
         // 激活失败，而工具面/提示注入正常，表现为"插件半活"）。
         // 收养把宿主能力逐项取一次后落到纯对象上，且不展开代理（展开会实体化 getter
         // 从而绕过 Guard）。
-        const scoped: Kernel = adoptContext(
-          (hostCtx ?? {}) as ForeignContextLike,
-          {
-            services: {
-              get: <T,>(name: string) => services.get<T>(name),
-              names: () => services.names(),
-              provide: (name, value) => services.provide(name, value),
-            },
-            on: (event, fn) => bus.on(event, fn),
-            emit: (event, payload) => {
-              if (!disposed) bus.emit(event, payload)
-            },
-            budget: (kind, amount) => budgetTable.grant(kind, amount),
-            pressure: session => kernel.pressure(session),
-            focus: session => kernel.focus(session),
-            setFocus: (session, depth, reason) => kernel.setFocus(session, depth, reason as FocusDepth),
-            logger,
-            clock,
-          },
-          health => healthTable.report(id, health),
-        )
+        //
+        // 与 `mount()` 共用同一份 `scopedKernel`：两条路径行为必须一致，
+        // 否则"模块在测试里好好的、在宿主里空转"这类偏差会再次出现。
+        const scoped = scopedKernel(id, hostCtx)
         try {
           const config = registration.manifest.configSchema.parse(configs?.get(id))
           const disposer = registration.apply(scoped, config)
@@ -242,6 +325,10 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       healthTable.report('omb-kernel', { state: 'ok', detail: '内核已注销' })
     },
   }
+  // 句柄上打标记（值就是句柄自己）：模块入口（`hostEntry.ts`）靠它拿到 `mount`，
+  // 从而让模块自报的健康绑定到模块 id。见 `markKernelHandle` 的说明。
+  markKernelHandle(handle)
+  return handle
 }
 
 /** 由 `start` 传入的模块配置。缺省配置在模块 schema 里，这里传 undefined 让其走 defaults。 */

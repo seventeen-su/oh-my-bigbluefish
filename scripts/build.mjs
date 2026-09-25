@@ -12,7 +12,7 @@
  * 用法：`node scripts/build.mjs`
  */
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,6 +24,60 @@ const PATCH_FILE = join(ROOT, 'cordis.patch.yml')
 
 /** 允许被清理的旧代目录名：只匹配我们自己生成的 `g<数字>`，绝不误删别的目录。 */
 const GENERATION_DIR = /^g\d+$/
+
+/** 源码目录（.ts）与产物目录（.js）——用于陈旧检测。 */
+const SOURCE_DIRS = ['kernel', 'modules', 'dsh']
+
+/** 递归找目录下最新的文件 mtime（毫秒）；目录为空返回 0。 */
+function newestMtime(dir, extension) {
+  let newest = 0
+  const walk = current => {
+    let entries
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name)
+      if (entry.isDirectory()) {
+        walk(full)
+      } else if (entry.name.endsWith(extension)) {
+        try {
+          const { mtimeMs } = statSync(full)
+          if (mtimeMs > newest) newest = mtimeMs
+        } catch {
+          // 读不到就跳过，不让诊断本身失败
+        }
+      }
+    }
+  }
+  walk(dir)
+  return newest
+}
+
+/**
+ * 陈旧检测：产物比源码旧就**明确报错**。
+ *
+ * 为什么必须做这一步：我把源码改了却忘了重建，结果装到宿主后跑的是旧产物，
+ * 于是"功能没生效"被误判成代码问题——实际只是没构建。
+ * 这类误判在"改一版装一版"的循环里极易发生，所以要让它响亮地失败。
+ */
+function assertFresh(outDirPath) {
+  const newestSource = Math.max(
+    ...SOURCE_DIRS.map(dir => newestMtime(join(ROOT, dir), '.ts')),
+  )
+  const newestArtifact = newestMtime(outDirPath, '.js')
+  if (newestArtifact === 0) throw new Error(`[build] ${outDirPath} 里没有 .js 产物`)
+  if (newestSource > newestArtifact) {
+    const lag = Math.round((newestSource - newestArtifact) / 1000)
+    throw new Error(
+      `[build] 产物比源码旧 ${lag} 秒——tsc 没产出最新代码。`
+      + `请检查 tsconfig.build.json 的 include/exclude 是否漏了刚改的文件。`,
+    )
+  }
+  return { newestSource, newestArtifact }
+}
 
 function readGeneration() {
   if (!existsSync(GENERATION_FILE)) return { generation: 0, outDir: '' }
@@ -75,10 +129,17 @@ function main() {
   }
   writeFileSync(PATCH_FILE, rewritten)
 
+  // 2b) 陈旧检测：产物必须比源码新
+  const freshness = assertFresh(target)
+
   // 3) 写代数文件（运行期经它核对"现在跑的是哪一代"）
   writeFileSync(
     GENERATION_FILE,
-    `${JSON.stringify({ outDir, generation, builtAt: new Date().toISOString() }, null, 2)}\n`,
+    `${JSON.stringify(
+      { outDir, generation, builtAt: new Date().toISOString(), ...freshness },
+      null,
+      2,
+    )}\n`,
   )
 
   // 4) 清掉更早的代数目录（**只删自己生成的 g<数字>**，不碰别的东西）

@@ -1,5 +1,7 @@
 {
-  "outDir": "lib-gen/g1",
-  "generation": 1,
-  "builtAt": "2026-09-25T18:05:00.616Z"
+  "outDir": "lib-gen/g6",
+  "generation": 6,
+  "builtAt": "2026-09-25T18:19:59.846Z",
+  "newestSource": 1790360361475.4048,
+  "newestArtifact": 1790360399806.4453
 }
