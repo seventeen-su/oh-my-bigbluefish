@@ -140,6 +140,20 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
         name: '桌面通知（omb-notify）',
         render: (): string => {
           try {
+            /**
+             * **渲染前先自报一次健康。**
+             *
+             * 模块行（`## 模块` 段）读的是 `kernel.report()` 的**快照**，而
+             * `kernel.report(health())` 原本只在 `apply` 时调一次——
+             * 于是那一行永远停在启动那一刻。实测踩过：宿主服务后来变得可解析了，
+             * 组件自述（实时读）已经说「已接上」，模块行却还卡在「未安装」，
+             * 同一次输出里两种说法。
+             *
+             * 这里自报是零成本的：`render` 只在 `omb_status` 被调用时跑，
+             * 而 `kernel.report` 正是 `omb_status` 的提供者，必然在场。
+             * 于是两个面在**同一次调用内**读到同一份状态，不可能再分叉。
+             */
+            kernel.report(health())
             const status = created.status()
             const lines = [status.detail]
             if (status.available) {
