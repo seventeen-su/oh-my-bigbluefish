@@ -35,7 +35,7 @@ export const PROFILE_MODULE_ID = 'omb-profile'
 export const PROFILE_SERVICE = SERVICES.profile
 /** 提示贡献服务名：`prompt:<模块 id>`（只输出未裁决冲突，见 `conflictDigest`）。 */
 export const PROFILE_PROMPT_SERVICE = `prompt:${PROFILE_MODULE_ID}`
-export const PROFILE_VERSION = '3.0.0'
+export const PROFILE_VERSION = '3.1.0'
 
 /** 记忆模块提供的服务名（**ABI 契约**，不是本地约定）。 */
 export const MEMORY_STORES_SERVICE = SERVICES.stores

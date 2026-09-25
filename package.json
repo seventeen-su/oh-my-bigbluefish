@@ -1,6 +1,6 @@
 {
   "name": "@omb/plugin",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "description": "OMB v3 通用认知增强：思维链质量 / 记忆库 / 上下文优化三个组件，共 8 个可单独开关的插件行。不限于编程，生活与闲聊同样适用。",

@@ -994,7 +994,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
   const manifest: VectorManifest = {
     id: VECTOR_MODULE_ID,
-    version: '3.0.0',
+    version: '3.1.0',
     // 依赖 `omb-memory`：关掉记忆库，向量通道没有意义（依赖方会标 failed 并写明原因）。
     requires: ['omb-memory'],
     capabilities: ['memory.recall.semantic'],

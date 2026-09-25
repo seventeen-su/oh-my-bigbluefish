@@ -71,7 +71,7 @@ export const inject = ['commands']
 export const KERNEL_SELF: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.0.0',
+    version: '3.1.0',
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health', 'kernel.metrics'],
     configSchema: { parse: (input: unknown) => input ?? {} },

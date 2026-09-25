@@ -17,7 +17,7 @@ import { toHostPlugin } from '../../kernel/hostEntry.js'
 export const NOTIFY_MODULE_ID = 'omb-notify'
 /** 服务名取 ABI 契约里的 `SERVICES.notify`（不是本地约定）。 */
 export const NOTIFY_SERVICE = SERVICES.notify
-export const NOTIFY_VERSION = '3.0.0'
+export const NOTIFY_VERSION = '3.1.0'
 
 /**
  * 宿主服务名。`dsh/` 侧把 `ctx.get('desktopNotify')` 注册进内核服务表后，

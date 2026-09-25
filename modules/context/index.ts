@@ -46,7 +46,7 @@ import { buildStatusPanel, createStatusContributor } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
-export const MODULE_VERSION = '3.0.0'
+export const MODULE_VERSION = '3.1.0'
 
 /** 配置：`cordis.patch.yml` 的 `config` 段。 */
 export interface ContextConfig {
