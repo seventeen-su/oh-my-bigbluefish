@@ -3,9 +3,13 @@
  *
  * 存储形态：每个 scope 一份**确定性 id 的 JSON 文档**
  * （`omb-profile/user`、`omb-profile/project`）。
- * 为什么是文档而不是每条目一条记录：冻结的 `MemoryStore` 只有 `get`/`put`，
+ * 为什么是文档而不是每条目一条记录：`MemoryStore` 只有 `get`/`put`，
  * **没有枚举接口**，逐条写入后无法读回全部条目。用一份文档 + 确定性 id，
  * 只需 `get`/`put` 两个方法，不依赖任何未冻结的接口。
+ *
+ * 取库方式遵循 ABI（`kernel/abi/storage.ts` 的 `StoresService`）：
+ * `forSession(sessionId)` / `forProject(cwd)` → `StoreSet | undefined`，**异步且可能未就绪**。
+ * 本项目画像因此不假设"库一定在"：解析失败一律降级为可读原因。
  *
  * 路由（§5.8 + 任务约定）：
  * - `intent` 轴 → **项目库**（意图是项目相关的）
@@ -20,28 +24,34 @@ import { MEMORY_SCOPES, RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js
 import type { ProfileEntry } from './entries.js'
 import { decodeDocument, fnv1a, serializeDocument } from './entries.js'
 
-/**
- * 只用到 `get`/`put` 的窄端口。
- * 真实的 `StoreSet`（`kernel/abi/storage.ts`）在结构上可直接传入
- * （`projectScope` 是可选读取项：有就用它当记录的项目来源标注）。
- */
+/** 只用到 `get`/`put` 的窄端口（`MemoryStore` 的形状子集）。 */
 export interface ProfileStorePort {
   put(record: MemoryRecord): Promise<void>
   get(id: string): Promise<MemoryRecord | undefined>
 }
 
-export interface ProfileStoresPort {
+/** 一套库的窄端口（ABI `StoreSet` 的形状子集）。 */
+export interface ProfileStoreSetPort {
   store(scope: MemoryScope): ProfileStorePort | undefined
   /** 项目库对应的规范化 cwd（ABI 的 `StoreSet.projectScope`）；用户库专属套件为 null。 */
   readonly projectScope?: string | null
 }
 
 /**
- * 服务可以按需解析（兼容热插拔：记忆模块可能在画像之后加载，或被卸载后重载）。
+ * `stores` 服务的窄端口（ABI `StoresService` 的形状子集）。
+ *
+ * **异步**是契约的一部分：`apply` 里只能同步 provide，真正打开库是异步的，
+ * 因此 `forSession`/`forProject` 可能返回 undefined——调用方必须能降级。
  */
+export interface ProfileStoresServicePort {
+  forSession(sessionId: string): Promise<ProfileStoreSetPort | undefined>
+  forProject?(cwd: string): Promise<ProfileStoreSetPort | undefined>
+}
+
+/** 服务可以按需解析（兼容热插拔：记忆模块可能在画像之后加载，或被卸载后重载）。 */
 export type ProfileStoresProvider =
-  | ProfileStoresPort
-  | (() => ProfileStoresPort | undefined)
+  | ProfileStoresServicePort
+  | (() => ProfileStoresServicePort | undefined)
   | undefined
 
 export const PROFILE_DOC_ID_PREFIX = 'omb-profile'
@@ -77,13 +87,11 @@ export interface ProfileStorageDeps {
   readonly stores: ProfileStoresProvider
   readonly clock: Clock
   readonly logger: Logger
-  /** 项目名（来源标注）；未知传 null。可用 `setProject` 在会话建立后补齐。 */
-  readonly project?: string | null
 }
 
 export interface ProfileLoadResult {
   readonly entries: readonly ProfileEntry[]
-  /** 可读的降级原因；全部正常时为 null。 */
+  /** 可读的读取失败原因（异常/损坏）；正常为 null。 */
   readonly error: string | null
 }
 
@@ -116,43 +124,53 @@ export class ProfileStorage {
   }
 
   readonly #deps: ProfileStorageDeps
-  #project: string | null
+  /** 当前会话（由模块订阅 `turn/start` 维护）。 */
+  #sessionId = ''
+  /** 显式 cwd 覆盖（可选）；设置后优先于会话映射。 */
+  #project: string | null = null
+  /** 最近一次取库结果，供**同步**的健康面读取（取库本身是异步的）。 */
+  #resolved = false
+  #lastResolve: ProfileAvailability = {
+    ok: false,
+    detail: '尚未解析记忆库（还没有读写请求）',
+  }
 
   constructor(deps: ProfileStorageDeps) {
     this.#deps = deps
-    this.#project = deps.project ?? null
   }
 
+  /** 记下当前会话：取库走 `stores.forSession(sessionId)`。 */
+  setSession(sessionId: string): void {
+    this.#sessionId = sessionId
+  }
+
+  /** 显式指定项目 cwd（优先于会话映射；null = 回到按会话解析）。 */
   setProject(project: string | null): void {
     this.#project = project
   }
 
-  /** 记忆库是否可用。**取不到时给出可读原因**，不抛。 */
+  /**
+   * 记忆库最近一次解析结果。**同步**，原因必填。
+   *
+   * 还没有发起过读写时只做**同步探测**（服务在不在），不假装知道库是否就绪。
+   */
   availability(): ProfileAvailability {
-    const stores = this.#resolveStores()
-    if (stores === undefined) {
-      return { ok: false, detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）' }
-    }
-    const missing: MemoryScope[] = []
-    for (const scope of MEMORY_SCOPES) {
-      if (stores.store(scope) === undefined) missing.push(scope)
-    }
-    if (missing.length > 0) {
-      return { ok: false, detail: `记忆库缺少 ${missing.join('、')} 库（该库未打开）` }
-    }
-    return { ok: true, detail: `记忆库可用（${MEMORY_SCOPES.join('、')} 双库）` }
+    if (this.#resolved) return this.#lastResolve
+    return this.#resolveService() === undefined
+      ? { ok: false, detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）' }
+      : { ok: true, detail: '记忆库服务已就绪（尚未发起读写，库状态未探明）' }
   }
 
-  /** 读取两个库里的画像文档。任何失败都变成可读错误。 */
+  /** 读取两个库里的画像文档。任何读取失败都变成可读错误。 */
   async load(): Promise<ProfileLoadResult> {
+    const set = await this.#resolveSet()
+    if (set === undefined) return { entries: [], error: this.#lastResolve.detail }
+
     const entries: ProfileEntry[] = []
     const errors: string[] = []
     for (const scope of MEMORY_SCOPES) {
-      const store = this.#storeFor(scope)
-      if (store === undefined) {
-        errors.push(`${scope} 库不可用：${this.#missingReason(scope)}`)
-        continue
-      }
+      const store = this.#storeOf(set, scope)
+      if (store === undefined) continue // 缺库不算读失败：由 availability() 如实说明
       let record: MemoryRecord | undefined
       try {
         record = await store.get(profileDocId(scope))
@@ -186,13 +204,23 @@ export class ProfileStorage {
       )
     }
 
+    const set = await this.#resolveSet()
+    if (set === undefined) {
+      return {
+        ok: false,
+        documentsWritten: 0,
+        capabilitySkipped,
+        error: this.#lastResolve.detail,
+      }
+    }
+
     const errors: string[] = []
     let documentsWritten = 0
     for (const scope of MEMORY_SCOPES) {
       const scoped = admitted.filter(entry => scopeOfEntry(entry) === scope)
-      const store = this.#storeFor(scope)
+      const store = this.#storeOf(set, scope)
       if (store === undefined) {
-        if (scoped.length > 0) errors.push(`${scope} 库不可用：${this.#missingReason(scope)}`)
+        if (scoped.length > 0) errors.push(`${scope} 库不可用：${this.#lastResolve.detail}`)
         continue
       }
 
@@ -209,7 +237,7 @@ export class ProfileStorage {
       if (existing === undefined && scoped.length === 0) continue
 
       try {
-        await store.put(this.#toRecord(scope, scoped, text))
+        await store.put(this.#toRecord(scope, scoped, text, set))
         documentsWritten += 1
       } catch (error) {
         errors.push(`${scope} 库写入失败：${messageOf(error)}`)
@@ -224,7 +252,7 @@ export class ProfileStorage {
     }
   }
 
-  #resolveStores(): ProfileStoresPort | undefined {
+  #resolveService(): ProfileStoresServicePort | undefined {
     const provider = this.#deps.stores
     if (provider === undefined) return undefined
     try {
@@ -235,24 +263,79 @@ export class ProfileStorage {
     }
   }
 
-  #storeFor(scope: MemoryScope): ProfileStorePort | undefined {
-    const stores = this.#resolveStores()
-    if (stores === undefined) return undefined
+  /** 取库。**绝不抛**：失败写进 `#lastResolve` 并返回 undefined。 */
+  async #resolveSet(): Promise<ProfileStoreSetPort | undefined> {
+    this.#resolved = true // 从这里开始，availability() 报真实解析结果而不是探测值
+    const service = this.#resolveService()
+    if (service === undefined) {
+      this.#lastResolve = {
+        ok: false,
+        detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）',
+      }
+      return undefined
+    }
+
     try {
-      return stores.store(scope)
+      let set: ProfileStoreSetPort | undefined
+      if (this.#project !== null && typeof service.forProject === 'function') {
+        set = await service.forProject(this.#project)
+      } else {
+        // 会话未登记 cwd 时，记忆侧会降级为"仅用户库"（projectScope = null）——
+        // 显式条目仍可读写，项目条目会如实报"项目库不可用"。
+        set = await service.forSession(this.#sessionId)
+      }
+      if (set === undefined) {
+        this.#lastResolve = {
+          ok: false,
+          detail:
+            this.#project !== null
+              ? `项目库打开失败或未就绪（cwd=${this.#project}）`
+              : '记忆库尚未就绪（stores.forSession 返回 undefined）',
+        }
+        return undefined
+      }
+      this.#noteSet(set)
+      return set
+    } catch (error) {
+      this.#lastResolve = { ok: false, detail: `取记忆库失败：${messageOf(error)}` }
+      return undefined
+    }
+  }
+
+  #noteSet(set: ProfileStoreSetPort): void {
+    const missing: MemoryScope[] = []
+    for (const scope of MEMORY_SCOPES) {
+      if (this.#storeOf(set, scope) === undefined) missing.push(scope)
+    }
+    if (missing.length === 0) {
+      this.#lastResolve = { ok: true, detail: `记忆库可用（${MEMORY_SCOPES.join('、')} 双库）` }
+      return
+    }
+    this.#lastResolve = {
+      ok: false,
+      detail:
+        `记忆库缺少 ${missing.join('、')} 库` +
+        (missing.includes('project')
+          ? '：宿主尚未告知该会话的 cwd（记忆侧按契约降级为仅用户库）'
+          : '（该库未打开）'),
+    }
+  }
+
+  #storeOf(set: ProfileStoreSetPort, scope: MemoryScope): ProfileStorePort | undefined {
+    try {
+      return set.store(scope)
     } catch (error) {
       this.#deps.logger.warn(`画像：取 ${scope} 库失败——${messageOf(error)}`)
       return undefined
     }
   }
 
-  #missingReason(scope: MemoryScope): string {
-    const stores = this.#resolveStores()
-    if (stores === undefined) return '内核服务 stores 不可用（omb-memory 未加载或已卸载）'
-    return `${scope} 库未打开`
-  }
-
-  #toRecord(scope: MemoryScope, entries: readonly ProfileEntry[], text: string): MemoryRecord {
+  #toRecord(
+    scope: MemoryScope,
+    entries: readonly ProfileEntry[],
+    text: string,
+    set: ProfileStoreSetPort,
+  ): MemoryRecord {
     const now = this.#deps.clock.now()
     return {
       id: profileDocId(scope),
@@ -269,15 +352,14 @@ export class ProfileStorage {
       supersededBy: null,
       lastUsedAt: now,
       useCount: 0,
-      project: scope === 'project' ? this.#projectName() : null,
+      project: scope === 'project' ? this.#projectName(set) : null,
     }
   }
 
-  /** 项目来源标注：显式设置优先；否则取记忆套件声明的 `projectScope`（规范化 cwd）。 */
-  #projectName(): string | null {
+  /** 项目来源标注：显式 cwd 优先；否则取套件声明的 `projectScope`。 */
+  #projectName(set: ProfileStoreSetPort): string | null {
     if (this.#project !== null) return this.#project
-    const stores = this.#resolveStores()
-    const projectScope = stores?.projectScope
+    const projectScope = set.projectScope
     return typeof projectScope === 'string' && projectScope.length > 0 ? projectScope : null
   }
 }

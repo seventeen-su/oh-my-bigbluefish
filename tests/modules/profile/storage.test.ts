@@ -1,11 +1,12 @@
 /**
- * 画像落盘测试：**经 omb-memory 的窄端口**（get/put），不自己开数据库。
+ * 画像落盘测试：**经 omb-memory 的服务**（`stores.forSession/forProject` → `StoreSet`），
+ * 不自己开数据库。
  *
  * 关键断言：
  * ① 路由正确（显式 → 用户库；intent / 推断 → 项目库）
  * ② 能力轴**结构性拒绝落盘**（D4）
  * ③ `sourceRef` 用 ABI 保留前缀（离线整合据此跳过）
- * ④ 一切失败返回可读错误，绝不抛
+ * ④ 取库失败/缺库/写入失败都返回可读错误，绝不抛
  * ⑤ 内容未变不重复写
  */
 import { describe, expect, it } from 'vitest'
@@ -26,13 +27,8 @@ function entry(partial: Partial<ProfileEntry> & { value: string }): ProfileEntry
   return { axis: 'stable', key: 'k', provenance: 'declared', evidence: [], updated: 1, ...partial }
 }
 
-function storageWith(stores: unknown, project: string | null = null): ProfileStorage {
-  return new ProfileStorage({
-    stores: stores as never,
-    clock: fakeClock(),
-    logger: silent,
-    project,
-  })
+function storageWith(stores: unknown): ProfileStorage {
+  return new ProfileStorage({ stores: stores as never, clock: fakeClock(), logger: silent })
 }
 
 describe('scopeOfEntry：位置即权威', () => {
@@ -154,6 +150,47 @@ describe('save：路由与记录字段', () => {
   })
 })
 
+describe('取库：会话 → cwd → 套件（异步、可能未就绪）', () => {
+  it('无会话信息时用空会话 id 取库（记忆侧降级为仅用户库），并如实记录原因', async () => {
+    const stores = new FakeStores()
+    stores.userOnly = true
+    const storage = storageWith(stores)
+    await storage.load()
+    expect(stores.sessionCalls).toEqual([''])
+    expect(storage.availability().ok).toBe(false)
+    expect(storage.availability().detail).toContain('缺少 project 库')
+    expect(storage.availability().detail).toContain('cwd')
+  })
+
+  it('setSession 后按会话取库；显式 setProject 时按 cwd 取库', async () => {
+    const stores = new FakeStores()
+    const storage = storageWith(stores)
+
+    storage.setSession('s1')
+    await storage.load()
+    expect(stores.sessionCalls).toEqual(['s1'])
+
+    storage.setProject('D:/proj/x')
+    await storage.load()
+    expect(stores.projectCalls).toEqual(['D:/proj/x'])
+    expect(stores.projectCalls).toHaveLength(1)
+  })
+
+  it('只有用户库时，项目条目写入失败但用户条目照写（不静默）', async () => {
+    const stores = new FakeStores()
+    stores.userOnly = true
+    const storage = storageWith(stores)
+    const result = await storage.save([
+      entry({ value: '简洁' }),
+      entry({ axis: 'intent', key: 'goal', value: '重构' }),
+    ])
+    expect(stores.user.putCalls).toHaveLength(1)
+    expect(stores.project.putCalls).toHaveLength(0)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('project 库不可用')
+  })
+})
+
 describe('load / save：失败都返回可读错误，绝不抛', () => {
   it('没有 stores 服务 → 可读原因，且 load 返回空', async () => {
     const storage = storageWith(undefined)
@@ -168,11 +205,24 @@ describe('load / save：失败都返回可读错误，绝不抛', () => {
     expect(saved.error).toContain('stores 不可用')
   })
 
-  it('库未打开（store 返回 undefined）→ 可读原因', async () => {
-    const storage = storageWith({ store: () => undefined })
-    expect(storage.availability().detail).toContain('缺少')
+  it('服务存在但库未就绪（forSession 返回 undefined）→ 可读原因', async () => {
+    const storage = storageWith({
+      forSession: async () => undefined,
+    })
     const loaded = await storage.load()
-    expect(loaded.error).toContain('库不可用')
+    expect(loaded.error).toContain('尚未就绪')
+    expect(storage.availability().detail).toContain('尚未就绪')
+  })
+
+  it('forSession 抛异常 → 可读错误，不向上抛', async () => {
+    const storage = storageWith({
+      forSession: async () => {
+        throw new Error('打不开')
+      },
+    })
+    const loaded = await storage.load()
+    expect(loaded.error).toContain('打不开')
+    expect(loaded.entries).toEqual([])
   })
 
   it('put 抛异常 → ok=false 且原因可读，不向上抛', async () => {
@@ -220,7 +270,7 @@ describe('load / save：失败都返回可读错误，绝不抛', () => {
 })
 
 describe('项目来源', () => {
-  it('显式 setProject 覆盖 projectScope', async () => {
+  it('显式 setProject 覆盖 projectScope 并作为记录来源', async () => {
     const stores = new FakeStores()
     stores.projectScope = 'D:/from-stores'
     const storage = storageWith(stores)
@@ -229,11 +279,13 @@ describe('项目来源', () => {
     expect(stores.project.putCalls[0]?.project).toBe('D:/explicit')
   })
 
-  it('解析 stores 抛异常时降级为"不可用"，不抛', () => {
+  it('解析 stores 抛异常时降级为"不可用"，不抛', async () => {
     const storage = storageWith(() => {
       throw new Error('解析失败')
     })
     expect(() => storage.availability()).not.toThrow()
     expect(storage.availability().ok).toBe(false)
+    const loaded = await storage.load()
+    expect(loaded.error).toContain('stores 不可用')
   })
 })
