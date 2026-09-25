@@ -63,7 +63,18 @@ function tokensOf(text: string): readonly string[] {
     .filter(token => token.length > 0)
 }
 
-/** 相关性打分。**词法相关，不做"最近即相关"的替换**。 */
+/**
+ * 相关性打分。**词法相关，不做"最近即相关"的替换**。
+ *
+ * 打分分档（从精确到宽松）：
+ * 1. 整条路径相等 → 100
+ * 2. 文件名相等 / 路径以 `/<query>` 结尾 → 70
+ * 3. **含分隔符的路径片段或 CJK** → 允许整串包含（这两类没有可用的词边界）
+ * 4. 其余情况要求**词元相等**
+ *
+ * 为什么第 3 档要限定条件：`does-not-exist` 曾因 `notes` 里含 `not` 而命中
+ * `docs/notes.md`——"看起来沾边"和"最近"一样是假召回。精度优先于召回（§5.1）。
+ */
 function relevance(entry: ArtifactEntry, query: string, queryTokens: readonly string[]): number {
   const path = matchPath(entry.path)
   const wanted = matchPath(query)
@@ -71,11 +82,12 @@ function relevance(entry: ArtifactEntry, query: string, queryTokens: readonly st
   if (path === wanted) return 100
   const base = basename(path)
   if (base === wanted || path.endsWith(`/${wanted}`)) return 70
-  if (base.includes(wanted)) return 50
-  if (path.includes(wanted)) return 30
+  // 无词边界的查询（路径片段 / CJK）才允许整串包含
+  if ((wanted.includes('/') || /[^\u0000-\u007F]/.test(wanted)) && path.includes(wanted)) return 40
+  const pathTokens = new Set(tokensOf(path))
   let hits = 0
   for (const token of queryTokens) {
-    if (path.includes(token)) hits += 1
+    if (pathTokens.has(token)) hits += 1
   }
   return hits > 0 ? 10 + hits : 0
 }
