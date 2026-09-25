@@ -1,7 +1,0 @@
-{
-  "id": "bench:code-03",
-  "category": "code",
-  "prompt": "实现函数 fizzbuzz(n)：返回 1..n 的字符串数组，3 的倍数替换为 'Fizz'，5 的倍数为 'Buzz'，15 的倍数为 'FizzBuzz'。",
-  "fixture_ref": "code-03.fixture.json",
-  "verifier": { "kind": "tests", "ref": "code-03.fixture.json", "expected_pass": 4 }
-}

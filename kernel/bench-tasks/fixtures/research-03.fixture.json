@@ -1,5 +1,0 @@
-{
-  "output": "OMB v2 的记忆存储默认后端为 SQLite（WAL 单写者），全文检索采用 FTS5（BM25）。",
-  "cost": { "model_tokens": 1760, "tool_calls": 3, "retrieval_calls": 2, "reacquisition": 1, "latency_ms": 5830, "branch_count": 1, "memory_pollution": 1, "corrections": 0 },
-  "rubric": { "required_terms": ["SQLite", "FTS5"] }
-}

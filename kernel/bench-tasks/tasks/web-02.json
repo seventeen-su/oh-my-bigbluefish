@@ -1,7 +1,0 @@
-{
-  "id": "bench:web-02",
-  "category": "web",
-  "prompt": "空表单提交（离线 fixture 模拟）：校验错误列表 errors 必须包含 '请填写必填项'。",
-  "fixture_ref": "web-02.fixture.json",
-  "verifier": { "kind": "predicate", "ref": "web-02.fixture.json" }
-}

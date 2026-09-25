@@ -1,9 +1,0 @@
-{
-  "output": { "title": "OMB v2 文档中心", "nav": { "items": ["首页", "文档", "关于"] }, "count": 3 },
-  "cost": { "model_tokens": 1560, "tool_calls": 9, "retrieval_calls": 2, "reacquisition": 1, "latency_ms": 5120, "branch_count": 3, "memory_pollution": 0, "corrections": 1 },
-  "predicates": [
-    { "path": "title", "matches": "OMB" },
-    { "path": "nav.items", "contains": "文档" },
-    { "path": "count", "equals": 3 }
-  ]
-}

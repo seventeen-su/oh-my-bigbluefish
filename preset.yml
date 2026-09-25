@@ -1,3 +1,0 @@
-# OMB v2 preset 显示元数据（DSH agent-presets 读取；id 来自目录名，不可在此写）
-name: 大肥鱼模式 v2
-description: OMB v2 认知增强 preset（三线版本切换 /mode initial|stable|latest；默认 stable）

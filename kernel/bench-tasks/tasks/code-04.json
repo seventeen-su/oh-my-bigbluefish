@@ -1,7 +1,0 @@
-{
-  "id": "bench:code-04",
-  "category": "code",
-  "prompt": "实现函数 deepClone(obj)：深拷贝任意 JSON 兼容对象（数组/嵌套对象/基本类型），不改动原对象。",
-  "fixture_ref": "code-04.fixture.json",
-  "verifier": { "kind": "tests", "ref": "code-04.fixture.json", "expected_pass": 5 }
-}

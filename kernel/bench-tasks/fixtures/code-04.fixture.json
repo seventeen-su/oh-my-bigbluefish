@@ -1,5 +1,0 @@
-{
-  "output": { "passed": 5, "failed": 0, "total": 5 },
-  "cost": { "model_tokens": 1340, "tool_calls": 8, "retrieval_calls": 1, "reacquisition": 1, "latency_ms": 4210, "branch_count": 2, "memory_pollution": 0, "corrections": 2 },
-  "total": 5
-}

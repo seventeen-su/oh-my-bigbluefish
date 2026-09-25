@@ -1,7 +1,0 @@
-{
-  "output": { "errors": ["请填写必填项", "邮箱格式不正确"] },
-  "cost": { "model_tokens": 1180, "tool_calls": 7, "retrieval_calls": 1, "reacquisition": 0, "latency_ms": 4360, "branch_count": 2, "memory_pollution": 0, "corrections": 0 },
-  "predicates": [
-    { "path": "errors", "contains": "请填写必填项" }
-  ]
-}

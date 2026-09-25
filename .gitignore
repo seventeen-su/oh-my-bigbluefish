@@ -4,9 +4,12 @@ lib/
 dist/
 *.tsbuildinfo
 
-# 认知运行时目录（不跟踪不提交）
+# 认知运行时数据（双库 + 制品索引等），不跟踪不提交
 .omb/
-.superpowers/
+
+# 嵌入权重：BGE-small-zh-v1.5 约 23GB（含 .onnx_data），绝不入库
+# 用 scripts/fetch-embedding-model.ts 获取
+models/
 
 # 日志与临时文件
 *.log
@@ -17,10 +20,3 @@ Thumbs.db
 .env
 .env.*
 !.env.example
-
-# 三线 git 布局运行时产物
-versions.git/
-stable/
-latest/
-workspace/.omb/
-workspace/selfcheck/

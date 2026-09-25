@@ -1,7 +1,0 @@
-{
-  "id": "bench:research-02",
-  "category": "research",
-  "prompt": "比较方案A 与方案B（固定语料）：回答必须提及两个方案并给出取舍结论（离线规则化 judge 判定）。",
-  "fixture_ref": "research-02.fixture.json",
-  "verifier": { "kind": "blind_judge", "ref": "research-02.fixture.json" }
-}

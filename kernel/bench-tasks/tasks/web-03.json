@@ -1,7 +1,0 @@
-{
-  "id": "bench:web-03",
-  "category": "web",
-  "prompt": "搜索 'benchmark'（离线 fixture 模拟）：结果区 results.count 必须 = 3（非空结果页）。",
-  "fixture_ref": "web-03.fixture.json",
-  "verifier": { "kind": "predicate", "ref": "web-03.fixture.json" }
-}

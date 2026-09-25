@@ -1,7 +1,0 @@
-{
-  "id": "bench:web-01",
-  "category": "web",
-  "prompt": "打开首页（离线 fixture 模拟 DOM）：页面标题必须含 'OMB'，导航栏必须含 '文档' 链接，导航项总数 = 3。",
-  "fixture_ref": "web-01.fixture.json",
-  "verifier": { "kind": "predicate", "ref": "web-01.fixture.json" }
-}
