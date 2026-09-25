@@ -85,7 +85,23 @@ export type AdmissionDecision =
     }
   | { readonly ok: false; readonly reason: string }
 
-/** "可由具体工件复现"的可核对标记。命中即说明这条挂在某个具体东西上，不是模糊印象。 */
+/**
+ * "可由具体工件复现"的可核对标记。命中即说明这条挂在某个具体东西上，不是模糊印象。
+ *
+ * ## 判据只对**正文**生效，不看 `sourceRef`
+ *
+ * 踩过的坑：原先匹配的是 `正文 + sourceRef`，而 `sourceRef` 在省略时由工具
+ * 自动生成成 `session:<uuid>#turn-N`。于是
+ *
+ * ```
+ * 正文：今天感觉还不错，学到了很多东西。        ← 不含任何工件
+ * 命中：提交哈希（"90730570"）                 ← 其实是 UUID 的一段
+ * ```
+ *
+ * 模糊内容被**当成可复现事实收下**——准入网在这个类别上直接漏。
+ * 教训：`sourceRef` 是**溯源**（这条从哪来），不是**可复现工件**（这条凭什么能被验证）；
+ * 拿它当依据等于让工具自己给自己发合格证。
+ */
 const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: string }[] = [
   { pattern: /(?:^|[\s("'`])[A-Za-z]:\\/, label: 'Windows 路径' },
   { pattern: /(?:^|[\s("'`])(?:\.{0,2}\/)[\w.-]+\//, label: '文件路径' },
@@ -96,7 +112,24 @@ const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: str
   },
   { pattern: /#L\d+|\bline\s*\d+\b|\b\d+:\d+\b/, label: '行号' },
   { pattern: /https?:\/\/\S+/, label: 'URL' },
-  { pattern: /\b[0-9a-f]{7,40}\b/, label: '提交哈希' },
+  /**
+   * 提交哈希。**不能用裸 `\b[0-9a-f]{7,40}\b`**：UUID 的每一段（8 位十六进制）
+   * 都符合，于是任何自动生成的 `session:<uuid>` 溯源都会命中——实测就是这样
+   * 把一句"今天感觉还不错"当成"命中提交哈希"收进来的。
+   *
+   * 而且**形态上无法区分**裸短哈希与标识符片段：
+   * `a1b2c3d4`（短哈希）与 `mem_muhg9mlv_1_3c6bf8ae` 的尾段长得一模一样。
+   * 所以短哈希一律要求**显式语境**；只有 ≥12 位才认裸写
+   * （12 位以上就不是 UUID 段或常见 id 尾段了）。
+   *
+   * 取舍是**宁可漏，不错收**：漏了只是让用户补个 `commit:` 前缀重写；
+   * 错收的代价是假事实进库，并被后续会话当成有效结论召回——那比漏更贵。
+   */
+  {
+    pattern:
+      /\b[0-9a-f]{40}\b|\b(?:commit|hash|sha|revision)\W{0,3}[0-9a-f]{7,40}\b|@[0-9a-f]{7,40}\b|\b[0-9a-f]{12,40}\b/i,
+    label: '提交哈希',
+  },
   { pattern: /\bv?\d+\.\d+(?:\.\d+)*\b/, label: '版本号' },
   {
     pattern:
@@ -203,8 +236,12 @@ export function decideAdmission(input: AdmissionInput): AdmissionDecision {
   }
 
   // ② 可由具体工件复现
-  const haystack = `${trimmed}\n${input.sourceRef}`
-  const marker = ARTIFACT_MARKERS.find(candidate => candidate.pattern.test(haystack))
+  //
+  // **只看正文**，不看 `sourceRef`：`sourceRef` 是溯源（这条从哪来），不是
+  // 可复现工件（这条凭什么能被验证）。把它算进判据，等于让工具用自己自动生成的
+  // `session:<uuid>#turn-N` 给自己发合格证——实测就是这样把一句模糊感想收下的
+  // （UUID 的一段 8 位十六进制命中了"提交哈希"）。
+  const marker = ARTIFACT_MARKERS.find(candidate => candidate.pattern.test(trimmed))
   if (marker !== undefined) {
     return {
       ok: true,
