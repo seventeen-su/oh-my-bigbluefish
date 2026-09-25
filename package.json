@@ -3,7 +3,7 @@
   "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "OMB v3 —— DSH 通用认知增强插件（思维链质量 / 记忆 / 上下文优化）",
+  "description": "OMB v3 —— DSH 通用认知增强插件（包装配包：一份 profile 补丁 + 8 个组件包）",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -18,6 +18,14 @@
     "verify": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "dependencies": {
+    "@omb/artifact": "workspace:*",
+    "@omb/context": "workspace:*",
+    "@omb/kernel": "workspace:*",
+    "@omb/memory": "workspace:*",
+    "@omb/memory-vector": "workspace:*",
+    "@omb/notify": "workspace:*",
+    "@omb/profile": "workspace:*",
+    "@omb/reasoning": "workspace:*",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
@@ -33,6 +41,7 @@
   },
   "files": [
     "lib-gen",
+    "packages",
     "cordis.patch.yml",
     "build-generation.json"
   ]

@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Microkernel",
-    "description": "Plugin body and required row: service bus, event bus, health, status surface, tool registration gateway."
-  }
-}

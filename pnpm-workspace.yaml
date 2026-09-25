@@ -1,3 +1,13 @@
+# pnpm workspace：根包是**装配包**（`dsh.bundle.patch` 指向 cordis.patch.yml，
+# profile 装的就是它），8 个组件包各自是一个独立顶层包（`@omb/<组件>`）。
+#
+# 为什么组件必须是独立顶层包：插件页的中文名只能经 DSH 的本地化元数据拿到，
+# 而那条路只对**裸包名**生效（`packages/boot/app-boot/src/package-meta.ts:148`）；
+# 「裸包名 + 子路径」宿主又解析不了（实测 8 行 failed to import）。
+# 详见 kernel/display.ts。
+packages:
+  - 'packages/*'
+
 # pnpm 11 构建脚本策略（settings 已从 package.json 的 "pnpm" 字段迁移至 pnpm-workspace.yaml，见 https://pnpm.io/settings）
 # 批准 esbuild 的构建脚本（vitest/vite 工具链的传递依赖，install.js 仅校验平台二进制）
 # koffi（T0.5 沙盒 FFI）：install 脚本 cnoke.cjs 安装/构建其原生二进制（win32-x64 预编译，实测结论见 task-0.5-report.md）

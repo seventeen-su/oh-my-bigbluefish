@@ -66,7 +66,21 @@ OMB 自己另加三条抗噪约束（`modules/notify/bridge.ts`）：同类型 3
 plugin_manager install_bundle <本仓库绝对路径>
 ```
 
-安装后 OMB 的行出现在 profile 根层，插件页可逐行开关。
+装的是**包装配包**（`@omb/plugin`：一份 `cordis.patch.yml`），它把 8 个组件包
+（`@omb/kernel`、`@omb/memory`、…）作为 workspace 依赖挂在**自己的** `node_modules` 下——
+而这正是行名的解析落点（宿主从补丁文件所在目录起按 Node 规则向上找）。
+
+因此有一条前提：**本仓库要先装过一次依赖**
+
+```bash
+pnpm install      # 建出 node_modules/@omb/<组件> → packages/<组件> 的链接
+```
+
+少了它，profile 里的 8 行会解析不到包（`failed to import`）。构建脚本会在
+`node_modules/@omb/*` 缺席时打印提醒；`node scripts/check-resolution.mjs`
+可以在不碰 profile 的前提下把这条路走一遍。
+
+安装后 OMB 的行出现在 profile 根层，插件页可逐行开关，并显示中文组件名。
 
 ### 目录位置
 
@@ -76,6 +90,7 @@ plugin_manager install_bundle <本仓库绝对路径>
 | 项目库（随 cwd） | `<cwd>/.omb/memory/session.db` |
 | 构建代数 | `build-generation.json` |
 | 产物 | `lib-gen/g<N>/`（不入库） |
+| 组件包 | `packages/<组件>/`（`locale/` 入库，`lib-gen/` 不入库） |
 
 ## 构建
 
@@ -84,17 +99,24 @@ pnpm install
 node scripts/build.mjs     # 或 pnpm build
 ```
 
-**每次构建都会换代**（`lib-gen/g1` → `g2` → …），自动改写 `cordis.patch.yml`
-并把代数写进 `build-generation.json`。
+**每次构建都会换代**（`lib-gen/g1` → `g2` → …），并把每个组件包的
+`package.json` 的 `main`/`exports` 刷到本代：
+
+```
+packages/<组件>/lib-gen/g<N>/index.js   ← 生成的一层转发（URL 里带代数）
+  ↓ export * / export { default }
+lib-gen/g<N>/packages/<组件>/index.js   ← tsc 产物（实现都在仓库根的 lib-gen/g<N>/）
+```
+
+`cordis.patch.yml` 里**不出现代数号**（行名是裸包名 `@omb/<组件>`，见下节），
+换代完全由上面这条链承担：URL 变 = 不会命中 Node 的 ESM 按 URL 缓存。
+构建后需要**重新启用该行**（关掉再打开）才会加载新代号。
 
 ### 为什么必须换代
 
 DSH 的**插件行**可以免重启动态增删，但**模块代码走 Node ESM 按 URL 缓存**。
 改了源码而产物路径没变时，宿主加载的仍是**旧模块实例**——于是"功能没生效"
 这类现象可能只是陈旧代码，极易误判。
-
-换目录名让 URL 必然变化，加载的必然是本次构建的代码。
-`omb_status` 的「构建」段会直接印出当前代数，随时可核对跑的是哪一代。
 
 构建脚本还会做**陈旧检测**：产物比源码旧就报错，不让"改了源码忘了重建"混过去。
 
@@ -103,6 +125,7 @@ DSH 的**插件行**可以免重启动态增删，但**模块代码走 Node ESM 
 ```bash
 pnpm verify          # typecheck + lint + test
 node scripts/build.mjs
+node scripts/check-resolution.mjs   # 8 行可解析、可加载、有中文名（不碰 profile）
 plugin_manager remove_bundle @omb/plugin && plugin_manager install_bundle <路径>
 ```
 
@@ -110,19 +133,27 @@ plugin_manager remove_bundle @omb/plugin && plugin_manager install_bundle <路�
 
 ## 组件的中文显示名
 
-行的标题取自 DSH 的本地化元数据，而 `readPluginMeta` 在
+插件页每一行的标题/说明来自 DSH 的本地化元数据：`readPluginMeta` 在
 `barePackageName(specifier) === undefined` 时直接返回 undefined
-（`packages/boot/app-boot/src/package-meta.ts:149`）——即**相对路径的行拿不到元数据**。
+（`packages/boot/app-boot/src/package-meta.ts:148`），只有**裸包名**才有元数据，
+名字取自 `<包名>/locale/zh.json` 的 `meta.title`/`meta.description`。
 
-改成裸包子路径（`@omb/plugin/omb-kernel`）后实测 8 行全部 `failed to import`：
-宿主加载器解析不了子路径。两个要求互斥，于是：
+而宿主加载器又要能**解析**行名。三种写法只有一种同时成立：
 
-- 行名保持**相对路径**（能跑，这是硬约束）
-- 中文名与说明生成到 `locale/<组件>/{en,zh}.json` 备用
-- 唯一真源是 [`kernel/display.ts`](kernel/display.ts)，改文案只改那里
+| 行名写法 | 能解析 | 有中文名 |
+| --- | --- | --- |
+| `./lib-gen/g<N>/modules/memory/index.js` | ✅ | ❌ 相对路径没有元数据，插件页显示 `file:///` 路径 |
+| `@omb/plugin/omb-memory` | ❌ 实测 8 行 `failed to import` | ✅ |
+| `@omb/memory`（**当前**） | ✅ | ✅ |
 
-**结果：插件页目前仍显示产物路径。** 要显示中文名需要每个组件是独立顶层包
-（各自 `package.json` + `locale/zh.json`），代价是 8 份包清单样板。
+于是每个组件是一个**独立顶层包**（`packages/<组件>/`，`name: @omb/<组件>`），
+中文名的唯一真源是 [`kernel/display.ts`](kernel/display.ts)：
+
+```bash
+node scripts/build.mjs    # 由 display.ts 生成 packages/<组件>/locale/{zh,en}.json
+```
+
+改文案只改 `kernel/display.ts`，不要在 locale 文件里手改——测试会核对两者逐字一致。
 
 ## 测试
 
@@ -130,6 +161,8 @@ plugin_manager remove_bundle @omb/plugin && plugin_manager install_bundle <路�
 pnpm test        # vitest
 pnpm typecheck
 pnpm lint
+pnpm verify      # 上面三件一起
+node scripts/check-resolution.mjs   # 行名解析 + 中文名（不需要装进 profile）
 ```
 
 测试里有两类**只有真宿主才会暴露**的契约，已固化：
@@ -140,6 +173,11 @@ pnpm lint
   会让每个用 zod 生成的工具被宿主拒绝。
 - `tests/dsh/assembly.smoke.test.ts`：用真实清单、真实内核装配，并让假宿主
   **复刻真宿主的校验**。假宿主不复刻校验，测试就会对"全被拒绝"保持全绿（踩过两次）。
+
+另有一组**形状契约**（`tests/dsh/modules.test.ts`、`tests/kernel/abi.contract.test.ts`）
+把「行名 = 裸包名 = `packages/<组件>` 的包名 = `kernel/display.ts` 的 `packageName`」
+与「`main`/`exports` 指向当前代数」「locale 文案与 display.ts 逐字一致」钉在一起：
+任一处漂移都会失败，而不是变成插件页上一串看不懂的路径。
 
 ## 神经向量检索（可选）
 

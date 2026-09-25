@@ -1,17 +1,21 @@
 // OMB v3 分层 import 契约（机器强制）。
 //
 // 依赖方向不可逆：
-//   kernel/  ←  modules/  ←  dsh/
+//   kernel/  ←  modules/  ←  dsh/  ←  packages/
 //   最内层零宿主依赖；只有 dsh/ 能 import @deepseek-ai/*
 //
-//   kernel/          不得 import modules/、dsh/、@deepseek-ai/*（type-only 亦禁止）
-//   modules/<a>/     不得 import modules/<b>/；不得 import dsh/
-//   dsh/             唯一接触宿主的层
+//   kernel/          不得 import modules/、dsh/、packages/、@deepseek-ai/*（type-only 亦禁止）
+//   modules/<a>/     不得 import modules/<b>/；不得 import dsh/、packages/
+//   dsh/             唯一接触宿主的层；不得 import packages/（组件包在最外层）
+//   packages/<组件>/ 组件包入口：只做 re-export + default 包装，可 import 下三层
 //   tests/           豁免（可 import 任何层）
 //
 // 另有一条内核纯度规则：kernel/ 不得出现业务词汇
 //（memory/retrieve/embed/reasoning/context/profile/artifact 等），
 // 防止微内核膨胀成第二个 assembly.ts。
+//
+// 注意 `packages/kernel/` 这类路径**同时**含 `/packages/` 与 `/kernel/` 段；
+// layerOf 取最早出现的段，因此它属于 packages（组件包层），不会被内核纯度规则误判。
 import path from 'node:path';
 import tseslint from 'typescript-eslint';
 
@@ -20,14 +24,15 @@ function toPosix(p) {
 }
 
 /**
- * 返回文件所属的顶层区段（kernel / modules / dsh / tests），否则 null。
- * 取**路径中第一个出现**的区段——`tests/modules/x/y.ts` 属于 tests 而非 modules。
+ * 返回文件所属的顶层区段（packages / kernel / modules / dsh / tests），否则 null。
+ * 取**路径中第一个出现**的区段——`tests/modules/x/y.ts` 属于 tests 而非 modules，
+ * `packages/kernel/index.ts` 属于 packages 而非 kernel。
  */
 function layerOf(filePath) {
   const posix = toPosix(filePath);
   let best = null;
   let bestIndex = Number.POSITIVE_INFINITY;
-  for (const seg of ['kernel', 'modules', 'dsh', 'tests']) {
+  for (const seg of ['packages', 'kernel', 'modules', 'dsh', 'tests']) {
     const at = posix.indexOf(`/${seg}/`);
     if (at === -1) continue;
     if (at < bestIndex) {
@@ -45,9 +50,10 @@ function moduleOf(filePath) {
 }
 
 const IMPORT_RULES = {
-  kernel: { forbiddenLayers: ['modules', 'dsh'], forbiddenBare: /^@deepseek-ai\// },
-  modules: { forbiddenLayers: ['dsh'], forbiddenBare: /^@deepseek-ai\// },
-  dsh: { forbiddenLayers: [], forbiddenBare: null },
+  packages: { forbiddenLayers: [], forbiddenBare: /^@deepseek-ai\// },
+  kernel: { forbiddenLayers: ['modules', 'dsh', 'packages'], forbiddenBare: /^@deepseek-ai\// },
+  modules: { forbiddenLayers: ['dsh', 'packages'], forbiddenBare: /^@deepseek-ai\// },
+  dsh: { forbiddenLayers: ['packages'], forbiddenBare: null },
 };
 
 const noLayerViolation = {

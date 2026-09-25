@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Desktop notifications",
-    "description": "Pushes a few noteworthy events to the host desktop notification service, throttled and deduplicated."
-  }
-}

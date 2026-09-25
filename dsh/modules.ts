@@ -3,8 +3,9 @@
  *
  * 设计要点：
  * - **模块入口属于模块自己**（`modules/<name>/index.ts` 或 `module.ts`），
- *   不在 `dsh/` 下复制一层"入口文件"。因此 `cordis.patch.yml` 的 `name`
- *   直接指向 `lib/modules/<name>/index.js`。
+ *   不在 `dsh/` 下复制一层"入口文件"。
+ * - **宿主按行加载的是组件包入口**（`@omb/<组件>` → `packages/<组件>/index.ts`），
+ *   它只做 re-export + `export default toHostPlugin(...)`，实现仍在本目录的模块里。
  * - **发现靠一份静态导入清单**（`moduleEntries.ts`），按**结构**判定模块形状：
  *   队友实际用了 `artifactModule` / `profileModule` / `reasoningRegistration` /
  *   `vectorModule` 等多种导出命名，按名字白名单会不断漏。
@@ -91,12 +92,33 @@ export function pickRegistrations(namespace: unknown): readonly ModuleRegistrati
 const DEFAULT_EXPORT_KEY = 'default'
 
 /**
- * 找出「同一 id 有多个可运行注册项」的歧义。
+ * 取**唯一**同名注册项——组件包入口（`packages/<组件>/index.ts`）用。
  *
- * 用途：把"行为由枚举顺序决定"这件事变成一条可见告警。它不是错误
- * （挑选规则是确定的），但**必须可见**——否则同一份代码在不同运行时下
- * 表现不同而无人察觉。
+ * 组件包入口只做两件转发：把真正的注册项 re-export 出去（内核原生装配路径用），
+ * 并把 `toHostPlugin(registration)` 作为 `default`（宿主逐行加载时读的就是它）。
+ *
+ * 这里把"入口里恰好有一个目标 id 的注册项"变成一条**会抛的判据**：组件的
+ * `manifest.id` 与行 id 不一致时，装配期就响亮失败，而不是加载出一个
+ * "看起来正常、实际没有任何能力"的空壳——本项目在这上面吃过两次亏
+ * （`default` 包装器被当成模块、`vectorManifest` 挤掉 `vectorModule`）。
+ *
+ * @param namespace - 组件包的模块实现命名空间（`import * as` 的结果）。
+ * @param id - 该组件的模块 id（取自模块自己导出的常量，不在这里硬编码）。
+ * @throws 当同名注册项不是恰好一个时。
  */
+export function registrationFor(namespace: unknown, id: string): ModuleRegistration<unknown> {
+  const matches = pickRegistrations(namespace).filter(entry => entry.manifest.id === id)
+  if (matches.length !== 1) {
+    const keys = typeof namespace === 'object' && namespace !== null
+      ? Object.keys(namespace as Record<string, unknown>).join('、')
+      : String(namespace)
+    throw new Error(
+      `组件入口应恰好导出一个 id 为 ${id} 的注册项，实际 ${matches.length} 个（导出：${keys}）`,
+    )
+  }
+  return matches[0] as ModuleRegistration<unknown>
+}
+
 /** 该命名空间是否导出了 default。 */
 export function hasDefaultExport(namespace: unknown): boolean {
   if (typeof namespace !== 'object' || namespace === null) return false

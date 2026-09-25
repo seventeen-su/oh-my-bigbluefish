@@ -13,5 +13,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["kernel", "modules", "dsh", "tests"]
+  "include": ["kernel", "modules", "dsh", "packages", "tests"]
 }
