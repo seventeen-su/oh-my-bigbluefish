@@ -274,22 +274,54 @@ export class NotifyBridge {
       resolved = undefined
     }
     if (isDesktopNotifyLike(resolved)) return resolved
+
+    /**
+     * **配了解析器时，它说了算——不要回落到构造时缓存的实例。**
+     *
+     * 原来这里无条件回落，于是出现一处自相矛盾（自检报告实测抓到）：
+     * 同一次 `omb_status` 里，模块行说「宿主未安装 desktopNotify 服务」，
+     * 组件自述却说「已接上宿主 desktopNotify（通道 push）」。
+     *
+     * 成因：两个内核实例各有一个桥。工具那个实例的 `resolve` 取不到宿主服务
+     * （宿主服务只发布给行实例），于是回落到**装载时快照**里的那份——
+     * 而那份可能早已不在，也可能从来只是"当时看起来像"。
+     *
+     * `resolve` 的契约就是"每次推送时重新解析"，它是权威；回落到陈旧快照
+     * 等于让状态面说一件已经不再成立的事。**宁可如实报"不可用"，也不要报一个
+     * 已经不成立的好消息**——后者会让人以为通知在工作。
+     *
+     * 只有**没配解析器**时才用构造时给的那份（那正是它的用途）。
+     */
+    if (this.#deps.resolve !== undefined) return undefined
     if (isDesktopNotifyLike(this.#deps.notify)) return this.#deps.notify
     return undefined
   }
 
   #unavailableReason(): string {
     let resolved: unknown
+    let probeFailed = false
     try {
       resolved = this.#deps.resolve?.()
     } catch {
       resolved = undefined
+      probeFailed = true
     }
-    if (resolved === undefined && this.#deps.notify === undefined) {
+
+    // **配了解析器时，只有它说了算**（与 `#target` 同一口径）。
+    // 不能再拿装载时的快照来判断"是没装还是形状不对"——那会给出与
+    // `available: false` 不匹配的理由，读者会以为"服务在、只是形状怪"。
+    if (this.#deps.resolve !== undefined) {
+      if (probeFailed) return '解析宿主 desktopNotify 时出错；通知全部静默降级（不影响任何功能）'
+      if (resolved === undefined) {
+        return '宿主未安装 desktopNotify 服务（本次解析为空）；通知全部静默降级，不影响任何功能'
+      }
+      return `宿主 desktopNotify 形状不匹配（push/pushAlways/notify 都不可调用，实际为 ${typeNameOf(resolved)}）；通知全部静默降级`
+    }
+
+    if (this.#deps.notify === undefined) {
       return '宿主未安装 desktopNotify 服务；通知全部静默降级，不影响任何功能'
     }
-    const seen = resolved !== undefined ? resolved : this.#deps.notify
-    return `宿主 desktopNotify 形状不匹配（push/pushAlways/notify 都不可调用，实际为 ${typeNameOf(seen)}）；通知全部静默降级`
+    return `宿主 desktopNotify 形状不匹配（push/pushAlways/notify 都不可调用，实际为 ${typeNameOf(this.#deps.notify)}）；通知全部静默降级`
   }
 
   #suppress(reason: string): void {

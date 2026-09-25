@@ -229,4 +229,37 @@ describe('零改码自动接上', () => {
     expect(bridge.push('k2', 'b')).toBe(false)
     expect(bridge.status().available).toBe(false)
   })
+
+  it('配了解析器时以它为准，不回落到装载时的快照（避免状态面自相矛盾）', () => {
+    // **这条来自一次真实自检报告**：同一次 `omb_status` 里，
+    // 模块行说「宿主未安装 desktopNotify 服务」，组件自述却说
+    // 「已接上宿主 desktopNotify（通道 push）」——两种说法相反。
+    //
+    // 成因是两个内核实例各有一个桥：工具那个实例的 `resolve` 取不到宿主服务
+    // （宿主服务只发布给行实例），于是回落到**装载时快照**里的那份。
+    //
+    // `resolve` 的契约是"每次推送时重新解析"，它就是权威。回落到陈旧快照
+    // 等于让状态面报一个已经不成立的好消息——**那比报"不可用"更坏**，
+    // 因为它会让人以为通知在工作。
+    const snapshotted = { push: () => {} }
+    const bridge = new NotifyBridge({
+      notify: snapshotted,
+      clock: clock(),
+      logger: logger(),
+      resolve: () => undefined, // 解析器说：现在没有
+    })
+    const status = bridge.status()
+    expect(status.available, '解析器说了算，不能靠装载时的快照报可用').toBe(false)
+    expect(status.detail).toContain('未安装 desktopNotify')
+    expect(bridge.push('k', '标题')).toBe(false)
+  })
+
+  it('没配解析器时才用装载时给的实例', () => {
+    const bridge = new NotifyBridge({
+      notify: { push: () => {} },
+      clock: clock(),
+      logger: logger(),
+    })
+    expect(bridge.status().available).toBe(true)
+  })
 })
