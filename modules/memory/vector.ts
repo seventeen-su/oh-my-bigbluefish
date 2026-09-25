@@ -155,6 +155,14 @@ export interface VectorChannelState {
   readonly lastSearchError: string | null
   /** 检索期降级累计次数（空通道不是静默的——它是可读数字）。 */
   readonly channelErrors: number
+  /**
+   * **已观测到的**向量检索次数（成功 + 失败）。
+   *
+   * 为什么必须与 `lastSearchError` 并存：`lastSearchError === null` 有两种完全不同的含义——
+   * "检索过一次且正常"与"一次都没检索过（无读数）"。没有这个计数，状态面只能把后者
+   * 渲染成"最近一次检索：正常"，那是拿未测量冒充测量结果。
+   */
+  readonly searches: number
 }
 
 /** 装载器签名（默认 = `loadOnnxEmbedder`；测试可注入，避免碰真实权重）。 */
@@ -251,6 +259,8 @@ function channelMetrics(
     dimensions: current?.dimensions ?? 0,
     // 检索期降级累计（空通道可观测）
     channelErrors: state.channelErrors,
+    // 已观测检索次数：0 = 未测量（一次都没走过），与"走过且正常"必须能区分
+    searches: state.searches,
     // 落盘读数：待编码队列与累计计数（"写入却没向量"必须可见，而不是查表为空却无人知道）
     pendingEmbeddings: enc.pending,
     encodedEmbeddings: enc.encoded,
@@ -481,10 +491,15 @@ function renderStatus(
   )
   lines.push(`装载期降级原因：${state.reason === null ? '无' : state.reason}`)
   if (state.modelDir !== null) lines.push(`权重目录：${state.modelDir}`)
-  lines.push(
-    `最近一次检索：${state.lastSearchError === null ? '正常' : `降级（${state.lastSearchError}）`}` +
-      `；累计降级 ${state.channelErrors} 次`,
-  )
+  // **未测量 ≠ 测量为零**：一次检索都没发生过时，只能报"尚未发生（无读数）"，
+  // 不能写成"正常"——那会把"没接线/没走过这条路"冒充成"走过且没问题"。
+  const lastSearch =
+    state.searches === 0
+      ? '尚未发生（无读数：本进程还没有观测到一次向量检索）'
+      : state.lastSearchError === null
+        ? '正常'
+        : `降级（${state.lastSearchError}）`
+  lines.push(`最近一次检索：${lastSearch}；已观测检索 ${state.searches} 次；累计降级 ${state.channelErrors} 次`)
   lines.push(
     `向量落盘：待编码 ${enc.pending} 条；已编码 ${enc.encoded}；跳过 ${enc.skipped}；` +
       `失败 ${enc.failures}（其中被拒 ${enc.rejected}）；超界丢弃 ${enc.dropped}`,
@@ -542,6 +557,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     reason: '模块尚未启动（apply 未被调用）',
     lastSearchError: null,
     channelErrors: 0,
+    searches: 0,
   }
   let installed: SwitchableEmbedder | undefined
   /** apply 装上的健康上报出口；通道的**检索期**降级也要经它上报。 */
@@ -788,7 +804,11 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
   /** 换"装载期"状态（通道选型）；**不动**检索期字段——两者语义不同。 */
   const commit = (
     next: Pick<VectorChannelState, 'channel' | 'probing' | 'modelDir' | 'reason'>,
-    runtime: { readonly lastSearchError?: string | null; readonly channelErrors?: number } = {},
+    runtime: {
+      readonly lastSearchError?: string | null
+      readonly channelErrors?: number
+      readonly searches?: number
+    } = {},
   ): void => {
     state = {
       ...next,
@@ -796,6 +816,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         runtime.lastSearchError !== undefined ? runtime.lastSearchError : state.lastSearchError,
       channelErrors:
         runtime.channelErrors !== undefined ? runtime.channelErrors : state.channelErrors,
+      searches: runtime.searches !== undefined ? runtime.searches : state.searches,
     }
   }
 
@@ -804,13 +825,20 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
    *
    * 为什么成功也要记：不清掉上一次的原因，健康面会永远停在"降级"——
    * 那会让"现在到底好不好"变成不可回答的问题。
+   *
+   * 同时**每次都累加 `searches`**（成功也累加）：否则"尚未检索过"与"最近一次正常"
+   * 在读数上无法区分。只有计数变化时不重报健康（读数没变，避免无谓的重报）。
    */
   const noteSearchOutcome = (failure: string | null): void => {
+    const searches = state.searches + 1
     if (failure === null) {
-      if (state.lastSearchError === null) return
-      state = { ...state, lastSearchError: null }
+      if (state.lastSearchError === null) {
+        state = { ...state, searches }
+        return
+      }
+      state = { ...state, searches, lastSearchError: null }
     } else {
-      state = { ...state, lastSearchError: failure, channelErrors: state.channelErrors + 1 }
+      state = { ...state, searches, lastSearchError: failure, channelErrors: state.channelErrors + 1 }
     }
     reportHealth?.()
   }
@@ -911,8 +939,10 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       installedEncoder = undefined
       kernelRef = undefined
       commit(
+        // "卸载后无残留读数"：连 `searches` 一起清——残留的检索次数会让下一次装载
+        // 把"还没检索过"错报成"检索过 N 次"。
         { channel: 'off', probing: false, modelDir: null, reason: null },
-        { lastSearchError: null, channelErrors: 0 },
+        { lastSearchError: null, channelErrors: 0, searches: 0 },
       )
       try {
         offWritten()

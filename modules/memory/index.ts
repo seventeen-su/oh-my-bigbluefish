@@ -78,7 +78,10 @@ function messageOf(error: unknown): string {
 }
 
 function describeVectors(stats: StoreStats): string {
-  return stats.vectors === null ? '无' : `${stats.vectors.rows}@${stats.vectors.modelId}/${stats.vectors.dim}`
+  // `vectors === null` 在本实现里的含义是**该库没有向量行**（见 `SqliteStore.stats`）：
+  // 那是"测到了 0 行"，不是"没测到"。所以写 `0 行` 并注明未声明通道身份，
+  // 而不是一个含糊的"无"（读者无法区分"零行"与"没查"）。
+  return stats.vectors === null ? '0 行（无向量行/未接线）' : `${stats.vectors.rows}@${stats.vectors.modelId}/${stats.vectors.dim}`
 }
 
 async function describeStore(label: string, store: MemoryStore | undefined): Promise<{
@@ -88,7 +91,13 @@ async function describeStore(label: string, store: MemoryStore | undefined): Pro
   if (store === undefined) return { line: `${label}=未打开`, stats: undefined }
   const concrete = asMemoryStore(store)
   const path = concrete?.dbPath ?? '（路径未知：非本实现）'
-  const migrated = concrete === undefined ? '' : `（迁移 v${concrete.migrated.from}→v${concrete.migrated.to}）`
+  // 没有迁移记录时**不写 v0→v0**：那会把"未记录"伪装成一个版本号（详见 store.ts 的 migrationText）
+  const migrated =
+    concrete === undefined
+      ? ''
+      : concrete.migrated.from === concrete.migrated.to
+        ? `（本次打开未迁移：schema v${concrete.migrated.to}）`
+        : `（迁移 v${concrete.migrated.from}→v${concrete.migrated.to}）`
   const stats = await store.stats()
   return {
     line: `${label}=${path}${migrated} 行数=${stats.rows} schema=v${stats.schemaVersion} 向量=${describeVectors(stats)}`,
@@ -123,10 +132,13 @@ async function describeHealth(
   let totalRows = 0
   let vectorRows = 0
   let schemaVersion = 0
+  /** 真正测到行数的库数。**0 = 未测量**（没有任何库打开），不是"合计 0 行"。 */
+  let measuredStores = 0
 
   const user = await describeStore('用户库', snapshot.user?.store('user'))
   parts.push(user.line)
   if (user.stats !== undefined) {
+    measuredStores += 1
     totalRows += user.stats.rows
     vectorRows += user.stats.vectors?.rows ?? 0
     schemaVersion = Math.max(schemaVersion, user.stats.schemaVersion)
@@ -136,14 +148,21 @@ async function describeHealth(
     const described = await describeStore(`项目库(${set.projectScope ?? '未知 cwd'})`, set.store('project'))
     parts.push(described.line)
     if (described.stats !== undefined) {
+      measuredStores += 1
       totalRows += described.stats.rows
       vectorRows += described.stats.vectors?.rows ?? 0
       schemaVersion = Math.max(schemaVersion, described.stats.schemaVersion)
     }
   }
 
-  metrics['rows.total'] = totalRows
-  metrics['vectors.total'] = vectorRows
+  // **只报测到的**：一个库都没打开时，"合计行数"是未知而不是 0。
+  // 把未测量写成 0 会让状态面看起来像"库是空的"——那正好掩盖了"库根本没打开"这个真问题。
+  if (measuredStores > 0) {
+    metrics['rows.total'] = totalRows
+    metrics['vectors.total'] = vectorRows
+  } else {
+    parts.push('行数/向量合计：未测量（没有任何库打开，无从统计——不是 0 行）')
+  }
   if (schemaVersion > 0) metrics['schemaVersion'] = schemaVersion
   if (ledger !== undefined) {
     metrics['writes'] = ledger.writes

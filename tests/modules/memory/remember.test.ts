@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest'
 import type { MemoryStore, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
 import {
   MAX_TEXT_CHARS,
+  RECEIPT_ECHO_CHARS,
   REMEMBER_JSON_SCHEMA,
   REMEMBER_TOOL,
   contentHashOf,
@@ -173,7 +174,10 @@ interface WriteFixture {
   close(): Promise<void>
 }
 
-function writeFixture(overrides: Partial<MemoryWriteDeps> = {}): WriteFixture {
+function writeFixture(
+  overrides: Partial<MemoryWriteDeps> = {},
+  wrapStore: (store: SqliteMemoryStore) => MemoryStore = store => store,
+): WriteFixture {
   const ws: TempWorkspace = tempWorkspace()
   const logger = capturingLogger()
   const clock: TestClock = fixedClock()
@@ -190,7 +194,8 @@ function writeFixture(overrides: Partial<MemoryWriteDeps> = {}): WriteFixture {
   const abstained: { reason: string; text: string }[] = []
 
   const deps: MemoryWriteDeps = {
-    resolveStore: async (scope): Promise<MemoryStore | undefined> => (scope === 'user' ? user : project),
+    resolveStore: async (scope): Promise<MemoryStore | undefined> =>
+      scope === 'user' ? wrapStore(user) : wrapStore(project),
     clock,
     currentSession: () => 's1',
     currentTurn: () => 7,
@@ -405,5 +410,213 @@ describe('omb_remember：弃权、事件与降级', () => {
     await run(fixture.tool, { text: '纯词法路径必须完整可用', kind: 'semantic', userAsserted: true })
     expect(await fixture.user.searchLexical({ text: '词法', scope: 'user', limit: 5 })).toHaveLength(1)
     await fixture.close()
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// 回显：写入当下就能自证"我存了什么"（原先只能靠事后 omb_recall 反证）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('omb_remember：写入回执回显逐字原文', () => {
+  it('成功回执含存下的逐字原文与原文哈希（与库中 content_hash 一致即为逐字保真）', async () => {
+    const fixture = writeFixture()
+    const text = '提交前先跑 pnpm verify。'
+    const outcome = await run(fixture.tool, { text, kind: 'procedural' })
+
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('已记住')
+    expect(outcome.text).toContain(`存下的逐字原文（${text.length} 字符，全文如下）：`)
+    expect(outcome.text).toContain(text)
+
+    const record = await onlyRecord(fixture.project, 'pnpm verify')
+    expect(outcome.text).toContain(`原文哈希=${record?.contentHash}`)
+    expect(outcome.text).not.toContain('已截断')
+    await fixture.close()
+  })
+
+  it('超长原文：回执截断到上限并**注明截断**与完整长度（不把截断伪装成全文）', async () => {
+    const fixture = writeFixture()
+    const tail = '（结尾标记TAIL）'
+    const text = `实测结论（见 docs/notes.md#L1）：${'细'.repeat(RECEIPT_ECHO_CHARS + 50)}${tail}`
+    expect(text.length).toBeGreaterThan(RECEIPT_ECHO_CHARS)
+    expect(text.length).toBeLessThanOrEqual(MAX_TEXT_CHARS)
+
+    const outcome = await run(fixture.tool, { text, kind: 'semantic' })
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain(`回执只显示前 ${RECEIPT_ECHO_CHARS} 字符——已截断`)
+    expect(outcome.text).toContain('（截断处）')
+    expect(outcome.text).toContain(`完整长度是 ${text.length} 字符`)
+    expect(outcome.text).toContain(text.slice(0, RECEIPT_ECHO_CHARS))
+    expect(outcome.text).not.toContain(tail) // 截断就是截断
+
+    // 库里存的仍是完整原文（回执截断 ≠ 存储截断）
+    const record = await onlyRecord(fixture.user, '实测结论')
+    expect(record?.text).toBe(text)
+    await fixture.close()
+  })
+
+  it('弃权回执不回显"存下的原文"（没写入就不该说存了什么）', async () => {
+    const fixture = writeFixture()
+    const outcome = await run(fixture.tool, { text: '用户大概是个喜欢安静的人吧。', kind: 'semantic' })
+    expect(outcome.text).toContain('未写入（准入弃权）')
+    expect(outcome.text).not.toContain('存下的逐字原文')
+    await fixture.close()
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// 推翻标注（supersedes）：过时结论必须能被标掉，且标注结果如实回执
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 边只读的库：用来验证"标注失败必须如实说"，而不是静默成功。 */
+function readOnlyEdgeStore(inner: SqliteMemoryStore): MemoryStore {
+  return new Proxy(inner, {
+    get(target, property, receiver): unknown {
+      if (property === 'upsertEdge') {
+        return async (): Promise<void> => {
+          throw new Error('edge 表只读')
+        }
+      }
+      const value = Reflect.get(target, property, receiver) as unknown
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as MemoryStore
+}
+
+async function edgesOf(store: SqliteMemoryStore, fromId: string): Promise<readonly string[]> {
+  const walk = await store.walkGraph({ fromId, depth: 1, types: ['supersedes'] })
+  return walk.edges.map(edge => `${edge.fromId}->${edge.toId}:${edge.type}`)
+}
+
+describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
+  it('标注成功：旧条目 validTo+supersededBy 已写、边方向 newer→older、正文一字未改', async () => {
+    const fixture = writeFixture()
+    const oldText = '旧的端口结论是 8080。'
+    await run(fixture.tool, { text: oldText, kind: 'semantic', userAsserted: true })
+    const old = await onlyRecord(fixture.user, '8080')
+    expect(old?.validTo).toBeNull()
+
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测不是 8080，而是 9090。',
+      kind: 'semantic',
+      supersedes: [old?.id ?? ''],
+    })
+
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('推翻标注：1 条旧记忆已标为"被本条取代"')
+    expect(outcome.text).toContain(old?.id ?? 'x')
+
+    const marked = await fixture.user.get(old?.id ?? '')
+    const fresh = await onlyRecord(fixture.user, '9090')
+    expect(marked?.supersededBy).toBe(fresh?.id)
+    expect(marked?.validTo).toBe(fresh?.observedAt)
+    expect(marked?.text).toBe(oldText) // 非破坏性：正文与溯源都没动
+    expect(marked?.sourceRef).toBe(old?.sourceRef)
+    expect(await edgesOf(fixture.user, old?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
+    await fixture.close()
+  })
+
+  it('目标不存在：新条目照写，回执如实写"未找到"，绝不抛', async () => {
+    const fixture = writeFixture()
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测是 9090。',
+      kind: 'semantic',
+      supersedes: ['mem_不存在_1'],
+    })
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('推翻标注：未找到 1 条：mem_不存在_1')
+    expect((await fixture.user.stats()).rows).toBe(1) // 新条目仍然写进去了
+    await fixture.close()
+  })
+
+  it('目标已在取代链里：保留原标注（不改写历史），只补边并说明', async () => {
+    const fixture = writeFixture()
+    await run(fixture.tool, { text: '第一版结论：端口是 8080。', kind: 'semantic', userAsserted: true })
+    const first = await onlyRecord(fixture.user, '8080')
+    await run(fixture.tool, {
+      text: '更正一（见 src/a.ts）：端口不是 8080。CORRECTION-ONE',
+      kind: 'semantic',
+      supersedes: [first?.id ?? ''],
+    })
+    const second = await onlyRecord(fixture.user, 'CORRECTION-ONE')
+
+    const outcome = await run(fixture.tool, {
+      text: '更正二（见 src/b.ts）：端口确实不是 8080，且 8080 已被占用。CORRECTION-TWO',
+      kind: 'semantic',
+      supersedes: [first?.id ?? ''],
+    })
+    expect(outcome.text).toContain('早已在取代链里')
+    expect(outcome.text).toContain(`原取代者 ${second?.id}`)
+
+    const firstRecord = await fixture.user.get(first?.id ?? '')
+    expect(firstRecord?.supersededBy).toBe(second?.id) // 未被改写
+    const third = await onlyRecord(fixture.user, 'CORRECTION-TWO')
+    const edges = await edgesOf(fixture.user, first?.id ?? '')
+    expect(edges).toContain(`${third?.id}->${first?.id}:supersedes`)
+    await fixture.close()
+  })
+
+  it('建边失败：旧条目已标注但回执**明说未完成**（不把没做成说成做成了）', async () => {
+    const fixture = writeFixture({}, readOnlyEdgeStore)
+    await run(fixture.tool, { text: '旧的端口结论是 8080。', kind: 'semantic', userAsserted: true })
+    const old = await onlyRecord(fixture.user, '8080')
+
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测不是 8080。',
+      kind: 'semantic',
+      supersedes: [old?.id ?? ''],
+    })
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('推翻标注**未完成** 1 条')
+    expect(outcome.text).toContain('edge 表只读')
+    expect(outcome.text).toContain('新条目已写入')
+    const marked = await fixture.user.get(old?.id ?? '')
+    expect(marked?.supersededBy).not.toBeNull() // 记录标注其实成功了，只有边失败
+    await fixture.close()
+  })
+
+  it('跨库取代：新条目落项目库、旧结论在用户库 —— 旧条目照样被标掉，边两边都建', async () => {
+    const fixture = writeFixture()
+    await run(fixture.tool, { text: '用户偏好：端口固定 8080。', kind: 'semantic', userAsserted: true })
+    const old = await onlyRecord(fixture.user, '8080')
+
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测不是 8080。',
+      kind: 'procedural',
+      supersedes: [old?.id ?? ''],
+    })
+    expect(outcome.text).toContain('落库=项目库')
+    expect(outcome.text).toContain('推翻标注：1 条旧记忆已标为"被本条取代"')
+
+    const marked = await fixture.user.get(old?.id ?? '')
+    const fresh = await onlyRecord(fixture.project, '更正')
+    expect(marked?.supersededBy).toBe(fresh?.id)
+    // 边要落在**两个库**：从旧条目所在的用户库能找到，从新条目所在的项目库也能找到
+    expect(await edgesOf(fixture.user, old?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
+    expect(await edgesOf(fixture.project, fresh?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
+    await fixture.close()
+  })
+
+  it('supersedes 参数非法（空 id / 超过上限）→ kind:error，且不写入任何东西', async () => {
+    const fixture = writeFixture()
+    const empty = await run(fixture.tool, {
+      text: '更正（见 src/a.ts）：端口不是 8080。',
+      kind: 'semantic',
+      supersedes: [''],
+    })
+    expect(empty.kind).toBe('error')
+
+    const tooMany = await run(fixture.tool, {
+      text: '更正（见 src/a.ts）：端口不是 8080。',
+      kind: 'semantic',
+      supersedes: Array.from({ length: 21 }, (_, index) => `mem_x_${index}`),
+    })
+    expect(tooMany.kind).toBe('error')
+    expect((await fixture.user.stats()).rows).toBe(0)
+    await fixture.close()
+  })
+
+  it('schema 与校验同源：supersedes 出现在给模型看的 JSON Schema 里', () => {
+    expect(JSON.stringify(REMEMBER_JSON_SCHEMA)).toContain('"supersedes"')
   })
 })
