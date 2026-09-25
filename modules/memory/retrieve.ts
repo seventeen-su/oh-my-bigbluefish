@@ -61,9 +61,14 @@ export interface ChannelQuery {
 }
 
 /**
- * 可选第二通道。由 `omb-memory-vector`（或未来的图通道）在装配时注入；
- * 缺省 → 纯词法路径完整可用（§5.7「向量模块关闭 → 完整纯词法版本」）。
- * 通道**不得**改写端口；它只返回 `ScoredHit[]`，且顺序即相关度降序。
+ * 可选第二通道——**这是向量/图通道的注入缝，故意不写进 `MemoryStore` 端口**。
+ *
+ * 三个理由（lead 已裁决采纳）：
+ * ① `MemoryStore` 端口保持纯净（词法为主），纯词法路径完整可用（§5.7 的硬要求）
+ * ② 第二通道由 `ports` 注入而非写进 store 接口，存储层因此**不必知道向量存在**
+ * ③ `Text`/`LexicalQuery` 的既有契约不需要为「可选的第二个通道」做任何妥协
+ *
+ * 通道只返回 `ScoredHit[]`，顺序即相关度降序；它的 `score` 只允许用于**通道内**排序。
  */
 export interface RetrievalChannel {
   readonly name: SecondaryChannelName
@@ -525,7 +530,7 @@ export async function retrieve(
   const selected = new Set(selection.map(s => s.id))
   const chosen = reranked.filter(h => selected.has(h.candidate.id))
 
-  const items = chosen.map((h, rank) => toItem(h, rank, selected))
+  const items = chosen.map((h, rank) => toItem(h, rank))
   return {
     items,
     gate,
@@ -581,7 +586,7 @@ function buildNote(storeCount: number, rankingCount: number, hitCount: number): 
   return `已查询 ${storeCount} 个库、${rankingCount} 个通道，注入 ${hitCount} 条（逐字 + 溯源）`
 }
 
-function toItem(hydrated: HydratedCandidate, rank: number, _selected: ReadonlySet<string>): RetrievedItem {
+function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
   const { candidate, record } = hydrated
   return {
     rank,
@@ -631,7 +636,7 @@ async function hydrate(
   const records = new Map<string, MemoryRecord>()
   await Promise.all(
     [...idsByScope].map(async ([scope, ids]) => {
-      const tagged = ordered.find(t => t.scope === scope && idsByScope.has(t.scope))
+      const tagged = ordered.find(t => t.scope === scope)
       if (tagged === undefined) return
       try {
         const found = await tagged.store.getMany(ids)
