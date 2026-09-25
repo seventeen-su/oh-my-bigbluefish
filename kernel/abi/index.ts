@@ -37,6 +37,16 @@ export type {
 export type { ConfigSchema, ModuleManifest, ModuleHealth, ModuleRegistration } from './manifest.js'
 
 export type {
+  TaggedStore,
+  StoreSet,
+  OpenStoreSetOptions,
+  OpenStoreSet,
+  SqliteLike,
+  SqliteStatementLike,
+} from './storage.js'
+export { SCHEMA_VERSION } from './storage.js'
+
+export type {
   Kernel,
   ModuleEvents,
   ModuleEventName,
