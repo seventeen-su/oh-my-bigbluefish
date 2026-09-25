@@ -222,8 +222,10 @@ describe('MemoryStore：词法检索（FTS5 + JS 侧分词）', () => {
       makeRecord({ id: 's', kind: 'semantic', text: '契约边界' }),
       makeRecord({ id: 'e', kind: 'episodic', text: '契约边界的现场记录' }),
     ])
-    expect(await searchIds(store, '契约边界', { kinds: ['semantic'] })).toEqual(['s'])
-    expect((await searchIds(store, '契约边界', { kinds: ['semantic', 'episodic'] })).sort()).toEqual(['e', 's'])
+    expect((await searchIds(store, '契约边界', { kinds: ['semantic'] })).slice().sort()).toEqual(['s'])
+    expect(
+      (await searchIds(store, '契约边界', { kinds: ['semantic', 'episodic'] })).slice().sort(),
+    ).toEqual(['e', 's'])
     await expect(
       store.searchLexical({ text: '契约', scope: 'user', limit: 5, kinds: ['bogus' as MemoryKind] }),
     ).rejects.toThrow(/不在允许集合/)
@@ -575,6 +577,168 @@ describe('MemoryStore：可归属向量', () => {
     const current = await store.listEmbeddings({ modelId: 'bge-small-zh-v1.5-512' })
     expect(current).toEqual([])
     expect(await store.countEmbeddings()).toBe(1)
+    ws.cleanup()
+  })
+})
+
+describe('MemoryStore：向量检索（searchVector）', () => {
+  const attribution = { modelId: 'hash-bow-256', dim: 4, revision: '1' } as const
+
+  /** 造一条记忆 + 一条向量。 */
+  async function seed(
+    store: SqliteMemoryStore,
+    options: {
+      readonly id: string
+      readonly vec: readonly number[]
+      readonly kind?: MemoryKind
+      readonly modelId?: string
+      readonly revision?: string
+      readonly validTo?: number | null
+    },
+  ): Promise<void> {
+    await store.put(
+      makeRecord({
+        id: options.id,
+        kind: options.kind ?? 'semantic',
+        text: `记忆 ${options.id}`,
+        ...(options.validTo === undefined ? {} : { validTo: options.validTo }),
+      }),
+    )
+    await store.putEmbedding({
+      memoryId: options.id,
+      modelId: options.modelId ?? attribution.modelId,
+      dim: options.vec.length,
+      revision: options.revision ?? attribution.revision,
+      vector: Float32Array.from(options.vec),
+    })
+  }
+
+  it('按余弦排序，只返回归属完全匹配的行（过滤在 SQL 里，不读全表）', async () => {
+    const { store, db, ws } = fixtureOf()
+    await seed(store, { id: 'exact', vec: [1, 0, 0, 0] })
+    await seed(store, { id: 'orthogonal', vec: [0, 1, 0, 0] })
+    // 同一模型但不同修订（换修订后残留的陈旧向量）——不许参与当前空间的比较
+    await seed(store, { id: 'other-rev', vec: [1, 0, 0, 0], revision: '2' })
+    // 换模型后残留的另一个向量空间：写入口会拒绝与 meta 不一致的向量，
+    // 因此这里走真实序列（先 setEmbeddingMeta，再写新模型的向量）
+    await store.setEmbeddingMeta({ modelId: 'other-model', dim: 4, revision: '1' })
+    await store.put(makeRecord({ id: 'other-space', text: '别的空间' }))
+    await store.putEmbedding({
+      memoryId: 'other-space',
+      modelId: 'other-model',
+      dim: 4,
+      revision: '1',
+      vector: Float32Array.from([1, 0, 0, 0]),
+    })
+
+    const before = snapshotCounters(db.counters)
+    const hits = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 10,
+    })
+    const spent = delta(db.counters, before)
+
+    expect(hits.map(hit => hit.id)).toEqual(['exact', 'orthogonal'])
+    expect(hits.every(hit => hit.channel === 'vector')).toBe(true)
+    expect(hits[0]?.score).toBeCloseTo(1, 6)
+    expect(hits[1]?.score).toBeCloseTo(0, 6)
+    expect(spent.all).toBe(1) // 一条带归属过滤的查询，而不是"全表读进 JS"
+
+    // 声明当前模型时，只拿到新空间的向量
+    const current = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: { modelId: 'other-model', dim: 4, revision: '1' },
+      limit: 10,
+    })
+    expect(current.map(hit => hit.id)).toEqual(['other-space'])
+    ws.cleanup()
+  })
+
+  it('minScore 给了才截断；未给则不过滤（下限标定属调用方）', async () => {
+    const { store, ws } = fixtureOf()
+    await seed(store, { id: 'close', vec: [1, 0, 0, 0] })
+    await seed(store, { id: 'far', vec: [0, 1, 0, 0] })
+
+    const all = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 10,
+    })
+    expect(all).toHaveLength(2)
+
+    const cut = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 10,
+      minScore: 0.5,
+    })
+    expect(cut.map(hit => hit.id)).toEqual(['close'])
+    ws.cleanup()
+  })
+
+  it('kinds 过滤、limit 生效；无匹配归属时返回空数组（不是错误）', async () => {
+    const { store, ws } = fixtureOf()
+    await seed(store, { id: 'sem', vec: [1, 0, 0, 0], kind: 'semantic' })
+    await seed(store, { id: 'epi', vec: [1, 0, 0, 0], kind: 'episodic' })
+
+    const semantic = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 10,
+      kinds: ['semantic'],
+    })
+    expect(semantic.map(hit => hit.id)).toEqual(['sem'])
+
+    const one = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 1,
+    })
+    expect(one).toHaveLength(1)
+
+    const none = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: { modelId: 'nobody', dim: 4, revision: '1' },
+      limit: 10,
+    })
+    expect(none).toEqual([])
+    ws.cleanup()
+  })
+
+  it('失效记忆（valid_to / superseded_by）不参与向量召回——与词法通道一致', async () => {
+    const { store, ws } = fixtureOf()
+    await seed(store, { id: 'live', vec: [1, 0, 0, 0] })
+    await seed(store, { id: 'dead', vec: [1, 0, 0, 0], validTo: 123 })
+
+    const hits = await store.searchVector({
+      embedding: Float32Array.from([1, 0, 0, 0]),
+      expect: attribution,
+      limit: 10,
+    })
+    expect(hits.map(hit => hit.id)).toEqual(['live'])
+    // 溯源仍可回答"我当时相信什么"
+    expect((await store.get('dead'))?.validTo).toBe(123)
+    ws.cleanup()
+  })
+
+  it('归属标签不全或查询维度不符 → 明确拒绝（不静默返回空）', async () => {
+    const { store, ws } = fixtureOf()
+    await expect(
+      store.searchVector({
+        embedding: Float32Array.from([1, 0, 0, 0]),
+        expect: { modelId: '', dim: 4, revision: '1' },
+        limit: 5,
+      }),
+    ).rejects.toBeInstanceOf(VectorAttributionError)
+
+    await expect(
+      store.searchVector({
+        embedding: Float32Array.from([1, 0]),
+        expect: attribution,
+        limit: 5,
+      }),
+    ).rejects.toThrow(/维度不符/)
     ws.cleanup()
   })
 })
