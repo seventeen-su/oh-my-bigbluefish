@@ -539,6 +539,18 @@ describe('MemoryStore：可归属向量', () => {
     ws.cleanup()
   })
 
+  it('meta 行缺失（库结构损坏）时拒绝写入向量，而不是当成"首次写入"', async () => {
+    const { store, db, ws } = fixtureOf()
+    db.raw.prepare('DELETE FROM meta').run()
+
+    await expect(store.putEmbedding(vector())).rejects.toThrow(/meta 表缺失或为空/)
+    await expect(store.setEmbeddingMeta({ modelId: 'hash-bow-256', dim: 256, revision: '1' })).rejects.toThrow(
+      /meta 表缺失或为空/,
+    )
+    expect(await store.countEmbeddings()).toBe(0)
+    ws.cleanup()
+  })
+
   it('同模型不同 revision 允许写入（陈旧但可归属）；meta 不被陈旧写入改动', async () => {
     const { store, ws } = fixtureOf()
     await store.putEmbedding(vector({ memoryId: 'm1' }))

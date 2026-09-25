@@ -5,8 +5,8 @@
  * 一份用 **真实内核**（验证 `start` 的装配顺序与 health 面的实际输出）。
  */
 import { describe, expect, it } from 'vitest'
-import type { ContextPressure, Kernel, ModuleHealth, ModuleRegistration } from '../../../kernel/abi/index.js'
-import { MODULE_CATALOG, SERVICES, SCHEMA_VERSION } from '../../../kernel/abi/index.js'
+import type { ContextPressure, Kernel, ModuleHealth, ModuleRegistration, ToolDefinition } from '../../../kernel/abi/index.js'
+import { MODULE_CATALOG, SERVICES, SCHEMA_VERSION, toolsServiceFor } from '../../../kernel/abi/index.js'
 import { createKernel } from '../../../kernel/index.js'
 import {
   MEMORY_CONFIG_DEFAULTS,
@@ -98,9 +98,12 @@ describe('omb-memory 清单', () => {
     expect(entry).toBeDefined()
     expect(registration.manifest.id).toBe('omb-memory')
     expect(registration.manifest.requires).toEqual(entry?.requires)
+    // 能力与工具是**目录**的权威内容：这里只断言"清单照抄目录"，不复制目录里的取值
+    // （复制一份就会变成第二处需要同步的契约；目录自身的合法性由内核契约测试保证）
     expect(registration.manifest.capabilities).toEqual(entry?.capabilities)
-    expect(registration.manifest.capabilities).toEqual(['memory.write', 'memory.recall', 'memory.retain'])
-    expect(entry?.tools).toEqual(['omb_recall', 'omb_forget'])
+    expect(registration.manifest.requires).toEqual(['omb-kernel'])
+    expect(entry?.tools).toEqual(expect.arrayContaining(['omb_recall', 'omb_forget']))
+    expect(entry?.capabilities).toEqual(expect.arrayContaining(['memory.write', 'memory.recall']))
     expect(registration.manifest.version).toBe('3.0.0')
   })
 
@@ -287,6 +290,71 @@ describe('omb-memory 与真实内核', () => {
     const health = await registration.manifest.health()
     expect(health.state).toBe('degraded')
     expect(health.detail).toContain('未注入')
+
+    handle.dispose()
+  })
+})
+
+describe('omb-memory 工具面（tools:omb-memory）', () => {
+  function toolsOf(handle: ReturnType<typeof createKernel>): readonly ToolDefinition[] | undefined {
+    return handle.kernel.service<readonly ToolDefinition[]>(toolsServiceFor('omb-memory'))
+  }
+
+  it('apply 内同步提供三个工具（recall/forget/relate），与目录声明一致', () => {
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+
+    const tools = toolsOf(handle)
+    expect(tools?.map(tool => tool.name).sort()).toEqual(['omb_forget', 'omb_recall', 'omb_relate'])
+
+    handle.dispose()
+    // 注销后工具服务消失 → dsh 的工具面里不会留下"关掉了还在"的工具
+    expect(toolsOf(handle)).toBeUndefined()
+    ws.cleanup()
+  })
+
+  it('端到端：turn/start 预热项目库后，omb_recall 能取回该项目库的记忆（逐字 + 溯源）', async () => {
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+
+    const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
+    expect(service).toBeDefined()
+    service?.rememberCwd('s1', ws.dir)
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
+
+    const set = await service?.forSession('s1')
+    await set?.store('project')?.put(
+      makeRecord({ scope: 'project', id: 'p-conv', text: '项目约定：提交前先跑 pnpm verify', sourceRef: 'session:s1#turn-1' }),
+    )
+    expect(service?.peek('s1')?.projectScope).toBeTruthy()
+
+    const recall = toolsOf(handle)?.find(tool => tool.name === 'omb_recall')
+    const outcome = await recall?.execute({ query: 'pnpm verify', limit: 5 })
+    expect(outcome?.kind).toBe('text')
+    expect(outcome?.kind === 'text' ? outcome.text : '').toContain('pnpm verify')
+    // 溯源随行：消费者免费拿到 sourceRef
+    expect(outcome?.kind === 'text' ? outcome.text : '').toContain('session:s1#turn-1')
+
+    handle.dispose()
+    await service?.close()
+    ws.cleanup()
+  })
+
+  it('服务未就绪时工具返回 kind:error（绝不抛）——H-3', async () => {
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const registration = createMemoryRegistration() // 没有存储端口 → 库永远打不开
+    handle.start([kernelRow, registration])
+
+    const tools = toolsOf(handle)
+    expect(tools).toHaveLength(3)
+    for (const tool of tools ?? []) {
+      const outcome = await tool.execute({ query: '任意', id: '任意', ids: ['任意'] })
+      expect(outcome.kind).toBe('error')
+    }
 
     handle.dispose()
   })
