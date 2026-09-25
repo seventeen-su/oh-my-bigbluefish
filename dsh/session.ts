@@ -19,6 +19,7 @@ import type {
   SessionRef,
 } from '../kernel/abi/index.js'
 import { RESIDENT_HINT_MAX, SERVICES } from '../kernel/abi/index.js'
+import { heartbeat } from '../kernel/hostEntry.js'
 
 /** 宿主系统提示服务的最小结构面。 */
 export interface SystemPromptLike {
@@ -253,6 +254,8 @@ export function wireSessionEvents(options: {
   readonly onToolResult?: (payload: { sessionId: string; text: string; callId: string | undefined }) => void
 }): () => void {
   const { ctx, kernel, sessions, onToolResult } = options
+  /** 见过的会话事件类型 → 次数（诊断用）。 */
+  const sawEventTypes = new Map<string, number>()
   if (typeof ctx.on !== 'function') {
     kernel.logger.warn('OMB：宿主事件订阅不可用，认知层将只做注入不做观察（状态面已记录）')
     return () => {}
@@ -284,20 +287,43 @@ export function wireSessionEvents(options: {
     if (cwd !== undefined) sessions.remember(sessionId, cwd)
 
     if (type === undefined) return
+    // 最后一次收到的会话事件类型（诊断）。
+    // 用途：`omb_focus` 报"取不到会话"时，需要立刻分清是"事件没到"还是
+    // "到了但字段取错"——两者的修法完全不同，而症状一模一样。
+    sawEventTypes.set(type, (sawEventTypes.get(type) ?? 0) + 1)
+    heartbeat('session-event', {
+      type,
+      hasSessionId: sessionId.length > 0,
+      cwd: cwd ?? null,
+      seen: Object.fromEntries(sawEventTypes),
+    })
     const data = (event as { data?: unknown } | undefined)?.data
     switch (type) {
-      case 'turn/start': {
-        const turn = typeof (data as { turn?: unknown })?.turn === 'number'
-          ? (data as { turn: number }).turn
+      // **DSH 的会话事件里没有 `turn/start` / `turn/end`** —— 这是本次实测纠正的
+      // 一个错误假设：实际边界是 `step/start` / `step/end`
+      // （`packages/core/session/src/known-event-types.ts`，心跳日志实测到
+      // `step/start`/`step/end`/`tool/call`/`tool/result`/`request/header` 等）。
+      //
+      // 后果曾很具体：认知层从不发 `turn/start`，于是推理模块的
+      // `lastActiveSession` 永远是 null → `omb_focus` 报"取不到当前会话标识"；
+      // 上下文模块的拉取台账也永远是 0 轮。
+      //
+      // 一个 step 是"模型一轮内的单次工具往返"；把它当作回合边界对本用途是合适的
+      // （要在每次往返后冲刷编码队列、刷新观测窗口）。
+      case 'step/start': {
+        const step = typeof data === 'object' && data !== null && 'step' in data
+          && typeof (data as { step?: unknown }).step === 'number'
+          ? (data as { step: number }).step
           : 0
-        kernel.emit('turn/start', { sessionId, turn })
+        kernel.emit('turn/start', { sessionId, turn: step })
         return
       }
-      case 'turn/end': {
-        const turn = typeof (data as { turn?: unknown })?.turn === 'number'
-          ? (data as { turn: number }).turn
+      case 'step/end': {
+        const step = typeof data === 'object' && data !== null && 'step' in data
+          && typeof (data as { step?: unknown }).step === 'number'
+          ? (data as { step: number }).step
           : 0
-        kernel.emit('turn/end', { sessionId, turn })
+        kernel.emit('turn/end', { sessionId, turn: step })
         // 回合边界冲刷向量编码队列。
         //
         // **不驱动的话 `embedding` 表恒空**：写入侧会发 `memory/written`，
