@@ -22,6 +22,7 @@ describe('内核 ABI 契约', () => {
       'MEMORY_KINDS',
       'MEMORY_SCOPES',
       'RESIDENT_HINT_MAX',
+      'SCHEMA_VERSION',
     ])
   })
 
