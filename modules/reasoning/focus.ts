@@ -16,6 +16,13 @@ import { CARDS_BY_DEPTH, cardsFor, renderCards } from './methods.js'
 export const QUICK_DIRECTIVE = '本轮不要展开，直接回答。'
 
 /**
+ * 档位取值元组。与 `kernel/abi/kinds.ts` 的 `FOCUS_DEPTHS` 是同一集合，
+ * 这里用元组形式是因为 zod 的 `z.enum` 需要元组类型；
+ * `satisfies` 保证任何一个都不是新造的词，测试再断言两处一致。
+ */
+export const FOCUS_DEPTH_VALUES = ['quick', 'standard', 'deep'] as const satisfies readonly FocusDepth[]
+
+/**
  * `deep` 档注入的抬头。三条全文由 `cards` 给出，这里只说明本轮的强制动作。
  */
 export const DEEP_DIRECTIVE = '本轮按深档展开：先列互斥备选，再给可检验的结论，并锚定具体事实。'
@@ -57,7 +64,7 @@ export function renderProjection(projection: DepthProjection, includeCards = tru
 
 /** 档位合法性判定（`omb_focus` 的入参校验用）。 */
 export function isFocusDepth(value: unknown): value is FocusDepth {
-  return typeof value === 'string' && (FOCUS_DEPTHS as readonly string[]).includes(value)
+  return typeof value === 'string' && (FOCUS_DEPTH_VALUES as readonly string[]).includes(value)
 }
 
 /**
