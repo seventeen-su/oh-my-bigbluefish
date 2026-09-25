@@ -18,8 +18,10 @@ import { createKernel } from '../../kernel/index.js'
 import { MODULE_CATALOG, SERVICES, toolsServiceFor, type StatusRegistry } from '../../kernel/abi/index.js'
 import { MODULE_ENTRIES } from '../../dsh/moduleEntries.js'
 import { loadModulesSync } from '../../dsh/modules.js'
+import { buildStatusTool } from '../../dsh/status-tool.js'
 import { collectToolSpecs, testHostContext } from '../../dsh/plugin.js'
-import { toHostPlugin } from '../../kernel/hostEntry.js'
+import { createToolBridge } from '../../dsh/tool-bridge.js'
+import { TOOL_BRIDGE_SERVICE, toHostPlugin } from '../../kernel/hostEntry.js'
 import { SessionTable, collectPromptContributions } from '../../dsh/session.js'
 
 /**
@@ -83,6 +85,50 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
       expect(names, `模块 ${entry.id} 声明了工具 ${entry.tools.join(',')}，但未注册 ${serviceName}`)
         .toContain(serviceName)
     }
+  })
+
+  it('工具桥：模块挂载完成后，模块工具真的进了宿主工具面', async () => {
+    // **这条防的是"看起来全对、功能却不在"**：内核 `apply` 是同步的，模块行由宿主
+    // 异步挂载。先前内核在 apply 里一次性收集工具，结果只有内核自带的 `omb_status`
+    // 进了工具面，其余 7 个工具**全部消失**，而健康面一切正常。
+    // 现在由 `toolBridge` 幂等重放：每挂载完一个模块就同步一次。
+    const registered: string[] = []
+    const host = { register: (def: unknown) => { registered.push((def as { name: string }).name); return () => {} } }
+    const handle = createKernel()
+    handle.kernel.provide(SERVICES.kernel, handle.kernel)
+    const bridge = createToolBridge()
+    bridge.attach(host, {
+      services: () => handle.kernel.services(),
+      service: <T,>(name: string) => handle.kernel.service<T>(name),
+      logger: { warn: () => {} },
+    })
+    handle.kernel.provide(TOOL_BRIDGE_SERVICE, bridge)
+
+    // 内核自带工具：由内核行加进桥
+    const statusSpec = buildStatusTool(handle, new SessionTable())
+    bridge.add([statusSpec], 'omb-kernel')
+
+    // 模拟宿主逐行加载：每挂载完一个模块重放一次
+    const loaded = loadModulesSync(MODULE_ENTRIES)
+    const hostCtx = testHostContext(handle)
+    for (const registration of loaded.modules) {
+      handle.mount(registration, hostCtx)
+      bridge.sync()
+    }
+
+    // 目录里声明的**每一个**工具都必须在工具面里
+    const declared = MODULE_CATALOG.flatMap(entry => entry.tools)
+    for (const tool of declared) {
+      expect(registered, `目录声明了 ${tool}，但它不在工具面里`).toContain(tool)
+    }
+    // 无重名（宿主对重名会抛，而抛会让整批失败）
+    expect(new Set(registered).size).toBe(registered.length)
+    // 桥是幂等的：再同步几次不会重复注册
+    const before = registered.length
+    bridge.sync()
+    bridge.sync()
+    expect(registered.length).toBe(before)
+    bridge.dispose()
   })
 
   it('工具面能真正收集到工具（含内核自带的 omb_status）', async () => {

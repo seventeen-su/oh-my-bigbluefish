@@ -115,6 +115,32 @@ export interface KernelHandleLike {
   mount(registration: ModuleRegistration<unknown>, hostCtx?: unknown): () => void
 }
 
+/** 内核行提供"动作型注册重放"时用的服务名。 */
+export const TOOL_BRIDGE_SERVICE = 'omb:tool-bridge'
+
+/**
+ * 模块挂载完成后，触发一次"把动作型注册同步给宿主"。
+ *
+ * **为什么需要**：内核行在 `apply` 里注册工具，而模块行是**异步**挂载的
+ * （Cordis 先等 `inject` 就绪，再在微任务里挂载）。内核注册那一刻模块还没有
+ * 任何工具服务，于是模块的工具**全部消失**——健康面却一切正常
+ * （实测：工具面只剩内核自带的 `omb_status`）。
+ *
+ * 由服务名解耦：内核不 import `dsh/`，模块入口不认识 `dsh/`，双方只认这个键。
+ */
+export function replayModuleRegistrations(kernel: Kernel, moduleId: string): void {
+  try {
+    const bridge = kernel.service<{ sync(): void }>(TOOL_BRIDGE_SERVICE)
+    if (bridge === undefined || typeof bridge.sync !== 'function') return
+    bridge.sync()
+  } catch (error) {
+    // 重放失败不得影响模块挂载本身；但要留声（工具会缺席）
+    process.stderr.write(
+      `OMB：模块 ${moduleId} 挂载后的注册重放失败——${error instanceof Error ? error.message : String(error)}\n`,
+    )
+  }
+}
+
 /**
  * 等待内核就绪。
  *
@@ -285,6 +311,9 @@ export function toHostPlugin<T>(registration: ModuleRegistration<T>): {
             const result = registration.apply(kernel, parsed as T)
             if (typeof result === 'function') dispose = result
           }
+          // **把动作型注册重放给宿主**：模块此时才把自己的工具/提示段注册进服务表，
+          // 而内核行早已 `apply` 完毕。`toolBridge` 由内核行提供，缺失即跳过。
+          replayModuleRegistrations(kernel, registration.manifest.id)
         } catch (error) {
           // H-1：启动路径不得把异常抛回宿主
           kernel.logger.warn(
