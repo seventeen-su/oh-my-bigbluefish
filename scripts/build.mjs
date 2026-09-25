@@ -179,7 +179,15 @@ function main() {
   }
 
   process.stdout.write(`[build] 第 ${generation} 代就绪：${outDir}（${entries.length} 个组件包已指向本代）\n`)
-  process.stdout.write('[build] 重新安装插件即可加载本代代码（组件包入口 URL 已变，不受 ESM 缓存影响）\n')
+  process.stdout.write(
+  '[build] 重新安装插件即可加载本代代码（组件包入口 URL 已变，不受 ESM 缓存影响）\n'
+  // 这条不是客套：实测踩过——`main` 已指向新代，但宿主仍报旧代，
+  // 因为**行的 name 没变**，宿主按包名解析后命中 Node 的模块缓存，
+  // 不会因为 `main` 变了就重新 import。症状是 `omb_status` 的「构建」代数
+  // 比 `build-generation.json` 旧，而功能看起来正常——最难查的一类。
+  + '[build] 注意：宿主进程若已在运行，行名（@omb/<组件>）没变，模块可能仍被缓存。\n'
+  + '        请重启 dsh web 后核对 omb_status 的「构建」代数与本代一致。\n',
+)
 }
 
 /**
