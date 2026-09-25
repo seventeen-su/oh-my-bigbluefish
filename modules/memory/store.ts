@@ -49,7 +49,7 @@ import {
   projectIdentity,
   type MemoryPaths,
 } from './paths.js'
-import { migrate, readUserVersion } from './migrate.js'
+import { migrate, readUserVersion, SchemaVersionAheadError } from './migrate.js'
 import { ftsMatchExpr, tokenizeForFts } from './text.js'
 
 /** 写锁等待上限：1000ms。**快速失败**，不做无限等待（规划 R8）。 */
@@ -1099,6 +1099,26 @@ export function openMemoryStore(options: OpenMemoryStoreOptions): SqliteMemorySt
 // 服务：用户库单例 + 项目库按 cwd 惰性缓存
 // ────────────────────────────────────────────────────────────────────────────
 
+/**
+ * 打开失败后的重试节奏（毫秒）。
+ *
+ * 为什么需要：宿主的 `node:sqlite` 是**异步解析**的（`dsh/stores.ts` 的 `ensureSqlite()`），
+ * 而模块的 `apply` 是同步的、开库必须在 `apply` 里发起——于是"首次打开"必然可能撞上
+ * "sqlite 尚未解析"。一次时序竞态不该被固化成永久降级：这里按节奏重试，直到成功或预算耗尽。
+ *
+ * 首个延迟是 0（下一个宏任务就试）：异步解析通常只差一个动态 `import` 的时间。
+ */
+export const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [0, 50, 150, 400, 1000]
+
+/** 等待宿主"就绪回调"的上限：回调挂住时不能让开库无限期跟着挂。 */
+export const DEFAULT_READY_WAIT_MS = 2000
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  const candidate = timer as unknown as { unref?: () => void }
+  // 不阻止进程退出（宿主进程里长驻，测试里不留悬挂句柄）
+  if (typeof candidate.unref === 'function') candidate.unref()
+}
+
 export interface StoresServiceOptions {
   readonly logger: Logger
   /** 注入时钟（内核 `kernel.clock`），传给每个库句柄。 */
@@ -1117,6 +1137,10 @@ export interface StoresServiceOptions {
    * `dsh/` 在构造注册项时直接注入是首选路径（不依赖服务名约定）。
    */
   readonly port?: StorageHostPort
+  /** 覆盖打开失败的重试节奏（测试用；缺省 `DEFAULT_RETRY_DELAYS_MS`）。 */
+  readonly retryDelaysMs?: readonly number[]
+  /** 覆盖"等待宿主就绪"的上限（毫秒）。 */
+  readonly readyWaitMs?: number
 }
 
 /**
@@ -1151,6 +1175,8 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
   const logger = options.logger
   const config = options.config ?? {}
   const maxOpenProjects = Math.max(1, options.maxOpenProjects ?? DEFAULT_MAX_OPEN_PROJECTS)
+  const retryDelays = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS
+  const readyWaitMs = options.readyWaitMs ?? DEFAULT_READY_WAIT_MS
 
   /** 会话 → cwd（宿主告知）。未登记时 forSession 降级为"仅用户库"。 */
   const cwdBySession = new Map<string, string>()
@@ -1166,6 +1192,12 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
   let userFailure: string | undefined
   let unexpectedFailure: string | undefined
   let resolvedPort: StorageHostPort | undefined
+  /** 已用掉的重试次数（成功即归零）。 */
+  let userAttempts = 0
+  /** 待执行的重试定时器（关闭时清掉，避免关库后又被唤醒）。 */
+  let userRetryTimer: ReturnType<typeof setTimeout> | undefined
+  /** 上一次用户库失败是否值得重试（确定性失败不重试）。 */
+  let lastUserFailureRetryable = true
   let closing = false
   let closePromise: Promise<void> | undefined
 
@@ -1222,6 +1254,63 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
     }
   }
 
+  /**
+   * 等宿主声明"sqlite 就绪"（可选能力）。
+   *
+   * `StorageHostPort` 是冻结 ABI，所以这里**结构化探测**一个可选的 `whenReady()`：
+   * `dsh/` 给了就等它（不再猜时序），没给就退化为下面的有界重试。
+   * 等待失败/超时都不抛——真正的错误由 `openDatabase` 抛出来，那才有诊断价值。
+   */
+  async function awaitPortReady(hostPort: StorageHostPort): Promise<void> {
+    const probe = (hostPort as { whenReady?: unknown }).whenReady
+    if (typeof probe !== 'function') return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.resolve((probe as () => unknown).call(hostPort)),
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, readyWaitMs)
+          unrefTimer(timer)
+        }),
+      ])
+    } catch {
+      // 就绪等待本身失败：继续尝试打开，让错误在 openDatabase 处显形
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * 用户库就绪后补开"已登记会话"的项目库。
+   *
+   * 为什么需要：`turn/start` 的预热可能发生在 sqlite 就绪之前（那次必然失败），
+   * 而项目库失败**不缓存**——但也没人再去开它。用户库一旦打开就补一次，
+   * 使"记录在案的会话"不会被一次时序竞态永久漏掉。
+   */
+  function warmKnownSessions(): void {
+    for (const cwd of new Set(cwdBySession.values())) {
+      void ensureProject(cwd).catch(NOOP)
+    }
+  }
+
+  /**
+   * 排一次重试。
+   * @returns `scheduled` 已排；`pending` 已有重试在排队；`exhausted` 预算耗尽（或已关闭）。
+   */
+  function scheduleUserRetry(): 'scheduled' | 'pending' | 'exhausted' {
+    if (closing) return 'exhausted'
+    if (userRetryTimer !== undefined) return 'pending'
+    const delay = retryDelays[userAttempts]
+    if (delay === undefined) return 'exhausted' // 预算耗尽：不再忙等，原因留在状态面
+    userAttempts += 1
+    userRetryTimer = setTimeout(() => {
+      userRetryTimer = undefined
+      void ensureUser().catch(NOOP)
+    }, delay)
+    unrefTimer(userRetryTimer)
+    return 'scheduled'
+  }
+
   async function ensureUser(): Promise<StoreSet | undefined> {
     if (closing) return undefined
     if (userSet !== undefined) return userSet
@@ -1233,8 +1322,10 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       return undefined
     }
 
+    let lastError: unknown
     userPromise = (async (): Promise<StoreSet | undefined> => {
       try {
+        await awaitPortReady(hostPort)
         const store = openMemoryStore({
           scope: 'user',
           dbPath: hostPort.userDbPath,
@@ -1249,15 +1340,31 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         userStore = store
         userSet = userOnlySet(store)
         userFailure = undefined
+        userAttempts = 0
+        warmKnownSessions()
         return userSet
       } catch (error) {
-        recordUserFailure(`用户库打开失败（${hostPort.userDbPath}）：${messageOf(error)}`)
+        lastError = error
+        // 确定性失败（版本高于插件支持）重试没有意义；其余失败按节奏重试
+        lastUserFailureRetryable = !(error instanceof SchemaVersionAheadError)
         return undefined
       }
     })()
 
     const result = await userPromise
-    if (result === undefined) userPromise = undefined // 允许下次调用重试
+    if (result === undefined) {
+      userPromise = undefined // 允许下次调用立即重试
+      // 重试决策**之后**才写原因：不能在还有重试排队时就说"放弃"（诚实降级）
+      const retryState = lastUserFailureRetryable ? scheduleUserRetry() : 'exhausted'
+      const suffix = !lastUserFailureRetryable
+        ? '（确定性失败，不重试）'
+        : retryState === 'scheduled'
+          ? `（第 ${userAttempts} 次失败，将重试）`
+          : retryState === 'pending'
+            ? '（已有重试在排队）'
+            : `（已重试 ${userAttempts} 次，放弃）`
+      recordUserFailure(`用户库打开失败（${hostPort.userDbPath}）：${messageOf(lastError)}${suffix}`)
+    }
     return result
   }
 
@@ -1351,6 +1458,11 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
   const closeService = (): Promise<void> => {
     closePromise ??= (async () => {
       closing = true
+      // 关库后不该再被重试定时器唤醒（否则会对已关闭的库再开一次）
+      if (userRetryTimer !== undefined) {
+        clearTimeout(userRetryTimer)
+        userRetryTimer = undefined
+      }
       const openSets = [...projects.values()]
       projects.clear()
       const inflight = [...pendingProjects.values()]
