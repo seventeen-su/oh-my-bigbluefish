@@ -56,12 +56,11 @@ export const VECTOR_MODULE_ID = 'omb-memory-vector'
 /** 本模块注册的嵌入器服务名（契约见 `SERVICES`）。 */
 export const EMBEDDER_SERVICE = SERVICES.embedder
 /**
- * 本模块注册的**编码队列**服务名。
+ * 本模块注册的**编码队列**服务名（契约见 `SERVICES.vectorEncoder`）。
  *
- * ⚠️ 待 `kernel/abi/catalog.ts` 冻结 `SERVICES.vectorEncoder = 'vectorEncoder'` 后改为引用常量
- * （字面量临时用，避免 ABI 变更阻塞施工）。
+ * 写入只入队、编码由 `dsh/` 在宿主回合边界批量驱动（`dsh/session.ts` 的 `encodePending` 调用）。
  */
-export const VECTOR_ENCODER_SERVICE = 'vectorEncoder'
+export const VECTOR_ENCODER_SERVICE = SERVICES.vectorEncoder
 /** 待编码队列的默认上界（`maxPending` 配置的缺省值）。 */
 export const DEFAULT_MAX_PENDING = 256
 
@@ -212,17 +211,12 @@ function messageOf(error: unknown): string {
 export type StoreSetResolver = (kernel: Kernel) => readonly StoreSet[]
 
 /**
- * 缺省解析：读内核 `stores` 服务的 `snapshot()`。
- *
- * ⚠️ `snapshot()` 目前是 store 实现的**附加**方法（`MemoryStoresService`，尚未进 ABI）。
- * 已向 lead 申请把它提升进 `StoresService`；在那之前用结构面读取：
- * 缺失或抛错 → 空数组（上层给可读原因），**绝不抛**。ABI 冻结后应删掉这个 cast。
+ * 缺省解析：读内核 `stores` 服务的 `snapshot()`（ABI 已冻结，见 `kernel/abi/storage.ts`）。
+ * 服务缺失或抛错 → 空数组（上层给可读原因），**绝不抛**。
  */
 const defaultResolveStoreSets: StoreSetResolver = (kernel) => {
-  const stores = kernel.service<StoresService>(SERVICES.stores) as
-    | (StoresService & { snapshot?: () => { user?: StoreSet; projects?: readonly StoreSet[] } })
-    | undefined
-  if (stores === undefined || typeof stores.snapshot !== 'function') return []
+  const stores = kernel.service<StoresService>(SERVICES.stores)
+  if (stores === undefined) return []
   try {
     const snapshot = stores.snapshot()
     const sets: StoreSet[] = []
