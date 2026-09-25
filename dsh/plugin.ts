@@ -26,11 +26,12 @@
 import { createKernel, type KernelHandle } from '../kernel/index.js'
 import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES, toolsServiceFor } from '../kernel/abi/index.js'
-import { KERNEL_READY_KEY, heartbeat } from '../kernel/hostEntry.js'
+import { KERNEL_READY_KEY, TOOL_BRIDGE_SERVICE, heartbeat } from '../kernel/hostEntry.js'
 import { generationFromUrl } from '../kernel/buildInfo.js'
 import type { HostContextLike } from './host.js'
 import { hostLogger, publishToHost, readService, systemClock } from './host.js'
-import { registerTools, type ToolSpec } from './tools.js'
+import { type ToolSpec } from './tools.js'
+import { createToolBridge } from './tool-bridge.js'
 import {
   SessionTable,
   collectPromptContributions,
@@ -118,19 +119,27 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   // 内核已可解析——放行（必须在任何 await 之前，否则模块行会等到超时）
   markReady()
 
-  // ── 1b) 内核自身的工具服务 ─────────────────────────────────────────────
-  // `MODULE_CATALOG` 给 `omb-kernel` 声明了 `omb_status`，而 `collectToolSpecs`
-  // 按 `tools:<id>` 前缀收集——所以这里必须真的注册它。否则"目录声明了、
-  // 但没有人实现"，而声明与实现不一致正是规划 §8.2 要删掉的那类东西。
+  // ── 1b) 工具桥（必须先于任何工具注册建立）──────────────────────────────
+  //
+  // **不要一次性收集工具**：内核 `apply` 是同步的，而模块行由宿主异步挂载
+  // （Cordis 先等 `inject: ['omb:kernel']` 就绪，再在微任务里挂载）。一次性收集的
+  // 结果是只有内核自带的 `omb_status` 进了工具面，其余 7 个工具**全部消失**，
+  // 而健康面一切正常——"看起来全对、功能却不在"。
+  // 桥的 `sync()` 幂等；每个模块挂载完成后由 `kernel/hostEntry.ts` 重放一次。
+  const toolBridge = createToolBridge()
+  const toolSource = {
+    services: () => handle.kernel.services(),
+    service: <T,>(name: string) => handle.kernel.service<T>(name),
+    logger,
+  }
+  handle.kernel.provide(TOOL_BRIDGE_SERVICE, toolBridge)
+  toolBridge.attach(readService<{ register(definition: unknown): unknown }>(ctx, 'tools'), toolSource)
+
+  // 内核自带的 `omb_status` 也走桥：这样"内核工具"与"模块工具"只有一条注册路径，
+  // 不必维护两套（两套必然漂移）。`MODULE_CATALOG` 给 `omb-kernel` 声明了它，
+  // 这里就是那个声明对应的实现。
   const statusSpec = buildStatusTool(handle, sessions)
-  handle.kernel.provide(toolsServiceFor('omb-kernel'), [
-    {
-      name: statusSpec.name,
-      description: statusSpec.description,
-      parameters: statusSpec.parameters,
-      execute: (args: unknown) => statusSpec.run(args),
-    },
-  ])
+  toolBridge.add([statusSpec], 'omb-kernel')
 
   // ── 2) 模块由**宿主 Cordis** 启动，内核不再自己启动 ──────────────────────
   //
@@ -153,12 +162,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   // 微内核自身在健康面留一行，让"内核有没有起来"与模块一样可见
   handle.kernel.report({ state: 'ok', detail: `微内核已就绪（产物代数 ${generationFromUrl(import.meta.url) ?? '未知'}）` })
 
-  // ── 3) 工具注册（同步；单个失败不影响其余）─────────────────────────────
-  const toolsService = readService<{ register(definition: unknown): unknown }>(ctx, 'tools')
-  const toolRegistration = registerTools(toolsService, collectToolSpecs(handle, sessions), logger)
-  for (const failure of toolRegistration.failures) logger.warn(`OMB：${failure}`)
-
-  // ── 4) 提示注入（同步注册）────────────────────────────────────────────
+  // ── 3) 提示注入（同步注册）────────────────────────────────────────────
   const disposePrompt = wirePromptInjection({
     kernel: handle.kernel,
     contributions: collectPromptContributions(handle.kernel),
@@ -181,7 +185,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 
   if (config.debug === true) {
     logger.info(
-      `OMB：已装配 ${loaded.modules.length} 个模块、${toolRegistration.failures.length} 个工具失败、`
+      `OMB：已装配 ${loaded.modules.length} 个模块、已注册工具 ${toolBridge.registered().length} 个、`
       + `${collectPromptContributions(handle.kernel).length} 个提示贡献`,
     )
   }
@@ -194,7 +198,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     const steps: readonly (() => void)[] = [
       disposeEvents,
       disposePrompt,
-      () => toolRegistration.dispose(),
+      () => toolBridge.dispose(),
       () => handle.dispose(),
     ]
     for (const step of steps) {
