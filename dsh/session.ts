@@ -292,7 +292,13 @@ export function wireSessionEvents(options: {
     // 为什么必要：模块经收养视图订阅 `turn/start` 时，`on` 优先绑的是**宿主**
     // 事件面，而下面 `kernel.emit` 发在**内核总线**——两者永远碰不到，
     // 且不报任何错。实测症状就是 `omb_focus` 报"取不到当前会话标识"。
-    kernel.service<{ remember(session: string): void }>(SERVICES.activeSession)?.remember(sessionId)
+    //
+    // **cwd 一并交给内核**：模块拿不到会话 cwd（`turn/start` 只有 sessionId/turn），
+    // 只能退回 `process.cwd()`——那是宿主进程的工作目录，不是用户会话的。
+    // 用户在别的目录里干活时，准入核验会把真实存在的文件判成不存在。
+    kernel
+      .service<{ remember(session: string, cwd?: string): void }>(SERVICES.activeSession)
+      ?.remember(sessionId, cwd)
     // 最后一次收到的会话事件类型（诊断）。
     // 用途：`omb_focus` 报"取不到会话"时，需要立刻分清是"事件没到"还是
     // "到了但字段取错"——两者的修法完全不同，而症状一模一样。

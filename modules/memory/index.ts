@@ -332,14 +332,31 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
                 .replace(/:\d+$/, '')
                 .trim()
               if (bare.length === 0) return undefined
-              const bases = [process.cwd()]
+              if (isAbsolute(bare)) return existsSync(bare)
+              /**
+               * **解析基准的顺序很重要**：先**会话 cwd**，再宿主进程 cwd。
+               *
+               * 会话 cwd 才是用户眼里的"当前目录"。拿 `process.cwd()` 当主基准是错的
+               * ——那是**宿主进程**的工作目录，用户在别的目录里干活时，相对路径会按
+               * 宿主 cwd 解析，把真实存在的文件判成不存在（假阴性 → 误拒）。
+               *
+               * `process.cwd()` 只作兜底：会话 cwd 尚未观测到时至少还能核验一种基准。
+               */
+              const bases: string[] = []
+              const sessionCwd = kernel
+                .service<{ cwd(): string | null }>(SERVICES.activeSession)
+                ?.cwd()
+              if (typeof sessionCwd === 'string' && sessionCwd.length > 0) bases.push(sessionCwd)
               const project = lastActiveSession === null
                 ? undefined
                 : service.peek(lastActiveSession)?.projectScope
-              if (project !== undefined && project !== null && project.length > 0) bases.push(project)
+              if (project !== undefined && project !== null && project.length > 0
+                && !bases.includes(project)) {
+                bases.push(project)
+              }
+              bases.push(process.cwd())
               for (const base of bases) {
-                const full = isAbsolute(bare) ? bare : join(base, bare)
-                if (existsSync(full)) return true
+                if (existsSync(join(base, bare))) return true
               }
               return false
             } catch {
