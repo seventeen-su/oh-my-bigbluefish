@@ -61,6 +61,16 @@ export interface StorageHostPort {
   openDatabase(path: string): SqliteLike
   /** 库文件所在目录不存在时是否自动创建。 */
   readonly createDirs: boolean
+  /**
+   * 宿主异步资源（`node:sqlite`）的就绪等待。**可选**——给了就不必猜时序。
+   *
+   * 存在的理由：宿主侧的 sqlite 解析是**异步**的（动态 `import`），
+   * 而模块的 `apply` 是同步的、读路径又是同步的 `peek()`（故意不在工具调用里做 I/O）。
+   * 于是"第一次打开失败"就可能被固化成永久降级。
+   * 有了它，模块可以先 `await` 就绪再开库；等待超时也只是继续尝试真开库，
+   * 让错误在 `openDatabase` 处显形——**不把忙等伪装成修复**。
+   */
+  readonly whenReady?: () => Promise<void>
 }
 
 /**
