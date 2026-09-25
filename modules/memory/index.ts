@@ -13,6 +13,7 @@ import { z } from 'zod'
 import type {
   Embedder,
   Kernel,
+  MemoryScope,
   MemoryStore,
   ModuleHealth,
   ModuleManifest,
@@ -27,6 +28,7 @@ import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/inde
 import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
+import { createRememberTool } from './remember.js'
 import type { RetrievalChannel } from './retrieve.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
@@ -94,10 +96,24 @@ async function describeStore(label: string, store: MemoryStore | undefined): Pro
 }
 
 /**
+ * 写入账本。**弃权必须可审计**（规划 §5.6）：弃权率是发现"该记的没记"的唯一手段。
+ * 经 `health()` 的 metrics 与 detail 暴露给状态面。
+ */
+export interface MemoryWriteLedger {
+  writes: number
+  abstentions: number
+  /** 最近一次弃权的原因（截断后进 detail，完整原因在日志里）。 */
+  lastAbstention: string
+}
+
+/**
  * 健康面。**必须写明原因**（无空降级）：
  * 库路径、行数、schema 版本、迁移结果、项目库打开情况，缺一不可。
  */
-async function describeHealth(service: MemoryStoresService): Promise<ModuleHealth> {
+async function describeHealth(
+  service: MemoryStoresService,
+  ledger: MemoryWriteLedger | undefined,
+): Promise<ModuleHealth> {
   const status = service.status()
   const snapshot = service.snapshot()
 
@@ -128,10 +144,22 @@ async function describeHealth(service: MemoryStoresService): Promise<ModuleHealt
   metrics['rows.total'] = totalRows
   metrics['vectors.total'] = vectorRows
   if (schemaVersion > 0) metrics['schemaVersion'] = schemaVersion
+  if (ledger !== undefined) {
+    metrics['writes'] = ledger.writes
+    metrics['abstentions'] = ledger.abstentions
+  }
 
   const catalogNote =
     CATALOG === undefined ? '；⚠ 模块目录里缺少 omb-memory 登记项（契约漂移）' : ''
-  const detail = `${parts.join('；')}；${status.detail}${catalogNote}`
+  const ledgerNote =
+    ledger === undefined || (ledger.writes === 0 && ledger.abstentions === 0)
+      ? ''
+      : `；写入 ${ledger.writes} 次、准入弃权 ${ledger.abstentions} 次${
+          ledger.lastAbstention.length === 0
+            ? ''
+            : `（最近弃权：${ledger.lastAbstention.slice(0, 60)}${ledger.lastAbstention.length > 60 ? '…' : ''}）`
+        }`
+  const detail = `${parts.join('；')}；${status.detail}${ledgerNote}${catalogNote}`
 
   if (service.failure() === undefined && status.ready) {
     return { state: 'ok', detail, metrics }
@@ -156,6 +184,7 @@ export interface MemoryModuleOptions {
  */
 export function createMemoryRegistration(options: MemoryModuleOptions = {}): ModuleRegistration<MemoryConfig> {
   let current: MemoryStoresService | undefined
+  let ledgerRef: MemoryWriteLedger | undefined
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
@@ -169,7 +198,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         return { state: 'degraded', detail: '模块未启动：apply 尚未执行（或已被卸载）' }
       }
       try {
-        return await describeHealth(service)
+        return await describeHealth(service, ledgerRef)
       } catch (error) {
         // health() 自身绝不抛：状态面拿不到原因比拿到"检查失败"更糟
         return { state: 'degraded', detail: `健康检查失败：${messageOf(error)}` }
@@ -198,16 +227,26 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 这是仓库既有模式（reasoning/context/artifact 都这么做），也是 H-2 的要求
       // （注册必须在 apply 返回前完成，且只有 dsh/ 能接触宿主）。
       let lastActiveSession: string | null = null
+      let lastTurn: number | undefined
       const offTurn = kernel.on('turn/start', payload => {
         lastActiveSession = payload.sessionId
+        lastTurn = payload.turn
         // 预热该会话的项目库：打开是异步的，工具执行体只能同步取库（`peek`）。
         // 失败由服务记入状态面（`status().detail`），这里吞掉是刻意的。
         void service.forSession(payload.sessionId)
       })
+
+      /**
+       * 写入账本。**弃权必须可审计**（§5.6）：弃权率是发现"该记的没记"的唯一手段。
+       * 通过 health 的 metrics 与 detail 暴露给状态面。
+       */
+      const ledger: MemoryWriteLedger = { writes: 0, abstentions: 0, lastAbstention: '' }
+      ledgerRef = ledger
       const resolveStores = (): readonly TaggedStore[] | undefined => {
         const set = lastActiveSession === null ? undefined : service.peek(lastActiveSession)
         return (set ?? service.snapshot().user)?.stores
       }
+
       const tools: readonly ToolDefinition[] = [
         ...createMemoryTools({
           resolveStores,
@@ -231,6 +270,38 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             lastActiveSession === null ? undefined : kernel.pressure(lastActiveSession).band,
         }),
         createRelateTool({ resolveStores }),
+        // ── 写入路径（规划 §5.6 在线部分）：不写，两个库永远是空的 ──────────────
+        createRememberTool({
+          // 写入可**等库打开**（读路径不行，它有延迟预算）：项目库尚未预热也能落库
+          resolveStore: async (scope: MemoryScope) => {
+            const set =
+              lastActiveSession === null
+                ? service.snapshot().user
+                : (await service.forSession(lastActiveSession)) ?? service.snapshot().user
+            return set?.store(scope)
+          },
+          clock: kernel.clock,
+          currentSession: () => lastActiveSession ?? undefined,
+          currentTurn: () => lastTurn,
+          // 项目身份：套件的 projectScope 就是规范化 cwd（§5.3）
+          currentProject: () =>
+            lastActiveSession === null ? undefined : service.peek(lastActiveSession)?.projectScope ?? undefined,
+          degradeReason: () => service.failure(),
+          /**
+           * `memory/written` 是**向量落盘的唯一触发源**：embed-dev 订阅它做批量编码。
+           * 在 put 成功之后发；订阅者异常由事件总线隔离，`emit` 自身也不会抛。
+           */
+          onWritten: payload => {
+            ledger.writes += 1
+            kernel.emit('memory/written', payload)
+          },
+          onAbstained: info => {
+            ledger.abstentions += 1
+            ledger.lastAbstention = info.reason
+            // 完整原因进日志（detail 里只放截断版，避免状态面被长文本淹没）
+            kernel.logger.info(`OMB：记忆写入弃权——${info.reason}`)
+          },
+        }),
       ]
       const offTools = kernel.provide(toolsServiceFor(MODULE_ID), tools)
 
@@ -269,6 +340,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           }
         }
         if (current === service) current = undefined
+        if (ledgerRef === ledger) ledgerRef = undefined
         await service.dispose()
       }
     },
