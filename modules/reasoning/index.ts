@@ -24,9 +24,8 @@ import type {
   StatusContributor,
   StatusRegistry,
   ToolDefinition,
-  ToolFactory,
 } from '../../kernel/abi/index.js'
-import { RESIDENT_HINT_MAX, SERVICES } from '../../kernel/abi/index.js'
+import { RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES, applyFocus, isFocusDepth, projectFocus, readFocus, renderProjection } from './focus.js'
 import type { LoopSignal, TurnFingerprint } from './loop.js'
 import { DEFAULT_WINDOW_SIZE, appendFingerprint, detectLoop, renderLoopSignal } from './loop.js'
@@ -62,12 +61,8 @@ export const reasoningConfigSchema = z
   })
   .default(DEFAULT_REASONING_CONFIG)
 
-/** `ToolFactory` 的输入：`dsh/` 在正确的作用域里传入当前会话。 */
-export interface ReasoningToolInput {
-  readonly currentSession: SessionRef
-}
-
-export type ReasoningToolFactory = ToolFactory<ReasoningToolInput>
+/** `tools:omb-reasoning` 的交付形状：`dsh/plugin.ts` 只消费数组（见 catalog 的 `toolsPrefix`）。 */
+export type ReasoningTools = readonly ToolDefinition[]
 
 /** `reasoning:loop` 服务面。 */
 export interface ReasoningLoopService {
@@ -129,8 +124,8 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
      * 最近活跃的会话。
      *
      * 工具调用发生在某个回合内，而回合边界事件带 `sessionId`——因此
-     * "最近活跃会话"就是当前会话。这是给 `dsh/` 传空 `currentSession` 时的回落
-     * （见 `toolFactory`），宿主若改为按会话建工厂，这个回落自然不再触发。
+     * "最近活跃会话"就是当前会话。这是 `tools:omb-reasoning` 里
+     * `omb_focus` 唯一的会话归属来源（dsh 无法按会话建工具，见工具面注释）。
      */
     let lastActiveSession: SessionRef | null = null
 
@@ -248,23 +243,28 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
       resident: () => hint,
     }
 
-    const toolFactory: ReasoningToolFactory = {
-      create: (input: ReasoningToolInput): readonly ToolDefinition[] => {
-        try {
-          const fixed = typeof input?.currentSession === 'string' ? input.currentSession.trim() : ''
-          return createReasoningTools({
-            // 空会话时回落到"最近活跃会话"：工具调用必然发生在某个回合内，
-            // 而回合边界事件带 sessionId，因此这个回落指向的就是当前会话。
-            currentSession: fixed !== '' ? fixed : () => lastActiveSession ?? '',
-            readDepth: target => readFocus(kernel, target).depth,
-            applyDepth: (target, depth, reason) => applyFocus(kernel, target, depth, reason),
-            loopSignal: target => loopService.signal(target),
-          })
-        } catch (error) {
-          kernel.logger.warn(`${MODULE_ID}：工具工厂创建失败——${messageOf(error)}`)
-          return []
-        }
-      },
+    /**
+     * 工具面。交付约定是 `tools:<模块 id>` → `readonly ToolDefinition[]`
+     * （`dsh/plugin.ts` 的前缀遍历只消费数组）。
+     *
+     * **会话解析用"最近活跃会话"是正确语义，不是 hack**（Lead 已确认）：
+     * 工具调用必然发生在某个回合内，而 `turn/start` / `evidence/observed` /
+     * `focus/changed` 都带 `sessionId`，因此最近活跃的那个就是当前会话。
+     * dsh 侧无法按会话建工具（那会让注册变成动态的，违反 H-2 的"apply 返回后不得注册"），
+     * 所以这里有且只有这一个正确的归属来源。
+     */
+    let tools: ReasoningTools = []
+    try {
+      tools = createReasoningTools({
+        currentSession: () => lastActiveSession ?? '',
+        readDepth: target => readFocus(kernel, target).depth,
+        applyDepth: (target, depth, reason) => applyFocus(kernel, target, depth, reason),
+        loopSignal: target => loopService.signal(target),
+      })
+    } catch (error) {
+      const note = `工具构造失败：${messageOf(error)}`
+      degradations.push(note)
+      kernel.logger.warn(`${MODULE_ID}：${note}`)
     }
 
     /**
@@ -325,7 +325,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     }
 
     provide(SERVICES.promptReasoning, contribution)
-    provide(SERVICES.reasoningTools, toolFactory)
+    provide(toolsServiceFor(MODULE_ID), tools)
     provide(SERVICES.reasoningLoop, loopService)
     provide(SERVICES.reasoningMethods, methodsService)
 

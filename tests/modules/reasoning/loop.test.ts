@@ -171,7 +171,8 @@ describe('滚动窗口与渲染', () => {
 
   it('renderLoopSignal：无信号返回空串（不注入"没有信号"这句话）', () => {
     expect(renderLoopSignal(null)).toBe('')
-    const signal = detectLoop(POSITIVE.oscillation)
+    const window = POSITIVE.oscillation ?? []
+    const signal = detectLoop(window)
     expect(renderLoopSignal(signal)).toContain(signal?.hint ?? '')
   })
 

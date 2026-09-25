@@ -3,9 +3,13 @@
  *
  * 核心契约（H-3）：**执行体绝不抛异常**——端口缺失、端口抛异常、
  * 参数非法，一律返回 `{kind:'error', text}`。
+ *
+ * 调用方按 ABI 要求 **await** 执行体（`execute` 的返回类型是
+ * `ToolOutcome | Promise<ToolOutcome>`）。本实现是同步的，`await` 不改变结果。
  */
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
+import type { ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
 import { applyFocus, readFocus } from '../../../modules/reasoning/focus.js'
 import type { LoopSignal } from '../../../modules/reasoning/loop.js'
 import { cardById, residentHint } from '../../../modules/reasoning/methods.js'
@@ -24,13 +28,16 @@ function makePorts(session = 's1', overrides: Partial<ReasoningToolPorts> = {}) 
   return { handle, ports }
 }
 
-const outcomeText = (outcome: { kind: string; text: string }): string => outcome.text
+async function run(tool: ToolDefinition, args: unknown): Promise<ToolOutcome> {
+  return await tool.execute(args)
+}
+
+const outcomeText = (outcome: ToolOutcome): string => outcome.text
 
 describe('omb_method', () => {
-  it('不传 topic：返回索引（八张编号 + 何时用），不给正文', () => {
+  it('不传 topic：返回索引（八张编号 + 何时用），不给正文', async () => {
     const { handle, ports } = makePorts()
-    const tool = createMethodTool(ports)
-    const outcome = tool.execute({})
+    const outcome = await run(createMethodTool(ports), {})
     expect(outcome.kind).toBe('text')
     for (const id of ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8']) {
       expect(outcomeText(outcome)).toContain(id)
@@ -39,62 +46,62 @@ describe('omb_method', () => {
     handle.dispose()
   })
 
-  it('传 topic："R3" / "备选" / "失败" 都能取到对应全文', () => {
+  it('传 topic："R3" / "备选" / "失败" 都能取到对应全文', async () => {
     const { handle, ports } = makePorts()
     const tool = createMethodTool(ports)
-    expect(outcomeText(tool.execute({ topic: 'R3' }))).toContain(cardById('R3')?.text ?? '')
-    expect(outcomeText(tool.execute({ topic: '备选' }))).toContain(cardById('R3')?.text ?? '')
-    expect(outcomeText(tool.execute({ topic: '失败' }))).toContain(cardById('R6')?.text ?? '')
+    expect(outcomeText(await run(tool, { topic: 'R3' }))).toContain(cardById('R3')?.text ?? '')
+    expect(outcomeText(await run(tool, { topic: '备选' }))).toContain(cardById('R3')?.text ?? '')
+    expect(outcomeText(await run(tool, { topic: '失败' }))).toContain(cardById('R6')?.text ?? '')
     handle.dispose()
   })
 
-  it('topic="all" 取八张全文', () => {
+  it('topic="all" 取八张全文', async () => {
     const { handle, ports } = makePorts()
-    const outcome = createMethodTool(ports).execute({ topic: 'all' })
+    const outcome = await run(createMethodTool(ports), { topic: 'all' })
     for (const id of ['R1', 'R8']) expect(outcomeText(outcome)).toContain(cardById(id)?.text ?? '')
     handle.dispose()
   })
 
-  it('无匹配话题：错误分支 + 索引（模型能自行改话题重试）', () => {
+  it('无匹配话题：错误分支 + 索引（模型能自行改话题重试）', async () => {
     const { handle, ports } = makePorts()
-    const outcome = createMethodTool(ports).execute({ topic: '不存在的词zzz' })
+    const outcome = await run(createMethodTool(ports), { topic: '不存在的词zzz' })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('没有匹配')
     expect(outcomeText(outcome)).toContain('R1')
     handle.dispose()
   })
 
-  it('参数非法（topic 不是字符串）：错误分支，不抛', () => {
+  it('参数非法（topic 不是字符串）：错误分支，不抛', async () => {
     const { handle, ports } = makePorts()
-    const outcome = createMethodTool(ports).execute({ topic: 42 })
+    const outcome = await run(createMethodTool(ports), { topic: 42 })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('omb_method')
     handle.dispose()
   })
 
-  it('args 为 null / 字符串同样不抛', () => {
+  it('args 为 null / 字符串同样不抛', async () => {
     const { handle, ports } = makePorts()
     const tool = createMethodTool(ports)
-    expect(tool.execute(null).kind).toBe('text')
-    expect(tool.execute('R3').kind).toBe('error')
+    expect((await run(tool, null)).kind).toBe('text')
+    expect((await run(tool, 'R3')).kind).toBe('error')
     handle.dispose()
   })
 
-  it('会话端口抛异常：仍然返回索引文本（该方法不需要会话）', () => {
+  it('会话端口抛异常：仍然返回索引文本（该方法不需要会话）', async () => {
     const { handle, ports } = makePorts('s1', {
       currentSession: () => {
         throw new Error('没有会话')
       },
     })
-    const outcome = createMethodTool(ports).execute({})
+    const outcome = await run(createMethodTool(ports), {})
     expect(outcome.kind).toBe('text')
     handle.dispose()
   })
 
-  it('有循环信号时附上一句话提示；信号端口抛异常则静默略过', () => {
+  it('有循环信号时附上一句话提示；信号端口抛异常则静默略过', async () => {
     const signal: LoopSignal = { kind: 'oscillation', detail: '来回两次', hint: '换个第三个选项。' }
     const ok = makePorts('s1', { loopSignal: () => signal })
-    expect(outcomeText(createMethodTool(ok.ports).execute({}))).toContain(signal.hint)
+    expect(outcomeText(await run(createMethodTool(ok.ports), {}))).toContain(signal.hint)
     ok.handle.dispose()
 
     const bad = makePorts('s1', {
@@ -102,15 +109,15 @@ describe('omb_method', () => {
         throw new Error('读数失败')
       },
     })
-    expect(createMethodTool(bad.ports).execute({}).kind).toBe('text')
+    expect((await run(createMethodTool(bad.ports), {})).kind).toBe('text')
     bad.handle.dispose()
   })
 })
 
 describe('omb_focus', () => {
-  it('合法档位：写进内核并回自解释文本', () => {
+  it('合法档位：写进内核并回自解释文本', async () => {
     const { handle, ports } = makePorts('s-focus')
-    const outcome = createFocusTool(ports).execute({ depth: 'deep', reason: '多方案权衡' })
+    const outcome = await run(createFocusTool(ports), { depth: 'deep', reason: '多方案权衡' })
     expect(outcome.kind).toBe('text')
     expect(outcomeText(outcome)).toContain('deep')
     expect(outcomeText(outcome)).toContain('多方案权衡')
@@ -118,42 +125,42 @@ describe('omb_focus', () => {
     handle.dispose()
   })
 
-  it('reason 缺省也能用（记为"模型未给理由"）', () => {
+  it('reason 缺省也能用（记为"模型未给理由"）', async () => {
     const { handle, ports } = makePorts('s2')
-    const outcome = createFocusTool(ports).execute({ depth: 'quick' })
+    const outcome = await run(createFocusTool(ports), { depth: 'quick' })
     expect(outcome.kind).toBe('text')
     expect(outcomeText(outcome)).toContain('模型未给理由')
     expect(handle.kernel.focus('s2')).toBe('quick')
     handle.dispose()
   })
 
-  it('非法档位：错误分支且不改状态', () => {
+  it('非法档位：错误分支且不改状态', async () => {
     const { handle, ports } = makePorts('s3')
     const tool = createFocusTool(ports)
-    const outcome = tool.execute({ depth: 'DEEP' })
+    const outcome = await run(tool, { depth: 'DEEP' })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('quick / standard / deep')
     expect(handle.kernel.focus('s3')).toBe('standard')
-    expect(tool.execute({}).kind).toBe('error')
-    expect(tool.execute({ depth: 7 }).kind).toBe('error')
+    expect((await run(tool, {})).kind).toBe('error')
+    expect((await run(tool, { depth: 7 })).kind).toBe('error')
     handle.dispose()
   })
 
-  it('取不到会话：错误分支，明说未改变任何状态', () => {
+  it('取不到会话：错误分支，明说未改变任何状态', async () => {
     const { handle, ports } = makePorts('s4', { currentSession: '' })
-    const outcome = createFocusTool(ports).execute({ depth: 'deep', reason: 'r' })
+    const outcome = await run(createFocusTool(ports), { depth: 'deep', reason: 'r' })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('会话')
     handle.dispose()
   })
 
-  it('端口抛异常：错误分支，绝不抛', () => {
+  it('端口抛异常：错误分支，绝不抛', async () => {
     const { handle, ports } = makePorts('s5', {
       applyDepth: () => {
         throw new Error('写不进去')
       },
     })
-    const outcome = createFocusTool(ports).execute({ depth: 'deep' })
+    const outcome = await run(createFocusTool(ports), { depth: 'deep' })
     expect(outcome.kind).toBe('error')
     expect(outcomeText(outcome)).toContain('写不进去')
     handle.dispose()
@@ -172,6 +179,18 @@ describe('工具工厂', () => {
     handle.dispose()
   })
 
+  it('每个工具都带原始 JSON Schema（dsh 注册需要，缺失则模型看不到入参）', () => {
+    const { handle, ports } = makePorts()
+    const schemaOf = (tool: ToolDefinition): Record<string, unknown> =>
+      (tool.parameters as unknown as { jsonSchema?: Record<string, unknown> }).jsonSchema ?? {}
+    const [method, focus] = createReasoningTools(ports)
+    expect(Object.keys((schemaOf(method!).properties as Record<string, unknown>) ?? {})).toEqual(['topic'])
+    const properties = schemaOf(focus!).properties as Record<string, { enum?: readonly string[] }>
+    expect(properties.depth?.enum).toEqual(['quick', 'standard', 'deep'])
+    expect(schemaOf(focus!).required).toEqual(['depth'])
+    handle.dispose()
+  })
+
   it('描述里含常驻提示提到的那两把工具（模型看得到）', () => {
     const hint = residentHint()
     const { handle, ports } = makePorts()
@@ -179,12 +198,10 @@ describe('工具工厂', () => {
     handle.dispose()
   })
 
-  it('两个工具的 execute 都是同步返回 ToolOutcome（不返回 Promise）', () => {
+  it('两个工具的 execute 都是同步返回（不返回 Promise）——await 两种实现都兼容', () => {
     const { handle, ports } = makePorts()
     for (const tool of createReasoningTools(ports)) {
-      const outcome = tool.execute({})
-      expect(outcome).not.toBeInstanceOf(Promise)
-      expect(['text', 'error']).toContain(outcome.kind)
+      expect(tool.execute({})).not.toBeInstanceOf(Promise)
     }
     handle.dispose()
   })

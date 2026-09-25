@@ -7,15 +7,14 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
-import type { ModuleRegistration, PromptContribution, ToolDefinition, ToolFactory } from '../../../kernel/abi/index.js'
-import { MODULE_CATALOG, RESIDENT_HINT_MAX, SERVICES } from '../../../kernel/abi/index.js'
+import type { ModuleRegistration, PromptContribution, ToolDefinition } from '../../../kernel/abi/index.js'
+import { MODULE_CATALOG, RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../../kernel/abi/index.js'
 import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES } from '../../../modules/reasoning/focus.js'
 import { FOCUS_DEPTHS } from '../../../kernel/abi/index.js'
 import type {
   ReasoningConfig,
   ReasoningLoopService,
   ReasoningMethodsService,
-  ReasoningToolInput,
 } from '../../../modules/reasoning/index.js'
 import {
   DEFAULT_REASONING_CONFIG,
@@ -58,6 +57,13 @@ function loopOf(handle: ReturnType<typeof createKernel>): ReasoningLoopService {
   const service = handle.kernel.service<ReasoningLoopService>(SERVICES.reasoningLoop)
   expect(service).toBeDefined()
   return service!
+}
+
+/** `tools:<模块 id>` 的交付形状是数组（dsh/plugin.ts 的前缀遍历只消费数组）。 */
+function toolsOf(handle: ReturnType<typeof createKernel>): readonly ToolDefinition[] {
+  const tools = handle.kernel.service<readonly ToolDefinition[]>(toolsServiceFor(MODULE_ID))
+  expect(Array.isArray(tools)).toBe(true)
+  return tools ?? []
 }
 
 describe('清单与目录一致（catalog 冻结契约）', () => {
@@ -110,7 +116,7 @@ describe('configSchema（缺省值必须完整）', () => {
 })
 
 describe('启动后的服务面', () => {
-  it('五个服务/登记项都在：prompt:reasoning / reasoning:tools / loop / methods / 状态段', () => {
+  it('五个服务/登记项都在：prompt:omb-reasoning / tools:omb-reasoning / loop / methods / 状态段', () => {
     const { handle, blocked } = start()
     expect(blocked).toEqual([])
     expect(handle.health()[MODULE_ID]?.state).toBe('ok')
@@ -119,10 +125,7 @@ describe('启动后的服务面', () => {
     expect(contribution.resident).toBe(residentHint())
     expect(contribution.resident!.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX)
 
-    const factory = handle.kernel.service<ToolFactory<ReasoningToolInput>>(SERVICES.reasoningTools)
-    expect(factory).toBeDefined()
-    const tools = factory!.create({ currentSession: 's1' })
-    expect(tools.map(tool => tool.name)).toEqual(entry!.tools)
+    expect(toolsOf(handle).map(tool => tool.name)).toEqual(entry!.tools)
 
     expect(loopOf(handle).signal('没人用过的会话')).toBeNull()
 
@@ -137,15 +140,13 @@ describe('启动后的服务面', () => {
 
   it('工具带原始 JSON Schema（dsh 注册需要；缺失会让模型看不到入参）', () => {
     const { handle } = start()
-    const factory = handle.kernel.service<ToolFactory<ReasoningToolInput>>(SERVICES.reasoningTools)
-    const tools = factory!.create({ currentSession: 's1' })
     const schemaOf = (tool: ToolDefinition | undefined): Record<string, unknown> =>
       (tool?.parameters as unknown as { jsonSchema?: Record<string, unknown> }).jsonSchema ?? {}
 
-    const methodSchema = schemaOf(tools.find(tool => tool.name === 'omb_method'))
+    const methodSchema = schemaOf(toolsOf(handle).find(tool => tool.name === 'omb_method'))
     expect(Object.keys((methodSchema.properties as Record<string, unknown>) ?? {})).toContain('topic')
 
-    const focusSchema = schemaOf(tools.find(tool => tool.name === 'omb_focus'))
+    const focusSchema = schemaOf(toolsOf(handle).find(tool => tool.name === 'omb_focus'))
     const depth = (focusSchema.properties as Record<string, { enum?: readonly string[] }>).depth
     expect(depth?.enum).toEqual([...FOCUS_DEPTHS])
     expect(focusSchema.required).toEqual(['depth'])
@@ -277,24 +278,20 @@ describe('默认档位只在会话首次落地（幂等，不逐轮抖动）', (
   })
 })
 
-describe('工具工厂的会话回落（dsh 目前传空 currentSession）', () => {
-  it('空会话时回落到最近活跃会话，omb_focus 仍然可用', () => {
+describe('工具的会话归属（最近活跃会话，不是 hack）', () => {
+  it('回合开始后 omb_focus 落到该会话', async () => {
     const { handle } = start()
-    const factory = handle.kernel.service<ToolFactory<ReasoningToolInput>>(SERVICES.reasoningTools)
-    const tools = factory!.create({ currentSession: '' })
     handle.kernel.emit('turn/start', { sessionId: 'live', turn: 1 })
-    const focusTool = tools.find(tool => tool.name === 'omb_focus')
-    const outcome = focusTool?.execute({ depth: 'deep', reason: '测试回落' })
+    const focusTool = toolsOf(handle).find(tool => tool.name === 'omb_focus')
+    const outcome = await focusTool?.execute({ depth: 'deep', reason: '测试归属' })
     expect(outcome?.kind).toBe('text')
     expect(handle.kernel.focus('live')).toBe('deep')
     handle.dispose()
   })
 
-  it('从未有过任何会话时给可读错误（不是抛异常）', () => {
+  it('从未有过任何会话时给可读错误（不是抛异常）', async () => {
     const { handle } = start()
-    const factory = handle.kernel.service<ToolFactory<ReasoningToolInput>>(SERVICES.reasoningTools)
-    const tools = factory!.create({ currentSession: '' })
-    const outcome = tools.find(tool => tool.name === 'omb_focus')?.execute({ depth: 'deep', reason: 'r' })
+    const outcome = await toolsOf(handle).find(tool => tool.name === 'omb_focus')?.execute({ depth: 'deep', reason: 'r' })
     expect(outcome?.kind).toBe('error')
     expect(outcome?.text).toContain('会话')
     handle.dispose()
@@ -309,7 +306,7 @@ describe('热插拔（H-1 / H-2）', () => {
     handle.dispose()
     expect(handle.listenerCount()).toBe(0)
     expect(kernel.service(SERVICES.promptReasoning)).toBeUndefined()
-    expect(kernel.service(SERVICES.reasoningTools)).toBeUndefined()
+    expect(kernel.service(toolsServiceFor(MODULE_ID))).toBeUndefined()
     expect(kernel.service(SERVICES.reasoningLoop)).toBeUndefined()
     expect(kernel.service(SERVICES.reasoningMethods)).toBeUndefined()
     expect(handle.statusNames()).not.toContain('思维链质量（omb-reasoning）')
@@ -323,22 +320,19 @@ describe('热插拔（H-1 / H-2）', () => {
     expect(health.detail.length).toBeGreaterThan(0)
   })
 
-  it('配置超限时降级可见（manifest + 状态段 + 下一个事件后的健康面），常驻提示仍守 120 上限', async () => {
+  it('配置超限时降级在启动瞬间就可见（内核不覆盖模块自报健康）', async () => {
     const { handle, registration } = start({ defaultDepth: 'standard', residentHintChars: 500 })
 
-    // 内核在 `apply` 返回后会写一条通用的 `{state:'ok'}`（kernel/index.ts:173），
-    // 因此**启动瞬间**的 handle.health() 不反映模块自报的降级。降级本身不丢：
-    // ① manifest.health() ② 状态面段落 ③ 下一个事件触发的重新上报都会写明原因。
     const own = await registration.manifest.health()
     expect(own.state).toBe('degraded')
     expect(own.detail).toContain('residentHintChars=500')
 
-    expect(handle.status().join('\n')).toContain('residentHintChars=500')
-
-    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    // 三条都要如实：模块自报、状态段、内核健康面
     const health = handle.health()[MODULE_ID]
     expect(health?.state).toBe('degraded')
     expect(health?.detail).toContain('residentHintChars=500')
+    expect(handle.status().join('\n')).toContain('residentHintChars=500')
+
     expect(contributionOf(handle).resident!.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX)
     handle.dispose()
   })
