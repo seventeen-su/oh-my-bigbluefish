@@ -13,6 +13,7 @@ import {
   createFilesTool,
   FILES_TOOL_NAME,
   formatFilesResult,
+  formatUtc,
   parseFilesInput,
 } from '../../../modules/artifact/tools.js'
 
@@ -32,6 +33,20 @@ describe('parseFilesInput：非法输入不抛', () => {
     expect(parseFilesInput({ query: '  a  ', limit: 2 })).toEqual({ query: 'a', limit: 2 })
     expect(parseFilesInput({ query: '' })).toEqual({})
     expect(parseFilesInput({ limit: Number.NaN })).toEqual({})
+  })
+})
+
+describe('formatUtc：不用 Date 的纯算术格式化（模块层禁直接取时间）', () => {
+  it('已知时间戳格式稳定', () => {
+    expect(formatUtc(1_000)).toBe('1970-01-01 00:00Z')
+    expect(formatUtc(1_700_000_000_000)).toBe('2023-11-14 22:13Z')
+    expect(formatUtc(1_000_000_000_000)).toBe('2001-09-09 01:46Z')
+  })
+
+  it('0 是"未观察到时间"的哨兵，非法时间降级为可读文案', () => {
+    expect(formatUtc(0)).toBe('时间未知')
+    expect(formatUtc(Number.NaN)).toBe('时间未知')
+    expect(formatUtc(-1)).toBe('时间未知')
   })
 })
 
@@ -61,6 +76,17 @@ describe('createFilesTool', () => {
     expect(tool.description).toContain('不含内容')
     expect(() => tool.parameters.parse(null)).not.toThrow()
     expect(() => tool.parameters.parse({ query: { nested: true } })).not.toThrow()
+  })
+
+  it('参数带 jsonSchema（模型看不到 zod；缺失会让工具"存在但无从填写"）', () => {
+    const tool = createFilesTool({ index: indexWith([{ path: 'src/a.ts', at: 1 }]) })
+    const jsonSchema = (tool.parameters as { jsonSchema?: Record<string, unknown> }).jsonSchema
+    expect(jsonSchema).toBeDefined()
+    expect(jsonSchema?.['type']).toBe('object')
+    const properties = jsonSchema?.['properties'] as Record<string, { type?: string; maximum?: number }>
+    expect(properties['query']?.type).toBe('string')
+    expect(properties['limit']?.type).toBe('integer')
+    expect(properties['limit']?.maximum).toBe(3) // 与运行期夹取上限一致，声明不漂
   })
 
   it('正常执行返回索引文本', async () => {

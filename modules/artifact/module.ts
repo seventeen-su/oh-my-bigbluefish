@@ -10,6 +10,7 @@
  * ③ 把服务与 `omb_files` 工具声明出去，由 `dsh/` 侧注册到宿主
  */
 import { z } from 'zod'
+import { SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import type { Clock, Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import type { ToolDefinition } from '../../kernel/abi/index.js'
 import type { ArtifactEntry, ArtifactKind } from './index.js'
@@ -17,12 +18,13 @@ import { ARTIFACT_DEFAULT_MAX, ARTIFACT_TOP_MAX, ArtifactIndex } from './index.j
 import { createFilesTool } from './tools.js'
 
 export const ARTIFACT_MODULE_ID = 'omb-artifact'
-export const ARTIFACT_SERVICE = 'artifact'
+/** 服务名取 ABI 契约（不是本地约定）。 */
+export const ARTIFACT_SERVICE = SERVICES.artifact
 /**
- * 工具声明服务名（跨模块约定：`tools:<moduleId>`）。
+ * 工具声明服务名：`tools:<模块 id>`（ABI `SERVICES.toolsPrefix` + `toolsServiceFor`）。
  * 模块**不自己注册宿主工具**——只声明，由 `dsh/` 侧在正确的生命周期里注册（ABI host.ts）。
  */
-export const ARTIFACT_TOOLS_SERVICE = `tools:${ARTIFACT_MODULE_ID}`
+export const ARTIFACT_TOOLS_SERVICE = toolsServiceFor(ARTIFACT_MODULE_ID)
 export const ARTIFACT_VERSION = '3.0.0'
 
 export interface ArtifactConfig {

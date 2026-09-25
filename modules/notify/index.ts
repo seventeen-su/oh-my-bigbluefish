@@ -47,7 +47,7 @@ export const notifyConfigSchema = z
 export interface NotifyService {
   /** 推送一条通知；返回是否真的发出（探测不到就是 false，绝不抛）。 */
   push(kind: string, message: string, sessionId?: string): boolean
-  status(): { readonly available: boolean; readonly detail: string }
+  status(): { readonly available: boolean; readonly detail: string; readonly sent: number; readonly suppressed: number }
 }
 
 export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
@@ -98,7 +98,12 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
           created.push(kind, message, sessionId),
         status: () => {
           const status = created.status()
-          return { available: status.available, detail: status.detail }
+          return {
+            available: status.available,
+            detail: status.detail,
+            sent: status.sent,
+            suppressed: status.suppressed,
+          }
         },
       }
 
