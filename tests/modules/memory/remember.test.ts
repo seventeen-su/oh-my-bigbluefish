@@ -86,11 +86,38 @@ describe('准入启发式（纯函数，§5.6）', () => {
       // 裸短哈希**不认**：形态上与标识符尾段无法区分（mem_..._3c6bf8ae）。
       // 宁可漏也不错收——错收会让假事实进库并被后续会话当结论召回。
       { text: 'Node 版本固定为 24.12.0', label: '版本号' },
+      { text: '改动在 src/memory/remember.ts:137 那一行', label: '行号' },
+      { text: '改动在 remember.ts#L137', label: '行号' },
+      { text: '见 line 137 的判据', label: '行号' },
     ]
     for (const item of cases) {
       const decision = decideAdmission({ ...base, text: item.text })
       expect(decision, item.text).toMatchObject({ ok: true, ground: 'reproducible-artifact', assertedBy: 'model' })
       expect(decision.ok && decision.reason).toContain(item.label)
+    }
+  })
+
+  it('行号判据不认时间戳与比例（曾把日期里的 35:54 当成行号）', () => {
+    // **这条来自一次真实自检报告**：写入
+    // `OMB v3 自检标记：本次自检时间为 2026-09-26T05:35:54+08:00，执行者为本会话。`
+    // 被记成「准入依据=reproducible-artifact（命中行号）」——而正文里没有任何行号。
+    //
+    // 根因是旧判据 `\b\d+:\d+\b`：它命中 `35:54`（时间）、`14:30`、`16:9`（比例），
+    // 却**漏掉**真正的 `src/index.ts:120`（`:` 前是字母，`\b` 不成立）——两头都错。
+    // 后果不只是漏收/错收：**判据给出的理由与内容不符，于是它的 verdict 不能当证据用**。
+    const cases: readonly string[] = [
+      'OMB v3 自检标记：本次自检时间为 2026-09-26T05:35:54+08:00，执行者为本会话。',
+      '会议定在 14:30 开始，别迟到。',
+      '屏幕比例是 16:9，录屏按这个来。',
+    ]
+    for (const text of cases) {
+      const decision = decideAdmission({ ...base, text })
+      // 要么被拒，要么即使通过也**不得**以"行号"为理由
+      if (decision.ok) {
+        expect(decision.reason, `不该以行号为由收下：${text}`).not.toContain('行号')
+      } else {
+        expect(decision.reason).toContain('没有准入依据')
+      }
     }
   })
 
