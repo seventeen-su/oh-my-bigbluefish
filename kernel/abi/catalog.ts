@@ -178,6 +178,22 @@ export const SERVICES = {
    * 若反过来让记忆模块直接 import 向量模块，依赖方向就与目录声明相反了。
    */
   channelRegistry: 'retrieval:channels',
+  /**
+   * 当前活跃会话。
+   *
+   * **为什么需要它**：模块经 `toHostPlugin` 拿到的内核是**收养视图**，
+   * 而收养视图的 `on` **优先绑定宿主的事件面**（`kernel/adopt.ts`）——于是
+   * 模块订阅的 `turn/start` 与 `dsh/` 在内核总线上发出的 `turn/start`
+   * **永远碰不到**。订阅注册成功、不报任何错，症状只是"事件好像没来"。
+   *
+   * 实测代价：`omb_focus` 一直报"取不到当前会话标识"（它读模块自己记的
+   * `lastActiveSession`，而那个变量永远停在 null）。诊断到这一步花了很久，
+   * 因为发送端与订阅端看起来都对。
+   *
+   * 会话是**内核级事实**（由 `dsh/` 从宿主的 `session/event` 观测而来），
+   * 不该依赖"模块能不能收到某条事件"。放在内核里，模块随时可以问。
+   */
+  activeSession: 'omb:active-session',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]

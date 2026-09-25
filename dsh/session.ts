@@ -287,6 +287,12 @@ export function wireSessionEvents(options: {
     if (cwd !== undefined) sessions.remember(sessionId, cwd)
 
     if (type === undefined) return
+    // **会话是内核级事实，观测到就写进内核**，不让模块依赖"能不能收到某条事件"。
+    //
+    // 为什么必要：模块经收养视图订阅 `turn/start` 时，`on` 优先绑的是**宿主**
+    // 事件面，而下面 `kernel.emit` 发在**内核总线**——两者永远碰不到，
+    // 且不报任何错。实测症状就是 `omb_focus` 报"取不到当前会话标识"。
+    kernel.service<{ remember(session: string): void }>(SERVICES.activeSession)?.remember(sessionId)
     // 最后一次收到的会话事件类型（诊断）。
     // 用途：`omb_focus` 报"取不到会话"时，需要立刻分清是"事件没到"还是
     // "到了但字段取错"——两者的修法完全不同，而症状一模一样。
