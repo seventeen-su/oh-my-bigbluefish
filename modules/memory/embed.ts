@@ -16,7 +16,7 @@
  * **不是语义模型**——同义改写与跨语言无力。状态面与文档不得把它宣传成语义嵌入。
  * 分词口径复用 `./text.js`（与 FTS 索引同源），使词法通道与向量通道在同一 token 空间互补。
  */
-import type { Embedder } from '../../kernel/abi/index.js'
+import type { Embedder, VectorAttribution } from '../../kernel/abi/index.js'
 import { tokenizeForFts } from './text.js'
 
 /**
@@ -184,12 +184,23 @@ export function blobToVector(blob: unknown): Float32Array | null {
   return new Float32Array(copy.buffer)
 }
 
-/** 库内已存向量的归属标签（`embedding` 表的 `model_id` / `dim` / `revision` 三列；见规划 §5.2）。 */
-export interface VectorAttribution {
-  readonly modelId: string
-  readonly dim: number
-  readonly revision: string
-}
+/**
+ * 库内已存向量的归属标签（`embedding` 表的 `model_id` / `dim` / `revision` 三列；见规划 §5.2）。
+ *
+ * **唯一定义在 ABI**（`kernel/abi/ports.ts` 的 `VectorAttribution`）：store 侧的表结构、
+ * 向量检索口与这里的校验函数必须说同一件事，所以这里只是按原路径再导出，不另立一份。
+ */
+export type { VectorAttribution }
+
+/**
+ * 哈希词袋路径的余弦下限：**只丢非正相关**（0）。
+ *
+ * 稀疏哈希词袋的无关文本余弦落在 0 附近或负值，所以 0 这条线足够；
+ * 而稠密神经嵌入的余弦**恒为正**（实测无关中文对 0.174~0.315），同一条线会让任何查询都返回
+ * 满额候选池、把排序压平。**两条路径的下限不可混用**——混用不会报错，只会静默改变召回量。
+ * 稠密路径的下限见 `onnx.ts` 的 `BGE_COSINE_FLOOR`（按模型实测标定）。
+ */
+export const HASH_BOW_COSINE_FLOOR = 0
 
 /** 归属校验结论。失败时 `reason` 必须是可行动的一句话（无空降级）。 */
 export type EmbedderCompat =
