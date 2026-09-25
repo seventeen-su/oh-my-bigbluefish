@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Artifact index",
+    "description": "Index of session artifacts, read on demand by omb_files; never injected into context."
+  }
+}

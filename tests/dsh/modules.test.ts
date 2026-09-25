@@ -1,42 +1,28 @@
 /**
  * 模块装配的契约测试。
  *
- * 防的是一条**由本设计新引入的失败模式**：为了让插件能在宿主 Node 进程里加载，
+ * 防的是**由本设计新引入的失败模式**：为了让插件能在宿主 Node 进程里加载，
  * 模块入口必须是静态导入（`import.meta.glob` 编译后不是合法 Node 代码，
  * 运行期扫目录又是异步的、违反 H-2）。代价是"新增模块要加一行"。
  *
  * 本测试把这个代价变成一条会失败的测试，而不是一个静默缺席的功能。
  */
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { MODULE_ENTRIES } from '../../dsh/moduleEntries.js'
 import { loadModulesSync, isModuleEntry, pickRegistrations, ambiguousIds } from '../../dsh/modules.js'
 import { MODULE_IDS } from '../../kernel/abi/index.js'
+import { COMPONENT_DISPLAY } from '../../kernel/display.js'
 
 const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
+const root = fileURLToPath(new URL('../../', import.meta.url))
 
-/**
- * 产物目录的路径片段。产物目录带**代数后缀**（`lib-gen/g1`）——代数变 = URL 变 =
- * 宿主必然加载新模块，而不是命中 ESM 缓存里的旧实例。
- *
- * 用字符串构造正则（而不是正则字面量）：路径里有 `/`，写在字面量里要层层转义，
- * 可读性差且极易写错（这里踩过一次）。
- */
-const OUTPUT_DIR = String.raw`(?:lib-gen/g\d+|lib|build\d*)`
-
-/** 从 YAML 里取指向本仓库模块的相对入口。 */
-function moduleEntrySpecs(): readonly string[] {
-  const re = new RegExp(String.raw`name:\s*'\./${OUTPUT_DIR}/(modules/[^'?]+)\.js`, 'g')
-  return [...yaml.matchAll(re)].map(m => m[1] as string)
-}
-
-/** 取 YAML 里「模块行 id + 其入口」的配对。 */
+/** 从 YAML 里取「行 id → 行 name」的配对。 */
 function moduleRows(): readonly (readonly [string, string])[] {
-  const re = new RegExp(
-    String.raw`- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'\./${OUTPUT_DIR}/(modules/[^'?]+)\.js`,
-    'g',
+  return [...yaml.matchAll(/- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'([^']+)'/g)].map(
+    m => [m[1] as string, m[2] as string] as const,
   )
-  return [...yaml.matchAll(re)].map(m => [m[1] as string, m[2] as string] as const)
 }
 
 describe('模块入口清单与 YAML 一致', () => {
@@ -50,23 +36,31 @@ describe('模块入口清单与 YAML 一致', () => {
     expect(offenders, `这些行带了 ?v= 尾缀，装到宿主后会加载失败：\n${offenders.join('\n')}`).toEqual([])
   })
 
-  it('cordis.patch.yml 里每个模块入口都在静态清单中', () => {
-    const declared = moduleEntrySpecs()
-    expect(declared.length).toBeGreaterThan(0)
-    for (const spec of declared) {
+  it('每行的 name 都是相对路径（硬约束：宿主用 new URL(name, baseUrl) 解析它）', () => {
+    // 实测：裸包名 + 子路径（`@omb/plugin/omb-kernel`）在这个宿主里**解析不了**
+    // ——8 行全部 "failed to import"。宿主只认相对路径与顶层包名，
+    // 所以这不是风格偏好：想换代码代次只能换产物目录名。
+    const rows = moduleRows()
+    expect(rows.length).toBeGreaterThan(0)
+    for (const [id, name] of rows) {
+      expect(name.startsWith('./'), `行 ${id} 的 name「${name}」不是相对路径`).toBe(true)
+    }
+  })
+
+  it('每行指向的产物文件真实存在', () => {
+    for (const [id, name] of moduleRows()) {
+      const target = name.split('?')[0] as string
       expect(
-        MODULE_ENTRIES.has(spec),
-        `YAML 引用了 ${spec}，但 dsh/moduleEntries.ts 的静态清单里没有它——`
-        + '这会让该行在插件页显示为激活失败（模块入口必须是静态导入，见 modules.ts 的说明）',
+        existsSync(`${root}${target.replace(/^\.\//, '')}`),
+        `行 ${id} 的 ${name} 不存在（先跑 node scripts/build.mjs）`,
       ).toBe(true)
     }
   })
 
-  it('静态清单里没有 YAML 未声明的入口（否则是没人装的死代码）', () => {
-    const declared = new Set(moduleEntrySpecs())
-    for (const key of MODULE_ENTRIES.keys()) {
-      expect(declared.has(key), `静态清单里的 ${key} 在 YAML 里没有对应行`).toBe(true)
-    }
+  it('没有两行指向同一个产物文件（否则同一模块被激活两次）', () => {
+    // 实测过这个症状：状态面出现两条 `omb-context` 段落、计数器各自独立。
+    const targets = moduleRows().map(([, name]) => name.split('?')[0] as string)
+    expect(new Set(targets).size).toBe(targets.length)
   })
 
   it('每个 YAML 模块行的 id 都在 MODULE_IDS 里', () => {
@@ -77,14 +71,18 @@ describe('模块入口清单与 YAML 一致', () => {
     }
   })
 
-  it('每个 YAML 模块行的入口与静态清单里的键一一对应', () => {
-    // 这条防的是"清单和 YAML 各自指向不同文件"——两边都对但配不上，
-    // 于是插件页那一行激活的是另一个文件里的注册项。
-    const rows = moduleRows()
-    expect(rows.length).toBe(MODULE_ENTRIES.size)
-    for (const [id, spec] of rows) {
-      const namespace = MODULE_ENTRIES.get(spec)
-      expect(namespace, `${id} 的入口 ${spec} 不在静态清单里`).toBeDefined()
+  it('每个组件都有中文显示名与说明（插件页那一列靠它）', () => {
+    // 插件页显示的是行 id 与 name（路径）；中文名来自 DSH 的本地化元数据。
+    // 缺了它用户看到的就是一串 file:/// 路径，不知道哪个开关对应哪个组件。
+    for (const id of MODULE_IDS) {
+      const entry = COMPONENT_DISPLAY.find(item => item.rowId === id)
+      expect(entry, `组件 ${id} 缺显示元数据（kernel/display.ts）`).toBeDefined()
+      expect((entry?.zh ?? '').length, `组件 ${id} 的中文名为空`).toBeGreaterThan(0)
+      expect((entry?.zhDescription ?? '').length, `组件 ${id} 缺中文说明`).toBeGreaterThan(0)
+    }
+    // 显示表里不该有孤儿条目
+    for (const entry of COMPONENT_DISPLAY) {
+      expect(MODULE_IDS).toContain(entry.rowId)
     }
   })
 })
@@ -115,9 +113,7 @@ describe('loadModulesSync', () => {
     expect(isModuleEntry('modules/memory/module')).toBe(true)
     // 这条曾经是 bug：vector.ts 是合法模块入口，却因文件名被静默跳过
     expect(isModuleEntry('modules/memory/vector')).toBe(true)
-    // 模块目录下的非入口文件也能被识别（形状判定会把它筛掉并记失败）
     expect(isModuleEntry('modules/memory/store')).toBe(true)
-    // 子目录里的文件不是模块入口
     expect(isModuleEntry('modules/memory/sub/thing')).toBe(false)
     expect(isModuleEntry('modules/memory')).toBe(false)
   })
@@ -140,7 +136,6 @@ describe('loadModulesSync', () => {
   it('模块 id 重复记为失败', () => {
     const profile = MODULE_ENTRIES.get('modules/profile/index')
     expect(loadModulesSync(new Map([['modules/a/index', profile]])).modules).toHaveLength(1)
-    // 把同一模块放进两个入口键 → 只装配一次并记一次失败
     const result = loadModulesSync(
       new Map<string, unknown>([
         ['modules/a/index', profile],
@@ -161,9 +156,8 @@ describe('pickRegistrations：按结构判定，不按导出名', () => {
 
   it('同一 id 下"可运行的注册项"优先于"裸清单"', () => {
     // 真实情形：vector.ts 同时导出 vectorManifest 与 vectorModule。
-    // 裸 manifest 也能通过形状判定（有 manifest.id 且 configSchema.parse 是函数），
-    // 若被收下就会因 id 重复把真正可运行的注册项挤掉——实测导致模块被装配成
-    // 没有 apply 的空壳，再被内核剔除。
+    // 裸 manifest 也能通过形状判定，若被收下就会因 id 重复把真正可运行的注册项
+    // 挤掉——实测导致模块被装配成没有 apply 的空壳，再被内核剔除。
     const bare = { manifest: { id: 'x', configSchema: { parse: () => ({}) } } }
     const runnable = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
     const picked = pickRegistrations({ vectorManifest: bare, vectorModule: runnable })
@@ -173,14 +167,12 @@ describe('pickRegistrations：按结构判定，不按导出名', () => {
 
   it('具名注册项优先于 default 宿主包装器（**不依赖命名空间键序**）', () => {
     // 这条防的是一个只在 Node 原生 ESM 下暴露、vitest 下**假绿**的 bug：
-    // ESM 命名空间的键按**字典序**枚举，`default` 排在 `registration` / `vectorModule`
-    // 等之前；而 `default` 是 `toHostPlugin` 包装器（它**也有** manifest 与 apply，
-    // 所以形状判定认它）。挑中包装器后，内核原生路径（`mount`/`start`）传进去的
-    // 第一参是内核视图而非宿主 ctx → 包装器取不到内核 → **静默失效**。
+    // ESM 命名空间的键按**字典序**枚举，`default` 排在 `registration` 等之前；
+    // 而 `default` 是 `toHostPlugin` 包装器（它**也有** manifest 与 apply）。
+    // 挑中包装器后内核原生路径传进去的第一参是内核视图而非宿主 ctx → 静默失效。
     //
-    // vitest 下 Vite 按**源码顺序**建键（`default` 在最后），所以只断言
-    // `pickRegistrations(MODULE_ENTRIES.get(...))` 是抓不住它的——必须手工构造
-    // "default 在前"的命名空间。
+    // vitest 下 Vite 按**源码顺序**建键（`default` 在最后），所以只断言真实清单
+    // 是抓不住它的——必须手工构造"default 在前"的命名空间。
     const real = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
     const wrapper = { manifest: real.manifest, apply: () => {} }
     for (const ns of [
@@ -199,9 +191,6 @@ describe('pickRegistrations：按结构判定，不按导出名', () => {
     expect(ambiguousIds({ default: wrapper, registration: real })).toEqual(['x'])
     expect(ambiguousIds({ registration: real })).toEqual([])
 
-    // 真实清单里**每个**入口都同时有具名项与 default 包装器（default 供宿主按行加载，
-    // 具名项供内核原生路径装配）。所以这不能报成失败——但"选了哪个"必须可见，
-    // 否则同一份代码在不同运行时下表现不同而无人察觉。
     const result = loadModulesSync(new Map([['modules/x/index', { default: wrapper, registration: real }]]))
     expect(result.modules).toHaveLength(1)
     expect(result.modules[0]).toBe(real)

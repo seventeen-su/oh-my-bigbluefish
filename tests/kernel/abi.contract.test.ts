@@ -12,7 +12,6 @@ import * as abi from '../../kernel/abi/index.js'
  * 宿主必然加载新模块，而不是命中 ESM 缓存里的旧实例
  * （见 `kernel/buildInfo.ts` 的说明）。
  */
-const OUTPUT_PREFIX = /^\.\/(?:lib-gen\/g\d+|lib|build\d*)\//
 
 describe('内核 ABI 契约', () => {
   it('CORE_ABI_VERSION 已冻结为 1', () => {
@@ -54,36 +53,31 @@ describe('内核 ABI 契约', () => {
     }
   })
 
-  it('cordis.patch.yml 的每个 name 都能映射到源码入口（构建前即可校验落点）', async () => {
+  it('cordis.patch.yml 的每个 name 都是存在的产物相对路径', async () => {
     const { readFileSync, existsSync } = await import('node:fs')
     const { fileURLToPath } = await import('node:url')
     const root = fileURLToPath(new URL('../../', import.meta.url))
     const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
 
-    // 只校验指向本仓库的相对路径（'./lib/...'），宿主包行（'@deepseek-ai/...'）跳过
-    const relativeNames = [...yaml.matchAll(/name:\s*'(\.\/[^']+)'/g)].map(m => m[1] as string)
-    expect(relativeNames.length).toBeGreaterThan(0)
+    // 行名必须是**相对路径**：宿主用 `new URL(name, baseUrl)` 解析它。
+    // 实测裸包名 + 子路径（`@omb/plugin/omb-kernel`）在这个宿主里解析不了
+    // ——8 行全部 "failed to import"。所以这是硬约束，不是风格偏好。
+    const ourNames = [...yaml.matchAll(/name:\s*'(\.\/[^']+)'/g)].map(m => m[1] as string)
+    expect(ourNames.length).toBeGreaterThan(0)
 
-    // 尚未实现的模块入口不计为失败——本段在实现到位前输出信息，实现后自然全绿。
-    // 这样契约测试可以在施工过程中保持可运行，而不是一开始就红着挡住所有提交。
-    const missing: string[] = []
-    for (const name of relativeNames) {
-      // './lib-gen/g1/modules/memory/index.js' → 源码落点 'modules/memory/index.ts'
+    for (const name of ourNames) {
       const withoutQuery = name.split('?')[0] as string
-      const sourceBase = withoutQuery.replace(OUTPUT_PREFIX, '').replace(/\.js$/, '')
-      const candidates = [`${sourceBase}.ts`, `${sourceBase}/index.ts`]
-      if (!candidates.some(c => existsSync(`${root}${c}`))) missing.push(`${name} → 试过 ${candidates.join(' / ')}`)
+      // 相对路径锚定补丁文件所在目录（仓库根）
+      expect(
+        existsSync(`${root}${withoutQuery.replace(/^\.\//, '')}`),
+        `${name} 指向的产物不存在（先跑 node scripts/build.mjs）`,
+      ).toBe(true)
     }
-    if (missing.length > 0) {
-       
-      console.warn(`[未实现的模块入口 ${missing.length} 个]\n${missing.join('\n')}`)
-    }
-    // 指向 dsh/ 的入口必须存在——那是插件本体，缺了整个插件都装不上
-    for (const name of relativeNames.filter(n => n.includes('/dsh/'))) {
-      const sourceBase = (name.split('?')[0] as string).replace(OUTPUT_PREFIX, '').replace(/\.js$/, '')
-      const exists = [`${sourceBase}.ts`, `${sourceBase}/index.ts`].some(c => existsSync(`${root}${c}`))
-      expect(exists, `插件入口缺失：${name}`).toBe(true)
-    }
+
+    // 指向内核本体的那一行必须在 dsh/ 下——它缺了整个插件都装不上
+    const kernelRow = /- id:\s*omb-kernel\s*\n\s*name:\s*'([^']+)'/.exec(yaml)?.[1]
+    expect(kernelRow, 'cordis.patch.yml 里找不到 omb-kernel 行').toBeDefined()
+    expect(kernelRow as string).toContain('/dsh/')
   })
 
   it('每个模块 id 在 cordis.patch.yml 里都有对应行（缺行 = 插件页看不到开关）', async () => {
