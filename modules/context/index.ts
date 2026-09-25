@@ -182,6 +182,15 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     const activeSession = (session?: SessionRef): SessionRef | null =>
       typeof session === 'string' && session.trim() !== '' ? session : lastActiveSession
 
+    /** 读时钟：端口异常时返回 0（服务方法不因宿主端口坏掉而抛给调用方）。 */
+    const now = (): number => {
+      try {
+        return kernel.clock.now()
+      } catch {
+        return 0
+      }
+    }
+
     const pressureOf = (session?: SessionRef): ContextPressure => {
       const target = activeSession(session)
       if (target === null) {
@@ -208,7 +217,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
           depth = recorded?.depth ?? 'standard'
         }
       }
-      return { depth, reason: recorded?.reason ?? '', setAt: kernel.clock.now() }
+      return { depth, reason: recorded?.reason ?? '', setAt: now() }
     }
 
     const healthNow = (): ModuleHealth => {
