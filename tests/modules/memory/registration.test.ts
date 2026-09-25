@@ -315,7 +315,12 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     handle.start([kernelRow, registration])
 
     const tools = toolsOf(handle)
-    expect(tools?.map(tool => tool.name).sort()).toEqual(['omb_forget', 'omb_recall', 'omb_relate'])
+    expect(tools?.map(tool => tool.name).sort()).toEqual([
+      'omb_forget',
+      'omb_recall',
+      'omb_relate',
+      'omb_remember',
+    ])
 
     handle.dispose()
     // 注销后工具服务消失 → dsh 的工具面里不会留下"关掉了还在"的工具
@@ -353,13 +358,87 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     ws.cleanup()
   })
 
+  it('端到端写入：omb_remember → memory/written 事件 → omb_recall 取回逐字+溯源；账本进健康面', async () => {
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const events: { id: string; scope: string; kind: string }[] = []
+    handle.kernel.on('memory/written', payload => void events.push(payload))
+
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+    const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
+    service?.rememberCwd('s1', ws.dir)
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 3 })
+
+    const tools = toolsOf(handle)
+    const remember = tools?.find(tool => tool.name === 'omb_remember')
+    const written = await remember?.execute({
+      text: '提交前先跑 pnpm verify，全绿才算完成',
+      kind: 'semantic',
+      userAsserted: true,
+    })
+    expect(written?.kind).toBe('text')
+    expect(written?.kind === 'text' ? written.text : '').toContain('已记住')
+    // 事件在 put 成功之后发：它是向量落盘的唯一触发源
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ scope: 'user', kind: 'semantic' })
+    expect(events[0]?.id).toMatch(/^mem_/)
+
+    // semantic → 用户库；项目库仍为空
+    expect((await service?.snapshot().user?.store('user')?.stats())?.rows).toBe(1)
+    const projectSet = await service?.forSession('s1')
+    expect((await projectSet?.store('project')?.stats())?.rows).toBe(0)
+
+    const recall = tools?.find(tool => tool.name === 'omb_recall')
+    const recalled = await recall?.execute({ query: 'pnpm verify', limit: 5 })
+    expect(recalled?.kind).toBe('text')
+    expect(recalled?.kind === 'text' ? recalled.text : '').toContain('提交前先跑 pnpm verify，全绿才算完成')
+    expect(recalled?.kind === 'text' ? recalled.text : '').toContain('observedAt=')
+
+    const health = await registration.manifest.health()
+    expect(health.metrics?.['writes']).toBe(1)
+    expect(health.metrics?.['rows.total']).toBe(1)
+
+    handle.dispose()
+    await service?.close()
+    ws.cleanup()
+  })
+
+  it('准入弃权与项目库路由：episodic 落项目库；模糊印象被拒并计入弃权账本', async () => {
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+    const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
+    service?.rememberCwd('s1', ws.dir)
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
+
+    const remember = toolsOf(handle)?.find(tool => tool.name === 'omb_remember')
+    await remember?.execute({ text: '今天定位了一个端口冲突', kind: 'episodic', userAsserted: true })
+    const rejected = await remember?.execute({ text: '用户大概是个喜欢安静的人吧。', kind: 'semantic' })
+
+    expect(rejected?.kind).toBe('text')
+    expect(rejected?.kind === 'text' ? rejected.text : '').toContain('未写入（准入弃权）')
+    const set = await service?.forSession('s1')
+    expect((await set?.store('project')?.stats())?.rows).toBe(1)
+    expect((await service?.snapshot().user?.store('user')?.stats())?.rows).toBe(0)
+
+    const health = await registration.manifest.health()
+    expect(health.metrics).toMatchObject({ writes: 1, abstentions: 1 })
+    expect(health.detail).toContain('准入弃权 1 次')
+
+    handle.dispose()
+    await service?.close()
+    ws.cleanup()
+  })
+
   it('服务未就绪时工具返回 kind:error（绝不抛）——H-3', async () => {
     const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
     const registration = createMemoryRegistration() // 没有存储端口 → 库永远打不开
     handle.start([kernelRow, registration])
 
     const tools = toolsOf(handle)
-    expect(tools).toHaveLength(3)
+    expect(tools).toHaveLength(4)
     for (const tool of tools ?? []) {
       const outcome = await tool.execute({ query: '任意', id: '任意', ids: ['任意'] })
       expect(outcome.kind).toBe('error')
