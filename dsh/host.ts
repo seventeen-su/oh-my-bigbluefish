@@ -101,3 +101,38 @@ export function registerEffect(ctx: HostContextLike, fn: () => void, label: stri
   }
   return run
 }
+
+/**
+ * 把内核能力发布到**宿主** ctx。
+ *
+ * **为什么不能只注册进我们自己的服务表**：宿主按行独立加载插件，
+ * 模块行 `ctx.get()` 查的是**宿主**的服务表；我们的 `kernel.provide` 写的是
+ * 内核自己的表——两者不通。实测后果：8 个模块全部"正常"却什么都没做
+ * （`resolveKernel` 对每一行返回 undefined，兜底成空 disposer，**静默空转**）。
+ *
+ * 探测式调用：宿主 ctx 上可能是 `provide` / `set` / `service` 之一，
+ * 逐个试且**绝不抛**；都不可用时返回 false，由调用方如实降级。
+ */
+export function publishToHost(ctx: HostContextLike, name: string, value: unknown): boolean {
+  const candidate = ctx as {
+    provide?: (n: string, v: unknown) => unknown
+    set?: (n: string, v: unknown) => unknown
+    service?: (n: string, v: unknown) => unknown
+  }
+  for (const key of ['provide', 'set', 'service'] as const) {
+    let fn: unknown
+    try {
+      fn = candidate[key]
+    } catch {
+      continue
+    }
+    if (typeof fn !== 'function') continue
+    try {
+      ;(fn as (n: string, v: unknown) => unknown).call(ctx, name, value)
+      return true
+    } catch {
+      // 该形态不接受这个调用方式 → 试下一个
+    }
+  }
+  return false
+}

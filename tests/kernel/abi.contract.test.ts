@@ -63,7 +63,7 @@ describe('内核 ABI 契约', () => {
     for (const name of relativeNames) {
       // './lib/modules/memory/index.js?v=1' → 源码落点 'modules/memory/index.ts'
       const withoutQuery = name.split('?')[0] as string
-      const sourceBase = withoutQuery.replace(/^\.\/lib\//, '').replace(/\.js$/, '')
+      const sourceBase = withoutQuery.replace(/^\.\/(?:lib|build\d*)\//, '').replace(/\.js$/, '')
       const candidates = [`${sourceBase}.ts`, `${sourceBase}/index.ts`]
       if (!candidates.some(c => existsSync(`${root}${c}`))) missing.push(`${name} → 试过 ${candidates.join(' / ')}`)
     }
@@ -73,7 +73,7 @@ describe('内核 ABI 契约', () => {
     }
     // 指向 dsh/ 的入口必须存在——那是插件本体，缺了整个插件都装不上
     for (const name of relativeNames.filter(n => n.includes('/dsh/'))) {
-      const sourceBase = (name.split('?')[0] as string).replace(/^\.\/lib\//, '').replace(/\.js$/, '')
+      const sourceBase = (name.split('?')[0] as string).replace(/^\.\/(?:lib|build\d*)\//, '').replace(/\.js$/, '')
       const exists = [`${sourceBase}.ts`, `${sourceBase}/index.ts`].some(c => existsSync(`${root}${c}`))
       expect(exists, `插件入口缺失：${name}`).toBe(true)
     }
