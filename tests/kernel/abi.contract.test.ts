@@ -7,6 +7,13 @@
 import { describe, expect, it } from 'vitest'
 import * as abi from '../../kernel/abi/index.js'
 
+/**
+ * 产物路径前缀。产物目录带**代数后缀**（`lib-gen/g1`）——代数变 = URL 变 =
+ * 宿主必然加载新模块，而不是命中 ESM 缓存里的旧实例
+ * （见 `kernel/buildInfo.ts` 的说明）。
+ */
+const OUTPUT_PREFIX = /^\.\/(?:lib-gen\/g\d+|lib|build\d*)\//
+
 describe('内核 ABI 契约', () => {
   it('CORE_ABI_VERSION 已冻结为 1', () => {
     expect(abi.CORE_ABI_VERSION).toBe(1)
@@ -61,9 +68,9 @@ describe('内核 ABI 契约', () => {
     // 这样契约测试可以在施工过程中保持可运行，而不是一开始就红着挡住所有提交。
     const missing: string[] = []
     for (const name of relativeNames) {
-      // './lib/modules/memory/index.js?v=1' → 源码落点 'modules/memory/index.ts'
+      // './lib-gen/g1/modules/memory/index.js' → 源码落点 'modules/memory/index.ts'
       const withoutQuery = name.split('?')[0] as string
-      const sourceBase = withoutQuery.replace(/^\.\/(?:lib|build\d*)\//, '').replace(/\.js$/, '')
+      const sourceBase = withoutQuery.replace(OUTPUT_PREFIX, '').replace(/\.js$/, '')
       const candidates = [`${sourceBase}.ts`, `${sourceBase}/index.ts`]
       if (!candidates.some(c => existsSync(`${root}${c}`))) missing.push(`${name} → 试过 ${candidates.join(' / ')}`)
     }
@@ -73,7 +80,7 @@ describe('内核 ABI 契约', () => {
     }
     // 指向 dsh/ 的入口必须存在——那是插件本体，缺了整个插件都装不上
     for (const name of relativeNames.filter(n => n.includes('/dsh/'))) {
-      const sourceBase = (name.split('?')[0] as string).replace(/^\.\/(?:lib|build\d*)\//, '').replace(/\.js$/, '')
+      const sourceBase = (name.split('?')[0] as string).replace(OUTPUT_PREFIX, '').replace(/\.js$/, '')
       const exists = [`${sourceBase}.ts`, `${sourceBase}/index.ts`].some(c => existsSync(`${root}${c}`))
       expect(exists, `插件入口缺失：${name}`).toBe(true)
     }

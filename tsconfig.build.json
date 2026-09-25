@@ -2,10 +2,13 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "outDir": "lib",
+    "outDir": "lib-gen",
     "rootDir": ".",
     "declaration": false,
-    "sourceMap": false
+    "sourceMap": false,
+    "incremental": true,
+    "tsBuildInfoFile": "lib-gen/.tsbuildinfo"
   },
-  "include": ["kernel", "modules", "dsh"]
+  "include": ["kernel", "modules", "dsh"],
+  "exclude": ["lib-gen", "node_modules", "tests"]
 }
