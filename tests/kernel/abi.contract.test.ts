@@ -21,9 +21,34 @@ describe('内核 ABI 契约', () => {
       'FOCUS_DEPTHS',
       'MEMORY_KINDS',
       'MEMORY_SCOPES',
+      'MODULE_CATALOG',
+      'MODULE_IDS',
       'RESIDENT_HINT_MAX',
       'SCHEMA_VERSION',
+      'SCOPE_BY_KIND',
+      'STATUS_TOOL',
+      'validateCatalog',
     ])
+  })
+
+  it('模块目录自身一致：依赖存在、无环、id 唯一', () => {
+    expect(abi.validateCatalog()).toEqual([])
+  })
+
+  it('模块 id 与 cordis.patch.yml 的行 id 一一对应（契约三方一致）', async () => {
+    const { readFileSync } = await import('node:fs')
+    const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
+    for (const id of abi.MODULE_IDS) {
+      expect(yaml, `缺少行 id：${id}`).toContain(`id: ${id}`)
+    }
+  })
+
+  it('写入路由：情景/程序性落项目库，语义落用户库', () => {
+    expect(abi.SCOPE_BY_KIND).toEqual({
+      episodic: 'project',
+      procedural: 'project',
+      semantic: 'user',
+    })
   })
 
   it('枚举取值冻结（改动即破坏性变更）', () => {
