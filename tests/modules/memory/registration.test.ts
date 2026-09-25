@@ -344,8 +344,9 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const outcome = await recall?.execute({ query: 'pnpm verify', limit: 5 })
     expect(outcome?.kind).toBe('text')
     expect(outcome?.kind === 'text' ? outcome.text : '').toContain('pnpm verify')
-    // 溯源随行：消费者免费拿到 sourceRef
+    // 溯源随行：消费者免费拿到 sourceRef 与 observedAt（逐字 + 溯源，不再需要额外查询）
     expect(outcome?.kind === 'text' ? outcome.text : '').toContain('session:s1#turn-1')
+    expect(outcome?.kind === 'text' ? outcome.text : '').toContain('observedAt=')
 
     handle.dispose()
     await service?.close()
