@@ -26,7 +26,7 @@ export const ARTIFACT_SERVICE = SERVICES.artifact
  * 模块**不自己注册宿主工具**——只声明，由 `dsh/` 侧在正确的生命周期里注册（ABI host.ts）。
  */
 export const ARTIFACT_TOOLS_SERVICE = toolsServiceFor(ARTIFACT_MODULE_ID)
-export const ARTIFACT_VERSION = '3.0.0'
+export const ARTIFACT_VERSION = '3.1.0'
 
 export interface ArtifactConfig {
   /** 索引簿记上限（不是上下文预算）。 */

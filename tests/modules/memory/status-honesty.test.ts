@@ -24,7 +24,7 @@ import { capturingLogger, fixedClock, tempWorkspace, testPort, testSessionCwds }
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.0.0',
+    version: '3.1.0',
     requires: [],
     capabilities: [],
     configSchema: { parse: () => ({}) },

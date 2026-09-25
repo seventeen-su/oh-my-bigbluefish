@@ -35,7 +35,7 @@ import { createReasoningTools } from './tools.js'
 import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
-export const MODULE_VERSION = '3.0.0'
+export const MODULE_VERSION = '3.1.0'
 
 /** 配置：`cordis.patch.yml` 的 `config` 段。 */
 export interface ReasoningConfig {
