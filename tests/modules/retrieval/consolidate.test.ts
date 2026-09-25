@@ -301,6 +301,29 @@ describe('衰减：只重排先验，不衰减行', () => {
   })
 })
 
+describe('保留来源（omb-doc:）：结构化状态不参与整合', () => {
+  it('画像记录不被去重/回响合并，也不进衰减排序；但隐私擦除照常有效', () => {
+    const records = [
+      makeRecord({ id: 'profile-doc', text: '用户偏好：中文回复', sourceRef: 'omb-doc:profile', useCount: 3 }),
+      makeRecord({ id: 't1', text: '用户偏好：中文回复', sourceRef: 'session:s1#turn:1' }),
+      makeRecord({ id: 't2', text: '用户偏好：中文回复', sourceRef: 'session:s1#turn:8' }),
+    ]
+    const plan = planConsolidation({ records, contradictions: [] }, { now: NOW })
+    // 两条经验痕迹塌缩成一条；画像记录被完全跳过
+    expect(plan.merges.length).toBe(1)
+    expect(plan.merges[0]?.keepId).not.toBe('profile-doc')
+    expect(plan.merges[0]?.absorbedIds).not.toContain('profile-doc')
+    expect(plan.decay.map(d => d.id).sort()).toEqual(['t1', 't2'])
+    expect(plan.stats.reservedSkipped).toBe(1)
+    expect(plan.stats.records).toBe(2)
+    expect(plan.notes.join('\n')).toContain('omb-doc')
+
+    // 隐私擦除必须对它有效（整库擦除是文件级操作，但按 id 擦除走这里）
+    const erased = planConsolidation({ records }, { now: NOW, erasureIds: ['profile-doc'] })
+    expect(erased.erasures).toEqual(['profile-doc'])
+  })
+})
+
 describe('纯原语与确定性', () => {
   it('sourceChain / jaccard / shingles 语义', () => {
     expect(sourceChain('session:s1#turn:3')).toBe('session:s1')

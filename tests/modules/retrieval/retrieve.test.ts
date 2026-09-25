@@ -13,11 +13,12 @@ import {
   asciiCompare,
   fuseByRank,
   gateRetrieval,
+  isoUtc,
   rankHits,
   retrieve,
   selectWithQuota,
 } from '../../../modules/memory/retrieve.js'
-import { clockAt, countingEmbedder, fakeStore, hits, makeRecord, tagged } from './fakes.js'
+import { clockAt, countingEmbedder, fakeStore, fixedEmbedder, hits, makeRecord, tagged, vectorChannelOf } from './fakes.js'
 
 const CLOCK = clockAt(10_000_000)
 
@@ -319,6 +320,22 @@ describe('阶段⑤⑥⑦ 配额、上限、水合与溯源', () => {
     expect('a'.localeCompare('B')).toBeLessThan(0)
   })
 
+  it('时间格式化是纯算术：与 new Date(ms).toISOString() 逐字节一致', () => {
+    // 模块层禁止 new Date（omb/no-direct-clock）；这里用差分测试证明等价性
+    for (const ms of [
+      0,
+      1,
+      999,
+      1_000,
+      1_699_100_000_000,
+      1_700_000_000_000,
+      2_000_000_000_000,
+      253_402_300_799_999, // 9999-12-31T23:59:59.999Z
+    ]) {
+      expect(isoUtc(ms), `ms=${ms}`).toBe(new Date(ms).toISOString())
+    }
+  })
+
   it('同分时按作用域优先级排序（与输入顺序无关）', async () => {
     const left = fakeStore({ scope: 'user', records: [makeRecord({ id: 'a', text: 'x' })], search: () => hits(['a']) })
     const right = fakeStore({
@@ -368,6 +385,42 @@ describe('阶段⑥ 可选廉价重排', () => {
   })
 })
 
+describe('保留来源（omb-doc:）：结构化状态不是经验，不参与召回排名', () => {
+  it('画像记录即使词法命中也不注入；真正的经验候选照常返回', async () => {
+    const store = fakeStore({
+      scope: 'user',
+      records: [
+        makeRecord({ id: 'profile', text: '用户偏好：中文回复，术语保留英文', sourceRef: 'omb-doc:profile', observedAt: 9_999 }),
+        makeRecord({ id: 'trace', text: '用户要求：中文回复，术语保留英文', sourceRef: 'session:s1#turn:3' }),
+      ],
+      // 画像记录相关度更高（排在前面），仍必须被排除
+      search: () => hits(['profile', 'trace'], 100),
+    })
+    const result = await retrieve([tagged(store)], { text: '中文回复', limit: 5 }, { clock: CLOCK })
+    expect(result.items.map(i => i.id)).toEqual(['trace'])
+    expect(result.stats.reservedSkipped).toBe(1)
+  })
+
+  it('保留来源不占用候选上限的位次（水合在截断之前）', async () => {
+    const store = fakeStore({
+      scope: 'user',
+      records: [
+        makeRecord({ id: 'profile', text: '画像：中文', sourceRef: 'omb-doc:profile' }),
+        makeRecord({ id: 'trace-1', text: '经验一：中文' }),
+        makeRecord({ id: 'trace-2', text: '经验二：中文' }),
+      ],
+      search: () => hits(['profile', 'trace-1', 'trace-2'], 100),
+    })
+    const result = await retrieve(
+      [tagged(store)],
+      { text: '中文', limit: 5, maxCandidates: 2, poolLimit: 3 },
+      { clock: CLOCK },
+    )
+    expect(result.items.map(i => i.id)).toEqual(['trace-1', 'trace-2'])
+    expect(result.stats.candidatesCapped).toBe(2)
+  })
+})
+
 describe('端口注入的可选第二通道', () => {
   it('每个库都被每个通道查询一次；嵌入器只调用一次', async () => {
     const store = fakeStore({ scope: 'user', records: [makeRecord({ id: 'a', text: 'alpha' })] })
@@ -393,6 +446,82 @@ describe('端口注入的可选第二通道', () => {
     }
     const result = await retrieve([tagged(store)], { text: 'alpha', limit: 1 }, { clock: CLOCK, channels: [channel] })
     expect(result.items.map(i => i.id)).toEqual(['a'])
+    expect(result.degraded.join('\n')).toContain('维度不匹配')
+  })
+})
+
+describe('向量通道接缝：通道只适配，归属过滤与存取在端口 searchVector', () => {
+  const embedder = fixedEmbedder([1, 0, 0, 0], 'bge-small-zh-v1.5', 'rev-2026')
+  const attribution = { modelId: 'bge-small-zh-v1.5', dim: 4, revision: 'rev-2026' }
+
+  function vectorStore(): ReturnType<typeof fakeStore> {
+    return fakeStore({
+      scope: 'user',
+      records: [
+        makeRecord({ id: 'v-best', text: '契约边界语义相关' }),
+        makeRecord({ id: 'v-poor', text: '完全无关的闲聊' }),
+        makeRecord({ id: 'v-lexical-only', text: '契约边界词法命中' }),
+      ],
+      search: () => hits(['v-best', 'v-lexical-only'], 50),
+      vectors: [
+        { id: 'v-best', attribution, vector: Float32Array.from([0.99, 0.1, 0, 0]) },
+        { id: 'v-poor', attribution, vector: Float32Array.from([0.05, 0.99, 0, 0]) },
+        // 归属不符的向量：必须被排除（宁可少召回也不要跨空间比距离）
+        { id: 'v-lexical-only', attribution: { ...attribution, modelId: '别的模型' }, vector: Float32Array.from([1, 0, 0, 0]) },
+      ],
+    })
+  }
+
+  it('查询向量交给端口，命中进入 RRF；低于标定下限的被丢弃', async () => {
+    const store = vectorStore()
+    const result = await retrieve(
+      [tagged(store)],
+      { text: '契约 边界', limit: 5 },
+      { clock: CLOCK, embedder, channels: [vectorChannelOf(embedder, { minScore: 0.375 })] },
+    )
+    const ids = result.items.map(i => i.id)
+    expect(ids).toContain('v-best')
+    expect(ids).toContain('v-lexical-only')
+    expect(ids).not.toContain('v-poor') // 余弦 0.05 < 0.375：显式下限把它挡掉
+    expect(store.calls.searchVector).toBe(1)
+    expect(store.vectorQueries[0]?.limit).toBe(20) // poolLimit 默认 = maxCandidates
+    expect(store.vectorQueries[0]?.expect).toEqual(attribution)
+    // 两通道都命中 → 分数是两段 1/(k+rank) 之和；单通道命中只有一段
+    expect(result.items.find(i => i.id === 'v-best')?.score).toBeCloseTo(1 / 61 + 1 / 61, 12)
+    expect(result.items.find(i => i.id === 'v-lexical-only')?.score).toBeCloseTo(1 / 62, 12)
+    expect(result.items.find(i => i.id === 'v-best')?.channels).toEqual(['lexical', 'vector'])
+  })
+
+  it('标定下限缺省时稠密余弦会灌满候选池——这正是必须显式传下限的理由', async () => {
+    const store = vectorStore()
+    const filled = await retrieve(
+      [tagged(store)],
+      { text: '契约 边界', limit: 5 },
+      { clock: CLOCK, embedder, channels: [vectorChannelOf(embedder)] },
+    )
+    expect(filled.items.map(i => i.id)).toContain('v-poor')
+
+    const floored = await retrieve(
+      [tagged(store)],
+      { text: '契约 边界', limit: 5 },
+      { clock: CLOCK, embedder, channels: [vectorChannelOf(embedder, { minScore: 0.375 })] },
+    )
+    expect(floored.items.map(i => i.id)).not.toContain('v-poor')
+  })
+
+  it('向量通道故障：纯词法结果照常返回，降级可见', async () => {
+    const store = fakeStore({
+      scope: 'user',
+      records: [makeRecord({ id: 'v-lexical-only', text: '契约边界' })],
+      search: () => hits(['v-lexical-only']),
+      failVector: '向量表维度不匹配',
+    })
+    const result = await retrieve(
+      [tagged(store)],
+      { text: '契约', limit: 3 },
+      { clock: CLOCK, embedder, channels: [vectorChannelOf(embedder)] },
+    )
+    expect(result.items.map(i => i.id)).toEqual(['v-lexical-only'])
     expect(result.degraded.join('\n')).toContain('维度不匹配')
   })
 })
