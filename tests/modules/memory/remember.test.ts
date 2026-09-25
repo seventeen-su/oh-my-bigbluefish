@@ -34,7 +34,14 @@ import {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('准入启发式（纯函数，§5.6）', () => {
-  const base = { sourceRef: 'session:s1#turn-3', claimedUserAssertion: false } as const
+  const base = {
+    sourceRef: 'session:s1#turn-3',
+    claimedUserAssertion: false,
+    // 准入判据对**可核验**的工件（文件/路径/行号）现在真的去核验存在。
+    // 纯函数测试里用一个"一切皆存在"的核验器代表"文件确实在"；
+    // 「核验失败」与「不给核验器（fail closed）」两条分支各自有独立用例。
+    verifyArtifact: () => true,
+  } as const
 
   it('用户显式陈述 → 准入；拿不到用户消息原文时如实记为"自报未核对"', () => {
     const decision = decideAdmission({
@@ -119,6 +126,88 @@ describe('准入启发式（纯函数，§5.6）', () => {
         expect(decision.reason).toContain('没有准入依据')
       }
     }
+  })
+
+  it('编造的工件名不能当准入依据（核验不过 = 不是依据）', () => {
+    // **这条来自一次真实自检报告**：负对照条引用一个不存在的文件名
+    // `does-not-exist-9f3a.json`，**依然通过并落库**——因为旧判据只做形态匹配。
+    // 字段叫 `reproducible-artifact`（可复现），行为却只是"长得像文件名"。
+    //
+    // 那时的后果很直接：**编造的工件与真实工件得到同一个准入结论**，
+    // 于是这道闸门只是一种措辞。
+    const decision = decideAdmission({
+      ...base,
+      text: '这个结论记在 does-not-exist-9f3a.json 里。',
+      verifyArtifact: () => false, // 核验器说：这个文件不存在
+    })
+    expect(decision.ok, '核验不过的工件不能构成依据').toBe(false)
+    expect(decision.ok === false && decision.reason).toContain('没有准入依据')
+  })
+
+  it('不给核验器时文件类工件不算依据（fail closed）', () => {
+    // 契约选择"保守"而不是"乐观"：核验不了就不算依据。
+    // 理由是不对称——**漏收**只是让用户补一个可核验的引用；
+    // **错收**是假事实进库，并被后续会话当成有效结论召回。
+    const decision = decideAdmission({
+      sourceRef: 'session:s1#turn-3',
+      claimedUserAssertion: false,
+      text: '端口配置在 src/config/server.ts 里',
+    })
+    expect(decision.ok, '没有核验器就不该拿文件形态当依据').toBe(false)
+  })
+
+  it('核验器说"核验不了"（undefined）同样不算依据', () => {
+    const decision = decideAdmission({
+      ...base,
+      text: '端口配置在 src/config/server.ts 里',
+      verifyArtifact: () => undefined,
+    })
+    expect(decision.ok).toBe(false)
+  })
+
+  it('不可核验的类别（URL/命令/版本号/哈希）仍然只按形态算依据', () => {
+    // 它们不是"存在性"声明，无法也无需核验文件系统；判据对它们保持原样。
+    const cases: readonly { readonly text: string; readonly label: string }[] = [
+      { text: '接口文档在 https://example.com/api 上', label: 'URL' },
+      { text: '提交前跑 pnpm verify 全绿才算完成', label: '可复现命令' },
+      { text: 'Node 版本固定为 24.12.0', label: '版本号' },
+    ]
+    for (const item of cases) {
+      const decision = decideAdmission({ ...base, text: item.text, verifyArtifact: () => false })
+      expect(decision, item.text).toMatchObject({ ok: true, ground: 'reproducible-artifact' })
+      expect(decision.ok && decision.reason).toContain(item.label)
+    }
+  })
+
+  it('显式 sourceRef 指向真实工件时，来源本身构成依据', () => {
+    // **补的是一个真实操作摩擦**：用户按工具描述给出
+    // `sourceRef=D:\...\build-generation.json`，正文里没有任何工件形态，于是被拒
+    // ——而那个文件**确实存在**，溯源是成立的。
+    //
+    // 与"正文里有工件"的分工：这条看**来源**（陈述从哪来），那条看**正文**
+    // （陈述自己说了什么）。两者都要求真实存在，所以编造的字符串都骗不过。
+    const decision = decideAdmission({
+      ...base,
+      sourceRefExplicit: true,
+      sourceRef: 'D:\\Program\\Oh-My-BigBlueFish\\build-generation.json',
+      text: 'OMB v3 自检标记：执行者为本会话。',
+      verifyArtifact: () => true,
+    })
+    expect(decision).toMatchObject({ ok: true, ground: 'reproducible-artifact' })
+    expect(decision.ok && decision.reason).toContain('来源')
+  })
+
+  it('自动生成的 sourceRef 不算依据（只认调用方显式给的）', () => {
+    // 工具自动生成的是 `session:<uuid>#turn-N`——那是内部标识符，不是工件。
+    // 把它算进来就是让工具给自己发合格证；那个假阳性修过一次，不能重新打开。
+    const decision = decideAdmission({
+      ...base,
+      text: '今天感觉还不错，学到了很多东西。',
+      sourceRef: 'session:session-90730570-1717-4474-92ad-8086507e77d1#turn-5',
+      // 没给 sourceRefExplicit ⇒ 不认来源；正文里也没有工件 ⇒ 必须弃权
+      verifyArtifact: () => true,
+    })
+    expect(decision.ok, '自动生成的来源不该让模糊内容通过').toBe(false)
   })
 
   it('执行结果确认（来源标注）→ 准入；但**绝不**写 assertedBy=execution（本次没有真的执行过）', () => {
@@ -227,6 +316,9 @@ function writeFixture(
     currentSession: () => 's1',
     currentTurn: () => 7,
     currentProject: () => '/work/demo',
+    // 工具级用例默认"工件都存在"。核验失败与 fail-closed 两条分支
+    // 由专门的准入用例覆盖（它们直接调 `decideAdmission`）。
+    verifyArtifact: () => true,
     onWritten: payload => void written.push(payload),
     onAbstained: info => void abstained.push(info),
     ...overrides,

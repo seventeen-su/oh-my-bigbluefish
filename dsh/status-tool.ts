@@ -91,6 +91,16 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     if (status.openProjects.length > 0) {
       lines.push(`- 已打开项目库：${status.openProjects.length} 个`)
     }
+    // **内核侧**的会话→cwd 表。与记忆模块自维护的那张**不是同一张**：
+    // 内核这张由 `session/event` 即时登记（内核行观测到的），记忆模块那张是它
+    // 自己按需解析项目库时填的（懒加载），两者时序不同、数量可以不同。
+    //
+    // 它们曾经**同名**（都叫「会话→cwd 映射」），于是一次自检报告把它当成
+    // "同一份输出自相矛盾"记了两遍。名字里带上归属，读者就不必猜。
+    lines.push(
+      `- 内核会话→cwd 登记：${sessions.sessions().length} 条`
+      + '（内核行按 session/event 即时登记；与记忆模块自维护的那张不是同一张表）',
+    )
     lines.push('')
   }
 

@@ -114,8 +114,18 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
       }
       // **零拉取视图列表同样要过判定门槛**：刚开的新会话里五个视图必然全是 0，
       // 那不是"该删"，是"还没样本"。轮数不足时只写"不下结论"，不给列表。
+      //
+      // **但字段本身必须出现**。原先"为空就不渲染"的写法会让读者无法分辨
+      // "这项没有可删的"与"这项根本没被统计"——自检报告正是这么记的：
+      // 「返回里没有『零拉取视图』字段」。**空集与缺字段是两件事，状态面必须能分开。**
       const silent = pulls.settled ? pulls.views.filter(view => view.pulls === 0).map(view => view.view) : []
-      if (silent.length > 0) lines.push(`  零拉取视图：${silent.join('、')}（持续为零即按杀死判据删除）`)
+      if (silent.length > 0) {
+        lines.push(`  零拉取视图：${silent.join('、')}（持续为零即按杀死判据删除）`)
+      } else if (pulls.settled) {
+        lines.push('  零拉取视图：（无——本会话已达到判定轮数，登记的视图都有拉取记录）')
+      } else {
+        lines.push(`  零拉取视图：（暂不判定——本会话尚未达到 ${pulls.minTurns} 轮，现在下"该删"的结论会把"没样本"当成"没人用"）`)
+      }
     }
 
     const budgetKeys = Object.keys(input.budgets ?? {}).sort()
