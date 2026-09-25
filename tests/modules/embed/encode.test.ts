@@ -319,7 +319,6 @@ describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 r
       status: () => ({ ready: true, detail: '桩：只有 snapshot 有用', openProjects: [] }),
       forSession: async () => undefined,
       forProject: async () => undefined,
-      rememberCwd: () => {},
       close: async () => {},
       snapshot: () => ({ user: storeSetOf('user', store), projects: [] }),
     })
@@ -343,7 +342,6 @@ describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 r
       status: () => ({ ready: false, detail: '桩：尚未打开任何库', openProjects: [] }),
       forSession: async () => undefined,
       forProject: async () => undefined,
-      rememberCwd: () => {},
       close: async () => {},
       snapshot: () => ({ user: undefined, projects: [] }),
     })
@@ -369,7 +367,6 @@ describe('全链路（生产接线的四个接点）：写入 → 冲刷 → 登
       status: () => ({ ready: true, detail: '桩：直接给库套件', openProjects: [] }),
       forSession: async () => undefined,
       forProject: async () => undefined,
-      rememberCwd: () => {},
       close: async () => {},
       snapshot: () => ({ user: storeSetOf('user', store), projects: [] }),
     })

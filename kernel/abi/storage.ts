@@ -85,7 +85,10 @@ export interface StoresService {
   status(): {
     readonly ready: boolean
     readonly detail: string
+    /** 已打开的项目库身份（规范化 cwd）。这是**唯一**的"已打开项目库"口径。 */
     readonly openProjects: readonly string[]
+    /** 项目库连接缓存上限（与 `openProjects.length` 一起读作 `N/上限`）。 */
+    readonly maxOpenProjects: number
   }
   /**
    * 已打开的库套件快照。**不触发新打开**。
@@ -98,6 +101,10 @@ export interface StoresService {
   snapshot(): { readonly user: StoreSet | undefined; readonly projects: readonly StoreSet[] }
   /**
    * 取某会话所在项目的库。未就绪或打开失败返回 undefined（**不抛**）。
+   *
+   * `sessionId → cwd` **不在这里存**：唯一来源是内核的 `SERVICES.activeSession`
+   * （`ActiveSessionTable`，由 `dsh/` 观测会话事件时写入）。本方法按需向它查询，
+   * 因此不存在"宿主刚告知 cwd、这里还没更新"的时间差。
    * @param sessionId 宿主会话 id（用于把 cwd 映射到项目库）。
    */
   forSession(sessionId: string): Promise<StoreSet | undefined>
@@ -106,8 +113,6 @@ export interface StoresService {
    * @param cwd 项目工作目录。
    */
   forProject(cwd: string): Promise<StoreSet | undefined>
-  /** 记下会话的 cwd（宿主在会话建立/切换时告知）。 */
-  rememberCwd(sessionId: string, cwd: string): void
   /** 关闭全部库。**绝不抛异常**。 */
   close(): Promise<void>
 }

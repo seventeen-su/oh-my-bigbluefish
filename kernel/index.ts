@@ -328,6 +328,10 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         }
       }
       disposers.length = 0
+      // 「会话 → cwd」是内核持有的**唯一**一份（`kernel/activeSession.ts`）：
+      // 内核注销后旧会话在新一轮里不再可信，必须连它一起清——
+      // 否则重挂后模块会按上一代的会话 cwd 去打开项目库（把记忆写到别人的项目里）。
+      activeSessions.clear()
       healthTable.report('omb-kernel', { state: 'ok', detail: '内核已注销' })
     },
   }

@@ -1,11 +1,12 @@
 /**
- * 自述的诚实性：**未测量 ≠ 测量为零**。
+ * 自述的诚实性：**未测量 ≠ 测量为零**，且**同一份事实只报一处**。
  *
  * 报告踩过的坑：状态面把"没测到"渲染成 `0`，或者把"一次都没发生过"渲染成"正常"。
  * 两者都会让状态面**看起来在报数，其实什么都没测**——比不报更坏（它把真问题掩盖了）。
  *
- * 本文件把记忆模块自己的三处输出钉住：
- * ① 「会话→cwd」自述必须写明是**本模块**的登记（内核行 `SessionTable` 有同名读数，不是同一张表）
+ * 本文件把记忆模块自己的输出钉住：
+ * ① 「会话→cwd」与「已打开项目库」**只在「存储」段报**：模块行进的是上报快照，
+ *    印实时计数必然与实时读数打架（实测模块段 0/0、存储段 1/1，三次调用都一样）
  * ② 一个库都没打开时，行数/向量合计是"未测量"，**不写 0**
  * ③ 一次向量检索都没发生过时，报"尚未发生（无读数）"，**不写"正常"**
  * ④ 没有迁移发生时，不写"迁移 v0→v0"（那会把"未记录"伪装成一个版本号）
@@ -18,7 +19,7 @@ import type { MemoryStoresService } from '../../../modules/memory/store.js'
 import { createStoresService, openMemoryStore } from '../../../modules/memory/store.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
 import { createVectorModule } from '../../../modules/memory/vector.js'
-import { capturingLogger, fixedClock, tempWorkspace, testPort } from './helpers.js'
+import { capturingLogger, fixedClock, tempWorkspace, testPort, testSessionCwds } from './helpers.js'
 
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
@@ -32,21 +33,24 @@ const kernelRow: ModuleRegistration<unknown> = {
   apply: () => {},
 }
 
-describe('存储段自述：「会话→cwd」必须说清是本模块的登记', () => {
-  it('写明"本模块会话→cwd 登记"并指出与内核 SessionTable 不是同一张表', async () => {
+describe('存储服务的自述：不再出现第二份会话→cwd / 已打开项目库计数', () => {
+  it('status().detail 只讲就绪与失败原因，计数交给状态面的「存储」段', async () => {
     const ws = tempWorkspace('omb-status-')
+    const cwds = testSessionCwds()
     const service = createStoresService({
       logger: capturingLogger(),
       clock: fixedClock(),
       resolvePort: () => testPort(ws.dir),
+      resolveSessionCwd: cwds.resolveSessionCwd,
+      knownSessionCwds: cwds.knownSessionCwds,
     })
-    service.rememberCwd('s1', ws.dir)
+    cwds.remember('s1', ws.dir)
+    await service.forSession('s1') // 真的打开一个项目库
 
-    const detail = service.status().detail
-    expect(detail).toContain('本模块会话→cwd 登记 1 条')
-    expect(detail).toContain('与内核 SessionTable 不是同一张表')
-    // 不再与内核行的读数同名——同名会让状态面读起来像自相矛盾
-    expect(detail).not.toContain('会话→cwd 映射')
+    const status = service.status()
+    expect(status.openProjects).toHaveLength(1)
+    expect(status.maxOpenProjects).toBe(16) // 计数由调用方（状态面）报，且只报一次
+    expect(status.detail).not.toMatch(/会话→cwd|已打开项目库|项目库 \d+\//)
 
     await service.close()
     ws.cleanup()
@@ -62,8 +66,6 @@ describe('存储段自述：「会话→cwd」必须说清是本模块的登记'
 
     // 第二次打开：库已是最新，没有任何迁移发生 —— 这里绝不能写 v0→v0
     const second = createStoresService({ logger: capturingLogger(), clock: fixedClock(), resolvePort: () => port })
-    await second.forSession('s2')
-    second.rememberCwd('s2', ws.dir)
     await second.forProject(ws.dir)
     const detail = second.status().detail
     expect(detail).toContain('本次打开未迁移：schema v1')
@@ -74,7 +76,7 @@ describe('存储段自述：「会话→cwd」必须说清是本模块的登记'
 })
 
 describe('健康面：没测到的不要写 0', () => {
-  it('一个库都没打开：不报 rows.total/vectors.total，并写明"未测量"', async () => {
+  it('一个库都没打开：metrics 里不出现 rows.total/vectors.total（未测量不是 0）', async () => {
     const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
     const registration = createMemoryRegistration() // 无 storageHost → 库打不开
 
@@ -84,10 +86,13 @@ describe('健康面：没测到的不要写 0', () => {
     expect(health.state).toBe('degraded')
     expect(health.metrics?.['rows.total']).toBeUndefined()
     expect(health.metrics?.['vectors.total']).toBeUndefined()
-    expect(health.detail).toContain('未测量')
-    expect(health.detail).toContain('不是 0 行')
+    // 模块行只指向「存储」段，不重复报数
+    expect(health.detail).toContain('见「存储」段')
     // openProjects 是**测到的**（0 个已打开），所以它照常报 0
     expect(health.metrics?.['openProjects']).toBe(0)
+    // 降级原因不空：模块行与存储段都写得出为什么
+    const service = handle.kernel.service<MemoryStoresService>('stores')
+    expect(health.detail + (service?.status().detail ?? '')).toContain('未注入')
 
     handle.dispose()
   })
@@ -105,9 +110,9 @@ describe('健康面：没测到的不要写 0', () => {
     const health = await registration.manifest.health()
     expect(health.state).toBe('ok')
     expect(health.metrics?.['rows.total']).toBe(0) // 测到了：确实是 0 行
-    expect(health.detail).toContain('行数=0')
-    expect(health.detail).toContain('向量=0 行（无向量行/未接线）')
-    expect(health.detail).not.toContain('未测量（没有任何库打开')
+    expect(health.metrics?.['vectors.total']).toBe(0)
+    // 库路径由「存储」段给出（唯一一处）
+    expect(service?.status().detail).toContain('knowledge.db')
 
     handle.dispose()
     await service?.close()

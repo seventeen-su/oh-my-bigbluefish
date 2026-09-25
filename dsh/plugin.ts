@@ -35,7 +35,6 @@ import { hostLogger, publishToHost, readService, systemClock } from './host.js'
 import { type ToolSpec } from './tools.js'
 import { createToolBridge } from './tool-bridge.js'
 import {
-  SessionTable,
   collectPromptContributions,
   readSystemPrompt,
   wirePromptInjection,
@@ -91,7 +90,6 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const logger = hostLogger(ctx)
   const clock = systemClock
   const handle = createKernel({ logger, clock })
-  const sessions = new SessionTable()
 
   // 把"内核就绪"发布到宿主 ctx：模块行由宿主独立加载，需要经宿主 ctx 取内核。
   // 见 `docs/host-wiring-handoff.md`——这一步在真实宿主上**尚未验证成功**，
@@ -206,7 +204,11 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   // 内核自带的 `omb_status` 也走桥：这样"内核工具"与"模块工具"只有一条注册路径，
   // 不必维护两套（两套必然漂移）。`MODULE_CATALOG` 给 `omb-kernel` 声明了它，
   // 这里就是那个声明对应的实现。
-  const statusSpec = buildStatusTool(handle, sessions)
+  //
+  // **不再往里传会话表**：会话事实的唯一来源是内核自己的 `ActiveSessionTable`
+  // （`SERVICES.activeSession`），`omb_status` 直接读它。传一张外部表进来就等于
+  // 允许"状态面读的表"与"模块读的表"不是同一张——那正是先前稳定矛盾的成因。
+  const statusSpec = buildStatusTool(handle)
   toolBridge.add([statusSpec], 'omb-kernel')
 
   // ── 2) 模块由**宿主 Cordis** 启动，内核不再自己启动 ──────────────────────
@@ -249,7 +251,8 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   })
 
   // ── 5) 会话事件（只观察，不接管 Loop）─────────────────────────────────
-  const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, sessions })
+  //    会话 → cwd 由这里写进内核登记处（唯一存放处）；不再另存一份。
+  const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel })
   /**
    * 制品索引的**生产者**。
    *
@@ -320,9 +323,9 @@ export function testHostContext(handle: KernelHandle): { get(name: string): unkn
  * `tools:<模块 id>` → `readonly ToolDefinition[]`。用统一前缀使 `dsh/` 只需一段遍历，
  * 且新增模块不必改本文件。
  */
-export function collectToolSpecs(handle: KernelHandle, sessions: SessionTable): readonly ToolSpec[] {
+export function collectToolSpecs(handle: KernelHandle): readonly ToolSpec[] {
   const kernel = handle.kernel
-  const specs: ToolSpec[] = [buildStatusTool(handle, sessions)]
+  const specs: ToolSpec[] = [buildStatusTool(handle)]
   const seen = new Set<string>(specs.map(s => s.name))
 
   for (const serviceName of kernel.services()) {

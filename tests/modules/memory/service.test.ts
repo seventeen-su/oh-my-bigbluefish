@@ -19,6 +19,7 @@ import {
 } from '../../../modules/memory/store.js'
 import {
   type CapturingLogger,
+  type TestSessionCwds,
   capturingLogger,
   countingSqlite,
   fixedClock,
@@ -26,6 +27,7 @@ import {
   nodeSqlite,
   tempWorkspace,
   testPort,
+  testSessionCwds,
   type TempWorkspace,
   type TestPort,
 } from './helpers.js'
@@ -33,15 +35,19 @@ import {
 function makeService(
   port: StorageHostPort | undefined,
   options: { readonly maxOpenProjects?: number } = {},
-): { service: MemoryStoresService; logger: CapturingLogger } {
+): { service: MemoryStoresService; logger: CapturingLogger; cwds: TestSessionCwds } {
   const logger = capturingLogger()
+  const cwds = testSessionCwds()
   const service = createStoresService({
     logger,
     clock: fixedClock(),
     resolvePort: () => port,
+    // 「会话 → cwd」的唯一来源（生产里是内核 ActiveSessionTable）
+    resolveSessionCwd: cwds.resolveSessionCwd,
+    knownSessionCwds: cwds.knownSessionCwds,
     ...(options.maxOpenProjects === undefined ? {} : { maxOpenProjects: options.maxOpenProjects }),
   })
-  return { service, logger }
+  return { service, logger, cwds }
 }
 
 describe('StoresService：双库与 cwd 身份', () => {
@@ -117,17 +123,57 @@ describe('StoresService：双库与 cwd 身份', () => {
     ws.cleanup()
   })
 
-  it('forSession：登记 cwd 后拿到项目库', async () => {
+  it('forSession：登记 cwd 后拿到项目库（cwd 只写唯一来源，模块按需读）', async () => {
     const ws = tempWorkspace()
     const port = testPort(ws.dir)
-    const { service } = makeService(port)
+    const { service, cwds } = makeService(port)
 
-    service.rememberCwd('s1', ws.dir)
+    cwds.remember('s1', ws.dir)
     const set = await service.forSession('s1')
     expect(set?.projectScope).toBe(projectIdentity(ws.dir))
     expect(set?.stores).toHaveLength(2)
     expect(await set?.store('project')?.put(makeRecord({ scope: 'project', id: 'p1' }))).toBeUndefined()
     expect(await set?.store('project')?.get('p1')).toMatchObject({ id: 'p1', text: expect.any(String) })
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('唯一来源里没有该会话 → 仅用户库；来源故障也不抛（降级为不知道）', async () => {
+    const ws = tempWorkspace()
+    const port = testPort(ws.dir)
+    const logger = capturingLogger()
+    const service = createStoresService({
+      logger,
+      clock: fixedClock(),
+      resolvePort: () => port,
+      resolveSessionCwd: () => {
+        throw new Error('登记处故障')
+      },
+      knownSessionCwds: () => {
+        throw new Error('登记处故障')
+      },
+    })
+
+    const set = await service.forSession('s1')
+    expect(set?.projectScope).toBeNull()
+    expect(await service.start()).toBeUndefined() // 预热也不抛（warmKnownSessions 吞掉来源故障）
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('不在本模块留第二份：来源一改，下一次读取立刻反映（含遗忘）', async () => {
+    const ws = tempWorkspace()
+    const port = testPort(ws.dir)
+    const { service, cwds } = makeService(port)
+
+    expect((await service.forSession('s1'))?.projectScope).toBeNull() // 来源里还没有
+    cwds.remember('s1', ws.dir)
+    expect((await service.forSession('s1'))?.projectScope).toBe(projectIdentity(ws.dir))
+    // 来源把这条忘掉（会话结束）→ 模块立刻不能再拿到项目库：没有本地副本可以"记得更久"
+    cwds.sessions.forget('s1')
+    expect((await service.forSession('s1'))?.projectScope).toBeNull()
 
     await service.close()
     ws.cleanup()
@@ -208,8 +254,8 @@ describe('StoresService：降级与诚实原因', () => {
     // 用目录占住项目库文件位置 → openDatabase 必然失败
     mkdirSync(projectDbPathFor(ws.dir), { recursive: true })
 
-    const { service } = makeService(port)
-    service.rememberCwd('s1', ws.dir)
+    const { service, cwds } = makeService(port)
+    cwds.remember('s1', ws.dir)
 
     expect(await service.forProject(ws.dir)).toBeUndefined()
     expect(service.failure()).toContain('项目库打开失败')
@@ -383,16 +429,19 @@ function makeRetryingService(
   gate: Gate,
   extra: PortExtras = {},
   retryDelaysMs: readonly number[] = [0, 10, 20],
-): { service: MemoryStoresService; logger: CapturingLogger } {
+): { service: MemoryStoresService; logger: CapturingLogger; cwds: TestSessionCwds } {
   const logger = capturingLogger()
+  const cwds = testSessionCwds()
   const service = createStoresService({
     logger,
     clock: fixedClock(),
     resolvePort: () => gatedPort(ws, gate, extra),
+    resolveSessionCwd: cwds.resolveSessionCwd,
+    knownSessionCwds: cwds.knownSessionCwds,
     retryDelaysMs,
     readyWaitMs: 100,
   })
-  return { service, logger }
+  return { service, logger, cwds }
 }
 
 describe('StoresService：打开失败的重试（时序竞态不成永久降级）', () => {
@@ -477,9 +526,9 @@ describe('StoresService：打开失败的重试（时序竞态不成永久降级
   it('用户库就绪后补开已登记会话的项目库（预热早于就绪也不会永久漏掉）', async () => {
     const ws = tempWorkspace()
     const gate: Gate = { ready: false, opens: 0 }
-    const { service } = makeRetryingService(ws, gate)
+    const { service, cwds } = makeRetryingService(ws, gate)
 
-    service.rememberCwd('s1', ws.dir)
+    cwds.remember('s1', ws.dir) // 写唯一来源（不是写记忆模块）
     expect(await service.forSession('s1')).toBeUndefined() // 用户库未就绪 → 降级
 
     gate.ready = true

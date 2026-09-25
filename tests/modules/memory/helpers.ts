@@ -18,6 +18,38 @@ import type {
   SqliteStatementLike,
   StorageHostPort,
 } from '../../../kernel/abi/index.js'
+import { ActiveSessionTable } from '../../../kernel/activeSession.js'
+
+/**
+ * 「会话 → cwd」的**唯一来源**在测试里的替身。
+ *
+ * 生产里这个角色由内核的 `ActiveSessionTable` 担任（`SERVICES.activeSession`），
+ * 记忆模块经 `resolveSessionCwd` / `knownSessionCwds` 按需读它、**不自己存**。
+ * 因此测试里"告诉宿主某会话的 cwd"= 写这张表，而**不是**调记忆服务上的某个方法
+ * （那个方法已经删掉了：它就是"同一份事实存两遍"的另一半）。
+ */
+export interface TestSessionCwds {
+  readonly sessions: ActiveSessionTable
+  /** 模拟 `dsh/` 观测到会话 cwd（唯一写入口）。 */
+  remember(sessionId: string, cwd: string): void
+  readonly resolveSessionCwd: (sessionId: string) => string | undefined
+  readonly knownSessionCwds: () => readonly string[]
+}
+
+export function testSessionCwds(): TestSessionCwds {
+  const sessions = new ActiveSessionTable()
+  const cwdsOf = (): readonly string[] =>
+    sessions
+      .sessions()
+      .map(sessionId => sessions.cwd(sessionId))
+      .filter((cwd): cwd is string => cwd !== null)
+  return {
+    sessions,
+    remember: (sessionId, cwd) => sessions.remember(sessionId, cwd),
+    resolveSessionCwd: sessionId => sessions.cwd(sessionId) ?? undefined,
+    knownSessionCwds: cwdsOf,
+  }
+}
 
 /** 逐语句计数：用来断言"批量而不是 N+1"。 */
 export interface SqliteCounters {

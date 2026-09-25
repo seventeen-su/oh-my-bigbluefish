@@ -14,20 +14,18 @@ import type {
   Embedder,
   Kernel,
   MemoryScope,
-  MemoryStore,
   ModuleHealth,
   ModuleManifest,
   ModuleRegistration,
   SecondaryChannelRegistry,
   StorageHostPort,
-  StoreStats,
   TaggedStore,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
 import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
-import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
+import { createStoresService, type MemoryStoresService } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import type { ArtifactKind } from './remember.js'
@@ -81,31 +79,46 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function describeVectors(stats: StoreStats): string {
-  // `vectors === null` 在本实现里的含义是**该库没有向量行**（见 `SqliteStore.stats`）：
-  // 那是"测到了 0 行"，不是"没测到"。所以写 `0 行` 并注明未声明通道身份，
-  // 而不是一个含糊的"无"（读者无法区分"零行"与"没查"）。
-  return stats.vectors === null ? '0 行（无向量行/未接线）' : `${stats.vectors.rows}@${stats.vectors.modelId}/${stats.vectors.dim}`
-}
-
-async function describeStore(label: string, store: MemoryStore | undefined): Promise<{
-  readonly line: string
-  readonly stats: StoreStats | undefined
-}> {
-  if (store === undefined) return { line: `${label}=未打开`, stats: undefined }
-  const concrete = asMemoryStore(store)
-  const path = concrete?.dbPath ?? '（路径未知：非本实现）'
-  // 没有迁移记录时**不写 v0→v0**：那会把"未记录"伪装成一个版本号（详见 store.ts 的 migrationText）
-  const migrated =
-    concrete === undefined
-      ? ''
-      : concrete.migrated.from === concrete.migrated.to
-        ? `（本次打开未迁移：schema v${concrete.migrated.to}）`
-        : `（迁移 v${concrete.migrated.from}→v${concrete.migrated.to}）`
-  const stats = await store.stats()
+/**
+ * 读「会话 → cwd」的**唯一来源**（内核 `ActiveSessionTable`）。
+ *
+ * 本模块**不自己存**这条事实：曾经存过一份 `cwdBySession`，与内核登记处更新时机
+ * 不同 → 状态面稳定矛盾（模块段 0 条、存储段 1 条）。现在每次按需问内核，
+ * 因此"宿主刚告知 cwd"与"这里能取到项目库"之间没有时间差。
+ *
+ * 服务缺失/畸形/抛异常一律当作"不知道"（降级为仅用户库），**绝不抛**。
+ */
+function sessionCwdSource(kernel: Kernel): {
+  readonly resolveSessionCwd: (sessionId: string) => string | undefined
+  readonly knownSessionCwds: () => readonly string[]
+} {
+  const table = (): {
+    cwd(session?: string): string | null
+    sessions(): readonly string[]
+  } | undefined => kernel.service(SERVICES.activeSession)
   return {
-    line: `${label}=${path}${migrated} 行数=${stats.rows} schema=v${stats.schemaVersion} 向量=${describeVectors(stats)}`,
-    stats,
+    resolveSessionCwd: sessionId => {
+      try {
+        const cwd = table()?.cwd(sessionId) ?? null
+        return typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined
+      } catch {
+        return undefined
+      }
+    },
+    knownSessionCwds: () => {
+      try {
+        const sessions = table()
+        if (sessions === undefined) return []
+        const cwds: string[] = []
+        for (const sessionId of sessions.sessions()) {
+          const cwd = sessions.cwd(sessionId)
+          if (typeof cwd === 'string' && cwd.length > 0) cwds.push(cwd)
+        }
+        return cwds
+      } catch {
+        return []
+      }
+    },
   }
 }
 
@@ -121,8 +134,18 @@ export interface MemoryWriteLedger {
 }
 
 /**
- * 健康面。**必须写明原因**（无空降级）：
- * 库路径、行数、schema 版本、迁移结果、项目库打开情况，缺一不可。
+ * 健康面。
+ *
+ * ## 这里**不再**报库路径/行数/已打开项目库/会话→cwd 计数
+ *
+ * 原因不是"少写点"，而是**报数必然打架**：内核健康面保存的是模块**最近一次上报
+ * 的快照**（`kernel/health.ts`），而 `## 存储` 段每次都读实时状态。快照里印实时
+ * 计数，就会出现同一次 `omb_status` 里「模块段 项目库 0/16 已打开；会话→cwd
+ * 登记 0 条」对「存储段 1 个 / 1 条」——实测三次调用都一样，是稳定矛盾而非抖动。
+ *
+ * 所以本行只报**本模块自有**的事实（写入账本、目录漂移），库相关一律指向
+ * 「存储」段（唯一报数处）。`metrics` 仍带实时统计——它给健康面消费者用，
+ * **不进 `omb_status` 文本**，因此不会制造第二个可见数字。
  */
 async function describeHealth(
   service: MemoryStoresService,
@@ -131,7 +154,6 @@ async function describeHealth(
   const status = service.status()
   const snapshot = service.snapshot()
 
-  const parts: string[] = []
   const metrics: Record<string, number> = { openProjects: status.openProjects.length }
   let totalRows = 0
   let vectorRows = 0
@@ -139,23 +161,20 @@ async function describeHealth(
   /** 真正测到行数的库数。**0 = 未测量**（没有任何库打开），不是"合计 0 行"。 */
   let measuredStores = 0
 
-  const user = await describeStore('用户库', snapshot.user?.store('user'))
-  parts.push(user.line)
-  if (user.stats !== undefined) {
-    measuredStores += 1
-    totalRows += user.stats.rows
-    vectorRows += user.stats.vectors?.rows ?? 0
-    schemaVersion = Math.max(schemaVersion, user.stats.schemaVersion)
-  }
-
-  for (const set of snapshot.projects) {
-    const described = await describeStore(`项目库(${set.projectScope ?? '未知 cwd'})`, set.store('project'))
-    parts.push(described.line)
-    if (described.stats !== undefined) {
+  const stores = [
+    snapshot.user?.store('user'),
+    ...snapshot.projects.map(set => set.store('project')),
+  ]
+  for (const store of stores) {
+    if (store === undefined) continue
+    try {
+      const stats = await store.stats()
       measuredStores += 1
-      totalRows += described.stats.rows
-      vectorRows += described.stats.vectors?.rows ?? 0
-      schemaVersion = Math.max(schemaVersion, described.stats.schemaVersion)
+      totalRows += stats.rows
+      vectorRows += stats.vectors?.rows ?? 0
+      schemaVersion = Math.max(schemaVersion, stats.schemaVersion)
+    } catch {
+      // 单个库统计失败不得让整份健康检查失败（真原因由 status().detail / failure() 说）
     }
   }
 
@@ -164,8 +183,6 @@ async function describeHealth(
   if (measuredStores > 0) {
     metrics['rows.total'] = totalRows
     metrics['vectors.total'] = vectorRows
-  } else {
-    parts.push('行数/向量合计：未测量（没有任何库打开，无从统计——不是 0 行）')
   }
   if (schemaVersion > 0) metrics['schemaVersion'] = schemaVersion
   if (ledger !== undefined) {
@@ -183,9 +200,12 @@ async function describeHealth(
             ? ''
             : `（最近弃权：${ledger.lastAbstention.slice(0, 60)}${ledger.lastAbstention.length > 60 ? '…' : ''}）`
         }`
-  const detail = `${parts.join('；')}；${status.detail}${ledgerNote}${catalogNote}`
+  // 「无空降级」：降级时原因仍写在本行，只是**不抄计数**。
+  const why = service.failure()
+  const pointer = '库、路径与计数见「存储」段（本行是健康上报快照，不重复报实时读数）'
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}`
 
-  if (service.failure() === undefined && status.ready) {
+  if (why === undefined && status.ready) {
     return { state: 'ok', detail, metrics }
   }
   return { state: 'degraded', detail, metrics }
@@ -240,6 +260,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         config: { ...config },
         maxOpenProjects: options.maxOpenProjects,
         resolvePort: () => options.storageHost ?? kernel.service<StorageHostPort>(STORAGE_HOST_SERVICE),
+        // 「会话 → cwd」不再由本模块存：唯一来源是内核登记处（见 sessionCwdSource 的说明）
+        ...sessionCwdSource(kernel),
       })
       // 同名重复注册 = 替换（ABI 契约，热插拔重载必然发生）；因此这里不 catch——
       // 若宿主实现真的抛，apply 抛出会由内核记为本模块 failed，语义正确。
@@ -362,15 +384,26 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
       // 打开是异步的，但注册已经全部完成——这里只填内部状态（H-2）。
       // `start()` 内部吞掉一切异常，`.catch` 只是防止未来的改动引入 unhandled rejection。
+      //
+      // **上报的 detail 里不放库与计数**：内核健康面保存的是这份上报的**快照**，
+      // 而 `## 存储` 段每次读实时状态——快照印实时数字就是那个稳定矛盾的来源
+      // （模块段 0/0，存储段 1/1）。库相关一律指向「存储」段；降级原因照样写清楚。
       void service
         .start()
         .then(() => {
           const status = service.status()
-          kernel.report(
-            status.ready
-              ? { state: 'ok', detail: `记忆库就绪：${status.detail}` }
-              : { state: 'degraded', detail: `记忆库未就绪：${status.detail}` },
-          )
+          const why = service.failure()
+          if (status.ready) {
+            kernel.report({
+              state: 'ok',
+              detail: '记忆库就绪（库、路径与计数见「存储」段：本行是上报快照，不重复报实时读数）',
+            })
+          } else {
+            kernel.report({
+              state: 'degraded',
+              detail: `记忆库未就绪：${why ?? '用户库未打开'}（详情见「存储」段）`,
+            })
+          }
         })
         .catch((error: unknown) => {
           kernel.logger.warn(`OMB：记忆库预热回调异常（已隔离）——${messageOf(error)}`)

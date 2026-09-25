@@ -1271,6 +1271,26 @@ export interface StoresServiceOptions {
    * （**不缓存失败**：宿主可能在 apply 之后才注册端口）。
    */
   readonly resolvePort: () => StorageHostPort | undefined
+  /**
+   * 读「会话 → cwd」的**唯一来源**（生产：内核 `ActiveSessionTable`，见
+   * `kernel/activeSession.ts` 与 `SERVICES.activeSession`）。
+   *
+   * 为什么是"读"而不是"本模块自己存"：这条事实曾经在本模块也存了一份
+   * （`cwdBySession`），与内核登记处更新时机不同，于是状态面出现**稳定矛盾**
+   * （模块段 0 条、存储段 1 条）。现在本模块**不缓存**——每次按需向唯一来源查。
+   * 缓存要么需要失效规则，要么会再次制造"两个数字"。
+   *
+   * 缺省（不注入）→ 一律视为"宿主尚未告知 cwd"：`forSession` 退回仅用户库，
+   * 与本模块的既有降级语义一致。
+   */
+  readonly resolveSessionCwd?: (sessionId: string) => string | undefined
+  /**
+   * 唯一来源里**当前已知 cwd 的会话列表**（去重前）。
+   *
+   * 用途只有一个：用户库就绪后补开这些会话的项目库（`warmKnownSessions`），
+   * 使"sqlite 就绪前预热失败"不被固化成永久缺库。缺省即"没有已知会话"。
+   */
+  readonly knownSessionCwds?: () => readonly string[]
   /** 模块配置的只读副本，供子能力（向量线程数等）读取。 */
   readonly config?: Readonly<Record<string, unknown>>
   /** 项目库连接缓存上限。 */
@@ -1321,13 +1341,27 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
   const retryDelays = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS
   const readyWaitMs = options.readyWaitMs ?? DEFAULT_READY_WAIT_MS
 
-  /** 会话 → cwd（宿主告知）。未登记时 forSession 降级为"仅用户库"。 */
-  const cwdBySession = new Map<string, string>()
   /** 已打开的项目库套件，插入顺序 = LRU 顺序。 */
   const projects = new Map<string, StoreSet>()
   /** 正在打开的项目库（去重并发打开）。 */
   const pendingProjects = new Map<string, Promise<StoreSet | undefined>>()
   const projectFailures = new Map<string, string>()
+
+  /**
+   * 查「会话 → cwd」。**按需向唯一来源问，不存第二份**（见 `resolveSessionCwd` 的说明）。
+   *
+   * 来源故障/返回畸形值一律当作"未登记"：本模块降级为仅用户库，
+   * 工具与检索照常可用（绝不抛）。
+   */
+  function sessionCwdOf(sessionId: string): string | undefined {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined
+    try {
+      const cwd = options.resolveSessionCwd?.(sessionId)
+      return typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined
+    } catch {
+      return undefined
+    }
+  }
 
   let userStore: SqliteMemoryStore | undefined
   let userSet: StoreSet | undefined
@@ -1429,9 +1463,19 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
    * 为什么需要：`turn/start` 的预热可能发生在 sqlite 就绪之前（那次必然失败），
    * 而项目库失败**不缓存**——但也没人再去开它。用户库一旦打开就补一次，
    * 使"记录在案的会话"不会被一次时序竞态永久漏掉。
+   *
+   * 会话列表同样从**唯一来源**取（`knownSessionCwds`），本模块不留第二份。
    */
   function warmKnownSessions(): void {
-    for (const cwd of new Set(cwdBySession.values())) {
+    let cwds: readonly string[] = []
+    try {
+      cwds = options.knownSessionCwds?.() ?? []
+    } catch {
+      // 来源故障 → 没有可补开的会话；后续会话自己会再触发 forSession
+      return
+    }
+    for (const cwd of new Set(cwds)) {
+      if (typeof cwd !== 'string' || cwd.length === 0) continue
       void ensureProject(cwd).catch(NOOP)
     }
   }
@@ -1628,7 +1672,6 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       userSet = undefined
       userStore = undefined
       userPromise = undefined
-      cwdBySession.clear()
     })()
     return closePromise
   }
@@ -1656,7 +1699,6 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       } else {
         parts.push(`用户库=${resolvedPort?.userDbPath ?? userPath}${migrationText(userSet.migrated[0])}`)
       }
-      parts.push(`项目库 ${openProjects.length}/${maxOpenProjects} 已打开${openProjects.length === 0 ? '' : `：${openProjects.join('、')}`}`)
       if (projectFailures.size > 0) {
         parts.push(
           `项目库失败 ${projectFailures.size} 个：${[...projectFailures]
@@ -1665,18 +1707,19 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         )
       }
       if (unexpectedFailure !== undefined) parts.push(`意外失败：${unexpectedFailure}`)
-      // 这一行**必须与本模块的实际维护者同名**：内核行的 `SessionTable` 在「存储」段也报
-      // 「会话→cwd 映射」，两张表完全不同（一个是内核行，一个是本模块的 `cwdBySession`）。
-      // 文案一样会让状态面读起来像自相矛盾（实测被当成矛盾记了两次），所以这里写明是本模块的登记。
-      parts.push(`本模块会话→cwd 登记 ${cwdBySession.size} 条（本模块自维护：会话 id→项目库 cwd，供 forSession/peek 选库；与内核 SessionTable 不是同一张表）`)
-      return { ready: !closing && userSet !== undefined, detail: parts.join('；'), openProjects }
+      // **这里不再出现任何"已打开项目库 N/M"或"会话→cwd 登记 N 条"**：
+      // 状态面只有一个报数处（`## 存储` 段），它读 `openProjects`/`maxOpenProjects`
+      // 与内核 `ActiveSessionTable`。本 detail 只说就绪情况与失败原因
+      // （"无空降级"要求原因写在这里，而不是把计数再抄一遍）。
+      return { ready: !closing && userSet !== undefined, detail: parts.join('；'), openProjects, maxOpenProjects }
     },
 
     async forSession(sessionId: string): Promise<StoreSet | undefined> {
       try {
         const user = await ensureUser()
         if (user === undefined) return undefined
-        const cwd = cwdBySession.get(sessionId)
+        // 按需向**唯一来源**查（不缓存）：宿主刚告知 cwd，这里立刻就能取到项目库。
+        const cwd = sessionCwdOf(sessionId)
         // 宿主尚未告知 cwd：降级为"仅用户库"，projectScope=null 是给调用方的显式信号
         if (cwd === undefined) return user
         const project = await ensureProject(cwd)
@@ -1698,25 +1741,19 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       }
     },
 
-    rememberCwd(sessionId: string, cwd: string): void {
-      if (closing) return
-      if (sessionId.length === 0 || cwd.length === 0) return
-      // 只记映射，不打开库：会话很多而项目很少，预热会浪费句柄
-      cwdBySession.set(sessionId, cwd)
-    },
-
     snapshot() {
       return { user: userSet, projects: [...projects.values()] }
     },
 
     peek(sessionId: string): StoreSet | undefined {
       if (closing) return undefined
-      const cwd = cwdBySession.get(sessionId)
+      const cwd = sessionCwdOf(sessionId)
       if (cwd !== undefined) {
-        const set = projects.get(projectIdentity(cwd))
+        const key = projectIdentity(cwd)
+        const set = projects.get(key)
         if (set !== undefined) {
-          projects.delete(projectIdentity(cwd))
-          projects.set(projectIdentity(cwd), set) // LRU 触碰：正在被用的库不该被淘汰
+          projects.delete(key)
+          projects.set(key, set) // LRU 触碰：正在被用的库不该被淘汰
           return set
         }
       }
