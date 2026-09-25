@@ -70,6 +70,14 @@ export interface Kernel {
    */
   service<T>(name: string): T | undefined
 
+  /**
+   * 已注册的服务名（稳定排序）。
+   *
+   * 存在的理由：集成层需要按前缀发现服务（如汇总所有 `prompt:*` 贡献），
+   * 否则每新增一个模块都要改集成层——那就不是模块化了。
+   */
+  services(): readonly string[]
+
   /** 发布事件。订阅者抛异常不得影响发布者。 */
   emit<E extends ModuleEventName>(event: E, payload: ModuleEvents[E]): void
 
