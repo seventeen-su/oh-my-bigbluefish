@@ -161,7 +161,7 @@ export class ProfileStorage {
   /** 读取两个库里的画像文档。任何读取失败都变成可读错误。 */
   async load(): Promise<ProfileLoadResult> {
     const set = await this.#resolveSet()
-    if (set === undefined) return { entries: [], error: this.#lastResolve.detail }
+    if (set === undefined) return { entries: [], error: this.availability().detail }
 
     const entries: ProfileEntry[] = []
     const errors: string[] = []
@@ -207,17 +207,18 @@ export class ProfileStorage {
         ok: false,
         documentsWritten: 0,
         capabilitySkipped,
-        error: this.#lastResolve.detail,
+        error: this.availability().detail,
       }
     }
 
     const errors: string[] = []
+    const availability = this.availability()
     let documentsWritten = 0
     for (const scope of MEMORY_SCOPES) {
       const scoped = admitted.filter(entry => scopeOfEntry(entry) === scope)
       const store = this.#storeOf(set, scope)
       if (store === undefined) {
-        if (scoped.length > 0) errors.push(`${scope} 库不可用：${this.#lastResolve.detail}`)
+        if (scoped.length > 0) errors.push(`${scope} 库不可用：${availability.detail}`)
         continue
       }
 
