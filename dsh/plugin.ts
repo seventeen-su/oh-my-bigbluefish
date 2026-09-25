@@ -119,6 +119,64 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     // 服务表不再对重名抛错，但保留守卫以免未来语义变化
     logger.warn(`OMB：存储端口注册失败——${String(error)}（记忆库将降级）`)
   }
+
+  /**
+   * **把宿主的可选服务接进内核服务表，用惰性值保证每次重新解析。**
+   *
+   * ## 这条线曾经是断的（实测：通知一条都发不出去）
+   *
+   * `modules/notify` 的 `resolve` 只问内核服务表（`kernel.service('desktopNotify')`），
+   * 而 `dsh/` **从来没有把宿主服务放进那张表**——grep 全仓库，发布点零处。
+   * 于是 `resolve()` 永远返回 `undefined`，通知全部静默，状态面还报"未安装"。
+   *
+   * ## 佐证：`dsh-path-guard` 的做法是对的
+   *
+   * 它的 `src/notify.js` 用 `ctx.get('desktopNotify')` 直接取**宿主**服务，
+   * 每次事件重新解析，并且**确实能投递**。而 `dsh-desktop-notify` 的实现是
+   * `ctx.provide('desktopNotify', …)`（`lib/index.js:445`）——服务在**宿主**容器里。
+   *
+   * ## 为什么每次读都重新问宿主，而不是取一次存下来
+   *
+   * 装配顺序不保证：`dsh-desktop-notify` 可能比 OMB 晚加载，也可能中途被开关。
+   * 每次读都重新问，于是"后装上也能用""卸下立刻失效"都免费成立——
+   * 这正是 path-guard 注释里那条 *"enabling the plugin mid-session starts
+   * working immediately"* 的同一个机制。
+   *
+   * 读 `ctx.get` 必须包 try/catch：宿主 ctx 受 Cordis Guard 管，
+   * 未 `inject` 的名字会抛（本文件上方有同样的告诫）。
+   */
+  try {
+    const services = handle.kernel.services()
+    const table = typeof services === 'object' && services !== null
+      ? (services as { provide?(name: string, value: unknown): unknown })
+      : undefined
+    if (typeof table?.provide === 'function') {
+      const hostOf = (): { push?: unknown; pushAlways?: unknown } | undefined => {
+        try {
+          return (typeof ctx.get === 'function' ? ctx.get('desktopNotify') : undefined) as
+            | { push?: unknown; pushAlways?: unknown }
+            | undefined
+        } catch {
+          // Guard 拒绝（该行没 inject 这个服务）→ 不可用，不是错误
+          return undefined
+        }
+      }
+      /**
+       * **包一层，不能直接返回方法引用**：宿主的方法依赖 `this` 指向它自己，
+       * 把 `host.push` 摘出来单独调用会因 `this` 丢失而抛
+       * `TypeError: Illegal invocation`。这里以宿主对象为 `this` 调用。
+       */
+      const forward = (name: 'push' | 'pushAlways') => (payload: unknown): unknown => {
+        const host = hostOf()
+        const method = host?.[name]
+        if (typeof method !== 'function') return false
+        return (method as (this: unknown, p: unknown) => unknown).call(host, payload)
+      }
+      table.provide('desktopNotify', { push: forward('push'), pushAlways: forward('pushAlways') })
+    }
+  } catch (error) {
+    logger.warn(`OMB：通知服务接线失败（桌面通知将不可用）——${String(error)}`)
+  }
   // 内核已可解析——放行（必须在任何 await 之前，否则模块行会等到超时）
   markReady()
 
