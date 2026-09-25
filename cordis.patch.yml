@@ -20,7 +20,7 @@
       config:
         debug: false
 
-    # ── 记忆库（三个子能力各自可关）──────────────────────────────
+    # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
     - id: omb-memory
       name: './lib/modules/memory/index.js?v=1'
       config:
@@ -28,11 +28,6 @@
         embeddingThreads: 2
     - id: omb-memory-vector
       name: './lib/modules/memory/vector.js?v=1'
-    - id: omb-memory-graph
-      name: './lib/modules/memory/graph.js?v=1'
-    - id: omb-memory-multiquery
-      name: './lib/modules/memory/multiquery.js?v=1'
-      disabled: true          # 默认关闭；打开后一次查询改写成多条并行检索
 
     # ── 用户画像 ─────────────────────────────────────────────────
     - id: omb-profile
