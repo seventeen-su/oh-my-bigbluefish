@@ -76,9 +76,13 @@ describe('注册面', () => {
     const module = createArtifactModule()
     // 提示段只能经 PromptContribution 形状暴露；这里在清单与服务面上都不存在
     expect(Object.keys(module)).toEqual(['manifest', 'apply'])
-    const { kernel } = start()
+    const { kernel, service } = start()
     expect(kernel.service('prompt:artifact')).toBeUndefined()
     expect(kernel.service('prompt:omb-artifact')).toBeUndefined()
+    // 服务 API 里没有"往里塞上下文"的入口：只有查询
+    for (const forbidden of ['inject', 'contribute', 'prompt', 'resident', 'context']) {
+      expect(Object.keys(service)).not.toContain(forbidden)
+    }
   })
 })
 

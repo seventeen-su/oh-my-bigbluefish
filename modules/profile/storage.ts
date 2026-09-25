@@ -128,12 +128,8 @@ export class ProfileStorage {
   #sessionId = ''
   /** 显式 cwd 覆盖（可选）；设置后优先于会话映射。 */
   #project: string | null = null
-  /** 最近一次取库结果，供**同步**的健康面读取（取库本身是异步的）。 */
-  #resolved = false
-  #lastResolve: ProfileAvailability = {
-    ok: false,
-    detail: '尚未解析记忆库（还没有读写请求）',
-  }
+  /** 最近一次取库结果，供**同步**的健康面读取（取库本身是异步的）。null = 尚未解析完成。 */
+  #lastResolve: ProfileAvailability | null = null
 
   constructor(deps: ProfileStorageDeps) {
     this.#deps = deps
@@ -152,13 +148,14 @@ export class ProfileStorage {
   /**
    * 记忆库最近一次解析结果。**同步**，原因必填。
    *
-   * 还没有发起过读写时只做**同步探测**（服务在不在），不假装知道库是否就绪。
+   * 解析尚未完成（异步取库在飞行中）时只做**同步探测**（服务在不在），
+   * 不假装知道库是否就绪，也不用"还没有请求"这类不实描述。
    */
   availability(): ProfileAvailability {
-    if (this.#resolved) return this.#lastResolve
+    if (this.#lastResolve !== null) return this.#lastResolve
     return this.#resolveService() === undefined
       ? { ok: false, detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）' }
-      : { ok: true, detail: '记忆库服务已就绪（尚未发起读写，库状态未探明）' }
+      : { ok: true, detail: '记忆库服务已就绪（首次取库尚未完成，库状态未探明）' }
   }
 
   /** 读取两个库里的画像文档。任何读取失败都变成可读错误。 */
@@ -265,7 +262,6 @@ export class ProfileStorage {
 
   /** 取库。**绝不抛**：失败写进 `#lastResolve` 并返回 undefined。 */
   async #resolveSet(): Promise<ProfileStoreSetPort | undefined> {
-    this.#resolved = true // 从这里开始，availability() 报真实解析结果而不是探测值
     const service = this.#resolveService()
     if (service === undefined) {
       this.#lastResolve = {
