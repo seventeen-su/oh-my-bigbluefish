@@ -43,9 +43,17 @@ export interface ToolBridge {
   add(tools: readonly RegistrableTool[], origin: string): void
   /**
    * 同步一次：注册所有尚未注册的工具。
-   * 幂等——重复调用只注册新增的。
+   * 幂等——重复调用不改变注册（除非某个来源刚被 `invalidate` 标记重挂）。
    */
   sync(): void
+  /**
+   * 标记某来源已重挂：它的工具闭包换代了，下次 `sync()` 必须替换注册。
+   *
+   * 为什么需要显式标记：模块的 `tools:` 服务可能每次访问都返回新对象，
+   * 「对象变了就重注册」会让每次 `sync()` 都重注册（实测唯一名单 7 个、
+   * 调用 29 次）。而"重挂了"这件事**只有挂载方知道**。
+   */
+  invalidate(origin: string): void
   /** 当前已注册的工具名（诊断用）。 */
   registered(): readonly string[]
   /** 注销全部已注册工具（disposer，绝不抛）。 */
@@ -57,6 +65,10 @@ export function createToolBridge(): ToolBridge {
   let source: ToolSource | undefined
   /** 已注册的工具名 → 宿主返回的 disposer。 */
   const registered = new Map<string, () => void>()
+  /** 每个来源（模块 id / `omb-kernel`）的世代；`invalidate` 时递增。 */
+  const generations = new Map<string, number>()
+  /** 注册时记录的世代；与当前世代不符才替换。 */
+  const registeredAt = new Map<string, number>()
   /** 已知的工具（含模块还没挂载时先加的）。 */
   const extra: RegistrableTool[] = []
 
@@ -67,11 +79,25 @@ export function createToolBridge(): ToolBridge {
       bridge.sync()
     },
     add(tools, origin) {
-      for (const tool of tools) {
-        if (registered.has(tool.name) || extra.some(t => t.name === tool.name)) continue
-        extra.push(tool)
-        void origin
+      // **重挂时必须换掉旧实例**，不能因为名字已存在就 `continue`。
+      //
+      // 这条与 `sync` 里的替换是同一个坑，但发生在另一条路径上：
+      // `add` 注册的是内核自带的 `omb_status` 等工具，而它们的闭包里**握着一个
+      // 内核实例**（`buildStatusTool(handle, sessions)`）。内核行重挂后旧实例仍在
+      // 注册表里，于是工具跑的是**上一代内核**——它的 `sessions` 表是空的。
+      //
+      // 实测症状极难判读：`omb_status` 报的「会话→cwd 映射」是 0，而模块行报 1；
+      // 于是 `omb_focus` 一直"取不到当前会话标识"（工具问的是旧实例的活跃会话表，
+      // 而会话事件灌进的是新实例）。两处数字对不上就是最直接的线索。
+      const names = new Set(tools.map(tool => tool.name))
+      for (let i = extra.length - 1; i >= 0; i -= 1) {
+        if (names.has(extra[i]!.name)) extra.splice(i, 1)
       }
+      for (const tool of tools) extra.push(tool)
+      void origin
+      // **先标世代失效再同步**：`sync` 只在"来源重挂过"时才替换已注册的同名工具
+      // （见那边的注释）。内核行重挂时 `add` 被调用，正是那个信号。
+      bridge.invalidate('omb-kernel')
       bridge.sync()
     },
     sync() {
@@ -93,7 +119,17 @@ export function createToolBridge(): ToolBridge {
       }
 
       for (const { tool, origin } of pending) {
-        if (registered.has(tool.name)) continue
+        // **只在来源重挂后才替换**，普通重放不动注册。
+        //
+        // 为什么不比较工具对象：模块的 `tools:` 服务可能每次访问都返回新对象，
+        // 「对象变了就重注册」会让每次 `sync()` 都重注册（实测唯一名单 7 个、
+        // 调用 29 次）。而"重挂了要换新闭包"这件事**只有调用方知道**，
+        // 所以由 `add` 与 `hostEntry` 在挂载后调 `invalidate`。
+        const generation = generations.get(origin) ?? 0
+        const previous = registered.get(tool.name)
+        const already = previous !== undefined
+        const stale = already && (registeredAt.get(tool.name) ?? -1) !== generation
+        if (already && !stale) continue
         try {
           // **必须经 `toHostTool`**：宿主 `tools.register()` 要求
           // `output { schema, render }`，缺了会抛
@@ -101,10 +137,23 @@ export function createToolBridge(): ToolBridge {
           // （`packages/core/tools/src/index.ts:1066-1070`）。
           // 这里曾手搓注册对象、漏了 `output`，于是**每一个 OMB 工具都被拒绝**
           // 而异常被下面的 catch 吞成一条 warn——工具面全空、纤维状态却全正常。
-          const off = host.register(
-            toHostTool(tool),
-          )
+          //
+          // **必须先注销旧的再注册新的**：宿主 `NamedEntries.insert` 在名字已存在时
+          // **直接抛错**（`packages/core/scope/src/store.ts:45`），不是覆盖。
+          // 反过来做（先注册新的）会撞名抛错、被下面的 catch 吞掉，
+          // 于是宿主永远留着旧闭包——实测 `omb_focus` 代码修好了却仍是旧行为。
+          if (previous !== undefined) {
+            try {
+              previous()
+            } catch {
+              // H-1：disposer 绝不抛
+            }
+            registered.delete(tool.name)
+            registeredAt.delete(tool.name)
+          }
+          const off = host.register(toHostTool(tool))
           registered.set(tool.name, typeof off === 'function' ? (off as () => void) : () => {})
+          registeredAt.set(tool.name, generation)
         } catch (error) {
           // 单个工具失败不影响其余（宿主对重名/形状非法会抛）
           source?.logger.warn(
@@ -112,6 +161,10 @@ export function createToolBridge(): ToolBridge {
           )
         }
       }
+    },
+    invalidate(origin) {
+      // 该来源重挂了：它的工具闭包已换代，下次 sync 必须替换
+      generations.set(origin, (generations.get(origin) ?? 0) + 1)
     },
     registered: () => [...registered.keys()].sort(),
     dispose() {

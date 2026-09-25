@@ -315,6 +315,10 @@ export function wireSessionEvents(options: {
           && typeof (data as { step?: unknown }).step === 'number'
           ? (data as { step: number }).step
           : 0
+        // 诊断：确认这一段真的被执行。
+        // `omb_focus` 报"取不到会话"时，分叉点就在这：是这段没跑（事件类型不符），
+        // 还是跑了但订阅者不在这个内核实例上。只有这里能分辨。
+        heartbeat('step-start', { sessionId })
         kernel.emit('turn/start', { sessionId, turn: step })
         return
       }

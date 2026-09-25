@@ -93,6 +93,8 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     // 进了工具面，其余 7 个工具**全部消失**，而健康面一切正常。
     // 现在由 `toolBridge` 幂等重放：每挂载完一个模块就同步一次。
     const registered: string[] = []
+    /** 当前在册的工具名——用来复刻宿主的「重名抛错」。 */
+    const live = new Set<string>()
     const missingOutput: string[] = []
     const dirtySchema: string[] = []
     // 假宿主**复刻真宿主的契约校验**：
@@ -128,8 +130,19 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
           dirtySchema.push(d.name)
           throw new TypeError(`tool "${d.name}" parameters must be lossless JSON before schema projection`)
         }
+        // ③ **重名直接抛错，不是覆盖**：宿主 `NamedEntries.insert` 就是这么做的
+        //    （`packages/core/scope/src/store.ts:45`）。桥若"先注册新的再注销旧的"
+        //    会在这里抛、被吞掉，于是宿主永远留着旧闭包——实测 `omb_focus`
+        //    代码修好了却仍是旧行为。必须复刻，否则测试对这个问题全绿。
+        if (live.has(d.name)) {
+          throw new Error(`tool "${d.name}" is already registered`)
+        }
+        live.add(d.name)
         registered.push(d.name)
-        return () => {}
+        // 真实的 disposer：注销后才允许同名重注册
+        return () => {
+          live.delete(d.name)
+        }
       },
     }
     const handle = createKernel()
@@ -166,11 +179,13 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
       missingOutput,
       `这些工具缺 output { schema, render }，会被宿主拒绝：${missingOutput.join('、')}`,
     ).toEqual([])
-    // 桥是幂等的：再同步几次不会重复注册
-    const before = registered.length
+    // 桥是幂等的：同一批工具再同步几次，**唯一名单**不变。
+    // 不能用 register 调用次数断言——模块重挂后服务表里是新实例，
+    // 桥会替换注册，那时**必须**再调一次 register（详见 tool-bridge 的注释）。
+    const before = new Set(registered).size
     bridge.sync()
     bridge.sync()
-    expect(registered.length).toBe(before)
+    expect(new Set(registered).size).toBe(before)
     bridge.dispose()
   })
 
