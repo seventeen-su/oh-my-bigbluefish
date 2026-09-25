@@ -416,6 +416,13 @@ class SqliteStore implements SqliteMemoryStore {
 
   /** 写操作串行化链：**一次只有一个写事务在飞**。 */
   #queue: Promise<unknown> = Promise.resolve()
+  /**
+   * 上一次 `forget` 的 WAL 截断是否失败。
+   *
+   * 隐私擦除的失败必须可见：行确实删了，但磁盘上可能仍有明文残留——
+   * 那是两件事，回执不能把它们说成一件。
+   */
+  #checkpointFailed = false
   /** 当前事务（含 savepoint）嵌套深度。>0 时写入并入当前事务，避免自死锁。 */
   #txDepth = 0
   #savepointSeq = 0
@@ -530,8 +537,51 @@ class SqliteStore implements SqliteMemoryStore {
         this.#run(`DELETE FROM embedding WHERE memory_id IN (${placeholders})`, chunk)
         removed += this.#run(`DELETE FROM memory WHERE id IN (${placeholders})`, chunk)
       }
+      /**
+       * **删完必须把 WAL 截断**——否则"硬删除"只是措辞。
+       *
+       * ## 实测（自检报告追问"物理抹除 vs 逻辑不可召回"，逐字节扫过）
+       *
+       * 删掉一条记忆后：
+       *
+       * | 层 | 被删文本 |
+       * | --- | --- |
+       * | `memory` / `memory_fts` / `embedding` / `edge`（SQL） | 0 ✅ |
+       * | **WAL 原始字节** | **6 处，全文可读** ❌ |
+       *
+       * 三个 PRAGMA 决定了它：`journal_mode=wal`（写入先进 WAL）、
+       * `secure_delete=0`（删除不覆写字节）、`wal_autocheckpoint=1000`（远没到阈值）。
+       * 于是原文以**明文**留在 `<库>.db-wal` 里，`strings` 就能捞出来。
+       *
+       * ## 为什么这条不能只是文档问题
+       *
+       * `forget` 是**隐私擦除**路径（`consolidate.ts` 写明"唯一允许的删除路径"）。
+       * 隐私擦除的语义是"内容不再存在"，而不是"查不到了"。
+       * 对隐私场景，"查不到但字节还在"是不合格的。
+       *
+       * `TRUNCATE` 会 checkpoint 并把 WAL 截回零长度（已提交内容进了主库文件，
+       * 不是丢数据）。整个删除在同一事务边界内完成，代价可接受——
+       * 隐私擦除本来就是低频、显式、可审计的操作。
+       */
+      try {
+        this.#run('PRAGMA wal_checkpoint(TRUNCATE)')
+      } catch {
+        // checkpoint 失败不得让"已经删掉了"变成"删除失败"：行确实已经删了。
+        // 但这条降级必须留声——调用方据此提示"逻辑已删、磁盘可能仍有残留"。
+        this.#checkpointFailed = true
+      }
       return removed
     })
+  }
+
+  /**
+   * 上一次 `forget` 的 WAL 截断是否失败。
+   *
+   * 用途：`forget` 的回执要能如实说"逻辑已删，但磁盘残留未清干净"——
+   * **隐私擦除的失败必须可见**，不能因为行删掉了就当整件事成功了。
+   */
+  checkpointAfterForgetFailed(): boolean {
+    return this.#checkpointFailed
   }
 
   async putEmbedding(vector: EmbeddingVector): Promise<void> {

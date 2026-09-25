@@ -187,7 +187,7 @@ describe('omb_forget：唯一硬删除路径 + 可审计回执', () => {
 
     const outcome = (await tool.execute({ ids: ['u1', 'p1', 'ghost'] })) as { kind: string; text: string }
     expect(outcome.kind).toBe('text')
-    expect(outcome.text).toContain('已硬删除 2 条')
+    expect(outcome.text).toContain('已删除 2 条')
     expect(outcome.text).toContain('user 1')
     expect(outcome.text).toContain('project 1')
     expect(outcome.text).toContain('未找到 1 条')
@@ -204,7 +204,7 @@ describe('omb_forget：唯一硬删除路径 + 可审计回执', () => {
     const tool = toolNamed(createMemoryTools({ resolveStores: () => [tagged(store)], clock: CLOCK }), FORGET_TOOL)
     const outcome = (await tool.execute({ id: 'u1' })) as { kind: string; text: string }
     expect(outcome.kind).toBe('text')
-    expect(outcome.text).toContain('已硬删除 1 条')
+    expect(outcome.text).toContain('已删除 1 条')
   })
 
   it('服务缺失 / 参数非法 / forget 抛异常 → kind:error，绝不抛', async () => {
