@@ -18,6 +18,7 @@
  * ② 服务注册（`provide`）一律进**内核自己的服务表**。宿主服务只经 `get` 读取。
  *    这样"模块注册了什么"完全由内核掌握，不依赖宿主 ctx 的内部形状。
  */
+import { heartbeat } from './hostEntry.js'
 import type {
   FocusDepth,
   BudgetGrant,
@@ -122,11 +123,17 @@ export function adoptContext(
       if (hostOn !== undefined) {
         try {
           const off = hostOn(event, fn as (...args: never[]) => void)
-          if (typeof off === 'function') return off as () => void
+          if (typeof off === 'function') {
+            // 诊断：模块到底订到了哪个后端。模块订阅宿主、而 dsh 发内核总线时，
+            // 事件永远碰不到——症状与"事件没来"一模一样，只有这里能分辨。
+            heartbeat('adopt-on', { event, backend: 'host' })
+            return off as () => void
+          }
         } catch {
           // 回落内核总线
         }
       }
+      heartbeat('adopt-on', { event, backend: 'kernel' })
       return core.on(event, fn as (payload: unknown) => void)
     },
     emit: (event, payload) => core.emit(event, payload),
