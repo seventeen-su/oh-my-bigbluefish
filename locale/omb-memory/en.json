@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory store",
+    "description": "Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, and forgetting."
+  }
+}

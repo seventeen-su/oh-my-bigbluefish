@@ -21,6 +21,10 @@ const STAGE = join(ROOT, 'lib-gen', '.stage')
 const BUILD_ROOT = join(ROOT, 'lib-gen')
 const GENERATION_FILE = join(ROOT, 'build-generation.json')
 const PATCH_FILE = join(ROOT, 'cordis.patch.yml')
+const MANIFEST_FILE = join(ROOT, 'package.json')
+
+/** 行名用的包名（来自清单，不硬编码）。 */
+
 
 /** 允许被清理的旧代目录名：只匹配我们自己生成的 `g<数字>`，绝不误删别的目录。 */
 const GENERATION_DIR = /^g\d+$/
@@ -132,6 +136,26 @@ function main() {
   // 2b) 陈旧检测：产物必须比源码新
   const freshness = assertFresh(target)
 
+  // 2c) 生成插件页的显示名与导出口
+  //
+  // **为什么必须生成**：插件页每一行显示的是行的 `name`，而中文名只能经 DSH 的
+  // 本地化元数据拿到（`packages/boot/app-boot/src/package-meta.ts:148`）：
+  // 行名得是**裸包名 + 子路径**，名字取自 `<specifier>/locale/zh.json` 的
+  // `meta.title`、说明取自 `meta.description`。
+  // 用相对路径时拿不到任何元数据，退回显示完整 `file:///` 路径——用户看不出
+  // 哪个开关对应哪个组件，也看不出开的是哪一代产物。
+  writeDisplayMetadata(outDir)
+
+  // 2d) 行名保持**相对路径**，不改成裸包子路径。
+  //
+  // 实测：裸包名 + 子路径（`@omb/plugin/omb-kernel`）在这个宿主里**解析不了**
+  // ——8 行全部 "failed to import"。宿主用 `new URL(name, baseUrl)` 解析行名，
+  // 相对路径直接可行；裸包名要靠包解析器，而它只认顶层包名
+  // （`@deepseek-ai/dsh-agent-preset` 之类），不认子路径。
+  //
+  // 换目录名（`lib-gen/g<N>`）才是让"新代码被加载"的正解，路径形式必须保持相对。
+  // 中文显示名改由模块目录下的 `package.json` 提供（见 `writeDisplayMetadata`）。
+
   // 3) 写代数文件（运行期经它核对"现在跑的是哪一代"）
   writeFileSync(
     GENERATION_FILE,
@@ -151,6 +175,79 @@ function main() {
 
   process.stdout.write(`[build] 第 ${generation} 代就绪：${outDir}\n`)
   process.stdout.write('[build] 重新安装插件即可加载本代代码（URL 已变，不受 ESM 缓存影响）\n')
+}
+
+/**
+ * 从 `kernel/display.ts` 解析出组件显示元数据。
+ *
+ * 直接读源码而不用 `import`：那是 `.ts`，Node 不能直接加载；而为它加构建步骤
+ * 只为了拿 8 条显示名，代价不成比例。格式固定（我们自己写的），正则够用，
+ * 且解析结果会与 `cordis.patch.yml` 的行 id 交叉校验——解析漏了会立刻报错。
+ */
+function readComponentDisplay() {
+  const source = readFileSync(join(ROOT, 'kernel', 'display.ts'), 'utf8')
+  const entries = []
+  const block = /\{\s*rowId:\s*'([^']+)',\s*subpath:\s*'([^']+)',\s*zh:\s*'([^']*)',\s*en:\s*'([^']*)',\s*zhDescription:\s*'((?:[^'\\]|\\.)*)',\s*enDescription:\s*'((?:[^'\\]|\\.)*)',\s*\}/g
+  for (const match of source.matchAll(block)) {
+    entries.push({
+      rowId: match[1],
+      subpath: match[2],
+      zh: match[3],
+      en: match[4],
+      zhDescription: match[5].replace(/\\'/g, "'"),
+      enDescription: match[6].replace(/\\'/g, "'"),
+    })
+  }
+  if (entries.length === 0) {
+    throw new Error('[build] 未能从 kernel/display.ts 解析出组件显示元数据——检查那里的字面量格式')
+  }
+  return entries
+}
+
+/** 每个组件的产物入口（相对仓库根）。 */
+function componentEntry(outDir, rowId) {
+  const map = {
+    'omb-kernel': `${outDir}/dsh/kernel.js`,
+    'omb-memory': `${outDir}/modules/memory/index.js`,
+    'omb-memory-vector': `${outDir}/modules/memory/vector.js`,
+    'omb-profile': `${outDir}/modules/profile/index.js`,
+    'omb-reasoning': `${outDir}/modules/reasoning/index.js`,
+    'omb-context': `${outDir}/modules/context/index.js`,
+    'omb-artifact': `${outDir}/modules/artifact/module.js`,
+    'omb-notify': `${outDir}/modules/notify/index.js`,
+  }
+  const entry = map[rowId]
+  if (entry === undefined) throw new Error(`[build] 组件 ${rowId} 没有产物入口映射`)
+  return entry
+}
+
+/**
+ * 生成 `locale/<组件>/{en,zh}.json`。
+ *
+ * **用途**：DSH 的插件页显示名来自本地化元数据
+ * （`packages/boot/app-boot/src/package-meta.ts:148`）。
+ * 中文名从 `kernel/display.ts`（唯一真源）生成到这些文件，改文案只改那里。
+ *
+ * **注意**：暂时还没接上显示。让宿主认这些文件需要行名是**裸包子路径**
+ * （`@omb/plugin/<组件>`），但实测宿主解析不了子路径（8 行全部
+ * "failed to import"），所以行名保持相对路径。locale 先备好：
+ * 一旦找到让宿主认子路径的办法（或在 DSH 侧支持），直接接上即可。
+ */
+function writeDisplayMetadata(outDir) {
+  const entries = readComponentDisplay()
+  for (const entry of entries) {
+    const dir = join(ROOT, 'locale', entry.subpath)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(
+      join(dir, 'en.json'),
+      `${JSON.stringify({ meta: { title: entry.en, description: entry.enDescription } }, null, 2)}\n`,
+    )
+    writeFileSync(
+      join(dir, 'zh.json'),
+      `${JSON.stringify({ meta: { title: entry.zh, description: entry.zhDescription } }, null, 2)}\n`,
+    )
+  }
+  return entries
 }
 
 main()
