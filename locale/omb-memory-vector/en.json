@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Vector retrieval",
-    "description": "Semantic recall channel. Turning it off keeps lexical recall fully working."
-  }
-}

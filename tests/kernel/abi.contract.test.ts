@@ -6,11 +6,13 @@
  */
 import { describe, expect, it } from 'vitest'
 import * as abi from '../../kernel/abi/index.js'
+import { componentDirOf } from '../../kernel/display.js'
 
 /**
- * 产物路径前缀。产物目录带**代数后缀**（`lib-gen/g1`）——代数变 = URL 变 =
- * 宿主必然加载新模块，而不是命中 ESM 缓存里的旧实例
- * （见 `kernel/buildInfo.ts` 的说明）。
+ * 产物目录带**代数后缀**（`lib-gen/g<N>`）——代数变 = URL 变 = 宿主必然加载新模块，
+ * 而不是命中 ESM 缓存里的旧实例（见 `kernel/buildInfo.ts` 的说明）。
+ * 行名里**不出现**代数：换代由每个组件包的 `main`/`exports` 承担
+ * （`scripts/build.mjs` 每次构建刷新它们）。
  */
 
 describe('内核 ABI 契约', () => {
@@ -53,31 +55,54 @@ describe('内核 ABI 契约', () => {
     }
   })
 
-  it('cordis.patch.yml 的每个 name 都是存在的产物相对路径', async () => {
+  it('cordis.patch.yml 的每个 name 都是**存在且有中文名的裸顶层包**', async () => {
     const { readFileSync, existsSync } = await import('node:fs')
+    const { join } = await import('node:path')
     const { fileURLToPath } = await import('node:url')
     const root = fileURLToPath(new URL('../../', import.meta.url))
     const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
 
-    // 行名必须是**相对路径**：宿主用 `new URL(name, baseUrl)` 解析它。
-    // 实测裸包名 + 子路径（`@omb/plugin/omb-kernel`）在这个宿主里解析不了
-    // ——8 行全部 "failed to import"。所以这是硬约束，不是风格偏好。
-    const ourNames = [...yaml.matchAll(/name:\s*'(\.\/[^']+)'/g)].map(m => m[1] as string)
+    // 判据（三方一致，两条硬约束夹出来的唯一解）：
+    // ① 行名必须是**裸包名**：相对路径的行拿不到本地化元数据
+    //    （`readPluginMeta` 见 `barePackageName(specifier) === undefined` 就放弃，
+    //    packages/boot/app-boot/src/package-meta.ts:148），插件页只显示一串文件路径；
+    // ② 不得带子路径：`@omb/plugin/omb-kernel` 实测 8 行 "failed to import"——
+    //    宿主按 `barePackageName(request)` 查拦截路由，拿到的是 `@omb/plugin`。
+    // 于是每个组件必须是一个独立顶层包，中文名放该包自己的 `locale/zh.json`。
+    const ourNames = [...yaml.matchAll(/name:\s*'(@?[^']+)'/g)]
+      .map(m => m[1] as string)
+      .filter(name => name.startsWith('@omb/'))
     expect(ourNames.length).toBeGreaterThan(0)
 
     for (const name of ourNames) {
-      const withoutQuery = name.split('?')[0] as string
-      // 相对路径锚定补丁文件所在目录（仓库根）
+      const parts = name.split('/')
+      expect(parts.length, `${name} 不是裸顶层包名（带了子路径）`).toBe(2)
+      const dir = join(root, 'packages', componentDirOf(name))
+      const manifestPath = join(dir, 'package.json')
+      expect(existsSync(manifestPath), `${name} 对应的组件包不存在：${manifestPath}`).toBe(true)
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { name?: unknown }
+      expect(manifest.name, `${manifestPath} 的 name 与行名不一致`).toBe(name)
+
+      // 中文名/说明：插件页那一列就取这两个字段
+      const localePath = join(dir, 'locale', 'zh.json')
+      expect(existsSync(localePath), `${name} 缺 locale/zh.json——插件页会退回显示包名`).toBe(true)
+      const locale = JSON.parse(readFileSync(localePath, 'utf8')) as { meta?: { title?: unknown; description?: unknown } }
+      expect(typeof locale.meta?.title === 'string' && locale.meta.title.length > 0, `${localePath} 缺 meta.title`).toBe(true)
       expect(
-        existsSync(`${root}${withoutQuery.replace(/^\.\//, '')}`),
-        `${name} 指向的产物不存在（先跑 node scripts/build.mjs）`,
+        typeof locale.meta?.description === 'string' && locale.meta.description.length > 0,
+        `${localePath} 缺 meta.description`,
       ).toBe(true)
+
+      // `exports` 必须放行 locale 与 package.json——元数据解析走的就是这两个子路径
+      const exports = (manifest as { exports?: Record<string, unknown> }).exports
+      expect(exports?.['./locale/zh.json'], `${name} 没有导出 locale/zh.json`).toBe('./locale/zh.json')
+      expect(exports?.['./package.json'], `${name} 没有导出 package.json`).toBe('./package.json')
     }
 
-    // 指向内核本体的那一行必须在 dsh/ 下——它缺了整个插件都装不上
+    // 微内核那一行指向自己的组件包（它缺了整个插件都装不上）
     const kernelRow = /- id:\s*omb-kernel\s*\n\s*name:\s*'([^']+)'/.exec(yaml)?.[1]
     expect(kernelRow, 'cordis.patch.yml 里找不到 omb-kernel 行').toBeDefined()
-    expect(kernelRow as string).toContain('/dsh/')
+    expect(kernelRow as string).toBe('@omb/kernel')
   })
 
   it('每个模块 id 在 cordis.patch.yml 里都有对应行（缺行 = 插件页看不到开关）', async () => {

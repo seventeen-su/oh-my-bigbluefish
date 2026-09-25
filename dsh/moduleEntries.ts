@@ -26,7 +26,9 @@ import * as notify from '../modules/notify/index.js'
 /**
  * 入口路径 → 已加载命名空间。
  *
- * 键的格式与 `cordis.patch.yml` 的 `name` 落点对应，供诊断与契约测试比对。
+ * 键是**模块的源码路径**（`modules/<目录>/<文件>`）；`cordis.patch.yml` 的行名
+ * 现在是组件包的裸包名（`@omb/<组件>`，见 `packages/<组件>/index.ts`），不再是路径——
+ * 本清单是内核侧"装配哪些模块"的静态真源，与行名由测试交叉核对。
  *
  * 注意 `modules/memory/graph.ts` **不在此清单**：它是 `omb-memory` 的工具工厂
  * （`relateToolFactory`），不是独立模块——工具是"始终存在、按需调用"的能力，

@@ -10,11 +10,14 @@
  * - `app-boot/src/profile-resolution/resolver.ts:128`
  *   *"existing modules and Node caches remain intact."*
  *
- * 后果：改完代码重新安装，如果 patch 里的路径没变，**跑的还是旧代码**，
+ * 后果：改完代码重新安装，如果加载的路径没变，**跑的还是旧代码**，
  * 于是"激活失败"这类报错根本不能反映当前源码——**极易误判**。
  *
  * 修法：产物放进**带代数后缀**的目录（`lib-gen/g1`、`g2`…），
  * 每次构建换代 → URL 变 → 必然加载新模块。
+ * `cordis.patch.yml` 的行名是裸包名（不含代数），换代由每个组件包
+ * `package.json` 的 `main`/`exports` 指向 `lib-gen/g<N>/` 承担——
+ * 见 `scripts/build.mjs`。
  *
  * 本文件是**唯一**的代数来源：`scripts/build.mjs` 写它，
  * `dsh/plugin.ts` 读它并把代数带进 `apply` 的返回值上，供运行期核对。
@@ -60,9 +63,11 @@ export function parseGeneration(raw: unknown): BuildGeneration | undefined {
 /**
  * 从产物 URL 里解析出代数。
  *
- * 产物布局固定为 `<…>/lib-gen/g<代数>/dsh/kernel.js`，所以代数可以从**自己的 URL**
- * 读出来——不必读文件、不会因文件缺失而失效。源码树里（`dsh/kernel.ts`）解析不到，
- * 返回 `undefined`，表示"非构建产物运行"。
+ * 产物布局固定为 `<…>/lib-gen/g<代数>/…`：实现是 `lib-gen/g<代数>/dsh/kernel.js`
+ * 与 `lib-gen/g<代数>/packages/<组件>/index.js`；组件包里还有一层带代数的转发
+ * （`packages/<组件>/lib-gen/g<代数>/index.js`）。三种 URL 都含 `/lib-gen/g<代数>/`，
+ * 所以代数可以从**自己的 URL** 读出来——不必读文件、不会因文件缺失而失效。
+ * 源码树里（`dsh/kernel.ts`）解析不到，返回 `undefined`，表示"非构建产物运行"。
  *
  * **用途**：`omb_status` 与健康面显示"当前第 N 代"，于是"宿主跑的到底是新代码还是
  * 缓存旧代码"变成一个可观测事实，而不是靠推断。这正是不重启部署下最容易误判的一点。

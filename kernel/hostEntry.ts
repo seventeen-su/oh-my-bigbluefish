@@ -25,7 +25,7 @@ import type { Kernel, ModuleRegistration } from './abi/index.js'
 const require = createRequire(import.meta.url)
 import { SERVICES } from './abi/index.js'
 
-/** `cordis.patch.yml` 的 `name` 指向 `dsh/kernel.ts`。 */
+/** `cordis.patch.yml` 的 `omb-kernel` 行 id（行名是组件包名 `@omb/kernel`）。 */
 export const KERNEL_ENTRY_NAME = 'omb-kernel'
 
 /** 宿主 ctx 的最小结构面。**只声明 `get`/`on`**——其余属性一概不摸（Guard 会抛）。 */

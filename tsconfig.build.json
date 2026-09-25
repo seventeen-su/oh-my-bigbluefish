@@ -9,6 +9,6 @@
     "incremental": true,
     "tsBuildInfoFile": "lib-gen/.tsbuildinfo"
   },
-  "include": ["kernel", "modules", "dsh"],
+  "include": ["kernel", "modules", "dsh", "packages"],
   "exclude": ["lib-gen", "node_modules", "tests"]
 }

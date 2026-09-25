@@ -6,34 +6,48 @@
 #   preset-<id> 树下，会被标为 readOnlyReason: 'unaddressable'，插件页拨不动。
 #   而「前端开关 = 文件开关」正是靠这一层实现的（写 cordis.patch.yml 的 disabled）。
 #
-# name 里的相对路径锚定**本补丁文件所在目录**（loader 的 ctx.baseUrl），
-# 因此 './lib-gen/g20/...' 指仓库根的构建产物。开发循环：改码 → pnpm build → 递增 ?v=N → 新会话。
+# 每行的 `name` 是**组件包的裸顶层包名**（`@omb/<组件>`），对应 `packages/<组件>/`。
+# 三个要求把它夹到唯一解，别改成别的写法：
+#   ① 相对路径（`./lib-gen/g<N>/...`）**永远拿不到本地化元数据**——
+#      `readPluginMeta` 见 `barePackageName(specifier) === undefined` 就放弃
+#      （packages/boot/app-boot/src/package-meta.ts:148），插件页只会显示一串
+#      `file:///` 路径，用户看不出哪个开关对应哪个组件。
+#   ② 「裸包名 + 子路径」（`@omb/plugin/omb-kernel`）宿主**解析不了**：解析器按
+#      `barePackageName(request)` 查拦截路由，拿到的是 `@omb/plugin`（不是任何
+#      已注册依赖）→ 退回 Node 原生解析 → 8 行全部 "failed to import"（已实测）。
+#   ③ 带 `?v=N` 会让宿主把 `?v=N` 当文件名字面量去找 → 同样加载失败。
+# 只有"一个组件 = 一个独立顶层包"同时满足"能解析"与"有中文名"。
+#
+# 换代（`lib-gen/g<N>/`）**不写在本文件里**：`scripts/build.mjs` 每次构建刷新
+# `packages/<组件>/package.json` 的 main/exports 指向新代，URL 随之变化，
+# 因此必然加载到本次构建的代码（绕过 Node 的 ESM 按 URL 缓存）。
+# 开发循环：改码 → pnpm build → 重新启用该行（或新会话）。
 #
 # `name` 的落点规则：**模块入口属于模块自己**（`modules/<name>/index.ts` 或 `module.ts`），
-# 不在 dsh/ 下复制一层"入口文件"——否则每加一个模块要改两处。
-# 只有微内核入口在 dsh/（它就是插件本体）。
+# 组件包入口（`packages/<组件>/index.ts`）只做 re-export + `export default toHostPlugin(...)`，
+# 不复制任何实现——否则每加一个模块要改三处。
 
 - insert:
     # ── 微内核（必需）────────────────────────────────────────────
     - id: omb-kernel
-      name: './lib-gen/g20/dsh/kernel.js'
+      name: '@omb/kernel'
       config:
         debug: false
 
     # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
     - id: omb-memory
-      name: './lib-gen/g20/modules/memory/index.js'
+      name: '@omb/memory'
       inject: ['omb:kernel']
       config:
         consolidationEveryTurns: 32
         embeddingThreads: 2
     - id: omb-memory-vector
-      name: './lib-gen/g20/modules/memory/vector.js'
+      name: '@omb/memory-vector'
       inject: ['omb:kernel']
 
     # ── 用户画像 ─────────────────────────────────────────────────
     - id: omb-profile
-      name: './lib-gen/g20/modules/profile/index.js'
+      name: '@omb/profile'
       inject: ['omb:kernel']
       config:
         # 能力轴默认关闭，且**永不落盘**：错误成本不对称（高估用户会产生自信的错误帮助）
@@ -41,14 +55,14 @@
 
     # ── 思维链质量层 ─────────────────────────────────────────────
     - id: omb-reasoning
-      name: './lib-gen/g20/modules/reasoning/index.js'
+      name: '@omb/reasoning'
       inject: ['omb:kernel']
       config:
         defaultDepth: standard
 
     # ── 上下文优化 ───────────────────────────────────────────────
     - id: omb-context
-      name: './lib-gen/g20/modules/context/index.js'
+      name: '@omb/context'
       inject: ['omb:kernel']
       config:
         # 软压力档位，**不是每回合 token 上限**；阈值从测量标定
@@ -57,10 +71,10 @@
 
     # ── 制品索引 / 通知桥 ────────────────────────────────────────
     - id: omb-artifact
-      name: './lib-gen/g20/modules/artifact/module.js'
+      name: '@omb/artifact'
       inject: ['omb:kernel']
     - id: omb-notify
-      name: './lib-gen/g20/modules/notify/index.js'
+      name: '@omb/notify'
       inject: ['omb:kernel']
 
     # ── 大肥鱼模式预设 ───────────────────────────────────────────

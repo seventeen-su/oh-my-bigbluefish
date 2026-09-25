@@ -1,14 +1,16 @@
 /**
- * Cordis 插件入口。`cordis.patch.yml` 的 `omb-kernel` 行指向本文件。
+ * Cordis 插件入口 —— `@omb/kernel` 组件包（`packages/kernel/index.ts`）re-export 本文件，
+ * `cordis.patch.yml` 的 `omb-kernel` 行加载的就是它。
  *
  * **运行状态说明**：本文件（内核行）在 DSH 0.1.7-rc.2 上**已验证工作**——
  * 工具面（7 个工具）、常驻提示注入、`omb_status`、拉取台账、会话 cwd 映射
  * 都在真实宿主里确认过。
  *
- * **未完成的一环**：`cordis.patch.yml` 里另外 8 个**模块行**由宿主**独立加载**，
- * 它们拿到的 `ctx` 是宿主 ctx 代理，取不到本内核对象；因此模块加载成功但
- * 不注册任何能力（空转）。精确断点、两个候选解法与最小探测插件见
- * `docs/host-wiring-handoff.md`。
+ * **模块行的加载路径**：`cordis.patch.yml` 里另外 7 个**模块行**由宿主**独立加载**，
+ * 行名是各自独立组件包的裸包名（`@omb/<组件>` → `packages/<组件>/index.ts`）。
+ * 组件入口的 `default` 是 `toHostPlugin(registration)`：它经
+ * `ctx.get('omb:kernel')` 取本内核（依赖顺序由行级 `inject: ['omb:kernel']` 保证），
+ * 取不到时**不抛**，只在 stderr 留一条"本行不会提供任何能力"的说明。
  *
  * 三条硬约束（违反即插件加载失败或开关操作失败）：
  *
