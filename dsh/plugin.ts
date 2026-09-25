@@ -30,7 +30,8 @@ import {
 } from './session.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { buildStatusTool } from './status-tool.js'
-import { loadModules } from './modules.js'
+import { loadModulesSync } from './modules.js'
+import { MODULE_ENTRIES } from './moduleEntries.js'
 
 /** `cordis.patch.yml` 行 config 的形状。 */
 export interface PluginConfig {
@@ -66,7 +67,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   }
 
   // ── 2) 模块装配（同步发现 + 同步启动）──────────────────────────────────
-  const loaded = loadModules()
+  const loaded = loadModulesSync(MODULE_ENTRIES)
   for (const failure of loaded.failures) {
     logger.warn(`OMB：模块入口 ${failure.path} 未装配——${failure.reason}`)
   }

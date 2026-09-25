@@ -132,17 +132,52 @@ const kernelPurity = {
   },
 };
 
+// 模块层禁止直接读时钟：一律经 `kernel.clock`。
+// 理由：测试要可控时钟；且"模块层不许有隐式环境依赖"是内核/模块边界的可检查形式。
+const noDirectClock = {
+  meta: {
+    type: 'problem',
+    docs: { description: '模块层禁止直接使用 Date.now()/new Date()，一律经 kernel.clock' },
+    messages: {
+      direct: '模块层不得直接取时间（{{what}}）——用 kernel.clock.now()，测试需要可控时钟',
+    },
+  },
+  create(context) {
+    const filename = context.filename ?? '';
+    if (layerOf(filename) !== 'modules') return {};
+    return {
+      MemberExpression(node) {
+        if (node.object?.name === 'Date' && node.property?.name === 'now') {
+          context.report({ node, messageId: 'direct', data: { what: 'Date.now()' } });
+        }
+      },
+      NewExpression(node) {
+        if (node.callee?.name === 'Date') {
+          context.report({ node, messageId: 'direct', data: { what: 'new Date()' } });
+        }
+      },
+    };
+  },
+};
+
 export default tseslint.config(
   { ignores: ['**/node_modules/**', '**/lib/**', '**/dist/**'] },
   tseslint.configs.recommended,
   {
     files: ['**/*.ts'],
     plugins: {
-      omb: { rules: { 'no-layer-violation': noLayerViolation, 'kernel-purity': kernelPurity } },
+      omb: {
+        rules: {
+          'no-layer-violation': noLayerViolation,
+          'kernel-purity': kernelPurity,
+          'no-direct-clock': noDirectClock,
+        },
+      },
     },
     rules: {
       'omb/no-layer-violation': 'error',
       'omb/kernel-purity': 'error',
+      'omb/no-direct-clock': 'error',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },
   },

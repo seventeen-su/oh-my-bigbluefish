@@ -15,8 +15,6 @@ export const MODULE_IDS = [
   'omb-kernel',
   'omb-memory',
   'omb-memory-vector',
-  'omb-memory-graph',
-  'omb-memory-multiquery',
   'omb-profile',
   'omb-reasoning',
   'omb-context',
@@ -49,28 +47,24 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     id: 'omb-memory',
     enabledByDefault: true,
     requires: ['omb-kernel'],
-    capabilities: ['memory.write', 'memory.recall', 'memory.retain'],
-    tools: ['omb_recall', 'omb_forget'],
+    // 关联扩展（多跳）与多查询改写是**本模块的子能力**，各自提供工具而不是独立模块行：
+    // 工具是"始终存在、按需调用"的东西，给它单独一行会让插件页多出两个没有独立资源的开关。
+    capabilities: [
+      'memory.write',
+      'memory.recall',
+      'memory.retain',
+      'memory.recall.related',
+      'memory.recall.multiquery',
+    ],
+    tools: ['omb_recall', 'omb_forget', 'omb_relate'],
   },
   {
     id: 'omb-memory-vector',
     enabledByDefault: true,
     requires: ['omb-memory'],
+    // 保留为独立模块：它有独立资源（嵌入器实例 + 可选 ONNX 运行时与权重目录），
+    // 关掉后纯词法路径完整可用。
     capabilities: ['memory.recall.semantic'],
-    tools: [],
-  },
-  {
-    id: 'omb-memory-graph',
-    enabledByDefault: true,
-    requires: ['omb-memory'],
-    capabilities: ['memory.recall.related'],
-    tools: ['omb_relate'],
-  },
-  {
-    id: 'omb-memory-multiquery',
-    enabledByDefault: false,
-    requires: ['omb-memory'],
-    capabilities: ['memory.recall.multiquery'],
     tools: [],
   },
   {
