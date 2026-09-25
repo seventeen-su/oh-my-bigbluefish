@@ -5,8 +5,16 @@
  * 一份用 **真实内核**（验证 `start` 的装配顺序与 health 面的实际输出）。
  */
 import { describe, expect, it } from 'vitest'
-import type { ContextPressure, Kernel, ModuleHealth, ModuleRegistration, ToolDefinition } from '../../../kernel/abi/index.js'
+import type {
+  ContextPressure,
+  Kernel,
+  ModuleHealth,
+  ModuleRegistration,
+  SecondaryChannelRegistry,
+  ToolDefinition,
+} from '../../../kernel/abi/index.js'
 import { MODULE_CATALOG, SERVICES, SCHEMA_VERSION, toolsServiceFor } from '../../../kernel/abi/index.js'
+import type { RetrievalChannel } from '../../../modules/memory/retrieve.js'
 import { createKernel } from '../../../kernel/index.js'
 import {
   MEMORY_CONFIG_DEFAULTS,
@@ -357,5 +365,55 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     }
 
     handle.dispose()
+  })
+
+  it('消费第二通道登记处：只有向量通道能命中的记忆也会被召回（关掉则退化纯词法）', async () => {
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+
+    // 向量模块的等价物：Embedder 槽 + 把自己的通道登记进**内核提供的**登记处
+    // （ABI `retrieval:channels`，由 `kernel/index.ts` provide）
+    handle.kernel.provide(SERVICES.embedder, {
+      id: 'fake-vector',
+      dimensions: 4,
+      revision: '1',
+      embed: async (texts: readonly string[]) => texts.map(() => new Float32Array(4)),
+    })
+    const registry = handle.kernel.service<SecondaryChannelRegistry<RetrievalChannel>>(
+      SERVICES.channelRegistry,
+    )
+    expect(registry).toBeDefined()
+
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+    const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
+    service?.rememberCwd('s1', ws.dir)
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
+    const set = await service?.forSession('s1')
+    await set?.store('project')?.put(
+      makeRecord({ scope: 'project', id: 'vec-only', text: '词法上完全不同的内容', sourceRef: 'src:vec' }),
+    )
+    // 第二通道声称这条记忆相关（真实实现里是被 embedder 算出的近邻）。
+    // 通道按库被调用：只对真正拥有该记忆的项目库回话，否则水合会按作用域找不到它。
+    const offChannel = registry?.register({
+      name: 'vector',
+      search: async query =>
+        query.store.scope === 'project' ? [{ id: 'vec-only', score: 0.9, channel: 'vector' }] : [],
+    })
+
+    const recall = toolsOf(handle)?.find(tool => tool.name === 'omb_recall')
+    const withChannel = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' })
+    expect(withChannel?.kind).toBe('text')
+    expect(withChannel?.kind === 'text' ? withChannel.text : '').toContain('词法上完全不同的内容')
+
+    // 关掉第二通道（注销登记）→ 同一次查询退回纯词法：召回不到（§5.7 完整可用）
+    offChannel?.()
+    const lexicalOnly = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' })
+    expect(lexicalOnly?.kind).toBe('text')
+    expect(lexicalOnly?.kind === 'text' ? lexicalOnly.text : '').not.toContain('词法上完全不同的内容')
+
+    handle.dispose()
+    await service?.close()
+    ws.cleanup()
   })
 })

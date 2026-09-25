@@ -17,6 +17,7 @@ import type {
   ModuleHealth,
   ModuleManifest,
   ModuleRegistration,
+  SecondaryChannelRegistry,
   StorageHostPort,
   StoreStats,
   TaggedStore,
@@ -26,6 +27,7 @@ import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/inde
 import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
+import type { RetrievalChannel } from './retrieve.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
 export const MODULE_ID = 'omb-memory'
@@ -210,13 +212,21 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         ...createMemoryTools({
           resolveStores,
           clock: kernel.clock,
-          ports: () => ({
-            clock: kernel.clock,
-            // 向量通道由独立模块提供；关掉它 → undefined → 退化为纯词法（完整可用）
-            ...(kernel.service<Embedder>(SERVICES.embedder) === undefined
-              ? {}
-              : { embedder: kernel.service<Embedder>(SERVICES.embedder) }),
-          }),
+          /**
+           * 检索端口在**每次调用时**读服务表：向量模块可能后到、也可能被关掉，
+           * 两种情形都必须只影响通道数，不影响词法主路径（§5.7）。
+           */
+          ports: () => {
+            const embedder = kernel.service<Embedder>(SERVICES.embedder)
+            const channels = kernel
+              .service<SecondaryChannelRegistry<RetrievalChannel>>(SERVICES.channelRegistry)
+              ?.list()
+            return {
+              clock: kernel.clock,
+              ...(embedder === undefined ? {} : { embedder }),
+              ...(channels === undefined || channels.length === 0 ? {} : { channels }),
+            }
+          },
           pressureBand: () =>
             lastActiveSession === null ? undefined : kernel.pressure(lastActiveSession).band,
         }),
