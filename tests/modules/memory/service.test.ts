@@ -26,6 +26,7 @@ import {
   nodeSqlite,
   tempWorkspace,
   testPort,
+  type TempWorkspace,
   type TestPort,
 } from './helpers.js'
 
@@ -328,6 +329,179 @@ describe('StoresService：缓存上限与关闭', () => {
     expect(service.status().openProjects).toEqual([projectIdentity(ws.dir)])
 
     await service.close()
+    ws.cleanup()
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// 时序竞态：宿主的 node:sqlite 是**异步解析**的，而模块的 apply 是同步的。
+// 一次"sqlite 尚未解析"不该被固化成永久降级（真实宿主上实测到的缺陷）。
+// ────────────────────────────────────────────────────────────────────────────
+
+const delay = async (ms: number): Promise<void> => {
+  await new Promise<void>(resolve => setTimeout(resolve, ms))
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await delay(5)
+  }
+  return predicate()
+}
+
+interface Gate {
+  ready: boolean
+  opens: number
+}
+
+/**
+ * 端口 + 可选的就绪回调（`whenReady` 不是 ABI 字段，是结构化探测的可选能力）。
+ */
+type PortExtras = Partial<StorageHostPort> & { readonly whenReady?: () => Promise<void> | void }
+
+/** 就绪前 `openDatabase` 抛错（与 `dsh/stores.ts` 的 `sqlite 不可用（尚未解析）` 同形）。 */
+function gatedPort(ws: TempWorkspace, gate: Gate, extra: PortExtras = {}): StorageHostPort {
+  const real = testPort(ws.dir)
+  return {
+    userDbPath: real.userDbPath,
+    createDirs: true,
+    openDatabase: (path: string) => {
+      gate.opens += 1
+      if (!gate.ready) {
+        throw new Error('OMB：sqlite 不可用（尚未解析）——记忆库无法打开，其余功能不受影响')
+      }
+      return real.openDatabase(path)
+    },
+    ...extra,
+  }
+}
+
+function makeRetryingService(
+  ws: TempWorkspace,
+  gate: Gate,
+  extra: PortExtras = {},
+  retryDelaysMs: readonly number[] = [0, 10, 20],
+): { service: MemoryStoresService; logger: CapturingLogger } {
+  const logger = capturingLogger()
+  const service = createStoresService({
+    logger,
+    clock: fixedClock(),
+    resolvePort: () => gatedPort(ws, gate, extra),
+    retryDelaysMs,
+    readyWaitMs: 100,
+  })
+  return { service, logger }
+}
+
+describe('StoresService：打开失败的重试（时序竞态不成永久降级）', () => {
+  it('首次打开失败（sqlite 未就绪）→ 调用方拿到 undefined；后台重试自动就绪，无需再次调用', async () => {
+    const ws = tempWorkspace()
+    const gate: Gate = { ready: false, opens: 0 }
+    const { service } = makeRetryingService(ws, gate)
+
+    expect(await service.forProject(ws.dir)).toBeUndefined()
+    expect(service.status().ready).toBe(false)
+    expect(service.failure()).toContain('sqlite 不可用')
+    expect(service.failure()).toContain('将重试')
+
+    gate.ready = true
+    expect(await waitFor(() => service.status().ready)).toBe(true)
+    // 用户库与项目库都补上了（就绪后还会补开已登记会话的项目库）
+    expect(await service.forProject(ws.dir)).toBeDefined()
+    expect(service.failure()).toBeUndefined()
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('宿主提供 whenReady() → 首次调用就等到就绪，不靠猜时序', async () => {
+    const ws = tempWorkspace()
+    const gate: Gate = { ready: false, opens: 0 }
+    const { service } = makeRetryingService(ws, gate, {
+      whenReady: async () => {
+        await delay(5)
+        gate.ready = true
+      },
+    })
+
+    const set = await service.forProject(ws.dir)
+    expect(set).toBeDefined()
+    expect(service.status().ready).toBe(true)
+    expect(gate.opens).toBe(2) // 用户库 + 项目库，各一次成功打开（没有失败重试）
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('库版本高于插件支持 → 确定性失败，**不重试**（不把忙等伪装成修复）', async () => {
+    const ws = tempWorkspace()
+    const port = testPort(ws.dir)
+    mkdirSync(join(ws.dir, '.omb', 'memory'), { recursive: true })
+    const future = nodeSqlite(port.userDbPath)
+    future.exec('PRAGMA user_version = 99')
+    future.close()
+
+    const { service } = makeRetryingService(ws, { ready: true, opens: 0 }, { userDbPath: port.userDbPath, openDatabase: port.openDatabase })
+    expect(await service.forProject(ws.dir)).toBeUndefined()
+    const opensAfterFirst = port.opened.length
+    expect(opensAfterFirst).toBe(1)
+
+    await delay(80)
+    expect(port.opened.length).toBe(opensAfterFirst) // 没有第二次尝试
+    expect(service.failure()).toContain('拒绝打开')
+    expect(service.failure()).toContain('不重试')
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('重试预算耗尽 → 停止并写明"放弃"，原因仍在状态面', async () => {
+    const ws = tempWorkspace()
+    const gate: Gate = { ready: false, opens: 0 }
+    const { service } = makeRetryingService(ws, gate, {}, [0, 5])
+
+    expect(await service.forProject(ws.dir)).toBeUndefined()
+    expect(await waitFor(() => (service.failure() ?? '').includes('放弃'), 500)).toBe(true)
+    expect(gate.opens).toBe(3) // 1 次首发 + 2 次重试
+
+    await delay(50)
+    expect(gate.opens).toBe(3) // 不再忙等
+    expect(service.status().ready).toBe(false)
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('用户库就绪后补开已登记会话的项目库（预热早于就绪也不会永久漏掉）', async () => {
+    const ws = tempWorkspace()
+    const gate: Gate = { ready: false, opens: 0 }
+    const { service } = makeRetryingService(ws, gate)
+
+    service.rememberCwd('s1', ws.dir)
+    expect(await service.forSession('s1')).toBeUndefined() // 用户库未就绪 → 降级
+
+    gate.ready = true
+    expect(await waitFor(() => service.status().openProjects.length === 1)).toBe(true)
+    expect(service.status().openProjects).toEqual([projectIdentity(ws.dir)])
+    expect(service.peek('s1')?.projectScope).toBe(projectIdentity(ws.dir))
+
+    await service.close()
+    ws.cleanup()
+  })
+
+  it('close 清掉待执行的重试：关库后不再被唤醒', async () => {
+    const ws = tempWorkspace()
+    const gate: Gate = { ready: false, opens: 0 }
+    const { service } = makeRetryingService(ws, gate)
+
+    expect(await service.forProject(ws.dir)).toBeUndefined()
+    await service.close()
+    const opensAfterClose = gate.opens
+
+    await delay(80)
+    expect(gate.opens).toBe(opensAfterClose)
     ws.cleanup()
   })
 })
