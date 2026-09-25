@@ -25,15 +25,14 @@ import type {
   ToolDefinition,
 } from '../../kernel/abi/index.js'
 import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
-// 准入判据要**真的核验工件存在**，所以记忆模块必须碰文件系统。
-// 这是有意为之：只做形态匹配时，编造的文件名会与真实文件名得到同一个准入结论。
-import { existsSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+// 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
+// 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import type { ArtifactKind } from './remember.js'
 import { createRememberTool } from './remember.js'
+import { verifyArtifactExists } from './artifacts.js'
 import type { RetrievalChannel } from './retrieve.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
@@ -325,44 +324,23 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
            */
           verifyArtifact: (candidate: string, kind: ArtifactKind) => {
             if (kind !== 'path' && kind !== 'line') return undefined
-            try {
-              // 行号的候选形如 `src/index.ts:120` / `index.ts#L120`：剥掉行号部分
-              const bare = candidate
-                .replace(/#L\d+$/, '')
-                .replace(/:\d+$/, '')
-                .trim()
-              if (bare.length === 0) return undefined
-              if (isAbsolute(bare)) return existsSync(bare)
-              /**
-               * **解析基准的顺序很重要**：先**会话 cwd**，再宿主进程 cwd。
-               *
-               * 会话 cwd 才是用户眼里的"当前目录"。拿 `process.cwd()` 当主基准是错的
-               * ——那是**宿主进程**的工作目录，用户在别的目录里干活时，相对路径会按
-               * 宿主 cwd 解析，把真实存在的文件判成不存在（假阴性 → 误拒）。
-               *
-               * `process.cwd()` 只作兜底：会话 cwd 尚未观测到时至少还能核验一种基准。
-               */
-              const bases: string[] = []
-              const sessionCwd = kernel
-                .service<{ cwd(): string | null }>(SERVICES.activeSession)
-                ?.cwd()
-              if (typeof sessionCwd === 'string' && sessionCwd.length > 0) bases.push(sessionCwd)
-              const project = lastActiveSession === null
-                ? undefined
-                : service.peek(lastActiveSession)?.projectScope
-              if (project !== undefined && project !== null && project.length > 0
-                && !bases.includes(project)) {
-                bases.push(project)
-              }
-              bases.push(process.cwd())
-              for (const base of bases) {
-                if (existsSync(join(base, bare))) return true
-              }
-              return false
-            } catch {
-              // 核验不了 ≠ 核验通过：保守返回 undefined，让它不构成依据
-              return undefined
-            }
+            /**
+             * **用 git 索引核验，不做文件系统遍历**。
+             *
+             * 判据匹配到的往往是**裸文件名**（正文写 `modules/memory/remember.ts`，
+             * 正则只捕获 `remember.ts`），而它相对基准的位置未知：
+             * 直接拼 `<cwd>/remember.ts` 不存在；从 cwd **向上**找永远找不到
+             * （文件在仓库**内部**）；**向下**递归则要遍历整棵树。
+             *
+             * 实测确认过这三条都不通，`git ls-files` 一次给出权威答案
+             * （裸名用后缀匹配），且本仓库只用 167 条。详见 `./artifacts.ts`。
+             *
+             * 会话 cwd 优先于宿主进程 cwd：前者才是用户眼里的"当前目录"。
+             */
+            const sessionCwd = kernel
+              .service<{ cwd(): string | null }>(SERVICES.activeSession)
+              ?.cwd() ?? null
+            return verifyArtifactExists(candidate, sessionCwd)
           },
           /**
            * `memory/written` 是**向量落盘的唯一触发源**：embed-dev 订阅它做批量编码。
