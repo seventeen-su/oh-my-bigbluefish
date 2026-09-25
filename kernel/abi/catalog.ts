@@ -143,6 +143,14 @@ export const SERVICES = {
   artifact: 'artifact',
   /** `NotifyBridge`。 */
   notify: 'notify',
+  /**
+   * 向量编码队列（`VectorEncoder`）：订阅 `memory/written` → 批量编码 → 落盘。
+   *
+   * 名字是"编码器"而不是"索引"：它做的是待编码队列 + 批量冲刷 + 读数，
+   * **不是**可查询的检索索引——叫 Index 会让人以为它能查。
+   * 由 `dsh/` 在回合边界驱动 `encodePending()`；不驱动则向量表恒空。
+   */
+  vectorEncoder: 'vectorEncoder',
   /** `PromptContribution`：思维链方法卡的常驻提示与易变上下文。 */
   promptReasoning: 'prompt:omb-reasoning',
   /**
