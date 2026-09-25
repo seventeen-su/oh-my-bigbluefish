@@ -68,10 +68,11 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
   return error instanceof Error ? error.message : String(error)
 }
 
-let bridge: NotifyBridge | undefined
 /** 状态面登记的注销函数；dispose 时必须调，否则热插拔会留下悬空段落。 */
 let statusUnregister: (() => void) | undefined
-  let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
+
+let bridge: NotifyBridge | undefined
+let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
 
   /** 同步健康函数：既能进清单，也能直接 `report`（清单的 health 允许返回 Promise）。 */
   const health = (): ModuleHealth => {
