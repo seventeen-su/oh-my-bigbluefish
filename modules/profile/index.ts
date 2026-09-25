@@ -162,6 +162,15 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   let declared = 0
   let inferred = 0
   let conflicts = 0
+  /**
+   * 能力轴的活动计数——用来把"关闭"与"没触发"分开。
+   *
+   * 自检报告指出：条目数为 0 时无法区分这两者，而它们的含义相反
+   * （前者设计如此，后者是模块没接上调用方）。三个计数让归因永远成立。
+   */
+  let capabilityAttempts = 0
+  let capabilityRejectedBySwitch = 0
+  let capabilityRecorded = 0
   let lastError: string | null = null
   /**
    * 冲突文本缓存（同步可读）。R8 要求把冲突**摆出来**，而提示注入的渲染函数
@@ -192,28 +201,45 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
 
   function health(): ModuleHealth {
     const availability = storage.availability()
+    /**
+     * 能力轴的三个事实，**分开报**。
+     *
+     * 自检报告指出：「条目数为 0，无法区分『关闭』与『没触发』」——完全正确。
+     * 原来的文案只说开关状态，于是"轴开着但一次都没被调用"与"轴关着"在状态面
+     * 长得一模一样，两者对使用者的含义却相反（前者是模块没接上调用方，
+     * 后者是设计如此）。
+     *
+     * 所以报三件事：开关状态、**被开关拦掉的次数**、**成功记录的次数**。
+     * 有了后两个，`0 条目` 就永远能归因。
+     */
     const capabilityState = config.inferCapabilityAxis
       ? '能力轴已开启：观察只存在于当前会话内存与 sessionProjections，不写任何存储（D4）'
       : '能力轴关闭（默认，D4）：不产生任何能力相关条目'
+    const capabilityTraffic = capabilityAttempts === 0
+      ? '能力观察：从未收到过调用（0 次请求）——这是"没触发"，不是"被关闭"'
+      : `能力观察：收到 ${capabilityAttempts} 次请求，其中被开关拦掉 ${capabilityRejectedBySwitch} 次、成功记录 ${capabilityRecorded} 次`
     const metrics: Record<string, number> = {
       declared,
       inferred,
       conflicts,
       capabilitySessionEntries: capability.entryCount(),
+      capabilityAttempts,
+      capabilityRejectedBySwitch,
+      capabilityRecorded,
     }
     if (!availability.ok) {
       return {
         state: 'degraded',
-        detail: `显式条目读写不可用——${availability.detail}；${capabilityState}`,
+        detail: `显式条目读写不可用——${availability.detail}；${capabilityState}；${capabilityTraffic}`,
         metrics,
       }
     }
     if (lastError !== null) {
-      return { state: 'degraded', detail: `最近一次画像操作失败：${lastError}；${capabilityState}`, metrics }
+      return { state: 'degraded', detail: `最近一次画像操作失败：${lastError}；${capabilityState}；${capabilityTraffic}`, metrics }
     }
     return {
       state: 'ok',
-      detail: `显式条目 ${declared} 条、推断条目 ${inferred} 条、未裁决冲突 ${conflicts} 组；${capabilityState}`,
+      detail: `显式条目 ${declared} 条、推断条目 ${inferred} 条、未裁决冲突 ${conflicts} 组；${capabilityState}；${capabilityTraffic}`,
       metrics,
     }
   }
@@ -317,10 +343,18 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
 
     observeCapability(sessionId, observation) {
       if (disposed) return false
+      // 先记账**再**判断：只有把"被开关拦掉"与"根本没触发"分开，
+      // 状态面才能回答"能力轴为什么是 0 条"（见 capabilityCounters 的说明）。
+      capabilityAttempts += 1
       // 开关关闭 → 不产生任何观察。开启 → 只进内存，**没有任何存储调用**（D4）。
-      if (!config.inferCapabilityAxis) return false
+      if (!config.inferCapabilityAxis) {
+        capabilityRejectedBySwitch += 1
+        return false
+      }
       if (sessionId.length === 0 || observation.key.trim().length === 0) return false
+      const before = capability.list(sessionId).length
       capability.observe(sessionId, observation)
+      if (capability.list(sessionId).length > before) capabilityRecorded += 1
       report()
       return true
     },
