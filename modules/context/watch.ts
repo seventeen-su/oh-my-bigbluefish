@@ -74,6 +74,10 @@ export interface PullSnapshot {
   readonly views: readonly ViewPullStats[]
   /** 长期趋近 0、按杀死判据应删除的视图（轮数不足时恒为空）。 */
   readonly deadViews: readonly string[]
+  /** 轮数是否已达到判定门槛。未达到时 `deadViews` 为空**不代表没问题**。 */
+  readonly settled: boolean
+  /** 判定所用的最少轮数（配置过就带出来，供状态面说明）。 */
+  readonly minTurns: number
   /** 人可读结论，进状态面。 */
   readonly verdict: string
 }
@@ -110,10 +114,10 @@ export function summarize(ledger: PullLedger, options: WatchOptions = {}): PullS
     const counters = base.views[view] ?? { pulls: 0, firstTurn: null, lastTurn: null }
     return {
       view,
-      pulls: counters.pulls,
-      firstTurn: counters.firstTurn,
-      lastTurn: counters.lastTurn,
-      pullsPerTurn: ratio(counters.pulls, turns),
+      pulls: countOf(counters.pulls),
+      firstTurn: counters.firstTurn === null ? null : turnOf(counters.firstTurn),
+      lastTurn: counters.lastTurn === null ? null : turnOf(counters.lastTurn),
+      pullsPerTurn: ratio(countOf(counters.pulls), turns),
     }
   })
 
@@ -129,17 +133,28 @@ export function summarize(ledger: PullLedger, options: WatchOptions = {}): PullS
     pullsPerTurn: ratio(totalPulls, turns),
     views,
     deadViews,
+    settled,
+    minTurns,
     verdict: verdictOf({ turns, totalPulls, pullsPerTurn: ratio(totalPulls, turns), deadViews, minTurns, deadBelow }),
   }
 }
 
-/** health().detail 里的一行：拉取率 + 待删除视图（杀死判据必须可见）。 */
+/**
+ * health().detail 里的一行：拉取率 + 杀死判据结论。
+ *
+ * 三种情形**必须分开说**：轮数不足 / 有待删除视图 / 无视图趋近 0。
+ * 把"样本不够"说成"一切正常"是这类计数器最常见的谎。
+ */
 export function healthDetail(snapshot: PullSnapshot): string {
   const rate = snapshot.pullsPerTurn.toFixed(2)
+  const head = `拉取 ${snapshot.totalPulls} 次 / ${snapshot.turns} 轮 = ${rate} 次/轮`
+  if (!snapshot.settled) {
+    return `${head}；轮数不足（判定需 ${snapshot.minTurns} 轮），暂不下删除结论`
+  }
   const dead = snapshot.deadViews.length > 0
     ? `待删除视图：${snapshot.deadViews.join('、')}（长期趋近 0 次/轮）`
     : '无视图趋近 0'
-  return `拉取 ${snapshot.totalPulls} 次 / ${snapshot.turns} 轮 = ${rate} 次/轮；${dead}`
+  return `${head}；${dead}`
 }
 
 /**
@@ -180,6 +195,11 @@ function normalizeLedger(ledger: PullLedger | undefined | null): PullLedger {
 }
 
 function turnOf(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+}
+
+/** 计数：非有限数或负数按 0（畸形台账不得把 NaN 传染给 pullsPerTurn 与状态面）。 */
+function countOf(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
 }
 
