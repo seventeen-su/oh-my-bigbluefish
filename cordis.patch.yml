@@ -7,7 +7,7 @@
 #   而「前端开关 = 文件开关」正是靠这一层实现的（写 cordis.patch.yml 的 disabled）。
 #
 # name 里的相对路径锚定**本补丁文件所在目录**（loader 的 ctx.baseUrl），
-# 因此 './lib-gen/g19/...' 指仓库根的构建产物。开发循环：改码 → pnpm build → 递增 ?v=N → 新会话。
+# 因此 './lib-gen/g20/...' 指仓库根的构建产物。开发循环：改码 → pnpm build → 递增 ?v=N → 新会话。
 #
 # `name` 的落点规则：**模块入口属于模块自己**（`modules/<name>/index.ts` 或 `module.ts`），
 # 不在 dsh/ 下复制一层"入口文件"——否则每加一个模块要改两处。
@@ -16,24 +16,24 @@
 - insert:
     # ── 微内核（必需）────────────────────────────────────────────
     - id: omb-kernel
-      name: './lib-gen/g19/dsh/kernel.js'
+      name: './lib-gen/g20/dsh/kernel.js'
       config:
         debug: false
 
     # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
     - id: omb-memory
-      name: './lib-gen/g19/modules/memory/index.js'
+      name: './lib-gen/g20/modules/memory/index.js'
       inject: ['omb:kernel']
       config:
         consolidationEveryTurns: 32
         embeddingThreads: 2
     - id: omb-memory-vector
-      name: './lib-gen/g19/modules/memory/vector.js'
+      name: './lib-gen/g20/modules/memory/vector.js'
       inject: ['omb:kernel']
 
     # ── 用户画像 ─────────────────────────────────────────────────
     - id: omb-profile
-      name: './lib-gen/g19/modules/profile/index.js'
+      name: './lib-gen/g20/modules/profile/index.js'
       inject: ['omb:kernel']
       config:
         # 能力轴默认关闭，且**永不落盘**：错误成本不对称（高估用户会产生自信的错误帮助）
@@ -41,14 +41,14 @@
 
     # ── 思维链质量层 ─────────────────────────────────────────────
     - id: omb-reasoning
-      name: './lib-gen/g19/modules/reasoning/index.js'
+      name: './lib-gen/g20/modules/reasoning/index.js'
       inject: ['omb:kernel']
       config:
         defaultDepth: standard
 
     # ── 上下文优化 ───────────────────────────────────────────────
     - id: omb-context
-      name: './lib-gen/g19/modules/context/index.js'
+      name: './lib-gen/g20/modules/context/index.js'
       inject: ['omb:kernel']
       config:
         # 软压力档位，**不是每回合 token 上限**；阈值从测量标定
@@ -57,10 +57,10 @@
 
     # ── 制品索引 / 通知桥 ────────────────────────────────────────
     - id: omb-artifact
-      name: './lib-gen/g19/modules/artifact/module.js'
+      name: './lib-gen/g20/modules/artifact/module.js'
       inject: ['omb:kernel']
     - id: omb-notify
-      name: './lib-gen/g19/modules/notify/index.js'
+      name: './lib-gen/g20/modules/notify/index.js'
       inject: ['omb:kernel']
 
     # ── 大肥鱼模式预设 ───────────────────────────────────────────
