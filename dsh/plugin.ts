@@ -133,7 +133,14 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     logger,
   }
   handle.kernel.provide(TOOL_BRIDGE_SERVICE, toolBridge)
-  toolBridge.attach(readService<{ register(definition: unknown): unknown }>(ctx, 'tools'), toolSource)
+  const hostTools = readService<{ register(definition: unknown): unknown }>(ctx, 'tools')
+  toolBridge.attach(hostTools, toolSource)
+  // 工具面为空的排查入口：`tools` 服务取不到时整条工具链静默失效，
+  // 而健康面与纤维状态都是"正常"——必须留下可观测事实。
+  heartbeat('tool-bridge', {
+    hostToolsAvailable: hostTools !== undefined,
+    registerIsFunction: typeof hostTools?.register === 'function',
+  })
 
   // 内核自带的 `omb_status` 也走桥：这样"内核工具"与"模块工具"只有一条注册路径，
   // 不必维护两套（两套必然漂移）。`MODULE_CATALOG` 给 `omb-kernel` 声明了它，
@@ -170,6 +177,16 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     clock,
   })
 
+  // 回合边界再重放一次工具注册。
+  //
+  // **为什么**：模块行由宿主异步挂载，而 agent 的工具表在会话/回合建立时确定。
+  // 只在内核 `apply` 那一刻注册，工具可能赶不上 agent 的工具表——表现为
+  // "插件页全部 active、`omb_status` 里一切正常，但工具面里一个 OMB 工具都没有"。
+  // `sync()` 幂等，重放没有副作用；换成新会话时工具表重建，这次重放就补上了。
+  const disposeToolResync = handle.kernel.on('turn/start', () => {
+    toolBridge.sync()
+  })
+
   // ── 5) 会话事件（只观察，不接管 Loop）─────────────────────────────────
   const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, sessions })
 
@@ -197,6 +214,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     disposed = true
     const steps: readonly (() => void)[] = [
       disposeEvents,
+      disposeToolResync,
       disposePrompt,
       () => toolBridge.dispose(),
       () => handle.dispose(),
