@@ -66,6 +66,18 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     const failed = ids.filter(id => health[id]?.state === 'failed')
     const degraded = ids.filter(id => health[id]?.state === 'degraded')
     lines.push('', `合计：${ids.length} 个模块，${degraded.length} 降级，${failed.length} 失败。`, '')
+    // **这一行是必须的**：自检报告明确指出过——
+    // 「我不知道『正常』是『模块进程活着』还是『功能可用』；如果是前者，这个字段
+    // 对使用者有误导性」。
+    //
+    // 答案是前者：`正常` 只表示**模块自报健康且注册了服务**。至于它的能力有没有
+    // 真的在做事，要看下面的组件自述（例如"跟踪会话 0"意味着循环检测没有输入）。
+    // 把这句话写出来，读者就不必猜这个字段的语义。
+    lines.push(
+      '说明：上面的状态是**模块自报**——`正常` 只表示它注册了服务且没报降级，'
+      + '**不等于它的每项能力都在工作**。某项能力是否真的有输入，看「组件自述」里的计数。',
+      '',
+    )
   }
 
   // ── 存储 ──────────────────────────────────────────────────────────────
@@ -86,13 +98,24 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   const activeSession = sessionId ?? sessions.sessions()[0] ?? ''
   lines.push('## 上下文', '')
   if (activeSession.length === 0) {
-    lines.push('（无活跃会话）', '')
+    lines.push(
+      '（无活跃会话：**本段的所有读数都取不到**，不是读到了 0）',
+      '',
+    )
   } else {
     const pressure: ContextPressure = kernel.pressure(activeSession)
-    const ratio = pressure.fillRatio === null ? '未知（宿主未声明窗口）' : pressure.fillRatio.toFixed(3)
-    lines.push(`- 压力档位：${pressure.band}（fillRatio ${ratio}）`)
-    lines.push(`- 总 token：${pressure.totalTokens}`)
-    lines.push(`- 缓存：读 ${pressure.cacheReadTokens} / 写 ${pressure.cacheWriteTokens}`)
+    // **未测量 ≠ 测量为零**。这两者在状态面里必须能分辨，否则"总 token 0"
+    // 会被读成"上下文是空的"，而真相可能是"宿主没告诉窗口大小、根本没在量"。
+    // 自检报告因此把这一整段从"通过"降级成了"未验证"——它读对了，是文案没说清。
+    const unmeasured = pressure.fillRatio === null
+    const ratio = unmeasured ? '未测量（宿主未声明窗口）' : pressure.fillRatio.toFixed(3)
+    lines.push(`- 压力档位：${pressure.band}${unmeasured ? '（**按宽松档处理**：没有度量，故不施压）' : ''}`)
+    lines.push(`- 窗口占用：${ratio}`)
+    lines.push(`- 总 token：${pressure.totalTokens}${unmeasured ? '（未测量，不是 0）' : ''}`)
+    lines.push(
+      `- 缓存：读 ${pressure.cacheReadTokens} / 写 ${pressure.cacheWriteTokens}`
+      + `${pressure.cacheReadTokens === 0 && pressure.cacheWriteTokens === 0 ? '（未测量，不是 0）' : ''}`,
+    )
     if (pressure.nodes.length > 0) {
       const top = [...pressure.nodes].sort((a, b) => b.tokens - a.tokens).slice(0, 5)
       lines.push(`- 最贵的 ${top.length} 块：${top.map(n => `${n.name}(${n.tokens})`).join('、')}`)
