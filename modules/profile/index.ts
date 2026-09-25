@@ -1,11 +1,13 @@
 /**
  * `omb-profile` 模块注册入口：显式条目读写 + 冲突呈现。
  *
- * 对外服务名 `profile`（供 `dsh/` 侧投影与状态面消费）。
+ * 对外服务名 `profile`（供 `dsh/` 侧投影与状态面消费）；
+ * 另提供 `prompt:omb-profile` 提示贡献——**只**输出未裁决冲突（R8 的呈现路径）。
  *
  * 三条不可动摇的设计（§5.8 / §4.3 R8 / D4）：
  * ① 只存显式陈述 + 用户可编辑；推断是低等级来源，不参与投票
- * ② 冲突只呈现不裁决：`conflicts()` / `renderConflicts()` 把矛盾摆出来
+ * ② 冲突只呈现不裁决：`conflicts()` / `renderConflicts()` 把矛盾摆出来；
+ *    唯一的"推"就是冲突本身（无冲突时贡献空串，不占任何上下文）
  * ③ 能力轴默认关闭且**永不落盘**：即使 `inferCapabilityAxis: true`，
  *    观察也只进当前会话内存（`CapabilityMemory`），不产生任何存储写入。
  *    `health().detail` 如实写明当前处于哪种状态。
@@ -273,6 +275,15 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     },
 
     declare(input) {
+      // 能力轴**永不落盘**（D4）：这里必须拒绝，否则调用方会以为"声明成功"而实际什么都没写。
+      if ((input.axis as string) === 'capability') {
+        return Promise.resolve({
+          ok: false,
+          outcome: 'rejected' as const,
+          conflict: false,
+          error: '能力轴不接受落盘声明（D4）：请用 observeCapability 记入会话内存',
+        })
+      }
       return mutate({
         axis: input.axis,
         key: input.key,

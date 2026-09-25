@@ -188,6 +188,12 @@ describe('能力轴：默认关闭，且永不落盘（D4）', () => {
     expect(rejected.error).toContain('observeCapability')
     expect(stores.puts).toBe(0)
 
+    // 声明路径同样拒绝：否则调用方会以为"声明成功"而实际什么都没写
+    const declared = await service.declare({ axis: 'capability' as never, key: 'lang', value: '中文' })
+    expect(declared.ok).toBe(false)
+    expect(declared.error).toContain('observeCapability')
+    expect(stores.puts).toBe(0)
+
     const cleared = await service.clearDeduced()
     expect(cleared.removed).toBe(1)
     expect(service.capability('s1')).toEqual([])
