@@ -11,6 +11,7 @@ import {
   type TurnFingerprint,
   appendFingerprint,
   detectLoop,
+  noteObservation,
   renderLoopSignal,
 } from '../../../modules/reasoning/loop.js'
 
@@ -191,5 +192,82 @@ describe('滚动窗口与渲染', () => {
     expect(coding?.kind).toBe('repeat-action')
     expect(comfort?.kind).toBe('repeat-action')
     expect(comfort?.hint).toBe(coding?.hint)
+  })
+})
+
+describe('noteObservation：把 call + result 两条事件归并成"一步"', () => {
+  /** 集成层的真实接线：tool/call 的 evidenceHash 为空，tools/result 带证据哈希。 */
+  const stream = (steps: readonly (readonly [string, string])[]): readonly TurnFingerprint[] => {
+    let window: readonly TurnFingerprint[] = []
+    for (const [action, evidence] of steps) {
+      window = noteObservation(window, fp(action, ''))
+      if (evidence !== '') window = noteObservation(window, fp(`result:${action}`, evidence))
+    }
+    return window
+  }
+
+  it('调用与其结果合成一条指纹，动作哈希是"调用"的', () => {
+    const window = stream([['read:a.ts', 'h1']])
+    expect(window.length).toBe(1)
+    expect(window[0]?.actionHash).toBe('read:a.ts')
+    expect(window[0]?.evidenceHash).toBe('h1')
+  })
+
+  it('真实接线下的重复动作仍被检出（不归并就永远对不上号）', () => {
+    const window = stream([
+      ['read:a.ts', 'h1'],
+      ['read:a.ts', 'h1'],
+    ])
+    expect(window.length).toBe(2)
+    expect(detectLoop(window)?.kind).toBe('repeat-action')
+  })
+
+  it('真实接线下的"连续三轮无新证据"仍被检出', () => {
+    const window = stream([
+      ['list:dir', 'same'],
+      ['stat:x', 'same'],
+      ['grep:y', 'same'],
+    ])
+    expect(window.length).toBe(3)
+    expect(detectLoop(window)?.kind).toBe('no-new-evidence')
+  })
+
+  it('真实接线下的 A→B→A→B 振荡仍被检出', () => {
+    const window = stream([
+      ['run:test', 'e1'],
+      ['run:lint', 'e2'],
+      ['run:test', 'e3'],
+      ['run:lint', 'e4'],
+    ])
+    expect(detectLoop(window)?.kind).toBe('oscillation')
+  })
+
+  it('空事件（动作与证据都空）不入账', () => {
+    const window = noteObservation(noteObservation([], fp('A', 'e')), fp('', ''))
+    expect(window.length).toBe(1)
+  })
+
+  it('证据事件没有对应动作时单独成步（例如用户消息）', () => {
+    const window = noteObservation([], fp('', 'user-said-x'))
+    expect(window.length).toBe(1)
+    expect(window[0]?.evidenceHash).toBe('user-said-x')
+  })
+
+  it('不把两次连续结果并到一起；上限仍然生效', () => {
+    let window: readonly TurnFingerprint[] = []
+    for (let index = 1; index <= 20; index += 1) {
+      window = noteObservation(window, fp(`step${index}`, ''))
+      window = noteObservation(window, fp(`result:${index}`, `e${index}`))
+    }
+    expect(window.length).toBe(DEFAULT_WINDOW_SIZE)
+    expect(window[window.length - 1]?.evidenceHash).toBe('e20')
+    expect(window.every(entry => entry.evidenceHash !== '')).toBe(true)
+  })
+
+  it('纯函数：不改入参', () => {
+    const original = [fp('A', '')]
+    const copy = [...original]
+    noteObservation(original, fp('result', 'h'))
+    expect(original).toEqual(copy)
   })
 })

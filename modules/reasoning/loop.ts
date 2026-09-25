@@ -61,9 +61,48 @@ export function appendFingerprint(
   fingerprint: TurnFingerprint,
   max: number = DEFAULT_WINDOW_SIZE,
 ): readonly TurnFingerprint[] {
-  const limit = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : DEFAULT_WINDOW_SIZE
+  const limit = limitOf(max)
   const next = [...window, normalize(fingerprint)]
   return next.length > limit ? next.slice(next.length - limit) : next
+}
+
+/**
+ * 把一次"证据观察"并入滚动窗口——**一步 = 一个动作 + 它产生的证据**。
+ *
+ * 集成层对一次工具调用会发**两条** `evidence/observed`（`dsh/session.ts`）：
+ * ① `tool/call`：动作指纹，`evidenceHash` 为空（"发生了这个动作，证据还没到"）
+ * ② `tools/result`：证据指纹（动作哈希是结果指纹，不是动作本身）
+ *
+ * 因此这里做归并，而不是无脑追加：
+ * - 证据哈希非空、且上一条正缺证据 → **就地补上证据**（同一个步骤，不新增）
+ * - 证据哈希为空 → 新动作开始，追加一条待补证据的指纹
+ * - 其余 → 追加新指纹
+ *
+ * 不做这一步归并，"连续两次同动作"与"连续 k 轮无新证据"在真实接线里
+ * 会永远对不上号：调用与其结果会把窗口交替填满。
+ */
+export function noteObservation(
+  window: readonly TurnFingerprint[],
+  observation: TurnFingerprint,
+  max: number = DEFAULT_WINDOW_SIZE,
+): readonly TurnFingerprint[] {
+  const limit = limitOf(max)
+  const next = normalize(observation)
+  const last = window[window.length - 1]
+
+  if (next.evidenceHash !== '' && last !== undefined && last.evidenceHash === '') {
+    const merged = [...window.slice(0, -1), { ...last, evidenceHash: next.evidenceHash, at: next.at }]
+    return merged.length > limit ? merged.slice(merged.length - limit) : merged
+  }
+  if (next.actionHash === '' && next.evidenceHash === '') {
+    // 空事件不入账：它既不表示动作，也不表示新证据
+    return window.length > limit ? window.slice(window.length - limit) : [...window]
+  }
+  return appendFingerprint(window, next, limit)
+}
+
+function limitOf(max: number): number {
+  return Number.isFinite(max) ? Math.max(1, Math.floor(max)) : DEFAULT_WINDOW_SIZE
 }
 
 /**
