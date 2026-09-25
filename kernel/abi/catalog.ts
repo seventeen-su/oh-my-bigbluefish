@@ -117,10 +117,12 @@ export const STATUS_TOOL = 'omb_status'
  * 内核服务名契约。**三方一致**：模块 `provide` 的名字、`dsh/` 侧 `service()` 取用的名字、
  * 以及测试断言的名字。改任何一处都要同步。
  *
- * 命名约定：
- * - `stores` 等裸名 = 数据/能力服务
- * - `prompt:*` = 注入宿主的提示贡献（值符合 `host.ts` 的 `PromptContribution`）
- * - `*:tools` = 工具工厂（供 `dsh/` 在正确作用域注册；模块自己无法注册工具）
+ * 命名约定（**只有这几条，不再扩张**）：
+ * - 裸名 = 数据/能力服务（`stores` / `embedder` / `profile` / `artifact` / `notify`）
+ * - `prompt:<id>` = 注入宿主的提示贡献（值符合 `host.ts` 的 `PromptContribution`）
+ * - `tools:<id>` = 该模块声明的工具（`readonly ToolDefinition[]` 或 `ToolFactory`）。
+ *   **统一用 `tools:<模块 id>`**：模块 id 天然唯一，`dsh/` 只需一段前缀遍历；
+ *   曾经并存的 `<模块>:<功能>` 形式已废弃，避免两套遍历逻辑。
  * - `*:metrics` / `*:loop` / `*:methods` = 供状态面与 `dsh/` 读取的观测面
  */
 export const SERVICES = {
@@ -128,27 +130,37 @@ export const SERVICES = {
   stores: 'stores',
   /** `Embedder` 槽（见 `ports.ts`）。 */
   embedder: 'embedder',
+  /** `ProfileService`。 */
+  profile: 'profile',
+  /** `ArtifactService`（含 `record(path)` / `topFor(query, limit)`）。 */
+  artifact: 'artifact',
+  /** `NotifyBridge`。 */
+  notify: 'notify',
   /** `PromptContribution`：思维链方法卡的常驻提示与易变上下文。 */
-  promptReasoning: 'prompt:reasoning',
-  /** `ToolFactory`：`omb_method` / `omb_focus`。 */
-  reasoningTools: 'reasoning:tools',
+  promptReasoning: 'prompt:omb-reasoning',
+  /**
+   * 工具服务名的前缀。完整名 = `tools:<模块 id>`。
+   * 用函数而不是枚举，避免"新增模块要改 ABI"。
+   */
+  toolsPrefix: 'tools:',
   /** 循环检测读数（`{ signal, window, reset }`）。 */
   reasoningLoop: 'reasoning:loop',
   /** 方法卡目录（`{ cardsFor(depth) }`）。 */
   reasoningMethods: 'reasoning:methods',
-  /** `ToolFactory`：上下文侧工具（保留位；当前无）。 */
-  contextTools: 'context:tools',
   /** `ContextPressure` 读数 + 档位行为。 */
   contextPressure: 'context:pressure',
   /** 拉取计数与缓存命中率的账本（供状态面）。 */
   contextMetrics: 'context:metrics',
-  /** `StatusContributor`：向 `omb_status` 贡献一段。 */
+  /** `StatusRegistry`：由微内核自己 provide，各模块 `register` 贡献段落。 */
   statusContributor: 'status:contributor',
-  /** 外部通知桥（`NotifyBridge`）。 */
-  notify: 'notify',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
+
+/** 构造某模块的工具服务名。唯一入口，避免各写各的拼法。 */
+export function toolsServiceFor(moduleId: string): string {
+  return `${SERVICES.toolsPrefix}${moduleId}`
+}
 
 /**
  * 保留的来源前缀。**离线整合必须跳过这些记录。**

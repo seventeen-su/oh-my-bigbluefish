@@ -58,7 +58,14 @@ export type SessionRef = string
 export interface Kernel {
   /**
    * 注册一个命名服务。
-   * @returns 注销函数；同时应交给模块自己的 disposer 链。
+   *
+   * **同名重复注册 = 替换（不抛异常）。** 这是刻意的语义，两种情形都会发生：
+   * ① 热插拔重载同一模块（旧 fiber 的 disposer 可能晚于新注册执行）
+   * ② 模块自己重建服务实例
+   * 抛异常会把"重载"变成"插件加载失败"，与「开关不该让会话报错」直接冲突。
+   * 返回的 disposer **只移除本次注册的实例**，迟到的旧 disposer 不会误删新服务。
+   *
+   * @returns 注销函数（幂等）。
    */
   provide<T>(name: string, service: T): () => void
 

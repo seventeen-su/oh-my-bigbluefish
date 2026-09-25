@@ -55,6 +55,24 @@ export interface LexicalQuery {
   readonly limit: number
 }
 
+/** 向量的归属标签。三者齐备才允许参与距离计算。 */
+export interface VectorAttribution {
+  readonly modelId: string
+  readonly dim: number
+  readonly revision: string
+}
+
+/** 向量检索请求。 */
+export interface VectorQuery {
+  readonly embedding: Float32Array
+  /** 期望归属；与库内不符的行被排除。 */
+  readonly expect: VectorAttribution
+  readonly kinds?: readonly MemoryKind[]
+  readonly limit: number
+  /** 低于该余弦值的候选被丢弃（由调用方按模型标定，见 `searchVector` 的说明）。 */
+  readonly minScore?: number
+}
+
 /** 图谱遍历请求。 */
 export interface GraphQuery {
   readonly fromId: string
@@ -92,6 +110,22 @@ export interface MemoryStore {
   /** **必须批量**——禁止 N+1（旧实现每 id 一次 SELECT）。 */
   getMany(ids: readonly string[]): Promise<readonly MemoryRecord[]>
   searchLexical(query: LexicalQuery): Promise<readonly ScoredHit[]>
+  /**
+   * 向量检索。
+   *
+   * **为什么在 `MemoryStore` 上而不是独立服务**：向量行就在这个库里，
+   * 归属过滤（`modelId`/`dim`/`revision`）必须下推到 SQL——否则要先把整表
+   * 读进 JS 再逐行比对，那正是旧实现"读全部向量再打分"的性能缺陷。
+   *
+   * 检索侧的 `RetrievalChannel`（见 `modules/memory/retrieve.ts`）只是本方法的适配层：
+   * 它负责余弦与排名语义，本方法负责存取与归属过滤。
+   *
+   * @param query.embedding 查询向量（由 `Embedder` 算出，检索侧传入）。
+   * @param query.expect 期望归属；与库内不符的行**不参与**（宁可少召回也不要跨空间比距离）。
+   * @param query.minScore 提前截断阈值。稠密模型的余弦恒为正，因此"非正才丢"
+   *   会让任何查询都返回满额候选池、把排序压平——检索侧应显式给出标定过的下限。
+   */
+  searchVector(query: VectorQuery): Promise<readonly ScoredHit[]>
   upsertEdge(edge: Edge): Promise<void>
   walkGraph(query: GraphQuery): Promise<GraphWalk>
   /**
