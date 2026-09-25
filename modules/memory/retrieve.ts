@@ -17,7 +17,8 @@
  * 旧的两个缺陷是**被消解**，而不是被修补。代价：通道内的原始分（bm25/余弦）
  * 只用于通道内排序，绝不跨通道做算术。
  *
- * 分层约束：本文件只依赖 `kernel/abi`（ESLint 强制）。I/O 只经端口，逻辑是纯函数。
+ * 分层约束：本文件只依赖 `kernel/abi` 与同模块的**纯契约面**（`overturned.ts` 的
+ * 结构契约、无 I/O）。I/O 只经端口，逻辑是纯函数。
  */
 import type {
   AssertedBy,
@@ -31,6 +32,7 @@ import type {
   TaggedStore,
 } from '../../kernel/abi/index.js'
 import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
+import { asOverturnedProbe, type OverturnedHit } from './overturned.js'
 
 /** RRF 常数 k 的惯例默认值。⚠️ 这是惯例，不是最优值——规划 §5.4 明确标注，故暴露为配置项。 */
 export const DEFAULT_RRF_K = 60
@@ -44,6 +46,13 @@ export const SCOPE_PRIORITY: Readonly<Record<MemoryScope, number>> = { user: 0, 
 export const RERANK_WEIGHTS = { fusion: 0.55, recency: 0.25, usage: 0.12, asserted: 0.08 } as const
 /** 重排的时间半衰期（默认 30 天）。 */
 export const RERANK_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000
+/**
+ * 状态里最多列出多少个"已被取代"的候选 id。
+ *
+ * 这是**输出体积**限制，不是语义限制：计数（`supersededSkipped`）永远是精确的，
+ * 只有 id 列表会被截到这么多条（给 id 是为了让后续会话能追到那条历史痕迹）。
+ */
+export const MAX_REPORTED_SUPERSEDED = 5
 
 const ASSERTED_WEIGHT: Readonly<Record<AssertedBy, number>> = { user: 1, execution: 0.7, model: 0.3 }
 
@@ -179,8 +188,29 @@ export interface RetrieveStats {
   readonly dropped: number
   /** 因是保留来源（画像一类）而被排除的候选数。 */
   readonly reservedSkipped: number
-  /** 因已失效（`validTo` 非空）而被排除的候选数。 */
+  /**
+   * 因已失效（`validTo` 非空）而未注入的、与本次查询匹配的条目数。
+   *
+   * 来源是**过时探测 + 水合后的兜底过滤**（按 id 去重）：真实实现的通道在 SQL 层
+   * 就排除了过时行，所以这个数几乎总是由探测给出——它回答的是
+   * "这条查询匹配到多少**已经不算数**的记忆"，而不是"候选池里丢了多少"。
+   */
   readonly expiredSkipped: number
+  /**
+   * 其中**已被取代**（`supersededBy` 非空）的条数。
+   *
+   * 为什么要单独计数：这些条目不是"没有记忆"，而是"有过结论、已被推翻"。
+   * 只报零命中会让后续会话以为这里从来没有结论——那正是过时结论的镜像缺陷
+   * （信息不是被误导，而是被悄悄抹掉）。
+   */
+  readonly supersededSkipped: number
+  /**
+   * 被排除的已取代条目 id（确定性排序、上限 `MAX_REPORTED_SUPERSEDED`）。
+   *
+   * 给出 id 而不是只给数字：后续会话要能**追到那条历史痕迹**
+   * （`omb_relate <id> depth=1 types=["supersedes"]`），而不是只知道"有 2 条被丢了"。
+   */
+  readonly supersededSkippedIds: readonly string[]
   readonly perStore: readonly {
     readonly scope: MemoryScope
     readonly candidates: number
@@ -196,7 +226,13 @@ export interface RetrieveResult {
   /** 通道/库级降级说明（如「向量通道故障」）。**不是异常**：可用的部分照常返回。 */
   readonly degraded: readonly string[]
   readonly stats: RetrieveStats
-  readonly now: number
+  /**
+   * 本次检索的时钟读数；**时钟不可用时为 `null`**。
+   *
+   * 不用 `0` 兜底：epoch 0 是一个**看起来合法的假时间**，任何拿它做新旧判断的消费方
+   * 都会把全部记忆当成"1970 年的事"。未知就是未知（未测量 ≠ 测到 0）。
+   */
+  readonly now: number | null
   /** 人类可读结论；门控跳过与零命中都是正常结论。 */
   readonly note: string
 }
@@ -494,9 +530,9 @@ export async function retrieve(
     return {
       items: [],
       gate,
-      degraded: [],
+      degraded: now === undefined ? ['时钟不可用：本次没有时间读数（now=未知，不是 0）'] : [],
       stats: emptyStats(k),
-      now: now ?? 0,
+      now: now ?? null,
       note: `门控跳过检索（${gate.reason}）：${gate.detail}（一等结果，不是错误）`,
     }
   }
@@ -574,23 +610,44 @@ export async function retrieve(
   //    水合在**截断之前**做：保留来源（画像）与已失效条目因此不会占用候选上限的位次，
   //    否则一条 `omb-doc:` 记录就能把一个真正的经验候选挤出窗口。
   const hydrated = await hydrate(ordered, orderedFused, degraded)
+
+  /**
+   * 未注入的**过时**条目（按 id 去重）。两个来源，缺一不可：
+   * ① 水合后的兜底过滤：通道实现若没排除过时行，这里兜住（不注入是硬要求）
+   * ② 过时探测：真实实现的通道**结构上**不返回过时行（SQL 层就排除了），
+   *    所以主路径只能靠探测知道"这里曾经有过一条已被推翻的结论"
+   */
+  const overturnedById = new Map<string, { supersededBy: string | null; validTo: number | null }>()
   let reservedSkipped = 0
-  let expiredSkipped = 0
   const usable: HydratedCandidate[] = []
   for (const entry of hydrated) {
     if (isReservedSource(entry.record.sourceRef)) {
       reservedSkipped += 1
       continue
     }
-    // 已失效（被取代/矛盾裁决）的条目不注入——通道实现若不排除，这里兜底。
+    // 已失效（被取代/矛盾裁决/到期）的条目不注入——通道实现若不排除，这里兜底。
+    // 注意：真实实现的通道在 SQL 层就排除了 `valid_to`/`superseded_by` 非空的行，
+    // 所以这里通常什么也拦不到；"曾经有过一条已被推翻的结论"靠**过时探测**（见下）而非本行。
+    // 只设了 `supersededBy`（`validTo` 仍为空）的半成品行会走到注入列表里——
+    // 那是刻意的：与其静默丢弃，不如注入并逐条标注"不是有效结论"（渲染层负责标注）。
     if (entry.record.validTo !== null) {
-      expiredSkipped += 1
+      noteOverturned(overturnedById, entry.record.id, entry.record.supersededBy, entry.record.validTo)
       continue
     }
     usable.push(entry)
   }
   const capped = usable.slice(0, maxCandidates)
   const dropped = orderedFused.length - usable.length
+
+  for (const hit of await probeOverturned(ordered, query, degraded)) {
+    noteOverturned(overturnedById, hit.id, hit.supersededBy, hit.validTo)
+  }
+  const supersededIds = [...overturnedById]
+    .filter(([, value]) => value.supersededBy !== null)
+    .map(([id]) => id)
+    .sort(asciiCompare)
+  const supersededSkipped = supersededIds.length
+  const expiredSkipped = [...overturnedById.values()].filter(value => value.validTo !== null).length
 
   // ⑥ 可选廉价重排。
   const reranked = rerankRequested && now !== undefined
@@ -624,6 +681,8 @@ export async function retrieve(
       dropped,
       reservedSkipped,
       expiredSkipped,
+      supersededSkipped,
+      supersededSkippedIds: supersededIds.slice(0, MAX_REPORTED_SUPERSEDED),
       perStore: ordered.map(t => ({
         scope: t.scope,
         candidates: capped.filter(entry => primaryScope(entry.candidate) === t.scope).length,
@@ -632,8 +691,8 @@ export async function retrieve(
       rrfK: k,
       reranked: rerankRequested,
     },
-    now: now ?? 0,
-    note: buildNote(ordered.length, rankings.length, items.length),
+    now: now ?? null,
+    note: buildNote(ordered.length, rankings.length, items.length, supersededSkipped),
   }
 }
 
@@ -658,21 +717,97 @@ function emptyStats(k: number): RetrieveStats {
     dropped: 0,
     reservedSkipped: 0,
     expiredSkipped: 0,
+    supersededSkipped: 0,
+    supersededSkippedIds: [],
     perStore: [],
     rrfK: k,
     reranked: false,
   }
 }
 
-function buildNote(storeCount: number, rankingCount: number, hitCount: number): string {
+/**
+ * 一句话结论。**"被取代"必须出现在这里**：
+ * 零命中既可能是"没有这段记忆"，也可能是"有过结论、已被推翻"——两者对后续会话的含义完全相反。
+ */
+function buildNote(
+  storeCount: number,
+  rankingCount: number,
+  hitCount: number,
+  supersededSkipped: number,
+): string {
+  const overturned =
+    supersededSkipped > 0
+      ? `；另有 ${supersededSkipped} 条相关记忆因**已被取代**而未注入（它们不是有效结论；历史痕迹用 omb_relate 追）`
+      : ''
   if (hitCount === 0) {
-    return `已查询 ${storeCount} 个库、${rankingCount} 个通道，零命中（一等结果，不是错误）`
+    return `已查询 ${storeCount} 个库、${rankingCount} 个通道，零命中（一等结果，不是错误）${overturned}`
   }
-  return `已查询 ${storeCount} 个库、${rankingCount} 个通道，注入 ${hitCount} 条（逐字 + 溯源）`
+  return `已查询 ${storeCount} 个库、${rankingCount} 个通道，注入 ${hitCount} 条（逐字 + 溯源）${overturned}`
 }
 
-function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
-  const { candidate, record } = hydrated
+/**
+ * 记一条"匹配到但不算数"的条目。**按 id 去重**：兜底过滤与探测可能报同一条，
+ * 重复计数会让状态面撒谎（"有 2 条被推翻"而实际只有 1 条）。
+ */
+function noteOverturned(
+  map: Map<string, { supersededBy: string | null; validTo: number | null }>,
+  id: string,
+  supersededBy: string | null,
+  validTo: number | null,
+): void {
+  const existing = map.get(id)
+  if (existing === undefined) {
+    map.set(id, { supersededBy, validTo })
+    return
+  }
+  // 同一条只记一次，信息取更全的那个（谁取代了它比"失效了"更有用）
+  map.set(id, {
+    supersededBy: existing.supersededBy ?? supersededBy,
+    validTo: existing.validTo ?? validTo,
+  })
+}
+
+/**
+ * 过时探测：问每个库"这条查询匹配到、但已经不算数的条目有哪些"。
+ *
+ * 库不支持探测（fake store / 其它实现）→ 跳过，**不算降级**；
+ * 探测抛错 → 记降级原因（不静默：那会让人误以为"没有过时结论"）。
+ */
+async function probeOverturned(
+  ordered: readonly TaggedStore[],
+  query: RetrieveQuery,
+  degraded: string[],
+): Promise<readonly OverturnedHit[]> {
+  const hits: OverturnedHit[] = []
+  await Promise.all(
+    ordered.map(async tagged => {
+      const probe = asOverturnedProbe(tagged.store)
+      if (probe === undefined) return
+      try {
+        const found: unknown = await probe.searchOverturned({
+          text: query.text,
+          scope: tagged.store.scope,
+          limit: MAX_REPORTED_SUPERSEDED,
+          ...(query.kinds === undefined ? {} : { kinds: query.kinds }),
+        })
+        if (!Array.isArray(found)) {
+          degraded.push(`库 ${tagged.store.scope} 的过时探测返回了非数组（已忽略）：本次不报告过时结论`)
+          return
+        }
+        for (const hit of found as readonly OverturnedHit[]) {
+          if (typeof hit?.id === 'string' && hit.id.length > 0) hits.push(hit)
+        }
+      } catch (error) {
+        degraded.push(
+          `库 ${tagged.store.scope} 的过时探测失败（${messageOf(error)}）：本次不报告"已被推翻"的结论`,
+        )
+      }
+    }),
+  )
+  return hits
+}
+
+function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {  const { candidate, record } = hydrated
   return {
     rank,
     id: record.id,
@@ -691,8 +826,7 @@ function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
   }
 }
 
-/** 库的确定序：作用域优先级 → 原序（保证同一输入永远同一结果）。 */
-function orderStores(stores: readonly TaggedStore[]): readonly TaggedStore[] {
+/** 库的确定序：作用域优先级 → 原序（保证同一输入永远同一结果）。 */function orderStores(stores: readonly TaggedStore[]): readonly TaggedStore[] {
   return stores
     .map((store, index) => ({ store, index }))
     .sort((a, b) => {

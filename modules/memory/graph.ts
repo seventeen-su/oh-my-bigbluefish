@@ -356,7 +356,7 @@ export function renderRelate(result: RelateResult): string {
   for (const node of result.nodes) {
     lines.push(
       `- [hop ${node.hop}] ${node.id} · ${node.scope}/${node.kind} · observedAt=${formatTime(node.observedAt)} · sourceRef=${node.sourceRef}` +
-        (node.validTo !== null ? ` · ⚠️已被取代（supersededBy=${node.supersededBy ?? '未知'}）` : ''),
+        invalidityMark(node.supersededBy, node.validTo),
     )
     lines.push(`  ${node.text}`)
   }
@@ -365,6 +365,19 @@ export function renderRelate(result: RelateResult): string {
   }
   lines.push(result.why)
   return lines.join('\n')
+}
+
+/**
+ * 节点有效性标注。
+ *
+ * **先看 `supersededBy` 再看 `validTo`**：一条记录可能只被建了取代边而 `validTo` 还没写
+ * （写入路径中途失败会留下这种半成品）。只看 `validTo` 会把"已被推翻"显示成"有效结论"，
+ * 而这里正是后续会话判定"这条还能不能用"的唯一依据。
+ */
+function invalidityMark(supersededBy: string | null, validTo: number | null): string {
+  if (supersededBy !== null) return ` · ⚠️已被取代（supersededBy=${supersededBy}，不再是有效结论）`
+  if (validTo !== null) return ` · ⚠️已失效（validTo=${formatTime(validTo)}）`
+  return ''
 }
 
 export interface RelateToolDeps {

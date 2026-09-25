@@ -246,8 +246,9 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
     description:
       '从记忆库召回与当前任务相关的既往结论/偏好/经验。**逐字返回**并附带溯源 ' +
       '（sourceRef 与 observedAt），便于你判断证据新旧与来源。返回空结果也是正常结论 ' +
-      '（说明"不需要记忆"或确实没有相关记忆），不是错误。需要多跳关联（这条结论被谁取代、' +
-      '还有哪些冲突）时用 omb_relate。',
+      '（说明"不需要记忆"或确实没有相关记忆），不是错误。**已被推翻的条目不作为有效结论注入**；' +
+      '若本次存在这类候选，回执会列出它们的 id——那是历史痕迹，需要追溯时用 omb_relate。' +
+      '需要多跳关联（这条结论被谁取代、还有哪些冲突）时也用 omb_relate。',
     parameters,
     async execute(args: unknown): Promise<ToolOutcome> {
       const parsed = parseRecallArgs(args)
@@ -306,7 +307,7 @@ export function renderRecall(result: RetrieveResult): string {
     lines.push(
       `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · observedAt=${formatTime(item.observedAt)}` +
         ` · score=${item.score.toFixed(4)} · 通道 ${channels} · sourceRef=${item.sourceRef}` +
-        (item.validTo !== null ? ' · ⚠️已失效' : ''),
+        validityMark(item.supersededBy, item.validTo),
     )
     lines.push(`  ${item.text}`)
   }
@@ -315,8 +316,33 @@ export function renderRecall(result: RetrieveResult): string {
   } else {
     lines.push('（以上为逐字原文；需要多跳关联时用 omb_relate。）')
   }
+  // "被取代"不能只体现在计数上：给出 id，后续会话才能追到那条历史痕迹。
+  if (result.stats.supersededSkipped > 0) {
+    const ids = result.stats.supersededSkippedIds
+    const listed = ids.length === 0 ? '（id 列表已达上限，未列出）' : ids.join('、')
+    const more = result.stats.supersededSkipped > ids.length ? ` 等 ${result.stats.supersededSkipped} 条` : ''
+    lines.push(
+      `⚠️ 另有 ${result.stats.supersededSkipped} 条相关记忆**已被推翻**、未作为有效结论注入：${listed}${more}。` +
+        '这是历史痕迹（"曾经相信过什么"），不是当前结论；要核对用 omb_relate <id> depth=1 types=["supersedes"]。',
+    )
+  }
   if (result.degraded.length > 0) lines.push(`降级：${result.degraded.join('；')}`)
   return lines.join('\n')
+}
+
+/**
+ * 单条的有效性标注。
+ *
+ * 已失效的条目通常**根本不会**被注入（`retrieve` 会排除 `validTo` 非空的候选），
+ * 这里仍然显式标注：通道实现或未来的放宽一旦让它漏进来，
+ * 读到的人必须立刻知道"这条已被推翻"，而不是把它当成有效结论。
+ */
+function validityMark(supersededBy: string | null, validTo: number | null): string {
+  if (supersededBy !== null) {
+    return ` · ⚠️已被 ${supersededBy} 取代（本条不是有效结论）`
+  }
+  if (validTo !== null) return ` · ⚠️已失效（validTo=${formatTime(validTo)}）`
+  return ''
 }
 
 /** 删除回执：删了几条、哪些没找到、有没有降级。 */

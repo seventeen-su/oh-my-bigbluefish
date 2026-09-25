@@ -50,6 +50,7 @@ import {
   type MemoryPaths,
 } from './paths.js'
 import { migrate, readUserVersion, SchemaVersionAheadError } from './migrate.js'
+import type { OverturnedHit, OverturnedProbe, OverturnedQuery } from './overturned.js'
 import { ftsMatchExpr, tokenizeForFts } from './text.js'
 
 /** 写锁等待上限：1000ms。**快速失败**，不做无限等待（规划 R8）。 */
@@ -146,7 +147,7 @@ export interface VectorStoreApi {
 }
 
 /** 具体实现类型。除端口外还暴露状态面需要的诊断字段。 */
-export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi {
+export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe {
   /** 库文件路径（`:memory:` 时为该字面量）。 */
   readonly dbPath: string
   /** 打开时的迁移结果；未迁移时为 `{from: n, to: n}`。 */
@@ -289,6 +290,20 @@ function requireNonEmptyText(value: unknown, field: string): string {
     throw new Error(`OMB：记忆写入被拒——字段 ${field} 必须是非空字符串`)
   }
   return value
+}
+
+/**
+ * 迁移结果的**如实**文案。
+ *
+ * 为什么不能省事写成 `v${from}→v${to}`：没有迁移记录时那是 `v0→v0`，
+ * 读起来像"库版本是 v0"——而 v0 是"未知/未打开"，不是版本号。
+ * 只有**测到**的迁移才写迁移；测不到就写"未记录（版本未知）"。
+ * （约束：没测到 ≠ 测到 0。`0` 只能表示"测到了，值就是 0"。）
+ */
+function migrationText(entry: { readonly from: number; readonly to: number } | undefined): string {
+  if (entry === undefined) return '（迁移记录缺失：schema 版本未知）'
+  if (entry.from === entry.to) return `（本次打开未迁移：schema v${entry.to}）`
+  return `（迁移 v${entry.from}→v${entry.to}）`
 }
 
 /**
@@ -665,6 +680,55 @@ class SqliteStore implements SqliteMemoryStore {
         id: textOf(r['id'], 'id'),
         score: numberOf(r['score']),
         channel: 'lexical' as const,
+      }
+    })
+  }
+
+  /**
+   * 过时结论探测（非 ABI 面，契约见 `overturned.ts`）。
+   *
+   * **只读**，且与 `searchLexical` 查的是同一个 FTS 索引，只是**不排除**过时行：
+   * 它回答"这条查询匹配到哪些已经不算数的条目、被谁取代了"，好让召回侧如实说出
+   * "有过结论、已被推翻"，而不是报一个含义相反的"零命中"。
+   * 返回结果绝不进注入列表（注入过滤仍在检索侧）。
+   */
+  async searchOverturned(query: OverturnedQuery): Promise<readonly OverturnedHit[]> {
+    this.#assertUsable()
+    if (query.scope !== this.scope) return [] // 与 searchLexical 同一口径：读错库返回空，不抛
+    const limit = Number.isFinite(query.limit) ? Math.max(0, Math.floor(query.limit)) : 0
+    if (limit === 0) return []
+
+    const expression = ftsMatchExpr(tokenizeForFts(query.text))
+    if (expression.trim().length === 0) return []
+
+    const kinds = query.kinds === undefined ? [] : [...new Set(query.kinds)]
+    for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')
+
+    const params: unknown[] = [expression, this.scope]
+    let kindClause = ''
+    if (kinds.length > 0) {
+      kindClause = ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
+      params.push(...kinds)
+    }
+    params.push(limit)
+
+    const rows = this.#all(
+      `SELECT m.id AS id, m.valid_to AS valid_to, m.superseded_by AS superseded_by
+         FROM memory_fts
+         JOIN memory m ON m.rowid = memory_fts.rowid
+        WHERE memory_fts MATCH ?
+          AND m.scope = ?
+          AND (m.valid_to IS NOT NULL OR m.superseded_by IS NOT NULL)${kindClause}
+        ORDER BY -bm25(memory_fts) DESC, m.observed_at DESC, m.id ASC
+        LIMIT ?`,
+      params,
+    )
+    return rows.map(row => {
+      const r = asRow(row, '过时条目')
+      return {
+        id: textOf(r['id'], 'id'),
+        supersededBy: nullableTextOf(r['superseded_by'], 'superseded_by'),
+        validTo: nullableIntegerOf(r['valid_to'], 'valid_to'),
       }
     })
   }
@@ -1511,7 +1575,7 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       if (userSet === undefined) {
         parts.push(`用户库未打开：${userFailure ?? userPath}`)
       } else {
-        parts.push(`用户库=${resolvedPort?.userDbPath ?? userPath}（迁移 v${userSet.migrated[0]?.from ?? 0}→v${userSet.migrated[0]?.to ?? 0}）`)
+        parts.push(`用户库=${resolvedPort?.userDbPath ?? userPath}${migrationText(userSet.migrated[0])}`)
       }
       parts.push(`项目库 ${openProjects.length}/${maxOpenProjects} 已打开${openProjects.length === 0 ? '' : `：${openProjects.join('、')}`}`)
       if (projectFailures.size > 0) {
@@ -1522,7 +1586,10 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         )
       }
       if (unexpectedFailure !== undefined) parts.push(`意外失败：${unexpectedFailure}`)
-      parts.push(`会话→cwd 映射 ${cwdBySession.size} 条`)
+      // 这一行**必须与本模块的实际维护者同名**：内核行的 `SessionTable` 在「存储」段也报
+      // 「会话→cwd 映射」，两张表完全不同（一个是内核行，一个是本模块的 `cwdBySession`）。
+      // 文案一样会让状态面读起来像自相矛盾（实测被当成矛盾记了两次），所以这里写明是本模块的登记。
+      parts.push(`本模块会话→cwd 登记 ${cwdBySession.size} 条（本模块自维护：会话 id→项目库 cwd，供 forSession/peek 选库；与内核 SessionTable 不是同一张表）`)
       return { ready: !closing && userSet !== undefined, detail: parts.join('；'), openProjects }
     },
 

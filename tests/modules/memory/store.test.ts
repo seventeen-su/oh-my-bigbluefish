@@ -22,6 +22,7 @@ import {
   openMemoryStore,
   type SqliteMemoryStore,
 } from '../../../modules/memory/store.js'
+import { asOverturnedProbe } from '../../../modules/memory/overturned.js'
 import {
   type CapturingLogger,
   type CountingSqlite,
@@ -302,6 +303,68 @@ describe('MemoryStore：valid_to 语义（时序可回答）', () => {
     await store.put({ ...record, validTo: 9_999, supersededBy: 'r2' })
     expect(await searchIds(store, '结论')).toEqual([])
     expect((await store.get('r'))?.validTo).toBe(9_999)
+    ws.cleanup()
+  })
+})
+
+describe('MemoryStore：过时结论探测（非 ABI 面，召回侧靠它不静默）', () => {
+  it('通道排除的过时行，探测仍能报出来（含取代者与失效时间）', async () => {
+    const { store, ws } = fixtureOf()
+    await putAll(store, [
+      makeRecord({ id: 'live', text: '端口结论：现在是 3080' }),
+      makeRecord({ id: 'dead', text: '端口结论：以前是 8080', validTo: 111, supersededBy: 'live' }),
+      makeRecord({ id: 'expired', text: '端口结论：更早是 80（仅到期）', validTo: 222 }),
+    ])
+    // 通道（注入用）看不到过时行 —— 这正是需要探测的原因
+    expect(await searchIds(store, '端口结论')).toEqual(['live'])
+
+    const probe = asOverturnedProbe(store)
+    expect(probe).toBeDefined()
+    const hits = await probe?.searchOverturned({ text: '端口结论', scope: 'user', limit: 10 })
+    expect([...(hits ?? [])].sort((a, b) => (a.id < b.id ? -1 : 1))).toEqual([
+      { id: 'dead', supersededBy: 'live', validTo: 111 },
+      { id: 'expired', supersededBy: null, validTo: 222 },
+    ])
+
+    // 探测是**只读**的：注入口径与读数都不受影响
+    expect(await searchIds(store, '端口结论')).toEqual(['live'])
+    expect((await store.get('dead'))?.supersededBy).toBe('live')
+    ws.cleanup()
+  })
+
+  it('探测不返回有效条目；limit 生效；kinds 过滤与词法通道同口径', async () => {
+    const { store, ws } = fixtureOf()
+    await putAll(store, [
+      makeRecord({ id: 'live', text: '端口结论 现在是 3080', kind: 'semantic' }),
+      makeRecord({ id: 'dead-a', text: '端口结论 以前是 8080', kind: 'semantic', validTo: 1 }),
+      makeRecord({ id: 'dead-b', text: '端口结论 以前是 80', kind: 'episodic', validTo: 2 }),
+    ])
+    const probe = asOverturnedProbe(store)
+    const limited = await probe?.searchOverturned({ text: '端口结论', scope: 'user', limit: 1 })
+    expect(limited).toHaveLength(1)
+
+    const episodic = await probe?.searchOverturned({
+      text: '端口结论',
+      scope: 'user',
+      limit: 10,
+      kinds: ['episodic'],
+    })
+    expect(episodic?.map(hit => hit.id)).toEqual(['dead-b'])
+
+    // 读错库不抛：返回空（与 searchLexical 同一口径）
+    expect(await probe?.searchOverturned({ text: '端口结论', scope: 'project', limit: 10 })).toEqual([])
+    ws.cleanup()
+  })
+
+  it('没有过时行时返回空数组（不是错误）；不是本实现时取不到探测面', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'live', text: '端口结论 3080' }))
+    const probe = asOverturnedProbe(store)
+    expect(await probe?.searchOverturned({ text: '端口结论', scope: 'user', limit: 10 })).toEqual([])
+
+    // 结构契约：没有该方法的 store 一律视为"不支持探测"（跳过，不抛）
+    const foreign = { scope: 'user' } as unknown as MemoryStore
+    expect(asOverturnedProbe(foreign)).toBeUndefined()
     ws.cleanup()
   })
 })
