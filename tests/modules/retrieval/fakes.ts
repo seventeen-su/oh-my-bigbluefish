@@ -19,9 +19,12 @@ import type {
   MemoryStore,
   ScoredHit,
   StoreStats,
+  VectorAttribution,
+  VectorQuery,
 } from '../../../kernel/abi/index.js'
 import { SCHEMA_VERSION } from '../../../kernel/abi/index.js'
 import type { TaggedStore } from '../../../kernel/abi/storage.js'
+import type { RetrievalChannel } from '../../../modules/memory/retrieve.js'
 
 export function contentHashOf(scope: MemoryScope, kind: MemoryKind, text: string): string {
   const normalized = `${scope}::${kind}::${text.trim().replace(/\s+/g, ' ')}`
@@ -59,16 +62,27 @@ export interface FakeStoreOptions {
   readonly scope: MemoryScope
   readonly records?: readonly MemoryRecord[]
   readonly edges?: readonly Edge[]
+  /** 可归属向量（向量通道测试用）。 */
+  readonly vectors?: readonly FakeVector[]
   /** 自定义词法检索；缺省按 token 重叠排序（并像真实实现一样排除已失效行）。 */
   readonly search?: (query: LexicalQuery) => readonly ScoredHit[]
   readonly failSearch?: string
   readonly failGetMany?: string
   readonly failWalk?: string
   readonly failForget?: string
+  readonly failVector?: string
+}
+
+/** 一条可归属向量：三个归属标签必须齐备（规划 §5.7）。 */
+export interface FakeVector {
+  readonly id: string
+  readonly attribution: VectorAttribution
+  readonly vector: Float32Array
 }
 
 export interface FakeStoreCalls {
   searchLexical: number
+  searchVector: number
   get: number
   getMany: number
   walkGraph: number
@@ -81,6 +95,7 @@ export interface FakeStoreCalls {
 export interface FakeStore extends MemoryStore {
   readonly calls: FakeStoreCalls
   readonly searchQueries: readonly LexicalQuery[]
+  readonly vectorQueries: readonly VectorQuery[]
   readonly getManyCalls: readonly (readonly string[])[]
   readonly getCalls: readonly string[]
   readonly forgetCalls: readonly (readonly string[])[]
@@ -93,8 +108,10 @@ export function fakeStore(options: FakeStoreOptions): FakeStore {
   const rows = new Map<string, MemoryRecord>()
   for (const record of options.records ?? []) rows.set(record.id, record)
   const edges: Edge[] = [...(options.edges ?? [])]
+  const vectors: FakeVector[] = [...(options.vectors ?? [])]
   const calls: FakeStoreCalls = {
     searchLexical: 0,
+    searchVector: 0,
     get: 0,
     getMany: 0,
     walkGraph: 0,
@@ -104,6 +121,7 @@ export function fakeStore(options: FakeStoreOptions): FakeStore {
     stats: 0,
   }
   const searchQueries: LexicalQuery[] = []
+  const vectorQueries: VectorQuery[] = []
   const getManyCalls: string[][] = []
   const getCalls: string[] = []
   const forgetCalls: string[][] = []
@@ -134,6 +152,7 @@ export function fakeStore(options: FakeStoreOptions): FakeStore {
     scope,
     calls,
     searchQueries,
+    vectorQueries,
     getManyCalls,
     getCalls,
     forgetCalls,
@@ -167,6 +186,26 @@ export function fakeStore(options: FakeStoreOptions): FakeStore {
       searchQueries.push(query)
       fail(options.failSearch)
       return options.search !== undefined ? options.search(query) : defaultSearch(query)
+    },
+    async searchVector(query: VectorQuery): Promise<readonly ScoredHit[]> {
+      calls.searchVector += 1
+      vectorQueries.push(query)
+      fail(options.failVector)
+      const scored: ScoredHit[] = []
+      for (const row of vectors) {
+        // 归属必须三者齐备且一致（模拟 SQL 侧下推过滤）。
+        if (row.attribution.modelId !== query.expect.modelId) continue
+        if (row.attribution.dim !== query.expect.dim) continue
+        if (row.attribution.revision !== query.expect.revision) continue
+        const record = rows.get(row.id)
+        if (record === undefined || record.validTo !== null) continue
+        if (query.kinds !== undefined && !query.kinds.includes(record.kind)) continue
+        const score = cosine(query.embedding, row.vector)
+        if (query.minScore !== undefined && score < query.minScore) continue
+        scored.push({ id: row.id, score, channel: 'vector' })
+      }
+      scored.sort((a, b) => (a.score !== b.score ? b.score - a.score : a.id < b.id ? -1 : 1))
+      return scored.slice(0, query.limit)
     },
     async upsertEdge(edge: Edge): Promise<void> {
       edges.push(edge)
@@ -286,4 +325,58 @@ export function hits(
   channel: ScoredHit['channel'] = 'lexical',
 ): readonly ScoredHit[] {
   return ids.map((id, index) => ({ id, score: base - index, channel }))
+}
+
+/** 余弦相似度（零向量 → 0）。 */
+export function cosine(a: Float32Array, b: Float32Array): number {
+  const length = Math.min(a.length, b.length)
+  let dot = 0
+  let normA = 0
+  let normB = 0
+  for (let i = 0; i < length; i += 1) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    dot += x * y
+    normA += x * x
+    normB += y * y
+  }
+  if (normA === 0 || normB === 0) return 0
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+/** 固定向量的嵌入器（向量通道测试用）。 */
+export function fixedEmbedder(vector: readonly number[], id = 'fake-fixed', revision = 'r1'): Embedder {
+  const frozen = Float32Array.from(vector)
+  return {
+    id,
+    dimensions: frozen.length,
+    revision,
+    embed: () => Promise.resolve([frozen]),
+  }
+}
+
+/**
+ * 第二通道的**测试替身**：形状与生产实现完全一致。
+ *
+ * 生产实例在 `modules/memory/vector.ts`（embed-dev 提供，持有嵌入器与标定常量）；
+ * 这里只把嵌入器算出的查询向量交给端口 `searchVector` —— 归属过滤与存取在存储层，
+ * 通道自己不读向量表（规划 §5.7 的分工：`RetrievalChannel` 是 `searchVector` 的适配层）。
+ */
+export function vectorChannelOf(
+  embedder: Embedder,
+  options: { readonly minScore?: number } = {},
+): RetrievalChannel {
+  return {
+    name: 'vector',
+    async search(query) {
+      if (query.embedding === undefined) return []
+      return query.store.store.searchVector({
+        embedding: query.embedding,
+        expect: { modelId: embedder.id, dim: embedder.dimensions, revision: embedder.revision },
+        ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+        limit: query.limit,
+        ...(options.minScore !== undefined ? { minScore: options.minScore } : {}),
+      })
+    },
+  }
 }

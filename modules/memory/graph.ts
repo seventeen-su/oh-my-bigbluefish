@@ -13,7 +13,6 @@
  * 分层约束：只依赖 `kernel/abi`。工具定义由 `dsh/` 侧注册（模块不能接触宿主）。
  */
 import type {
-  Clock,
   Edge,
   EdgeType,
   MemoryKind,
@@ -26,6 +25,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import type { TaggedStore } from '../../kernel/abi/index.js'
 import { EDGE_TYPES } from '../../kernel/abi/index.js'
+import { isoUtc } from './retrieve.js'
 
 export const RELATE_TOOL = 'omb_relate'
 /** 多跳深度上限（规划 §5.5：`depth?: 1|2`）。 */
@@ -374,7 +374,26 @@ export interface RelateToolDeps {
    */
   readonly resolveStores: () => readonly TaggedStore[] | undefined
   readonly limits?: WalkLimits
-  readonly clock?: Clock
+}
+
+/** 参数 schema：`parse`（校验）+ `jsonSchema`（**模型看不到我们的校验器**，必须附原生 JSON Schema）。 */
+interface ToolParameters extends ToolInputSchema {
+  readonly jsonSchema: Record<string, unknown>
+}
+
+const RELATE_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: '记忆 id（可从 omb_recall 的溯源行里拿到）' },
+    depth: { type: 'integer', enum: [1, 2], description: '跳数；默认 1，2 = 两跳' },
+    types: {
+      type: 'array',
+      items: { type: 'string', enum: [...EDGE_TYPES] },
+      description: '要跟的边类型；省略 = 三种全要',
+    },
+  },
+  required: ['id'],
+  additionalProperties: false,
 }
 
 /**
@@ -383,7 +402,8 @@ export interface RelateToolDeps {
  * 参数：`{ id, depth?: 1|2, types? }` → 返回 `{ nodes, edges, why }` 的可读文本。
  */
 export function createRelateTool(deps: RelateToolDeps): ToolDefinition {
-  const parameters: ToolInputSchema = {
+  const parameters: ToolParameters = {
+    jsonSchema: RELATE_JSON_SCHEMA,
     parse(input: unknown): unknown {
       const parsed = parseRelateArgs(input)
       if (!parsed.ok) throw new Error(parsed.error)
@@ -467,12 +487,7 @@ function asciiCompare(a: string, b: string): number {
 }
 
 function formatTime(epochMs: number): string {
-  if (!Number.isFinite(epochMs)) return String(epochMs)
-  try {
-    return new Date(epochMs).toISOString()
-  } catch {
-    return String(epochMs)
-  }
+  return isoUtc(epochMs)
 }
 
 function messageOf(err: unknown): string {

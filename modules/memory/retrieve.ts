@@ -30,6 +30,7 @@ import type {
   ScoredHit,
   TaggedStore,
 } from '../../kernel/abi/index.js'
+import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
 
 /** RRF 常数 k 的惯例默认值。⚠️ 这是惯例，不是最优值——规划 §5.4 明确标注，故暴露为配置项。 */
 export const DEFAULT_RRF_K = 60
@@ -176,6 +177,10 @@ export interface RetrieveStats {
   readonly candidatesFused: number
   readonly candidatesCapped: number
   readonly dropped: number
+  /** 因是保留来源（画像一类）而被排除的候选数。 */
+  readonly reservedSkipped: number
+  /** 因已失效（`validTo` 非空）而被排除的候选数。 */
+  readonly expiredSkipped: number
   readonly perStore: readonly {
     readonly scope: MemoryScope
     readonly candidates: number
@@ -194,6 +199,15 @@ export interface RetrieveResult {
   readonly now: number
   /** 人类可读结论；门控跳过与零命中都是正常结论。 */
   readonly note: string
+}
+
+/**
+ * 保留来源（`omb-doc:` 前缀）判定：画像这类"单文档结构化状态"**不是经验痕迹**，
+ * 不得参与经验召回排名（`kernel/abi/catalog.ts` 的 `RESERVED_SOURCE_PREFIX`）。
+ * 离线整合侧（`consolidate.ts`）复用同一判定。
+ */
+export function isReservedSource(sourceRef: string): boolean {
+  return sourceRef.startsWith(RESERVED_SOURCE_PREFIX)
 }
 
 // ---------- 纯逻辑：门控 ----------
@@ -239,6 +253,51 @@ export function gateRetrieval(
 export function asciiCompare(a: string, b: string): number {
   if (a === b) return 0
   return a < b ? -1 : 1
+}
+
+/**
+ * epoch ms → ISO-8601 UTC（纯算术）。
+ *
+ * 为什么不用 `new Date`：① 模块层不得直接取时间（`omb/no-direct-clock`，一律 `kernel.clock`）
+ * ② 算术版**逐字节确定**、不依赖宿主时区/locale——与"排序不用 localeCompare"同一条纪律。
+ * 与 `new Date(ms).toISOString()` 的等价性由测试差分验证。
+ */
+export function isoUtc(epochMs: number): string {
+  if (!Number.isFinite(epochMs)) return String(epochMs)
+  const ms = Math.floor(epochMs)
+  const days = Math.floor(ms / 86_400_000)
+  let rest = ms - days * 86_400_000
+  const hours = Math.floor(rest / 3_600_000)
+  rest -= hours * 3_600_000
+  const minutes = Math.floor(rest / 60_000)
+  rest -= minutes * 60_000
+  const seconds = Math.floor(rest / 1000)
+  const millis = rest - seconds * 1000
+  const civil = civilFromDays(days)
+  return (
+    `${pad(civil.year, 4)}-${pad(civil.month, 2)}-${pad(civil.day, 2)}` +
+    `T${pad(hours, 2)}:${pad(minutes, 2)}:${pad(seconds, 2)}.${pad(millis, 3)}Z`
+  )
+}
+
+/** Howard Hinnant 的 civil-from-days（纯整数运算）。 */
+function civilFromDays(daysSinceEpoch: number): { year: number; month: number; day: number } {
+  const z = daysSinceEpoch + 719_468
+  const era = Math.floor(z / 146_097)
+  const doe = z - era * 146_097
+  const yoe = Math.floor(
+    (doe - Math.floor(doe / 1460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365,
+  )
+  const year = yoe + era * 400
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const month = mp < 10 ? mp + 3 : mp - 9
+  return { year: month <= 2 ? year + 1 : year, month, day }
+}
+
+function pad(value: number, width: number): string {
+  return String(value).padStart(width, '0')
 }
 
 /** 去重（保留首次出现）并赋 1 起的排名。通道原始分在此被**丢弃**。 */
@@ -437,12 +496,16 @@ export async function retrieve(
       gate,
       degraded: [],
       stats: emptyStats(k),
-      now,
-      note: `门控跳过检索：${gate.detail}（一等结果，不是错误）`,
+      now: now ?? 0,
+      note: `门控跳过检索（${gate.reason}）：${gate.detail}（一等结果，不是错误）`,
     }
   }
 
   const degraded: string[] = []
+  if (now === undefined) {
+    degraded.push('时钟不可用：已跳过廉价重排（时间先验不可信）')
+  }
+  const rerankRequested = query.rerank === true && now !== undefined
   const limit = normalizePositive(query.limit, DEFAULT_LIMIT)
   const maxCandidates = normalizePositive(query.maxCandidates, DEFAULT_MAX_CANDIDATES)
   const poolLimit = normalizePositive(query.poolLimit, maxCandidates)
@@ -505,20 +568,38 @@ export async function retrieve(
 
   const rankings = searches.flatMap(s => s.rankings)
   const fused = fuseByRank(rankings, k)
-  const capped = totalOrder(fused, query.scope).slice(0, maxCandidates)
+  const orderedFused = totalOrder(fused, query.scope)
 
   // ⑦ 批量水合：每个作用域一次 `getMany`（**禁止 N+1**）。
-  const hydrated = await hydrate(ordered, capped, degraded)
-  const dropped = capped.length - hydrated.length
+  //    水合在**截断之前**做：保留来源（画像）与已失效条目因此不会占用候选上限的位次，
+  //    否则一条 `omb-doc:` 记录就能把一个真正的经验候选挤出窗口。
+  const hydrated = await hydrate(ordered, orderedFused, degraded)
+  let reservedSkipped = 0
+  let expiredSkipped = 0
+  const usable: HydratedCandidate[] = []
+  for (const entry of hydrated) {
+    if (isReservedSource(entry.record.sourceRef)) {
+      reservedSkipped += 1
+      continue
+    }
+    // 已失效（被取代/矛盾裁决）的条目不注入——通道实现若不排除，这里兜底。
+    if (entry.record.validTo !== null) {
+      expiredSkipped += 1
+      continue
+    }
+    usable.push(entry)
+  }
+  const capped = usable.slice(0, maxCandidates)
+  const dropped = orderedFused.length - usable.length
 
   // ⑥ 可选廉价重排。
-  const reranked = query.rerank === true
-    ? cheapRerank(hydrated, {
+  const reranked = rerankRequested && now !== undefined
+    ? cheapRerank(capped, {
         now,
         ...(query.rerankHalfLifeMs !== undefined ? { halfLifeMs: query.rerankHalfLifeMs } : {}),
         ...(query.scope !== undefined ? { preferredScope: query.scope } : {}),
       })
-    : hydrated
+    : capped
 
   // ⑤ 每库配额。
   const quota = normalizeQuota(query.perStoreQuota, limit, ordered.length)
@@ -541,15 +622,17 @@ export async function retrieve(
       candidatesFused: fused.length,
       candidatesCapped: capped.length,
       dropped,
+      reservedSkipped,
+      expiredSkipped,
       perStore: ordered.map(t => ({
         scope: t.scope,
-        candidates: capped.filter(c => primaryScope(c) === t.scope).length,
-        selected: chosen.filter(h => primaryScope(h.candidate) === t.scope).length,
+        candidates: capped.filter(entry => primaryScope(entry.candidate) === t.scope).length,
+        selected: chosen.filter(entry => primaryScope(entry.candidate) === t.scope).length,
       })),
       rrfK: k,
-      reranked: query.rerank === true,
+      reranked: rerankRequested,
     },
-    now,
+    now: now ?? 0,
     note: buildNote(ordered.length, rankings.length, items.length),
   }
 }
@@ -573,6 +656,8 @@ function emptyStats(k: number): RetrieveStats {
     candidatesFused: 0,
     candidatesCapped: 0,
     dropped: 0,
+    reservedSkipped: 0,
+    expiredSkipped: 0,
     perStore: [],
     rrfK: k,
     reranked: false,
@@ -622,12 +707,12 @@ function orderStores(stores: readonly TaggedStore[]): readonly TaggedStore[] {
 /** 每作用域一次批量水合；单库失败只降级不抛。 */
 async function hydrate(
   ordered: readonly TaggedStore[],
-  capped: readonly FusedCandidate[],
+  candidates: readonly FusedCandidate[],
   degraded: string[],
 ): Promise<readonly HydratedCandidate[]> {
-  if (capped.length === 0) return []
+  if (candidates.length === 0) return []
   const idsByScope = new Map<MemoryScope, string[]>()
-  for (const candidate of capped) {
+  for (const candidate of candidates) {
     const scope = primaryScope(candidate)
     const bucket = idsByScope.get(scope)
     if (bucket === undefined) idsByScope.set(scope, [candidate.id])
@@ -647,7 +732,7 @@ async function hydrate(
     }),
   )
   const out: HydratedCandidate[] = []
-  for (const candidate of capped) {
+  for (const candidate of candidates) {
     const record = records.get(candidate.id)
     if (record !== undefined) out.push({ candidate, record })
   }
@@ -683,14 +768,18 @@ function isUsableHit(value: unknown): value is ScoredHit {
   )
 }
 
-function readNow(ports: RetrievePorts): number {
+/**
+ * 读时钟。**模块层不读墙钟**：时钟一律经端口注入（`kernel.clock`）。
+ * 读数缺失/非法 → `undefined`，调用方据此关掉时间相关的先验并如实降级。
+ */
+function readNow(ports: RetrievePorts): number | undefined {
   try {
     const value = ports.clock?.now()
     if (typeof value === 'number' && Number.isFinite(value)) return value
   } catch {
-    // 时钟故障不该让检索失败：退化为宿主墙钟。
+    // 时钟故障不该让检索失败：由调用方降级（跳过重排）。
   }
-  return Date.now()
+  return undefined
 }
 
 function normalizeK(value: number | undefined): number {

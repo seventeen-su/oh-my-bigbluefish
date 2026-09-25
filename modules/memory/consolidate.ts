@@ -20,6 +20,7 @@
  */
 import type { AssertedBy, Edge, MemoryRecord } from '../../kernel/abi/index.js'
 import { tokenizeForFts } from './text.js'
+import { isReservedSource } from './retrieve.js'
 
 /** 合并次数的硬上限（每次运行）。 */
 export const DEFAULT_MERGE_LIMIT = 200
@@ -104,6 +105,8 @@ export interface DecayPrior {
 
 export interface ConsolidationStats {
   readonly records: number
+  /** 跳过的保留来源（`omb-doc:`：画像是结构化状态，不是经验痕迹）。 */
+  readonly reservedSkipped: number
   /** 精确去重 / 近重复 / 回响 各自的组数。 */
   readonly exactGroups: number
   readonly nearGroups: number
@@ -347,15 +350,23 @@ export function planConsolidation(
   const notes: string[] = []
 
   // 去重并按 id 排序，保证同输入同输出。
-  const records: MemoryRecord[] = []
+  const all: MemoryRecord[] = []
   const seenIds = new Set<string>()
   for (const record of input.records) {
     if (record.id.length === 0 || seenIds.has(record.id)) continue
     seenIds.add(record.id)
-    records.push(record)
+    all.push(record)
   }
-  if (records.length < input.records.length) {
-    notes.push(`已忽略 ${input.records.length - records.length} 条空 id / 重复 id 的输入`)
+  if (all.length < input.records.length) {
+    notes.push(`已忽略 ${input.records.length - all.length} 条空 id / 重复 id 的输入`)
+  }
+  // 保留来源（`omb-doc:` 前缀，如画像）= **结构化状态，不是经验痕迹**：
+  // 不参与去重/回响合并/衰减排序（否则会被错误地塌缩或降权）。
+  // 但仍留在 `all` 里，使隐私擦除（erasureIds）对它们照常有效。
+  const records = all.filter(record => !isReservedSource(record.sourceRef))
+  const reservedSkipped = all.length - records.length
+  if (reservedSkipped > 0) {
+    notes.push(`跳过 ${reservedSkipped} 条保留来源（omb-doc: 结构化状态，不参与整合）`)
   }
 
   const uf = new UnionFind(records.length)
@@ -599,9 +610,10 @@ export function planConsolidation(
     .map(record => ({ id: record.id, prior: decayPrior(record, options.now, halfLife) }))
     .sort((a, b) => b.prior - a.prior || compareText(a.id, b.id))
 
-  // ⑦ 隐私擦除（唯一允许的删除路径）。
+  // ⑦ 隐私擦除（唯一允许的删除路径）。按**全部输入**校验 id——保留来源也要能被擦除。
+  const erasableIds = new Set(all.map(record => record.id))
   const erasures = (options.erasureIds ?? [])
-    .filter(id => indexById.has(id))
+    .filter(id => erasableIds.has(id))
     .slice()
     .sort(compareText)
   if (erasures.length > 0) notes.push(`隐私擦除 ${erasures.length} 条：走端口 forget（唯一硬删除路径）`)
@@ -631,6 +643,7 @@ export function planConsolidation(
     truncated,
     stats: {
       records: records.length,
+      reservedSkipped,
       exactGroups,
       nearGroups,
       echoGroups,
