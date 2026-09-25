@@ -51,17 +51,25 @@ export const EMBEDDER_SERVICE = SERVICES.embedder
 /**
  * 配置 schema（缺省值必须完整：`apply` 永远收到完整配置）。
  *
+ * `preprocess` 把 `undefined`/`null` 归一成 `{}`：`cordis.patch.yml` 的
+ * `omb-memory-vector` 行**没有 `config`**，宿主会把 `undefined` 传进来；
+ * 裸 `z.object` 会因此抛 `expected object, received undefined`，让整个模块
+ * 启动失败——**一条没有配置的行不该让模块起不来**。
+ *
  * `dimensions` 是**哈希兜底路径**的维度，不是神经模型的维度——神经模型的维度由模型自身决定
  * （BGE-small-zh = 512），并作为归属标签随向量持久化。
  */
-export const vectorConfigSchema = z.object({
-  /** 模型目录（显式注入）。缺省按 `$OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5` 解析。 */
-  modelDir: z.string().optional(),
-  /** 推理线程数（默认 2：单条毫秒级；调大会抢主对话的 CPU）。 */
-  threads: z.number().int().min(1).default(2),
-  /** 哈希兜底维度（默认 256）。 */
-  dimensions: z.number().int().positive().default(256),
-})
+export const vectorConfigSchema = z.preprocess(
+  value => (value === undefined || value === null ? {} : value),
+  z.object({
+    /** 模型目录（显式注入）。缺省按 `$OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5` 解析。 */
+    modelDir: z.string().optional(),
+    /** 推理线程数（默认 2：单条毫秒级；调大会抢主对话的 CPU）。 */
+    threads: z.number().int().min(1).default(2),
+    /** 哈希兜底维度（默认 256）。 */
+    dimensions: z.number().int().positive().default(256),
+  }),
+)
 
 export type VectorConfig = z.infer<typeof vectorConfigSchema>
 

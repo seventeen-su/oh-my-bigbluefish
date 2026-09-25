@@ -114,6 +114,19 @@ describe('模块契约（三方一致：模块清单 / 目录 / cordis.patch.yml
     expect(config.modelDir).toBeUndefined()
   })
 
+  it('**没有 config 的 YAML 行也必须能启动**：parse(undefined) / parse(null) 走完整缺省值', () => {
+    // 回归：`cordis.patch.yml` 的 omb-memory-vector 行没有 `config`
+    //   → 内核 `start()` 里 `configSchema.parse(configs?.get(id))` 收到 undefined
+    //   → 裸 `z.object` 抛 `expected object, received undefined`，整个模块被标 failed
+    //   （`tests/dsh/assembly.smoke.test.ts` 暴露过）。YAML 里写空的 `config:` 则是 null。
+    for (const input of [undefined, null]) {
+      const config = vectorManifest.configSchema.parse(input)
+      expect(config.threads).toBe(2)
+      expect(config.dimensions).toBe(256)
+      expect(config.modelDir).toBeUndefined()
+    }
+  })
+
   it('配置校验失败给出精确路径（不静默取默认值）', () => {
     expect(() => vectorManifest.configSchema.parse({ threads: 0 })).toThrow()
     expect(() => vectorManifest.configSchema.parse({ threads: 1.5 })).toThrow()
@@ -122,6 +135,49 @@ describe('模块契约（三方一致：模块清单 / 目录 / cordis.patch.yml
 
   it('vectorModule（host 入口）与 vectorManifest 指向同一清单', () => {
     expect(vectorModule.manifest).toBe(vectorManifest)
+  })
+})
+
+describe('内核启动路径 —— 无 config 行不得让模块 failed（assembly.smoke 回归）', () => {
+  /** 最小 `omb-memory` 桩：本模块 requires 它，缺了会被内核判为 blocked（那是另一回事）。 */
+  const memoryStub: ModuleRegistration<unknown> = {
+    manifest: {
+      id: 'omb-memory',
+      version: '3.0.0',
+      requires: [],
+      capabilities: [],
+      configSchema: { parse: () => ({}) },
+      health: () => ({ state: 'ok', detail: '桩：只为满足依赖' }),
+    },
+    apply: () => {},
+  }
+
+  it('start([memory, vector]) 且**不给 configs** → 不阻断、服务可用、健康不是 failed', () => {
+    const handle = createKernel()
+    const instance = createVectorModule()
+    const missing = missingDir()
+    withEnv(missing, () => {
+      const blocked = handle.start([memoryStub, instance.registration])
+      expect(blocked).toEqual([])
+      expect(handle.kernel.service<Embedder>(EMBEDDER_SERVICE)?.id).toBe('hash-bow-256')
+      const health = handle.health()['omb-memory-vector']
+      expect(health?.state).not.toBe('failed')
+      expect(health?.detail).not.toContain('启动失败')
+      expect(health?.detail).not.toContain('expected object')
+    })
+  })
+
+  it('start 且 config 显式为 null（YAML 空 `config:`）→ 同样启动', () => {
+    const handle = createKernel()
+    const instance = createVectorModule()
+    withEnv(missingDir(), () => {
+      const blocked = handle.start(
+        [memoryStub, instance.registration],
+        new Map([[VECTOR_MODULE_ID, null]]),
+      )
+      expect(blocked).toEqual([])
+      expect(handle.health()['omb-memory-vector']?.state).not.toBe('failed')
+    })
   })
 })
 
