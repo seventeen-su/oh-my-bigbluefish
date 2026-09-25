@@ -27,7 +27,20 @@ export interface ModuleManifest<TConfig = unknown> {
   readonly optional?: readonly string[]
   /** 对外能力名（状态面与投影列出）。 */
   readonly capabilities: readonly string[]
-  /** 配置 schema；**缺省值必须完整**，使 apply 永远收到完整配置。 */
+  /**
+   * 配置 schema。
+   *
+   * **两条硬要求**：
+   * ① **缺省值必须完整**——`parse` 的结果要能直接使用，模块不必再判空。
+   * ② **必须接受 `undefined`**——`cordis.patch.yml` 的行可以**没有 `config`**，
+   *    宿主会把 `undefined` 传进来。裸 `z.object({...})` 会因此抛
+   *    `expected object, received undefined` 让整个模块启动失败；
+   *    用 `z.preprocess(v => v ?? {}, …)` 归一（见 `modules/memory/index.ts` 与
+   *    `modules/memory/vector.ts` 的写法）。
+   *
+   * 这两条都有对应的失败案例：`omb-memory-vector` 曾因缺 `preprocess`
+   * 在装配冒烟里启动失败，而它的 YAML 行本来就没有 `config`。
+   */
   readonly configSchema: ConfigSchema<TConfig>
   /** 健康检查。必须返回可读的 detail（无空降级）。 */
   readonly health: () => ModuleHealth | Promise<ModuleHealth>

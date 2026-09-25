@@ -16,7 +16,7 @@
  * 全部经结构化接口访问宿主。
  */
 import { createKernel, type KernelHandle } from '../kernel/index.js'
-import type { Kernel, ToolDefinition } from '../kernel/abi/index.js'
+import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES, toolsServiceFor } from '../kernel/abi/index.js'
 import type { HostContextLike } from './host.js'
 import { hostLogger, readService, systemClock } from './host.js'
@@ -46,6 +46,28 @@ export const name = 'omb'
 export const inject = ['commands']
 
 /**
+ * 微内核自身的注册项。
+ *
+ * 它不是模块——`modules/` 里没有它，`cordis.patch.yml` 的 `omb-kernel` 行指向的是
+ * 本插件入口。但**它必须在注册集合里**：内核的依赖解析要求"`requires` 里的 id
+ * 存在于本次启动的集合中"，否则所有声明 `requires: ['omb-kernel']` 的模块会被
+ * 整体阻断——表现为"插件装上了，但几乎所有功能都不在"，各自只报"缺少必需依赖"。
+ *
+ * `apply` 是空操作：内核已由 `createKernel()` 建好。
+ */
+export const KERNEL_SELF: ModuleRegistration<unknown> = {
+  manifest: {
+    id: 'omb-kernel',
+    version: '3.0.0',
+    requires: [],
+    capabilities: ['kernel.services', 'kernel.events', 'kernel.health', 'kernel.metrics'],
+    configSchema: { parse: (input: unknown) => input ?? {} },
+    health: () => ({ state: 'ok', detail: '微内核（插件本体，无独立模块资源）' }),
+  },
+  apply: () => {},
+}
+
+/**
  * 插件主体。返回值是 disposer（Cordis 函数插件契约：`apply(ctx, config)`）。
  */
 export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => void {
@@ -66,12 +88,26 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     logger.warn(`OMB：存储端口注册失败——${String(error)}（记忆库将降级）`)
   }
 
+  // ── 1b) 内核自身的工具服务 ─────────────────────────────────────────────
+  // `MODULE_CATALOG` 给 `omb-kernel` 声明了 `omb_status`，而 `collectToolSpecs`
+  // 按 `tools:<id>` 前缀收集——所以这里必须真的注册它。否则"目录声明了、
+  // 但没有人实现"，而声明与实现不一致正是规划 §8.2 要删掉的那类东西。
+  const statusSpec = buildStatusTool(handle, sessions)
+  handle.kernel.provide(toolsServiceFor('omb-kernel'), [
+    {
+      name: statusSpec.name,
+      description: statusSpec.description,
+      parameters: statusSpec.parameters,
+      execute: (args: unknown) => statusSpec.run(args),
+    },
+  ])
+
   // ── 2) 模块装配（同步发现 + 同步启动）──────────────────────────────────
   const loaded = loadModulesSync(MODULE_ENTRIES)
   for (const failure of loaded.failures) {
     logger.warn(`OMB：模块入口 ${failure.path} 未装配——${failure.reason}`)
   }
-  const blocked = handle.start(loaded.modules, configMapOf())
+  const blocked = handle.start([KERNEL_SELF, ...loaded.modules], configMapOf())
   for (const b of blocked) logger.warn(`OMB：模块 ${b.id} 未启动——${b.reason}`)
 
   // ── 3) 工具注册（同步；单个失败不影响其余）─────────────────────────────

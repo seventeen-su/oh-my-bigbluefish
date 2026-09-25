@@ -147,9 +147,33 @@ export const SERVICES = {
   contextMetrics: 'context:metrics',
   /** `StatusRegistry`：由微内核自己 provide，各模块 `register` 贡献段落。 */
   statusContributor: 'status:contributor',
+  /**
+   * `SecondaryChannelRegistry`：检索的第二通道登记处。
+   *
+   * 与 `statusContributor` 同构（单值登记处装 N 个），理由也同构：
+   * 单值服务表装不下多个通道，而**依赖方向要求"推"而不是"拉"**——
+   * `omb-memory-vector` 的 `requires` 包含 `omb-memory`，因此只能由
+   * 向量模块把自己的通道注册进来，记忆模块读登记处消费。
+   * 若反过来让记忆模块直接 import 向量模块，依赖方向就与目录声明相反了。
+   */
+  channelRegistry: 'retrieval:channels',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
+
+/**
+ * 第二通道登记处。
+ *
+ * 泛型化以避免 ABI 反向依赖 `modules/`：`T` 由使用方以
+ * `RetrievalChannel` 实例化（`RetrievalChannel` 定义在
+ * `modules/memory/retrieve.ts`，属模块层）。
+ */
+export interface SecondaryChannelRegistry<T> {
+  /** 登记一个通道。@returns 注销函数（幂等）。 */
+  register(channel: T): () => void
+  /** 当前全部通道，按 `name` 稳定排序。 */
+  list(): readonly T[]
+}
 
 /** 构造某模块的工具服务名。唯一入口，避免各写各的拼法。 */
 export function toolsServiceFor(moduleId: string): string {

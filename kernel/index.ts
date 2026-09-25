@@ -10,6 +10,7 @@ import { BudgetTable } from './budget.js'
 import { HealthTable } from './health.js'
 import { FocusTable, planModules } from './registry.js'
 import { StatusTable } from './status.js'
+import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
   BudgetGrant,
@@ -108,9 +109,14 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   const healthTable = new HealthTable()
   const focusTable = new FocusTable()
   const statusTable = new StatusTable()
+  const channelTable = new ChannelTable<{ readonly name: string }>()
 
-  // 状态面登记处由内核自己提供：单值服务表装不下 N 个贡献者（见 abi/catalog.ts 的说明）
+  // 两个登记处都由内核自己 provide：
+  // ① 状态面：单值服务表装不下 N 个贡献者（见 abi/catalog.ts 的说明）
+  // ② 第二通道：**依赖方向要求"推"而不是"拉"**——`omb-memory-vector` 的 requires
+  //    包含 `omb-memory`，所以只能由向量模块把自己的通道注册进来，记忆模块读登记处。
   services.provide(SERVICES.statusContributor, statusTable)
+  services.provide(SERVICES.channelRegistry, channelTable)
 
   let disposed = false
   const disposers: (() => void | Promise<void>)[] = []
