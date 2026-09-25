@@ -106,7 +106,15 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
       lines.push('拉取台账：无（尚无拉取记录）。')
     } else {
       lines.push(`拉取台账：${healthDetail(pulls)}`)
-      const silent = pulls.views.filter(view => view.pulls === 0).map(view => view.view)
+      // 口径必须写清：这个数是谁的、分母是什么。
+      if (pulls.session === null) {
+        lines.push('  口径：拿不到本会话标识——这些计数落在"未知会话"桶，不并入任何具体会话')
+      } else if (!pulls.turnsKnown) {
+        lines.push(`  口径：本会话回合数未知（本会话内未观察到回合边界）——pullsPerTurn 分母未知，判定需 ${pulls.minTurns} 轮`)
+      }
+      // **零拉取视图列表同样要过判定门槛**：刚开的新会话里五个视图必然全是 0，
+      // 那不是"该删"，是"还没样本"。轮数不足时只写"不下结论"，不给列表。
+      const silent = pulls.settled ? pulls.views.filter(view => view.pulls === 0).map(view => view.view) : []
       if (silent.length > 0) lines.push(`  零拉取视图：${silent.join('、')}（持续为零即按杀死判据删除）`)
     }
 
@@ -141,6 +149,9 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
     if (hit !== null) metrics.cacheHitRate = hit
     if (pulls !== null) {
       metrics.pullTurns = pulls.turns
+      // 0/1：`pullTurns` 为 0 时它区分"本会话真的一轮都没有"与"轮数未知（分母未知）"
+      metrics.pullTurnsKnown = pulls.turnsKnown ? 1 : 0
+      metrics.pullSessionKnown = pulls.session === null ? 0 : 1
       metrics.totalPulls = pulls.totalPulls
       metrics.pullsPerTurn = pulls.pullsPerTurn
       metrics.deadViews = pulls.deadViews.length

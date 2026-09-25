@@ -29,12 +29,12 @@ const health: Readonly<Record<string, ModuleHealth>> = {
   'omb-notify': { state: 'failed', detail: '依赖缺失：omb-kernel' },
 }
 
-const pullsAfter = (pulls: Readonly<Record<string, number>>, turns: number) => {
+const pullsAfter = (pulls: Readonly<Record<string, number>>, turns: number, session: string | null = 's') => {
   let ledger = noteTurn(EMPTY_LEDGER, turns)
   for (const [view, count] of Object.entries(pulls)) {
     for (let index = 0; index < count; index += 1) ledger = recordPull(ledger, view, turns)
   }
-  return summarize(ledger, { views: VIEW_TOOLS })
+  return summarize(ledger, { views: VIEW_TOOLS }, session)
 }
 
 describe('buildStatusPanel：健康面与降级原因', () => {
@@ -109,14 +109,49 @@ describe('buildStatusPanel：压力与塑形行为', () => {
 })
 
 describe('buildStatusPanel：拉取计数（杀死判据可见）', () => {
-  it('汇总拉取率、零拉取视图与待删除列表', () => {
+  it('汇总拉取率、零拉取视图与待删除列表，并写明是**本会话**口径', () => {
     const panel = buildStatusPanel({ pulls: pullsAfter({ omb_recall: 30 }, MIN_TURNS_FOR_VERDICT) })
     const text = renderStatusPanel(panel)
-    expect(text).toContain('拉取台账：拉取 30 次')
+    expect(text).toContain('拉取台账：本会话拉取 30 次')
+    expect(text).toContain('/ 20 轮')
     expect(text).toContain('待删除视图：omb_files')
     expect(text).toContain('零拉取视图：')
     expect(panel.metrics.totalPulls).toBe(30)
     expect(panel.metrics.deadViews).toBe(4)
+    expect(panel.metrics.pullSessionKnown).toBe(1)
+    expect(panel.metrics.pullTurnsKnown).toBe(1)
+  })
+
+  it('轮数不足 → 不给"待删除视图"、也不给零拉取清单（样本不够就不装懂）', () => {
+    const panel = buildStatusPanel({ pulls: pullsAfter({ omb_recall: 2 }, 3) })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('本会话拉取 2 次 / 3 轮')
+    expect(text).toContain('轮数不足')
+    expect(text).toContain('暂不下删除结论')
+    expect(text).not.toContain('待删除视图')
+    expect(text).not.toContain('零拉取视图')
+    expect(panel.metrics.deadViews).toBe(0)
+    expect(panel.metrics.pullTurnsKnown).toBe(1)
+  })
+
+  it('轮数未知 ⇒ 分母未知：如实写"未知"，不拿别的数顶替、也不下结论', () => {
+    const panel = buildStatusPanel({ pulls: pullsAfter({ omb_recall: 2 }, 0) })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('本会话拉取 2 次 / 轮数未知')
+    expect(text).toContain('口径：本会话回合数未知')
+    expect(text).toContain('分母未知')
+    expect(text).not.toContain('待删除视图')
+    expect(panel.metrics.pullTurns).toBe(0)
+    expect(panel.metrics.pullTurnsKnown).toBe(0)
+  })
+
+  it('拿不到会话 → 明说"未知会话"桶，不并入任何具体会话', () => {
+    const panel = buildStatusPanel({ pulls: pullsAfter({ omb_recall: 1 }, 1, null) })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('未知会话拉取 1 次')
+    expect(text).toContain('口径：拿不到本会话标识')
+    expect(text).toContain('不并入任何具体会话')
+    expect(panel.metrics.pullSessionKnown).toBe(0)
   })
 
   it('没有台账时写"无"，不留空', () => {

@@ -10,11 +10,14 @@ import {
   DEAD_VIEW_PULLS_PER_TURN,
   EMPTY_LEDGER,
   MIN_TURNS_FOR_VERDICT,
+  UNKNOWN_SESSION_KEY,
   VIEW_TOOLS,
   cacheHitRate,
   healthDetail,
   noteTurn,
   recordPull,
+  sessionKeyOf,
+  sessionOfKey,
   summarize,
 } from '../../../modules/context/watch.js'
 
@@ -113,6 +116,60 @@ describe('summarize：pullsPerTurn 与杀死判据', () => {
     const snapshot = summarize(EMPTY_LEDGER, { views: VIEW_TOOLS })
     expect(snapshot.pullsPerTurn).toBe(0)
     expect(snapshot.verdict).toContain('暂不下')
+  })
+})
+
+describe('会话口径：一份账只描述一个会话', () => {
+  it('会话键归一：空串 / 非串落进"未知会话"桶，不混进任何具体会话', () => {
+    expect(sessionKeyOf('sess-a')).toBe('sess-a')
+    expect(sessionKeyOf('   ')).toBe(UNKNOWN_SESSION_KEY)
+    expect(sessionKeyOf('')).toBe(UNKNOWN_SESSION_KEY)
+    expect(sessionKeyOf(null)).toBe(UNKNOWN_SESSION_KEY)
+    expect(sessionKeyOf(undefined)).toBe(UNKNOWN_SESSION_KEY)
+    expect(sessionOfKey(UNKNOWN_SESSION_KEY)).toBeNull()
+    expect(sessionOfKey('sess-a')).toBe('sess-a')
+  })
+
+  it('快照带会话标识（"未知会话"记作 null），文案自带口径', () => {
+    const ledger = ledgerAfter({ omb_recall: 30 }, MIN_TURNS_FOR_VERDICT)
+    expect(summarize(ledger, { views: VIEW_TOOLS }, 'sess-a').session).toBe('sess-a')
+    expect(healthDetail(summarize(ledger, { views: VIEW_TOOLS }, 'sess-a'))).toContain('本会话拉取 30 次 / 20 轮')
+    expect(summarize(ledger, { views: VIEW_TOOLS }, null).session).toBeNull()
+    expect(healthDetail(summarize(ledger, { views: VIEW_TOOLS }, null))).toContain('未知会话拉取 30 次')
+  })
+
+  it('轮数未知（0 轮）⇒ 分母未知：如实写"未知"，不下删除结论，也不用别的数顶替', () => {
+    // 有拉取、但本会话还没观察到任何回合边界（`recordPull` 的 turn 传 0）
+    const ledger = recordPull(recordPull(EMPTY_LEDGER, 'omb_recall', 0), 'omb_method', 0)
+    const snapshot = summarize(ledger, { views: VIEW_TOOLS }, 'sess-a')
+    expect(snapshot.turns).toBe(0)
+    expect(snapshot.turnsKnown).toBe(false)
+    expect(snapshot.totalPulls).toBe(2)
+    expect(snapshot.pullsPerTurn).toBe(0)
+    expect(snapshot.deadViews).toEqual([])
+    expect(snapshot.verdict).toContain('回合数未知')
+    expect(snapshot.verdict).toContain('暂不下')
+    expect(healthDetail(snapshot)).toContain('轮数未知')
+    expect(healthDetail(snapshot)).toContain('暂不下删除结论')
+  })
+
+  it('判定只算**登记的视图**：本会话里别的工具名不进"待删除视图"', () => {
+    // `dsh/` 把每次工具调用都记进来，所以台账里会有 `read` / `todo_write` 这类名字。
+    // 它们不是我们注册的视图，"删视图"删不到它们头上——不能出现在待删除列表里
+    // （自检时待删除列表里出现 `cordis_inspect_list` / `read` 就是这一类噪声）。
+    const ledger = ledgerAfter({ omb_recall: 30, read: 1, todo_write: 1, cordis_inspect_list: 1 }, 60)
+    const snapshot = summarize(ledger, { views: VIEW_TOOLS }, 'sess-a')
+    expect(snapshot.deadViews).toEqual(['omb_files', 'omb_focus', 'omb_method', 'omb_relate'])
+    expect(snapshot.deadViews).not.toContain('read')
+    expect(snapshot.deadViews).not.toContain('todo_write')
+    expect(snapshot.deadViews).not.toContain('cordis_inspect_list')
+    // 明细里仍然看得见它们（本会话真实发生过的拉取，只是不参与杀谁的决定）
+    expect(snapshot.views.map(view => view.view)).toContain('read')
+  })
+
+  it('只有非视图工具在动、五个视图全 0 → 待删除的就是那五个视图', () => {
+    const snapshot = summarize(ledgerAfter({ read: 1 }, MIN_TURNS_FOR_VERDICT), { views: VIEW_TOOLS }, 'sess-a')
+    expect(snapshot.deadViews).toEqual([...VIEW_TOOLS].sort())
   })
 })
 

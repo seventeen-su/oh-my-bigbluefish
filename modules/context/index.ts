@@ -28,15 +28,18 @@ import type { AdmissionOptions, Candidate } from './admission.js'
 import { DEFAULT_CANDIDATE_CONSIDER_LIMIT, marginalValue, measuredCost, selectForInjection } from './admission.js'
 import type { BandBehavior, PressureBands, PressureReading } from './pressure.js'
 import { bandOf, bandsFromPair, behaviorFor, readingOf } from './pressure.js'
-import type { PullSnapshot, ViewPullStats, WatchOptions } from './watch.js'
+import type { PullLedger, PullSnapshot, ViewPullStats, WatchOptions } from './watch.js'
 import {
   EMPTY_LEDGER,
   MIN_TURNS_FOR_VERDICT,
+  UNKNOWN_SESSION_KEY,
   VIEW_TOOLS,
   cacheHitRate,
   healthDetail,
   noteTurn,
   recordPull,
+  sessionKeyOf,
+  sessionOfKey,
   summarize,
 } from './watch.js'
 import { buildStatusPanel, createStatusContributor } from './tools.js'
@@ -91,12 +94,22 @@ export interface ContextPressureService {
  * 一个模块一个观测面服务，不为一个指标开一个服务）。
  */
 export interface ContextMetricsService {
-  /** 记一次拉取。`dsh/` 包住五个视图工具时调用。**绝不抛**。 */
+  /**
+   * 记一次拉取。`dsh/` 包住五个视图工具时调用。**绝不抛**。
+   *
+   * `session` 省略时用当前会话；**拿不到会话就记进"未知会话"桶**（状态面明说），
+   * 不会混进任何具体会话。
+   */
   recordPull(view: string, session?: SessionRef): void
-  /** 台账快照（含杀死判据）。 */
-  snapshot(options?: WatchOptions): PullSnapshot
-  /** 长期趋近 0、按杀死判据应删除的视图。 */
-  killList(options?: WatchOptions): readonly string[]
+  /**
+   * **某一个会话**的台账快照（含杀死判据）。
+   *
+   * `session` 省略时用"当前会话"（内核活跃会话登记处 → 本模块订阅到的最近回合）；
+   * 都拿不到就落到"未知会话"桶——**不会**混进任何具体会话。
+   */
+  snapshot(session?: SessionRef, options?: WatchOptions): PullSnapshot
+  /** 该会话里长期趋近 0、按杀死判据应删除的视图（轮数不足时为空）。 */
+  killList(session?: SessionRef, options?: WatchOptions): readonly string[]
   /** 缓存命中率；不可测时 null。 */
   cacheHitRate(session?: SessionRef): number | null
   /** 当前档位状态（供注入裁决用）。 */
@@ -112,8 +125,8 @@ export interface ContextMetricsService {
   ): readonly Candidate[]
   /** 逐节点真实成本；没有该节点返回 null（**不估算**）。 */
   measuredCost(name: string, session?: SessionRef): number | null
-  /** 每个视图的计数与轮次。 */
-  views(): readonly ViewPullStats[]
+  /** **某一个会话**里每个视图的计数与轮次。 */
+  views(session?: SessionRef, options?: WatchOptions): readonly ViewPullStats[]
 }
 
 interface SessionPressure {
@@ -136,7 +149,8 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * 建立模块实例。**每个实例自带状态**（拉取台账与回合计数）。
+ * 建立模块实例。**每个实例自带状态**：拉取台账（**按会话分桶**，一个会话一份账）
+ * 与回合计数。
  */
 export function createContextModule(): ModuleRegistration<ContextConfig> {
   let lastHealth: ModuleHealth = {
@@ -173,15 +187,47 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
       for (const note of degradations) kernel.logger.warn(`${MODULE_ID}：${note}`)
     }
 
-    // ── 台账与回合计数（全局口径：跨会话的"观察到的回合数"是 pullsPerTurn 的分母） ──
-    let ledger = EMPTY_LEDGER
+    // ── 拉取台账（**按会话隔离**）与回合计数 ──
+    //
+    // 曾经是"一份全局台账 + 一个全局回合计数"：别的会话的工具调用会混进来，
+    // 于是"待删除视图"里出现本会话从未调用过的工具（实测：`cordis_inspect_list`
+    // 变成了待删除视图），分母也是跨会话的总轮数。后果不是"数字不好看"——
+    // 而是**拿别人的噪声给本会话定罪**，将来按"零拉取视图"杀工具就会杀错。
+    // 现在：一个会话一本账，`turns` / `totalPulls` / 判据都只算本会话。
+    const ledgers = new Map<SessionRef, PullLedger>()
     const sessionTurns = new Map<SessionRef, number>()
     const sessionPressure = new Map<SessionRef, SessionPressure>()
     let lastActiveSession: SessionRef | null = null
-    let turnsSeen = 0
 
-    const activeSession = (session?: SessionRef): SessionRef | null =>
-      typeof session === 'string' && session.trim() !== '' ? session : lastActiveSession
+    const ledgerFor = (key: SessionRef): PullLedger => ledgers.get(key) ?? EMPTY_LEDGER
+
+    /**
+     * 读内核的活跃会话登记处（`SERVICES.activeSession`）。
+     *
+     * 会话是内核级事实（`dsh/` 观测到就写进去），**优先于本模块自己订阅到的事件**：
+     * 模块收不到 `turn/start` 时这里仍然是对的（见 `kernel/activeSession.ts`）。
+     * 端口坏掉时返回 null（服务方法不因宿主端口坏掉而抛给调用方）。
+     */
+    const kernelSession = (): SessionRef | null => {
+      try {
+        const current = kernel.service<{ current(): SessionRef | null }>(SERVICES.activeSession)?.current()
+        return typeof current === 'string' && current.trim() !== '' ? current : null
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * 会话解析（口径只认**这一个**会话）：
+     * ① 显式传入 ② 内核活跃会话登记处 ③ 本模块订阅到的最近回合 ④ 都没有 → null。
+     *
+     * ④ 落到 null 不等于"用全局数顶替"：调用方会把它记进"未知会话"桶，
+     * 状态面照实说明，不并入任何具体会话。
+     */
+    const resolveSession = (session?: SessionRef): SessionRef | null => {
+      if (typeof session === 'string' && session.trim() !== '') return session
+      return kernelSession() ?? lastActiveSession
+    }
 
     /** 读时钟：端口异常时返回 0（服务方法不因宿主端口坏掉而抛给调用方）。 */
     const now = (): number => {
@@ -193,7 +239,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     const pressureOf = (session?: SessionRef): ContextPressure => {
-      const target = activeSession(session)
+      const target = resolveSession(session)
       if (target === null) {
         const note = '无活跃会话：压力读数缺失，按宽松档处理'
         if (!notes.includes(note)) notes.push(note)
@@ -208,7 +254,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     const focusState = (session?: SessionRef): FocusState => {
-      const target = activeSession(session)
+      const target = resolveSession(session)
       const recorded = target === null ? undefined : sessionPressure.get(target)
       let depth: FocusDepth = recorded?.depth ?? 'standard'
       if (target !== null) {
@@ -221,9 +267,18 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
       return { depth, reason: recorded?.reason ?? '', setAt: now() }
     }
 
+    /**
+     * **某一个会话**的台账快照。会话口径由 `resolveSession` 定，
+     * 拿不到就落到"未知会话"桶（`session` 为 null，状态面照实说明）。
+     */
+    const snapshotFor = (session?: SessionRef, options?: WatchOptions): PullSnapshot => {
+      const key = sessionKeyOf(resolveSession(session))
+      return summarize(ledgerFor(key), options ?? { views: VIEW_TOOLS }, sessionOfKey(key))
+    }
+
     const healthNow = (): ModuleHealth => {
-      const pressure = pressureOf(lastActiveSession ?? undefined)
-      const snapshot = summarize(ledger, { views: VIEW_TOOLS })
+      const pressure = pressureOf()
+      const snapshot = snapshotFor()
       const band = pressure.band ?? bandOf(pressure.fillRatio, bands)
       const parts = [
         `软档位 ${band}`,
@@ -231,7 +286,8 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
           ? 'fillRatio 未知（宿主未声明窗口）→ 按宽松档，不施压'
           : `fillRatio ${pressure.fillRatio.toFixed(3)}`,
         `行为 ${behaviorFor(band).mode}（最多推 ${behaviorFor(band).pushLimit} 条）`,
-        // 杀死判据必须出现在 detail 里（轮数不足时如实说明"暂不下结论"）
+        // 杀死判据必须出现在 detail 里（轮数未知/不足时如实说明"暂不下结论"）。
+        // 文案自带口径（"本会话"/"未知会话"），不留"这个数是谁的"的疑问。
         healthDetail(snapshot),
       ]
       if (degradations.length > 0) parts.push(`降级：${degradations.join('；')}`)
@@ -240,6 +296,8 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         detail: parts.join('；'),
         metrics: {
           turns: snapshot.turns,
+          // 0/1：`turns` 为 0 时它区分"本会话真的一轮都没有"与"轮数未知（分母未知）"
+          turnsKnown: snapshot.turnsKnown ? 1 : 0,
           totalPulls: snapshot.totalPulls,
           pullsPerTurn: snapshot.pullsPerTurn,
           deadViews: snapshot.deadViews.length,
@@ -251,7 +309,13 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     const report = (): void => {
-      lastHealth = healthNow()
+      // 组装本身也不许把异常抛给事件总线：状态面挂掉是最难排查的故障，
+      // 它必须自己还能说话（写清"组装失败"而不是整段消失）。
+      try {
+        lastHealth = healthNow()
+      } catch (error) {
+        lastHealth = { state: 'degraded', detail: `健康面组装失败（已隔离）：${messageOf(error)}` }
+      }
       try {
         kernel.report(lastHealth)
       } catch (error) {
@@ -272,18 +336,25 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     // ── 事件：回合边界与压力档位（只观察，不接管 Loop） ──
     disposers.push(
       kernel.on('turn/start', payload => {
-        lastActiveSession = payload.sessionId
-        turnsSeen += 1
-        ledger = noteTurn(ledger, turnsSeen)
-        sessionTurns.set(payload.sessionId, Number.isFinite(payload.turn) ? payload.turn : turnsSeen)
+        const key = sessionKeyOf(payload.sessionId)
+        // 空会话标识不清掉已知会话（与内核 ActiveSessionTable 同一条纪律）
+        if (key !== UNKNOWN_SESSION_KEY) lastActiveSession = key
+        // 回合数**按本会话**推进：跨会话的总数不能当分母。
+        // 用"观察到的回合边界数"而不是事件里的 `turn` 值，因为 `dsh/` 传的是
+        // 0 基的 `step`（`dsh/session.ts` 的 `step/start` 分支）——直接用会把
+        // 首轮记成第 0 轮，续接会话的步号还会把分母一次抬大、把视图误判成没人用。
+        const turn = (sessionTurns.get(key) ?? 0) + 1
+        sessionTurns.set(key, turn)
+        ledgers.set(key, noteTurn(ledgerFor(key), turn))
         report()
       }),
     )
 
     disposers.push(
       kernel.on('focus/changed', payload => {
-        sessionPressure.set(payload.sessionId, {
-          band: sessionPressure.get(payload.sessionId)?.band ?? 'relaxed',
+        const key = sessionKeyOf(payload.sessionId)
+        sessionPressure.set(key, {
+          band: sessionPressure.get(key)?.band ?? 'relaxed',
           depth: payload.depth,
           reason: payload.reason,
         })
@@ -293,11 +364,12 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
 
     disposers.push(
       kernel.on('pressure/band-changed', payload => {
+        const key = sessionKeyOf(payload.sessionId)
         const reading = readingOf(payload.pressure, bands)
-        sessionPressure.set(payload.sessionId, {
+        sessionPressure.set(key, {
           band: reading.band,
-          depth: focusState(payload.sessionId).depth,
-          reason: sessionPressure.get(payload.sessionId)?.reason ?? '',
+          depth: focusState(key).depth,
+          reason: sessionPressure.get(key)?.reason ?? '',
         })
         report()
       }),
@@ -318,16 +390,22 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     const metricsService: ContextMetricsService = {
       recordPull: (view, session) => {
         try {
-          const target = activeSession(session)
-          const turn = target === null ? turnsSeen : sessionTurns.get(target) ?? turnsSeen
-          ledger = recordPull(ledger, view, turn)
+          const key = sessionKeyOf(resolveSession(session))
+          // 本会话的回合数；未知时传 0（= "轮次未知"），**不用别的会话或全局轮数顶替**。
+          const turn = sessionTurns.get(key) ?? 0
+          ledgers.set(key, recordPull(ledgerFor(key), view, turn))
+          if (key === UNKNOWN_SESSION_KEY) {
+            // 拿不到会话就在状态面明说，别让这些计数看起来像某个会话的
+            const note = '拿不到会话标识：拉取计数落在"未知会话"桶，不并入任何具体会话'
+            if (!notes.includes(note)) notes.push(note)
+          }
           report()
         } catch (error) {
           kernel.logger.warn(`${MODULE_ID}：记录拉取失败——${messageOf(error)}`)
         }
       },
-      snapshot: options => summarize(ledger, options ?? { views: VIEW_TOOLS }),
-      killList: options => summarize(ledger, options ?? { views: VIEW_TOOLS }).deadViews,
+      snapshot: (session, options) => snapshotFor(session, options),
+      killList: (session, options) => snapshotFor(session, options).deadViews,
       cacheHitRate: session => cacheHitRate(pressureOf(session)),
       focusState: session => focusState(session),
       marginalValue: (candidate, alreadyPresent, focus) =>
@@ -344,7 +422,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         })
       },
       measuredCost: (name, session) => measuredCost(pressureOf(session).nodes, name),
-      views: () => summarize(ledger, { views: VIEW_TOOLS }).views,
+      views: (session, options) => snapshotFor(session, options).views,
     }
 
     const tools: readonly ToolDefinition[] = []
@@ -352,13 +430,14 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     provide(toolsServiceFor(MODULE_ID), tools)
 
     const statusContributor: StatusContributor = createStatusContributor(() => {
-      const pressure = pressureOf(lastActiveSession ?? undefined)
+      const pressure = pressureOf()
       const reading = readingOf(pressure, bands)
       return {
         // 模块健康由 omb_status 顶部统一呈现（模块拿不到全局健康面，不假装有）
         pressure,
         behavior: reading.behavior,
-        pulls: summarize(ledger, { views: VIEW_TOOLS }),
+        // 只报**本会话**的账（拿不到会话就是"未知会话"桶，状态面照实说明）
+        pulls: snapshotFor(),
         degradations,
         notes,
       }
@@ -392,9 +471,10 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         }
       }
       disposers.length = 0
+      ledgers.clear()
       sessionTurns.clear()
       sessionPressure.clear()
-      ledger = EMPTY_LEDGER
+      lastActiveSession = null
       lastHealth = { state: 'ok', detail: `模块已卸载；历史拉取计数已清空（杀死判据的观察从零开始）` }
     }
   }
