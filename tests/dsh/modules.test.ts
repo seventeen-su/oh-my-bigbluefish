@@ -207,9 +207,17 @@ describe('模块入口清单与 YAML 一致', () => {
       expect((entry?.zh ?? '').length, `组件 ${id} 的中文名为空`).toBeGreaterThan(0)
       expect((entry?.zhDescription ?? '').length, `组件 ${id} 缺中文说明`).toBeGreaterThan(0)
     }
-    // 显示表里不该有孤儿条目
+    // 显示表里不该有孤儿条目：每一条都必须是一个真实的认知模块。
+    //
+    // 这里**只认 `MODULE_IDS`**。曾经为了给预设行 `preset-omb` 加中文名，
+    // 把 `@deepseek-ai/dsh-agent-preset` 写进显示表并包了一层自己的包——
+    // 结果那一行一直 `pending (waiting for service: agentPreset)`，
+    // 中文名没拿到、预设还可能挂掉。**用可用性换一行显示名不值得**，已回退。
+    // 所以：显示表只描述我们自己的组件，宿主包不进这张表。
     for (const entry of COMPONENT_DISPLAY) {
-      expect(MODULE_IDS).toContain(entry.rowId)
+      expect(MODULE_IDS, `显示表里的条目 ${entry.rowId} 不是认知模块`).toContain(entry.rowId)
+      expect((entry.zh ?? '').length, `${entry.rowId} 的中文名为空`).toBeGreaterThan(0)
+      expect((entry.zhDescription ?? '').length, `${entry.rowId} 缺中文说明`).toBeGreaterThan(0)
     }
   })
 

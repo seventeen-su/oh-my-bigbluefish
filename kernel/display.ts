@@ -38,6 +38,15 @@ export interface ComponentDisplay {
   /** 中文说明（插件页显示，告诉用户这个开关做什么）。 */
   readonly zhDescription: string
   readonly enDescription: string
+  /**
+   * 这一行的性质。
+   *
+   * - `module`：认知模块，与 `MODULE_IDS` 一一对应
+   * - `preset`：预设声明行（不是模块、不提供能力），但**同样需要中文名**——
+   *   否则插件页显示的是上游包 `@deepseek-ai/dsh-agent-preset` 的英文描述，
+   *   而它恰好是"每个 Agent 能力的组合声明"，与我们的预设毫无关系。
+   */
+  readonly kind: 'module' | 'preset'
 }
 
 export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
@@ -48,6 +57,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Microkernel',
     zhDescription: '插件本体与必需项：服务总线、事件总线、健康面、状态面、工具注册网关。关掉它整个 OMB 都不会工作。',
     enDescription: 'Plugin body and required row: service bus, event bus, health, status surface, tool registration gateway.',
+    kind: 'module',
   },
   {
     rowId: 'omb-memory',
@@ -56,6 +66,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Memory store',
     zhDescription: '双库长期记忆（用户库跨项目、项目库随 cwd），含写入准入、逐字召回、关联多跳、遗忘。',
     enDescription: 'Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, and forgetting.',
+    kind: 'module',
   },
   {
     rowId: 'omb-memory-vector',
@@ -64,6 +75,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Vector retrieval',
     zhDescription: '语义召回通道（BGE 中文嵌入）。关掉后纯词法召回完整可用，只是同义改写召不回。',
     enDescription: 'Semantic recall channel. Turning it off keeps lexical recall fully working.',
+    kind: 'module',
   },
   {
     rowId: 'omb-profile',
@@ -72,6 +84,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'User profile',
     zhDescription: '显式偏好与画像条目，冲突只呈现不替你裁决。能力轴默认关闭且永不落盘。',
     enDescription: 'Explicit preferences and profile entries; conflicts are surfaced, never auto-resolved.',
+    kind: 'module',
   },
   {
     rowId: 'omb-reasoning',
@@ -80,6 +93,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Chain-of-thought quality',
     zhDescription: '八张方法卡与循环检测：让思考不偏长也不偏短。含常驻提示与按需拉取的 omb_method。',
     enDescription: 'Eight method cards plus loop detection; keeps reasoning neither too long nor too short.',
+    kind: 'module',
   },
   {
     rowId: 'omb-context',
@@ -88,6 +102,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Context optimization',
     zhDescription: '软压力档位与拉取式上下文：默认不主动推送，按需取回；含拉取台账与杀死判据。',
     enDescription: 'Soft pressure bands and pull-based context; includes a pull ledger and kill criteria.',
+    kind: 'module',
   },
   {
     rowId: 'omb-artifact',
@@ -96,6 +111,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Artifact index',
     zhDescription: '本会话产出文件的索引（路径/类型/时间），不注入上下文，只由 omb_files 按需读取。',
     enDescription: 'Index of session artifacts, read on demand by omb_files; never injected into context.',
+    kind: 'module',
   },
   {
     rowId: 'omb-notify',
@@ -104,6 +120,7 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Desktop notifications',
     zhDescription: '把少数值得打扰的事件推到宿主桌面通知，带节流与去重。宿主没装通知服务时全静默。',
     enDescription: 'Pushes a few noteworthy events to the host desktop notification service, throttled and deduplicated.',
+    kind: 'module',
   },
 ]
 

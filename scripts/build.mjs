@@ -192,7 +192,7 @@ function main() {
 function readComponentDisplay() {
   const source = readFileSync(join(ROOT, 'kernel', 'display.ts'), 'utf8')
   const entries = []
-  const block = /\{\s*rowId:\s*'([^']+)',\s*packageName:\s*'([^']+)',\s*zh:\s*'([^']*)',\s*en:\s*'([^']*)',\s*zhDescription:\s*'((?:[^'\\]|\\.)*)',\s*enDescription:\s*'((?:[^'\\]|\\.)*)',\s*\}/g
+  const block = /\{\s*rowId:\s*'([^']+)',\s*packageName:\s*'([^']+)',\s*zh:\s*'([^']*)',\s*en:\s*'([^']*)',\s*zhDescription:\s*'((?:[^'\\]|\\.)*)',\s*enDescription:\s*'((?:[^'\\]|\\.)*)',\s*(?:kind:\s*'([^']+)',\s*)?\}/g
   for (const match of source.matchAll(block)) {
     entries.push({
       rowId: match[1],
@@ -203,6 +203,8 @@ function readComponentDisplay() {
       en: match[4],
       zhDescription: match[5].replace(/\\'/g, "'"),
       enDescription: match[6].replace(/\\'/g, "'"),
+      // 缺省按 module：老条目没写 kind 时不该静默变形
+      kind: match[7] ?? 'module',
     })
   }
   if (entries.length === 0) {
@@ -309,9 +311,16 @@ function writeComponentPackages(entries, generation) {
  */
 function assertPatchRows(entries) {
   const yaml = readFileSync(PATCH_FILE, 'utf8')
-  const rows = [...yaml.matchAll(/- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'([^']+)'/g)]
+  // 几条都踩过的坑，改这个正则前先读：
+  // - **不能写成 `omb-[\w-]+`**：预设行是 `preset-omb`，不以 `omb-` 开头，
+  //   会被静默漏掉——护栏看不见它就等于没有护栏。
+  // - **必须限定缩进（这里 4 空格）**：预设的 `config.plugins:` 子项形状完全相同
+  //   （`- id: persona` + `name: '...'`），放宽就会出现"行 persona 在显示表里
+  //   没有对应组件"这种把配置项当插件行的误报。
+  // 所以：只按顶层缩进 + `id + name: '裸包名'` 的形状抓，随后用显示表核对。
+  const rows = [...yaml.matchAll(/^ {4}-\s*id:\s*([\w-]+)\s*\n\s*name:\s*'([^']+)'/gm)]
     .map(match => [match[1], match[2]])
-  if (rows.length === 0) throw new Error('[build] cordis.patch.yml 里没有可识别的 OMB 行')
+  if (rows.length === 0) throw new Error('[build] cordis.patch.yml 里没有可识别的行')
 
   const known = new Map(entries.map(entry => [entry.packageName, entry.rowId]))
   const declared = new Map()
@@ -323,6 +332,11 @@ function assertPatchRows(entries) {
         + '相对路径的行拿不到本地化元数据，"裸包名 + 子路径"宿主解析不了（见 cordis.patch.yml 顶部说明）。',
       )
     }
+    // **`@omb/` 之外的行是宿主包**（如预设行指向 `@deepseek-ai/dsh-agent-preset`）：
+    // 它们的元数据由宿主提供，不归我们管，所以只核对"我们自己那些包都有行"。
+    // 曾经为了给预设行加中文名而把它包成 `@omb/preset-omb`，结果那一行一直
+    // `pending`（宿主包在运行期才解析得到），**用可用性换显示名不值得**，已回退。
+    if (!name.startsWith('@omb/')) continue
     if (!known.has(name)) throw new Error(`[build] 行 ${id} 的 name「${name}」在 kernel/display.ts 里没有对应组件`)
     if (declared.has(name)) throw new Error(`[build] 行 ${id} 与 ${declared.get(name)} 指向同一个包 ${name}`)
     declared.set(name, id)
