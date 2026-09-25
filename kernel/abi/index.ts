@@ -54,6 +54,7 @@ export type {
   ServiceName,
   StatusContributor,
   StatusRegistry,
+  SecondaryChannelRegistry,
   ToolFactory,
 } from './catalog.js'
 export {

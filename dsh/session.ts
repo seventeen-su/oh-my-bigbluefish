@@ -18,7 +18,7 @@ import type {
   PromptContribution,
   SessionRef,
 } from '../kernel/abi/index.js'
-import { RESIDENT_HINT_MAX } from '../kernel/abi/index.js'
+import { RESIDENT_HINT_MAX, SERVICES } from '../kernel/abi/index.js'
 
 /** 宿主系统提示服务的最小结构面。 */
 export interface SystemPromptLike {
@@ -137,6 +137,42 @@ export interface SessionWiringOptions {
 }
 
 /**
+ * 从会话对象里取 cwd 并登记。
+ *
+ * 宿主形状：`Session.header.cwd`（`packages/core/session/src/types.ts:105`）。
+ * 取不到就**什么都不做**——记忆模块会如实报「宿主尚未告知该会话的 cwd」，
+ * 而不是猜一个路径（猜错会把记忆写到别人的项目库）。
+ */
+export function cwdOfSession(session: unknown): string | undefined {
+  const header = (session as { header?: unknown } | undefined)?.header
+  const fromHeader = pickString(header, 'cwd')
+  if (fromHeader !== undefined) return fromHeader
+  // 少数宿主形状把 cwd 直接挂在会话上
+  return pickString(session, 'cwd')
+}
+
+/**
+ * 登记会话的 cwd 到存储服务。
+ *
+ * 这是"按 cwd 惰性打开项目库"这条设计的**唯一**驱动点：
+ * 少了它，项目库永远不会被打开，"记忆随项目走"就不成立。
+ */
+export function rememberCwdFrom(
+  sessionId: string,
+  session: unknown,
+  stores: { rememberCwd(sessionId: string, cwd: string): void } | undefined = undefined,
+): string | undefined {
+  const cwd = cwdOfSession(session)
+  if (cwd === undefined) return undefined
+  try {
+    stores?.rememberCwd(sessionId, cwd)
+  } catch {
+    // 登记失败不影响会话；记忆会如实降级为"仅用户库"
+  }
+  return cwd
+}
+
+/**
  * 把提示注入接到宿主。
  *
  * 注册时机：**同步**完成（热插拔 H-2——宿主挂载审计只查一次，
@@ -237,7 +273,17 @@ export function wireSessionEvents(options: {
     const [session, event] = args
     const sessionId = pickString(session, 'id') ?? ''
     const type = pickString(event, 'type')
-    if (sessionId.length === 0 || type === undefined) return
+    if (sessionId.length === 0) return
+
+    // ① 会话的 cwd 是项目库身份的唯一来源。
+    //    没有这一步，`stores.forSession()` 永远走"未登记 cwd"分支、
+    //    只返回用户库，于是 `<cwd>/.omb/memory/` 在生产里永远不会被打开——
+    //    "记忆随项目走"这条设计等于没生效。会话头在 `session/event` 里可取到。
+    const stores = kernel.service<{ rememberCwd(sessionId: string, cwd: string): void }>(SERVICES.stores)
+    const cwd = rememberCwdFrom(sessionId, session, stores)
+    if (cwd !== undefined) sessions.remember(sessionId, cwd)
+
+    if (type === undefined) return
     const data = (event as { data?: unknown } | undefined)?.data
     switch (type) {
       case 'turn/start': {
@@ -285,6 +331,21 @@ export function wireSessionEvents(options: {
       evidenceHash: fingerprint('evidence', text.slice(0, 512)),
       at: kernel.clock.now(),
     })
+
+    // 拉取计数：**这是"拉取式设计"唯一的有效性证据**。
+    // 不接线的话台账永远是 0，而杀死判据（"拉取次数/轮次长期趋近 0 → 删除该视图"）
+    // 会把五个视图全部误判为待删除——把一条测量缺失变成一次错误决策。
+    const toolName = pickString(exec, 'name') ?? pickString(exec, 'toolName') ?? ''
+    if (toolName.length > 0) {
+      try {
+        kernel
+          .service<{ recordPull?(tool: string, session: string): void }>(SERVICES.contextMetrics)
+          ?.recordPull?.(toolName, sessionId)
+      } catch {
+        // 计量失败不得影响会话
+      }
+    }
+
     try {
       onToolResult?.({ sessionId, text, callId })
     } catch {
