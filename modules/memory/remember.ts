@@ -96,7 +96,43 @@ export interface AdmissionInput {
    * 给了就**核对**"用户是不是真的这么说过"；没给则只能记为"自报未核对"。
    */
   readonly userMessage?: string
+  /**
+   * **工件存在的核验器**：给定一个"看起来像工件"的候选串，回答它是不是真的存在。
+   *
+   * ## 为什么必须有它
+   *
+   * 判据原本只做**形态匹配**——于是字段名叫 `reproducible-artifact`（可复现），
+   * 实际却只验"长得像文件名"。自检报告的负对照当场打穿：
+   *
+   * ```
+   * 引用 does-not-exist-9f3a.json        → 通过并落库
+   * 结论记在 totally-made-up.md 里       → 通过并落库
+   * ```
+   *
+   * **编造的工件与真实工件得到同一个准入结论**，那这道闸门就只是一种措辞。
+   *
+   * ## 契约
+   *
+   * - 返回 `true` = 核验通过（工件确实存在）
+   * - 返回 `false` = 核验不通过（不存在）
+   * - 返回 `undefined` = **这个候选核验不了**（例如 URL 需要联网、命令需要执行）。
+   *   调用方按**保守**处理：核验不了就不算依据——宁可让用户补一个可核验的引用，
+   *   也不要收下一条引用不存在工件的事实。
+   * - 不给这个核验器时：**文件类工件一律不算依据**（fail closed）。
+   *   纯函数测试只需传 `() => true` 即可覆盖"通过"分支。
+   */
+  readonly verifyArtifact?: (candidate: string, kind: ArtifactKind) => boolean | undefined
+  /**
+   * `sourceRef` 是不是**调用方显式给的**（而不是工具自动生成的 `session:<uuid>#turn-N`）。
+   *
+   * 只有显式来源才可能是"可复现工件"：自动生成的那个是内部标识符，
+   * 拿它当依据等于让工具给自己发合格证——那个假阳性修过一次，不要再打开。
+   */
+  readonly sourceRefExplicit?: boolean
 }
+
+/** 工件类别。只有**可核验**的类别才可能成为准入依据。 */
+export type ArtifactKind = 'path' | 'command' | 'url' | 'hash' | 'version' | 'line'
 
 export type AdmissionDecision =
   | {
@@ -126,9 +162,23 @@ export type AdmissionDecision =
  * 教训：`sourceRef` 是**溯源**（这条从哪来），不是**可复现工件**（这条凭什么能被验证）；
  * 拿它当依据等于让工具自己给自己发合格证。
  */
-const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: string }[] = [
-  { pattern: /(?:^|[\s("'`])[A-Za-z]:\\/, label: 'Windows 路径' },
-  { pattern: /(?:^|[\s("'`])(?:\.{0,2}\/)[\w.-]+\//, label: '文件路径' },
+const ARTIFACT_MARKERS: readonly {
+  readonly pattern: RegExp
+  readonly label: string
+  readonly kind: ArtifactKind
+  /**
+   * **能不能核验存在**。
+   *
+   * `true` 的类别必须经 `verifyArtifact` 核验通过才算依据——否则
+   * "命中文件名"这种理由会把编造的文件名也收进来（自检报告实测打穿过）。
+   *
+   * `false` 的类别只在**原位出现**时才算线索（命令里有可执行名与参数、
+   * 版本号有具体数字），它们不是"存在性"声明，无法也无需核验文件系统。
+   */
+  readonly verifiable: boolean
+}[] = [
+  { pattern: /(?:^|[\s("'`])[A-Za-z]:\\/, label: 'Windows 路径', kind: 'path', verifiable: true },
+  { pattern: /(?:^|[\s("'`])(?:\.{0,2}\/)[\w.-]+\//, label: '文件路径', kind: 'path', verifiable: true },
   /**
    * 行号。**判据只认三种无歧义形态，且必须排在「文件名」之前**。
    *
@@ -140,23 +190,24 @@ const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: str
    * - **假阴性**：真正的 `src/index.ts:120` **不**命中（`ts:120` 里 `:` 前是字母，
    *   `\b` 不成立）。它漏掉了自己本来要认的那一种。
    *
-   * 为什么排在「文件名」之前：`ARTIFACT_MARKERS.find()` 取**第一个**命中，
-   * 而 `remember.ts:137` 同时命中「文件名」与「行号」。行号更具体、更接近"可核对"，
-   * 理应优先；否则回执会报一个比实际证据更弱的理由。
-   *
-   * 宁可漏：漏了补个 `#L120` 就能过；错收是把与"可复现"无关的内容当成有实据。
+   * 行号依赖被引用的文件存在，所以归入可核验类：`verifyArtifact` 拿到的候选是
+   * 被引用的文件名，存在才算数。
    */
   {
     pattern:
       /#L\d+|\bline\s*\d+\b|\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|yml|yaml|toml|ini|py|go|rs|java|kt|sql|sh|ps1|css|html|txt|csv):\d+\b/,
     label: '行号',
+    kind: 'line',
+    verifiable: true,
   },
   {
     pattern:
       /\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|yml|yaml|toml|ini|py|go|rs|java|kt|sql|sh|ps1|css|html|txt|csv)\b/,
     label: '文件名',
+    kind: 'path',
+    verifiable: true,
   },
-  { pattern: /https?:\/\/\S+/, label: 'URL' },
+  { pattern: /https?:\/\/\S+/, label: 'URL', kind: 'url', verifiable: false },
   /**
    * 提交哈希。**不能用裸 `\b[0-9a-f]{7,40}\b`**：UUID 的每一段（8 位十六进制）
    * 都符合，于是任何自动生成的 `session:<uuid>` 溯源都会命中——实测就是这样
@@ -164,22 +215,22 @@ const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: str
    *
    * 而且**形态上无法区分**裸短哈希与标识符片段：
    * `a1b2c3d4`（短哈希）与 `mem_muhg9mlv_1_3c6bf8ae` 的尾段长得一模一样。
-   * 所以短哈希一律要求**显式语境**；只有 ≥12 位才认裸写
-   * （12 位以上就不是 UUID 段或常见 id 尾段了）。
-   *
-   * 取舍是**宁可漏，不错收**：漏了只是让用户补个 `commit:` 前缀重写；
-   * 错收的代价是假事实进库，并被后续会话当成有效结论召回——那比漏更贵。
+   * 所以短哈希一律要求**显式语境**；只有 ≥12 位才认裸写。
    */
   {
     pattern:
       /\b[0-9a-f]{40}\b|\b(?:commit|hash|sha|revision)\W{0,3}[0-9a-f]{7,40}\b|@[0-9a-f]{7,40}\b|\b[0-9a-f]{12,40}\b/i,
     label: '提交哈希',
+    kind: 'hash',
+    verifiable: false,
   },
-  { pattern: /\bv?\d+\.\d+(?:\.\d+)*\b/, label: '版本号' },
+  { pattern: /\bv?\d+\.\d+(?:\.\d+)*\b/, label: '版本号', kind: 'version', verifiable: false },
   {
     pattern:
       /\b(?:pnpm|npm|yarn|npx|node|git|docker|kubectl|curl|cargo|go|python|pip|pytest|tsc|vitest|eslint|make)\b\s+[\w./-]+/,
     label: '可复现命令',
+    kind: 'command',
+    verifiable: false,
   },
 ]
 
@@ -286,14 +337,64 @@ export function decideAdmission(input: AdmissionInput): AdmissionDecision {
   // 可复现工件（这条凭什么能被验证）。把它算进判据，等于让工具用自己自动生成的
   // `session:<uuid>#turn-N` 给自己发合格证——实测就是这样把一句模糊感想收下的
   // （UUID 的一段 8 位十六进制命中了"提交哈希"）。
-  const marker = ARTIFACT_MARKERS.find(candidate => candidate.pattern.test(trimmed))
-  if (marker !== undefined) {
-    return {
-      ok: true,
-      ground: 'reproducible-artifact',
-      assertedBy: 'model',
-      verification: 'not-user',
-      reason: `可由具体工件复现（命中${marker.label}）`,
+  //
+  // **可核验的类别必须真的核验通过**。只做形态匹配时，编造的文件名与真实文件名
+  // 得到同一个结论——自检报告的负对照当场打穿（`does-not-exist-9f3a.json` 被收下）。
+  // 那时"可复现"只是措辞。
+  for (const candidate of ARTIFACT_MARKERS) {
+    const hit = candidate.pattern.exec(trimmed)
+    if (hit === null) continue
+
+    if (!candidate.verifiable) {
+      // 命令/版本号/哈希/URL：不是"存在性"声明，无法也无需核验文件系统。
+      return {
+        ok: true,
+        ground: 'reproducible-artifact',
+        assertedBy: 'model',
+        verification: 'not-user',
+        reason: `可由具体工件复现（命中${candidate.label}）`,
+      }
+    }
+
+    const probe = input.verifyArtifact
+    const verified = probe === undefined ? undefined : probe(hit[0], candidate.kind)
+    if (verified === true) {
+      return {
+        ok: true,
+        ground: 'reproducible-artifact',
+        assertedBy: 'model',
+        verification: 'not-user',
+        reason: `可由具体工件复现（${candidate.label} ${hit[0]} 已核验存在）`,
+      }
+    }
+    // **核验不过或核验不了，就换下一个类别**：正文里可能同时出现一个编造的文件名
+    // 与一个真实的 URL。全部都不成立时才弃权。
+    //
+    // 这里**不**因为"看到了文件名却不存在"就直接判否：文本里出现一个假文件名
+    // 不等于整条陈述是假的。但**它绝不能成为准入依据**——这正是原来的漏洞。
+  }
+
+  // ②b `sourceRef` **显式给出且指向真实工件**时，它本身就是溯源依据。
+  //
+  // 这条补的是一个真实的操作摩擦：用户按工具描述给出
+  // `sourceRef=D:\...\build-generation.json`，正文里没有任何工件形态，
+  // 于是被拒——而那个文件**确实存在**，溯源是成立的。
+  //
+  // 与 ② 的分工很关键：② 看**正文**（陈述自己说了什么工件），这里看**来源**
+  // （这条陈述是从哪来的）。两者都要求"真实存在"，所以都不会被编造的字符串骗过。
+  // 注意**只认调用方显式给的**：工具自动生成的 `session:<uuid>#turn-N` 不是工件，
+  // 把它算进来就是让工具给自己发合格证（那个漏洞修过，见 ARTIFACT_MARKERS 注释）。
+  if (input.sourceRefExplicit === true) {
+    const probe = input.verifyArtifact
+    const verified = probe === undefined ? undefined : probe(input.sourceRef, 'path')
+    if (verified === true) {
+      return {
+        ok: true,
+        ground: 'reproducible-artifact',
+        assertedBy: 'model',
+        verification: 'not-user',
+        reason: `可由具体工件复现（来源 ${input.sourceRef} 已核验存在）`,
+      }
     }
   }
 
@@ -426,6 +527,17 @@ export interface MemoryWriteDeps {
   readonly lastUserMessage?: () => string | undefined
   /** 当前项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
   readonly currentProject?: () => string | undefined
+  /**
+   * **工件存在性核验**（准入判据的"可复现"靠它）。
+   *
+   * 判据自己做不了这件事：它是纯函数，不碰文件系统。而只做形态匹配的后果实测过——
+   * `does-not-exist-9f3a.json` 这种编造的文件名与真实文件名得到同一个准入结论，
+   * 字段却叫 `reproducible-artifact`。
+   *
+   * 缺省时**文件类工件一律不算依据**（fail closed）：宁可让用户补一个可核验的引用，
+   * 也不要收下一条引用不存在工件的事实。
+   */
+  readonly verifyArtifact?: (candidate: string, kind: ArtifactKind) => boolean | undefined
   /**
    * 库未就绪时的可读原因（来自 `stores.status()`），拼进错误文本。
    */
@@ -707,6 +819,9 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           sourceRef: sourceRef ?? '',
           claimedUserAssertion: input.userAsserted === true,
           ...(deps.lastUserMessage?.() === undefined ? {} : { userMessage: deps.lastUserMessage?.() }),
+          ...(deps.verifyArtifact === undefined ? {} : { verifyArtifact: deps.verifyArtifact }),
+          // 自动生成的来源（`session:<uuid>#turn-N`）不算工件；显式给的才算。
+          sourceRefExplicit: input.sourceRef !== undefined && input.sourceRef.length > 0,
         })
 
         if (!decision.ok) {

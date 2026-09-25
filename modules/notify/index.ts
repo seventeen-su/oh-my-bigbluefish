@@ -8,9 +8,10 @@
  */
 import { z } from 'zod'
 import type { Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
+import type { StatusContributor, StatusRegistry } from '../../kernel/abi/index.js'
 import { SERVICES } from '../../kernel/abi/index.js'
 import type { DesktopNotifyLike, NotifyUrgency } from './bridge.js'
-import { DEFAULT_NOTIFY_SESSION, NotifyBridge } from './bridge.js'
+import { DEFAULT_NOTIFY_SESSION, NOTIFY_SESSION_LIMIT, NOTIFY_THROTTLE_MS, NotifyBridge } from './bridge.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const NOTIFY_MODULE_ID = 'omb-notify'
@@ -63,7 +64,13 @@ export interface NotifyService {
 }
 
 export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
-  let bridge: NotifyBridge | undefined
+  function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+let bridge: NotifyBridge | undefined
+/** 状态面登记的注销函数；dispose 时必须调，否则热插拔会留下悬空段落。 */
+let statusUnregister: (() => void) | undefined
   let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
 
   /** 同步健康函数：既能进清单，也能直接 `report`（清单的 health 允许返回 Promise）。 */
@@ -120,6 +127,55 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
       }
 
       const unprovide = kernel.provide(NOTIFY_SERVICE, service)
+
+      // ── 状态面自述 ────────────────────────────────────────────────────────
+      //
+      // **降级时更需要这一节**：自检报告指出过「整个状态面里 `omb-notify`
+      // 没有独立的『组件自述』段」——因为宿主没装通知服务，它只在模块行出现一次，
+      // 而那一次的信息量不足以回答「通知到底接上了没有、发了几条、抑制了几条」。
+      //
+      // "没接上"本身就是要看的信息，不该因为没接上就整节消失。
+      const statusContributor: StatusContributor = {
+        name: '桌面通知（omb-notify）',
+        render: (): string => {
+          try {
+            const status = created.status()
+            const lines = [status.detail]
+            if (status.available) {
+              lines.push(
+                `已发 ${status.sent} 条、抑制 ${status.suppressed} 条`
+                + `（抑制 = 被节流/去重/超上限/宿主拒绝；最近一次原因：${status.lastReason ?? '无'}）`,
+              )
+            } else {
+              // 不可用时这三个数**没有意义**——它们是"没测到"，不是"测到 0"。
+              lines.push('已发/抑制：不可测（服务未接上，这两个计数不会被更新——不是 0）')
+            }
+            lines.push(`节流：同类型 ${NOTIFY_THROTTLE_MS / 60000} 分钟 1 条、同会话内同内容只发一次、单会话上限 ${NOTIFY_SESSION_LIMIT} 条`)
+            return lines.join('\n')
+          } catch (error) {
+            return `渲染失败：${messageOf(error)}`
+          }
+        },
+        metrics: (): Readonly<Record<string, number>> => {
+          try {
+            const status = created.status()
+            return { available: status.available ? 1 : 0, sent: status.sent, suppressed: status.suppressed }
+          } catch {
+            return { renderError: 1 }
+          }
+        },
+      }
+      try {
+        const registry = kernel.service<StatusRegistry>(SERVICES.statusContributor)
+        if (registry === undefined) {
+          kernel.logger.warn(`${NOTIFY_MODULE_ID}：未找到状态面登记处，本模块段落不会出现在 omb_status`)
+        } else {
+          statusUnregister = registry.register(statusContributor)
+        }
+      } catch (error) {
+        kernel.logger.warn(`${NOTIFY_MODULE_ID}：状态面登记失败——${messageOf(error)}`)
+      }
+
       /**
        * 健康转变跟踪：**只在"非 failed → failed"的转变时打扰**。
        * 首次看到某模块的健康时只记录（那是启动结果，管理页已经显示了），
@@ -152,6 +208,8 @@ export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
         }
         try {
           unprovide()
+      statusUnregister?.()
+      statusUnregister = undefined
         } catch (error) {
           kernel.logger.warn(`通知：注销服务失败（已隔离）——${String(error)}`)
         }

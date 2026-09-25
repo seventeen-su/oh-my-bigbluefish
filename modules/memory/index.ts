@@ -25,9 +25,14 @@ import type {
   ToolDefinition,
 } from '../../kernel/abi/index.js'
 import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
+// 准入判据要**真的核验工件存在**，所以记忆模块必须碰文件系统。
+// 这是有意为之：只做形态匹配时，编造的文件名会与真实文件名得到同一个准入结论。
+import { existsSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import { asMemoryStore, createStoresService, type MemoryStoresService } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
+import type { ArtifactKind } from './remember.js'
 import { createRememberTool } from './remember.js'
 import type { RetrievalChannel } from './retrieve.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
@@ -307,6 +312,41 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           currentProject: () =>
             lastActiveSession === null ? undefined : service.peek(lastActiveSession)?.projectScope ?? undefined,
           degradeReason: () => service.failure(),
+          /**
+           * 工件存在性核验——准入判据里"可由具体工件复现"**真的去核验**。
+           *
+           * 判据本身是纯函数，碰不了文件系统；而只做形态匹配的后果实测过：
+           * 编造的 `does-not-exist-9f3a.json` 与真实文件名拿到同一个准入结论，
+           * 字段却叫 `reproducible-artifact`。**名不副实的闸门等于没有闸门。**
+           *
+           * 这里按语义解析相对路径，主查 cwd，再退项目根（`currentProject`）。
+           * 只做同步 `existsSync`：一次系统调用，准入路径上可接受。
+           * 任何异常都返回 `undefined`（=核验不了 → 不算依据），绝不抛。
+           */
+          verifyArtifact: (candidate: string, kind: ArtifactKind) => {
+            if (kind !== 'path' && kind !== 'line') return undefined
+            try {
+              // 行号的候选形如 `src/index.ts:120` / `index.ts#L120`：剥掉行号部分
+              const bare = candidate
+                .replace(/#L\d+$/, '')
+                .replace(/:\d+$/, '')
+                .trim()
+              if (bare.length === 0) return undefined
+              const bases = [process.cwd()]
+              const project = lastActiveSession === null
+                ? undefined
+                : service.peek(lastActiveSession)?.projectScope
+              if (project !== undefined && project !== null && project.length > 0) bases.push(project)
+              for (const base of bases) {
+                const full = isAbsolute(bare) ? bare : join(base, bare)
+                if (existsSync(full)) return true
+              }
+              return false
+            } catch {
+              // 核验不了 ≠ 核验通过：保守返回 undefined，让它不构成依据
+              return undefined
+            }
+          },
           /**
            * `memory/written` 是**向量落盘的唯一触发源**：embed-dev 订阅它做批量编码。
            * 在 put 成功之后发；订阅者异常由事件总线隔离，`emit` 自身也不会抛。

@@ -122,14 +122,20 @@ describe('buildStatusPanel：拉取计数（杀死判据可见）', () => {
     expect(panel.metrics.pullTurnsKnown).toBe(1)
   })
 
-  it('轮数不足 → 不给"待删除视图"、也不给零拉取清单（样本不够就不装懂）', () => {
+  it('轮数不足 → 不给"待删除视图"、不下"该删"结论（样本不够就不装懂）', () => {
     const panel = buildStatusPanel({ pulls: pullsAfter({ omb_recall: 2 }, 3) })
     const text = renderStatusPanel(panel)
     expect(text).toContain('本会话拉取 2 次 / 3 轮')
     expect(text).toContain('轮数不足')
     expect(text).toContain('暂不下删除结论')
     expect(text).not.toContain('待删除视图')
-    expect(text).not.toContain('零拉取视图')
+    // **字段本身仍要出现**，只是内容写"暂不判定"。
+    //
+    // 原先"为空就整行不渲染"，于是读者无法分辨"没有可删的"与"根本没统计"
+    // ——自检报告正是这么记的：「返回里没有『零拉取视图』字段」。
+    // **空集与缺字段是两件事。**
+    expect(text, '字段必须出现，内容说明为什么不判定').toContain('零拉取视图：（暂不判定')
+    expect(text, '轮数不足时不得给出可删名单').not.toContain('零拉取视图：omb_')
     expect(panel.metrics.deadViews).toBe(0)
     expect(panel.metrics.pullTurnsKnown).toBe(1)
   })

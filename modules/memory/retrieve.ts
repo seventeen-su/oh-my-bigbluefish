@@ -728,6 +728,16 @@ function emptyStats(k: number): RetrieveStats {
 /**
  * 一句话结论。**"被取代"必须出现在这里**：
  * 零命中既可能是"没有这段记忆"，也可能是"有过结论、已被推翻"——两者对后续会话的含义完全相反。
+ *
+ * ## 为什么写清"通道"的口径
+ *
+ * 自检报告提过一个合理疑问：「召回头部通道数从首次的『已查询 2 个库、**4 个通道**』
+ * 变为后续的『**1 个通道**』，插件未解释该数字含义，我无法判断是"命中通道数"
+ * 还是"启用通道数"」。
+ *
+ * 答案是**参与本次排序的通道数**（注册表里当时可用的），不是"命中了几个通道"。
+ * 数字会变是因为通道注册是异步的：向量通道装载完成的那一刻它才加入。
+ * 这个口径必须写出来——否则读者只能猜，而"猜"正是状态面最该消灭的东西。
  */
 function buildNote(
   storeCount: number,
@@ -739,10 +749,11 @@ function buildNote(
     supersededSkipped > 0
       ? `；另有 ${supersededSkipped} 条相关记忆因**已被取代**而未注入（它们不是有效结论；历史痕迹用 omb_relate 追）`
       : ''
+  const channels = `${rankingCount} 个通道（本次参与排序的通道数，不是命中数；向量通道异步装载，装载完成前不计入）`
   if (hitCount === 0) {
-    return `已查询 ${storeCount} 个库、${rankingCount} 个通道，零命中（一等结果，不是错误）${overturned}`
+    return `已查询 ${storeCount} 个库、${channels}，零命中（一等结果，不是错误）${overturned}`
   }
-  return `已查询 ${storeCount} 个库、${rankingCount} 个通道，注入 ${hitCount} 条（逐字 + 溯源）${overturned}`
+  return `已查询 ${storeCount} 个库、${channels}，注入 ${hitCount} 条（逐字 + 溯源）${overturned}`
 }
 
 /**
