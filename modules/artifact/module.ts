@@ -16,6 +16,7 @@ import type { ToolDefinition } from '../../kernel/abi/index.js'
 import type { ArtifactEntry, ArtifactKind } from './index.js'
 import { ARTIFACT_DEFAULT_MAX, ARTIFACT_TOP_MAX, ArtifactIndex } from './index.js'
 import { createFilesTool } from './tools.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const ARTIFACT_MODULE_ID = 'omb-artifact'
 /** 服务名取 ABI 契约（不是本地约定）。 */
@@ -148,4 +149,4 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
 
 export const artifactModule = createArtifactModule()
 
-export default artifactModule
+export default toHostPlugin(artifactModule)

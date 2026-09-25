@@ -30,6 +30,7 @@ import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createRememberTool } from './remember.js'
 import type { RetrievalChannel } from './retrieve.js'
+import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
 export const MODULE_ID = 'omb-memory'
@@ -361,4 +362,4 @@ export function readMemoryConfig(kernel: Kernel): MemoryConfig {
 /** 默认注册项：宿主端口经 `STORAGE_HOST_SERVICE` 解析。 */
 export const registration = createMemoryRegistration()
 
-export default registration
+export default toHostPlugin(registration)
