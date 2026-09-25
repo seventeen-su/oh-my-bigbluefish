@@ -122,6 +122,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       return off
     },
     service: <T,>(name: string) => services.get<T>(name),
+    services: () => services.names(),
     emit: <E extends ModuleEventName>(event: E, payload: ModuleEvents[E]) => {
       if (disposed) return
       bus.emit(event, payload)
