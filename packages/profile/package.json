@@ -7,9 +7,9 @@
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g48/index.js",
+  "main": "./lib-gen/g49/index.js",
   "exports": {
-    ".": "./lib-gen/g48/index.js",
+    ".": "./lib-gen/g49/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"
