@@ -1,67 +1,165 @@
-# Oh-My-Bigbluefish
+# Oh-My-BigBlueFish (OMB v3)
 
-基于DeepSeek Harness的综合插件，通过统一的认知增强系统，为大模型提供动态的任务分析、上下文优化、技能统合、工具调用与验证的能力。采用恢复根、内外双核分层架构等底层框架，支持虚拟化沙盒、版本控制、深度记忆、迭代共享，使模型能够以较低的上下文与计算开销持续积累经验并改进自身处理流程。
+DSH 的**通用认知增强插件**：让模型想得更准、记得更久、上下文更省。
 
-## ⚠️ 实验性警告（使用前必读）
+不是编程专用——生活、情感陪伴、闲聊、一次性提问同样适用。三个组件都按"通用"
+设计，没有任何一个依赖代码库、任务类型或领域词汇。
 
-本插件是**实验性**的，会主动修改运行环境，进而影响DSH历史会话，其可能会造成严重的加载错误，请勿在实际生产环境中使用。
+## 三个组件
 
-## 功能一览
-
-- **认知投影与运行时契约**：每轮注入工作状态/记忆候选/认知过程 + 三层运行时契约（固定契约 → 动态能力行 → omb-runtime 技能渐进层）。
-- **三线版本切换**：`initial | stable | latest` 三线承载版本化策略/过程，`/mode` 与 `kern_switch` 切换，ls-tree 物化快照、启动自动初始化/修复/旧种子迁移。
-- **记忆与跨项目画像**：SQLite+FTS5 记忆库、六阶段检索（覆盖链 Session→Project→Global）；`kern_profile` 写入用户画像（Global 跨项目可检索）、`kern_memory` 读取。
-- **自演化与候选晋升**：信号 → 判定 → 候选管线（G1 结构 / G2 跳过 / G3 基准回放 / G3-exec 执行 / G4 shadow）→ trusted-latest 推进 + stable 晋升门禁（三层信号 + 验证契约信任门禁 fail-closed）。
-- **统一验证契约**：PASS/FAIL/UNKNOWN 三态（UNKNOWN 合法终态）、hard 约束不可被 LLM judge 覆盖、VerifierTrust L0-L4、防循环自证、数据面四库（事实/基线/任务/验证器）、验证债务队列。
-- **维护调度**：ROI 排序维护队列、债务语义（成功清偿/失败保留/中断累计）、请求间隙小量子、S2 观测数据化；队列与债务**跨重启同源**（`queue.json` 重建执行体），关停真正排空（等静默点而非只等标志）。
-- **修复系统**：损坏六分类 + 七类对象契约化重验证 + 真实验证执行器 + 处置语义（降级/隔离/保持怀疑/清除存疑）。
-- **kern 工具**：`kern_status` / `kern_bench` / `kern_evolve` / `kern_switch` / `kern_memory` / `kern_profile`等。
-- **制品索引**：事件驱动发现（`tool/result` → 路径提取 → manifest），上下文候选含最近制品。
-- **跨平台受限执行**：候选验证的执行型门（G3-exec）在 Windows 走受限令牌、Linux/macOS 走 bubblewrap 或 Node 权限模型；通道可用性经**真实自检**确认，通道不可用时缺省拒绝该候选晋升（`evolve.policy.candidate_gate.require_execution_verification`）。
-- **桌面通知（可选）**：宿主装了 `dsh-desktop-notify` 时，只对少数"值得打扰"的事件出声（内核未加载/启动回退/晋升回退/债务 critical/组件健康异常），带节流与去重。
-- **神经向量检索（可选）**：接入 BGE-small-zh-v1.5（ONNX，512 维）做中文语义检索——同义改写与跨语言查询能召回哈希词袋召不回的记忆。权重不进仓库，用 `pnpm fetch-embedding-model` 获取；未装权重时**诚实降级**回纯 JS 哈希词袋，状态面写明原因。
-
-## 架构说明
-
-- 实际施工架构：`docs/architecture.md`（分层、三线版本、记忆、演化、验证契约、维护、修复、工具面、数据落盘）。
-- **§15 开放问题解决记录**：本地未入库问题清单的逐条落地与**取向理由**（含"明确不在本仓库范围内的一层"）。
-
-## 安装插件
-
-1. **位置**：克隆到 `$DSH_HOME/.agent-presets/oh-my-bigbluefish/`（目录名即 preset id，须匹配 `^[a-z0-9][a-z0-9-]*$`）。`versions.git/`、`stable/`、`latest/`、`workspace/.omb/` 均 gitignored，首次启动自动初始化三线布局。
-2. **挂载**：仓库根自带全量组合 `agent.cordis.yml`（standard 工具面 + `omb-v2` 认知行，`name: './lib/runtime/plugin.js?v=15'`）；克隆后 `pnpm install && pnpm build`（`lib/` 为编译产物）。修改源码重新 build 后须递增 `?v=N` 或重启宿主。
-3. **生效**：重启 DSH，新建会话选择「大肥鱼模式 v2」。验证：
-   - `/bench` → 冻结基准（回放或真实执行）；
-   - `kern_status` → 版本线/快照哈希/维护债务/信号数/组件健康；
-
-> **ACL 提醒（三线只读）**：三线布局（`versions.git/` + `stable/` + `latest/`）由启动时自动初始化并施加**只读 ACL**（架构要求：`stable/`、`latest/` 仅 `Everyone:RX`——实现用 well-known SID `*S-1-1-0`，免本地化名称解析，非英文 Windows 同样可用）。拷贝/检出会丢失 ACL，启动时自动重新施加。若遇 `EPERM`/`EACCES` 等权限错误，先检查 `stable/`、`latest/` 的 ACL，排障可 `pnpm init-three-line` 重新初始化。**卸载前必须先解除只读 ACL**：`icacls <项目根>\stable /reset /T /C` 与 `icacls <项目根>\latest /reset /T /C`，否则目录删除被拒（详见下文「卸载」）。
-
-## 构建与测试
-
-- `pnpm build`（tsc → `lib/`）、`pnpm test`（vitest）、`pnpm typecheck`、`pnpm lint`。
-- 工具脚本：`pnpm init-three-line`（三线布局初始化/修复兜底）、`pnpm deploy-lines`（部署 per-line 后备预设，可选）。
-- `pnpm fetch-embedding-model`：获取神经嵌入权重（BGE-small-zh-v1.5 ONNX 量化版，约 23MB）到 `<preset>/workspace/.omb/models/`。
-  - 中国大陆网络可加镜像：`OMB_MODEL_MIRROR=https://hf-mirror.com pnpm fetch-embedding-model`。
-  - 幂等：按上游 sha256 校验，已就绪则跳过；下载不完整或校验失败会删除半份文件并报错。
-  - 可选参数：`--dir <目录>`（自定义位置，配合配置项 `embeddingModelDir` 或环境变量 `OMB_EMBEDDING_MODEL`）、`--variant fp32`（未量化版，质量略高、约 90MB）。
-  - 还需要推理运行时 `onnxruntime-node`（**optionalDependency**，解包约 296MB——只想用哈希词袋的部署不必装）：`pnpm add -O onnxruntime-node@1.29.0 --fetch-timeout 1800000 --fetch-retries 5`。脚本结束时会探测并提示。
-
-### 神经嵌入的配置面
-
-| 键 | 作用 | 缺省 |
+| 组件 | 做什么 | 关掉会怎样 |
 | --- | --- | --- |
-| `embeddingModelDir` | 权重目录绝对路径 | 按 `OMB_EMBEDDING_MODEL` → `<数据根>/models/bge-small-zh-v1.5/` 探测 |
-| `embeddingThreads` | ONNX 推理线程数（1~64） | `2`；本地小机可设 `1` 避免与主对话抢核 |
-| `debug` | 打印布局初始化/修复、启动回退等诊断行 | `false`（静默）；等价环境变量 `OMB_DEBUG=1` |
+| **思维链质量** | 八张方法卡（`omb_method` 按需拉）、循环检测、三档推理深度（`omb_focus`） | 模型仍能答，但思考长度失控与反复绕圈不会被提示 |
+| **记忆库** | 双库长期记忆、逐字召回（`omb_recall`）、多跳关联（`omb_relate`）、写入准入（`omb_remember`）、硬删除（`omb_forget`） | 每轮从零开始，跨会话经验丢失 |
+| **上下文优化** | 软压力档位、拉取式上下文、拉取台账与杀死判据 | 上下文只增不减 |
 
-三个键都可在 `agent.cordis.yml` 的 `config` 下配置；非法值只记降级、不阻断加载。未装权重时向量通道自动回落哈希词袋（功能仍可用，语义能力弱），原因见 `kern_status` 的状态面。
+另有三个小件：**制品索引**（`omb_files`，只记路径不注入）、**用户画像**（显式偏好，
+冲突只呈现不裁决）、**桌面通知**（可选，宿主装了才生效）。
 
-> `debug` **只控制终端输出**：降级记录与 `kern_status` 状态面任何时候都如实暴露，静音不会让故障变得不可见。之所以默认关闭，是因为"启动回退时 worktree 同步失败"在只读 worktree 的设计下是预期结果，打印出来会被误读成故障。
+### 设计上的几个取舍
 
-## 卸载
+- **没有每回合 token 上限**：只有软压力档位（宽松 <0.3 / 适中 0.3–0.6 / 紧张 ≥0.6）。
+  档位切换**行为**，不丢内容；被推迟的内容随时可按需取回。
+- **拉取式优先**：常驻提示只有一句（当前约 70 字符，承"先判断这个问题值多少思考"
+  这一动作，上限 120），其余全部按需拉取。默认不往上下文里塞东西。
+- **记忆逐字返回**：不做有损抽取。逐字原文 + 溯源（`sourceRef` + 时间）比摘要更可靠，
+  也便于判断证据新旧。
+- **写入有准入**：用户明确说过的原话、可由具体工件复现的事实、被执行结果确认过的结论
+  才写。模糊印象与推测会被拒绝并给出原因，弃权率记入状态面。
+- **冲突只呈现**：发现两个来源矛盾时不替你选择，把两条都摆出来。
+- **一切降级都可见**：没有静默失效。`omb_status` 随时告诉你哪个组件降级、为什么。
 
-先释放只读 ACL（`icacls <根>\stable /reset /T /C`、`icacls <根>\latest /reset /T /C`），再删除项目目录即可。
+### 桌面通知的协议（对齐 dsh-desktop-notify 1.5.4）
+
+宿主装了 [`dsh-desktop-notify`](https://github.com/Mvyvn/dsh-desktop-notify) 时，
+OMB 通过它注册的 Cordis 服务 `desktopNotify` 推送。**载荷是对象**：
+
+| 方法 | 行为 |
+| --- | --- |
+| `push({…})` | 走聚焦门控：只有"你正在看的那个会话"被静默 |
+| `pushAlways({…})` | 绕过门控，始终推送 |
+| `notify({…})` | 同上但返回明细 `{ ok, queued, silenced, reason }` |
+
+| 字段 | 约束 |
+| --- | --- |
+| `title` | **必填**。为空时对方一律拒绝并返回 `false` |
+| `message` | 上限 400 字符（标题 160），超出由对方截断且不切断代理对 |
+| `urgency` | `'low' \| 'normal' \| 'critical'`，缺省 `normal` |
+| `sessionId` | 可传会话对象/id/数组；**传了才按会话门控**，不传则始终推送 |
+| `url` | 点击要打开的地址，只接受 http/https |
+
+**返回值必须检查**：对方在标题为空、聚焦门控静默、1.5 秒同文案去重、或当前平台
+没有通知后端时都返回 `false`。OMB 因此把 `false` 记为"被抑制"并写明原因——
+早期实现不看返回值，于是"一条都没发出去"被记成"已发 N 条"，状态面在骗人。
+
+OMB 自己另加三条抗噪约束（`modules/notify/bridge.ts`）：同类型 30 分钟一次、
+同会话内同内容只发一次、单会话上限 10 条。会话门控交给对方，不重复实现。
+
+当前推送的种类只有一个：**模块运行中失败**（`ok → failed` 的转变，默认关闭，
+配置 `notifyModuleFailures: true` 开启）。启动期的健康结果不推送——管理页已经显示了。
+
+## 安装
+
+作为**插件包**安装（不是 Agent 预设；预设内不含任何 OMB 认知行，因此所有模式都能用）：
+
+```
+plugin_manager install_bundle <本仓库绝对路径>
+```
+
+安装后 OMB 的行出现在 profile 根层，插件页可逐行开关。
+
+### 目录位置
+
+| 数据 | 位置 |
+| --- | --- |
+| 用户库（跨项目） | `$DSH_HOME/.omb/memory/knowledge.db` |
+| 项目库（随 cwd） | `<cwd>/.omb/memory/session.db` |
+| 构建代数 | `build-generation.json` |
+| 产物 | `lib-gen/g<N>/`（不入库） |
+
+## 构建
+
+```bash
+pnpm install
+node scripts/build.mjs     # 或 pnpm build
+```
+
+**每次构建都会换代**（`lib-gen/g1` → `g2` → …），自动改写 `cordis.patch.yml`
+并把代数写进 `build-generation.json`。
+
+### 为什么必须换代
+
+DSH 的**插件行**可以免重启动态增删，但**模块代码走 Node ESM 按 URL 缓存**。
+改了源码而产物路径没变时，宿主加载的仍是**旧模块实例**——于是"功能没生效"
+这类现象可能只是陈旧代码，极易误判。
+
+换目录名让 URL 必然变化，加载的必然是本次构建的代码。
+`omb_status` 的「构建」段会直接印出当前代数，随时可核对跑的是哪一代。
+
+构建脚本还会做**陈旧检测**：产物比源码旧就报错，不让"改了源码忘了重建"混过去。
+
+### 开发循环
+
+```bash
+pnpm verify          # typecheck + lint + test
+node scripts/build.mjs
+plugin_manager remove_bundle @omb/plugin && plugin_manager install_bundle <路径>
+```
+
+安装后 `omb_status` 的代数应等于 `build-generation.json` 里的值。不等就说明装的是旧代。
+
+## 组件的中文显示名
+
+行的标题取自 DSH 的本地化元数据，而 `readPluginMeta` 在
+`barePackageName(specifier) === undefined` 时直接返回 undefined
+（`packages/boot/app-boot/src/package-meta.ts:149`）——即**相对路径的行拿不到元数据**。
+
+改成裸包子路径（`@omb/plugin/omb-kernel`）后实测 8 行全部 `failed to import`：
+宿主加载器解析不了子路径。两个要求互斥，于是：
+
+- 行名保持**相对路径**（能跑，这是硬约束）
+- 中文名与说明生成到 `locale/<组件>/{en,zh}.json` 备用
+- 唯一真源是 [`kernel/display.ts`](kernel/display.ts)，改文案只改那里
+
+**结果：插件页目前仍显示产物路径。** 要显示中文名需要每个组件是独立顶层包
+（各自 `package.json` + `locale/zh.json`），代价是 8 份包清单样板。
+
+## 测试
+
+```bash
+pnpm test        # vitest
+pnpm typecheck
+pnpm lint
+```
+
+测试里有两类**只有真宿主才会暴露**的契约，已固化：
+
+- `tests/dsh/tools.test.ts`：工具注册要求 `output { schema, render }`，
+  且参数 schema 必须是"只有可枚举字符串键的普通记录"。
+  后者尤其隐蔽：`z.toJSONSchema()` 的返回对象带一个**非枚举**键 `~standard`，
+  会让每个用 zod 生成的工具被宿主拒绝。
+- `tests/dsh/assembly.smoke.test.ts`：用真实清单、真实内核装配，并让假宿主
+  **复刻真宿主的校验**。假宿主不复刻校验，测试就会对"全被拒绝"保持全绿（踩过两次）。
+
+## 神经向量检索（可选）
+
+接入 BGE-small-zh-v1.5（ONNX，512 维）做中文语义检索：同义改写能召回哈希词袋
+召不回的记忆。
+
+**权重不进仓库**。未装权重时向量通道**诚实降级**为纯 JS 哈希词袋，
+纯词法召回完整可用，状态面写明原因。
+
+推理运行时 `onnxruntime-node` 是 **optionalDependency**（解包约 296MB），
+只想用哈希词袋的部署不必装。
+
+## 边界
+
+- 认知层**只观察与注入，不接管 Agent Loop**：不写会话日志、不阻断工具调用。
+- 所有 `apply` 与 disposer **绝不抛异常**——抛异常会让整个插件行加载失败。
+- 不注册任何在 `apply` 返回后才出现的工具或提示段（宿主挂载审计只查一次）。
+- 不猜路径：取不到会话 cwd 时如实报"宿主尚未告知"，而不是猜一个可能写错地方的路径。
 
 ## 许可证
 
-**GPL-3.0**，详见 [LICENSE](LICENSE)。随仓库分发的第三方文件（中文词表等）与运行期依赖的许可归属见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+**GPL-3.0**，详见 [LICENSE](LICENSE)。第三方文件与运行期依赖的许可归属见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
