@@ -81,7 +81,9 @@ describe('准入启发式（纯函数，§5.6）', () => {
       { text: '端口配置在 src/config/server.ts 里', label: '文件名' },
       { text: '提交前跑 pnpm verify 全绿才算完成', label: '可复现命令' },
       { text: '接口文档在 https://example.com/api 上', label: 'URL' },
-      { text: '这个 bug 在 a1b2c3d4 之后才出现', label: '提交哈希' },
+      { text: '这个 bug 在 commit:a1b2c3d4 之后才出现', label: '提交哈希' },
+      // 裸短哈希**不认**：形态上与标识符尾段无法区分（mem_..._3c6bf8ae）。
+      // 宁可漏也不错收——错收会让假事实进库并被后续会话当结论召回。
       { text: 'Node 版本固定为 24.12.0', label: '版本号' },
     ]
     for (const item of cases) {
@@ -105,6 +107,23 @@ describe('准入启发式（纯函数，§5.6）', () => {
     expect(decision.ok).toBe(false)
     expect(decision.ok === false && decision.reason).toContain('没有准入依据')
     expect(decision.ok === false && decision.reason).toContain('弃权并记录')
+  })
+
+  it('自动生成的 sourceRef 不得成为准入依据', () => {
+    // **这条防的是一个真实漏收**：模糊内容被当成"可由具体工件复现"收进库。
+    //
+    // 原判据把 `正文 + sourceRef` 一起匹配，而 sourceRef 省略时由工具自动生成成
+    // `session:<uuid>#turn-N`——UUID 的一段（8 位十六进制）命中了"提交哈希"。
+    // 于是「今天感觉还不错，学到了很多东西。」以 `reproducible-artifact` 入账。
+    //
+    // 教训：`sourceRef` 是**溯源**（这条从哪来），不是**可复现工件**（凭什么可验证）。
+    // 拿它当依据，等于让工具用自己生成的字符串给自己发合格证。
+    const decision = decideAdmission({
+      ...base,
+      text: '今天感觉还不错，学到了很多东西。',
+      sourceRef: 'session:session-90730570-1717-4474-92ad-8086507e77d1#turn-5',
+    })
+    expect(decision.ok, '自动生成的 sourceRef 不该让模糊内容通过准入').toBe(false)
   })
 
   it('空 / 纯标点 / 过短 / 过长 → 各自可读的弃权原因', () => {
