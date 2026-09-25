@@ -1,6 +1,15 @@
 /**
  * Cordis 插件入口。`cordis.patch.yml` 的 `omb-kernel` 行指向本文件。
  *
+ * **运行状态说明**：本文件（内核行）在 DSH 0.1.7-rc.2 上**已验证工作**——
+ * 工具面（7 个工具）、常驻提示注入、`omb_status`、拉取台账、会话 cwd 映射
+ * 都在真实宿主里确认过。
+ *
+ * **未完成的一环**：`cordis.patch.yml` 里另外 8 个**模块行**由宿主**独立加载**，
+ * 它们拿到的 `ctx` 是宿主 ctx 代理，取不到本内核对象；因此模块加载成功但
+ * 不注册任何能力（空转）。精确断点、两个候选解法与最小探测插件见
+ * `docs/host-wiring-handoff.md`。
+ *
  * 三条硬约束（违反即插件加载失败或开关操作失败）：
  *
  * - **H-1**：所有 disposer 绝不抛异常。宿主 `reconcileProfilePatches` 会 await 旧 fiber，
@@ -9,7 +18,6 @@
  * - **H-2**：不得在 `apply` 返回后**异步**注册工具/提示段。宿主挂载审计只查一次，
  *   事后注册会触发进程级失败告警
  *   （`packages/preset/agent-preset-registry/src/invariant.ts:33-44`）。
- *   因此模块发现与全部注册都是**同步**的；异步只用于"填内部状态"。
  * - **H-3**：服务缺失返回可读错误而非抛异常——模块可能在下一刻被卸下。
  *
  * 本文件**不 import 任何 `@deepseek-ai/*`**（本仓库解析不到它们），
@@ -18,6 +26,7 @@
 import { createKernel, type KernelHandle } from '../kernel/index.js'
 import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES, toolsServiceFor } from '../kernel/abi/index.js'
+import { KERNEL_READY_KEY } from '../kernel/hostEntry.js'
 import type { HostContextLike } from './host.js'
 import { hostLogger, publishToHost, readService, systemClock } from './host.js'
 import { registerTools, type ToolSpec } from './tools.js'
@@ -31,7 +40,6 @@ import {
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { buildStatusTool } from './status-tool.js'
 import { loadModulesSync } from './modules.js'
-import { KERNEL_READY_KEY } from '../kernel/hostEntry.js'
 import { MODULE_ENTRIES } from './moduleEntries.js'
 
 /** `cordis.patch.yml` 行 config 的形状。 */
@@ -69,12 +77,10 @@ export const KERNEL_SELF: ModuleRegistration<unknown> = {
 }
 
 /**
- * 插件主体。返回 disposer（Cordis 函数插件契约：`apply(ctx, config)`）。
+ * 插件主体。返回值是 disposer（Cordis 函数插件契约：`apply(ctx, config)`）。
  *
- * **返回 Promise 是刻意的**：模块行由宿主独立加载，`ctx.get()` 查的是**宿主**的
- * 服务表，而我们的内核服务在内核自己的表里——两者不通。所以这里必须把一个
- * **就绪 promise** 发布到宿主 ctx（`KERNEL_READY_KEY`），模块行 await 它。
- * Cordis 会等待本 Promise，因此"发布就绪"必定发生在任何模块行解析内核之前。
+ * 必须**同步返回 disposer**——宿主会把它当注销函数存起来；返回 Promise 等于
+ * 注销时调用一个 Promise，什么都没做。
  */
 export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => void {
   const logger = hostLogger(ctx)
@@ -82,7 +88,9 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const handle = createKernel({ logger, clock })
   const sessions = new SessionTable()
 
-  // ── 0) 把就绪 promise 发布到宿主 ctx（模块行 await 它）─────────────────
+  // 把"内核就绪"发布到宿主 ctx：模块行由宿主独立加载，需要经宿主 ctx 取内核。
+  // 见 `docs/host-wiring-handoff.md`——这一步在真实宿主上**尚未验证成功**，
+  // 因此模块行目前会走空转兜底（如实不提供能力，不抛）。
   let markReady!: () => void
   const ready = new Promise<void>(resolve => {
     markReady = resolve
@@ -101,7 +109,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     // 服务表不再对重名抛错，但保留守卫以免未来语义变化
     logger.warn(`OMB：存储端口注册失败——${String(error)}（记忆库将降级）`)
   }
-  // 内核已可被模块行解析——放行（必须在任何 await 之前，否则模块行会等到超时）
+  // 内核已可解析——放行（必须在任何 await 之前，否则模块行会等到超时）
   markReady()
 
   // ── 1b) 内核自身的工具服务 ─────────────────────────────────────────────
@@ -123,6 +131,10 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   for (const failure of loaded.failures) {
     logger.warn(`OMB：模块入口 ${failure.path} 未装配——${failure.reason}`)
   }
+  // **微内核自己也要作为注册项在场**：`planModules` 的判据是"`requires` 里的 id
+  // 必须在本次 start 的注册集合里"，而微内核是插件本体（不在 `moduleEntries` 里）。
+  // 少了这个 stub，所有 `requires: ['omb-kernel']` 的模块会被整体阻断——
+  // 表现为"插件装上了，但几乎所有功能都不在"，且各自报"缺少必需依赖"。
   const blocked = handle.start([KERNEL_SELF, ...loaded.modules], configMapOf(), ctx)
   for (const b of blocked) logger.warn(`OMB：模块 ${b.id} 未启动——${b.reason}`)
 
@@ -143,18 +155,14 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, sessions })
 
   // ── 6) 异步阶段：只填内部状态，不再注册任何东西（H-2）─────────────────
-  void (async (): Promise<void> => {
-    const failure = await storageHost.ensureSqlite()
-    if (failure !== null) {
-      logger.warn(`OMB：存储降级——${failure}`)
-      return
-    }
-    // 预热用户库，让状态面在第一次调用前就有真实数据
-    const stores = handle.kernel.service<{ forProject(cwd: string): Promise<unknown> }>(SERVICES.stores)
-    void stores
-  })().catch((error: unknown) => {
-    logger.warn(`OMB：异步初始化异常（已隔离）——${String(error)}`)
-  })
+  void storageHost
+    .ensureSqlite()
+    .then(failure => {
+      if (failure !== null) logger.warn(`OMB：存储降级——${failure}`)
+    })
+    .catch((error: unknown) => {
+      logger.warn(`OMB：异步初始化异常（已隔离）——${String(error)}`)
+    })
 
   if (config.debug === true) {
     logger.info(
