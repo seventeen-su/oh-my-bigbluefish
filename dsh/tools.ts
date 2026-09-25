@@ -47,6 +47,42 @@ const TEXT_OUTPUT = {
   ],
 }
 
+/**
+ * 把 schema 洗成"只剩可枚举字符串键的普通记录"。
+ *
+ * **为什么必须洗**：`z.toJSONSchema()` 的返回对象自带一个**非枚举**键
+ * `~standard`（zod v4 的 Standard Schema 标记）。宿主要求参数 schema
+ * "只有可枚举字符串键"
+ * （`isJsonSchemaRecord` → `hasOnlyEnumerableStringKeys`，
+ * `packages/core/tools/src/json-schema.ts:152`），于是**每一个用 zod 生成
+ * 参数的工具都被拒绝**：
+ *
+ * ```
+ * tool "omb_remember" parameters must be lossless JSON before schema projection
+ * ```
+ *
+ * 而手写 JSON Schema 的工具（如 `omb_status`）恰好通过——所以症状是
+ * "有的工具有、有的没有"，极易误判成个别模块的问题。
+ *
+ * 清洗用重建而不是 `delete`：`~standard` 不可枚举，`delete` 也能去掉，
+ * 但重建同时保证原型是 `Object.prototype`、没有多余装饰。
+ */
+export function cleanJsonRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  return cleanValue(value) as Record<string, unknown>
+}
+
+/** 递归清洗任意 JSON 值：对象洗键，数组逐元素，标量原样。 */
+function cleanValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(entry => cleanValue(entry))
+  if (typeof value !== 'object' || value === null) return value
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(value)) {
+    out[key] = cleanValue((value as Record<string, unknown>)[key])
+  }
+  return out
+}
+
 export interface ToolSpec {
   readonly name: string
   readonly description: string
@@ -64,12 +100,15 @@ export interface ToolSpec {
  * 执行体返回的 `ToolOutcome` 被转成纯字符串——这是本插件的规范输出值，
  * `render` 再把它渲染成 ContentBlock。这样"业务返回值"与"模型可见内容"
  * 在类型上分开，`render` 保持纯函数。
+ *
+ * **参数 schema 一律过 `cleanJsonRecord`**：这是唯一补齐宿主契约的地方，
+ * 绕过它就会漏字段或带脏键（两种情况都实测踩过）。
  */
 export function toHostTool(spec: ToolSpec): HostToolDefinition {
   return {
     name: spec.name,
     description: spec.description,
-    parameters: spec.parameters,
+    parameters: cleanJsonRecord(spec.parameters),
     output: TEXT_OUTPUT,
     async execute(args: unknown): Promise<unknown> {
       try {
