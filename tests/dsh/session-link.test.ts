@@ -21,6 +21,41 @@ import { toHostPlugin } from '../../kernel/hostEntry.js'
 import { createReasoningModule } from '../../modules/reasoning/index.js'
 
 describe('会话事件链路：dsh 发 turn/start，模块必须收到', () => {
+  it('模块的订阅落在**内核总线**上，不是宿主事件面', async () => {
+    // **这条补的是测试盲区**：`testHostContext` 没有 `on`，于是收养视图里
+    // `hostOn === undefined`、所有订阅都回落内核总线——那个 bug 在测试里
+    // 根本不可能出现。真实宿主有 `ctx.on`，而它对**任何**事件名都会"成功"
+    // 返回一个 disposer，于是 `turn/start`/`focus/changed` 被静默订到宿主面。
+    //
+    // 所以这里必须提供一个**有 `on` 的**宿主 ctx，才测得到真实行为。
+    const handle = createKernel()
+    handle.kernel.provide(SERVICES.kernel, handle.kernel)
+
+    const hostSubscriptions: string[] = []
+    const host = {
+      get: (name: string) => (name === SERVICES.kernel ? handle.kernel : handle.kernel.service(name)),
+      on: (event: string) => {
+        hostSubscriptions.push(event)
+        return () => {}
+      },
+    }
+
+    const plugin = toHostPlugin(createReasoningModule())
+    plugin.apply(host)
+    await new Promise(resolve => setImmediate(resolve))
+
+    // 内核总线事件**不得**被订到宿主面上。若这里出现 `focus/changed` 或
+    // `turn/start`，说明模块永远收不到——`dsh/` 发在内核总线
+    // （`dsh/session.ts` 与 `kernel/index.ts` 的 `core.emit`）。
+    expect(
+      hostSubscriptions,
+      `这些是内核总线事件，不该订到宿主事件面：${hostSubscriptions.join('、')}`,
+    ).not.toContain('focus/changed')
+    expect(hostSubscriptions, 'turn/start 是内核总线事件').not.toContain('turn/start')
+
+    handle.dispose()
+  })
+
   it('模块经 ctx.get 取内核后订阅 turn/start，能收到内核总线上的同一事件', () => {
     const handle = createKernel()
     handle.kernel.provide(SERVICES.kernel, handle.kernel)

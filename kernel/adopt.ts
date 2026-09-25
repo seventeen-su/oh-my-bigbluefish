@@ -85,6 +85,24 @@ function adoptLogger(raw: unknown): Logger | undefined {
 }
 
 /**
+ * **只有宿主才有的**事件名：这些必须订宿主的事件面。
+ *
+ * 其余一律订内核总线——因为 `dsh/` 发事件走的是 `core.emit`（内核总线），
+ * 而 `ctx.on` 对任何事件名都会"成功"返回一个 disposer，无法用它来区分。
+ * 换句话说：**"订上了"不等于"订对了地方"**，这句判据必须靠白名单。
+ *
+ * 新增宿主事件时把它加进来；新增**内核**事件时什么都不用做。
+ */
+const HOST_ONLY_EVENTS: ReadonlySet<string> = new Set([
+  'session/event',
+  'session/flush',
+  'tools/result',
+  'tools/call',
+  'tools/execute',
+  'tools/post-execute',
+])
+
+/**
  * 把宿主 ctx 收养成 `Kernel`。
  *
  * 每个**宿主**能力只取一次（经 `get`，不触发 Guard 的未声明属性读），
@@ -119,13 +137,28 @@ export function adoptContext(
     services: () => core.services.names(),
     provide: (name, value) => core.services.provide(name, value),
     on: (event, fn) => {
-      // 宿主事件面优先（`session/event` 等只有宿主有）；失败则回落内核总线
-      if (hostOn !== undefined) {
+      // **默认订内核总线，只有宿主独有的事件才用宿主事件面。**
+      //
+      // 为什么必须这样排（踩过两次，都不报错，症状只是"事件好像没来"）：
+      //
+      // 收养视图原先写成"宿主事件面优先，失败才回落内核总线"。而 `ctx.on` 对
+      // **任何**事件名都返回一个函数，于是 `turn/start`、`focus/changed` 这些
+      // 内核总线事件**全部被静默订到了宿主面上**：
+      //
+      // - 模块 `kernel.on('turn/start', …)` → 订到宿主面
+      // - `dsh/session.ts` `kernel.emit('turn/start')` → 发在内核总线
+      // - 两者永远碰不到；订阅注册成功、disposer 正常、健康面全绿
+      //
+      // 实测代价（两次）：
+      // ① `omb_focus` 一直报"取不到当前会话标识"；
+      // ② 修了①之后，「跟踪会话」恒为 0——因为 `focus/changed` 同样订错了面，
+      //    会话状态机从未被喂到，于是**循环检测事实上空转**，健康面却报"正常"。
+      //
+      // 判据是"这个事件名是不是宿主独有"，不是"宿主能不能订上"。
+      if (hostOn !== undefined && HOST_ONLY_EVENTS.has(event)) {
         try {
           const off = hostOn(event, fn as (...args: never[]) => void)
           if (typeof off === 'function') {
-            // 诊断：模块到底订到了哪个后端。模块订阅宿主、而 dsh 发内核总线时，
-            // 事件永远碰不到——症状与"事件没来"一模一样，只有这里能分辨。
             heartbeat('adopt-on', { event, backend: 'host' })
             return off as () => void
           }
