@@ -214,6 +214,23 @@ describe('档位驱动注入裁决（select）', () => {
     handle.dispose()
   })
 
+  it('内核端口异常时服务方法仍不抛（时钟坏掉不影响 select）', () => {
+    const handle = createKernel({
+      measure: () => pressureWith(0.45),
+      clock: {
+        now: () => {
+          throw new Error('时钟坏了')
+        },
+      },
+    })
+    handle.start([KERNEL_STUB, createContextModule()])
+    const metrics = metricsOf(handle)
+    expect(() => metrics.select(pool, [], undefined, { session: 's' })).not.toThrow()
+    expect(() => metrics.focusState('s')).not.toThrow()
+    expect(metrics.focusState('s').setAt).toBe(0)
+    handle.dispose()
+  })
+
   it('measuredCost 走真实测量；没有该节点返回 null（不估算）', () => {
     const { handle } = start({ nodes: [{ name: 'omb_recall', tokens: 321 }] })
     const metrics = metricsOf(handle)
