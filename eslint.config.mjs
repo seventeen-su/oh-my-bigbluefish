@@ -19,13 +19,23 @@ function toPosix(p) {
   return p.split(path.sep).join('/').replace(/\\/g, '/');
 }
 
-/** 返回文件所属的顶层区段（kernel / modules / dsh / tests），否则 null */
+/**
+ * 返回文件所属的顶层区段（kernel / modules / dsh / tests），否则 null。
+ * 取**路径中第一个出现**的区段——`tests/modules/x/y.ts` 属于 tests 而非 modules。
+ */
 function layerOf(filePath) {
   const posix = toPosix(filePath);
+  let best = null;
+  let bestIndex = Number.POSITIVE_INFINITY;
   for (const seg of ['kernel', 'modules', 'dsh', 'tests']) {
-    if (posix.includes(`/${seg}/`) || posix.endsWith(`/${seg}`)) return seg;
+    const at = posix.indexOf(`/${seg}/`);
+    if (at === -1) continue;
+    if (at < bestIndex) {
+      bestIndex = at;
+      best = seg;
+    }
   }
-  return null;
+  return best;
 }
 
 /** 返回 modules/ 下的模块名，否则 null */
@@ -53,6 +63,7 @@ const noLayerViolation = {
   create(context) {
     const filename = context.filename ?? '';
     const from = layerOf(filename);
+    // tests/ 豁免：测试需要横跨各层验证契约，规则只约束生产代码
     if (from === null || from === 'tests') return {};
     const rules = IMPORT_RULES[from];
     const fromModule = moduleOf(filename);

@@ -1,0 +1,718 @@
+/**
+ * 检索主路径（规划 §5.4 七阶段）。
+ *
+ * ```
+ * ① 门控     先决定【要不要检索】。"不需要记忆"是合法的一等结果，不是错误
+ * ② 扇出     两个库都查，**绝不短路**
+ * ③ 词法为主 FTS5/BM25 通道优先
+ * ④ 排名融合 第二通道存在 → RRF（k=60，可配置）
+ * ⑤ 每库配额 防一个库饿死另一个
+ * ⑥ 上限+重排 硬候选上限，可选廉价重排
+ * ⑦ 返回     逐字文本 + sourceRef + observedAt（溯源免费随行）
+ * ```
+ *
+ * **为什么是 RRF 而不是加权求和**：旧实现把「词法排名归一值」与「原始余弦」相加，
+ * 两者量纲不同；又用「评分 ÷ 池大小」归一，使同一条记忆的分数随候选池大小漂移。
+ * RRF 只消费**排名**（`1/(k+rank)`），因此天然无量纲、天然与候选池大小无关——
+ * 旧的两个缺陷是**被消解**，而不是被修补。代价：通道内的原始分（bm25/余弦）
+ * 只用于通道内排序，绝不跨通道做算术。
+ *
+ * 分层约束：本文件只依赖 `kernel/abi`（ESLint 强制）。I/O 只经端口，逻辑是纯函数。
+ */
+import type {
+  AssertedBy,
+  Clock,
+  Embedder,
+  MemoryKind,
+  MemoryRecord,
+  MemoryScope,
+  PressureBand,
+  ScoredHit,
+  TaggedStore,
+} from '../../kernel/abi/index.js'
+
+/** RRF 常数 k 的惯例默认值。⚠️ 这是惯例，不是最优值——规划 §5.4 明确标注，故暴露为配置项。 */
+export const DEFAULT_RRF_K = 60
+/** 默认注入条数。 */
+export const DEFAULT_LIMIT = 5
+/** 融合后、重排前的硬候选上限。 */
+export const DEFAULT_MAX_CANDIDATES = 20
+/** 无偏好作用域时的作用域优先级（跨界结论比项目情境更稳定）。 */
+export const SCOPE_PRIORITY: Readonly<Record<MemoryScope, number>> = { user: 0, project: 1 }
+/** 廉价重排权重（和 = 1）。全部是 [0,1] 的无量纲先验，不做任何跨通道分数算术。 */
+export const RERANK_WEIGHTS = { fusion: 0.55, recency: 0.25, usage: 0.12, asserted: 0.08 } as const
+/** 重排的时间半衰期（默认 30 天）。 */
+export const RERANK_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000
+
+const ASSERTED_WEIGHT: Readonly<Record<AssertedBy, number>> = { user: 1, execution: 0.7, model: 0.3 }
+
+export type ChannelName = ScoredHit['channel']
+/** 库内 FTS 之外的通道（向量 / 图）。缺省即纯词法，路径依然完整可用（§5.7）。 */
+export type SecondaryChannelName = Exclude<ChannelName, 'lexical'>
+
+/** 一次通道查询。`store` 是被查的库句柄；`embedding` 由 `ports.embedder` 预计算（可缺）。 */
+export interface ChannelQuery {
+  readonly store: TaggedStore
+  readonly text: string
+  readonly scope: MemoryScope
+  readonly kinds?: readonly MemoryKind[]
+  readonly limit: number
+  readonly embedding?: Float32Array
+}
+
+/**
+ * 可选第二通道。由 `omb-memory-vector`（或未来的图通道）在装配时注入；
+ * 缺省 → 纯词法路径完整可用（§5.7「向量模块关闭 → 完整纯词法版本」）。
+ * 通道**不得**改写端口；它只返回 `ScoredHit[]`，且顺序即相关度降序。
+ */
+export interface RetrievalChannel {
+  readonly name: SecondaryChannelName
+  search(query: ChannelQuery): Promise<readonly ScoredHit[]>
+}
+
+/**
+ * 端口集合。给定的签名 `{ embedder?, clock }` 是其子集（可选字段，结构兼容）。
+ */
+export interface RetrievePorts {
+  readonly clock: Clock
+  readonly embedder?: Embedder
+  readonly channels?: readonly RetrievalChannel[]
+}
+
+/** 检索请求。除 `text` 外全部可选：默认值即规划里的默认路径。 */
+export interface RetrieveQuery {
+  readonly text: string
+  /**
+   * 查询侧重的作用域。**只用于每库配额与确定性排序，不作为过滤条件**
+   * （§5.3：位置即权威，标签不用于过滤）。
+   */
+  readonly scope?: MemoryScope
+  readonly kinds?: readonly MemoryKind[]
+  readonly limit?: number
+  /** 融合后的硬候选上限（默认 20）。 */
+  readonly maxCandidates?: number
+  /** 每库每通道的候选池大小（默认 = maxCandidates）。 */
+  readonly poolLimit?: number
+  /** 每库在首次填充中最多占的注入位次；默认 `ceil(limit / 库数)`。 */
+  readonly perStoreQuota?: number
+  /** 可选廉价重排（top-maxCandidates → top-limit）；默认关闭。 */
+  readonly rerank?: boolean
+  readonly rerankHalfLifeMs?: number
+  /** RRF 常数 k（默认 60）。 */
+  readonly rrfK?: number
+  /** 门控模式：`auto`（默认）/ `always` / `never`。 */
+  readonly mode?: 'auto' | 'always' | 'never'
+  /** 上下文压力档位（软信号）。仅在显式给出且为 `tight` 时参与门控。 */
+  readonly pressureBand?: PressureBand
+  /** tight 压力下是否跳过检索（默认 true）；`mode: 'always'` 时忽略。 */
+  readonly skipOnTightPressure?: boolean
+}
+
+export type GateReason = 'ok' | 'empty-query' | 'explicit-never' | 'no-stores' | 'no-kinds' | 'pressure-tight'
+
+/** 门控结论。跳过时给出**可读原因**——空结果是一等结果，不是错误。 */
+export interface GateDecision {
+  readonly retrieve: boolean
+  readonly reason: GateReason
+  readonly detail: string
+}
+
+/** 通道内的一位（rank 从 1 起）。 */
+export interface RankedHit {
+  readonly id: string
+  readonly rank: number
+}
+
+/** 某一库某一通道的排名表。顺序即相关度降序（**原始分不参与跨通道计算**）。 */
+export interface ChannelRanking {
+  readonly channel: ChannelName
+  readonly scope: MemoryScope
+  readonly hits: readonly RankedHit[]
+}
+
+export interface ChannelMatch {
+  readonly channel: ChannelName
+  readonly scope: MemoryScope
+  readonly rank: number
+}
+
+export interface FusedCandidate {
+  readonly id: string
+  /** RRF 原始和：`Σ 1/(k+rank)`。有界、无量纲、与候选池大小无关。 */
+  readonly score: number
+  readonly scopes: readonly MemoryScope[]
+  readonly channels: readonly ChannelName[]
+  readonly matches: readonly ChannelMatch[]
+}
+
+/** 返回给消费者的逐字条目：溯源随行，输出因此可审计。 */
+export interface RetrievedItem {
+  readonly rank: number
+  readonly id: string
+  /** 逐字原文（**不做抽取式结构化**）。 */
+  readonly text: string
+  readonly sourceRef: string
+  readonly observedAt: number
+  readonly scope: MemoryScope
+  readonly kind: MemoryKind
+  readonly assertedBy: AssertedBy
+  readonly project: string | null
+  readonly validTo: number | null
+  readonly supersededBy: string | null
+  /** RRF 分（同 `FusedCandidate.score`）。 */
+  readonly score: number
+  readonly channels: readonly ChannelName[]
+  readonly ranks: readonly ChannelMatch[]
+}
+
+export interface RetrieveStats {
+  readonly storesQueried: number
+  readonly channelsUsed: readonly ChannelName[]
+  readonly candidatesFused: number
+  readonly candidatesCapped: number
+  readonly dropped: number
+  readonly perStore: readonly {
+    readonly scope: MemoryScope
+    readonly candidates: number
+    readonly selected: number
+  }[]
+  readonly rrfK: number
+  readonly reranked: boolean
+}
+
+export interface RetrieveResult {
+  readonly items: readonly RetrievedItem[]
+  readonly gate: GateDecision
+  /** 通道/库级降级说明（如「向量通道故障」）。**不是异常**：可用的部分照常返回。 */
+  readonly degraded: readonly string[]
+  readonly stats: RetrieveStats
+  readonly now: number
+  /** 人类可读结论；门控跳过与零命中都是正常结论。 */
+  readonly note: string
+}
+
+// ---------- 纯逻辑：门控 ----------
+
+/**
+ * ① 门控：先决定要不要检索。
+ *
+ * 「不需要记忆」是合法的一等结果——门控跳过时**零 I/O**，返回空结果 + 原因。
+ */
+export function gateRetrieval(
+  stores: readonly TaggedStore[],
+  query: RetrieveQuery,
+): GateDecision {
+  if (query.mode === 'never') {
+    return { retrieve: false, reason: 'explicit-never', detail: '调用方显式声明不检索（mode: never）' }
+  }
+  if (stores.length === 0) {
+    return { retrieve: false, reason: 'no-stores', detail: '没有可查的库（双库均未打开）' }
+  }
+  if (query.kinds !== undefined && query.kinds.length === 0) {
+    return { retrieve: false, reason: 'no-kinds', detail: '调用方把 kinds 限为空集——没有任何类型可命中' }
+  }
+  if (query.mode !== 'always' && query.text.trim().length === 0) {
+    return { retrieve: false, reason: 'empty-query', detail: '查询文本为空，无可匹配内容' }
+  }
+  if (
+    query.mode !== 'always' &&
+    query.pressureBand === 'tight' &&
+    query.skipOnTightPressure !== false
+  ) {
+    return {
+      retrieve: false,
+      reason: 'pressure-tight',
+      detail: '上下文压力 tight（软信号）：跳过检索以免挤占预算；需要时可用 mode: always 强制',
+    }
+  }
+  return { retrieve: true, reason: 'ok', detail: '门控通过' }
+}
+
+// ---------- 纯逻辑：排名与融合 ----------
+
+/** ID 的 ASCII 安全比较（**不用 `localeCompare`**：它的结果依赖 locale，破坏确定性）。 */
+export function asciiCompare(a: string, b: string): number {
+  if (a === b) return 0
+  return a < b ? -1 : 1
+}
+
+/** 去重（保留首次出现）并赋 1 起的排名。通道原始分在此被**丢弃**。 */
+export function rankHits(hits: readonly ScoredHit[]): readonly RankedHit[] {
+  const seen = new Set<string>()
+  const out: RankedHit[] = []
+  for (const hit of hits) {
+    if (seen.has(hit.id)) continue
+    seen.add(hit.id)
+    out.push({ id: hit.id, rank: out.length + 1 })
+  }
+  return out
+}
+
+/** 作用域优先级：偏好作用域最优先，其余按 `SCOPE_PRIORITY`（未给偏好时直接用常量）。 */
+export function scopeOrder(scope: MemoryScope, preferred?: MemoryScope): number {
+  if (preferred === undefined) return SCOPE_PRIORITY[scope]
+  return scope === preferred ? 0 : SCOPE_PRIORITY[scope] + 1
+}
+
+/**
+ * ④ RRF 融合：`score(d) = Σ_channels 1/(k + rank_c(d))`。
+ *
+ * **只用排名**，因此天然无量纲、天然与候选池大小无关——旧实现的
+ * 「排名归一值 + 原始余弦」与「评分 ÷ 池大小」两个缺陷在此被消解。
+ */
+export function fuseByRank(rankings: readonly ChannelRanking[], k: number): readonly FusedCandidate[] {
+  const effectiveK = normalizeK(k)
+  const acc = new Map<string, { score: number; matches: ChannelMatch[] }>()
+  for (const ranking of rankings) {
+    for (const hit of ranking.hits) {
+      let entry = acc.get(hit.id)
+      if (entry === undefined) {
+        entry = { score: 0, matches: [] }
+        acc.set(hit.id, entry)
+      }
+      entry.score += 1 / (effectiveK + hit.rank)
+      entry.matches.push({ channel: ranking.channel, scope: ranking.scope, rank: hit.rank })
+    }
+  }
+  const out: FusedCandidate[] = []
+  for (const [id, entry] of acc) {
+    out.push({
+      id,
+      score: entry.score,
+      matches: entry.matches,
+      scopes: unique(entry.matches.map(m => m.scope)),
+      channels: unique(entry.matches.map(m => m.channel)),
+    })
+  }
+  out.sort((a, b) => (a.score !== b.score ? (a.score > b.score ? -1 : 1) : asciiCompare(a.id, b.id)))
+  return out
+}
+
+/** 候选首选作用域：优先级最高者；同优先级取先出现者（确定性）。 */
+export function primaryScope(candidate: FusedCandidate): MemoryScope {
+  const first = candidate.scopes[0]
+  if (first === undefined) return 'user'
+  let best = first
+  for (const scope of candidate.scopes) {
+    if (SCOPE_PRIORITY[scope] < SCOPE_PRIORITY[best]) best = scope
+  }
+  return best
+}
+
+/** 确定性总序：**RRF 分 desc → 作用域优先级 → id（ASCII）**。 */
+export function compareCandidates(a: FusedCandidate, b: FusedCandidate, preferred?: MemoryScope): number {
+  if (a.score !== b.score) return a.score > b.score ? -1 : 1
+  const pa = scopeOrder(primaryScope(a), preferred)
+  const pb = scopeOrder(primaryScope(b), preferred)
+  if (pa !== pb) return pa - pb
+  return asciiCompare(a.id, b.id)
+}
+
+/** 按确定性总序排序（返回新数组，不改入参）。 */
+export function totalOrder(
+  candidates: readonly FusedCandidate[],
+  preferred?: MemoryScope,
+): readonly FusedCandidate[] {
+  return [...candidates].sort((a, b) => compareCandidates(a, b, preferred))
+}
+
+// ---------- 纯逻辑：配额与重排 ----------
+
+export interface QuotaCandidate {
+  readonly id: string
+  readonly scope: MemoryScope
+}
+
+/**
+ * ⑤ 每库配额：两遍填充。
+ *
+ * 第一遍每个库最多占 `quota` 个位次（保证弱库不被强库饿死），
+ * 第二遍忽略配额把剩余位次按全局序补齐（不留空位）。
+ */
+export function selectWithQuota(
+  ordered: readonly QuotaCandidate[],
+  limit: number,
+  quota: number,
+): readonly QuotaCandidate[] {
+  if (limit <= 0) return []
+  const cap = quota >= 1 ? Math.floor(quota) : 1
+  const taken = new Set<string>()
+  const perScope = new Map<MemoryScope, number>()
+  const out: QuotaCandidate[] = []
+  for (const candidate of ordered) {
+    if (out.length >= limit) break
+    if (taken.has(candidate.id)) continue
+    const used = perScope.get(candidate.scope) ?? 0
+    if (used >= cap) continue
+    perScope.set(candidate.scope, used + 1)
+    taken.add(candidate.id)
+    out.push(candidate)
+  }
+  for (const candidate of ordered) {
+    if (out.length >= limit) break
+    if (taken.has(candidate.id)) continue
+    taken.add(candidate.id)
+    out.push(candidate)
+  }
+  return out
+}
+
+export interface RerankInput {
+  readonly candidate: FusedCandidate
+  readonly record: MemoryRecord
+}
+
+export interface RerankOptions {
+  readonly now: number
+  readonly halfLifeMs?: number
+  readonly preferredScope?: MemoryScope
+  /** 融合位次（0 起），用于把融合信号折算成固定映射的分量。 */
+  readonly position: number
+}
+
+/**
+ * ⑥ 廉价重排的单一候选先验。
+ *
+ * 三个先验都是 [0,1] 的无量纲量，融合分量用**固定**的位置映射 `1/(1+pos)`
+ * （不除以池大小——那正是旧缺陷）。这不是「分数融合」：没有任何通道原始分参与。
+ */
+export function rerankPrior(input: RerankInput, options: RerankOptions): number {
+  const halfLife = normalizeHalfLife(options.halfLifeMs)
+  const age = Math.max(0, options.now - input.record.observedAt)
+  const recency = Math.pow(0.5, age / halfLife)
+  const useCount = Math.max(0, input.record.useCount)
+  const usage = useCount / (1 + useCount)
+  const asserted = ASSERTED_WEIGHT[input.record.assertedBy]
+  const fusion = 1 / (1 + Math.max(0, options.position))
+  return (
+    RERANK_WEIGHTS.fusion * fusion +
+    RERANK_WEIGHTS.recency * recency +
+    RERANK_WEIGHTS.usage * usage +
+    RERANK_WEIGHTS.asserted * asserted
+  )
+}
+
+/** 重排：按先验 desc → 作用域优先级 → id 重排前 `top` 条（返回新数组）。 */
+export function cheapRerank<T extends RerankInput>(
+  inputs: readonly T[],
+  options: { readonly now: number; readonly halfLifeMs?: number; readonly preferredScope?: MemoryScope },
+): readonly T[] {
+  const scored = inputs.map((input, position) => ({
+    input,
+    prior: rerankPrior(input, {
+      now: options.now,
+      position,
+      ...(options.halfLifeMs !== undefined ? { halfLifeMs: options.halfLifeMs } : {}),
+    }),
+  }))
+  scored.sort((a, b) => {
+    if (a.prior !== b.prior) return a.prior > b.prior ? -1 : 1
+    const pa = scopeOrder(primaryScope(a.input.candidate), options.preferredScope)
+    const pb = scopeOrder(primaryScope(b.input.candidate), options.preferredScope)
+    if (pa !== pb) return pa - pb
+    return asciiCompare(a.input.candidate.id, b.input.candidate.id)
+  })
+  return scored.map(s => s.input)
+}
+
+// ---------- 主流程 ----------
+
+/** ⑦ 检索。**I/O 失败降级不抛**；纯逻辑错误照常暴露（工具执行体会兜底）。 */
+export async function retrieve(
+  stores: readonly TaggedStore[],
+  query: RetrieveQuery,
+  ports: RetrievePorts,
+): Promise<RetrieveResult> {
+  const now = readNow(ports)
+  const k = normalizeK(query.rrfK)
+  const gate = gateRetrieval(stores, query)
+  if (!gate.retrieve) {
+    return {
+      items: [],
+      gate,
+      degraded: [],
+      stats: emptyStats(k),
+      now,
+      note: `门控跳过检索：${gate.detail}（一等结果，不是错误）`,
+    }
+  }
+
+  const degraded: string[] = []
+  const limit = normalizePositive(query.limit, DEFAULT_LIMIT)
+  const maxCandidates = normalizePositive(query.maxCandidates, DEFAULT_MAX_CANDIDATES)
+  const poolLimit = normalizePositive(query.poolLimit, maxCandidates)
+  const ordered = orderStores(stores)
+  const channels = ports.channels ?? []
+
+  // 查询向量只算一次；算不出就退化为纯词法（诚实降级，不抛）。
+  const channelsUsable = channels.length > 0
+  let embedding: Float32Array | undefined
+  if (channelsUsable && ports.embedder !== undefined) {
+    try {
+      const vectors = await ports.embedder.embed([query.text])
+      const first = vectors[0]
+      if (first === undefined) degraded.push(`嵌入器 ${ports.embedder.id} 未返回向量：退化为纯词法`)
+      else embedding = first
+    } catch (err) {
+      degraded.push(`嵌入器 ${ports.embedder.id} 失败（${messageOf(err)}）：退化为纯词法`)
+    }
+  }
+
+  // ② 扇出：两个库都查，**绝不短路**（`Promise.all` 覆盖全部库，任何一库为空都不提前结束）。
+  const searches = await Promise.all(
+    ordered.map(async (tagged): Promise<StoreSearch> => {
+      const rankings: ChannelRanking[] = []
+      const lexical = await safeSearch(
+        () =>
+          tagged.store.searchLexical({
+            text: query.text,
+            scope: tagged.scope,
+            ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+            limit: poolLimit,
+          }),
+        degraded,
+        `库 ${tagged.scope} 词法通道失败`,
+      )
+      if (lexical !== null && lexical.length > 0) {
+        rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(lexical) })
+      }
+      for (const channel of channels) {
+        const hits = await safeSearch(
+          () =>
+            channel.search({
+              store: tagged,
+              text: query.text,
+              scope: tagged.scope,
+              ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+              limit: poolLimit,
+              ...(embedding !== undefined ? { embedding } : {}),
+            }),
+          degraded,
+          `库 ${tagged.scope} ${channel.name} 通道失败`,
+        )
+        if (hits !== null && hits.length > 0) {
+          rankings.push({ channel: channel.name, scope: tagged.scope, hits: rankHits(hits) })
+        }
+      }
+      return { tagged, rankings }
+    }),
+  )
+
+  const rankings = searches.flatMap(s => s.rankings)
+  const fused = fuseByRank(rankings, k)
+  const capped = totalOrder(fused, query.scope).slice(0, maxCandidates)
+
+  // ⑦ 批量水合：每个作用域一次 `getMany`（**禁止 N+1**）。
+  const hydrated = await hydrate(ordered, capped, degraded)
+  const dropped = capped.length - hydrated.length
+
+  // ⑥ 可选廉价重排。
+  const reranked = query.rerank === true
+    ? cheapRerank(hydrated, {
+        now,
+        ...(query.rerankHalfLifeMs !== undefined ? { halfLifeMs: query.rerankHalfLifeMs } : {}),
+        ...(query.scope !== undefined ? { preferredScope: query.scope } : {}),
+      })
+    : hydrated
+
+  // ⑤ 每库配额。
+  const quota = normalizeQuota(query.perStoreQuota, limit, ordered.length)
+  const selection = selectWithQuota(
+    reranked.map(h => ({ id: h.candidate.id, scope: primaryScope(h.candidate) })),
+    limit,
+    quota,
+  )
+  const selected = new Set(selection.map(s => s.id))
+  const chosen = reranked.filter(h => selected.has(h.candidate.id))
+
+  const items = chosen.map((h, rank) => toItem(h, rank, selected))
+  return {
+    items,
+    gate,
+    degraded,
+    stats: {
+      storesQueried: ordered.length,
+      channelsUsed: unique(rankings.map(r => r.channel)),
+      candidatesFused: fused.length,
+      candidatesCapped: capped.length,
+      dropped,
+      perStore: ordered.map(t => ({
+        scope: t.scope,
+        candidates: capped.filter(c => primaryScope(c) === t.scope).length,
+        selected: chosen.filter(h => primaryScope(h.candidate) === t.scope).length,
+      })),
+      rrfK: k,
+      reranked: query.rerank === true,
+    },
+    now,
+    note: buildNote(ordered.length, rankings.length, items.length),
+  }
+}
+
+// ---------- 内部工具 ----------
+
+interface StoreSearch {
+  readonly tagged: TaggedStore
+  readonly rankings: readonly ChannelRanking[]
+}
+
+interface HydratedCandidate {
+  readonly candidate: FusedCandidate
+  readonly record: MemoryRecord
+}
+
+function emptyStats(k: number): RetrieveStats {
+  return {
+    storesQueried: 0,
+    channelsUsed: [],
+    candidatesFused: 0,
+    candidatesCapped: 0,
+    dropped: 0,
+    perStore: [],
+    rrfK: k,
+    reranked: false,
+  }
+}
+
+function buildNote(storeCount: number, rankingCount: number, hitCount: number): string {
+  if (hitCount === 0) {
+    return `已查询 ${storeCount} 个库、${rankingCount} 个通道，零命中（一等结果，不是错误）`
+  }
+  return `已查询 ${storeCount} 个库、${rankingCount} 个通道，注入 ${hitCount} 条（逐字 + 溯源）`
+}
+
+function toItem(hydrated: HydratedCandidate, rank: number, _selected: ReadonlySet<string>): RetrievedItem {
+  const { candidate, record } = hydrated
+  return {
+    rank,
+    id: record.id,
+    text: record.text,
+    sourceRef: record.sourceRef,
+    observedAt: record.observedAt,
+    scope: record.scope,
+    kind: record.kind,
+    assertedBy: record.assertedBy,
+    project: record.project,
+    validTo: record.validTo,
+    supersededBy: record.supersededBy,
+    score: candidate.score,
+    channels: candidate.channels,
+    ranks: candidate.matches,
+  }
+}
+
+/** 库的确定序：作用域优先级 → 原序（保证同一输入永远同一结果）。 */
+function orderStores(stores: readonly TaggedStore[]): readonly TaggedStore[] {
+  return stores
+    .map((store, index) => ({ store, index }))
+    .sort((a, b) => {
+      const pa = SCOPE_PRIORITY[a.store.scope]
+      const pb = SCOPE_PRIORITY[b.store.scope]
+      if (pa !== pb) return pa - pb
+      return a.index - b.index
+    })
+    .map(entry => entry.store)
+}
+
+/** 每作用域一次批量水合；单库失败只降级不抛。 */
+async function hydrate(
+  ordered: readonly TaggedStore[],
+  capped: readonly FusedCandidate[],
+  degraded: string[],
+): Promise<readonly HydratedCandidate[]> {
+  if (capped.length === 0) return []
+  const idsByScope = new Map<MemoryScope, string[]>()
+  for (const candidate of capped) {
+    const scope = primaryScope(candidate)
+    const bucket = idsByScope.get(scope)
+    if (bucket === undefined) idsByScope.set(scope, [candidate.id])
+    else bucket.push(candidate.id)
+  }
+  const records = new Map<string, MemoryRecord>()
+  await Promise.all(
+    [...idsByScope].map(async ([scope, ids]) => {
+      const tagged = ordered.find(t => t.scope === scope && idsByScope.has(t.scope))
+      if (tagged === undefined) return
+      try {
+        const found = await tagged.store.getMany(ids)
+        for (const record of found) records.set(record.id, record)
+      } catch (err) {
+        degraded.push(`库 ${scope} 水合失败（${messageOf(err)}）：该库候选被丢弃`)
+      }
+    }),
+  )
+  const out: HydratedCandidate[] = []
+  for (const candidate of capped) {
+    const record = records.get(candidate.id)
+    if (record !== undefined) out.push({ candidate, record })
+  }
+  return out
+}
+
+async function safeSearch(
+  fn: () => Promise<readonly ScoredHit[]>,
+  degraded: string[],
+  label: string,
+): Promise<readonly ScoredHit[] | null> {
+  try {
+    const raw: unknown = await fn()
+    if (!Array.isArray(raw)) {
+      degraded.push(`${label}：返回值不是数组（通道实现违规）`)
+      return null
+    }
+    return (raw as readonly unknown[]).filter(isUsableHit)
+  } catch (err) {
+    degraded.push(`${label}：${messageOf(err)}`)
+    return null
+  }
+}
+
+function isUsableHit(value: unknown): value is ScoredHit {
+  if (typeof value !== 'object' || value === null) return false
+  const hit = value as { id?: unknown; score?: unknown; channel?: unknown }
+  return (
+    typeof hit.id === 'string' &&
+    hit.id.length > 0 &&
+    typeof hit.score === 'number' &&
+    typeof hit.channel === 'string'
+  )
+}
+
+function readNow(ports: RetrievePorts): number {
+  try {
+    const value = ports.clock?.now()
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  } catch {
+    // 时钟故障不该让检索失败：退化为宿主墙钟。
+  }
+  return Date.now()
+}
+
+function normalizeK(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return DEFAULT_RRF_K
+  return value
+}
+
+function normalizePositive(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) return fallback
+  return Math.floor(value)
+}
+
+function normalizeQuota(value: number | undefined, limit: number, storeCount: number): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 1) return Math.floor(value)
+  return Math.max(1, Math.ceil(limit / Math.max(1, storeCount)))
+}
+
+function normalizeHalfLife(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return RERANK_HALF_LIFE_MS
+  return value
+}
+
+function unique<T>(values: readonly T[]): readonly T[] {
+  return [...new Set(values)]
+}
+
+function messageOf(err: unknown): string {
+  if (err instanceof Error) return err.message
+  return typeof err === 'string' ? err : String(err)
+}

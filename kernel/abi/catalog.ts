@@ -114,6 +114,66 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
 export const STATUS_TOOL = 'omb_status'
 
 /**
+ * 内核服务名契约。**三方一致**：模块 `provide` 的名字、`dsh/` 侧 `service()` 取用的名字、
+ * 以及测试断言的名字。改任何一处都要同步。
+ *
+ * 命名约定：
+ * - `stores` 等裸名 = 数据/能力服务
+ * - `prompt:*` = 注入宿主的提示贡献（值符合 `host.ts` 的 `PromptContribution`）
+ * - `*:tools` = 工具工厂（供 `dsh/` 在正确作用域注册；模块自己无法注册工具）
+ * - `*:metrics` / `*:loop` / `*:methods` = 供状态面与 `dsh/` 读取的观测面
+ */
+export const SERVICES = {
+  /** `StoresService`（见 `storage.ts`）。 */
+  stores: 'stores',
+  /** `Embedder` 槽（见 `ports.ts`）。 */
+  embedder: 'embedder',
+  /** `PromptContribution`：思维链方法卡的常驻提示与易变上下文。 */
+  promptReasoning: 'prompt:reasoning',
+  /** `ToolFactory`：`omb_method` / `omb_focus`。 */
+  reasoningTools: 'reasoning:tools',
+  /** 循环检测读数（`{ signal, window, reset }`）。 */
+  reasoningLoop: 'reasoning:loop',
+  /** 方法卡目录（`{ cardsFor(depth) }`）。 */
+  reasoningMethods: 'reasoning:methods',
+  /** `ToolFactory`：上下文侧工具（保留位；当前无）。 */
+  contextTools: 'context:tools',
+  /** `ContextPressure` 读数 + 档位行为。 */
+  contextPressure: 'context:pressure',
+  /** 拉取计数与缓存命中率的账本（供状态面）。 */
+  contextMetrics: 'context:metrics',
+  /** `StatusContributor`：向 `omb_status` 贡献一段。 */
+  statusContributor: 'status:contributor',
+  /** 外部通知桥（`NotifyBridge`）。 */
+  notify: 'notify',
+} as const
+
+export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
+
+/**
+ * 状态面贡献者。任一模块可实现它，`omb_status` 汇总。
+ *
+ * `detail` 必填——这是"诚实降级"在类型上的体现：
+ * 无法说明原因的降级不允许存在。
+ */
+export interface StatusContributor {
+  /** 本贡献者的段落名（会作为 `omb_status` 输出的小节标题）。 */
+  readonly name: string
+  /** 生成当前段落。**不得抛异常**——失败由调用方包成一行错误文本。 */
+  render(): string
+  /** 可选的结构化指标，便于机器读取。 */
+  readonly metrics?: () => Readonly<Record<string, number>>
+}
+
+/**
+ * 工具工厂：模块**不能**自己注册工具（只有 `dsh/` 能接触宿主），
+ * 因此模块提供工厂，由 `dsh/` 在正确作用域调用。
+ */
+export interface ToolFactory<TInput = unknown> {
+  create(input: TInput): readonly import('./host.js').ToolDefinition[]
+}
+
+/**
  * 写入路由：记忆该落哪个库。
  *
  * 位置即权威——不存在可漂移的 `scope` 标签。

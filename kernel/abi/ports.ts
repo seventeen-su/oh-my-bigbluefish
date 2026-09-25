@@ -90,6 +90,17 @@ export interface MemoryStore {
   searchLexical(query: LexicalQuery): Promise<readonly ScoredHit[]>
   upsertEdge(edge: Edge): Promise<void>
   walkGraph(query: GraphQuery): Promise<GraphWalk>
+  /**
+   * 显式删除。
+   *
+   * **这是唯一的硬删除路径**，只用于两种情形：
+   * ① 用户显式遗忘（隐私）② 保留策略清理过期记录。
+   *
+   * 常规的"衰减"**不走这里**——衰减是重新计算排序先验，不是改数据
+   * （见规划 §5.6）。误用会让"我当时相信什么"无法回答。
+   * @returns 实际删除的行数。
+   */
+  forget(ids: readonly string[]): Promise<number>
   /** 单库事务。实现方保证 `BEGIN IMMEDIATE` + 串行化。 */
   transaction<T>(fn: () => Promise<T>): Promise<T>
   stats(): Promise<StoreStats>

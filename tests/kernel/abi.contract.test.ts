@@ -26,7 +26,9 @@ describe('内核 ABI 契约', () => {
       'RESIDENT_HINT_MAX',
       'SCHEMA_VERSION',
       'SCOPE_BY_KIND',
+      'SERVICES',
       'STATUS_TOOL',
+      'STORES_SERVICE',
       'validateCatalog',
     ])
   })
