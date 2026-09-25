@@ -86,9 +86,14 @@ export function createToolBridge(): ToolBridge {
       // 内核实例**（`buildStatusTool(handle, sessions)`）。内核行重挂后旧实例仍在
       // 注册表里，于是工具跑的是**上一代内核**——它的 `sessions` 表是空的。
       //
-      // 实测症状极难判读：`omb_status` 报的「会话→cwd 映射」是 0，而模块行报 1；
+      // 实测症状极难判读：工具报的「会话→cwd 映射」是 0，而模块行报 1；
       // 于是 `omb_focus` 一直"取不到当前会话标识"（工具问的是旧实例的活跃会话表，
       // 而会话事件灌进的是新实例）。两处数字对不上就是最直接的线索。
+      //
+      // 注：这两处的字段**已经改名**，不再是同名不同表——模块段现在写
+      // 「本模块会话→cwd 登记」（`modules/memory/store.ts` 自己维护的
+      // `cwdBySession`），内核行的 `SessionTable` 才是本文件的 `sessions`。
+      // 同名曾经让自检报告把它当成"同一份输出的自相矛盾"记了两次。
       const names = new Set(tools.map(tool => tool.name))
       for (let i = extra.length - 1; i >= 0; i -= 1) {
         if (names.has(extra[i]!.name)) extra.splice(i, 1)
