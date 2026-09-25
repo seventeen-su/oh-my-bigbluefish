@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
+import { MODULE_CATALOG } from '../../../kernel/abi/index.js'
 import type { Kernel, ModuleHealth, ModuleRegistration } from '../../../kernel/abi/index.js'
 import {
   createProfileModule,
@@ -57,9 +58,12 @@ function startProfile(
 describe('注册面', () => {
   it('模块 id / 依赖 / 能力名与目录契约一致', () => {
     const module = createProfileModule()
+    const entry = MODULE_CATALOG.find(candidate => candidate.id === 'omb-profile')
     expect(module.manifest.id).toBe('omb-profile')
-    expect(module.manifest.requires).toEqual(['omb-memory'])
-    expect(module.manifest.capabilities).toEqual(['profile.declared'])
+    expect(module.manifest.requires).toEqual(entry?.requires)
+    expect(module.manifest.capabilities).toEqual(entry?.capabilities)
+    // 目录声明画像不注册工具（能力轴不落盘、显式条目由服务与投影消费）
+    expect(entry?.tools).toEqual([])
   })
 
   it('配置缺省值完整：inferCapabilityAxis 默认 false（D4）', () => {
@@ -196,6 +200,14 @@ describe('能力轴：默认关闭，且永不落盘（D4）', () => {
 })
 
 describe('降级与热插拔', () => {
+  it('订阅 turn/start：会话 id 用于取库（dsh 侧无需为画像额外接线）', async () => {
+    const stores = new FakeStores()
+    const { kernel, service } = startProfile(stores)
+    kernel.emit('turn/start', { sessionId: 'sess-42', turn: 1 })
+    await service.entries()
+    expect(stores.sessionCalls).toEqual(['sess-42'])
+  })
+
   it('记忆服务缺失 → 健康面 degraded 且原因可读，能力轴说明不受影响', async () => {
     const { service, health } = startProfile(undefined)
     const detail = (await health()).detail

@@ -1,6 +1,6 @@
 /**
  * 画像测试用的假件。**不 mock 宿主**：画像只依赖内核 ABI 的窄端口，
- * 所以一个内存假库就够了（规划 §11.1：modules 层零宿主 mock）。
+ * 所以一个内存假库 + 一个假的 `StoresService` 就够了（规划 §11.1：modules 层零宿主 mock）。
  */
 import type { MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
 
@@ -25,14 +25,42 @@ export class FakeStore {
   }
 }
 
-/** 双库假件：结构上满足 `ProfileStoresPort`（也是真实 `StoreSet` 的形状子集）。 */
+/**
+ * 假的 `StoresService`（ABI `kernel/abi/storage.ts`）：
+ * `forSession` / `forProject` → `StoreSet | undefined`，异步、可能未就绪。
+ *
+ * `userOnly = true` 模拟"宿主尚未告知该会话的 cwd"——记忆侧按契约降级为仅用户库。
+ */
 export class FakeStores {
   readonly user = new FakeStore()
   readonly project = new FakeStore()
   projectScope: string | null = 'D:/proj'
+  userOnly = false
+  failResolve: string | null = null
+  readonly sessionCalls: string[] = []
+  readonly projectCalls: string[] = []
 
-  store(scope: MemoryScope): FakeStore {
-    return scope === 'user' ? this.user : this.project
+  store(scope: MemoryScope): FakeStore | undefined {
+    if (scope === 'user') return this.user
+    return this.userOnly ? undefined : this.project
+  }
+
+  async forSession(sessionId: string): Promise<{ store(scope: MemoryScope): FakeStore | undefined; projectScope: string | null }> {
+    this.sessionCalls.push(sessionId)
+    if (this.failResolve !== null) throw new Error(this.failResolve)
+    return {
+      store: (scope: MemoryScope) => this.store(scope),
+      projectScope: this.userOnly ? null : this.projectScope,
+    }
+  }
+
+  async forProject(cwd: string): Promise<{ store(scope: MemoryScope): FakeStore | undefined; projectScope: string | null }> {
+    this.projectCalls.push(cwd)
+    if (this.failResolve !== null) throw new Error(this.failResolve)
+    return {
+      store: (scope: MemoryScope) => this.store(scope),
+      projectScope: cwd,
+    }
   }
 
   get puts(): number {

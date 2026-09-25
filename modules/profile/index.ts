@@ -21,13 +21,14 @@ import {
   renderDeclared as renderDeclaredText,
 } from './entries.js'
 import { CapabilityMemory } from './capability.js'
-import type { ProfileStoresPort } from './storage.js'
+import type { ProfileStoresServicePort } from './storage.js'
 import { ProfileStorage } from './storage.js'
 import type { ClearResult } from './clear.js'
 import { clearDeduced as clearDeducedFrom } from './clear.js'
 
 export const PROFILE_MODULE_ID = 'omb-profile'
-export const PROFILE_SERVICE = 'profile'
+/** 服务名取 ABI 契约里的 `SERVICES.profile`（不是本地约定）。 */
+export const PROFILE_SERVICE = SERVICES.profile
 export const PROFILE_VERSION = '3.0.0'
 
 /** 记忆模块提供的服务名（**ABI 契约**，不是本地约定）。 */
@@ -106,6 +107,8 @@ export interface ProfileService {
   clearDeduced(): Promise<ClearResult>
   /** 项目名（intent 轴与推断条目的来源标注）。 */
   setProject(project: string | null): void
+  /** 当前会话 id（正常由模块订阅 `turn/start` 自动维护；这里供 dsh 侧显式指定）。 */
+  setSession(sessionId: string): void
   status(): ProfileStatus
 }
 
@@ -310,6 +313,10 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
       storage.setProject(project)
     },
 
+    setSession(sessionId) {
+      storage.setSession(sessionId)
+    },
+
     status() {
       const availability = storage.availability()
       return {
@@ -364,7 +371,7 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
       config = parsed
       const storage = new ProfileStorage({
         // 按需解析，兼容热插拔：记忆模块可以先于/后于画像加载。
-        stores: () => kernel.service<ProfileStoresPort>(MEMORY_STORES_SERVICE),
+        stores: () => kernel.service<ProfileStoresServicePort>(MEMORY_STORES_SERVICE),
         clock: kernel.clock,
         logger: kernel.logger,
       })
@@ -380,10 +387,20 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
       runtime = created
 
       const unprovide = kernel.provide(PROFILE_SERVICE, created.service)
+      // 会话 id 来自内核事件（dsh 侧把宿主会话事件转成 `turn/start`），
+      // 因此画像不需要 dsh 额外接线就能定位"哪个项目的库"。
+      const unsubscribe = kernel.on('turn/start', payload => {
+        storage.setSession(payload.sessionId)
+      })
       kernel.report(created.health())
 
       return () => {
         // 热插拔：dispose 绝不抛异常（宿主 reconcileProfilePatches 会 await 旧 fiber）
+        try {
+          unsubscribe()
+        } catch (error) {
+          kernel.logger.warn(`画像：注销事件订阅失败（已隔离）——${messageOf(error)}`)
+        }
         try {
           unprovide()
         } catch (error) {
