@@ -10,10 +10,11 @@
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import { MODULE_CATALOG } from '../../../kernel/abi/index.js'
-import type { Kernel, ModuleHealth, ModuleRegistration } from '../../../kernel/abi/index.js'
+import type { Kernel, ModuleHealth, ModuleRegistration, PromptContribution } from '../../../kernel/abi/index.js'
 import {
   createProfileModule,
   profileConfigSchema,
+  PROFILE_PROMPT_SERVICE,
   PROFILE_SERVICE,
   type ProfileService,
 } from '../../../modules/profile/index.js'
@@ -199,13 +200,64 @@ describe('能力轴：默认关闭，且永不落盘（D4）', () => {
   })
 })
 
+describe('R8 呈现路径（prompt:omb-profile）', () => {
+  it('无冲突时为空串；有冲突时同时给出两种说法与"不替你选择"', async () => {
+    const stores = new FakeStores()
+    const { kernel, service } = startProfile(stores)
+    const contribution = kernel.service<PromptContribution>(PROFILE_PROMPT_SERVICE)
+    expect(contribution).toBeDefined()
+    expect(contribution?.resident).toBeUndefined() // 常驻前缀必须稳定，冲突是易变信息
+
+    const render = (): string =>
+      contribution?.context?.({ sessionId: 's1', depth: 'standard', band: 'relaxed' }) ?? ''
+
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    expect(render()).toBe('') // 无冲突 → 不占用任何上下文
+
+    await service.declare({ axis: 'stable', key: 'tone', value: '详尽' })
+    const text = render()
+    expect(text).toContain('简洁')
+    expect(text).toContain('详尽')
+    expect(text).toContain('不替你选择')
+  })
+
+  it('只推冲突，不推显式偏好（不推"可能有用"的东西）', async () => {
+    const stores = new FakeStores()
+    const { kernel, service } = startProfile(stores)
+    const contribution = kernel.service<PromptContribution>(PROFILE_PROMPT_SERVICE)
+    await service.declare({ axis: 'stable', key: 'editor', value: '用 vim' })
+    const text = contribution?.context?.({ sessionId: 's1', depth: 'standard', band: 'relaxed' }) ?? ''
+    expect(text).not.toContain('vim')
+  })
+
+  it('卸载后提示贡献被注销，旧贡献渲染为空串（不抛）', async () => {
+    const handle = createKernel({ clock: fakeClock() })
+    const module = createProfileModule()
+    handle.start([memoryStub(new FakeStores()), module as ModuleRegistration<unknown>])
+    const service = handle.kernel.service<ProfileService>(PROFILE_SERVICE)
+    const contribution = handle.kernel.service<PromptContribution>(PROFILE_PROMPT_SERVICE)
+    await service?.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    await service?.declare({ axis: 'stable', key: 'tone', value: '详尽' })
+    const render = (): string =>
+      contribution?.context?.({ sessionId: 's1', depth: 'standard', band: 'relaxed' }) ?? ''
+    expect(render()).not.toBe('')
+
+    handle.dispose()
+    expect(handle.kernel.service(PROFILE_PROMPT_SERVICE)).toBeUndefined()
+    expect(() => render()).not.toThrow()
+    expect(render()).toBe('')
+  })
+})
+
 describe('降级与热插拔', () => {
   it('订阅 turn/start：会话 id 用于取库（dsh 侧无需为画像额外接线）', async () => {
     const stores = new FakeStores()
     const { kernel, service } = startProfile(stores)
+    // 挂载时会预热一次（此时还没有会话，按空会话取库=记忆侧降级为仅用户库）
+    expect(stores.sessionCalls).toEqual([''])
     kernel.emit('turn/start', { sessionId: 'sess-42', turn: 1 })
     await service.entries()
-    expect(stores.sessionCalls).toEqual(['sess-42'])
+    expect(stores.sessionCalls.at(-1)).toBe('sess-42')
   })
 
   it('记忆服务缺失 → 健康面 degraded 且原因可读，能力轴说明不受影响', async () => {
