@@ -18,7 +18,7 @@
  * 本文件不 import `node:sqlite`：连接由 `dsh/` 经 `StorageHostPort.openDatabase` 注入。
  */
 import { mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import type {
   Clock,
   Edge,
@@ -36,8 +36,11 @@ import type {
   StoreStats,
   StoresService,
   TaggedStore,
+  VectorAttribution,
+  VectorQuery,
 } from '../../kernel/abi/index.js'
 import { ASSERTED_BY, EDGE_TYPES, MEMORY_KINDS } from '../../kernel/abi/index.js'
+import { blobToVector, cosineSimilarity, vectorToBlob } from './embed.js'
 import {
   DATA_DIR_NAME,
   MEMORY_DIR_NAME,
@@ -115,12 +118,8 @@ export interface EmbeddingVector {
   readonly vector: Float32Array
 }
 
-/** `meta` 表记录的当前嵌入器（权威身份）。 */
-export interface EmbeddingMeta {
-  readonly modelId: string
-  readonly dim: number
-  readonly revision: string
-}
+/** `meta` 表记录的当前嵌入器身份（与 ABI 的 `VectorAttribution` 同构，直接复用）。 */
+export type EmbeddingMeta = VectorAttribution
 
 /**
  * 某个库的向量读写面。
@@ -276,24 +275,6 @@ function toEdge(row: unknown): Edge {
     type: enumOf(r['type'], EDGE_TYPES, 'type'),
     createdAt: integerOf(r['created_at'], 'created_at'),
   }
-}
-
-/** Float32Array → BLOB。拷贝而不是共享 buffer：调用方可能复用同一块内存。 */
-function float32ToBlob(vector: Float32Array): Uint8Array {
-  return new Uint8Array(vector.buffer.slice(vector.byteOffset, vector.byteOffset + vector.byteLength))
-}
-
-function blobToFloat32(value: unknown, where: string): Float32Array {
-  let bytes: Uint8Array
-  if (value instanceof Uint8Array) bytes = value
-  else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value)
-  else throw new Error(`OMB：${where} 期望 BLOB，实际得到 ${typeof value}——数据已损坏`)
-  if (bytes.byteLength % 4 !== 0) {
-    throw new Error(`OMB：${where} 的 BLOB 长度 ${bytes.byteLength} 不是 4 的倍数——数据已损坏`)
-  }
-  const copy = new Uint8Array(bytes.byteLength)
-  copy.set(bytes)
-  return new Float32Array(copy.buffer)
 }
 
 function chunkArray<T>(items: readonly T[], size: number): readonly (readonly T[])[] {
@@ -560,7 +541,7 @@ class SqliteStore implements SqliteMemoryStore {
         vector.modelId,
         vector.dim,
         vector.revision,
-        float32ToBlob(vector.vector),
+        vectorToBlob(vector.vector),
       ])
     })
   }
@@ -808,7 +789,8 @@ class SqliteStore implements SqliteMemoryStore {
         `SELECT memory_id, model_id, dim, revision, vector FROM embedding WHERE memory_id IN (${placeholders})`,
         chunk,
       )) {
-        result.push(this.#toEmbedding(row))
+        const embedding = this.#toEmbedding(row)
+        if (embedding !== null) result.push(embedding)
       }
     }
     return result
@@ -840,7 +822,103 @@ class SqliteStore implements SqliteMemoryStore {
       }${limit}`,
       params,
     )
-    return rows.map(row => this.#toEmbedding(row))
+    const result: EmbeddingVector[] = []
+    for (const row of rows) {
+      const embedding = this.#toEmbedding(row)
+      if (embedding !== null) result.push(embedding)
+    }
+    return result
+  }
+
+  /**
+   * 向量检索（ABI `MemoryStore.searchVector`）。
+   *
+   * 分工：**本方法负责存取、归属过滤（下推到 SQL）与余弦打分**；
+   * 跨通道排名与融合是 `retrieve.ts` 的职责（§5.4 的 RRF），这里不做。
+   *
+   * 为什么归属过滤必须在 SQL 里：否则要把整表读进 JS 再逐行比对——
+   * 那正是旧实现"读全部向量再打分"的性能缺陷，也让"混进别的向量空间"有机可乘。
+   *
+   * 与 `searchLexical` 一致：`valid_to` / `superseded_by` 非空的记忆不参与（精度优先）。
+   * 库内没有匹配归属的向量行 → 空数组（**无向量是合法状态，不是错误**）。
+   */
+  async searchVector(query: VectorQuery): Promise<readonly ScoredHit[]> {
+    this.#assertUsable()
+    const limit = Number.isFinite(query.limit) ? Math.max(0, Math.floor(query.limit)) : 0
+    if (limit === 0) return []
+
+    const expect = query.expect
+    if (
+      typeof expect?.modelId !== 'string' ||
+      expect.modelId.trim().length === 0 ||
+      !Number.isInteger(expect.dim) ||
+      expect.dim <= 0 ||
+      typeof expect.revision !== 'string' ||
+      expect.revision.trim().length === 0
+    ) {
+      throw new VectorAttributionError('向量检索缺少完整归属标签（modelId/dim/revision）')
+    }
+    if (!(query.embedding instanceof Float32Array) || query.embedding.length !== expect.dim) {
+      throw new VectorAttributionError(
+        `查询向量与声明维度不符：期望 ${expect.dim} 维，实际 ${
+          query.embedding instanceof Float32Array ? query.embedding.length : typeof query.embedding
+        }`,
+      )
+    }
+
+    const kinds = query.kinds === undefined ? [] : [...new Set(query.kinds)]
+    for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')
+
+    const params: unknown[] = [expect.modelId, expect.dim, expect.revision, this.scope]
+    let kindClause = ''
+    if (kinds.length > 0) {
+      kindClause = ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
+      params.push(...kinds)
+    }
+
+    const rows = this.#all(
+      `SELECT e.memory_id AS id, e.vector AS vector
+         FROM embedding e
+         JOIN memory m ON m.id = e.memory_id
+        WHERE e.model_id = ?
+          AND e.dim = ?
+          AND e.revision = ?
+          AND m.scope = ?
+          AND m.valid_to IS NULL
+          AND m.superseded_by IS NULL${kindClause}`,
+      params,
+    )
+
+    // minScore 未给 → 不过滤（下限的标定属调用方责任）
+    const minScore =
+      typeof query.minScore === 'number' && Number.isFinite(query.minScore) ? query.minScore : undefined
+    const hits: ScoredHit[] = []
+    let unusable = 0
+    for (const row of rows) {
+      const r = asRow(row, '向量候选')
+      const vector = blobToVector(r['vector'])
+      // 解码失败或长度不等于声明维度 → 不可比，跳过（写入口已拒绝，这里防的是历史损坏）
+      if (vector === null || vector.length !== expect.dim) {
+        unusable++
+        continue
+      }
+      const score = cosineSimilarity(query.embedding, vector)
+      if (!Number.isFinite(score)) {
+        unusable++
+        continue
+      }
+      if (minScore !== undefined && score < minScore) continue
+      hits.push({ id: textOf(r['id'], 'id'), score, channel: 'vector' })
+    }
+    if (unusable > 0) {
+      // 诚实降级：跳过不是静默——计数与原因都要看得见
+      this.#logger.warn(
+        `OMB：向量检索跳过 ${unusable} 条不可用向量（损坏或维度不符）；解码失败计数见 embed.ts 的读数`,
+      )
+    }
+    // 分数降序；同分按 id 升序，使同一输入下返回顺序确定（排名可复现）
+    hits.sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    return hits.slice(0, limit)
   }
 
   async countEmbeddings(): Promise<number> {
@@ -848,16 +926,18 @@ class SqliteStore implements SqliteMemoryStore {
     return countOf(this.#get('SELECT COUNT(*) AS c FROM embedding')?.['c'])
   }
 
-  #toEmbedding(row: unknown): EmbeddingVector {
+  #toEmbedding(row: unknown): EmbeddingVector | null {
     const r = asRow(row, 'embedding 行')
     const memoryId = textOf(r['memory_id'], 'memory_id')
-    const dim = integerOf(r['dim'], 'dim')
+    // 解码原语只有一份实现（`./embed.js`）：损坏 BLOB → null 并计数
+    const vector = blobToVector(r['vector'])
+    if (vector === null) return null
     return {
       memoryId,
       modelId: textOf(r['model_id'], 'model_id'),
-      dim,
+      dim: integerOf(r['dim'], 'dim'),
       revision: textOf(r['revision'], 'revision'),
-      vector: blobToFloat32(r['vector'], `embedding(${memoryId})`),
+      vector,
     }
   }
 
@@ -922,8 +1002,15 @@ export interface OpenMemoryStoreOptions {
   readonly clock: Clock
 }
 
-/** 项目库路径 = `<cwd>/.omb/memory/session.db`（与 `paths.ts` 同一套常量，不重复拼字面量）。 */
+/**
+ * 项目库路径 = `<cwd>/.omb/memory/session.db`（与 `paths.ts` 同一套常量，不重复拼字面量）。
+ *
+ * @throws 非绝对路径（与 `memoryPaths` 同一策略：拒绝静默采用进程 cwd）
+ */
 export function projectDbPathFor(cwd: string): string {
+  if (!isAbsolute(cwd)) {
+    throw new Error(`OMB：项目库路径需要绝对 cwd，收到 "${cwd}"（拒绝静默采用进程 cwd）`)
+  }
   return join(projectIdentity(cwd), DATA_DIR_NAME, MEMORY_DIR_NAME, PROJECT_DB_FILE)
 }
 
@@ -1177,6 +1264,12 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       unexpectedFailure = '项目库需要一个非空 cwd'
       return undefined
     }
+    if (!isAbsolute(cwd)) {
+      // 与 paths.ts 同一策略：相对路径会被静默锚到进程 cwd，宁可拒绝
+      unexpectedFailure = `项目库需要绝对 cwd，收到 "${cwd}"——拒绝静默采用进程 cwd`
+      logger.warn(`OMB 记忆库：${unexpectedFailure}`)
+      return undefined
+    }
     const key = projectIdentity(cwd)
 
     const opened = projects.get(key)
@@ -1188,13 +1281,14 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
     const inflight = pendingProjects.get(key)
     if (inflight !== undefined) return await inflight
 
-    const user = await ensureUser()
-    if (user === undefined) return undefined
-    const hostPort = port()
-    if (hostPort === undefined) return undefined
-    if (userStore === undefined) return undefined
-
+    // **同步**登记在飞任务：否则并发 forProject 会各自打开一次同一个库文件
+    // （任务体里的第一个 await 之前，pendingProjects 必须已经可见）。
     const task = (async (): Promise<StoreSet | undefined> => {
+      const user = await ensureUser()
+      if (user === undefined) return undefined
+      const hostPort = port()
+      if (hostPort === undefined || userStore === undefined) return undefined
+      if (closing) return undefined
       try {
         const store = openMemoryStore({
           scope: 'project',
@@ -1208,7 +1302,10 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
           return undefined
         }
         projectFailures.delete(key)
-        return projectSet(key, store)
+        const set = projectSet(key, store)
+        // 在任务内登记：任务 resolve 时 `projects` 已经可见，晚到的调用者不会重复打开
+        projects.set(key, set)
+        return set
       } catch (error) {
         recordProjectFailure(key, `项目库打开失败（${key}）：${messageOf(error)}`)
         return undefined
@@ -1223,7 +1320,6 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       pendingProjects.delete(key)
     }
     if (set === undefined) return undefined
-    projects.set(key, set)
     evictProjects()
     return set
   }
