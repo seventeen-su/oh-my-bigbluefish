@@ -14,18 +14,21 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import {
+  SERVICES,
   type Embedder,
   type MemoryKind,
   type MemoryRecord,
   type MemoryScope,
   type MemoryStore,
   type ScoredHit,
+  type SecondaryChannelRegistry,
   type TaggedStore,
   type VectorQuery,
 } from '../../../kernel/abi/index.js'
 import { HASH_BOW_COSINE_FLOOR, hashBagEmbedder } from '../../../modules/memory/embed.js'
 import { BGE_COSINE_FLOOR, BGE_DIMENSIONS, BGE_EMBEDDER_ID } from '../../../modules/memory/onnx.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
+import type { RetrievalChannel } from '../../../modules/memory/retrieve.js'
 import {
   EMBEDDER_SERVICE,
   cosineFloorFor,
@@ -476,5 +479,55 @@ describe('§5.7 端到端：向量通道注入 retrieve 后与词法 RRF 融合'
     const channel = vectorChannel(kern.kernel)
     expect(channel.name).toBe('vector')
     await expect(channel.search(query({ store: tagged(spyStore().store) }))).resolves.toEqual([])
+  })
+})
+
+describe('生产接线：登记进 retrieval:channels（否则通道再对也没人消费）', () => {
+  it('apply 同步登记、dispose 注销（登记处是检索侧唯一的取通道入口）', () => {
+    const kern = createKernel()
+    const registry = kern.kernel.service<SecondaryChannelRegistry<RetrievalChannel>>(
+      SERVICES.channelRegistry,
+    )
+    expect(registry).toBeDefined()
+    expect(registry!.list()).toEqual([])
+
+    const module = createVectorModule()
+    const dispose = module.apply(kern.kernel, { modelDir: join(tempRoot(), 'nope') })
+    expect(registry!.list().map((c) => c.name)).toEqual(['vector'])
+
+    // 幂等：重复 dispose 不抛，且不会把别人的通道删掉
+    dispose()
+    dispose()
+    expect(registry!.list()).toEqual([])
+  })
+
+  it('§5.7 端到端（走生产接线）：registry.list() 喂给 retrieve → 两条通道都参与融合', async () => {
+    const kern = createKernel()
+    const module: VectorModuleInstance = createVectorModule()
+    const dispose = module.apply(kern.kernel, { modelDir: join(tempRoot(), 'nope'), dimensions: 256 })
+    const registry = kern.kernel.service<SecondaryChannelRegistry<RetrievalChannel>>(
+      SERVICES.channelRegistry,
+    )!
+    const stores: readonly TaggedStore[] = [{ scope: 'user', store: twoChannelStore() }]
+    const embedder = kern.kernel.service<Embedder>(EMBEDDER_SERVICE)
+
+    const result = await retrieve(stores, { text: '记忆系统', limit: 5 }, {
+      clock: { now: () => 1 },
+      ...(embedder !== undefined ? { embedder } : {}),
+      channels: registry.list(), // ← 与 modules/memory/index.ts 的 ports() 同一路径
+    })
+
+    expect(result.items.map((i) => i.id).sort()).toEqual(['a', 'b'])
+    expect([...result.stats.channelsUsed].sort()).toEqual(['lexical', 'vector'])
+    expect(result.degraded).toEqual([])
+
+    dispose()
+    const after = await retrieve(stores, { text: '记忆系统', limit: 5 }, {
+      clock: { now: () => 1 },
+      ...(embedder !== undefined ? { embedder } : {}),
+      channels: registry.list(), // 关掉模块 → 登记处为空 → 纯词法（完整可用）
+    })
+    expect(after.items.map((i) => i.id)).toEqual(['a'])
+    expect(after.stats.channelsUsed).toEqual(['lexical'])
   })
 })
