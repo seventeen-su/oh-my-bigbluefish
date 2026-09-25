@@ -338,16 +338,16 @@ describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 r
     dispose()
   })
 
-  it('stores 服务缺失 snapshot() → 可读原因 + 队列保留（不误报成功）', async () => {
-    const store = realStore()
-    await store.put(recordOf('m1', '长期记忆系统'))
+  it('库未就绪（snapshot 里没有可用库）→ 可读原因 + 队列保留（不误报成功）', async () => {
+    await realStore() // 保证库实现可用，但 stores 服务报告"未就绪"
     const handle = createKernel()
     handle.kernel.provide(SERVICES.stores, {
-      status: () => ({ ready: false, detail: '桩：没有 snapshot', openProjects: [] }),
+      status: () => ({ ready: false, detail: '桩：尚未打开任何库', openProjects: [] }),
       forSession: async () => undefined,
       forProject: async () => undefined,
       rememberCwd: () => {},
       close: async () => {},
+      snapshot: () => ({ user: undefined, projects: [] }),
     })
 
     const instance = createVectorModule({ loadOnnx: async () => ({ ok: false, reason: '测试' }) })
@@ -358,7 +358,6 @@ describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 r
     expect(outcome.encoded).toBe(0)
     expect(outcome.reason).toContain('记忆库未就绪')
     expect(instance.encoder()!.pending()).toBe(1)
-    void store
     dispose()
   })
 })
