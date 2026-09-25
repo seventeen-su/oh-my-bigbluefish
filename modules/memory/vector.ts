@@ -32,6 +32,7 @@ import {
   type ModuleManifest,
   type ModuleRegistration,
   type ScoredHit,
+  type SecondaryChannelRegistry,
   type StatusRegistry,
   type StoreSet,
   type StoresService,
