@@ -107,7 +107,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   for (const failure of loaded.failures) {
     logger.warn(`OMB：模块入口 ${failure.path} 未装配——${failure.reason}`)
   }
-  const blocked = handle.start([KERNEL_SELF, ...loaded.modules], configMapOf())
+  const blocked = handle.start([KERNEL_SELF, ...loaded.modules], configMapOf(), ctx)
   for (const b of blocked) logger.warn(`OMB：模块 ${b.id} 未启动——${b.reason}`)
 
   // ── 3) 工具注册（同步；单个失败不影响其余）─────────────────────────────

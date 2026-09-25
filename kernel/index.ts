@@ -10,6 +10,7 @@ import { BudgetTable } from './budget.js'
 import { HealthTable } from './health.js'
 import { FocusTable, planModules } from './registry.js'
 import { StatusTable } from './status.js'
+import { adoptContext, type ForeignContextLike } from './adopt.js'
 import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
@@ -55,6 +56,7 @@ export interface KernelHandle {
   start(
     modules: readonly ModuleRegistration<unknown>[],
     configs?: ReadonlyMap<string, unknown>,
+    hostCtx?: unknown,
   ): readonly {
     readonly id: string
     readonly reason: string
@@ -163,16 +165,40 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
 
   return {
     kernel,
-    start(modules, configs) {
+    start(modules, configs, hostCtx) {
       const plan = planModules(modules)
       for (const blocked of plan.blocked) {
         healthTable.report(blocked.id, { state: 'failed', detail: blocked.reason })
         logger.warn(`内核：模块 ${blocked.id} 未启动——${blocked.reason}`)
       }
       for (const { id, registration } of plan.ordered) {
-        // 每个模块拿到一个把健康上报绑定到自己 id 的内核视图；
-        // 这样健康面无需模块自己报 id（少一个出错点）。
-        const scoped: Kernel = { ...kernel, report: health => healthTable.report(id, health) }
+        // **关键**：`apply` 的第一参必须是我们的 `Kernel` 纯对象，而不是宿主 ctx。
+        // 宿主 Cordis 会按它自己的契约传 ctx 代理，而 Guard 对未 `inject` 的属性
+        // 读写直接抛（实测："cannot get property \"clock\" without inject" → 4 个模块
+        // 激活失败，而工具面/提示注入正常，表现为"插件半活"）。
+        // 收养把宿主能力逐项取一次后落到纯对象上，且不展开代理（展开会实体化 getter
+        // 从而绕过 Guard）。
+        const scoped: Kernel = adoptContext(
+          (hostCtx ?? {}) as ForeignContextLike,
+          {
+            services: {
+              get: <T,>(name: string) => services.get<T>(name),
+              names: () => services.names(),
+              provide: (name, value) => services.provide(name, value),
+            },
+            on: (event, fn) => bus.on(event, fn),
+            emit: (event, payload) => {
+              if (!disposed) bus.emit(event, payload)
+            },
+            budget: (kind, amount) => budgetTable.grant(kind, amount),
+            pressure: session => kernel.pressure(session),
+            focus: session => kernel.focus(session),
+            setFocus: (session, depth, reason) => kernel.setFocus(session, depth, reason as FocusDepth),
+            logger,
+            clock,
+          },
+          health => healthTable.report(id, health),
+        )
         try {
           const config = registration.manifest.configSchema.parse(configs?.get(id))
           const disposer = registration.apply(scoped, config)
