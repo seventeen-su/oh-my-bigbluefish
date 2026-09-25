@@ -629,12 +629,19 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
     // ① 批量水合：每个（库套件 × 作用域）一次 `getMany`——禁 N+1
     const found = new Map<string, { record: MemoryRecord; api: VectorStoreApi | undefined }>()
+    /** 本次真正检查过的作用域。**没被检查 ≠ 记录已删除**：项目库可能尚未预热。 */
+    const coveredScopes = new Set<MemoryScope>()
     let vectorCapable = false
     let hydrateError: string | null = null
     for (const set of sets) {
       for (const scope of MEMORY_SCOPES) {
         const target = set.store(scope)
         if (target === undefined) continue
+        // 覆盖与能力是**库的属性**，与本批是否有该作用域的候选无关：
+        // 先判定，再决定要不要 getMany（否则"项目库还没打开"会被误判成"库不支持向量"）。
+        coveredScopes.add(scope)
+        const api = asVectorStore(target)
+        if (api !== undefined) vectorCapable = true
         const ids = batch
           .filter(
             ([id, queuedScope]) =>
@@ -642,8 +649,6 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
           )
           .map(([id]) => id)
         if (ids.length === 0) continue
-        const api = asVectorStore(target)
-        if (api !== undefined) vectorCapable = true
         try {
           for (const record of await target.getMany(ids)) {
             found.set(record.id, { record, api })
@@ -653,9 +658,23 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         }
       }
     }
+    /** 作用域未被任何已打开库覆盖的待编码条目（项目库尚未预热）→ **保留队列**，下次再试。 */
+    const uncoveredScopes = (): readonly MemoryScope[] => [
+      ...new Set(
+        batch
+          .map(([, queuedScope]) => queuedScope)
+          .filter((scope): scope is MemoryScope => scope !== null && !coveredScopes.has(scope)),
+      ),
+    ]
     if (found.size === 0) {
       if (hydrateError !== null) return nothing(`${hydrateError}；待编码队列保留`)
       if (!vectorCapable) return nothing('库不支持向量写入（asVectorStore 未命中）；待编码队列保留')
+      const pendingScopes = uncoveredScopes()
+      if (pendingScopes.length > 0) {
+        return nothing(
+          `库尚未就绪（${pendingScopes.join('、')} 作用域的库还没打开）；待编码队列保留`,
+        )
+      }
       // 记录已不存在（被删除）：出队并计数——既不是失败，也不是可重试的状态
       for (const [id] of batch) queue.delete(id)
       skippedTotal += batch.length
@@ -664,11 +683,19 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
     // ② 分类：空文本 / 无向量口 → 跳过；其余待编码
     const encodable: { id: string; text: string; api: VectorStoreApi }[] = []
+    const queuedScopeOf = new Map(batch)
     let skipped = 0
     for (const [id] of batch) {
       const hit = found.get(id)
       if (hit === undefined) {
-        queue.delete(id) // 库里没有这条（已删除）
+        const queuedScope = queuedScopeOf.get(id) ?? null
+        if (queuedScope !== null && !coveredScopes.has(queuedScope)) {
+          // 该条所在作用域的库还没打开（例如项目库晚于用户库就绪）→ 不是"已删除"，保留重试
+          callReason = `库尚未就绪（${queuedScope} 作用域的库还没打开）；待编码队列保留`
+          lastEncodeReason = callReason
+          continue
+        }
+        queue.delete(id) // 库里确实没有这条（已删除）
         skipped += 1
         continue
       }
