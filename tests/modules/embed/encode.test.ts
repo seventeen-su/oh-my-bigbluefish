@@ -15,6 +15,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterAll, describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import {
+  SERVICES,
   type Embedder,
   type Kernel,
   type Logger,
@@ -259,8 +260,7 @@ describe('冲刷：批量读 → 一次批编码 → 逐条落盘（带归属标
     booted.dispose()
   })
 
-  it('limit 分批：一次只冲刷 N 条，其余留下', async () => {
-    const store = realStore()
+  it('limit 分批：一次只冲刷 N 条，其余留下', async () => {    const store = realStore()
     for (const id of ['m1', 'm2', 'm3']) await store.put(recordOf(id, `文本 ${id}`))
     const booted = boot(() => [storeSetOf('user', store)])
     for (const id of ['m1', 'm2', 'm3']) booted.kernel.emit('memory/written', written(id))
@@ -307,6 +307,59 @@ describe('冲刷：批量读 → 一次批编码 → 逐条落盘（带归属标
     expect(stored.map(v => v.memoryId).sort()).toEqual(['m2', 'm3'])
     expect(booted.encoder.stats().dropped).toBe(1)
     booted.dispose()
+  })
+})
+
+describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 resolveStoreSets）', () => {
+  it('从 stores 服务的 snapshot() 取库并完成编码', async () => {
+    const store = realStore()
+    await store.put(recordOf('m1', '长期记忆系统'))
+    const handle = createKernel()
+    // store-dev 的 MemoryStoresService 就是这样暴露 snapshot() 的（尚未进 ABI，用结构面）：
+    // 本用例证明**生产缺省路径今天就能工作**，不依赖 ABI 冻结。
+    handle.kernel.provide(SERVICES.stores, {
+      status: () => ({ ready: true, detail: '桩：只有 snapshot 有用', openProjects: [] }),
+      forSession: async () => undefined,
+      forProject: async () => undefined,
+      rememberCwd: () => {},
+      close: async () => {},
+      snapshot: () => ({ user: storeSetOf('user', store), projects: [] }),
+    })
+
+    const instance = createVectorModule({
+      loadOnnx: async () => ({ ok: false, reason: '测试：不装载 ONNX（用哈希词袋）' }),
+    })
+    const dispose = instance.apply(handle.kernel, { modelDir: join(tempDir(), '不存在') })
+    handle.kernel.emit('memory/written', written('m1'))
+
+    const outcome = await instance.encoder()!.encodePending()
+    expect(outcome).toEqual({ encoded: 1, skipped: 0, failures: 0 })
+    expect(await asVectorStore(store)!.getEmbeddings(['m1'])).toHaveLength(1)
+    dispose()
+  })
+
+  it('stores 服务缺失 snapshot() → 可读原因 + 队列保留（不误报成功）', async () => {
+    const store = realStore()
+    await store.put(recordOf('m1', '长期记忆系统'))
+    const handle = createKernel()
+    handle.kernel.provide(SERVICES.stores, {
+      status: () => ({ ready: false, detail: '桩：没有 snapshot', openProjects: [] }),
+      forSession: async () => undefined,
+      forProject: async () => undefined,
+      rememberCwd: () => {},
+      close: async () => {},
+    })
+
+    const instance = createVectorModule({ loadOnnx: async () => ({ ok: false, reason: '测试' }) })
+    const dispose = instance.apply(handle.kernel, { modelDir: join(tempDir(), '不存在') })
+    handle.kernel.emit('memory/written', written('m1'))
+
+    const outcome = await instance.encoder()!.encodePending()
+    expect(outcome.encoded).toBe(0)
+    expect(outcome.reason).toContain('记忆库未就绪')
+    expect(instance.encoder()!.pending()).toBe(1)
+    void store
+    dispose()
   })
 })
 
