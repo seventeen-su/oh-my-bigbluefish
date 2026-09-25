@@ -205,6 +205,14 @@ describe('load / save：失败都返回可读错误，绝不抛', () => {
     expect(saved.error).toContain('stores 不可用')
   })
 
+  it('服务存在但尚未完成首次取库 → 同步探测报"就绪但未探明"，不谎称知道库状态', () => {
+    const stores = new FakeStores()
+    const storage = storageWith(stores)
+    const availability = storage.availability()
+    expect(availability.ok).toBe(true)
+    expect(availability.detail).toContain('尚未完成')
+  })
+
   it('服务存在但库未就绪（forSession 返回 undefined）→ 可读原因', async () => {
     const storage = storageWith({
       forSession: async () => undefined,
