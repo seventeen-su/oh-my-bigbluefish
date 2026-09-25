@@ -13,6 +13,7 @@
 import { z } from 'zod'
 import type { Clock, Kernel, Logger, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import { SERVICES } from '../../kernel/abi/index.js'
+import type { PromptContribution } from '../../kernel/abi/index.js'
 import type { ProfileAxis, ProfileConflict, ProfileEntry, ProfileOutcome } from './entries.js'
 import {
   applyEntry,
@@ -29,6 +30,8 @@ import { clearDeduced as clearDeducedFrom } from './clear.js'
 export const PROFILE_MODULE_ID = 'omb-profile'
 /** 服务名取 ABI 契约里的 `SERVICES.profile`（不是本地约定）。 */
 export const PROFILE_SERVICE = SERVICES.profile
+/** 提示贡献服务名：`prompt:<模块 id>`（只输出未裁决冲突，见 `conflictDigest`）。 */
+export const PROFILE_PROMPT_SERVICE = `prompt:${PROFILE_MODULE_ID}`
 export const PROFILE_VERSION = '3.0.0'
 
 /** 记忆模块提供的服务名（**ABI 契约**，不是本地约定）。 */
@@ -125,6 +128,14 @@ export interface ProfileRuntimeDeps {
 export interface ProfileRuntime {
   readonly service: ProfileService
   readonly health: () => ModuleHealth
+  /**
+   * R8 的呈现路径：**只**返回未裁决冲突的文本（无冲突时为空串）。
+   *
+   * 为什么只有冲突会"推"：冲突是唯一必须让用户当场裁决的信息（用户自相矛盾时，
+   * 静默选一个是更坏的行为）。显式偏好等其余内容一律按需拉取（§6.4）。
+   * 同步返回，供宿主的易变上下文渲染函数使用（那里不能 await）。
+   */
+  readonly conflictDigest: () => string
   /** 卸载后一切读写降级为可读错误（不抛、也不再触碰存储）。 */
   readonly dispose: () => void
 }
@@ -149,6 +160,11 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   let inferred = 0
   let conflicts = 0
   let lastError: string | null = null
+  /**
+   * 冲突文本缓存（同步可读）。R8 要求把冲突**摆出来**，而提示注入的渲染函数
+   * 是同步的、存储读取是异步的——因此这里缓存最近一次的渲染结果。
+   */
+  let conflictText = ''
 
   function counts(entries: readonly ProfileEntry[]): { declared: number; inferred: number; conflicts: number } {
     let declaredCount = 0
@@ -166,6 +182,8 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     inferred = next.inferred
     const found = listConflicts(entries)
     conflicts = found.length
+    // 没有冲突时是空串：调用方据此决定不占用任何上下文（不推"可能有用"的东西）
+    conflictText = renderConflictsText(found)
     return found
   }
 
@@ -333,9 +351,11 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   return {
     service,
     health,
+    conflictDigest: () => (disposed ? '' : conflictText),
     dispose: () => {
       disposed = true
       capability.clearAll()
+      conflictText = ''
     },
   }
 }
@@ -387,11 +407,21 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
       runtime = created
 
       const unprovide = kernel.provide(PROFILE_SERVICE, created.service)
+      /**
+       * R8 呈现（`prompt:omb-profile`，走宿主的**易变**上下文槽）：
+       * 只在存在未裁决冲突时输出文本，其余时候是空串——不推"可能有用"的东西。
+       * 不设 `resident`：常驻前缀必须逐字节稳定且 ≤120 字符，冲突是易变信息。
+       */
+      const unprovidePrompt = kernel.provide<PromptContribution>(PROFILE_PROMPT_SERVICE, {
+        context: () => created.conflictDigest(),
+      })
       // 会话 id 来自内核事件（dsh 侧把宿主会话事件转成 `turn/start`），
       // 因此画像不需要 dsh 额外接线就能定位"哪个项目的库"。
       const unsubscribe = kernel.on('turn/start', payload => {
         storage.setSession(payload.sessionId)
       })
+      // 预热缓存：只填内部状态，不注册任何东西（H-2 允许异步填状态）
+      void created.service.entries()
       kernel.report(created.health())
 
       return () => {
@@ -400,6 +430,11 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
           unsubscribe()
         } catch (error) {
           kernel.logger.warn(`画像：注销事件订阅失败（已隔离）——${messageOf(error)}`)
+        }
+        try {
+          unprovidePrompt()
+        } catch (error) {
+          kernel.logger.warn(`画像：注销提示贡献失败（已隔离）——${messageOf(error)}`)
         }
         try {
           unprovide()
