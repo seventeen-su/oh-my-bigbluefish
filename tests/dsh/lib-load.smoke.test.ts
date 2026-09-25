@@ -15,11 +15,33 @@
  * 而不是给一个看不懂的 import 失败。
  */
 import { describe, expect, it } from 'vitest'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const libKernel = fileURLToPath(new URL('../../lib/dsh/kernel.js', import.meta.url))
-const built = existsSync(libKernel)
+/**
+ * 产物目录由 `scripts/build.mjs` **换代**写入（`lib-gen/g1` → `g2` → …）。
+ * 这里从代数文件读当前代数——不能写死目录名，否则换代后本冒烟会静默跳过。
+ */
+function currentOutDir(): string | undefined {
+  try {
+    const raw = readFileSync(new URL('../../build-generation.json', import.meta.url), 'utf8')
+    const parsed = JSON.parse(raw) as { outDir?: unknown }
+    return typeof parsed.outDir === 'string' ? parsed.outDir : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 产物根目录。**断言非空**：进入本文件的前提是产物存在（否则整体 skip）。 */
+function requireOutDir(): string {
+  const dir = currentOutDir()
+  if (dir === undefined) throw new Error('build-generation.json 缺失或损坏——先跑 node scripts/build.mjs')
+  return fileURLToPath(new URL(`../../${dir}/`, import.meta.url))
+}
+
+const outDir = currentOutDir()
+const libKernel = outDir === undefined ? undefined : fileURLToPath(new URL(`../../${outDir}/dsh/kernel.js`, import.meta.url))
+const built = libKernel !== undefined && existsSync(libKernel)
 
 /** fake 宿主：只提供 `apply` 真正会读的东西，其余一律缺失（走降级路径）。 */
 function fakeHost(): {
@@ -54,12 +76,10 @@ function fakeHost(): {
   return { ctx, registered }
 }
 
-describe.skipIf(!built)('构建产物加载冒烟（lib/）', () => {
+describe.skipIf(!built)('构建产物加载冒烟（换代产物）', () => {
   it('产物里没有 Vite 专有语法残留（import.meta.glob 曾让插件装不上）', async () => {
     const { readFileSync, readdirSync } = await import('node:fs')
     const { join } = await import('node:path')
-    const libRoot = fileURLToPath(new URL('../../lib/', import.meta.url))
-
     const offenders: string[] = []
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -74,19 +94,17 @@ describe.skipIf(!built)('构建产物加载冒烟（lib/）', () => {
             .split('\n')
             .filter(line => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
             .join('\n')
-          if (/import\.meta\.glob\s*\(/.test(code)) offenders.push(full.replace(libRoot, ''))
+          if (/import\.meta\.glob\s*\(/.test(code)) offenders.push(full.replace(requireOutDir(), ''))
         }
       }
     }
-    walk(libRoot)
+    walk(requireOutDir())
     expect(offenders, `产物里仍有 import.meta.glob 调用：${offenders.join(', ')}`).toEqual([])
   })
 
   it('产物不 import 任何 @deepseek-ai/* 包（宿主包在本仓库不可解析）', async () => {
     const { readFileSync, readdirSync } = await import('node:fs')
     const { join } = await import('node:path')
-    const libRoot = fileURLToPath(new URL('../../lib/', import.meta.url))
-
     const offenders: string[] = []
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -96,17 +114,17 @@ describe.skipIf(!built)('构建产物加载冒烟（lib/）', () => {
           const text = readFileSync(full, 'utf8')
           // 只看真正的 import/export from 语句，不看注释与字符串
           if (/^\s*(import|export)[^\n]*from\s*['"]@deepseek-ai\//m.test(text)) {
-            offenders.push(full.replace(libRoot, ''))
+            offenders.push(full.replace(requireOutDir(), ''))
           }
         }
       }
     }
-    walk(libRoot)
+    walk(requireOutDir())
     expect(offenders, `产物 import 了宿主包：${offenders.join(', ')}`).toEqual([])
   })
 
   it('入口能被 apply：模块全部装配、工具面齐全、卸载不抛', async () => {
-    const entry = (await import(libKernel)) as {
+    const entry = (await import(libKernel as string)) as {
       apply(ctx: unknown, config?: unknown): () => void
       name: string
       inject: readonly string[]

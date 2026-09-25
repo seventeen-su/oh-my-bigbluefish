@@ -16,16 +16,27 @@ import { MODULE_IDS } from '../../kernel/abi/index.js'
 const yaml = readFileSync(new URL('../../cordis.patch.yml', import.meta.url), 'utf8')
 
 /**
- * 从 YAML 里取指向本仓库模块的相对入口。
+ * 产物目录的路径片段。产物目录带**代数后缀**（`lib-gen/g1`）——代数变 = URL 变 =
+ * 宿主必然加载新模块，而不是命中 ESM 缓存里的旧实例。
  *
- * 产物目录名可以是 `lib` 也可以是别的（`build` 等）——**目录名是缓存代标记**：
- * 宿主 ESM 按 URL 缓存，换目录名 = 换 URL，才能在**不重启宿主**的前提下
- * 加载新的 JS 代。所以这里不能写死 `lib/`。
+ * 用字符串构造正则（而不是正则字面量）：路径里有 `/`，写在字面量里要层层转义，
+ * 可读性差且极易写错（这里踩过一次）。
  */
+const OUTPUT_DIR = String.raw`(?:lib-gen/g\d+|lib|build\d*)`
+
+/** 从 YAML 里取指向本仓库模块的相对入口。 */
 function moduleEntrySpecs(): readonly string[] {
-  return [...yaml.matchAll(/name:\s*'\.\/(?:lib|build\d*)\/(modules\/[^'?]+)\.js/g)].map(
-    m => m[1] as string,
+  const re = new RegExp(String.raw`name:\s*'\./${OUTPUT_DIR}/(modules/[^'?]+)\.js`, 'g')
+  return [...yaml.matchAll(re)].map(m => m[1] as string)
+}
+
+/** 取 YAML 里「模块行 id + 其入口」的配对。 */
+function moduleRows(): readonly (readonly [string, string])[] {
+  const re = new RegExp(
+    String.raw`- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'\./${OUTPUT_DIR}/(modules/[^'?]+)\.js`,
+    'g',
   )
+  return [...yaml.matchAll(re)].map(m => [m[1] as string, m[2] as string] as const)
 }
 
 describe('模块入口清单与 YAML 一致', () => {
@@ -34,7 +45,7 @@ describe('模块入口清单与 YAML 一致', () => {
     // 在 DSH 0.1.7 里它**从原理上不可用**——实测装到 profile 后 8 行全部
     // "failed to import"，报错 URL 形如 `kernel.js%3Fv=1`：那个 `?v=1`
     // 被当成**文件名字面量**去找，文件当然不存在。
-    // 新宿主自带 HMR，改代码后重载由宿主负责，不需要这个尾缀。
+    // 换代目录（`lib-gen/g<N>`）已能做到同样的"绕过 ESM 缓存"且不破坏路径。
     const offenders = [...yaml.matchAll(/name:\s*'([^']*\?v=\d+[^']*)'/g)].map(m => m[1] as string)
     expect(offenders, `这些行带了 ?v= 尾缀，装到宿主后会加载失败：\n${offenders.join('\n')}`).toEqual([])
   })
@@ -59,14 +70,21 @@ describe('模块入口清单与 YAML 一致', () => {
   })
 
   it('每个 YAML 模块行的 id 都在 MODULE_IDS 里', () => {
-    // YAML 里模块行的 name 指向产物目录，用行 id 与之配对（目录名可为 lib/build）
-    const rows = [
-      ...yaml.matchAll(/- id:\s*(omb-[\w-]+)\s*\n\s*name:\s*'\.\/(?:lib|build\d*)\/(modules\/[^'?]+)\.js/g),
-    ]
+    const rows = moduleRows()
     expect(rows.length).toBeGreaterThan(0)
-    for (const row of rows) {
-      const id = row[1] as string
+    for (const [id] of rows) {
       expect(MODULE_IDS.includes(id as (typeof MODULE_IDS)[number]), `YAML 行 id ${id} 不在 MODULE_IDS`).toBe(true)
+    }
+  })
+
+  it('每个 YAML 模块行的入口与静态清单里的键一一对应', () => {
+    // 这条防的是"清单和 YAML 各自指向不同文件"——两边都对但配不上，
+    // 于是插件页那一行激活的是另一个文件里的注册项。
+    const rows = moduleRows()
+    expect(rows.length).toBe(MODULE_ENTRIES.size)
+    for (const [id, spec] of rows) {
+      const namespace = MODULE_ENTRIES.get(spec)
+      expect(namespace, `${id} 的入口 ${spec} 不在静态清单里`).toBeDefined()
     }
   })
 })
@@ -120,36 +138,37 @@ describe('loadModulesSync', () => {
   })
 
   it('模块 id 重复记为失败', () => {
-    const entries = new Map<string, unknown>([
-      ['modules/a/index', MODULE_ENTRIES.get('modules/profile/index')],
-      ['modules/b/index', MODULE_ENTRIES.get('modules/notify/index')],
-    ])
-    // 用同一个注册项造重复：改不了 manifest.id，所以用两次相同入口
-    const dup = new Map<string, unknown>([
-      ['modules/a/index', MODULE_ENTRIES.get('modules/profile/index')],
-    ])
-    expect(loadModulesSync(dup).modules).toHaveLength(1)
-    // 把同一模块放进两个入口键 → 应只装配一次并记一次失败
-    const twice = new Map<string, unknown>([
-      ['modules/a/index', MODULE_ENTRIES.get('modules/profile/index')],
-      ['modules/b/index', MODULE_ENTRIES.get('modules/profile/index')],
-    ])
-    const result = loadModulesSync(twice)
+    const profile = MODULE_ENTRIES.get('modules/profile/index')
+    expect(loadModulesSync(new Map([['modules/a/index', profile]])).modules).toHaveLength(1)
+    // 把同一模块放进两个入口键 → 只装配一次并记一次失败
+    const result = loadModulesSync(
+      new Map<string, unknown>([
+        ['modules/a/index', profile],
+        ['modules/b/index', profile],
+      ]),
+    )
     expect(result.modules).toHaveLength(1)
     expect(result.failures[0]?.reason).toContain('模块 id 重复')
-    void entries
   })
 })
 
 describe('pickRegistrations：按结构判定，不按导出名', () => {
   it('多种导出命名都能被发现', () => {
-    const shape = {
-      manifest: { id: 'x', configSchema: { parse: () => ({}) } },
-      apply: () => {},
-    }
+    const shape = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
     expect(pickRegistrations({ artifactModule: shape })).toHaveLength(1)
     expect(pickRegistrations({ reasoningRegistration: shape })).toHaveLength(1)
-    expect(pickRegistrations({ vectorModule: shape, createX: () => shape })).toHaveLength(1) // 去重
+  })
+
+  it('同一 id 下"可运行的注册项"优先于"裸清单"', () => {
+    // 真实情形：vector.ts 同时导出 vectorManifest 与 vectorModule。
+    // 裸 manifest 也能通过形状判定（有 manifest.id 且 configSchema.parse 是函数），
+    // 若被收下就会因 id 重复把真正可运行的注册项挤掉——实测导致模块被装配成
+    // 没有 apply 的空壳，再被内核剔除。
+    const bare = { manifest: { id: 'x', configSchema: { parse: () => ({}) } } }
+    const runnable = { manifest: { id: 'x', configSchema: { parse: () => ({}) } }, apply: () => {} }
+    const picked = pickRegistrations({ vectorManifest: bare, vectorModule: runnable })
+    expect(picked).toHaveLength(1)
+    expect(typeof picked[0]?.apply).toBe('function')
   })
 
   it('缺少 apply 或 configSchema.parse 的不算模块', () => {

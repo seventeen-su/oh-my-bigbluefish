@@ -14,7 +14,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs",
     "verify": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "dependencies": {
@@ -37,8 +37,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib",
+    "lib-gen",
     "cordis.patch.yml",
-    "models"
+    "build-generation.json"
   ]
 }

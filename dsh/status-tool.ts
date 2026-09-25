@@ -16,6 +16,7 @@ import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
 import type { SessionTable } from './session.js'
+import { generationFromUrl } from '../kernel/buildInfo.js'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
   ok: '正常',
@@ -34,6 +35,21 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   const { handle, sessions } = options
   const kernel = handle.kernel
   const lines: string[] = ['# OMB 状态', '']
+
+  // ── 构建代数 ──────────────────────────────────────────────────────────
+  // **这一行是防误判的关键**：插件行能免重启动态增删，但模块代码走 Node ESM
+  // 按 URL 缓存——改了源码而 URL 没变时，宿主跑的还是**旧模块实例**，
+  // 此时任何"模块异常"的报错都不反映当前源码。
+  // 代数直接印在状态里，"到底跑的是哪一代"就成了可观测事实。
+  const generation = generationFromUrl(import.meta.url)
+  lines.push(
+    '## 构建',
+    '',
+    generation === undefined
+      ? '- 代数：未知（非换代产物运行，或从源码直接运行；无法据此判断代码新旧）'
+      : `- 代数：第 ${generation} 代（产物目录 lib-gen/g${generation}）`,
+    '',
+  )
 
   // ── 模块健康 ──────────────────────────────────────────────────────────
   const health = handle.health()
