@@ -129,12 +129,33 @@ export type AdmissionDecision =
 const ARTIFACT_MARKERS: readonly { readonly pattern: RegExp; readonly label: string }[] = [
   { pattern: /(?:^|[\s("'`])[A-Za-z]:\\/, label: 'Windows 路径' },
   { pattern: /(?:^|[\s("'`])(?:\.{0,2}\/)[\w.-]+\//, label: '文件路径' },
+  /**
+   * 行号。**判据只认三种无歧义形态，且必须排在「文件名」之前**。
+   *
+   * 为什么不能是 `\b\d+:\d+\b`——那条两头都错，实测：
+   *
+   * - **假阳性**：`…T05:35:54+08:00` 里的 `35:54`、`14:30`（时间）、`16:9`（比例）全命中。
+   *   自检报告里 `OMB v3 自检标记：本次自检时间为 2026-09-26T05:35:54+08:00，…`
+   *   被记成「命中行号」——**理由与内容不符**，于是判据的 verdict 不能当证据用。
+   * - **假阴性**：真正的 `src/index.ts:120` **不**命中（`ts:120` 里 `:` 前是字母，
+   *   `\b` 不成立）。它漏掉了自己本来要认的那一种。
+   *
+   * 为什么排在「文件名」之前：`ARTIFACT_MARKERS.find()` 取**第一个**命中，
+   * 而 `remember.ts:137` 同时命中「文件名」与「行号」。行号更具体、更接近"可核对"，
+   * 理应优先；否则回执会报一个比实际证据更弱的理由。
+   *
+   * 宁可漏：漏了补个 `#L120` 就能过；错收是把与"可复现"无关的内容当成有实据。
+   */
+  {
+    pattern:
+      /#L\d+|\bline\s*\d+\b|\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|yml|yaml|toml|ini|py|go|rs|java|kt|sql|sh|ps1|css|html|txt|csv):\d+\b/,
+    label: '行号',
+  },
   {
     pattern:
       /\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|yml|yaml|toml|ini|py|go|rs|java|kt|sql|sh|ps1|css|html|txt|csv)\b/,
     label: '文件名',
   },
-  { pattern: /#L\d+|\bline\s*\d+\b|\b\d+:\d+\b/, label: '行号' },
   { pattern: /https?:\/\/\S+/, label: 'URL' },
   /**
    * 提交哈希。**不能用裸 `\b[0-9a-f]{7,40}\b`**：UUID 的每一段（8 位十六进制）
