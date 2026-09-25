@@ -23,10 +23,12 @@ import {
   type MemoryRecord,
   type MemoryStore,
   type ModuleHealth,
+  type ModuleRegistration,
   type TaggedStore,
 } from '../../../kernel/abi/index.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
 import {
+  DEFAULT_MAX_PENDING,
   EMBEDDER_SERVICE,
   VECTOR_MODULE_ID,
   createVectorModule,
@@ -112,6 +114,7 @@ describe('模块契约（三方一致：模块清单 / 目录 / cordis.patch.yml
     expect(config.threads).toBe(2)
     expect(config.dimensions).toBe(256)
     expect(config.modelDir).toBeUndefined()
+    expect(config.maxPending).toBe(DEFAULT_MAX_PENDING)
   })
 
   it('**没有 config 的 YAML 行也必须能启动**：parse(undefined) / parse(null) 走完整缺省值', () => {
