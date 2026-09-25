@@ -97,6 +97,31 @@ export function createStorageHost(options: StorageHostOptions): StorageHost {
 
   let ctor: SqliteModule | undefined = options.sqlite
   let resolutionFailure: string | undefined
+  /** 在飞的解析任务：并发调用共享同一次解析（避免重复 import）。 */
+  let resolving: Promise<string | null> | undefined
+
+  async function ensureSqlite(): Promise<string | null> {
+    if (ctor !== undefined) return null
+    if (resolving !== undefined) return resolving
+    resolving = (async (): Promise<string | null> => {
+      try {
+        const loaded = (await import(/* @vite-ignore */ 'node:sqlite')) as unknown as SqliteModule
+        if (typeof loaded?.DatabaseSync !== 'function') {
+          resolutionFailure = 'node:sqlite 存在但没有 DatabaseSync 导出'
+          return resolutionFailure
+        }
+        ctor = loaded
+        return null
+      } catch (error) {
+        resolutionFailure = error instanceof Error ? error.message : String(error)
+        options.logger.warn(`OMB：node:sqlite 不可用——${resolutionFailure}`)
+        return resolutionFailure
+      } finally {
+        resolving = undefined
+      }
+    })()
+    return resolving
+  }
 
   const port: StorageHostPort = {
     userDbPath,
@@ -117,27 +142,16 @@ export function createStorageHost(options: StorageHostOptions): StorageHost {
       }
       return openSqliteSync(ready, path)
     },
+    // 把就绪等待交给模块，让它不必猜时序（见 `StorageHostPort.whenReady` 的说明）
+    whenReady: async () => {
+      await ensureSqlite()
+    },
   }
 
   return {
     port,
     userDbPath,
     projectDbPath: projectDbPathOf,
-    async ensureSqlite(): Promise<string | null> {
-      if (ctor !== undefined) return null
-      try {
-        const loaded = (await import(/* @vite-ignore */ 'node:sqlite')) as unknown as SqliteModule
-        if (typeof loaded?.DatabaseSync !== 'function') {
-          resolutionFailure = 'node:sqlite 存在但没有 DatabaseSync 导出'
-          return resolutionFailure
-        }
-        ctor = loaded
-        return null
-      } catch (error) {
-        resolutionFailure = error instanceof Error ? error.message : String(error)
-        options.logger.warn(`OMB：node:sqlite 不可用——${resolutionFailure}`)
-        return resolutionFailure
-      }
-    },
+    ensureSqlite,
   }
 }
