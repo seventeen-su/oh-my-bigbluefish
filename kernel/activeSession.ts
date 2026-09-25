@@ -21,16 +21,20 @@ import type { SessionRef } from './abi/index.js'
 
 export class ActiveSessionTable {
   #current: SessionRef | null = null
+  #cwd: string | null = null
 
   /**
    * 记录一次观测。
    *
    * 空串**不覆盖**已有值：宁可用稍旧的有效会话，也不要被一次空值清掉——
    * 宿主事件里字段缺失是可能的，而"取不到会话"会让一批工具直接失效。
+   *
+   * `cwd` 可选，且**带了才更新**：不是每次观测都带它，不带的观测不该把已知的 cwd 抹掉。
    */
-  remember(session: SessionRef): void {
+  remember(session: SessionRef, cwd?: string | undefined): void {
     if (typeof session !== 'string' || session.trim() === '') return
     this.#current = session
+    if (typeof cwd === 'string' && cwd.trim() !== '') this.#cwd = cwd
   }
 
   /** 当前活跃会话；从未观测到时为 null。 */
@@ -38,8 +42,25 @@ export class ActiveSessionTable {
     return this.#current
   }
 
+  /**
+   * 当前会话的**工作目录**；未知时为 null。
+   *
+   * ## 为什么内核要存它
+   *
+   * 模块拿不到会话 cwd（`turn/start` 只有 `sessionId`/`turn`），于是只能退回
+   * `process.cwd()`——而那是**宿主进程**的工作目录，不是用户会话的。
+   * 用户在别的目录里干活时，相对路径会按宿主 cwd 解析，把真实存在的文件判成
+   * 不存在（准入核验因此误拒）。
+   *
+   * 会话 cwd 是会话级事实，本来就该由观测它的 `dsh/` 交给内核持有。
+   */
+  cwd(): string | null {
+    return this.#cwd
+  }
+
   /** 内核关闭时清空（旧会话在新一轮里不再可信）。 */
   clear(): void {
     this.#current = null
+    this.#cwd = null
   }
 }
