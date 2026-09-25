@@ -71,10 +71,14 @@ describe('ServiceTable：缺失不抛', () => {
     expect(new ServiceTable().get('nope')).toBeUndefined()
   })
 
-  it('重复注册同名服务抛错（配置错误应当早失败）', () => {
+  it('同名重复注册不抛，后注册者生效（热插拔重载需要）', () => {
     const t = new ServiceTable()
-    t.provide('x', 1)
-    expect(() => t.provide('x', 2)).toThrow(/已被注册/)
+    const first = t.provide('x', 1)
+    t.provide('x', 2)
+    expect(t.get('x')).toBe(2)
+    // 迟到的旧 disposer 不得误删新注册的实例
+    first()
+    expect(t.get('x')).toBe(2)
   })
 
   it('注销只移除自己注册的那个实例', () => {

@@ -23,6 +23,7 @@ describe('内核 ABI 契约', () => {
       'MEMORY_SCOPES',
       'MODULE_CATALOG',
       'MODULE_IDS',
+      'RESERVED_SOURCE_PREFIX',
       'RESIDENT_HINT_MAX',
       'SCHEMA_VERSION',
       'SCOPE_BY_KIND',
