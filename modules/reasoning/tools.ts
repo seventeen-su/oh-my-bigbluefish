@@ -9,6 +9,8 @@
 import { z } from 'zod'
 import type { FocusDepth, SessionRef, ToolDefinition, ToolInputSchema, ToolOutcome } from '../../kernel/abi/index.js'
 import { FOCUS_DEPTHS } from '../../kernel/abi/index.js'
+import type { FailureClass } from './control.js'
+import { FAILURE_CLASSES } from './control.js'
 import type { FocusApplyResult } from './focus.js'
 import { FOCUS_DEPTH_VALUES } from './focus.js'
 import type { LoopSignal } from './loop.js'
@@ -48,12 +50,40 @@ const methodInput = z.object({
 const focusInput = z.object({
   depth: z
     .enum(FOCUS_DEPTH_VALUES, { error: `depth 必须是 ${FOCUS_DEPTHS.join(' / ')} 之一` })
-    .describe('推理深度档位：quick 直接回答 / standard 默认 / deep 展开'),
+    .describe('推理深度档位：quick 直接回答 / standard 默认 / deep 更高验证预算'),
   reason: z.string().describe('为什么调这一档（进审计与状态面，便于事后判断档位是否有用）').optional(),
+})
+
+const verifyInput = z.object({
+  claim: z.string().describe('要核对的结论（一句话）。与 failure 至少给一个').optional(),
+  evidence: z
+    .string()
+    .describe('支撑这条结论的来源：文件行号 / 命令输出 / 用户原话 / 工件路径')
+    .optional(),
+  falsifier: z.string().describe('如果这条结论错了，会看到什么不一样').optional(),
+  failure: z
+    .enum(FAILURE_CLASSES as unknown as [FailureClass, ...FailureClass[]])
+    .describe('给一次失败定性；给 unknown 时会用循环观察细化')
+    .optional(),
 })
 
 const methodParams = paramsOf(methodInput)
 const focusParams = paramsOf(focusInput)
+const verifyParams = paramsOf(verifyInput)
+
+/** `omb_verify` 的入参（`index.ts` 的端口按这个形状收）。 */
+export interface VerifyInput {
+  readonly claim?: string
+  readonly evidence?: string
+  readonly falsifier?: string
+  readonly failure?: FailureClass
+}
+
+/** Verify 端口的结果：`text` 直接给模型看。 */
+export interface VerifyOutcome {
+  readonly ok: boolean
+  readonly text: string
+}
 
 /** 工具端口。全部由 `index.ts` 注入；测试可传最小 fake。 */
 export interface ReasoningToolPorts {
@@ -66,6 +96,11 @@ export interface ReasoningToolPorts {
   readonly applyDepth: (session: SessionRef, depth: FocusDepth, reason: string) => FocusApplyResult
   /** 当前循环信号；缺省表示不可用（工具照样工作，只是不带这一行提示）。 */
   readonly loopSignal?: (session: SessionRef) => LoopSignal | null
+  /**
+   * Verify 端口：核对结论的形式、给失败定性并拿恢复动作。
+   * 缺省表示不可用——`omb_verify` 会回可读错误，不抛（H-3）。
+   */
+  readonly verify?: (session: SessionRef, input: VerifyInput) => VerifyOutcome
 }
 
 function text(value: string): ToolOutcome {
@@ -178,7 +213,54 @@ export function createFocusTool(ports: ReasoningToolPorts): ToolDefinition {
   }
 }
 
-/** 两个工具，顺序与 `MODULE_CATALOG` 的 `tools` 一致。 */
+/**
+ * `omb_verify({ claim?, evidence?, falsifier?, failure? })`——控制环里的 **Verify** 一环。
+ *
+ * 两件事，都是"核对/处置"这一类动作，所以共用一条工具（工具面有配额，见报告）：
+ * ① 核对一条结论的**形式**：来源指不指得出来、能不能被否证
+ * ② 给一次失败**定性**，拿回该类的恢复动作与预算（`FAILURE_PLAYBOOK`）
+ *
+ * 描述里必须写清"只做形式核对，不判断内容为真"——否则模型会把
+ * "形式可核对"当成"已证实"，那是我们承担不起的过度承诺。
+ */
+export function createVerifyTool(ports: ReasoningToolPorts): ToolDefinition {
+  return {
+    name: 'omb_verify',
+    description:
+      '验证一环。传 claim 核对一条结论：来源是否指得出来（文件行号/命令输出/用户原话/工件路径）、能否说出否证条件；传 failure 给一次失败定性（'
+      + `${FAILURE_CLASSES.join('/')}）并拿回该类处置与重试预算。只做形式核对，不判断内容是否为真。`,
+    parameters: verifyParams,
+    execute(args: unknown): ToolOutcome {
+      try {
+        const parsed = verifyInput.safeParse(args ?? {})
+        if (!parsed.success) {
+          const why = parsed.error.issues.map(i => i.message).join('；')
+          return failure(`参数不合法：${why}。用法：omb_verify { claim?, evidence?, falsifier?, failure? }`)
+        }
+        const { claim, evidence, falsifier, failure: declaredFailure } = parsed.data
+        if (claim === undefined && declaredFailure === undefined) {
+          return failure('至少要给一个：claim（要核对的结论）或 failure（失败分类）。用法：omb_verify { claim?, evidence?, falsifier?, failure? }')
+        }
+        const session = resolveSession(ports)
+        if (session === null) return failure(NO_SESSION)
+        if (ports.verify === undefined) {
+          return failure('验证端口不可用（模块可能已关闭或未接线）；本次调用未改变任何状态。')
+        }
+        let outcome: VerifyOutcome
+        try {
+          outcome = ports.verify(session, { claim, evidence, falsifier, failure: declaredFailure })
+        } catch (error) {
+          return failure(`验证失败：${messageOf(error)}；本次调用未改变任何状态。`)
+        }
+        return outcome.ok ? text(outcome.text) : failure(outcome.text)
+      } catch (error) {
+        return failure(`omb_verify 内部错误：${messageOf(error)}`)
+      }
+    },
+  }
+}
+
+/** 三个工具，顺序与 `MODULE_CATALOG` 的 `tools` 一致（`omb_verify` 为本次新增）。 */
 export function createReasoningTools(ports: ReasoningToolPorts): readonly ToolDefinition[] {
-  return [createMethodTool(ports), createFocusTool(ports)]
+  return [createMethodTool(ports), createFocusTool(ports), createVerifyTool(ports)]
 }

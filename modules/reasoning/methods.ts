@@ -12,9 +12,14 @@
  * 本文件不得出现任何哲学术语，新增文案也必须先过这一条。
  *
  * 注入策略（§4.3 / §6.4）：不是每轮注入全部八条。
- * 常驻的只有 `residentHint()` 那一句；全文由模型经 `omb_method` 按需拉取，
- * `cardsFor(depth)` 只是"某一档位声明需要哪些卡"的投影，是否真的注入
- * 由上下文层按压力档位裁决（§4.6 的反向接口）。
+ * 常驻的只有 `residentHint()` 那一句；全文由模型经 `omb_method` 按需拉取。
+ *
+ * R3/R6 的形态在 v3.1 改过一次（用户判断）：
+ * - `R3` 不再写死"至少两个"备选，改为"不止一种就并列"——**份数**由档位的
+ *   `branchBudget` 决定（见 `control.ts`），固定数字从文案里移出。
+ * - `R6` 不再是"连续失败两次就不再重试第三次"这种全局阈值，改为
+ *   **失败分类 → 恢复策略**（`FAILURE_PLAYBOOK`）；旧阈值降级为
+ *   `transient` 一类下的重试预算，理由写在该策略的 `why` 里。
  */
 import type { FocusDepth } from '../../kernel/abi/index.js'
 import { RESIDENT_HINT_MAX } from '../../kernel/abi/index.js'
@@ -51,7 +56,7 @@ export const METHOD_CARDS: readonly MethodCard[] = [
   {
     id: 'R3',
     title: '备选再收敛',
-    text: "在确定方案前，列出至少两个互斥的可能解释或做法，然后说明为什么选这一个。但不要为凑数列假备选——只有一个合理解释时直接说。",
+    text: "如果不止一种合理解释或做法，就把它们并列摆出来再选一个，并说明为什么选这一个；只有一个合理解释时直接说，不要为凑数列假备选。",
     whenToUse: '要在多个可能解释或做法里选一个时',
   },
   {
@@ -68,9 +73,9 @@ export const METHOD_CARDS: readonly MethodCard[] = [
   },
   {
     id: 'R6',
-    title: '失败即换向',
-    text: "同一个方向连续失败两次，就不再重试第三次。停下来，说明为什么这个方向不行，换一个方向或问用户。",
-    whenToUse: '同一个方向已经失败两次时',
+    title: '失败先分类',
+    text: "一次尝试失败后先分类再处置：瞬时的（超时、限流）重试，但要有次数上限；参数错的改参数再来；方向错的换方向，不要重试；环境错的先查环境（权限、依赖、网络）；分不清的先用 omb_verify 报一次失败，或直接问用户。",
+    whenToUse: '一次尝试失败、或同一动作再做一次仍没有新结果时',
   },
   {
     id: 'R7',
@@ -94,11 +99,16 @@ export function cardById(id: string): MethodCard | undefined {
 }
 
 /**
- * 每个深度档位**声明需要**的卡片 id（§4.4 / §4.6）。
+ * 每个深度档位**声明需要**的卡片 id（§4.6 的反向接口）。
+ *
+ * 这里是**拉取建议**，不是注入计划：真正自动注入的卡片由 `control.ts` 的
+ * `injectCard` 决定，且任何档位都 ≤ 1 张（`AUTO_INJECT_CARD_CAP`）。
+ * 档位差异的载体是**控制参数**（验证预算 / 证据要求 / 分支 / 复核 / 收尾），
+ * 不是"给你更多规则文本"。
  *
  * - `quick`：一张都不要——本档位的动作是"别展开"，不是"读规则"
- * - `standard`：最多一张（R1 匹配深度），是否真的注入由上下文层按压力裁决
- * - `deep`：R3/R4/R5 全文（强制展开备选、可检验性、具体锚定）
+ * - `standard`：至多一张（R1 匹配深度）——它的动作已由常驻提示逐字承载，故不额外注入正文
+ * - `deep`：R3/R4/R5 声明需要，自动注入 R4（可检验），其余按需用 `omb_method` 拉
  */
 export const CARDS_BY_DEPTH: Readonly<Record<FocusDepth, readonly RuleId[]>> = {
   quick: [],
@@ -106,13 +116,13 @@ export const CARDS_BY_DEPTH: Readonly<Record<FocusDepth, readonly RuleId[]>> = {
   deep: ['R3', 'R4', 'R5'],
 }
 
-/** `deep` 档需要的卡片（供 `focus.ts` 与测试引用，避免各处硬写）。 */
+/** `deep` 档声明需要的卡片（供测试与状态面引用，避免各处硬写）。 */
 export const DEEP_CARD_IDS: readonly RuleId[] = CARDS_BY_DEPTH.deep
 
 /**
- * 某档位声明的规则卡。**纯函数**：同一 depth 永远返回同一批卡（顺序固定）。
+ * 某档位**声明需要**的规则卡。**纯函数**：同一 depth 永远返回同一批卡（顺序固定）。
  *
- * `quick` → 空数组；`standard` → 至多一张；`deep` → R3/R4/R5。
+ * 注意它返回的是"声明"，不是"会注入什么"——注入预算见 `control.ts`。
  */
 export function cardsFor(depth: FocusDepth): readonly MethodCard[] {
   const ids = CARDS_BY_DEPTH[depth] ?? []
@@ -157,12 +167,13 @@ export function residentHint(maxChars: number = RESIDENT_HINT_MAX): string {
  *
  * 四条都以 R1 的动作**逐字**开头（"先判断这个问题需要多少推理"）；
  * 预算变小时先舍工具名、再舍后半句——动作本身留到最后（只有截断才可能丢）。
- * 变体的取舍顺序是有意的：先说清"该想多少"，再说"去哪儿取"。
+ * 三条常用工具（方法卡 / 档位 / 验证）只在预算够时点名：工具本身在工具面里可见，
+ * 常驻提示的职责是"何时用"，不是"有哪些工具"。
  */
 const RESIDENT_HINT_VARIANTS: readonly string[] = [
-  '先判断这个问题需要多少推理：简单/闲聊/事实问答直接答，需推导或多方案再展开。规则卡 R1–R8 用 omb_method 取，深度档位用 omb_focus 设。',
-  '先判断这个问题需要多少推理：简单直接答，需推导或多方案再展开。规则卡 omb_method，档位 omb_focus。',
-  '先判断这个问题需要多少推理：简单直接答，复杂再展开；规则卡 omb_method，档位 omb_focus。',
+  '先判断这个问题需要多少推理：简单/闲聊/事实问答直接答，需推导或多方案再展开。规则卡 R1–R8 用 omb_method 取，深度档位用 omb_focus 设，结论核对与失败定性用 omb_verify。',
+  '先判断这个问题需要多少推理：简单直接答，需推导或多方案再展开。卡 omb_method，档位 omb_focus，验证 omb_verify。',
+  '先判断这个问题需要多少推理：简单直接答，复杂再展开；omb_method / omb_focus / omb_verify。',
   '先判断这个问题需要多少推理：简单直接答，复杂再展开。',
 ]
 
@@ -170,10 +181,10 @@ const RESIDENT_HINT_VARIANTS: readonly string[] = [
 const TOPIC_ALIASES: Readonly<Record<RuleId, readonly string[]>> = {
   R1: ['深度', '长度', '思考量', '过度推理', '匹配'],
   R2: ['判据', '目标', '成功标准', '验收', '什么算解决'],
-  R3: ['备选', '方案', '收敛', '过早收敛', '互斥', '选择'],
+  R3: ['备选', '方案', '收敛', '过早收敛', '互斥', '选择', '分支'],
   R4: ['可检验', '验证', '断言', '待确认', '证伪'],
   R5: ['具体', '事实', '锚定', '核实', '出处'],
-  R6: ['失败', '换向', '重试', '卡住', '换方向'],
+  R6: ['失败', '换向', '重试', '卡住', '换方向', '分类', '处置', '恢复', '瞬时', '环境'],
   R7: ['编造', '不知道', '不确定', '幻觉', '猜'],
   R8: ['冲突', '矛盾', '不一致', '前后矛盾'],
 }

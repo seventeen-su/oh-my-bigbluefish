@@ -1,16 +1,20 @@
 /**
- * 推理深度档位的投影层（规划 §4.4）。
+ * 推理深度档位的投影层（规划 §4.4，v3.1 按用户判断改造）。
  *
  * **状态不在我们这里**：读写在 `kernel.focus()` / `kernel.setFocus()`，
  * 本文件只做三件事——把 depth 投影成"给模型看什么"、安全地读、安全地写。
  *
- * 我们只做两件事（§4.4）：①把深度选择变成一次**显式动作**
- * ②**测量它**（`reasoningTokens` 按 depth 分层，记账在上下文层）。
+ * v3.1 的关键变化：档位差异的载体从"注入多少卡片文本"换成
+ * **`control.ts` 里的结构化控制参数**（验证预算 / 证据要求 / 分支 / 复核 / 收尾）。
+ * 自动注入的卡片被钉死在 ≤1 张（`AUTO_INJECT_CARD_CAP`），
+ * 且只有偏离默认基线的档位会多读一行控制参数——文本量不随档位线性增长。
  */
 import type { FocusDepth, Kernel, SessionRef } from '../../kernel/abi/index.js'
 import { FOCUS_DEPTHS } from '../../kernel/abi/index.js'
+import type { DepthControl } from './control.js'
+import { AUTO_INJECT_CARD_CAP, controlLine, controlOf, describeControl } from './control.js'
 import type { MethodCard, RuleId } from './methods.js'
-import { CARDS_BY_DEPTH, cardsFor, renderCards } from './methods.js'
+import { CARDS_BY_DEPTH, cardById } from './methods.js'
 
 /** `quick` 档注入的动作指令：抑制过度推理（§4.4 表格原文）。 */
 export const QUICK_DIRECTIVE = '本轮不要展开，直接回答。'
@@ -23,42 +27,66 @@ export const QUICK_DIRECTIVE = '本轮不要展开，直接回答。'
 export const FOCUS_DEPTH_VALUES = ['quick', 'standard', 'deep'] as const satisfies readonly FocusDepth[]
 
 /**
- * `deep` 档注入的抬头。三条全文由 `cards` 给出，这里只说明本轮的强制动作。
+ * 哪些档位需要把控制读数读给模型。
+ *
+ * 只有 `deep`：它偏离默认基线，模型需要知道本轮被要求多少验证、允许几个分支、
+ * 收尾门槛是什么。`standard` 是基线本身（读数没有新信息，纯属占字符），
+ * `quick` 的动作是"别展开"，一行抑制指令足够。
  */
-export const DEEP_DIRECTIVE = '本轮按深档展开：先列互斥备选，再给可检验的结论，并锚定具体事实。'
+const ANNOUNCE_CONTROL: Readonly<Record<FocusDepth, boolean>> = {
+  quick: false,
+  standard: false,
+  deep: true,
+}
 
 export interface DepthProjection {
   readonly depth: FocusDepth
-  /** 本档位的动作指令；`standard` 为空串（默认档不加戏）。 */
+  /** 本档位的动作指令；`quick` 之外为空串。 */
   readonly directive: string
+  /** 本档位的**结构化控制参数**——档位差异的真正载体。 */
+  readonly control: DepthControl
+  /** 控制读数一行（`ANNOUNCE_CONTROL` 为 false 的档位是空串）。 */
+  readonly controlText: string
   /**
-   * 本档位**声明需要**的规则卡 id（§4.6 的反向接口）。
+   * 本档位**声明需要**的规则卡 id（§4.6 的反向接口，拉取建议）。
    *
-   * 声明 ≠ 注入：思维链层提需求，上下文层按压力档位裁决是否与如何给。
+   * 声明 ≠ 注入：注入的是 `cards`（≤1 张），其余由模型按需用 `omb_method` 拉。
    */
   readonly needs: readonly RuleId[]
-  /** `needs` 解析出的卡片全文；上下文层据此渲染，不推的时候直接不用。 */
+  /** 本档位**自动注入**的卡片（受 `AUTO_INJECT_CARD_CAP` 约束，至多一张）。 */
   readonly cards: readonly MethodCard[]
 }
 
-/** 深度 → 投影。**纯函数**：同档位永远同结果。 */
-export function projectFocus(depth: FocusDepth): DepthProjection {
-  const needs = CARDS_BY_DEPTH[depth] ?? []
+/**
+ * 深度 → 投影。**纯函数**：同一 `(depth, verifyUsed)` 永远同结果。
+ *
+ * `verifyUsed` 只影响控制读数里的"已用/预算"，不影响任何卡片。
+ */
+export function projectFocus(depth: FocusDepth, verifyUsed = 0): DepthProjection {
+  const control = controlOf(depth)
+  const declared: RuleId | null = control.injectCard
+  const card = declared === null ? undefined : cardById(declared)
   return {
     depth,
-    directive: depth === 'quick' ? QUICK_DIRECTIVE : depth === 'deep' ? DEEP_DIRECTIVE : '',
-    needs,
-    cards: cardsFor(depth),
+    directive: depth === 'quick' ? QUICK_DIRECTIVE : '',
+    control,
+    controlText: ANNOUNCE_CONTROL[depth] ? controlLine(depth, verifyUsed) : '',
+    needs: CARDS_BY_DEPTH[depth] ?? [],
+    // 上限在代码里强制，而不只是写在注释里：任何档位都不得注入超过 AUTO_INJECT_CARD_CAP 张
+    cards: card === undefined ? [] : [card].slice(0, AUTO_INJECT_CARD_CAP),
   }
 }
 
 /**
- * 渲染投影。`includeCards=false` 时只给指令——
- * 这是上下文层在紧张档位下的用法（内容转工具拉取，指令保留）。
+ * 渲染投影：指令 + 控制读数 + 自动注入的卡片。
+ *
+ * `includeCards=false` 时不给卡片正文（紧张档：内容转工具拉取，读数与指令保留）。
  */
 export function renderProjection(projection: DepthProjection, includeCards = true): string {
-  const parts = [projection.directive]
-  if (includeCards && projection.cards.length > 0) parts.push(renderCards(projection.cards))
+  const parts = [projection.directive, projection.controlText]
+  if (includeCards) {
+    for (const card of projection.cards) parts.push(`【${card.id} ${card.title}】${card.text}`)
+  }
   return parts.filter(part => part !== '').join('\n')
 }
 
@@ -176,14 +204,23 @@ export function applyFocus(
  * 一句话说明该档位**接下来会请求什么**（回执里给模型的自解释）。
  *
  * 措辞必须是**意图**，不能是完成态：注入发生在下一轮渲染
- * `PromptContribution.context` 时，且上下文紧张时规则卡会降级成索引
+ * `PromptContribution.context` 时，且上下文紧张时卡片会降级成索引
  * （见 `index.ts` 的渲染分支）。回执若说"本轮会带上规则卡全文"，
- * 就是替渲染路径承诺了一件它可能做不到的事——自检报告抓的正是这句。
+ * 就是替渲染路径承诺了一件它可能做不到的事。
+ *
+ * v3.1 起回执的主语是**控制参数**（验证预算 / 证据要求 / 分支 / 复核 / 收尾），
+ * 不再是"给你更多规则文本"：档位换的是行为门槛，不是字数。
  */
 export function describeDepthEffect(depth: FocusDepth): string {
-  if (depth === 'quick') return '此后每轮请求注入"不要展开、直接回答"的指令。'
-  if (depth === 'deep') {
-    return `此后每轮请求注入规则卡全文 ${CARDS_BY_DEPTH.deep.join('/')}；上下文紧张时只给索引，全文用 omb_method 取。`
+  if (depth === 'quick') {
+    return `此后每轮请求注入"不要展开、直接回答"的指令。控制：${describeControl(depth)}。`
   }
-  return '此后每轮不再主动注入规则卡全文；需要时用 omb_method 取。'
+  if (depth === 'deep') {
+    const card = controlOf(depth).injectCard
+    return [
+      `此后每轮请求注入控制读数与规则卡 ${card ?? '（无）'}；控制：${describeControl(depth)}。`,
+      `其余声明的规则卡（${(CARDS_BY_DEPTH.deep ?? []).filter(id => id !== card).join('/')}）用 omb_method 取；上下文紧张时只给读数、不给卡片。`,
+    ].join('')
+  }
+  return `此后每轮不再主动注入规则卡正文；控制：${describeControl(depth)}。需要规则卡时用 omb_method 取。`
 }
