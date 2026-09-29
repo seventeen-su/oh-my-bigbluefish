@@ -1,5 +1,5 @@
 /**
- * `omb_method` / `omb_focus` 工具面。
+ * `omb_method` / `omb_focus` / `omb_verify` 工具面。
  *
  * 核心契约（H-3）：**执行体绝不抛异常**——端口缺失、端口抛异常、
  * 参数非法，一律返回 `{kind:'error', text}`。
@@ -7,14 +7,14 @@
  * 调用方按 ABI 要求 **await** 执行体（`execute` 的返回类型是
  * `ToolOutcome | Promise<ToolOutcome>`）。本实现是同步的，`await` 不改变结果。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import type { Kernel, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
 import { applyFocus, readFocus } from '../../../modules/reasoning/focus.js'
 import type { LoopSignal } from '../../../modules/reasoning/loop.js'
 import { cardById, residentHint } from '../../../modules/reasoning/methods.js'
-import type { ReasoningToolPorts } from '../../../modules/reasoning/tools.js'
-import { createFocusTool, createMethodTool, createReasoningTools } from '../../../modules/reasoning/tools.js'
+import type { ReasoningToolPorts, VerifyInput } from '../../../modules/reasoning/tools.js'
+import { createFocusTool, createMethodTool, createReasoningTools, createVerifyTool } from '../../../modules/reasoning/tools.js'
 
 /** 用真实内核搭一套最小端口；`overrides` 可注入会抛异常的坏端口。 */
 function makePorts(session = 's1', overrides: Partial<ReasoningToolPorts> = {}) {
@@ -213,11 +213,100 @@ describe('omb_focus', () => {
   })
 })
 
+describe('omb_verify：Verify 一环', () => {
+  it('核对结论（有来源+否证条件）→ text，且回执明说只是形式核对', async () => {
+    const verify = vi.fn((_session: string, input: VerifyInput) => ({
+      ok: true,
+      text: `形式核对：${input.claim ?? ''} / ${input.failure ?? ''}`,
+    }))
+    const { handle, ports } = makePorts('sv', { verify })
+    const outcome = await run(createVerifyTool(ports), {
+      claim: '这个函数是纯的',
+      evidence: 'src/a.ts:12',
+      falsifier: '同输入不同结果就不纯',
+    })
+    expect(outcome.kind).toBe('text')
+    expect(outcomeText(outcome)).toContain('形式核对')
+    expect(verify).toHaveBeenCalledTimes(1)
+    expect(verify.mock.calls[0]?.[0]).toBe('sv')
+    handle.dispose()
+  })
+
+  it('给失败定性 → text（端口拿到 failure 原样转发）', async () => {
+    const seen: (string | undefined)[] = []
+    const { handle, ports } = makePorts('sf', {
+      verify: (_session, input) => {
+        seen.push(input.failure)
+        return { ok: true, text: '失败分类 transient → retry（预算 2 次）' }
+      },
+    })
+    const outcome = await run(createVerifyTool(ports), { failure: 'transient' })
+    expect(outcome.kind).toBe('text')
+    expect(seen).toEqual(['transient'])
+    expect(outcomeText(outcome)).toContain('retry')
+    handle.dispose()
+  })
+
+  it('两个参数都不给：错误分支并交代用法', async () => {
+    const { handle, ports } = makePorts()
+    const outcome = await run(createVerifyTool(ports), {})
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('claim')
+    expect(outcomeText(outcome)).toContain('failure')
+    handle.dispose()
+  })
+
+  it('非法 failure 取值：错误分支，不抛', async () => {
+    const { handle, ports } = makePorts()
+    const outcome = await run(createVerifyTool(ports), { failure: '莫名其妙的类' })
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('transient')
+    handle.dispose()
+  })
+
+  it('端口缺失（模块未接线）：可读错误而非抛（H-3）', async () => {
+    const { handle, ports } = makePorts()
+    const outcome = await run(createVerifyTool(ports), { claim: '甲' })
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('端口不可用')
+    handle.dispose()
+  })
+
+  it('端口抛异常：错误分支，绝不抛', async () => {
+    const { handle, ports } = makePorts('sb', {
+      verify: () => {
+        throw new Error('台账炸了')
+      },
+    })
+    const outcome = await run(createVerifyTool(ports), { claim: '甲' })
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('台账炸了')
+    handle.dispose()
+  })
+
+  it('取不到会话：错误分支', async () => {
+    const { handle, ports } = makePorts('', { verify: () => ({ ok: true, text: 'ok' }) })
+    const outcome = await run(createVerifyTool(ports), { claim: '甲' })
+    expect(outcome.kind).toBe('error')
+    expect(outcomeText(outcome)).toContain('会话')
+    handle.dispose()
+  })
+
+  it('描述如实写"只做形式核对，不判断内容是否为真"', () => {
+    const { handle, ports } = makePorts()
+    const description = createVerifyTool(ports).description
+    expect(description).toContain('形式核对')
+    expect(description).toContain('不判断内容是否为真')
+    expect(description).toContain('failure')
+    handle.dispose()
+  })
+})
+
 describe('工具工厂', () => {
-  it('返回两个工具，名字与目录一致', () => {
+  it('返回三个工具（新增 omb_verify），名字固定有序', () => {
     const { handle, ports } = makePorts()
     const tools = createReasoningTools(ports)
-    expect(tools.map(tool => tool.name)).toEqual(['omb_method', 'omb_focus'])
+    expect(tools.map(tool => tool.name)).toEqual(['omb_method', 'omb_focus', 'omb_verify'])
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(0)
       expect(typeof tool.parameters.parse).toBe('function')

@@ -10,6 +10,7 @@ import { createKernel } from '../../../kernel/index.js'
 import type { ModuleRegistration, PromptContribution, ToolDefinition } from '../../../kernel/abi/index.js'
 import { MODULE_CATALOG, RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../../kernel/abi/index.js'
 import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES } from '../../../modules/reasoning/focus.js'
+import { CONTROL_LINE_MAX, controlLine } from '../../../modules/reasoning/control.js'
 import { FOCUS_DEPTHS } from '../../../kernel/abi/index.js'
 import type {
   ReasoningConfig,
@@ -125,7 +126,11 @@ describe('启动后的服务面', () => {
     expect(contribution.resident).toBe(residentHint())
     expect(contribution.resident!.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX)
 
-    expect(toolsOf(handle).map(tool => tool.name)).toEqual(entry!.tools)
+    // 目录声明的工具必须在（目录是 canonical）；`omb_verify` 是本次新增的第 9 个工具，
+    // 需要 lead 在 `kernel/abi/catalog.ts` 的 omb-reasoning 行补一行（该文件不在我的写入范围）。
+    const names = toolsOf(handle).map(tool => tool.name)
+    for (const declared of entry!.tools) expect(names).toContain(declared)
+    expect(names).toEqual(['omb_method', 'omb_focus', 'omb_verify'])
 
     expect(loopOf(handle).signal('没人用过的会话')).toBeNull()
 
@@ -150,6 +155,10 @@ describe('启动后的服务面', () => {
     const depth = (focusSchema.properties as Record<string, { enum?: readonly string[] }>).depth
     expect(depth?.enum).toEqual([...FOCUS_DEPTHS])
     expect(focusSchema.required).toEqual(['depth'])
+
+    const verifySchema = schemaOf(toolsOf(handle).find(tool => tool.name === 'omb_verify'))
+    const verifyProps = Object.keys((verifySchema.properties as Record<string, unknown>) ?? {})
+    expect(verifyProps.sort()).toEqual(['claim', 'evidence', 'failure', 'falsifier'])
     handle.dispose()
   })
 })
@@ -220,11 +229,32 @@ describe('提示贡献：三档行为 + 压力塑形', () => {
     handle.dispose()
   })
 
-  it('deep + 非紧张档：给 R3/R4/R5 全文（模型显式动作提出的需求）', () => {
+  it('deep + 非紧张档：一行控制读数 + 只注入 R4（不再注入 R3/R5 全文）', () => {
     const { handle } = start()
     const render = contributionOf(handle).context!
     const text = render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
-    for (const id of ['R3', 'R4', 'R5']) expect(text).toContain(cardById(id)?.text ?? '')
+    expect(text).toContain(controlLine('deep', 0))
+    expect(text).toContain(cardById('R4')?.text ?? '')
+    expect(text).not.toContain(cardById('R3')?.text ?? '不可能匹配')
+    expect(text).not.toContain(cardById('R5')?.text ?? '不可能匹配')
+    handle.dispose()
+  })
+
+  it('注入的文本量不随档位线性膨胀：卡片数 0/0/1，deep 只比 standard 多一行读数', () => {
+    const { handle } = start()
+    const render = contributionOf(handle).context!
+    const quick = render({ sessionId: 's', depth: 'quick', band: 'relaxed' })
+    const standard = render({ sessionId: 's', depth: 'standard', band: 'relaxed' })
+    const deep = render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
+    // standard 是基线（空）；quick 反而有一行抑制指令 → 文本量不是随档位单调膨胀
+    expect(standard).toBe('')
+    expect(quick.length).toBeGreaterThan(0)
+    // deep 比 standard 多的只有那一行控制读数 + 一张卡，且读数有硬上限
+    expect(deep.length - standard.length).toBeLessThanOrEqual(CONTROL_LINE_MAX + (cardById('R4')?.text.length ?? 0) + 2)
+    // 今天的 deep 曾注入 R3+R4+R5 三张全文；现在必须显著更短
+    const oldDeep = ['R3', 'R4', 'R5'].map(id => cardById(id)?.text ?? '').join('')
+    expect(deep.length).toBeLessThan(oldDeep.length)
+    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(1)
     handle.dispose()
   })
 
@@ -233,7 +263,9 @@ describe('提示贡献：三档行为 + 压力塑形', () => {
     const render = contributionOf(handle).context!
     const text = render({ sessionId: 's', depth: 'deep', band: 'tight' })
     expect(text).toContain('omb_method')
-    expect(text).not.toContain(cardById('R3')?.text ?? '不可能匹配')
+    expect(text).toContain('omb_verify')
+    expect(text).not.toContain(cardById('R4')?.text ?? '不可能匹配')
+    expect(text).not.toContain(controlLine('deep', 0))
     handle.dispose()
   })
 
@@ -265,14 +297,15 @@ describe('提示贡献：三档行为 + 压力塑形', () => {
 describe('注入可核验：渲染留痕与失败留声', () => {
   const statusText = (handle: ReturnType<typeof createKernel>): string => handle.status().join('\n')
 
-  it('deep + relaxed：留痕显示真进了 R3/R4/R5 与字符数', () => {
+  it('deep + relaxed：留痕显示真进了 R4、字符数，并写明自动注入上限', () => {
     const { handle } = start()
     const render = contributionOf(handle).context!
     const text = render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
     expect(text.length).toBeGreaterThan(0)
-    expect(statusText(handle)).toContain('上次注入：成功（R3/R4/R5，')
+    expect(statusText(handle)).toContain('上次注入：成功（R4，')
     expect(statusText(handle)).toContain(`${text.length} 字符`)
-    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(3)
+    expect(statusText(handle)).toContain('自动注入上限 1 张')
+    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(1)
     handle.dispose()
   })
 
@@ -330,7 +363,7 @@ describe('注入可核验：渲染留痕与失败留声', () => {
     render(exploding as never)
     render({ sessionId: 's', depth: 'deep', band: 'relaxed' })
     const line = statusText(handle)
-    expect(line).toContain('上次注入：成功（R3/R4/R5，')
+    expect(line).toContain('上次注入：成功（R4，')
     expect(line).toContain('渲染失败累计 1 次（最近：坏了）')
     // 失败进过健康面就不会自己消失：降级状态保留
     expect(handle.health()[MODULE_ID]?.state).toBe('degraded')
@@ -342,7 +375,8 @@ describe('注入可核验：渲染留痕与失败留声', () => {
     handle.kernel.setFocus('s', 'deep', '内核里是 deep')
     const text = contributionOf(handle).context!({ sessionId: 's', depth: 'standard', band: 'relaxed' })
     // 内核是档位权威：宿主递来的旧快照不得让 deep 静默降级
-    expect(text).toContain(cardById('R3')?.text ?? '不可能匹配')
+    expect(text).toContain(controlLine('deep', 0))
+    expect(text).toContain(cardById('R4')?.text ?? '不可能匹配')
     expect(statusText(handle)).toContain('档位分歧：渲染入参 standard / 内核 deep')
     handle.dispose()
   })
@@ -365,20 +399,21 @@ describe('deep 正证：设 → 读 → 内容含卡号', () => {
     expect(handle.kernel.focus('live')).toBe('deep')
 
     const text = contributionOf(handle).context!({ sessionId: 'live', depth: 'deep', band: 'relaxed' })
-    for (const id of ['R3', 'R4', 'R5']) {
-      expect(text, `${id} 卡号应出现在注入内容里`).toContain(`【${id} `)
-      expect(text).toContain(cardById(id)?.text ?? '不可能匹配')
-    }
+    // 正证：deep 的注入含控制读数与唯一那张卡（R4）
+    expect(text).toContain(controlLine('deep', 0))
+    expect(text).toContain('【R4 ')
+    expect(text).toContain(cardById('R4')?.text ?? '不可能匹配')
     expect(handle.status().join('\n')).toContain('深度 deep')
     handle.dispose()
   })
 
-  it('配置默认档为 deep：首个回合就落地，渲染即含卡号（写入路径无 deep 专属分支）', () => {
+  it('配置默认档为 deep：首个回合就落地，渲染即含控制读数与 R4（写入路径无 deep 专属分支）', () => {
     const { handle } = start({ defaultDepth: 'deep', residentHintChars: RESIDENT_HINT_MAX })
     handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
     expect(handle.kernel.focus('s')).toBe('deep')
     const text = contributionOf(handle).context!({ sessionId: 's', depth: 'deep', band: 'relaxed' })
-    for (const id of ['R3', 'R4', 'R5']) expect(text).toContain(`【${id} `)
+    expect(text).toContain('【R4 ')
+    expect(text).toContain(controlLine('deep', 0))
     handle.dispose()
   })
 })
@@ -472,6 +507,104 @@ describe('热插拔（H-1 / H-2）', () => {
     expect(loopOf(second.handle).signal('s')).toBeNull()
     first.handle.dispose()
     second.handle.dispose()
+  })
+})
+
+describe('Verify 可观测：验证段、台账、状态面与健康面', () => {
+  const verifyToolOf = (handle: ReturnType<typeof createKernel>): ToolDefinition | undefined =>
+    toolsOf(handle).find(tool => tool.name === 'omb_verify')
+
+  it('核对一条没有来源的结论：回执给"缺来源"+下一步，台账记 1 次', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    const outcome = await verifyToolOf(handle)?.execute({ claim: '这个函数是纯的' })
+    expect(outcome?.kind).toBe('text')
+    expect(outcome?.text).toContain('形式核对：缺来源')
+    expect(outcome?.text).toContain('下一步')
+    const health = handle.health()[MODULE_ID]
+    expect(health?.metrics?.verifyCalls).toBe(1)
+    expect(health?.metrics?.verifyUnresolved).toBe(1)
+    expect(handle.status().join('\n')).toContain('验证：1 次')
+    handle.dispose()
+  })
+
+  it('补上来源与否证条件后重核：同一条结论的未闭合数回落到 0，验证段随之消失', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    const render = contributionOf(handle).context!
+    await verifyToolOf(handle)?.execute({ claim: '这个函数是纯的' })
+    // 有未闭合项 → 注入里出现验证段（状态驱动，不是档位驱动）
+    expect(render({ sessionId: 's', depth: 'standard', band: 'relaxed' })).toContain('未过形式核对')
+    await verifyToolOf(handle)?.execute({
+      claim: '这个函数是纯的',
+      evidence: 'src/a.ts:12',
+      falsifier: '同输入不同结果就说明不纯',
+    })
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyUnresolved).toBe(0)
+    expect(render({ sessionId: 's', depth: 'standard', band: 'relaxed' })).not.toContain('未过形式核对')
+    handle.dispose()
+  })
+
+  it('quick 档核对结论：明说本档不要求验证并建议升档（不阻塞）', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    handle.kernel.setFocus('s', 'quick', '简单问题')
+    const outcome = await verifyToolOf(handle)?.execute({ claim: '甲' })
+    expect(outcome?.kind).toBe('text')
+    expect(outcome?.text).toContain('不要求验证')
+    expect(outcome?.text).toContain('omb_focus')
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyOverBudget).toBe(1)
+    handle.dispose()
+  })
+
+  it('给失败定性：回执含分类、策略与预算；状态面记下分布', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    const outcome = await verifyToolOf(handle)?.execute({ failure: 'parameter-error' })
+    expect(outcome?.kind).toBe('text')
+    expect(outcome?.text).toContain('parameter-error')
+    expect(outcome?.text).toContain('alter')
+    expect(outcome?.text).toContain('预算 1 次')
+    expect(handle.status().join('\n')).toContain('失败分类：parameter-error 1')
+    expect(handle.health()[MODULE_ID]?.metrics?.classifiedFailures).toBe(1)
+    handle.dispose()
+  })
+
+  it('Loop → 分类：模型说 unknown，但窗口里有绕圈 → 判成 direction 问题（branch）', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    for (const action of ['a', 'a']) {
+      handle.kernel.emit('evidence/observed', { sessionId: 's', actionHash: action, evidenceHash: 'e', at: 1 })
+    }
+    expect(loopOf(handle).signal('s')?.kind).toBe('repeat-action')
+    const outcome = await verifyToolOf(handle)?.execute({ failure: 'unknown' })
+    expect(outcome?.kind).toBe('text')
+    expect(outcome?.text).toContain('strategy-error')
+    expect(outcome?.text).toContain('branch')
+    handle.dispose()
+  })
+
+  it('状态面回答"本回合验证了几次"（跨回合累计另有 calls）', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    await verifyToolOf(handle)?.execute({ claim: '甲' })
+    await verifyToolOf(handle)?.execute({ claim: '乙' })
+    expect(handle.status().join('\n')).toContain('本回合 2 次')
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 2 })
+    await verifyToolOf(handle)?.execute({ claim: '丙' })
+    expect(handle.status().join('\n')).toContain('验证：3 次（本回合 1 次')
+    handle.dispose()
+  })
+
+  it('会话之间台账不串味；卸载后验证读数归零', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
+    await verifyToolOf(handle)?.execute({ claim: '甲的结论' })
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyCalls).toBe(1)
+    handle.kernel.emit('turn/start', { sessionId: 's2', turn: 1 })
+    await verifyToolOf(handle)?.execute({ claim: '乙的结论' })
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyCalls).toBe(2)
+    handle.dispose()
   })
 })
 

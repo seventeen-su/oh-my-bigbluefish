@@ -25,13 +25,35 @@ import type {
   StatusRegistry,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
-import { RESIDENT_HINT_MAX, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
-import { QUICK_DIRECTIVE, FOCUS_DEPTH_VALUES, applyFocus, isFocusDepth, peekFocus, projectFocus, readFocus, renderProjection } from './focus.js'
+import { RESIDENT_HINT_MAX, SERVICES, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
+import type { DepthControl, FailureClass } from './control.js'
+import {
+  AUTO_INJECT_CARD_CAP,
+  FAILURE_CLASSES,
+  classifyFailure,
+  controlOf,
+  failureSignalsFromLoop,
+  isFailureClass,
+  recoveryFor,
+  renderRecovery,
+} from './control.js'
+import {
+  FOCUS_DEPTH_VALUES,
+  applyFocus,
+  isFocusDepth,
+  peekFocus,
+  projectFocus,
+  readFocus,
+  renderProjection,
+} from './focus.js'
 import type { LoopSignal, TurnFingerprint } from './loop.js'
 import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } from './loop.js'
 import type { MethodCard, RuleId } from './methods.js'
 import { CARDS_BY_DEPTH, METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
+import type { VerifyInput, VerifyOutcome } from './tools.js'
 import { createReasoningTools } from './tools.js'
+import type { VerifyLedger } from './verify.js'
+import { VERDICT_TEXT, describeVerify, judgeClaim, recordVerify, summarizeVerify, verifyLine } from './verify.js'
 import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
@@ -88,6 +110,10 @@ interface SessionState {
   explicitDepth: FocusDepth | undefined
   lastReason: string
   lastSignal: LoopSignal | null
+  /** Verify 台账：本会话核对过的结论（形式核对，见 `verify.ts`）。 */
+  verify: VerifyLedger
+  /** 当前回合号（`turn/start` 推进）；状态面据它回答"本回合验证了几次"。 */
+  turn: number
 }
 
 function messageOf(error: unknown): string {
@@ -95,7 +121,7 @@ function messageOf(error: unknown): string {
 }
 
 function newSessionState(): SessionState {
-  return { window: [], explicitDepth: undefined, lastReason: '', lastSignal: null }
+  return { window: [], explicitDepth: undefined, lastReason: '', lastSignal: null, verify: [], turn: 0 }
 }
 
 /**
@@ -110,12 +136,16 @@ interface RenderTrace {
   readonly session: SessionRef
   readonly depth: FocusDepth
   readonly band: ContextRenderInput['band']
-  /** 该档位**声明需要**的卡（请求，不保证注入）。 */
+  /** 该档位**声明需要**的卡（请求，不保证注入；注入受 1 张上限约束）。 */
   readonly requested: readonly RuleId[]
   /** 真的出现在渲染结果里的卡（按正文逐张比对得出，不是照抄请求）。 */
   readonly delivered: readonly RuleId[]
   /** 产出的 context 字符数；0 = 本轮确实什么都没注入。 */
   readonly chars: number
+  /** 控制读数（参数行）占的字符数——档位差异的文本成本，恒定一行。 */
+  readonly controlChars: number
+  /** 验证段占的字符数（有未闭合项才出现）。 */
+  readonly verifyChars: number
   /** 渲染入参档位与内核读数的分歧（'' = 一致或无从比较）。 */
   readonly depthDivergence: string
 }
@@ -165,9 +195,17 @@ function describeLastRender(trace: RenderTrace | null, failures: number, lastFai
       `上次注入：只给了指令未含卡片（${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；请求 ${idList(trace.requested)}；会话 ${trace.session}）`,
     )
   } else {
+    // 声明数 > 注入数不是失败：自动注入钉死在 1 张以内，其余按需拉取
+    const budget = trace.requested.length > trace.delivered.length
+      ? `；本档自动注入上限 ${AUTO_INJECT_CARD_CAP} 张，其余按需拉取`
+      : ''
     bits.push(
-      `上次注入：成功（${idList(trace.delivered)}，${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；会话 ${trace.session}）`,
+      `上次注入：成功（${idList(trace.delivered)}，${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}${budget}；会话 ${trace.session}）`,
     )
+  }
+  // 控制读数与验证段的字符成本分开记账：这是"档位差异不是靠字数"的可核验读数
+  if (trace !== null) {
+    bits.push(`控制读数 ${trace.controlChars} 字符，验证段 ${trace.verifyChars} 字符`)
   }
   // 失败历史不隐藏：失败过一次、后来又成功，两件事都要在状态面里看得到
   if (failures > 1 || (failures > 0 && trace !== null)) {
@@ -190,8 +228,8 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
   const manifest: ModuleManifest<ReasoningConfig> = {
     id: MODULE_ID,
     version: MODULE_VERSION,
-    requires: ['omb-kernel'],
-    capabilities: ['reasoning.methods', 'reasoning.depth', 'reasoning.loop-detect'],
+    requires: derivedRequires(MODULE_ID),
+    capabilities: derivedCapabilities(MODULE_ID),
     configSchema: reasoningConfigSchema,
     health: () => lastHealth,
   }
@@ -213,6 +251,20 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     let lastRender: RenderTrace | null = null
     let renderFailures = 0
     let lastRenderFailure = ''
+    /** Verify 读数（模块级累计 + 最近一次），状态面与健康面共用。 */
+    let verifyCalls = 0
+    let verifyOverBudget = 0
+    const failureCounts = new Map<FailureClass, number>()
+    let lastClassified: { readonly session: SessionRef; readonly failureClass: FailureClass } | null = null
+
+    /** 读时钟：端口异常时返回 0（服务方法不因宿主端口坏掉而抛给调用方）。 */
+    const now = (): number => {
+      try {
+        return kernel.clock.now()
+      } catch {
+        return 0
+      }
+    }
 
     // ── 常驻提示：apply 内算一次，之后逐字节不变（静态前缀靠它保缓存） ──
     const hintBudget = clampHintBudget(config.residentHintChars, kernel, degradations)
@@ -229,15 +281,25 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
 
     const healthNow = (): ModuleHealth => {
       let withSignal = 0
-      for (const state of sessions.values()) if (state.lastSignal !== null) withSignal += 1
+      let unresolved = 0
+      for (const [session, state] of sessions) {
+        if (state.lastSignal !== null) withSignal += 1
+        const depth = peekFocus(kernel, session) ?? state.explicitDepth ?? 'standard'
+        unresolved += summarizeVerify(state.verify, controlOf(depth).verifyBudget, state.turn).unresolved
+      }
+      const classified = [...failureCounts.values()].reduce((sum, count) => sum + count, 0)
       const parts = [
         `规则卡 ${METHOD_CARDS.length} 张`,
         `常驻提示 ${hint.length}/${RESIDENT_HINT_MAX} 字符`,
         `跟踪会话 ${sessions.size}`,
         withSignal > 0 ? `循环信号 ${withSignal} 个` : '无循环信号',
+        verifyCalls > 0 ? `验证 ${verifyCalls} 次（未闭合 ${unresolved}）` : '尚未核对过结论',
       ]
       // 渲染失败必须留声：它是"回执说了要注入、实际没注入"的唯一证据
       if (renderFailures > 0) parts.push(`上下文渲染失败 ${renderFailures} 次（最近：${lastRenderFailure}）`)
+      if (classified > 0 && lastClassified !== null) {
+        parts.push(`失败分类 ${classified} 次（最近：${lastClassified.failureClass}）`)
+      }
       if (degradations.length > 0) parts.push(`降级：${degradations.join('；')}`)
       return {
         state: degradations.length > 0 || renderFailures > 0 ? 'degraded' : 'ok',
@@ -250,6 +312,12 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           renderFailures,
           lastRenderChars: lastRender?.chars ?? 0,
           lastRenderCards: lastRender?.delivered.length ?? 0,
+          lastRenderControlChars: lastRender?.controlChars ?? 0,
+          lastRenderVerifyChars: lastRender?.verifyChars ?? 0,
+          verifyCalls,
+          verifyUnresolved: unresolved,
+          verifyOverBudget,
+          classifiedFailures: classified,
         },
       }
     }
@@ -309,6 +377,8 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
         const state = ensure(payload.sessionId)
         lastActiveSession = payload.sessionId
         state.lastSignal = detectLoop(state.window)
+        // 回合号推进：状态面据此回答"本回合验证了几次"（跨回合累计另有 calls）
+        if (Number.isFinite(payload.turn)) state.turn = Math.max(state.turn, Math.floor(payload.turn))
         // 配置的默认档位只在"本会话尚未显式设置"时落地一次：幂等，不逐轮抖动
         if (state.explicitDepth === undefined && config.defaultDepth !== 'standard') {
           try {
@@ -339,6 +409,64 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     }
 
     /**
+     * Verify 端口：`omb_verify` 的执行体。
+     *
+     * 两件事都记台账（状态面可读），且**都不阻塞**模型：
+     * - 核对结论：形式核对 + 预算读数（超预算只提示升档，不拒绝）
+     * - 给失败定性：分类器（模型定性优先，`unknown` 时用 Loop 观察细化）→ 恢复策略
+     */
+    const verifyPort = (session: SessionRef, input: VerifyInput): VerifyOutcome => {
+      try {
+        const depth = peekFocus(kernel, session) ?? 'standard'
+        const control = controlOf(depth)
+        const state = ensure(session)
+        const lines: string[] = []
+
+        if (input.failure !== undefined) {
+          const declared = isFailureClass(input.failure) ? input.failure : undefined
+          const signals = failureSignalsFromLoop(state.lastSignal)
+          const failureClass = classifyFailure({ declared, ...signals })
+          const policy = recoveryFor(failureClass)
+          failureCounts.set(failureClass, (failureCounts.get(failureClass) ?? 0) + 1)
+          lastClassified = { session, failureClass }
+          const refined = declared === undefined || declared === 'unknown'
+            ? `\n（你给的是${declared === undefined ? '未定性' : ' unknown'}；按循环观察细化为 ${failureClass}${state.lastSignal === null ? '（当前无循环信号）' : `：${state.lastSignal.kind}`}）`
+            : ''
+          lines.push(renderRecovery(policy) + refined)
+        }
+
+        if (input.claim !== undefined) {
+          const judgement = judgeClaim({ claim: input.claim, evidence: input.evidence, falsifier: input.falsifier })
+          const used = summarizeVerify(state.verify, control.verifyBudget, state.turn).calls
+          const overBudget = control.verifyBudget <= 0 || used + 1 > control.verifyBudget
+          state.verify = recordVerify(state.verify, {
+            claim: judgement.claim,
+            verdict: judgement.verdict,
+            at: now(),
+            depth,
+            turn: state.turn,
+            overBudget,
+          })
+          verifyCalls += 1
+          if (overBudget) verifyOverBudget += 1
+          const budgetNote = control.verifyBudget <= 0
+            ? `本档（${depth}）不要求验证：你正在核对结论，说明这个问题比 ${depth} 复杂，可用 omb_focus standard 或 deep。`
+            : overBudget
+              ? `本档验证预算 ${control.verifyBudget} 次已用完（这是第 ${used + 1} 次）。预算不是禁令：继续验证可以，但请把结论收敛——给出来源，或标为待确认，或用 omb_focus 升档。`
+              : `本档验证预算 ${control.verifyBudget} 次，已用 ${used + 1}。`
+          lines.push(
+            `形式核对：${VERDICT_TEXT[judgement.verdict]}——${judgement.note}\n下一步：${judgement.next}\n（${budgetNote}）`,
+          )
+        }
+
+        report()
+        return { ok: true, text: lines.join('\n\n') }
+      } catch (error) {
+        return { ok: false, text: `验证处理失败：${messageOf(error)}；本次调用未改变任何状态。` }
+      }
+    }
+
+    /**
      * 工具面。交付约定是 `tools:<模块 id>` → `readonly ToolDefinition[]`
      * （`dsh/plugin.ts` 的前缀遍历只消费数组）。
      *
@@ -361,6 +489,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
         readDepth: target => readFocus(kernel, target).depth,
         applyDepth: (target, depth, reason) => applyFocus(kernel, target, depth, reason),
         loopSignal: target => loopService.signal(target),
+        verify: verifyPort,
       })
     } catch (error) {
       const note = `工具构造失败：${messageOf(error)}`
@@ -371,12 +500,15 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     /**
      * `PromptContribution`：`resident` 是冻结的常驻提示；`context` 是每轮易变部分。
      *
-     * 易变部分遵守软压力塑形（§6.3）：紧张档只留索引（规则卡转 `omb_method` 拉取），
-     * 宽松/适中档在 `deep` 时给规则卡全文——那是模型**显式动作**提出的需求，不是推送。
+     * v3.1 的注入结构（**档位差异不是靠字数**）：
+     * ① 指令：只有 `quick` 有（"不要展开、直接回答"）
+     * ② 控制读数：只有偏离基线的档位有（`deep`），一行参数
+     * ③ 规则卡：任何档位自动注入 **≤1 张**（`AUTO_INJECT_CARD_CAP`），其余按需拉取
+     * ④ 验证段：**有未闭合结论才出现**，与档位无关（是状态，不是档位）
+     * ⑤ 循环提示：有信号才出现（≤80 字符）
      *
-     * 档位来源的裁决见 `resolveRenderDepth`：模型显式设过档时内核读数是权威，
-     * 否则以宿主入参为准。两者分歧**必定留痕**——否则"模型设了 deep、渲染却按
-     * standard 走"又会是静默事实。
+     * 紧张档只留索引行（内容全部转工具拉取），与既有语义一致。
+     * 档位来源的裁决见 `resolveRenderDepth`；两者分歧必定留痕。
      */
     const contribution: PromptContribution = {
       resident: hint,
@@ -392,32 +524,48 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
               : ''
           if (depthDivergence !== '') kernel.logger.warn(`${MODULE_ID}：${depthDivergence}`)
 
+          const control: DepthControl = controlOf(depth)
+          const ledger = state?.verify ?? []
+          const verifySummary = summarizeVerify(ledger, control.verifyBudget)
+          const projection = projectFocus(depth, verifySummary.calls)
+          const tight = input.band === 'tight'
+
           const parts: string[] = []
-          // 本档位声明需要的卡；真进了上下文几张，由下面的正文比对给出
-          const requested = CARDS_BY_DEPTH[depth] ?? []
-          const candidates = depth === 'deep' && input.band !== 'tight' ? cardsFor('deep') : []
-          if (depth === 'quick') {
-            parts.push(QUICK_DIRECTIVE)
-          } else if (depth === 'deep') {
-            parts.push(
-              input.band === 'tight'
-                ? '深度 deep：上下文紧张，规则卡全文改用 omb_method 拉取。'
-                : renderProjection(projectFocus('deep')),
-            )
+          let verifyOnly = ''
+          const substantive = projection.controlText !== '' || projection.cards.length > 0
+          if (tight) {
+            // quick 的抑制指令是"少想"，压力再大也不该被吞掉
+            if (projection.directive !== '') parts.push(projection.directive)
+            if (substantive) parts.push('上下文紧张：规则卡与验证改用 omb_method / omb_verify 取。')
+          } else {
+            const body = renderProjection(projection, true)
+            if (body !== '') parts.push(body)
+            // 验证段是**状态**驱动：有未闭合结论才出现，不随档位增减
+            if (control.verifyBudget > 0) {
+              verifyOnly = verifyLine(verifySummary)
+              if (verifyOnly !== '') parts.push(verifyOnly)
+            }
           }
+
           const signal = state?.lastSignal ?? null
           const loopLine = renderLoopSignal(signal)
           if (loopLine !== '') parts.push(loopLine)
           const text = parts.join('\n')
 
-          // 可核验留痕：按正文逐张确认卡真的进了上下文，而不是"我们打算注入"
+          // 可核验留痕：按正文逐张确认卡真的进了上下文，而不是"我们打算注入"。
+          // 控制读数与验证段分开记账——这是"档位差异不是靠字数"的可核验读数。
           lastRender = {
             session: input.sessionId,
             depth,
             band: input.band,
-            requested,
-            delivered: candidates.filter(card => text.includes(card.text)).map(card => card.id),
+            requested: CARDS_BY_DEPTH[depth] ?? [],
+            delivered: projection.cards.filter(card => text.includes(card.text)).map(card => card.id),
             chars: text.length,
+            controlChars:
+              projection.controlText !== '' && text.includes(projection.controlText)
+                ? projection.controlText.length
+                : 0,
+            verifyChars: verifyOnly !== '' && text.includes(verifyOnly) ? verifyOnly.length : 0,
             depthDivergence,
           }
           // 上报一次：否则内核健康面停留在上一次事件的快照，与 omb_status 里的
@@ -446,16 +594,30 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           // 第二行是"注入到底发生了没有"的可核验痕迹：回执说会注入的卡，
           // 在这里必须能看到真进了几张；失败连原因一起留下。
           const lines = [healthNow().detail, describeLastRender(lastRender, renderFailures, lastRenderFailure)]
+          // 失败分类的分布与最近一次处置：这是 R6 从"固定阈值"改成分类器之后的可核验读数
+          if (lastClassified !== null) {
+            const spread = FAILURE_CLASSES
+              .filter(failureClass => (failureCounts.get(failureClass) ?? 0) > 0)
+              .map(failureClass => `${failureClass} ${failureCounts.get(failureClass) ?? 0}`)
+              .join('、')
+            lines.push(
+              `失败分类：${spread}（最近：${lastClassified.failureClass} → ${recoveryFor(lastClassified.failureClass).strategy}）`,
+            )
+          }
           for (const [session, state] of sessions) {
-            // 只写"有事发生"的会话：显式设过档位（含理由，供事后判断旋钮是否有用）
-            // 或检出过循环信号。安静的会话不占行。
+            // 只写"有事发生"的会话：显式设过档位（含理由，供事后判断旋钮是否有用）、
+            // 检出过循环信号、或核对过结论。安静的会话不占行。
             const signal = state.lastSignal
-            if (signal === null && state.explicitDepth === undefined) continue
+            if (signal === null && state.explicitDepth === undefined && state.verify.length === 0) continue
             const bits: string[] = []
             if (state.explicitDepth !== undefined) {
               bits.push(`深度 ${state.explicitDepth}${state.lastReason === '' ? '' : `（理由：${state.lastReason}）`}`)
             }
             if (signal !== null) bits.push(`${signal.kind}——${signal.detail}`)
+            if (state.verify.length > 0) {
+              const depth = peekFocus(kernel, session) ?? state.explicitDepth ?? 'standard'
+              bits.push(describeVerify(summarizeVerify(state.verify, controlOf(depth).verifyBudget, state.turn)))
+            }
             lines.push(`会话 ${session}：${bits.join('；')}`)
           }
           if (hint !== '') lines.push(`常驻提示：${hint}`)

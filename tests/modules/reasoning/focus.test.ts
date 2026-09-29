@@ -8,7 +8,13 @@ import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import type { Kernel } from '../../../kernel/abi/index.js'
 import {
-  DEEP_DIRECTIVE,
+  AUTO_INJECT_CARD_CAP,
+  CONTROL_BY_DEPTH,
+  CONTROL_LINE_MAX,
+  controlLine,
+  describeControl,
+} from '../../../modules/reasoning/control.js'
+import {
   QUICK_DIRECTIVE,
   applyFocus,
   describeDepthEffect,
@@ -21,59 +27,88 @@ import {
 } from '../../../modules/reasoning/focus.js'
 import { cardById } from '../../../modules/reasoning/methods.js'
 
-describe('projectFocus：三档声明的差异', () => {
-  it('quick：只给抑制指令，不要卡片', () => {
+describe('projectFocus：三档的差异在控制参数，不在卡片数量', () => {
+  it('quick：只给抑制指令，不要卡片，验证预算为 0', () => {
     const projection = projectFocus('quick')
     expect(projection.directive).toBe(QUICK_DIRECTIVE)
     expect(projection.needs).toEqual([])
     expect(projection.cards).toEqual([])
+    expect(projection.control.verifyBudget).toBe(0)
+    expect(projection.controlText).toBe('')
   })
 
-  it('standard：默认档不加戏，声明至多一张', () => {
+  it('standard：默认档不加戏，也不注入卡片正文', () => {
     const projection = projectFocus('standard')
     expect(projection.directive).toBe('')
+    expect(projection.controlText).toBe('')
+    expect(projection.cards).toEqual([])
     expect(projection.needs.length).toBeLessThanOrEqual(1)
-    expect(projection.cards.length).toBeLessThanOrEqual(1)
   })
 
-  it('deep：声明并给出 R3/R4/R5 全文', () => {
+  it('deep：声明 R3/R4/R5，但只自动注入 R4 一张，并带上控制读数', () => {
     const projection = projectFocus('deep')
-    expect(projection.directive).toBe(DEEP_DIRECTIVE)
     expect(projection.needs).toEqual(['R3', 'R4', 'R5'])
-    expect(projection.cards.map(card => card.text)).toEqual([
-      cardById('R3')?.text,
-      cardById('R4')?.text,
-      cardById('R5')?.text,
-    ])
+    expect(projection.cards.map(card => card.id)).toEqual(['R4'])
+    expect(projection.cards[0]?.text).toBe(cardById('R4')?.text)
+    expect(projection.controlText).toBe(controlLine('deep', 0))
+    expect(projection.controlText.length).toBeLessThanOrEqual(CONTROL_LINE_MAX)
   })
 
-  it('纯函数：同档位多次调用结果相同', () => {
+  it('自动注入的卡片数不随档位增长（0/0/1，且都 ≤ 上限）', () => {
+    for (const depth of ['quick', 'standard', 'deep'] as const) {
+      const projection = projectFocus(depth)
+      expect(projection.cards.length, `${depth} 自动注入 ${projection.cards.length} 张`).toBeLessThanOrEqual(
+        AUTO_INJECT_CARD_CAP,
+      )
+    }
+    expect(projectFocus('deep').cards.length).toBe(projectFocus('standard').cards.length + 1)
+  })
+
+  it('三档的控制参数严格递增（档位差异的载体是这些数字与枚举）', () => {
+    const quick = CONTROL_BY_DEPTH.quick
+    const standard = CONTROL_BY_DEPTH.standard
+    const deep = CONTROL_BY_DEPTH.deep
+    expect(quick.verifyBudget).toBeLessThan(standard.verifyBudget)
+    expect(standard.verifyBudget).toBeLessThan(deep.verifyBudget)
+    expect(quick.branchBudget).toBeLessThan(standard.branchBudget)
+    expect(standard.branchBudget).toBeLessThan(deep.branchBudget)
+    expect(quick.reviewBudget).toBeLessThanOrEqual(standard.reviewBudget)
+    expect(standard.reviewBudget).toBeLessThan(deep.reviewBudget)
+    expect(quick.stopRule).not.toBe(standard.stopRule)
+    expect(standard.stopRule).not.toBe(deep.stopRule)
+    expect(quick.evidenceLevel).not.toBe(standard.evidenceLevel)
+    expect(standard.evidenceLevel).not.toBe(deep.evidenceLevel)
+    // 五个维度逐档都不同 —— 这就是"deep 变的是什么"
+    expect(projectFocus('deep').control).not.toEqual(projectFocus('standard').control)
+  })
+
+  it('纯函数：同档位同 verifyUsed 结果相同', () => {
     expect(projectFocus('deep')).toEqual(projectFocus('deep'))
+    expect(projectFocus('deep', 2).controlText).toBe(controlLine('deep', 2))
   })
 })
 
 describe('renderProjection', () => {
-  it('默认渲染指令 + 卡片全文', () => {
+  it('deep：控制读数 + R4 正文；不再注入 R3/R5 全文', () => {
     const text = renderProjection(projectFocus('deep'))
-    expect(text).toContain(DEEP_DIRECTIVE)
-    expect(text).toContain(cardById('R3')?.text ?? '')
+    expect(text).toContain(controlLine('deep', 0))
+    expect(text).toContain(cardById('R4')?.text ?? '')
+    expect(text).not.toContain(cardById('R3')?.text ?? '不可能匹配')
+    expect(text).not.toContain(cardById('R5')?.text ?? '不可能匹配')
   })
 
-  it('includeCards=false 时只留指令（紧张档：内容转工具拉取，指令保留）', () => {
+  it('includeCards=false：读数与指令保留，卡片不给（紧张档转工具拉取）', () => {
     const text = renderProjection(projectFocus('deep'), false)
-    expect(text).toBe(DEEP_DIRECTIVE)
-    expect(text).not.toContain(cardById('R3')?.text ?? '')
+    expect(text).toBe(controlLine('deep', 0))
+    expect(text).not.toContain(cardById('R4')?.text ?? '不可能匹配')
   })
 
-  it('standard 档渲染 = 声明的卡片正文（推不推由上下文层按压力裁决，见 module 测试）', () => {
-    const projection = projectFocus('standard')
-    const text = renderProjection(projection)
-    if (projection.cards.length === 0) {
-      expect(text).toBe(projection.directive)
-    } else {
-      for (const card of projection.cards) expect(text).toContain(card.text)
-      expect(text).toContain(cardById('R1')?.title ?? '不可能匹配')
-    }
+  it('standard 档渲染为空串（默认档不加戏，R1 的动作由常驻提示承载）', () => {
+    expect(renderProjection(projectFocus('standard'))).toBe('')
+  })
+
+  it('quick 档只渲染抑制指令', () => {
+    expect(renderProjection(projectFocus('quick'))).toBe(QUICK_DIRECTIVE)
   })
 })
 
@@ -103,7 +138,7 @@ describe('readFocus / applyFocus：走内核，绝不抛', () => {
     expect(result.depth).toBe('deep')
     expect(handle.kernel.focus('s1')).toBe('deep')
     expect(result.text).toContain('deep')
-    expect(readFocus(handle.kernel, 's1').projection.cards.map(c => c.id)).toEqual(['R3', 'R4', 'R5'])
+    expect(readFocus(handle.kernel, 's1').projection.cards.map(c => c.id)).toEqual(['R4'])
     handle.dispose()
   })
 
@@ -140,7 +175,7 @@ describe('readFocus / applyFocus：走内核，绝不抛', () => {
     expect(result.ok).toBe(true)
     expect(result.depth).toBe('deep')
     expect(handle.kernel.focus('sd')).toBe('deep')
-    expect(readFocus(handle.kernel, 'sd').projection.cards.map(card => card.id)).toEqual(['R3', 'R4', 'R5'])
+    expect(readFocus(handle.kernel, 'sd').projection.cards.map(card => card.id)).toEqual(['R4'])
     expect(result.text).toContain('已回读核实')
     expect(result.text).toContain('请求注入')
     expect(result.text).not.toContain('会带上')
@@ -211,8 +246,19 @@ describe('readFocus / applyFocus：走内核，绝不抛', () => {
 describe('describeDepthEffect', () => {
   it('三档都有自解释回执', () => {
     expect(describeDepthEffect('quick')).toContain('直接回答')
-    expect(describeDepthEffect('deep')).toContain('R3')
+    expect(describeDepthEffect('deep')).toContain('R4')
     expect(describeDepthEffect('standard')).toContain('omb_method')
+  })
+
+  it('回执的主语是控制参数，不是"给你更多规则文本"', () => {
+    const deep = describeDepthEffect('deep')
+    expect(deep).toContain('验证预算 3 次')
+    expect(deep).toContain('可复核 2 次')
+    expect(deep).toContain(describeControl('deep'))
+    // 声明的其余卡片只承诺"按需取"，不承诺自动注入
+    expect(deep).toContain('R3/R5')
+    expect(describeDepthEffect('quick')).toContain('验证预算 0 次')
+    expect(describeDepthEffect('standard')).toContain('验证预算 1 次')
   })
 
   it('deep 回执只说"请求注入"，不承诺结果（注入是下一轮渲染期的事）', () => {
