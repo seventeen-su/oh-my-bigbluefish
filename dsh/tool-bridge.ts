@@ -14,6 +14,7 @@
  */
 import type { ToolDefinition } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
+import type { ToolCallContext } from '../kernel/sessionRuntime.js'
 import { toHostTool, type ToolSpec } from './tools.js'
 
 /** `tools.register` 的最小结构面（宿主提供）。 */
@@ -198,7 +199,9 @@ export function toRegistrable(definition: ToolDefinition): RegistrableTool | und
     name: definition.name,
     description: definition.description,
     parameters: parameters ?? { type: 'object', properties: {} },
-    // 模块的 `execute` 契约是"返回 ToolOutcome 或抛"；桥统一成 ToolSpec 的 run
-    run: (args: unknown) => definition.execute(args),
+    // 模块的 `execute` 契约是"返回 ToolOutcome 或抛"；桥统一成 ToolSpec 的 run。
+    // **第二个参数是本次调用的会话归属**（`dsh/tools.ts` 从宿主 `exec.agent` 投影）：
+    // 丢掉它，工具就只能用"最近一个会话"猜——交错会话时会把状态写进别人的会话。
+    run: (args: unknown, call?: ToolCallContext) => definition.execute(args, call),
   }
 }

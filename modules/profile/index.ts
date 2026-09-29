@@ -14,7 +14,7 @@
  */
 import { z } from 'zod'
 import type { Clock, Kernel, Logger, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
-import { SERVICES } from '../../kernel/abi/index.js'
+import { SERVICES, derivedCapabilities, derivedRequires } from '../../kernel/abi/index.js'
 import type { PromptContribution } from '../../kernel/abi/index.js'
 import type { ProfileAxis, ProfileConflict, ProfileEntry, ProfileOutcome } from './entries.js'
 import {
@@ -90,18 +90,23 @@ export interface ProfileStatus {
 }
 
 export interface ProfileService {
-  /** 全部条目（含互相矛盾的多条：冲突在返回值里就是"两条都在"）。 */
-  entries(): Promise<readonly ProfileEntry[]>
+  /**
+   * 全部条目（含互相矛盾的多条：冲突在返回值里就是"两条都在"）。
+   *
+   * `sessionId` 决定**项目库**那一份读哪个会话的项目；不给就只读用户库
+   * （项目条目如实报"项目库不可用"）——**不挑"最近一个会话"**。
+   */
+  entries(sessionId?: string): Promise<readonly ProfileEntry[]>
   /** 未裁决冲突（R8：呈现用，不裁决）。 */
-  conflicts(): Promise<readonly ProfileConflict[]>
+  conflicts(sessionId?: string): Promise<readonly ProfileConflict[]>
   /** 冲突渲染成给用户看的文本；无冲突返回空串。 */
-  renderConflicts(): Promise<string>
+  renderConflicts(sessionId?: string): Promise<string>
   /** 显式条目渲染（**是否注入由上下文层裁决**，这里只渲染）。 */
-  renderDeclared(limit?: number): Promise<string>
+  renderDeclared(limit?: number, sessionId?: string): Promise<string>
   /** 用户可编辑路径：写入一条显式声明。 */
-  declare(input: ProfileDeclareInput): Promise<ProfileMutation>
+  declare(input: ProfileDeclareInput, sessionId?: string): Promise<ProfileMutation>
   /** 记录一条推断（低等级来源；同键若有显式声明则进不来）。 */
-  infer(input: ProfileInferInput): Promise<ProfileMutation>
+  infer(input: ProfileInferInput, sessionId?: string): Promise<ProfileMutation>
   /**
    * 记录一条能力观察。**只有开关开启时才接受**，且只进会话内存。
    * @returns 是否真的记录（false = 开关关闭或参数非法）
@@ -110,11 +115,9 @@ export interface ProfileService {
   /** 会话能力快照（内容未变时返回同一引用，供 sessionProjections 使用）。 */
   capability(sessionId: string): readonly ProfileEntry[]
   /** 一键清空全部**推断型**条目（含会话能力观察）；显式条目不动。 */
-  clearDeduced(): Promise<ClearResult>
+  clearDeduced(sessionId?: string): Promise<ClearResult>
   /** 项目名（intent 轴与推断条目的来源标注）。 */
   setProject(project: string | null): void
-  /** 当前会话 id（正常由模块订阅 `turn/start` 自动维护；这里供 dsh 侧显式指定）。 */
-  setSession(sessionId: string): void
   status(): ProfileStatus
 }
 
@@ -252,11 +255,11 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     }
   }
 
-  async function mutate(entry: ProfileEntry): Promise<ProfileMutation> {
+  async function mutate(entry: ProfileEntry, sessionId?: string): Promise<ProfileMutation> {
     if (disposed) {
       return { ok: false, outcome: 'rejected', conflict: false, error: '画像模块已卸载' }
     }
-    const loaded = await storage.load()
+    const loaded = await storage.load(sessionId)
     const resolution = applyEntry(entry, loaded.entries)
     const found = refresh(resolution.entries)
 
@@ -267,7 +270,7 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
       return { ok: loaded.error === null, outcome: resolution.outcome, conflict: found.length > 0, error: loaded.error }
     }
 
-    const saved = await storage.save(resolution.entries)
+    const saved = await storage.save(resolution.entries, sessionId)
     lastError = combineErrors(loaded.error, saved.error)
     report()
     return {
@@ -278,30 +281,30 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     }
   }
 
-  async function loadEntries(): Promise<readonly ProfileEntry[]> {
+  async function loadEntries(sessionId?: string): Promise<readonly ProfileEntry[]> {
     if (disposed) return []
-    const loaded = await storage.load()
+    const loaded = await storage.load(sessionId)
     lastError = loaded.error
     refresh(loaded.entries)
     return loaded.entries
   }
 
   const service: ProfileService = {
-    entries: () => loadEntries(),
+    entries: sessionId => loadEntries(sessionId),
 
-    async conflicts() {
-      return listConflicts(await loadEntries())
+    async conflicts(sessionId?: string) {
+      return listConflicts(await loadEntries(sessionId))
     },
 
-    async renderConflicts() {
-      return renderConflictsText(listConflicts(await loadEntries()))
+    async renderConflicts(sessionId?: string) {
+      return renderConflictsText(listConflicts(await loadEntries(sessionId)))
     },
 
-    async renderDeclared(limit = 5) {
-      return renderDeclaredText(await loadEntries(), limit)
+    async renderDeclared(limit = 5, sessionId?: string) {
+      return renderDeclaredText(await loadEntries(sessionId), limit)
     },
 
-    declare(input) {
+    declare(input, sessionId?: string) {
       // 能力轴**永不落盘**（D4）：这里必须拒绝，否则调用方会以为"声明成功"而实际什么都没写。
       if ((input.axis as string) === 'capability') {
         return Promise.resolve({
@@ -318,10 +321,10 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
         provenance: 'declared',
         evidence: input.evidence ?? [],
         updated: clock.now(),
-      })
+      }, sessionId)
     },
 
-    infer(input) {
+    infer(input, sessionId?: string) {
       // 类型层已排除 capability，但运行期调用方可能绕过类型——这里是结构性兜底。
       if ((input.axis as string) === 'capability') {
         return Promise.resolve({
@@ -338,7 +341,7 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
         provenance: 'inferred',
         evidence: input.evidence ?? [],
         updated: clock.now(),
-      })
+      }, sessionId)
     },
 
     observeCapability(sessionId, observation) {
@@ -361,12 +364,20 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
 
     capability: sessionId => capability.list(sessionId),
 
-    async clearDeduced(): Promise<ClearResult> {
+    async clearDeduced(sessionId?: string): Promise<ClearResult> {
       if (disposed) return { ok: false, removed: 0, error: '画像模块已卸载' }
       const capabilityRemoved = capability.entryCount()
       capability.clearAll()
-      const result = await clearDeducedFrom(storage)
-      refresh((await storage.load()).entries)
+      // 会话显式给出时按该会话的项目库清；没给就只清用户库（不挑"最近一个会话"）
+      const target =
+        sessionId === undefined
+          ? storage
+          : {
+              load: () => storage.load(sessionId),
+              save: (entries: readonly ProfileEntry[]) => storage.save(entries, sessionId),
+            }
+      const result = await clearDeducedFrom(target)
+      refresh((await storage.load(sessionId)).entries)
       if (result.ok) lastError = null
       else lastError = result.error
       report()
@@ -375,10 +386,6 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
 
     setProject(project) {
       storage.setProject(project)
-    },
-
-    setSession(sessionId) {
-      storage.setSession(sessionId)
     },
 
     status() {
@@ -425,8 +432,8 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
   const manifest: ModuleManifest<ProfileConfig> = {
     id: PROFILE_MODULE_ID,
     version: PROFILE_VERSION,
-    requires: ['omb-memory'],
-    capabilities: ['profile.declared'],
+    requires: derivedRequires(PROFILE_MODULE_ID),
+    capabilities: derivedCapabilities(PROFILE_MODULE_ID),
     configSchema: profileConfigSchema,
     health,
   }
@@ -461,22 +468,14 @@ export function createProfileModule(): ModuleRegistration<ProfileConfig> {
       const unprovidePrompt = kernel.provide<PromptContribution>(PROFILE_PROMPT_SERVICE, {
         context: () => created.conflictDigest(),
       })
-      // 会话 id 来自内核事件（dsh 侧把宿主会话事件转成 `turn/start`），
-      // 因此画像不需要 dsh 额外接线就能定位"哪个项目的库"。
-      const unsubscribe = kernel.on('turn/start', payload => {
-        storage.setSession(payload.sessionId)
-      })
+      // **不再订阅 `turn/start` 记"当前会话"**：那是"最近一个会话"，交错时会读错/写错
+      // 项目库。会话只从**本次操作**的调用方来（`entries(sessionId)` / `declare(input, sessionId)`）。
       // 预热缓存：只填内部状态，不注册任何东西（H-2 允许异步填状态）
       void created.service.entries()
       kernel.report(created.health())
 
       return () => {
         // 热插拔：dispose 绝不抛异常（宿主 reconcileProfilePatches 会 await 旧 fiber）
-        try {
-          unsubscribe()
-        } catch (error) {
-          kernel.logger.warn(`画像：注销事件订阅失败（已隔离）——${messageOf(error)}`)
-        }
         try {
           unprovidePrompt()
         } catch (error) {

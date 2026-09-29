@@ -9,7 +9,7 @@
 import { z } from 'zod'
 import type { Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import type { StatusContributor, StatusRegistry } from '../../kernel/abi/index.js'
-import { SERVICES } from '../../kernel/abi/index.js'
+import { SERVICES, derivedCapabilities, derivedRequires } from '../../kernel/abi/index.js'
 import type { DesktopNotifyLike, NotifyUrgency } from './bridge.js'
 import { DEFAULT_NOTIFY_SESSION, NOTIFY_SESSION_LIMIT, NOTIFY_THROTTLE_MS, NotifyBridge } from './bridge.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
@@ -94,8 +94,8 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
   const manifest: ModuleManifest<NotifyConfig> = {
     id: NOTIFY_MODULE_ID,
     version: NOTIFY_VERSION,
-    requires: ['omb-kernel'],
-    capabilities: ['notify.external'],
+    requires: derivedRequires(NOTIFY_MODULE_ID),
+    capabilities: derivedCapabilities(NOTIFY_MODULE_ID),
     configSchema: notifyConfigSchema,
     health,
   }

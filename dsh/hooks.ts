@@ -73,14 +73,46 @@ export function wireArtifactIndex(options: {
 
   let off: (() => void) | undefined
   try {
-    const returned = ctx.on('tool/call', ((...args: unknown[]) => {
+    /**
+     * ⚠️ **必须订 `session/event`，不能订 `tool/call`。**
+     *
+     * 实测（DSH `0.2.0-rc.2`）：`tool/call` 只是一个**会话事件类型**
+     * （`packages/core/session/src/known-event-types.ts:73`），**不是 ctx 层事件**。
+     * ctx 层只发 `session/event` 与 `session/disposed`
+     * （`packages/core/session/src/index.ts:405,757-764`）；DSH 自己的 agent-loop
+     * 也是用 `ctx.on('session/event')` 观察工具调用
+     * （`packages/core/agent-loop/src/runtime-context.ts:134`）。
+     *
+     * 这里原本写的是 `ctx.on('tool/call', …)`——**订阅语法上成功，但事件永不到来**，
+     * 于是制品索引恒为空。这个缺陷被"订阅存在"的测试放过去了：**断言了线接上了，
+     * 没断言电会来**。所以下面每条路径都有对应的测试用**真实事件形状**喂进来。
+     *
+     * 载荷形状（`packages/core/session/src/types.ts:361`）：
+     * `session/event` 是 `(session, event)`；`tool/call` 的 `event.data` 是
+     * `{turn, step, callId, name, arguments}`，其中 **`arguments` 是 JSON 字符串**，
+     * 不是对象——所以要 `JSON.parse`，且解析失败必须静默跳过（不猜）。
+     */
+    const returned = ctx.on('session/event', ((...args: unknown[]) => {
       try {
-        const payload = args[0] as { name?: unknown; toolName?: unknown; args?: unknown } | undefined
-        const name = typeof payload?.name === 'string'
-          ? payload.name
-          : (typeof payload?.toolName === 'string' ? payload.toolName : undefined)
+        const event = args[1] as { type?: unknown; data?: unknown } | undefined
+        if (event?.type !== 'tool/call') return
+        const data = event.data as { name?: unknown; arguments?: unknown } | undefined
+        const name = typeof data?.name === 'string' ? data.name : undefined
         if (name === undefined) return
-        const paths = pathsFromToolCall(name, payload?.args)
+
+        // `arguments` 是 JSON 字符串；解析失败 = 拿不到参数 = 不记录（不猜）
+        let parsed: unknown
+        if (typeof data?.arguments === 'string') {
+          try {
+            parsed = JSON.parse(data.arguments)
+          } catch {
+            return
+          }
+        } else {
+          parsed = data?.arguments
+        }
+
+        const paths = pathsFromToolCall(name, parsed)
         if (paths.length === 0) return
         const artifact = kernel.service<ArtifactRecorder>(SERVICES.artifact)
         if (artifact === undefined || typeof artifact.record !== 'function') return
@@ -97,7 +129,7 @@ export function wireArtifactIndex(options: {
     }) as (...args: never[]) => void)
     if (typeof returned === 'function') off = returned as () => void
   } catch (error) {
-    kernel.logger.warn(`OMB：订阅 tool/call 失败（制品索引不会有内容）——${String(error)}`)
+    kernel.logger.warn(`OMB：订阅 session/event 失败（制品索引不会有内容）——${String(error)}`)
   }
 
   return () => {
