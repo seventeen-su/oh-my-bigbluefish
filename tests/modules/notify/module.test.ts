@@ -79,8 +79,11 @@ describe('注册面', () => {
     expect(NOTIFY_SERVICE).toBe('notify')
   })
 
-  it('配置缺省值完整：notifyModuleFailures 默认 **false**（启动期不打扰）', () => {
-    expect(notifyConfigSchema.parse(undefined)).toEqual({ notifyModuleFailures: false })
+  it('配置缺省值完整：模块失败默认关（启动期不打扰）、依赖断裂默认开（用户动作的后果说明）', () => {
+    expect(notifyConfigSchema.parse(undefined)).toEqual({
+      notifyModuleFailures: false,
+      notifyDependencyBroken: true,
+    })
   })
 })
 
@@ -165,7 +168,10 @@ describe('中途失败才打扰', () => {
 describe('热插拔', () => {
   it('dispose 注销服务与订阅，且绝不抛', async () => {
     const { handle, kernel, module } = start(undefined)
-    expect(handle.listenerCount()).toBe(1)
+    // 两条订阅：`kernel/module-health`（模块自己失败）与
+    // `kernel/module-graph-changed`（前置被关掉连累依赖方）。两个都要被收干净，
+    // 少收一个就是热插拔后的悬空订阅——症状是重挂之后同一条通知发两遍。
+    expect(handle.listenerCount()).toBe(2)
     expect(() => handle.dispose()).not.toThrow()
     expect(handle.listenerCount()).toBe(0)
     expect(kernel.service(NOTIFY_SERVICE)).toBeUndefined()

@@ -243,8 +243,18 @@ export function wireSessionEvents(options: {
   readonly ctx: HostContextLike
   readonly kernel: Kernel
   readonly onToolResult?: (payload: { sessionId: string; text: string; callId: string | undefined }) => void
+  /**
+   * 每观测到一次会话事件时把 **Session 对象本身**交出去。
+   *
+   * 为什么需要它：宿主几个有用的读数（上下文压力、token 用量）是**按 Session 对象**
+   * 取投影的（`stateOf(session, key)`），而 OMB 内部一律以 sessionId 为准。
+   * 这个回调就是那个映射的**唯一采集点**——事件载荷的 `args[0]` 正是 Session 本身，
+   * 不在这里拿，别处就只能靠 `ctx.get('sessions')` 反查（那条路要过 Cordis Guard，
+   * 是兜底而非常路）。
+   */
+  readonly onHostSession?: (sessionId: string, session: unknown) => void
 }): () => void {
-  const { ctx, kernel, onToolResult } = options
+  const { ctx, kernel, onToolResult, onHostSession } = options
   /** 见过的会话事件类型 → 次数（诊断用）。 */
   const sawEventTypes = new Map<string, number>()
   if (typeof ctx.on !== 'function') {
@@ -290,6 +300,16 @@ export function wireSessionEvents(options: {
     //    `kernel.emit` 发在**内核总线**——两者永远碰不到且不报错。实测症状就是
     //    `omb_focus` 报"取不到当前会话标识"（详见 kernel/activeSession.ts）。
     const cwd = rememberCwdFrom(sessionId, session, activeSessions())
+
+    // ② Session 对象本身交给度量桥。
+    //    投影读数（上下文压力 / token 用量）按 Session 对象取，不按 id 取，
+    //    所以这里存的是"宿主认识的那个对象"。回调在桥里已经整段 try/catch，
+    //    外面再包一层是因为监听器是 async 的——抛出去会变成未处理的 rejection。
+    try {
+      onHostSession?.(sessionId, session)
+    } catch (error) {
+      kernel.logger.warn(`OMB：会话对象交接失败（度量将降级为"未测量"）——${String(error)}`)
+    }
 
     if (type === undefined) return
     // 最后一次收到的会话事件类型（诊断）。

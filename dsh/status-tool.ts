@@ -142,10 +142,18 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     // **未测量 ≠ 测量为零**。这两者在状态面里必须能分辨，否则"总 token 0"
     // 会被读成"上下文是空的"，而真相可能是"宿主没告诉窗口大小、根本没在量"。
     // 自检报告因此把这一整段从"通过"降级成了"未验证"——它读对了，是文案没说清。
+    //
+    // 进一步：`fillRatio === null` 本身有**四种成因**（宿主没提供投影服务 /
+    // 还没上报过 usage / 没声明窗口 / 根本没观察到那个会话）。四者修法不同，
+    // 所以原因由度量桥如实给出（`SERVICES.pressureReading`），这里只负责转述。
     const unmeasured = pressure.fillRatio === null
-    const ratio = unmeasured ? '未测量（宿主未声明窗口）' : pressure.fillRatio.toFixed(3)
+    const why = unmeasured
+      ? (handle.kernel.service<{ reason(): string }>(SERVICES.pressureReading)?.reason()
+        ?? '度量桥未接线（拿不到原因——这本身就是一条接线缺陷）')
+      : undefined
+    const ratio = unmeasured ? '未测量' : pressure.fillRatio.toFixed(3)
     lines.push(`- 压力档位：${pressure.band}${unmeasured ? '（**按宽松档处理**：没有度量，故不施压）' : ''}`)
-    lines.push(`- 窗口占用：${ratio}`)
+    lines.push(`- 窗口占用：${ratio}${why === undefined ? '' : ` —— ${why}`}`)
     lines.push(`- 总 token：${pressure.totalTokens}${unmeasured ? '（未测量，不是 0）' : ''}`)
     lines.push(
       `- 缓存：读 ${pressure.cacheReadTokens} / 写 ${pressure.cacheWriteTokens}`

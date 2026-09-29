@@ -28,6 +28,14 @@ export const NOTIFY_HOST_SERVICE = 'desktopNotify'
 /** 唯一保留的内核事件通知种类：**中途**失败的模块（启动失败不打扰）。 */
 export const KERNEL_FAILURE_KIND = 'kernel-module-failed'
 
+/**
+ * 依赖断裂的通知种类：**前置组件被关掉，依赖它的模块随之失效**。
+ *
+ * 这条通知与上面那条的分工：上面报"某个模块自己坏了"，这条报"某个模块
+ * 是被别人关掉前置**连累**的"——后者用户才知道该去把哪一行打开。
+ */
+export const KERNEL_DEPENDENCY_BROKEN_KIND = 'kernel-dependency-broken'
+
 export interface NotifyConfig {
   /**
    * **中途**模块失败时是否推送通知（**默认 false**）。
@@ -38,12 +46,26 @@ export interface NotifyConfig {
    * 不在启动首轮上报。
    */
   readonly notifyModuleFailures: boolean
+  /**
+   * 前置组件被关掉时是否推送通知（**默认 true**）。
+   *
+   * 为什么默认**开**，与上一条相反：这不是"噪音"，而是**用户自己刚做的动作的
+   * 后果说明**。宿主不会替用户检查这件事（实测：插件管理器从不读一行的
+   * `inject`，关掉前置后依赖方的行仍显示为启用，只是静默停在 PENDING），
+   * 所以这条提醒是用户唯一能知道"我刚刚关掉的东西连累了谁"的通道。
+   *
+   * 只在**卸下**时发，因此启动期（只有挂载、没有卸下）一条都不会发。
+   */
+  readonly notifyDependencyBroken: boolean
 }
 
-export const NOTIFY_DEFAULT_CONFIG: NotifyConfig = { notifyModuleFailures: false }
+export const NOTIFY_DEFAULT_CONFIG: NotifyConfig = { notifyModuleFailures: false, notifyDependencyBroken: true }
 
 export const notifyConfigSchema = z
-  .object({ notifyModuleFailures: z.boolean().default(false) })
+  .object({
+    notifyModuleFailures: z.boolean().default(false),
+    notifyDependencyBroken: z.boolean().default(true),
+  })
   .default(NOTIFY_DEFAULT_CONFIG)
 
 export interface NotifyService {
@@ -213,6 +235,41 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
           'critical',
         )
       })
+
+      /**
+       * 依赖断裂：**前置组件被关掉，依赖它的模块随之失效**。
+       *
+       * ## 这条通知补的是谁的缺口
+       *
+       * 宿主不会替用户检查这件事。实测（`D:\Program\deepseek-harness`）：
+       * 插件管理器的写路径从不读一行的 `inject`（`plugin-manager/src/index.ts:424-435`
+       * 只写 `disabled` 就落盘），被关掉的只是 **fiber**——依赖方被卸载到
+       * PENDING（`vendor/cordis/src/fiber.ts:611-639`），而**它自己的行仍然是启用状态**，
+       * 页面上只显示一行"等待依赖"。用户于是看到"我关了一个，另一个还在，
+       * 但好像不干活了"，没有任何地方告诉他是谁连累了谁。
+       *
+       * ## 为什么只认 `unmount`
+       *
+       * 启动期只有挂载、没有卸下，因此这条通知**天然不会在启动时打扰**——
+       * 不需要像上面那条一样额外做"首轮不报"的判断。
+       * 内核整体注销时的卸下也不会走到这里（账本那边 `disposed` 已经拦掉）。
+       */
+      const unsubscribeGraph = kernel.on('kernel/module-graph-changed', payload => {
+        if (!config.notifyDependencyBroken) return
+        if (payload.change !== 'unmount') return
+        if (payload.id === NOTIFY_MODULE_ID) return // 自己被关掉了，没有桥可用
+        if (payload.dependents.length === 0) return
+        const list = payload.dependents.join('、')
+        created.push(
+          KERNEL_DEPENDENCY_BROKEN_KIND,
+          `OMB：${payload.id} 已关闭，依赖它的 ${payload.dependents.length} 个模块已失效`,
+          `依赖 ${payload.id} 的模块：${list}。`
+            + '它们仍在启用状态，但拿不到前置，只会静默降级或空转。'
+            + `要恢复：在插件页把 ${payload.id} 那一行重新打开。`,
+          undefined,
+          'normal',
+        )
+      })
       kernel.report(health())
 
       return () => {
@@ -222,9 +279,14 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
           kernel.logger.warn(`通知：注销事件订阅失败（已隔离）——${String(error)}`)
         }
         try {
+          unsubscribeGraph()
+        } catch (error) {
+          kernel.logger.warn(`通知：注销模块图订阅失败（已隔离）——${String(error)}`)
+        }
+        try {
           unprovide()
-      statusUnregister?.()
-      statusUnregister = undefined
+          statusUnregister?.()
+          statusUnregister = undefined
         } catch (error) {
           kernel.logger.warn(`通知：注销服务失败（已隔离）——${String(error)}`)
         }

@@ -155,18 +155,29 @@ image-offload 是否被本预设重复声明: false
 
 ## 6. 核查中发现的、**不在本任务写入范围**的缺口（只报告，未改）
 
-### 6.1 内核压力桥没接宿主的 `tokenMeter` → 软压力档位恒为 relaxed
+### 6.1 内核压力桥没接宿主的 `tokenMeter` → 软压力档位恒为 relaxed —— **已修（2026-09-30）**
 
 - 证据：`dsh/plugin.ts:92` `createKernel({ logger, clock })` —— **没有传 `measure`**；而内核的 `pressure()` 只有在拿到 `measure` 时才有真读数（`kernel/abi/kernel.ts:102` 说明该桥来自宿主 `tokenMeter`）。`dsh/status-tool.ts:145-152` 已经把这如实写成"未测量（宿主未声明窗口）"。
 - 后果：规划 §6.3 的软压力三档在生产里**恒为 relaxed**（"不做任何注入裁决"），`omb_status` 的 `fillRatio`/逐节点价格永远显示未测量。拉取台账不受影响（它数的是 OMB 工具拉取）。
-- 修法（task-6/task-7 范围）：在 `dsh/plugin.ts` 里 `ctx.get('tokenMeter')` 后构造 `measure(session)` → `{totalTokens, fillRatio, nodes, cacheReadTokens, cacheWriteTokens}`，或让内核在 `pressure()` 内读服务表。
-- **与压缩的关系**：因为压力档位当前是恒 relaxed，压缩与 OMB 档位在真实宿主上**连测量耦合都还没发生**；接上以后 §4.2 的三条结论适用。
+- **实际修法（与上面最初设想的`ctx.get('tokenMeter')`不同，以实测为准）**：宿主暴露的不是 `tokenMeter` 服务，而是三个**会话投影**
+  （`packages/llm/token-meter/src/projection.ts:68-76`：`contextPressure` / `tokenUsage` / `contextBreakdown`），
+  经 `ctx.sessionProjections.stateOf(session, key)` 读取。**关键约束**：`stateOf` 要的是
+  **`Session` 对象**而不是 sessionId，而 `session/event` 的载荷第一参恰好就是它
+  （`packages/core/session/src/index.ts:77` 的签名 `(session, event)`）。
+  实现落在 `dsh/pressure.ts`（度量桥）+ `dsh/session.ts` 新增的 `onHostSession` 采集点 +
+  `dsh/plugin.ts` 的接线；`fillRatio = projectedTokens / contextWindow`。
+- **补充纠正**：本文档早前版本说过"宿主未声明窗口"。**不成立**——`ContextPressureProjection.contextWindow`
+  就是路由声明的窗口容量。真实情况是 OMB 从来没去读它。
+- **未测量现在有四条可分辨的原因**（服务缺失 / 未上报 usage / 未声明窗口 / 未观察到该会话），
+  由 `SERVICES.pressureReading` 给出，`omb_status` 逐字转述。此前四种成因在状态面上是同一个 `null`。
 
-### 6.2 `ctx.on('tool/call')` 在 0.2.0 不会触发 → 制品索引收不到工具调用
+### 6.2 `ctx.on('tool/call')` 在 0.2.0 不会触发 → 制品索引收不到工具调用 —— **已修**
 
 - 证据：见 §3.6。`dsh/hooks.ts:76` 订阅的 `tool/call` 不是 ctx 事件；DSH 侧 `tool/call` 只是会话事件类型（`known-event-types.ts:73`，载荷 `types.ts:361` 的 `arguments` 是 **JSON 字符串**）。
 - 后果：`wireArtifactIndex` 从未被调用 → 制品索引（`omb_files` 的数据源）为空。**单元测试发现不了**（测试用 fake ctx 直接 emit `tool/call`）。
-- 修法（dsh/ 范围）：把索引接到已有的 `session/event` 订阅（`dsh/session.ts:273` 那种形态），`event.type === 'tool/call'` 时读 `event.data.name` 并 `JSON.parse(event.data.arguments)`。
+- 修法（已实施）：索引接到 `session/event` 订阅，`event.type === 'tool/call'` 时读 `event.data.name` 并 `JSON.parse(event.data.arguments)`。
+- **教训（本档最贵的一条）**：旧测试断言的是"订阅存在"，而不是"事件真的会到"——
+  于是它一直绿着，而生产里那条线一次都没响。**存在 ≠ 生效。**
 
 ### 6.3 peer 的安装副作用
 
@@ -182,3 +193,68 @@ image-offload 是否被本预设重复声明: false
 4. **`node scripts/check-resolution.mjs` 未跑**：它校验的东西（模块解析/代数产物）正被 task-6/task-8 改动，跑出来的红无法归因到本任务；且 task-5 的判据点名的三项不含它。
 5. **`dsh-desktop-notify` 的 `*` 范围**：我没读它的发布历史，给不出更窄且安全的范围。OMB 只做结构探测，形状不符即降级（有测试），所以 `*` 是可辩护的，但它确实**不是**"核验过的范围"。
 6. **`cacheHitRate` 与压缩事件的关联**（§4.2 第 3 条）只是**建议**，没有实现，也没有测量数据支撑其收益。
+
+---
+
+## 8. 插件管理器的依赖表达能力（2026-09-30，只读调查 + 落地决定）
+
+**问题**：关掉一个前置组件时，能不能让它依赖的组件**一并自动关闭**？或者，**打开**一个依赖已被关掉的组件时，能不能**失败并提示**？
+
+**结论：两条都做不到（第二条只是偶然部分成立）**，因此按用户指定走兜底路线：**检测到变更时推送通知**。
+
+### 8.1 (A) 自动一并关闭 —— **不支持**
+
+- 全仓没有任何代码为依赖方写 `disabled`。唯一的"级联"发生在 **Cordis fiber 层**：
+  提供者被卸下 → `reflect.notify` 让每个 `inject` 它的 fiber 卸载到 PENDING
+  （`vendor/cordis/src/reflect.ts:297-303`、`:314-336`）。
+- 也就是说：**能力层面依赖方确实已经停摆了，但它的"行"仍然是启用状态**。
+  用户在插件页看到的是"等待依赖"（`ui-plugin-manager/src/client/locales.ts:238`），
+  而"我关掉的那个东西连累了谁"没有任何地方说。
+- 关闭动作的落盘路径完全不看依赖：`packages/boot/plugin-manager/src/index.ts:424-435`
+  只写 `disabled` 再 reconcile；`src/patch.ts:14-42` 是唯一的 `disabled` 写入者。
+
+### 8.2 (B) 打开时失败并提示 —— **部分支持，但依赖"偶然"**
+
+- 成立的那一半：`setPluginEnabled` 会把自己这一行的 patchId 放进 `requiredIds`
+  （`plugin-manager/src/index.ts:431`），`reconcileProfilePatches` 对"新变成未激活的必需项"抛错
+  （`app-boot/src/index.ts:293-296`）→ UI 弹 `failedRowEnable`（`locales.ts:378-379`）。
+- **但**它成立的原因不是"检查了依赖"，而是"这一行自己起不来"。所以：
+  - 只有当那一行**自己声明了** `inject`（行级或模块级静态 `inject`）时才成立；
+  - OMB 的模块行只 `inject: ['omb:kernel']`，模块之间的前置是 OMB 自己的
+    `manifest.requires`（内核 `planModules` 读的那一份），**DSH 看不到**；
+  - 且仅在活 HMR profile 下成立：没有 `hmr` 服务时同一调用直接返回
+    `application: 'restart-required'`，**零校验**（`index.ts:763`）。
+
+### 8.3 OMB 侧可以做的与不可以做的
+
+| 想做 | 能不能 | 依据 |
+| --- | --- | --- |
+| 阻止/修正一次开关 | **不能** | 写文件在前（`index.ts:430`），写完才 reconcile；没有 pre-write 钩子、没有 veto |
+| 让插件页把依赖它的行置灰 | **不能** | `protectedModules` / `readOnlyReason` 是 `plugin-manager` 内部私有集（`index.ts:66-76`、`:263-271`） |
+| 从 `plugin-manager/changed` **同步**级联 | **不能** | 该 emit 在 `hmr.runExclusive`（嵌套直接抛 `"HMR transactions cannot be nested"`）与 `withFileLock` 之内；同步重入会在 120s 后以 `atomic-write: timed out waiting for the writer lock` 失败（`util/atomic-write/src/index.ts:257-259`） |
+| 观察变更并**事后**提醒 | **能** | 见 8.4 |
+
+### 8.4 落地：OMB 自己的检测 + 桌面通知
+
+新增两条能力（都在 OMB 仓库内，不改 DSH）：
+
+1. **账本出账**（`kernel/index.ts` 的 `recordUnmount`）：在此之前挂载账本**只增不减**——
+   关掉一行之后 `mounted` 里仍然列着它，`missingDependencies` 恒为空，
+   自检还报"顺序自检通过"。**这是"连检测都做不到"的根因。**
+   销账的位置信息同时保留下来，重挂时回到原位，避免热开关产生**假**的顺序违规。
+2. **变更广播 + 通知**（`kernel/module-graph-changed` → `modules/notify`）：
+   卸下时若仍有模块依赖它，推送"`X` 已关闭，依赖它的 `N` 个模块已失效……要恢复：把 `X` 那一行重新打开"。
+   只在**卸下**时发，因此启动期天然无噪音（启动只有挂载）。
+3. **顺带修掉一条死线**：`kernel/module-health` 早就声明在事件表里、`modules/notify` 也早就订阅了它，
+   但**内核从来没有发射过**（全仓 `emit('kernel/module-health'` 只在测试里）。
+   于是"模块运行中失败就弹通知"在生产里一次都不会触发，而测试全绿——测试自己手动 emit 了那条事件。
+   现在上报与广播绑成同一个动作（`reportHealth`），9 个上报点不可能再漏。
+
+### 8.5 仍未做到的（如实记录）
+
+- **打开依赖方时没有任何提示**：DSH 不校验，OMB 也拿不到"用户正在打开某一行"的事件
+  （`plugin-manager/changed` 的载荷只有 `{reason: 'plugin'|'bundle'|'install'|'remove'}`，**没有 target**）。
+  事后 diff 只能得到"缺了"，得不到"因为刚才那次操作"。当前只在**关闭**方向给提醒。
+- **`desktopNotify` 是否真的在跑没有当场验证**：`dsh-desktop-notify` 的行是活的
+  （`Config.listConfigs` 查到 `include:desktop-notify`），但宿主 Service 目录里没有 `desktopNotify` 键，
+  无法确定该目录是否穷举。OMB 侧对它是纯结构探测，探测不到就静默降级（有测试），因此不影响正确性。

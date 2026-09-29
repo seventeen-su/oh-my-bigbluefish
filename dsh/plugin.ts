@@ -41,6 +41,7 @@ import {
   wireSessionEvents,
 } from './session.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
+import { createPressureBridge } from './pressure.js'
 import { wireArtifactIndex } from './hooks.js'
 import { buildStatusTool } from './status-tool.js'
 import { loadModulesSync } from './modules.js'
@@ -89,7 +90,12 @@ export const KERNEL_SELF: ModuleRegistration<unknown> = {
 export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => void {
   const logger = hostLogger(ctx)
   const clock = systemClock
-  const handle = createKernel({ logger, clock })
+  // ── 0) 上下文压力度量桥（**必须先于 createKernel**：measure 是构造期选项）──
+  //
+  // 缺了它，`kernel.pressure()` 恒为 `UNKNOWN_PRESSURE`，`band` 永远是 relaxed，
+  // 于是"紧张就少说"一次都不会触发，而所有健康面都是绿的。详见 `dsh/pressure.ts`。
+  const pressure = createPressureBridge({ ctx })
+  const handle = createKernel({ logger, clock, measure: pressure.measure })
 
   // 把"内核就绪"发布到宿主 ctx：模块行由宿主独立加载，需要经宿主 ctx 取内核。
   // 见 `docs/host-wiring-handoff.md`——这一步在真实宿主上**尚未验证成功**，
@@ -111,6 +117,16 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     logger,
   })
   handle.kernel.provide(SERVICES.kernel, handle.kernel)
+  // 压力读数的"为什么"也进服务表：`omb_status` 有两条构造路径，服务表是它们
+  // 唯一能共用同一份答案的地方（见 `SERVICES.pressureReading` 的注释）。
+  try {
+    handle.kernel.provide(SERVICES.pressureReading, {
+      reason: pressure.reason,
+      stats: pressure.stats,
+    })
+  } catch (error) {
+    logger.warn(`OMB：压力读数说明注册失败——${String(error)}（状态面将只说"未测量"，不说是哪种）`)
+  }
   try {
     handle.kernel.provide(STORAGE_HOST_SERVICE, storageHost.port)
   } catch (error) {
@@ -252,7 +268,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 
   // ── 5) 会话事件（只观察，不接管 Loop）─────────────────────────────────
   //    会话 → cwd 由这里写进内核登记处（唯一存放处）；不再另存一份。
-  const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel })
+  const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, onHostSession: pressure.remember })
   /**
    * 制品索引的**生产者**。
    *
@@ -297,6 +313,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       disposeToolResync,
       disposePrompt,
       () => toolBridge.dispose(),
+      () => pressure.dispose(),
       () => handle.dispose(),
     ]
     for (const step of steps) {
