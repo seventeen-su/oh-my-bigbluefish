@@ -376,6 +376,22 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
     if (report.missingDependencies.length > 0) {
       lines.push(`依赖未挂载 ${report.missingDependencies.length} 处（前置条件未满足，依赖方应已自行降级）：`)
       for (const missing of report.missingDependencies) lines.push(`- ${missing}`)
+      /**
+       * **必须给修法，否则这一段只是噪音。**
+       *
+       * 顺序违规那边有"改行序"的指引，这里原来只有条目——使用者看到
+       * "依赖未挂载"却不知道该做什么。而这一段的实际含义是：
+       * **某一行被关掉了，而依赖它的行没有跟着关**。
+       *
+       * ⚠️ 明写"运行时硬阻断未实现"是刻意的：硬阻断要么把"模块行之间没有顺序
+       * 保证"误判成"依赖缺失"（→ 静默丢能力），要么得把 `apply` 挪到 `mount`
+       * 返回之后（→ 宿主的一次性安装审计 H-2 失效）。所以保证是三件：行序守卫
+       * 测试、`inject: ['omb:kernel']` 门、以及这段自检本身。
+       * **不要在文案里假装硬阻断已经成立。**
+       */
+      lines.push('  含义：这些依赖行被关掉了，而依赖它们的行没有跟着关。')
+      lines.push('  修法：在插件页把依赖行打开；若确实要关掉某个依赖，请把它依赖的组件也一起关掉。')
+      lines.push('  （运行时不硬阻断——理由见 kernel/abi/catalog.ts 头部。依赖方不会假装正常。）')
     }
     return lines.join('\n')
   }

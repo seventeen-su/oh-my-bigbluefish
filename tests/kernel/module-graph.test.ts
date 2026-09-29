@@ -68,6 +68,16 @@ describe('moduleGraph：真实挂载顺序 vs 声明的依赖', () => {
     const status = h.status().join('\n')
     expect(status).toContain('依赖未挂载')
     expect(status).toContain('omb-profile ← omb-memory')
+    /**
+     * **"列出来"不等于"能处理"**：顺序违规那边一直有修法指引，依赖未挂载这边
+     * 原来只有条目。使用者看到"依赖未挂载"却不知道该做什么——那一段就只是噪音。
+     *
+     * 这两条断言要求**含义 + 修法**都在场，并且如实写明运行时不硬阻断
+     * （硬阻断会让行序的"晚到"误判成"缺失"→ 静默丢能力）。
+     */
+    expect(status, '必须说清这一段的含义').toContain('这些依赖行被关掉了')
+    expect(status, '必须给修法，否则只是噪音').toContain('修法：在插件页把依赖行打开')
+    expect(status, '不得假装硬阻断已实现').toContain('运行时不硬阻断')
   })
 
   it('自检读到的是**当前**事实：依赖晚到后，先前的"未挂载"会变成"顺序违规"（或反过来消失）', () => {
