@@ -13,6 +13,7 @@ import { StatusTable } from './status.js'
 import { adoptContext, type ForeignContextLike } from './adopt.js'
 import { markKernel, markKernelHandle } from './hostEntry.js'
 import { ActiveSessionTable } from './activeSession.js'
+import { SessionRuntimeTable } from './sessionRuntime.js'
 import { ChannelTable } from './channels.js'
 import { SERVICES } from './abi/index.js'
 import type {
@@ -87,8 +88,47 @@ export interface KernelHandle {
   budgets(): Readonly<Record<string, { used: number; limit: number }>>
   /** 事件总线订阅者数——热插拔验收用（卸载后应为 0）。 */
   listenerCount(): number
-  /** 注销全部服务与事件订阅。**绝不抛异常**（热插拔 H-1）。 */
+  /**
+   * **模块依赖图自检**：真实挂载顺序 vs 每个模块自己声明的 `requires`。
+   *
+   * 为什么需要它（这是唯一诚实且不碰 H-2 的强制方式）：行与行之间只有
+   * `inject: ['omb:kernel']` 一道门，**没有顺序保证**；一旦有人把
+   * `cordis.patch.yml` 的行序改错（例如把 `omb-memory-vector` 挪到 `omb-memory` 前），
+   * 依赖方会先加载、拿不到服务而静默降级。这里把"顺序被改错"从静默变成**可读事实**。
+   *
+   * 语义：
+   * - `orderViolations`：依赖**挂载得比依赖方晚**（真·顺序违规）
+   * - `missingDependencies`：依赖**从未挂载**（前置条件未满足；依赖方应已自行降级并写明原因）
+   *
+   * 按需计算（`omb_status` 渲染时），因此读到的是**当前**事实而不是启动瞬间的快照。
+   */
+  moduleGraph(): ModuleGraphReport
+  /**
+   * 注销全部服务与事件订阅。**绝不抛异常**（热插拔 H-1）。
+   *
+   * ⚠️ **同步路径不保证异步 disposer 已完成**：它逐个调用 disposer 但不等 Promise，
+   * 返回时可能有模块仍在异步收尾（例如关闭数据库、等 flush）。
+   * 需要"卸载确实完成"的调用方请用 `disposeAsync()`。
+   * 两条路径共用同一份 disposer 集合与同一个幂等包装，重复调用不会重复释放。
+   */
   dispose(): void
+  /**
+   * 注销并**等待全部 disposer 完成**（含返回 Promise 的）。
+   *
+   * 语义：`Promise.allSettled` —— 单个 disposer 抛错/reject 只记日志，不阻止其余，
+   * 也不让本方法 reject（H-1）。可在 `dispose()` 之后调用：此时它补等尚未完成的那些。
+   */
+  disposeAsync(): Promise<void>
+}
+
+/** 模块依赖图自检报告（见 `KernelHandle.moduleGraph`）。 */
+export interface ModuleGraphReport {
+  /** 实际挂载顺序（id，按挂载先后）。 */
+  readonly mounted: readonly string[]
+  /** 依赖挂载得比依赖方晚：`依赖方 ← 依赖`。 */
+  readonly orderViolations: readonly string[]
+  /** 依赖从未挂载：`依赖方 ← 依赖`（前置条件未满足，不是顺序问题）。 */
+  readonly missingDependencies: readonly string[]
 }
 
 const NOOP_LOGGER: Logger = { debug: () => {}, info: () => {}, warn: () => {} }
@@ -129,21 +169,177 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   const statusTable = new StatusTable()
   const channelTable = new ChannelTable<{ readonly name: string }>()
   const activeSessions = new ActiveSessionTable()
+  /**
+   * 会话运行态容器（`kernel/sessionRuntime.ts`）。
+   *
+   * **由内核 provide，模块只复用**：这张表一旦有多份，"同一个会话的隐私/推理/记忆状态"
+   * 就会被拆到不同的表里——那正是 `lastActiveSession` 那类缺陷（每个模块各记一份
+   * "当前会话"）的翻版。消费方（如 `omb-privacy` 的隐私槽）先问服务、拿不到才自建兜底。
+   */
+  const sessionRuntime = new SessionRuntimeTable(clock)
 
-  // 三个登记处都由内核自己 provide：
+  // 四个登记处都由内核自己 provide：
   // ① 状态面：单值服务表装不下 N 个贡献者（见 abi/catalog.ts 的说明）
   // ② 第二通道：**依赖方向要求"推"而不是"拉"**——`omb-memory-vector` 的 requires
   //    包含 `omb-memory`，所以只能由向量模块把自己的通道注册进来，记忆模块读登记处。
   // ③ 活跃会话：模块经收养视图订阅事件时订到的是**宿主**事件面，收不到内核对
   //    `turn/start` 的广播（见 kernel/activeSession.ts）。会话这个全局事实必须由
   //    内核持有，模块按需读取，不能依赖"模块能不能收到某条事件"。
+  // ④ 会话运行态：按会话键控的容器必须**只有一份**（见上面 sessionRuntime 的说明）。
   services.provide(SERVICES.statusContributor, statusTable)
   services.provide(SERVICES.channelRegistry, channelTable)
   services.provide(SERVICES.activeSession, activeSessions)
+  services.provide(SERVICES.sessionRuntime, sessionRuntime)
+
+  // 内核自己的状态面段落：**模块依赖图自检**。
+  // 行序是模块间依赖的唯一保证（行与行之间只有 `inject: ['omb:kernel']` 门），
+  // 所以"行序被改错"必须能从状态面读出来，而不是靠人盯 cordis.patch.yml。
+  statusTable.register({
+    name: '模块依赖图',
+    render: () => renderModuleGraph(moduleGraphReport()),
+    metrics: () => {
+      const report = moduleGraphReport()
+      return {
+        mounted: report.mounted.length,
+        orderViolations: report.orderViolations.length,
+        missingDependencies: report.missingDependencies.length,
+      }
+    },
+  })
 
   let disposed = false
-  const disposers: (() => void | Promise<void>)[] = []
-  
+  /**
+   * **唯一的 disposer owner 集合**：`start()` 与 `mount()` 登记的都进这里。
+   *
+   * 为什么必须统一：`mount()` 是真实宿主路径，它过去把 disposer 直接交给宿主、
+   * 内核自己不留——宿主一旦漏调（或只调了内核的 `dispose`），模块就永远不卸载。
+   * 现在宿主仍拿得到返回值，但内核**自己也持有同一份**，两边共用幂等包装。
+   */
+  const owners: (() => void | Promise<void>)[] = []
+  /**
+   * **实际挂载账本**：`{ id, requires }`，按挂载先后。用于依赖图自检
+   * （`moduleGraph()`）——它是"宿主到底按什么顺序把模块装上来的"这一事实的唯一记录。
+   */
+  const mountLedger: { readonly id: string; readonly requires: readonly string[] }[] = []
+  /**
+   * 同步 `dispose()` 已触发、但尚未被 await 的 promise。
+   * `dispose()` 返回后它们仍在跑；`disposeAsync()` 会把这些补等掉。
+   */
+  const settling: Promise<void>[] = []
+
+  function warnIsolated(what: string, error: unknown): void {
+    logger.warn(`内核：${what}（已隔离）——${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  /**
+   * 登记一个 disposer，返回**给宿主的幂等包装**（`() => void`）。
+   *
+   * 幂等是硬要求：宿主可能自己调一次 mount 的返回值，内核 dispose 时再调一次；
+   * 两次都执行会让"关闭数据库"这类收尾跑两遍（第二次通常抛错或损坏状态）。
+   *
+   * 内部登记的是 `owned` 本身（可能返回 Promise）：它的 promise 一产生就挂上
+   * `.catch` 记日志，因此即使调用方不 await 也不会出现 unhandled rejection。
+   */
+  function registerOwner(disposer: () => void | Promise<void>): () => void {
+    let called = false
+    let result: void | Promise<void>
+    const owned = (): void | Promise<void> => {
+      if (called) return result
+      called = true
+      try {
+        result = disposer()
+      } catch (error) {
+        warnIsolated('disposer 同步抛异常', error)
+        return
+      }
+      if (result instanceof Promise) {
+        result.catch((error: unknown) => { warnIsolated('disposer 异步失败', error) })
+      }
+      return result
+    }
+    owners.push(owned)
+    return () => { void owned() }
+  }
+
+  /**
+   * 取出全部 disposer（清空集合）并按注册逆序调用，收集返回的 promise。
+   * 任何一个抛错/reject 都被隔离并记日志——**绝不向上传播**（H-1）。
+   */
+  function drainOwners(): Promise<void>[] {
+    const pending: Promise<void>[] = []
+    for (const owner of owners.splice(0, owners.length).reverse()) {
+      try {
+        const result = owner()
+        if (result instanceof Promise) {
+          pending.push(result.then(() => undefined, (error: unknown) => { warnIsolated('disposer 异步失败', error) }))
+        }
+      } catch (error) {
+        warnIsolated('disposer 同步抛异常', error)
+      }
+    }
+    return pending
+  }
+
+  /**
+   * 记一笔挂载，并**当场**检出"依赖来得太晚"。
+   *
+   * 挂载 `id` 时，若账本里已有模块声明依赖它，那些依赖方就是在依赖之前启动的
+   * （它们启动时拿不到服务，会降级或空转）——这是**启动瞬间就能发现**的顺序违规。
+   */
+  function recordMount(id: string, requires: readonly string[]): void {
+    const late: string[] = []
+    for (const entry of mountLedger) {
+      if (entry.requires.includes(id)) late.push(entry.id)
+    }
+    mountLedger.push({ id, requires: [...requires] })
+    if (late.length === 0) return
+    logger.warn(
+      `内核：⚠ 模块挂载顺序违反依赖图——${late.join('、')} 依赖 ${id}，但 ${id} 挂载得更晚；`
+      + '请检查 cordis.patch.yml 的行序（依赖行必须在依赖方之前）',
+    )
+  }
+
+  /**
+   * 依赖图自检（按需计算，读到的是**当前**事实）。
+   *
+   * 两类结论分开报，因为修法不同：
+   * - 顺序违规 → 改 `cordis.patch.yml` 的行序；
+   * - 依赖未挂载 → 前置条件未满足（那一行被禁用），依赖方应已自行降级并写明原因。
+   */
+  function moduleGraphReport(): ModuleGraphReport {
+    const positions = new Map<string, number>()
+    mountLedger.forEach((entry, index) => positions.set(entry.id, index))
+    const orderViolations: string[] = []
+    const missingDependencies: string[] = []
+    for (const entry of mountLedger) {
+      const self = positions.get(entry.id) ?? 0
+      for (const dep of entry.requires) {
+        const at = positions.get(dep)
+        if (at === undefined) missingDependencies.push(`${entry.id} ← ${dep}`)
+        else if (at > self) orderViolations.push(`${entry.id} ← ${dep}`)
+      }
+    }
+    return { mounted: mountLedger.map(entry => entry.id), orderViolations, missingDependencies }
+  }
+
+  /** 状态面渲染：自检通过时一行话，出问题时逐条列出并给修法。 */
+  function renderModuleGraph(report: ModuleGraphReport): string {
+    const lines: string[] = []
+    if (report.orderViolations.length === 0 && report.missingDependencies.length === 0) {
+      return `已按依赖顺序挂载 ${report.mounted.length} 个模块；顺序自检通过（行序 = cordis.patch.yml）`
+    }
+    if (report.orderViolations.length > 0) {
+      lines.push(`⚠ **顺序违规** ${report.orderViolations.length} 处（依赖挂载得比依赖方晚）：`)
+      for (const violation of report.orderViolations) lines.push(`- ${violation}`)
+      lines.push('  修法：调整 cordis.patch.yml 的行序，依赖行必须排在依赖方之前。')
+    }
+    if (report.missingDependencies.length > 0) {
+      lines.push(`依赖未挂载 ${report.missingDependencies.length} 处（前置条件未满足，依赖方应已自行降级）：`)
+      for (const missing of report.missingDependencies) lines.push(`- ${missing}`)
+    }
+    return lines.join('\n')
+  }
+
   const kernel: Kernel = {
     provide: (name, service) => {
       if (disposed) throw new Error('内核已注销，不能再注册服务')
@@ -263,7 +459,9 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
               + `当前工具服务：${registered.length === 0 ? '无' : registered.join('、')}`,
           })
         }
-        return typeof result === 'function' ? result : () => {}
+        // 挂载成功（apply 返回了）→ 记进挂载账本：依赖图自检靠它
+        recordMount(id, registration.manifest.requires)
+        return typeof result === 'function' ? registerOwner(result) : () => {}
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         healthTable.report(id, { state: 'failed', detail: `挂载失败：${message}` })
@@ -296,7 +494,8 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         try {
           const config = registration.manifest.configSchema.parse(configs?.get(id))
           const disposer = registration.apply(scoped, config)
-          if (typeof disposer === 'function') disposers.push(disposer)
+          if (typeof disposer === 'function') registerOwner(disposer)
+          recordMount(id, registration.manifest.requires)
           // **只在模块未自报时**补通用值：模块自报的降级原因优先级更高，
           // 否则"配置被收敛/服务注册失败"这类原因会在启动瞬间被覆盖
           // （与「无空降级」冲突）。
@@ -315,24 +514,40 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
     health: () => healthTable.snapshot(),
     status: () => statusTable.render(),
     statusNames: () => statusTable.list().map(c => c.name),
+    moduleGraph: () => moduleGraphReport(),
     budgets: () => budgetTable.snapshot(),
     listenerCount: () => bus.listenerCount(),
     dispose() {
+      if (disposed) return
       disposed = true
-      // 逐个注销；任何一个抛异常都被吞掉并记日志——绝不向上传播（H-1）
-      for (const disposer of disposers.reverse()) {
-        try {
-          void disposer()
-        } catch (error) {
-          logger.warn(`内核：模块注销时抛异常（已隔离）——${String(error)}`)
-        }
-      }
-      disposers.length = 0
+      // 逐个注销（逆序）；抛错/reject 都被隔离并记日志——绝不向上传播（H-1）。
+      // **不等待** Promise：需要"卸载确实完成"的调用方用 disposeAsync()。
+      settling.push(...drainOwners())
       // 「会话 → cwd」是内核持有的**唯一**一份（`kernel/activeSession.ts`）：
       // 内核注销后旧会话在新一轮里不再可信，必须连它一起清——
       // 否则重挂后模块会按上一代的会话 cwd 去打开项目库（把记忆写到别人的项目里）。
       activeSessions.clear()
-      healthTable.report('omb-kernel', { state: 'ok', detail: '内核已注销' })
+      // 按会话的运行态同理（`kernel/sessionRuntime.ts`）：不清就会让重挂后的模块
+      // 读到上一代的槽（隐私模式、循环信号…），那是"状态记到别人的会话"的另一种形态。
+      sessionRuntime.clear()
+      healthTable.report('omb-kernel', {
+        state: 'ok',
+        detail: '内核已注销（同步路径：不等待异步 disposer；需要等待请用 disposeAsync）',
+      })
+    },
+    async disposeAsync() {
+      if (!disposed) {
+        disposed = true
+        settling.push(...drainOwners())
+        activeSessions.clear()
+        sessionRuntime.clear()
+      }
+      // allSettled 语义：任何一个失败都不阻止其余，也不让本方法 reject
+      await Promise.allSettled(settling.splice(0, settling.length))
+      healthTable.report('omb-kernel', {
+        state: 'ok',
+        detail: '内核已注销（异步路径：全部 disposer 已完成）',
+      })
     },
   }
   // 句柄上打标记（值就是句柄自己）：模块入口（`hostEntry.ts`）靠它拿到 `mount`，

@@ -1,12 +1,34 @@
 /**
- * 模块目录（canonical）。**这是 `cordis.patch.yml` 行 id 与模块清单 id 之间的唯一契约。**
+ * 模块目录（canonical）。**模块的 requires / capabilities / tools 只在这里写一次**，
+ * 其余各处派生或由契约测试比对。
  *
- * 三方必须一致，改任何一处都要同步另两处：
- * ① 本文件的 `id` ② `cordis.patch.yml` 的行 id ③ 插件管理页显示的开关 id
+ * ## 这份表到底驱动什么（2026-09 实测核对，别再靠推断）
  *
- * 依赖是**树不是网**：除记忆的三个子能力依赖 `omb-memory` 外，
- * 其余模块只依赖内核，彼此经事件通信——这样任一模块关闭，其订阅者收到的是
- * "事件不再来"，而不是"服务解析失败"。
+ * | 字段 | 消费者 | 性质 |
+ * |---|---|---|
+ * | `requires` | 各模块 manifest 经 `derivedRequires(id)` **派生** | 派生 → 进入运行时（`planModules` 的依赖规划） |
+ * | `capabilities` | 各模块 manifest 经 `derivedCapabilities(id)` 派生 | 派生 |
+ * | `tools` | `tests/dsh/assembly.smoke.test.ts`（声明的工具必须真有 `tools:<id>` 服务） | 测试强制 |
+ * | `enabledByDefault` | `tests/dsh/module-graph-source.test.ts`（必须与 `cordis.patch.yml` 的 `disabled` 互为镜像） | 测试强制 |
+ * | `id` | `cordis.patch.yml` 行 id、`MODULE_IDS`、插件页开关 id | 测试强制（一一对应） |
+ *
+ * ⚠️ **`requires` 不决定真实启动顺序**：生产路径上模块由宿主按 `cordis.patch.yml`
+ * **行序**逐行加载（`dsh/plugin.ts` 明确不调用 `handle.start()`）。行级 `inject` 里只放**门**
+ * （`omb:kernel` = 等内核就绪；少量已登记的宿主服务，如 `commands`），**不放模块 id**——
+ * 宿主服务表里没有模块 id 这个键，写了会让整行永远 pending。因此模块→模块的边靠**行序**满足，
+ * 由 `tests/dsh/module-graph-source.test.ts` 断言行序符合本表依赖图，并校验 inject 白名单。
+ *
+ * ⚠️ **开关前置条件（"依赖没开就自动关掉依赖方"）尚未实现为运行时硬阻断。**
+ * 现在的保证是三件：① 行序（守卫测试）② 行级 `inject` 的门（内核 + 已登记宿主服务）
+ * ③ 内核的**启动自检**（`KernelHandle.moduleGraph()`：真实挂载顺序 vs 依赖图，
+ * 违规写进状态面与日志）。为什么不做硬阻断：模块行之间没有顺序保证，硬阻断会把
+ * "晚一点就绪"误判成"依赖缺失"→ 静默丢失能力；把 `apply` 挪到 `mount` 返回之后
+ * 又会让宿主的一次性安装审计（H-2）失效。**不要在注释或文档里假装它已经成立。**
+ *
+ * 三方一致（历史契约）：① 本文件的 `id` ② `cordis.patch.yml` 的行 id ③ 插件页开关 id。
+ *
+ * 依赖是**树不是网**：除记忆的子能力依赖 `omb-memory` 外，其余模块只依赖内核，
+ * 彼此经事件通信——这样任一模块关闭，其订阅者收到的是"事件不再来"，而不是"服务解析失败"。
  */
 import type { MemoryKind, MemoryScope } from './kinds.js'
 
@@ -20,6 +42,7 @@ export const MODULE_IDS = [
   'omb-context',
   'omb-artifact',
   'omb-notify',
+  'omb-privacy',
 ] as const
 
 export type ModuleId = (typeof MODULE_IDS)[number]
@@ -27,7 +50,15 @@ export type ModuleId = (typeof MODULE_IDS)[number]
 /** 一个模块在目录里的登记项。 */
 export interface CatalogEntry {
   readonly id: ModuleId
-  /** 默认是否启用（对应 `disabled` 的缺省值）。 */
+  /**
+   * 默认是否启用。**与 `cordis.patch.yml` 的 `disabled` 互为镜像**，
+   * 由 `tests/dsh/module-graph-source.test.ts` 双向核对：
+   * `enabledByDefault === true` ⇔ 该行**不得**写 `disabled: true`（条件式 `!!js` 除外）。
+   *
+   * 它不驱动运行时（真正的开关是那一行的 `disabled`）——所以这里只放"默认值"这一件事，
+   * **不要再往本接口加没有消费者的字段**：一份"看起来权威、实际不驱动"的声明
+   * 比没有更坏（测试会把它当真源断言）。
+   */
   readonly enabledByDefault: boolean
   readonly requires: readonly ModuleId[]
   readonly capabilities: readonly string[]
@@ -102,10 +133,58 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     capabilities: ['notify.external'],
     tools: [],
   },
+  {
+    id: 'omb-privacy',
+    enabledByDefault: true,
+    requires: ['omb-kernel'],
+    // 没有工具：控制面是一条斜杠命令（`/omb-privacy`），不是模型可调用的工具——
+    // 隐私模式是**用户**的决定，不该由模型自己改。
+    capabilities: ['privacy.modes'],
+    tools: [],
+  },
 ]
 
 /** 状态面用的常量。 */
 export const STATUS_TOOL = 'omb_status'
+
+/**
+ * 按 id 取登记项。未知 id 返回 `undefined`（**不抛**）——诊断路径要能安全探测。
+ */
+export function catalogEntryOf(id: string): CatalogEntry | undefined {
+  return MODULE_CATALOG.find(entry => entry.id === id)
+}
+
+/**
+ * 取登记项；未知 id → **抛**（这是编程错误，不是运行时缺服务）。
+ *
+ * 为什么抛：模块 id 不在目录里，意味着"这个模块没被登记"，而它的 requires/capabilities
+ * 就会变成猜的默认值——静默漂移的典型来源（旧写法 `CATALOG?.requires ?? ['omb-kernel']`
+ * 正是如此）。宁可在模块构建时炸掉，也不要让一份猜出来的依赖图进运行时。
+ */
+function requireEntry(id: string): CatalogEntry {
+  const entry = catalogEntryOf(id)
+  if (entry === undefined) {
+    throw new Error(`模块 ${id} 不在 MODULE_CATALOG 里——先登记，再派生 requires/capabilities`)
+  }
+  return entry
+}
+
+/**
+ * 模块 manifest 的 `requires` —— **唯一真源是本文件**。
+ *
+ * 各模块这样用（不要在模块里再抄一遍依赖）：
+ * ```ts
+ * const manifest: ModuleManifest<C> = { id: MODULE_ID, requires: derivedRequires(MODULE_ID), ... }
+ * ```
+ */
+export function derivedRequires(id: string): readonly string[] {
+  return [...requireEntry(id).requires]
+}
+
+/** 模块 manifest 的 `capabilities` —— 同上，唯一真源是本文件。 */
+export function derivedCapabilities(id: string): readonly string[] {
+  return [...requireEntry(id).capabilities]
+}
 
 /**
  * 内核服务名契约。**三方一致**：模块 `provide` 的名字、`dsh/` 侧 `service()` 取用的名字、
@@ -194,6 +273,30 @@ export const SERVICES = {
    * 不该依赖"模块能不能收到某条事件"。放在内核里，模块随时可以问。
    */
   activeSession: 'omb:active-session',
+  /**
+   * **会话运行态容器**（`SessionRuntimeTable`，见 `kernel/sessionRuntime.ts`）。
+   *
+   * 与 `activeSession` 的分工（别混）：
+   * - `activeSession` = 「会话 → cwd」的事实 + "最后一次观测到的会话"（**读历史可以，当归属不行**）
+   * - 本服务 = **按会话键控的运行态**：`for(A)` 永远拿不到 B 的槽，`note()` 拿不到会话就拒绝并计数
+   *
+   * 为什么由内核 provide 而不是让需要它的模块自己建：运行态容器一旦有多份，
+   * "同一个会话的隐私/推理/记忆状态"就会被拆到不同的表里——那正是
+   * `lastActiveSession` 那类缺陷的翻版（每个模块各记一份"当前会话"）。
+   * 模块一律 `kernel.service(SERVICES.sessionRuntime)` **复用**；取不到时
+   * 允许自己建一份兜底（隔离测试等场景），但**不得**在能拿到时另建。
+   */
+  sessionRuntime: 'omb:session-runtime',
+  /**
+   * **隐私判定端口**（`PrivacyGatePort`，形状定义在 `modules/memory/store.ts`）。
+   *
+   * 为什么是服务而不是模块间 import：分层规则禁止模块互相 import，双方只认形状。
+   * 为什么必须存在这个服务：**库访问边界的唯一强制点**靠它——记忆模块在
+   * `forSession`/`peek`/`snapshot`/`forProject` 的出口惰性解析它，
+   * 因此直接调库（绕过工具层、绕过任何装饰）也一样被拒。
+   * 取不到 = 不受限（隐私模块被关掉时语义就是"没有隐私模式"）。
+   */
+  privacy: 'privacy',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]

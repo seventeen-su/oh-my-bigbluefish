@@ -9,6 +9,7 @@
  * ② 注册时机集中在一处，便于满足 DSH 的"不得在 apply 返回后异步注册"约束（热插拔 H-2）
  */
 import type { FocusDepth } from './kinds.js'
+import type { ToolCallContext } from '../sessionRuntime.js'
 
 /**
  * 工具的输入 schema。
@@ -44,7 +45,21 @@ export interface ToolDefinition {
   readonly name: string
   readonly description: string
   readonly parameters: ToolInputSchema
-  execute(args: unknown): Promise<ToolOutcome> | ToolOutcome
+  /**
+   * 执行体。
+   *
+   * `context` 是**本次调用**的归属（会话 / 调用 id / 子代理血统），由 `dsh/` 从宿主
+   * `exec.agent` 投影而来（见 `kernel/sessionRuntime.ts` 的 `ToolCallContext`）。
+   *
+   * 它是可选参数，但语义**不是**"可以忽略"：
+   * - `context?.attribution === 'session'` → 用 `context.sessionId` 定位会话；
+   * - 否则**不得**改用"最近看到的那个会话"——要么给可读原因拒绝，要么在输出里
+   *   明说"归属未知"。
+   *
+   * 为什么必须有：工具调用与回合事件是两条独立到达的流，交错会话时
+   * "最近一个会话"会把 A 的状态写进 B（详见 `kernel/sessionRuntime.ts`）。
+   */
+  execute(args: unknown, context?: ToolCallContext): Promise<ToolOutcome> | ToolOutcome
 }
 
 export type ToolOutcome =

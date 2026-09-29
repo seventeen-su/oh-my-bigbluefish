@@ -38,6 +38,9 @@ describe('内核 ABI 契约', () => {
       'SERVICES',
       'STATUS_TOOL',
       'STORES_SERVICE',
+      'catalogEntryOf',
+      'derivedCapabilities',
+      'derivedRequires',
       'toolsServiceFor',
       'validateCatalog',
     ])
