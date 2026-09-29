@@ -31,7 +31,8 @@ describe('moduleGraph：真实挂载顺序 vs 声明的依赖', () => {
     h.mount(mod('omb-memory'))
     h.mount(mod('omb-memory-vector', ['omb-memory']))
     const report = h.moduleGraph()
-    expect(report.mounted).toEqual(['omb-memory', 'omb-memory-vector'])
+    // 内核行自己总是最先入账（KERNEL_SELF.apply 是空操作，不经过 mount()）
+    expect(report.mounted).toEqual(['omb-kernel', 'omb-memory', 'omb-memory-vector'])
     expect(report.orderViolations).toEqual([])
     expect(report.missingDependencies).toEqual([])
     expect(h.status().join('\n')).toContain('顺序自检通过')
@@ -44,7 +45,7 @@ describe('moduleGraph：真实挂载顺序 vs 声明的依赖', () => {
     h.mount(mod('omb-memory')) // 依赖后到 → 依赖方启动时拿不到服务
 
     const report = h.moduleGraph()
-    expect(report.mounted).toEqual(['omb-memory-vector', 'omb-memory'])
+    expect(report.mounted).toEqual(['omb-kernel', 'omb-memory-vector', 'omb-memory'])
     expect(report.orderViolations).toEqual(['omb-memory-vector ← omb-memory'])
     expect(report.missingDependencies).toEqual([])
 
@@ -83,7 +84,7 @@ describe('moduleGraph：真实挂载顺序 vs 声明的依赖', () => {
     const h = createKernel()
     h.start([mod('omb-memory-vector', ['omb-memory']), mod('omb-memory')])
     expect(h.moduleGraph()).toEqual({
-      mounted: ['omb-memory', 'omb-memory-vector'],
+      mounted: ['omb-kernel', 'omb-memory', 'omb-memory-vector'],
       orderViolations: [],
       missingDependencies: [],
     })
@@ -98,7 +99,7 @@ describe('moduleGraph：真实挂载顺序 vs 声明的依赖', () => {
       },
     }
     h.mount(broken)
-    expect(h.moduleGraph().mounted).toEqual([])
+    expect(h.moduleGraph().mounted, '只有内核入账（它不经过 mount，所以不受配置解析失败影响）').toEqual(['omb-kernel'])
     expect(h.health()['omb-broken']?.state).toBe('failed')
   })
 

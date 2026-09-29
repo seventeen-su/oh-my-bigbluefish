@@ -219,6 +219,20 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   /**
    * **实际挂载账本**：`{ id, requires }`，按挂载先后。用于依赖图自检
    * （`moduleGraph()`）——它是"宿主到底按什么顺序把模块装上来的"这一事实的唯一记录。
+   *
+   * ⚠️ **内核行自己必须先入账**（见下面的 `recordMount(KERNEL_MANIFEST_ID, [])`）。
+   *
+   * 内核行（`dsh/plugin.ts` 的 `KERNEL_SELF`）的 `apply` 是**空操作**——内核在
+   * `createKernel()` 里就建好了，行只是把"内核已就绪"发布到宿主 ctx，**从不经过
+   * `mount()`**。于是账本里没有 `omb-kernel`，而其余 8 个模块的 `requires` 都含它，
+   * 依赖图自检就会报 8 条假的"依赖未挂载"。
+   *
+   * 这不是理论风险：真实宿主实测到的输出是
+   * `依赖未挂载 6 处：omb-privacy ← omb-kernel、omb-memory ← omb-kernel …`，
+   * 而同一次状态面里 8 个模块全部 `正常`、0 失败——**内核显然在**。
+   *
+   * 教训与「制品索引空转」那次同源：**自检若把"我没记录到的"当成"不存在"，
+   * 它就会稳定地产出假告警**，而假告警会让人开始无视真告警。
    */
   const mountLedger: { readonly id: string; readonly requires: readonly string[] }[] = []
   /**
@@ -230,6 +244,16 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   function warnIsolated(what: string, error: unknown): void {
     logger.warn(`内核：${what}（已隔离）——${error instanceof Error ? error.message : String(error)}`)
   }
+
+  /**
+   * 内核行自己先入账——它是模块图里的一个节点，只是**不经过 `mount()`**
+   * （`apply` 是空操作，见 `mountLedger` 上方的说明）。
+   *
+   * 记在账本**最前面**：内核是其余所有模块的依赖，它必须最早"就位"，
+   * 否则后面每个模块都会判成"依赖挂载得更晚"→ 变成顺序违规（另一种假告警）。
+   */
+  const KERNEL_ROW_ID = 'omb-kernel'
+  mountLedger.push({ id: KERNEL_ROW_ID, requires: [] })
 
   /**
    * 登记一个 disposer，返回**给宿主的幂等包装**（`() => void`）。
