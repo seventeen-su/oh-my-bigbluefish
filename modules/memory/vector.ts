@@ -1045,7 +1045,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
   const manifest: VectorManifest = {
     id: VECTOR_MODULE_ID,
-    version: '3.2.0',
+    version: '3.3.0',
     // 依赖 `omb-memory`：关掉记忆库，向量通道没有意义。依赖从目录派生（唯一真源）。
     requires: derivedRequires(VECTOR_MODULE_ID),
     capabilities: derivedCapabilities(VECTOR_MODULE_ID),
