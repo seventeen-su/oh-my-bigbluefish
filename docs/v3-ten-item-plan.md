@@ -189,8 +189,17 @@ TS7 下无类型错误 —— 兼容。          exit=0
 
 以下项**尚未验证**，本节如实记录，不用"应该没问题"糊过去：
 
-1. **`MODULE_CATALOG` 是否真的一处都不驱动运行时**——已 grep，但可能有间接路径未覆盖（`validateCatalog` 的调用方、`kernel/index.ts:62` re-export 的消费者）。task-6 会复核。
-2. **`exec.agent` → 会话 id 的确切取值路径**——`Agent` 的 `session` 字段名待核实（已知 `ToolExecutionInput.agent?: Agent` 存在）。
+1. ~~**`MODULE_CATALOG` 是否真的一处都不驱动运行时**~~ → **✅ 已查实（task-6）**：定性为"**测试在当真源断言的文档**"。
+   `handle.start()` **不在生产路径上**（`dsh/plugin.ts` 只有注释提到它，`grep '\.start\('` 零命中），
+   `planModules` 只被它与测试引用 → **`requires` 一次都没驱动过生产启动顺序**；
+   `enabledByDefault` 零消费者。真相是：**三处都不驱动生产，生产由 `cordis.patch.yml` 的行序决定**。
+   修法：`catalog.ts` 新增 `derivedRequires` / `derivedCapabilities`（未知 id **抛**，不再静默兜底），
+   7 个模块 manifest 改为派生；行序由 `tests/dsh/module-graph-source.test.ts` 比对并失败。
+2. ~~**`exec.agent` → 会话 id 的确切取值路径**~~ → **✅ 已查实**：`Agent.id: SessionId`
+   （`core/agent/src/types.ts:15-18`）、`Agent.session` 增强（`core/agent/src/runtime-types.ts:163-168`）、
+   血统 `parentSession` / `delegationDepth`（`core/session/src/types.ts:101/107/123`）。
+   **而且生产里本来就在用**：`dsh/session.ts:365` 在 `tools/result` 里读 `exec.agent.session.id`——
+   **我们一直在读它，只是没接到工具归属上**。我最初判断"拿不到"是错的，原因见下条教训。
 3. ~~**DSH `0.1.7-rc.2` → `0.2.0-rc.2` 的破坏面**——尚未逐项对照，task-5 负责。~~
    **✅ task-5 已做**：逐条核对见 `docs/dsh-compatibility.md` §3（10 项契约，每条带两侧 `文件:行号`）。
    结论：4 项匹配；**1 项不匹配**（`ctx.on('tool/call')` 在 0.2.0 不触发 → 制品索引静默失效，修法见该档 §6.2）；
@@ -202,6 +211,23 @@ TS7 下无类型错误 —— 兼容。          exit=0
    **有选择地恢复** `compaction-basic` + `command-compact` + `tool-result-pruner` 三行（`image-offload` 不加，留宿主平面）。
    完整证据、开/关理由与装配级解析输出见 `docs/dsh-compatibility.md` §4。
 5. **本仓库外是否有 `StoresService` / `SessionTable` 的消费方**——`3.1.0` 删除了这两个接口成员，已 grep 仓库内无遗留，但仓库外未知。
+
+### 一条方法论教训（本轮最贵的一课）
+
+我最初判断"工具执行上下文里**没有**会话身份，所以只能用 `lastActiveSession`"，并把它写进了任务描述。
+**那是错的**，原因很具体：`ToolRunContext` 的**接口体**只声明了 `deferContext` / `concludeTurn` 两个成员，
+`agent` 来自 `extends ToolExecution` → `extends ToolExecutionInput`（`core/tools/src/index.ts:338-339`）。
+**我只读了接口体就下了结论。**
+
+代价：如果没被队友复核推翻，整个第 4 项会被"拿不到会话"这个假前提带偏——
+要么做不成，要么做成一个建立在错误借口上的妥协方案。
+
+**纪律**：**"我在这一处没看到"不等于"它不存在"**。类型可以先 grep 全定义链再下结论；
+而"生产里有没有人在用"是更便宜的判据——`dsh/session.ts:365` 早就在读 `exec.agent.session.id`，
+**一次 grep 就能推翻我的结论**，我却先写了任务描述。
+
+同源的另一课：`ctx.on('tool/call')` 我**断言了"线接上了"，没断言"电会来"**，
+于是制品索引空转了整整一轮，而测试全绿。**这两次都是"看着对"而不是"验过"。**
 
 ---
 
