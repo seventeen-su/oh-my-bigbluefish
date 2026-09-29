@@ -165,6 +165,31 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
   const bus = new EventBus()
   const budgetTable = new BudgetTable()
   const healthTable = new HealthTable()
+
+  /**
+   * 上报健康**并且**广播出去。
+   *
+   * ## 为什么必须集中在这一处
+   *
+   * `kernel/module-health` 早就声明在 `ModuleEvents` 里，`modules/notify` 也早就
+   * 订阅了它——但**内核从来没有发射过**：全仓找 `emit('kernel/module-health'`，
+   * 只有测试里有。于是"模块运行中失败就弹桌面通知"这条路径在生产里**一次都不会触发**，
+   * 而订阅注册成功、类型也对、测试全绿（测试自己手动 emit 了那条事件）。
+   *
+   * 修法不是"在某个调用点补一句 emit"——那会重新长出第二个真源：9 个上报点里
+   * 漏掉任何一个，症状都和当初一模一样。所以上报与广播绑成一个动作，
+   * 所有调用点一律走它。
+   */
+  function reportHealth(id: string, health: ModuleHealth): void {
+    healthTable.report(id, health)
+    if (disposed) return
+    try {
+      bus.emit('kernel/module-health', { id, health })
+    } catch (error) {
+      // 订阅方抛错不得影响上报本身（H-1 同源：广播是附属品，事实才是主体）
+      warnIsolated('健康广播失败', error)
+    }
+  }
   const focusTable = new FocusTable()
   const statusTable = new StatusTable()
   const channelTable = new ChannelTable<{ readonly name: string }>()
@@ -236,6 +261,17 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
    */
   const mountLedger: { readonly id: string; readonly requires: readonly string[] }[] = []
   /**
+   * 被卸下的模块当初在第几个位置，以及它当初声明的前置。
+   *
+   * 位置要留着：热开关是"卸下再挂上"，重挂时必须回到原位，否则会被自检
+   * 误判成"依赖挂得比依赖方晚"（假顺序违规）。见 `recordMount`。
+   *
+   * 前置也要留着：卸下之后账本里已经没有它的 `requires` 了，而"关掉的这个
+   * 东西是谁的前置"正是提醒文案需要的那句话（见 `recordUnmount`）。
+   */
+  const removedAt = new Map<string, number>()
+  const unmountedRequires = new Map<string, readonly string[]>()
+  /**
    * 同步 `dispose()` 已触发、但尚未被 await 的 promise。
    * `dispose()` 返回后它们仍在跑；`disposeAsync()` 会把这些补等掉。
    */
@@ -264,12 +300,21 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
    * 内部登记的是 `owned` 本身（可能返回 Promise）：它的 promise 一产生就挂上
    * `.catch` 记日志，因此即使调用方不 await 也不会出现 unhandled rejection。
    */
-  function registerOwner(disposer: () => void | Promise<void>): () => void {
+  function registerOwner(disposer: () => void | Promise<void>, onRelease?: () => void): () => void {
     let called = false
     let result: void | Promise<void>
     const owned = (): void | Promise<void> => {
       if (called) return result
       called = true
+      // **先销账再收尾**：模块一开始拆卸就不再是"当前装着的模块"了，
+      // 此刻若有依赖方来问，应当已经看到它不在（失败方向是安全的那一侧）。
+      // 放在这里而不是各调用点：`mount()` 与 `start()` 两条路径必须同步动作，
+      // 否则"宿主里好好的、测试里好好的"这类偏差会再次出现。
+      try {
+        onRelease?.()
+      } catch (error) {
+        warnIsolated('卸载记账失败', error)
+      }
       try {
         result = disposer()
       } catch (error) {
@@ -330,13 +375,76 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       if (entry.id !== id && entry.requires.includes(id)) late.push(entry.id)
     }
     const existing = mountLedger.findIndex(entry => entry.id === id)
-    if (existing === -1) mountLedger.push({ id, requires: [...requires] })
-    else mountLedger[existing] = { id, requires: [...requires] }
+    if (existing !== -1) {
+      mountLedger[existing] = { id, requires: [...requires] }
+    } else {
+      // **回到它原来的位置**，不是追加到末尾。热开关是"卸下再挂上"，
+      // 追加会让它排到依赖方后面 → 下一次自检报出**假**的顺序违规。
+      // 这个坑与当初 `omb-kernel` 未入账造成的假"依赖未挂载"是同一类：
+      // 账本的位置信息一旦失真，自检就在说谎。
+      const remembered = removedAt.get(id)
+      if (remembered === undefined) mountLedger.push({ id, requires: [...requires] })
+      else mountLedger.splice(Math.min(remembered, mountLedger.length), 0, { id, requires: [...requires] })
+    }
+    removedAt.delete(id)
+    emitGraphChange('mount', id, [])
     if (late.length === 0) return
     logger.warn(
       `内核：⚠ 模块挂载顺序违反依赖图——${late.join('、')} 依赖 ${id}，但 ${id} 挂载得更晚；`
       + '请检查 cordis.patch.yml 的行序（依赖行必须在依赖方之前）',
     )
+  }
+
+  /**
+   * 销一笔账：模块被**卸下**（宿主关掉了那一行，或内核整体注销）。
+   *
+   * ## 为什么这条路径曾经不存在，以及它造成过什么
+   *
+   * 账本的注释一直写着"当前装上了哪些模块"，但代码里**只有入账没有出账**。
+   * 后果不是"数字大了一点"，而是**第 5 项要做的事根本无从检测**：
+   *
+   * - 关掉 `omb-memory` 之后，`mounted` 里仍然列着它；
+   * - 于是 `missingDependencies` 恒为空——依赖它的 `omb-memory-vector`
+   *   明明已经在空转降级，自检却报"顺序自检通过"。
+   *
+   * 也就是说：**用户关掉前置组件时，OMB 连"检测到了"都做不到**，更谈不上提醒。
+   *
+   * 位置要记下来（`removedAt`）：重挂时必须回到原位，否则见 `recordMount` 的说明。
+   */
+  function recordUnmount(id: string): void {
+    const at = mountLedger.findIndex(entry => entry.id === id)
+    if (at === -1) return
+    const [gone] = mountLedger.splice(at, 1)
+    removedAt.set(id, at)
+    unmountedRequires.set(id, gone?.requires ?? [])
+    // 谁还在依赖它——**必须在 splice 之后算**：此刻账本正好是"变化之后"的状态，
+    // 于是"谁需要这个已经不在的东西"可以直接读出来，不必另存一份依赖边。
+    const dependents = mountLedger.filter(entry => entry.requires.includes(id)).map(entry => entry.id)
+    emitGraphChange('unmount', id, dependents)
+  }
+
+  /**
+   * 广播账本变化。
+   *
+   * 载荷里的 `missingDependencies` 由 `moduleGraphReport()` **现算**，
+   * 与状态面显示的是同一个函数产出的同一份事实——订阅方因此不可能
+   * 看到与 `omb_status` 不一致的说法。
+   */
+  function emitGraphChange(change: 'mount' | 'unmount', id: string, dependents: readonly string[]): void {
+    if (disposed) return
+    const report = moduleGraphReport()
+    try {
+      bus.emit('kernel/module-graph-changed', {
+        change,
+        id,
+        missingDependencies: report.missingDependencies,
+        unmetRequires: change === 'unmount' ? (unmountedRequires.get(id) ?? []) : [],
+        dependents: [...dependents],
+      })
+    } catch (error) {
+      // 广播是附属品：订阅方抛错不得影响账本本身（H-1 同源）
+      warnIsolated('模块图变更广播失败', error)
+    }
   }
 
   /**
@@ -467,7 +575,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         logger,
         clock,
       },
-      health => healthTable.report(id, health),
+      health => reportHealth(id, health),
     )
   }
 
@@ -492,7 +600,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         config = registration.manifest.configSchema.parse(undefined)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        healthTable.report(id, { state: 'failed', detail: `配置解析失败：${message}` })
+        reportHealth(id, { state: 'failed', detail: `配置解析失败：${message}` })
         logger.warn(`内核：模块 ${id} 配置解析失败——${message}`)
         return () => {}
       }
@@ -509,7 +617,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
             `内核：模块 ${id} 已挂载但未自报健康（未注册服务）；`
             + `宿主 ctx 提供的内核服务=${String(services.get(SERVICES.kernel) !== undefined)}`,
           )
-          healthTable.report(id, {
+          reportHealth(id, {
             state: 'degraded',
             detail: `已挂载但未自报健康——通常表示 apply 提前返回（依赖的服务不可用）；`
               + `当前工具服务：${registered.length === 0 ? '无' : registered.join('、')}`,
@@ -517,10 +625,10 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         }
         // 挂载成功（apply 返回了）→ 记进挂载账本：依赖图自检靠它
         recordMount(id, registration.manifest.requires)
-        return typeof result === 'function' ? registerOwner(result) : () => {}
+        return typeof result === 'function' ? registerOwner(result, () => recordUnmount(id)) : () => {}
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        healthTable.report(id, { state: 'failed', detail: `挂载失败：${message}` })
+        reportHealth(id, { state: 'failed', detail: `挂载失败：${message}` })
         logger.warn(`内核：模块 ${id} 挂载失败——${message}`)
         return () => {}
       }
@@ -533,7 +641,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       markKernel(kernel)
       const plan = planModules(modules)
       for (const blocked of plan.blocked) {
-        healthTable.report(blocked.id, { state: 'failed', detail: blocked.reason })
+        reportHealth(blocked.id, { state: 'failed', detail: blocked.reason })
         logger.warn(`内核：模块 ${blocked.id} 未启动——${blocked.reason}`)
       }
       for (const { id, registration } of plan.ordered) {
@@ -550,18 +658,18 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
         try {
           const config = registration.manifest.configSchema.parse(configs?.get(id))
           const disposer = registration.apply(scoped, config)
-          if (typeof disposer === 'function') registerOwner(disposer)
+          if (typeof disposer === 'function') registerOwner(disposer, () => recordUnmount(id))
           recordMount(id, registration.manifest.requires)
           // **只在模块未自报时**补通用值：模块自报的降级原因优先级更高，
           // 否则"配置被收敛/服务注册失败"这类原因会在启动瞬间被覆盖
           // （与「无空降级」冲突）。
           if (!healthTable.has(id)) {
-            healthTable.report(id, { state: 'ok', detail: `模块 ${id} 已启动（未自报健康）` })
+            reportHealth(id, { state: 'ok', detail: `模块 ${id} 已启动（未自报健康）` })
           }
         } catch (error) {
           // 单模块失败不连坐：只记健康面，继续启动其余模块
           const message = error instanceof Error ? error.message : String(error)
-          healthTable.report(id, { state: 'failed', detail: `启动失败：${message}` })
+          reportHealth(id, { state: 'failed', detail: `启动失败：${message}` })
           logger.warn(`内核：模块 ${id} 启动失败——${message}`)
         }
       }
@@ -586,7 +694,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       // 按会话的运行态同理（`kernel/sessionRuntime.ts`）：不清就会让重挂后的模块
       // 读到上一代的槽（隐私模式、循环信号…），那是"状态记到别人的会话"的另一种形态。
       sessionRuntime.clear()
-      healthTable.report('omb-kernel', {
+      reportHealth('omb-kernel', {
         state: 'ok',
         detail: '内核已注销（同步路径：不等待异步 disposer；需要等待请用 disposeAsync）',
       })
@@ -600,7 +708,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
       }
       // allSettled 语义：任何一个失败都不阻止其余，也不让本方法 reject
       await Promise.allSettled(settling.splice(0, settling.length))
-      healthTable.report('omb-kernel', {
+      reportHealth('omb-kernel', {
         state: 'ok',
         detail: '内核已注销（异步路径：全部 disposer 已完成）',
       })

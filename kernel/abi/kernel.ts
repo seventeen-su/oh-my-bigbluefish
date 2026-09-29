@@ -42,6 +42,33 @@ export interface ModuleEvents {
   'pressure/band-changed': { readonly sessionId: string; readonly pressure: ContextPressure }
   /** 内核广播本身的健康变化（供状态面聚合）。 */
   'kernel/module-health': { readonly id: string; readonly health: ModuleHealth }
+  /**
+   * 模块挂载账本发生变化（挂上 / 卸下）。
+   *
+   * **为什么要一条专门的事件，而不是让订阅方自己去轮询 `moduleGraph()`**：
+   * "前置组件被关掉了"这件事只在**变化的瞬间**有信息量——依赖方当时并不会报错，
+   * 它只会静默降级。等到下一次有人来查账本时，能拿到的只有"现在缺了"，
+   * 拿不到"刚才是谁被关的"，而后者才是用户需要知道的那句话。
+   *
+   * 载荷直接带上变化之后的 `missingDependencies`：订阅方不必自己重算，
+   * 于是"事件里说的"与"状态面显示的"必然是同一份（同一函数产出）。
+   */
+  'kernel/module-graph-changed': {
+    readonly change: 'mount' | 'unmount'
+    readonly id: string
+    /** `依赖方 ← 依赖`，变化**之后**的全量未满足项。 */
+    readonly missingDependencies: readonly string[]
+    /** 被卸下的模块在它首次挂载时声明的前置；挂载事件里为空数组。 */
+    readonly unmetRequires: readonly string[]
+    /**
+     * 被卸下的这个模块**是谁的前置**（仍挂着的那些模块 id）。
+     *
+     * 这一项就是提醒文案要说的那句"关了 X 之后依赖它的 Y 会失效"。
+     * 由内核算，不由订阅方自己遍历：账本是内核的事实，且卸下的那一刻
+     * 位置信息就会变，让订阅方各算一遍必然出现"事件里说的"与"状态面显示的"不一致。
+     */
+    readonly dependents: readonly string[]
+  }
 }
 
 export type ModuleEventName = keyof ModuleEvents

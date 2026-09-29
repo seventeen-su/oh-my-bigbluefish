@@ -297,6 +297,20 @@ export const SERVICES = {
    * 取不到 = 不受限（隐私模块被关掉时语义就是"没有隐私模式"）。
    */
   privacy: 'privacy',
+  /**
+   * **上下文压力读数的"为什么"**（形状：`{ reason(): string; stats(): {...} }`）。
+   *
+   * 压力读数本身走内核的 `pressure()`（`measure` 由 `dsh/pressure.ts` 提供），
+   * 本服务只多给一件东西：**当前为什么量不到**。
+   *
+   * 为什么需要它：`fillRatio === null` 至少有四种完全不同的成因——
+   * 宿主没提供投影服务、宿主还没上报过 provider usage、宿主没声明窗口容量、
+   * 或者 OMB 根本没观察到那个会话。四者的修法完全不同，而状态面能显示的
+   * 只有同一个 `null`。这正是自检报告反复记的"无法区分『没观察过』与
+   * 『没在工作』"。把原因放进内核服务表，两条造 `omb_status` 的路径
+   * （`apply` 里那条与 `collectToolSpecs` 那条）就都能拿到同一份答案。
+   */
+  pressureReading: 'omb:pressure-reading',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
