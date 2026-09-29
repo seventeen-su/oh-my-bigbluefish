@@ -7,7 +7,7 @@
  */
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { MemoryStore, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
+import type { MemoryStore, ToolCallContext, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
 import {
   MAX_TEXT_CHARS,
   RECEIPT_ECHO_CHARS,
@@ -20,6 +20,7 @@ import {
   type MemoryWriteDeps,
 } from '../../../modules/memory/remember.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
+import { toolCallContext } from '../../../kernel/sessionRuntime.js'
 import {
   capturingLogger,
   fixedClock,
@@ -313,9 +314,11 @@ function writeFixture(
     resolveStore: async (scope): Promise<MemoryStore | undefined> =>
       scope === 'user' ? wrapStore(user) : wrapStore(project),
     clock,
-    currentSession: () => 's1',
-    currentTurn: () => 7,
-    currentProject: () => '/work/demo',
+    // 会话不再来自 deps：它来自**本次工具调用**的归属（`call.sessionId`），
+    // 由 `run()` 传进来（见下面的 `SESSION_CALL`）。夹具也必须按会话取值——
+    // 忽略参数会让"归属未知时不借用任何会话"的用例失去意义。
+    currentTurn: (sessionId?: string) => (sessionId === undefined ? undefined : 7),
+    currentProject: (sessionId?: string) => (sessionId === undefined ? undefined : '/work/demo'),
     // 工具级用例默认"工件都存在"。核验失败与 fail-closed 两条分支
     // 由专门的准入用例覆盖（它们直接调 `decideAdmission`）。
     verifyArtifact: () => true,
@@ -338,8 +341,18 @@ function writeFixture(
   }
 }
 
-async function run(tool: ToolDefinition, args: unknown): Promise<ToolOutcome> {
-  return await tool.execute(args)
+/** 本文件默认的"调用归属"：会话 s1（等价于宿主 `exec.agent.id`）。 */
+const SESSION_CALL = toolCallContext({ sessionId: 's1', callId: 'call-1' })
+
+/** 归属未知的调用（宿主没给 agent）：用于"取不到会话就不猜"的用例。 */
+const UNKNOWN_CALL = toolCallContext({})
+
+async function run(
+  tool: ToolDefinition,
+  args: unknown,
+  call: ToolCallContext = SESSION_CALL,
+): Promise<ToolOutcome> {
+  return await tool.execute(args, call)
 }
 
 /** 取某库里唯一一条记录（避免测试里写死 id 生成规则）。 */
@@ -500,9 +513,10 @@ describe('omb_remember：弃权、事件与降级', () => {
     await fixture.close()
   })
 
-  it('无会话上下文且未给 sourceRef：弃权并说明缺少来源，不写一条无来源的记忆', async () => {
-    const fixture = writeFixture({ currentSession: () => undefined, currentTurn: () => undefined })
-    const outcome = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'semantic' })
+  it('归属未知（宿主没给 agent）且未给 sourceRef：弃权并说明缺少来源，不写一条无来源的记忆', async () => {
+    const fixture = writeFixture()
+    // **不猜**：没有会话归属时，默认 `sourceRef` 拿不到 → 准入如实弃权
+    const outcome = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'semantic' }, UNKNOWN_CALL)
     expect(outcome.kind).toBe('text')
     expect(outcome.text).toContain('未写入（准入弃权）')
     expect(outcome.text).toContain('缺少来源引用')
@@ -511,16 +525,35 @@ describe('omb_remember：弃权、事件与降级', () => {
     await fixture.close()
   })
 
-  it('显式 sourceRef 覆盖默认来源（无会话上下文也能写）', async () => {
-    const fixture = writeFixture({ currentSession: () => undefined, currentTurn: () => undefined })
-    const outcome = await run(fixture.tool, {
-      text: '提交前先跑 pnpm verify',
-      kind: 'semantic',
-      sourceRef: 'file:docs/contributing.md#L12',
-    })
+  it('归属未知但显式给了 sourceRef：照样能写（来源由调用方负责）', async () => {
+    const fixture = writeFixture()
+    const outcome = await run(
+      fixture.tool,
+      {
+        text: '提交前先跑 pnpm verify',
+        kind: 'semantic',
+        sourceRef: 'file:docs/contributing.md#L12',
+      },
+      UNKNOWN_CALL,
+    )
     expect(outcome.kind).toBe('text')
     const record = await onlyRecord(fixture.user, 'pnpm verify')
     expect(record?.sourceRef).toBe('file:docs/contributing.md#L12')
+    await fixture.close()
+  })
+
+  it('归属未知时不借用任何"最近会话"：不写 project、不读到的会话回合号', async () => {
+    const fixture = writeFixture()
+    const outcome = await run(
+      fixture.tool,
+      { text: '提交前先跑 pnpm verify', kind: 'semantic', sourceRef: 'file:docs/x.md#L1' },
+      UNKNOWN_CALL,
+    )
+    expect(outcome.kind).toBe('text')
+    const record = await onlyRecord(fixture.user, 'pnpm verify')
+    // 会话相关字段必须是"没有"，而不是"上一个会话的"
+    expect(record?.project).toBeNull()
+    expect(record?.sourceRef).toBe('file:docs/x.md#L1')
     await fixture.close()
   })
 

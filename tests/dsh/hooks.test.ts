@@ -54,17 +54,87 @@ describe('制品索引接线', () => {
     }
 
     const dispose = wireArtifactIndex({ ctx, kernel: handle.kernel })
-    expect(handlers.has('tool/call'), '必须订阅 tool/call').toBe(true)
+    /**
+     * **必须订 `session/event`，不能订 `tool/call`。**
+     *
+     * 这条断言原来写的是 `handlers.has('tool/call')`——**它放过了真缺陷**：
+     * 订阅语法上成功、事件却在 DSH 里永不到来（`tool/call` 只是会话事件**类型**，
+     * ctx 层只发 `session/event`）。于是制品索引恒空，而测试全绿。
+     *
+     * 教训：**断言"线接上了"不等于"电会来"**。所以下面用**真实的会话事件形状**
+     * 喂进去（`session/event` 是 `(session, event)`，`event.data.arguments` 是
+     * **JSON 字符串**），而不是自造一个刚好合手的对象。
+     */
+    expect(handlers.has('session/event'), '必须订 session/event（ctx 层唯一会发的那个）').toBe(true)
+    expect(handlers.has('tool/call'), 'tool/call 不是 ctx 层事件，订它等于空转').toBe(false)
 
-    handlers.get('tool/call')?.({ name: 'read', args: { file_path: 'src/x.ts' } } as never)
+    const toolCall = (name: string, args: unknown): unknown[] => [
+      { id: 'sess-1' },
+      { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name, arguments: JSON.stringify(args) } },
+    ]
+
+    handlers.get('session/event')?.(...(toolCall('read', { file_path: 'src/x.ts' }) as never[]))
     expect(recorded).toEqual(['src/x.ts'])
 
     // 自由文本工具不该产出条目
-    handlers.get('tool/call')?.({ name: 'pwsh', args: { command: 'cat y.ts' } } as never)
+    handlers.get('session/event')?.(...(toolCall('pwsh', { command: 'cat y.ts' }) as never[]))
     expect(recorded).toEqual(['src/x.ts'])
 
     dispose()
-    expect(handlers.has('tool/call')).toBe(false)
+    expect(handlers.has('session/event')).toBe(false)
+    handle.dispose()
+  })
+
+  it('arguments 不是合法 JSON 时静默跳过（不猜）', () => {
+    const handle = createKernel()
+    const recorded: string[] = []
+    handle.kernel.provide(SERVICES.artifact, {
+      record: (path: string) => {
+        recorded.push(path)
+        return undefined
+      },
+    })
+    const handlers = new Map<string, (...args: never[]) => void>()
+    const ctx = {
+      on: (event: string, fn: (...args: never[]) => void) => {
+        handlers.set(event, fn)
+        return () => handlers.delete(event)
+      },
+    }
+    const dispose = wireArtifactIndex({ ctx, kernel: handle.kernel })
+    // 载荷损坏必须**什么都不做**，而不是抛、也不是猜一个路径出来
+    expect(() => {
+      handlers.get('session/event')?.(
+        ...([{ id: 's' }, { type: 'tool/call', data: { name: 'read', arguments: '{坏掉的 JSON' } }] as never[])
+      )
+    }).not.toThrow()
+    expect(recorded).toEqual([])
+    dispose()
+    handle.dispose()
+  })
+
+  it('非 tool/call 的会话事件不产生条目', () => {
+    const handle = createKernel()
+    const recorded: string[] = []
+    handle.kernel.provide(SERVICES.artifact, {
+      record: (path: string) => {
+        recorded.push(path)
+        return undefined
+      },
+    })
+    const handlers = new Map<string, (...args: never[]) => void>()
+    const ctx = {
+      on: (event: string, fn: (...args: never[]) => void) => {
+        handlers.set(event, fn)
+        return () => handlers.delete(event)
+      },
+    }
+    const dispose = wireArtifactIndex({ ctx, kernel: handle.kernel })
+    handlers.get('session/event')?.(
+      ...([{ id: 's' }, { type: 'step/start', data: { turn: 1 } }] as never[])
+    )
+    expect(recorded).toEqual([])
+    dispose()
     handle.dispose()
   })
 

@@ -31,6 +31,7 @@ import * as kernelEntry from '../../packages/kernel/index.js'
 import * as memoryEntry from '../../packages/memory/index.js'
 import * as memoryVectorEntry from '../../packages/memory-vector/index.js'
 import * as notifyEntry from '../../packages/notify/index.js'
+import * as privacyEntry from '../../packages/privacy/index.js'
 import * as profileEntry from '../../packages/profile/index.js'
 import * as reasoningEntry from '../../packages/reasoning/index.js'
 
@@ -50,6 +51,7 @@ const COMPONENT_ENTRIES: Readonly<Record<string, unknown>> = {
   context: contextEntry,
   artifact: artifactEntry,
   notify: notifyEntry,
+  privacy: privacyEntry,
 }
 
 /** 从 YAML 里取「行 id → 行 name」的配对。 */

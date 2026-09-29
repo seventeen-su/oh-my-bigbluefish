@@ -34,6 +34,16 @@
       config:
         debug: false
 
+    # ── 隐私模式（放在记忆之前：库访问边界要尽早有闸门）──────────────
+    # `commands` 是**宿主**服务（斜杠命令注册表），行级 inject 在这里的作用是
+    # "等宿主门就绪"，不是模块间依赖——判据见 tests/dsh/module-graph-source.test.ts。
+    - id: omb-privacy
+      name: '@omb/privacy'
+      inject: ['omb:kernel', 'commands']
+      config:
+        # 状态读不出时的基线（fail-closed）：sealed = 最严；只想禁写可改 read-only
+        failClosedMode: sealed
+
     # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
     - id: omb-memory
       name: '@omb/memory'
@@ -112,13 +122,16 @@
           # `build-generation.json`，于是"宿主跑的是哪一代产物"根本无从核对。
           # 认知层再好，没有手脚也验证不了自己。
           #
-          # **去掉的两项（相对创造模式）**：
+          # **去掉的项（相对创造模式）**：
           # ① `tool-cordis`（Cordis 源码导航）——那是给"改 DSH 自身"用的，
           #    与 OMB 的日常认知任务无关，且它有 `cordis_inspect_*` 一族工具面。
-          # ② `compaction` 组整体（compaction-basic / command-compact /
-          #    tool-result-pruner）——OMB 的上下文优化本身就是"拉取式 + 软压力档位"
-          #    的设计（见 README），默认不往上下文里塞东西，再叠一层自动压缩
-          #    既冗余又会跟拉取台账的判据互相干扰。
+          #
+          # **恢复的项**：② `compaction` 组（compaction-basic / command-compact /
+          #    tool-result-pruner）。原先整组去掉的理由是"OMB 是拉取式 + 软压力档位，
+          #    再叠自动压缩冗余且互相干扰"——**读实现后判定这个理由不成立**：
+          #    OMB 的上下文优化只**读** tokenMeter 且**从不改会话历史**（拉取台账只数
+          #    拉取次数与轮数），压缩改的是历史体量，二者是两条轴。
+          #    逐条证据与开/关决定见 `docs/dsh-compatibility.md` §4。
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'
@@ -158,6 +171,37 @@
                     Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
 
                     When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          # ── 自动压缩（恢复）──────────────────────────────────────────────
+          # 逐行与 DSH 自带创造模式预设一致
+          # （`packages/bundle/web-app/presets/cordis.patch.yml:62-78`），
+          # 位置也一致：紧接 `planning` 组之后。三行各司其职，且都不碰 OMB 的判据：
+          #   · compaction-basic   按 `ctx.tokenMeter` 压力在**步边界**触发
+          #                        （thresholdRatio 0.8、headroom 65536、retainRatio 0.16），
+          #                        把一段历史替换成**一个摘要节点**（会调一次模型）；
+          #   · tool-result-pruner 纯确定性：工具结果超过 8192 字符就保留
+          #                        head 4096 + tail 1024，原文仍可经 shadowed node 追回；
+          #   · command-compact   只由人打 `/compact` 触发，无自主行为。
+          # 为什么与 OMB 的上下文优化不冲突：OMB **只读** tokenMeter、**从不改会话历史**
+          # （`modules/context/index.ts:249` 读压力；拉取台账只累计 pulls/turns），
+          # 且在 fillRatio 0.6 就转"只给索引"，早于压缩的 ~0.8 阈值——互补而非互斥。
+          # 详情：`docs/dsh-compatibility.md` §4。
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
           - id: delegation
             name: cordis:group
             group: true
