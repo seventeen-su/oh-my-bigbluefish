@@ -36,7 +36,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import { derivedCapabilities, derivedRequires, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import { SessionRuntimeTable } from '../../kernel/sessionRuntime.js'
-import { toHostPlugin } from '../../kernel/hostEntry.js'
+import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 import type { PrivacyMode } from './modes.js'
 import { modeTitle, originTitle, type ResolvedPrivacy } from './modes.js'
 import { PrivacyState } from './state.js'
@@ -120,6 +120,21 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
   let durablePath: string | null = null
   let savedAt: number | null = null
   let stickyFailClosed = false
+  /**
+   * **命令注册结果**（可读事实，进状态面）。
+   *
+   * 起因：用户在 Web 界面发 `/omb-privacy normal` 时既无回执、又被当普通文本送进模型。
+   * 而"命令有没有注册进宿主"这件事我**从未验证过**——注册代码有 `catch`，
+   * 失败只写日志，所以"注册成功"一直是假设。
+   *
+   * 实测证据（2026-09-30）：DSH 的 `commands.execute` 每次调用都会写
+   * `command/run` 生命周期事件；扫**全部会话日志**，含该事件的文件数为 **0** ——
+   * 命令**从未进入执行器**。所以要么没注册（本字段会显示"未注册"），
+   * 要么注册了但前端 `/` 触发流水线没接。
+   *
+   * 这个字段把"假设"变成界面上一行可读文本。
+   */
+  let commandState = '（尚未尝试注册）'
   let config: PrivacyConfig = PRIVACY_DEFAULT_CONFIG
 
   /**
@@ -302,6 +317,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
           ` 拒绝计数：判定 ${stats.decisions} 次、读 ${stats.readDenials}、写 ${stats.writeDenials}、`
           + `归属未知写 ${stats.unattributedWriteDenials}`,
         )
+        lines.push(` 命令面：/omb-privacy —— ${commandState}`)
         lines.push(` ${PRIVACY_USAGE}`)
         return lines.join('\n')
       }
@@ -348,6 +364,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       try {
         const commands = kernel.service<CommandsLike>(COMMANDS_SERVICE)
         if (commands === undefined || typeof commands.register !== 'function') {
+          commandState = '**未注册**：宿主 commands 服务不可用（行缺 inject: commands？）'
           logger.warn(
             'OMB 隐私：宿主 commands 服务不可用（行缺 inject: commands？）——'
             + '隐私模式仍会被强制，用户无法用 /omb-privacy 切换（工具面不受影响）。',
@@ -375,8 +392,26 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
             },
           })
           if (typeof returned === 'function') disposers.push(returned as () => void)
+          /**
+           * **命令注册结果必须留痕。**
+           *
+           * 起因：用户在 Web 界面发 `/omb-privacy normal` 时既没有回执、又被当成
+           * 普通文本送进模型。而"命令有没有注册进宿主"这件事，我**从未验证过**——
+           * 注册代码有 `catch` 分支（失败只写日志），所以"注册成功"一直是假设。
+           *
+           * 这条心跳把假设变成可读事实：`registered: true/false` +
+           * 宿主返回了什么。若为 false，说明 `/omb-privacy` 在界面里不可能出现。
+           */
+          heartbeat('privacy-command', {
+            name: PRIVACY_COMMAND_NAME,
+            registered: true,
+            returned: typeof returned,
+          })
+          commandState = `已注册（宿主返回 ${typeof returned}）`
         }
       } catch (error) {
+        commandState = `**未注册**：注册抛错——${messageOf(error)}`
+        heartbeat('privacy-command', { name: PRIVACY_COMMAND_NAME, registered: false, error: messageOf(error) })
         logger.warn(`OMB 隐私：命令注册失败（已隔离）——${messageOf(error)}`)
       }
 
