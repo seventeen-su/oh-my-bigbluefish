@@ -21,6 +21,7 @@ import type {
   ToolOutcome,
 } from '../../kernel/abi/index.js'
 import type { TaggedStore } from '../../kernel/abi/index.js'
+import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { MEMORY_KINDS, MEMORY_SCOPES } from '../../kernel/abi/index.js'
 import type { RetrievePorts, RetrieveQuery, RetrieveResult } from './retrieve.js'
 import { isoUtc, retrieve } from './retrieve.js'
@@ -160,10 +161,14 @@ export function parseForgetArgs(input: unknown): ArgsResult<ForgetArgs> {
 
 export interface MemoryToolDeps {
   /**
-   * 解析当前可用的库。未就绪返回 undefined（**不抛**）——
+   * 解析**某会话**可用的库。未就绪返回 undefined（**不抛**）——
    * 库可能尚未打开（`apply` 同步、开库异步），工具必须能降级（热插拔契约）。
+   *
+   * `sessionId` 来自**本次工具调用**的归属（`ToolCallContext.sessionId`）。
+   * 缺省（`undefined`）= 归属未知 → 调用方只给用户库，并在回执里明说，
+   * **不得**退化成"最近一个会话"的库（那是交错会话污染的来源）。
    */
-  readonly resolveStores: () => readonly TaggedStore[] | undefined
+  readonly resolveStores: (sessionId?: string) => readonly TaggedStore[] | undefined
   /**
    * 时钟。**必填**：模块层不读墙钟，一律由 `dsh/` 传 `kernel.clock`
    * （团队约定；`retrieve`/`consolidate` 因此保持纯函数）。
@@ -172,10 +177,12 @@ export interface MemoryToolDeps {
   /** 检索端口（嵌入器/第二通道）。缺省只用注入的时钟 + 纯词法。 */
   readonly ports?: () => RetrievePorts | undefined
   /**
-   * 当前上下文压力档位（软信号）。由 `dsh/` 提供宿主读数；
+   * **某会话**的上下文压力档位（软信号）。由 `dsh/` 提供宿主读数；
    * 只在 `tight` 时参与门控（可被 `mode: always` 覆盖）。
+   *
+   * 没有会话 → `undefined`（不用别人的压力读数塑形本次检索）。
    */
-  readonly pressureBand?: () => PressureBand | undefined
+  readonly pressureBand?: (sessionId?: string) => PressureBand | undefined
 }
 
 export interface ForgetOutcome {
@@ -250,15 +257,16 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       '若本次存在这类候选，回执会列出它们的 id——那是历史痕迹，需要追溯时用 omb_relate。' +
       '需要多跳关联（这条结论被谁取代、还有哪些冲突）时也用 omb_relate。',
     parameters,
-    async execute(args: unknown): Promise<ToolOutcome> {
+    async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       const parsed = parseRecallArgs(args)
       if (!parsed.ok) return { kind: 'error', text: `${RECALL_TOOL} 参数非法：${parsed.error}` }
-      const resolved = resolveStores(deps)
+      const sessionId = sessionOf(call)
+      const resolved = resolveStores(deps, sessionId)
       if (!resolved.ok) return { kind: 'error', text: `${RECALL_TOOL} 不可用：${resolved.error}` }
       const ports = resolvePorts(deps)
-      const band = readPressureBand(deps)
+      const band = readPressureBand(deps, sessionId)
       const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band), ports)
-      return { kind: 'text', text: renderRecall(result) }
+      return { kind: 'text', text: renderRecall(result) + unknownAttributionNote(call) }
     },
   }
 }
@@ -279,14 +287,14 @@ export function createForgetTool(deps: MemoryToolDeps): ToolDefinition {
       '按 id **硬删除**记忆（不可撤销）。只在用户显式要求遗忘、或保留策略清理过期记录时使用；' +
       '常规的"记忆衰减"由离线整合负责，不需要调用本工具。整库擦除请由用户直接操作库文件。',
     parameters,
-    async execute(args: unknown): Promise<ToolOutcome> {
+    async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       const parsed = parseForgetArgs(args)
       if (!parsed.ok) return { kind: 'error', text: `${FORGET_TOOL} 参数非法：${parsed.error}` }
-      const resolved = resolveStores(deps)
+      const resolved = resolveStores(deps, sessionOf(call))
       if (!resolved.ok) return { kind: 'error', text: `${FORGET_TOOL} 不可用：${resolved.error}` }
       const outcome = await forgetRecords(resolved.stores, parsed.value.ids)
       if (!outcome.ok) return { kind: 'error', text: `${FORGET_TOOL} 失败：${outcome.error}` }
-      return { kind: 'text', text: renderForget(parsed.value.ids, outcome.value) }
+      return { kind: 'text', text: renderForget(parsed.value.ids, outcome.value) + unknownAttributionNote(call) }
     },
   }
 }
@@ -366,12 +374,37 @@ export function renderForget(ids: readonly string[], outcome: ForgetOutcome): st
 
 // ---------- 内部工具 ----------
 
+/**
+ * 本次调用的会话（**只在归属确定时**返回）。
+ *
+ * `attribution !== 'session'` → `undefined`：宁可让下游降级为"只查用户库"，
+ * 也不拿"最近一个会话"顶替（那正是交错会话污染的来源）。
+ */
+function sessionOf(call: ToolCallContext | undefined): string | undefined {
+  return call?.attribution === 'session' ? call.sessionId : undefined
+}
+
+/**
+ * 归属未知时在回执里**明说**。
+ *
+ * 不写这一句，读者会以为"召回不到项目库记忆"是"那里没有记忆"；
+ * 而真相可能是"这次调用没有会话归属，我们只查了用户库"。两者含义相反。
+ */
+function unknownAttributionNote(call: ToolCallContext | undefined): string {
+  if (call?.attribution === 'session') return ''
+  return (
+    '\n（归属未知：本次调用没有会话身份，**只查了用户库**——项目库的记忆没有被检索。'
+    + '要按项目召回，请在会话回合内调用。）'
+  )
+}
+
 function resolveStores(
   deps: MemoryToolDeps,
+  sessionId: string | undefined,
 ): { readonly ok: true; readonly stores: readonly TaggedStore[] } | { readonly ok: false; readonly error: string } {
   let stores: readonly TaggedStore[] | undefined
   try {
-    stores = deps.resolveStores()
+    stores = deps.resolveStores(sessionId)
   } catch (err) {
     return { ok: false, error: `无法解析记忆库（${messageOf(err)}）` }
   }
@@ -403,10 +436,10 @@ function resolvePorts(deps: MemoryToolDeps): RetrievePorts {
   return { clock: deps.clock }
 }
 
-/** 读宿主压力档位（软信号）；读数失败/缺失 → undefined（不参与门控）。 */
-function readPressureBand(deps: MemoryToolDeps): PressureBand | undefined {
+/** 读某会话的压力档位（软信号）；读数失败/缺失/无会话 → undefined（不参与门控）。 */
+function readPressureBand(deps: MemoryToolDeps, sessionId: string | undefined): PressureBand | undefined {
   try {
-    return deps.pressureBand?.()
+    return deps.pressureBand?.(sessionId)
   } catch {
     return undefined
   }
