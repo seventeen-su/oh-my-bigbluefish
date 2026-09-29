@@ -11,7 +11,7 @@
  */
 import { z } from 'zod'
 import { SERVICES, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
-import type { Clock, Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
+import type { Clock, Kernel, ModuleHealth, ModuleManifest, ModuleRegistration, StatusRegistry } from '../../kernel/abi/index.js'
 import type { ToolDefinition } from '../../kernel/abi/index.js'
 import type { ArtifactEntry, ArtifactKind, ArtifactPrivacyPort } from './index.js'
 import { ARTIFACT_DEFAULT_MAX, ARTIFACT_TOP_MAX, ArtifactIndex } from './index.js'
@@ -144,6 +144,52 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
       // 从它推导路径只能靠猜。路径由 dsh/hooks.ts 提取后经 service.record(path) 喂入。
       kernel.report(health())
 
+      /**
+       * **状态段 + 渲染前自报**：让模块行不再停在启动那一刻。
+       *
+       * ## 实测过的症状
+       *
+       * 同一次 `omb_status` 输出里：
+       *
+       * ```
+       * 模块行  omb-artifact：正常——制品索引 0/500 条
+       * 而 omb_files 立刻返回 3 条真实路径
+       * ```
+       *
+       * 模块行读的是 `kernel.report()` 的**快照**，而这里原来只在 `apply` 时报一次
+       * （那时索引还空着）；工具读的是实时索引。两者必然分叉。
+       *
+       * ## 为什么"渲染时自报"是对的做法
+       *
+       * `omb_status` **不会调用模块的 health 函数**——它只渲染已登记的「组件自述」段
+       * （`dsh/status-tool.ts` 的 `registry.list()`）。所以没有段的模块，其快照永远冻结。
+       * 这里登记一个段，并在渲染前自报一次：**两个面在同一次调用内读到同一份状态**，
+       * 结构上不可能再分叉。`omb-notify` 用的是同一条路子。
+       *
+       * 它也顺带解决了可观测性：制品索引原先**没有任何**状态面出口
+       * （索引条目数只在冻死的模块行里出现），索引有没有在工作只能靠调 `omb_files` 猜。
+       */
+      let statusUnregister: (() => void) | undefined
+      try {
+        const registry = kernel.service<StatusRegistry>(SERVICES.statusContributor)
+        statusUnregister = registry?.register({
+          name: '制品索引（omb-artifact）',
+          render: (): string => {
+            try {
+              kernel.report(health())
+            } catch {
+              // 自报失败不得影响状态面渲染
+            }
+            const size = index.size()
+            return size === 0
+              ? '制品索引为空（本会话还没有观察到任何制品；制品路径由工具调用参数提取）'
+              : `已索引 ${String(size)} 条；最近见 omb_files，内容请用读取类工具按需取`
+          },
+        })
+      } catch {
+        // 状态面登记失败不得影响索引可用性（对齐 notify 的处理）
+      }
+
       return () => {
         // 热插拔：每个注销步骤单独隔离，dispose 绝不抛异常。
         try {
@@ -155,6 +201,17 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
           unprovideService()
         } catch (error) {
           kernel.logger.warn(`制品：注销服务失败（已隔离）——${messageOf(error)}`)
+        }
+        /**
+         * **状态段也要注销**，否则热插拔会留下一个指向已 dispose 实例的悬空段落
+         * （它闭包捕获了 `index`，而下一行就把索引清空了）。
+         * 这条是 lint 抓出来的：`statusUnregister` 被赋值却从未使用——
+         * 那正是"注册了但忘了注销"的形态。
+         */
+        try {
+          statusUnregister?.()
+        } catch (error) {
+          kernel.logger.warn(`制品：注销状态段失败（已隔离）——${messageOf(error)}`)
         }
         index.clear()
         runtime = undefined
