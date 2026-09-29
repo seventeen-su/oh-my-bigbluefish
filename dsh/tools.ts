@@ -13,6 +13,8 @@
  */
 import type { Logger } from '../kernel/abi/index.js'
 import type { ToolOutcome } from '../kernel/abi/index.js'
+import type { ToolCallContext } from '../kernel/sessionRuntime.js'
+import { toolCallContext } from '../kernel/sessionRuntime.js'
 
 export interface ToolsLike {
   register(definition: unknown): unknown
@@ -36,7 +38,57 @@ export interface HostToolDefinition {
     /** 纯投影：把已验证的参数与规范值渲染成模型可见内容。 */
     readonly render: (args: unknown, value: unknown) => readonly ContentBlockLike[]
   }
-  readonly execute: (args: unknown) => Promise<unknown>
+  /**
+   * 执行体。
+   *
+   * **第二个参数是宿主的 `ToolRunContext`**（`packages/core/tools/src/index.ts:236`
+   * 的 `execute(args, exec)`，由 `:1581` 的 `tool.execute(exec.arguments, exec)` 传入）。
+   * 它里面**有会话身份**：`exec.agent`（`:326-339` 声明、`:1391-1417` 运行时填上）。
+   * 曾经这里只声明一个参数，于是那条信息在 OMB 边界上被丢掉——工具因此只能用
+   * "最近看到的会话"猜归属，交错会话时会把状态写进别人的会话。
+   */
+  readonly execute: (args: unknown, exec?: unknown) => Promise<unknown>
+}
+
+/**
+ * 从宿主 `exec` 投影出 OMB 的调用归属（**唯一**的宿主形状读取点）。
+ *
+ * 取值路径（DSH 0.2.0-rc.2）：
+ * - `exec.agent.id` → 会话 id（`packages/core/agent/src/types.ts:15-18` 声明为 `SessionId`）
+ * - `exec.agent.session.header.id` → 同一 id 的佐证/兜底
+ *   （`packages/core/agent/src/runtime-types.ts:163-168`；`SessionHeader.id` 见
+ *   `packages/core/session/src/types.ts:101`）
+ * - `exec.agent.session.header.parentSession` / `delegationDepth` → 子代理血统（`:107` / `:123`）
+ * - `exec.callId` → 调用关联 id
+ *
+ * 形状漂移一律退化为"归属未知"，**绝不抛**、**绝不改用"最近一个"**。
+ */
+export function toolCallContextFromHostExec(exec: unknown): ToolCallContext {
+  try {
+    const record = (exec ?? {}) as {
+      readonly callId?: unknown
+      readonly agent?: {
+        readonly id?: unknown
+        readonly session?: {
+          readonly header?: {
+            readonly id?: unknown
+            readonly parentSession?: unknown
+            readonly delegationDepth?: unknown
+          }
+        }
+      }
+    }
+    const header = record.agent?.session?.header
+    const fromAgentId = typeof record.agent?.id === 'string' ? record.agent.id : undefined
+    return toolCallContext({
+      sessionId: fromAgentId ?? header?.id,
+      callId: record.callId,
+      parentSessionId: header?.parentSession,
+      delegationDepth: header?.delegationDepth,
+    })
+  } catch {
+    return toolCallContext({})
+  }
 }
 
 /** 所有工具共用的输出契约：一个可读文本。 */
@@ -90,8 +142,12 @@ export interface ToolSpec {
   /**
    * 执行体。**绝不抛异常**——返回 `ToolOutcome` 的错误分支，
    * 模型看到的是可读文本而不是中断的回合（热插拔要求）。
+   *
+   * `call` 是**本次调用**的归属（会话 / 调用 id / 子代理血统）。拿不到会话时
+   * `call.attribution === 'unknown'`：执行体**不得**改用"最近一个会话"，
+   * 要么给出可读原因拒绝，要么在输出里明说"归属未知"。
    */
-  readonly run: (args: unknown) => Promise<ToolOutcome> | ToolOutcome
+  readonly run: (args: unknown, call?: ToolCallContext) => Promise<ToolOutcome> | ToolOutcome
 }
 
 /**
@@ -110,9 +166,11 @@ export function toHostTool(spec: ToolSpec): HostToolDefinition {
     description: spec.description,
     parameters: cleanJsonRecord(spec.parameters),
     output: TEXT_OUTPUT,
-    async execute(args: unknown): Promise<unknown> {
+    async execute(args: unknown, exec?: unknown): Promise<unknown> {
       try {
-        const outcome = await spec.run(args)
+        // 把宿主执行上下文里的**会话归属**交给执行体（唯一不丢的接法）：
+        // 工具因此能说"我属于哪个会话"，而不是去问"最近看到的是哪个会话"。
+        const outcome = await spec.run(args, toolCallContextFromHostExec(exec))
         return outcome.kind === 'error' ? `错误：${outcome.text}` : outcome.text
       } catch (error) {
         // 工具执行体本身已保证不抛；这里是最后一道网

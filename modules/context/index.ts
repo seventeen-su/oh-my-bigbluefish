@@ -23,7 +23,7 @@ import type {
   StatusRegistry,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
-import { SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
+import { SERVICES, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
 import type { AdmissionOptions, Candidate } from './admission.js'
 import { DEFAULT_CANDIDATE_CONSIDER_LIMIT, marginalValue, measuredCost, selectForInjection } from './admission.js'
 import type { BandBehavior, PressureBands, PressureReading } from './pressure.js'
@@ -35,7 +35,6 @@ import {
   UNKNOWN_SESSION_KEY,
   VIEW_TOOLS,
   cacheHitRate,
-  healthDetail,
   noteTurn,
   recordPull,
   sessionKeyOf,
@@ -161,8 +160,8 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
   const manifest: ModuleManifest<ContextConfig> = {
     id: MODULE_ID,
     version: MODULE_VERSION,
-    requires: ['omb-kernel'],
-    capabilities: ['context.pressure', 'context.admission', 'context.metrics'],
+    requires: derivedRequires(MODULE_ID),
+    capabilities: derivedCapabilities(MODULE_ID),
     configSchema: contextConfigSchema,
     health: () => lastHealth,
   }
@@ -197,37 +196,32 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     const ledgers = new Map<SessionRef, PullLedger>()
     const sessionTurns = new Map<SessionRef, number>()
     const sessionPressure = new Map<SessionRef, SessionPressure>()
-    let lastActiveSession: SessionRef | null = null
 
     const ledgerFor = (key: SessionRef): PullLedger => ledgers.get(key) ?? EMPTY_LEDGER
 
     /**
-     * 读内核的活跃会话登记处（`SERVICES.activeSession`）。
+     * 会话解析：**只认显式传入的那个会话**（口径唯一）。
      *
-     * 会话是内核级事实（`dsh/` 观测到就写进去），**优先于本模块自己订阅到的事件**：
-     * 模块收不到 `turn/start` 时这里仍然是对的（见 `kernel/activeSession.ts`）。
-     * 端口坏掉时返回 null（服务方法不因宿主端口坏掉而抛给调用方）。
-     */
-    const kernelSession = (): SessionRef | null => {
-      try {
-        const current = kernel.service<{ current(): SessionRef | null }>(SERVICES.activeSession)?.current()
-        return typeof current === 'string' && current.trim() !== '' ? current : null
-      } catch {
-        return null
-      }
-    }
-
-    /**
-     * 会话解析（口径只认**这一个**会话）：
-     * ① 显式传入 ② 内核活跃会话登记处 ③ 本模块订阅到的最近回合 ④ 都没有 → null。
+     * 这里曾经有两条兜底：内核活跃会话登记处（`SERVICES.activeSession.current()`）
+     * 与本模块订阅到的"最近回合"。两者都是"**最近**看到的会话"，而不是"这次是谁"——
+     * 两个会话交错时，A 的拉取计数会被记到 B 的账上（或反过来把 B 的账当成 A 的读），
+     * 而状态面看不出来这个数是谁的。**拿不到就落到"未知会话"桶**（`sessionKeyOf`），
+     * 状态面照实说明，绝不并入任何具体会话。
      *
-     * ④ 落到 null 不等于"用全局数顶替"：调用方会把它记进"未知会话"桶，
-     * 状态面照实说明，不并入任何具体会话。
+     * 调用方要精确归属时**必须显式传会话**：`dsh/` 在 `tools/result` 里从
+     * `exec.agent.session.id` 拿到的是**这次调用自己的**会话，那才是可用的来源。
      */
     const resolveSession = (session?: SessionRef): SessionRef | null => {
       if (typeof session === 'string' && session.trim() !== '') return session
-      return kernelSession() ?? lastActiveSession
+      return null
     }
+
+    /**
+     * 按**显式会话**读压力；没有会话时不借用别人的读数。
+     *
+     * 内核登记处的 `current()` 仍是"最后一次观测到的会话"，**读历史可以、当归属不行**，
+     * 所以这里不用它。
+     */
 
     /** 读时钟：端口异常时返回 0（服务方法不因宿主端口坏掉而抛给调用方）。 */
     const now = (): number => {
@@ -268,7 +262,31 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     /**
-     * **某一个会话**的台账快照。会话口径由 `resolveSession` 定，
+     * **各会话**的台账快照（含"未知会话"桶），确定性排序。
+     *
+     * 这是"归属"在状态面上的呈现方式：既然没有"当前会话"可挑，就把每一份账
+     * 连同它的主人一起摆出来——读者不需要猜"这个数是谁的"。
+     */
+    const sessionsSnapshot = (options?: WatchOptions): readonly {
+      readonly session: SessionRef | null
+      readonly band?: string
+      readonly pulls: PullSnapshot
+    }[] =>
+      [...ledgers.keys()]
+        .sort()
+        .map(key => {
+          const session = sessionOfKey(key)
+          // 压力读数**按该会话**取；拿不到就省略（不借用别人的读数）
+          const band = session === null ? undefined : pressureOf(session).band
+          return {
+            session,
+            ...(band === undefined ? {} : { band }),
+            pulls: summarize(ledgerFor(key), options ?? { views: VIEW_TOOLS }, session),
+          }
+        })
+
+    /**
+     * **某一个会话**的台账快照。会话口径由 `resolveSession` 定（只认显式传入），
      * 拿不到就落到"未知会话"桶（`session` 为 null，状态面照实说明）。
      */
     const snapshotFor = (session?: SessionRef, options?: WatchOptions): PullSnapshot => {
@@ -277,30 +295,34 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     const healthNow = (): ModuleHealth => {
+      // 压力读数**没有默认会话**：拿不到会话就是"未测量"（见 `resolveSession` 的说明）
       const pressure = pressureOf()
-      const snapshot = snapshotFor()
       const band = pressure.band ?? bandOf(pressure.fillRatio, bands)
+      const known = [...ledgers.keys()].filter(key => key !== UNKNOWN_SESSION_KEY).sort()
+      const unknown = snapshotFor(UNKNOWN_SESSION_KEY)
+      const ledgerLine =
+        known.length === 0 && unknown.totalPulls === 0
+          ? '拉取台账：尚无可读账（未观测到任何会话的回合或拉取）'
+          : `拉取台账：分会话计 ${known.length} 个会话`
+            + `${unknown.totalPulls === 0 ? '' : ` + 未知会话桶 ${unknown.totalPulls} 次`}`
+            + '（**不挑"当前会话"**：逐会话计数与杀死判据见「组件自述」）'
       const parts = [
         `软档位 ${band}`,
         pressure.fillRatio === null
           ? 'fillRatio 未知（宿主未声明窗口）→ 按宽松档，不施压'
           : `fillRatio ${pressure.fillRatio.toFixed(3)}`,
         `行为 ${behaviorFor(band).mode}（最多推 ${behaviorFor(band).pushLimit} 条）`,
-        // 杀死判据必须出现在 detail 里（轮数未知/不足时如实说明"暂不下结论"）。
-        // 文案自带口径（"本会话"/"未知会话"），不留"这个数是谁的"的疑问。
-        healthDetail(snapshot),
+        ledgerLine,
       ]
       if (degradations.length > 0) parts.push(`降级：${degradations.join('；')}`)
       return {
         state: degradations.length > 0 ? 'degraded' : 'ok',
         detail: parts.join('；'),
         metrics: {
-          turns: snapshot.turns,
-          // 0/1：`turns` 为 0 时它区分"本会话真的一轮都没有"与"轮数未知（分母未知）"
-          turnsKnown: snapshot.turnsKnown ? 1 : 0,
-          totalPulls: snapshot.totalPulls,
-          pullsPerTurn: snapshot.pullsPerTurn,
-          deadViews: snapshot.deadViews.length,
+          // 会话数是**测到的**（观测到几个会话）；每会话的轮数/拉取数不进这里——
+          // 它们属于具体会话，状态面逐会话列出（见 tools.ts 的分会话台账段）。
+          sessions: known.length,
+          unknownPulls: unknown.totalPulls,
           moderateBand: bands.moderate,
           tightBand: bands.tight,
           candidateConsiderLimit: considerLimit,
@@ -337,8 +359,6 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     disposers.push(
       kernel.on('turn/start', payload => {
         const key = sessionKeyOf(payload.sessionId)
-        // 空会话标识不清掉已知会话（与内核 ActiveSessionTable 同一条纪律）
-        if (key !== UNKNOWN_SESSION_KEY) lastActiveSession = key
         // 回合数**按本会话**推进：跨会话的总数不能当分母。
         // 用"观察到的回合边界数"而不是事件里的 `turn` 值，因为 `dsh/` 传的是
         // 0 基的 `step`（`dsh/session.ts` 的 `step/start` 分支）——直接用会把
@@ -436,8 +456,9 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         // 模块健康由 omb_status 顶部统一呈现（模块拿不到全局健康面，不假装有）
         pressure,
         behavior: reading.behavior,
-        // 只报**本会话**的账（拿不到会话就是"未知会话"桶，状态面照实说明）
+        // 本模块**不再挑"当前会话"**：计入"未知会话"桶的读数单列，分会话台账全列出
         pulls: snapshotFor(),
+        sessions: sessionsSnapshot(),
         degradations,
         notes,
       }
@@ -474,7 +495,6 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
       ledgers.clear()
       sessionTurns.clear()
       sessionPressure.clear()
-      lastActiveSession = null
       lastHealth = { state: 'ok', detail: `模块已卸载；历史拉取计数已清空（杀死判据的观察从零开始）` }
     }
   }

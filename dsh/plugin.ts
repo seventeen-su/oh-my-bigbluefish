@@ -282,7 +282,13 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 
   // ── 7) 单一 disposer：顺序与注册相反，每步都不抛（H-1）────────────────
   let disposed = false
-  return () => {
+  /**
+   * 卸载主体。**同步**跑完所有步骤（H-1：任何一步抛都被隔离）。
+   *
+   * 最后一步是内核的**同步** `dispose()`——它逐个调用模块 disposer 但不等待
+   * 返回 Promise 的那些（模块关库、flush 都是异步的）。
+   */
+  const disposeSync = (): void => {
     if (disposed) return
     disposed = true
     const steps: readonly (() => void)[] = [
@@ -301,6 +307,40 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       }
     }
   }
+
+  /**
+   * 交给宿主的 disposer。
+   *
+   * ## 为什么不是 `async () => { … }`
+   *
+   * 宿主（Cordis）可能**同步调用** disposer 并丢掉返回值；若改成 `async` 函数，
+   * 同步调用仍然会执行函数体——但**返回值变成 Promise 后就没有地方 await 它**，
+   * "卸载完成"依然不成立。所以这里保留**同步**签名，把异步收尾作为**函数属性**
+   * 挂上去，宿主愿意等就等，不等也不影响同步部分。
+   *
+   * ## 为什么必须补一个异步收尾
+   *
+   * 内核的 `dispose()` 是同步的：它逐个调用模块 disposer，但**不等待**返回 Promise
+   * 的那些。而模块的收尾几乎都是异步的（关 SQLite 句柄、flush 向量队列）。
+   * 所以同步 `dispose()` 返回时，"卸载完成"这句话并不成立——
+   * **内核行是唯一知道全部模块收尾何时结束的地方**，它有责任把这个事实交出去。
+   *
+   * `disposeAsync()` 明确定义为可在 `dispose()` 之后调用（补等尚未完成的那些），
+   * 两条路径共用同一份幂等包装，所以这里补等不会重复释放。
+   */
+  const dispose = (): void => {
+    disposeSync()
+  }
+  dispose.async = async (): Promise<void> => {
+    disposeSync()
+    try {
+      await handle.disposeAsync()
+    } catch (error) {
+      // H-1：异步收尾失败也不向宿主传播，但必须留声
+      logger.warn(`OMB：内核异步收尾失败（部分模块可能未完成清理）——${String(error)}`)
+    }
+  }
+  return dispose
 }
 
 /**

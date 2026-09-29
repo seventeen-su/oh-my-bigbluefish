@@ -124,8 +124,6 @@ export class ProfileStorage {
   }
 
   readonly #deps: ProfileStorageDeps
-  /** 当前会话（由模块订阅 `turn/start` 维护）。 */
-  #sessionId = ''
   /** 显式 cwd 覆盖（可选）；设置后优先于会话映射。 */
   #project: string | null = null
   /** 最近一次取库结果，供**同步**的健康面读取（取库本身是异步的）。null = 尚未解析完成。 */
@@ -133,11 +131,6 @@ export class ProfileStorage {
 
   constructor(deps: ProfileStorageDeps) {
     this.#deps = deps
-  }
-
-  /** 记下当前会话：取库走 `stores.forSession(sessionId)`。 */
-  setSession(sessionId: string): void {
-    this.#sessionId = sessionId
   }
 
   /** 显式指定项目 cwd（优先于会话映射；null = 回到按会话解析）。 */
@@ -158,9 +151,14 @@ export class ProfileStorage {
       : { ok: true, detail: '记忆库服务已就绪（首次取库尚未完成，库状态未探明）' }
   }
 
-  /** 读取两个库里的画像文档。任何读取失败都变成可读错误。 */
-  async load(): Promise<ProfileLoadResult> {
-    const set = await this.#resolveSet()
+  /**
+   * 读取两个库里的画像文档。任何读取失败都变成可读错误。
+   *
+   * `sessionId` 是**本次操作**所属的会话（用来选项目库）。**不给就不猜**：
+   * 只读用户库，项目库条目如实报"项目库不可用"——不借用"最近一个会话"的项目库。
+   */
+  async load(sessionId?: string): Promise<ProfileLoadResult> {
+    const set = await this.#resolveSet(sessionId)
     if (set === undefined) return { entries: [], error: this.availability().detail }
 
     const entries: ProfileEntry[] = []
@@ -191,8 +189,10 @@ export class ProfileStorage {
    *
    * 能力轴条目在这里被**拒绝**：丢弃 + warn + 计数。这不是策略开关，
    * 是 D4 的结构性边界——调用方即使误传也不会落盘。
+   *
+   * `sessionId` 同 `load()`：决定写哪个项目库；不给就不猜。
    */
-  async save(entries: readonly ProfileEntry[]): Promise<ProfileSaveResult> {
+  async save(entries: readonly ProfileEntry[], sessionId?: string): Promise<ProfileSaveResult> {
     const admitted = entries.filter(entry => entry.axis !== 'capability')
     const capabilitySkipped = entries.length - admitted.length
     if (capabilitySkipped > 0) {
@@ -201,7 +201,7 @@ export class ProfileStorage {
       )
     }
 
-    const set = await this.#resolveSet()
+    const set = await this.#resolveSet(sessionId)
     if (set === undefined) {
       return {
         ok: false,
@@ -261,8 +261,16 @@ export class ProfileStorage {
     }
   }
 
-  /** 取库。**绝不抛**：失败写进 `#lastResolve` 并返回 undefined。 */
-  async #resolveSet(): Promise<ProfileStoreSetPort | undefined> {
+  /**
+   * 取库。**绝不抛**：失败写进 `#lastResolve` 并返回 undefined。
+   *
+   * `sessionId` 只来自**本次操作**的调用方（工具调用归属 / 显式参数）。
+   * 不给就没有会话：记忆侧会按"未登记 cwd"降级为**仅用户库**（`projectScope = null`），
+   * 显式条目仍可读写，项目条目如实报"项目库不可用"。
+   *
+   * 这里**没有**"最近一个会话"可退：那会把别的会话的项目画像读进来/写出去。
+   */
+  async #resolveSet(sessionId?: string): Promise<ProfileStoreSetPort | undefined> {
     const service = this.#resolveService()
     if (service === undefined) {
       this.#lastResolve = {
@@ -279,7 +287,7 @@ export class ProfileStorage {
       } else {
         // 会话未登记 cwd 时，记忆侧会降级为"仅用户库"（projectScope = null）——
         // 显式条目仍可读写，项目条目会如实报"项目库不可用"。
-        set = await service.forSession(this.#sessionId)
+        set = await service.forSession(sessionId ?? '')
       }
       if (set === undefined) {
         this.#lastResolve = {

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ContextPressure, ModuleHealth } from '../../../kernel/abi/index.js'
 import { behaviorFor } from '../../../modules/context/pressure.js'
-import { buildStatusPanel, createStatusContributor, renderStatusPanel } from '../../../modules/context/tools.js'
+import { buildStatusPanel, createStatusContributor, renderStatusPanel, shapingOf } from '../../../modules/context/tools.js'
 import { EMPTY_LEDGER, MIN_TURNS_FOR_VERDICT, VIEW_TOOLS, noteTurn, recordPull, summarize } from '../../../modules/context/watch.js'
 
 const pressure = (over: Partial<ContextPressure> = {}): ContextPressure => ({
@@ -162,6 +162,58 @@ describe('buildStatusPanel：拉取计数（杀死判据可见）', () => {
 
   it('没有台账时写"无"，不留空', () => {
     expect(renderStatusPanel(buildStatusPanel({}))).toContain('拉取台账：无')
+  })
+})
+
+describe('buildStatusPanel：分会话台账（归属与塑形一起给）', () => {
+  it('每行一个会话：档位 + 塑形后果 + 该会话的账；未知桶不借别人的档位', () => {
+    const panel = buildStatusPanel({
+      pulls: pullsAfter({ omb_recall: 1 }, 1, null),
+      sessions: [
+        { session: 'A', band: 'tight', pulls: pullsAfter({}, MIN_TURNS_FOR_VERDICT, 'A') },
+        { session: 'B', band: 'moderate', pulls: pullsAfter({ omb_recall: 3 }, 1, 'B') },
+        { session: null, pulls: pullsAfter({ omb_recall: 1 }, 1, null) },
+      ],
+    })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('分会话拉取台账（每行一个会话，互不合并）：')
+    // 档位**连后果一起**写：只说"压力 tight"读者不知道行为会怎么变
+    expect(text).toContain('- A：压力 tight（只保留索引）｜')
+    expect(text).toContain('- B：压力 moderate（最多推 1 条）｜')
+    // 未知会话桶单列，且**不借任何具体会话的档位**
+    expect(text).toContain('- 未知会话：未知会话拉取 1 次')
+    expect(text).not.toContain('未知会话：压力')
+
+    // 判据只在**各自那一行**给：A 满 20 轮 → 待删除名单；B 只 1 轮 → 不下结论
+    const lineA = text.split('\n').find(line => line.includes('- A：')) ?? ''
+    const lineB = text.split('\n').find(line => line.includes('- B：')) ?? ''
+    expect(lineA).toContain('待删除视图')
+    expect(lineA).toContain('omb_files')
+    expect(lineB).toContain('轮数不足')
+    expect(lineB).not.toContain('待删除视图')
+    // 互不合并：A 的 0 次拉取不会把 B 的 3 次算进去
+    expect(lineA).toContain('本会话拉取 0 次 / 20 轮')
+    expect(lineB).toContain('本会话拉取 3 次 / 1 轮')
+  })
+
+  it('shapingOf：三档各给一句后果（宽松 / 适中 / 紧张）', () => {
+    expect(shapingOf('relaxed')).toBe('不做主动推')
+    expect(shapingOf('moderate')).toBe('最多推 1 条')
+    expect(shapingOf('tight')).toBe('只保留索引')
+    // 未知档位按 relaxed 的后果写（纯函数不抛）
+    expect(shapingOf('bogus')).toBe('不做主动推')
+  })
+
+  it('档位字符串畸形也不抛，照 relaxed 的后果写', () => {
+    const panel = buildStatusPanel({
+      sessions: [{ session: 'X', band: 'bogus', pulls: pullsAfter({ omb_recall: 1 }, 1, 'X') }],
+    })
+    expect(renderStatusPanel(panel)).toContain('- X：压力 bogus（不做主动推）｜')
+  })
+
+  it('没有 sessions 输入时该段不出现（模块缺席只少几行，不抛也不造假）', () => {
+    const text = renderStatusPanel(buildStatusPanel({ pulls: pullsAfter({ omb_recall: 1 }, 1) }))
+    expect(text).not.toContain('分会话拉取台账')
   })
 })
 

@@ -256,13 +256,19 @@ describe('R8 呈现路径（prompt:omb-profile）', () => {
 })
 
 describe('降级与热插拔', () => {
-  it('订阅 turn/start：会话 id 用于取库（dsh 侧无需为画像额外接线）', async () => {
+  it('会话由调用方显式给出（不再订阅 turn/start 记"当前会话"）', async () => {
     const stores = new FakeStores()
     const { kernel, service } = startProfile(stores)
     // 挂载时会预热一次（此时还没有会话，按空会话取库=记忆侧降级为仅用户库）
     expect(stores.sessionCalls).toEqual([''])
+
+    // 回合事件**不再**被当成会话来源：那是"最近一个会话"，交错时会读错/写错项目库
     kernel.emit('turn/start', { sessionId: 'sess-42', turn: 1 })
     await service.entries()
+    expect(stores.sessionCalls.at(-1)).toBe('')
+
+    // 显式给会话 → 才是那个会话的库
+    await service.entries('sess-42')
     expect(stores.sessionCalls.at(-1)).toBe('sess-42')
   })
 

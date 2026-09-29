@@ -151,13 +151,20 @@ describe('服务面', () => {
     const handle = createKernel()
     const registry = handle.kernel.service<StatusRegistry>(SERVICES.statusContributor)
     expect(registry).toBeDefined()
+    const before = handle.statusNames()
     const first = registry!.register({ name: '甲', render: () => '甲的内容' })
     const second = registry!.register({ name: '乙', render: () => '乙的内容' })
-    expect(handle.statusNames()).toEqual(['乙', '甲'])
+    // 别的模块（内核自带的"模块依赖图"等）也可能登记段落：只断言本用例的两条
+    // 各就各位、互不覆盖，不断言"总数恰好是 2"。
+    expect(handle.statusNames()).toContain('甲')
+    expect(handle.statusNames()).toContain('乙')
+    expect(handle.status().join('\n')).toContain('甲的内容')
+    expect(handle.status().join('\n')).toContain('乙的内容')
     first()
-    expect(handle.statusNames()).toEqual(['乙'])
+    expect(handle.statusNames()).not.toContain('甲')
+    expect(handle.statusNames()).toContain('乙')
     second()
-    expect(handle.statusNames()).toEqual([])
+    expect(handle.statusNames()).toEqual(before)
     handle.dispose()
   })
 
@@ -197,10 +204,17 @@ describe('档位驱动注入裁决（select）', () => {
     handle.dispose()
   })
 
-  it('不传 session 时用最近活跃会话读压力（工具/提示都发生在回合内）', () => {
+  it('不传 session 时**不挑"最近活跃会话"**：压力读数缺失，显式会话才读得到', () => {
     const { handle } = start({ fillRatio: 0.45 })
     handle.kernel.emit('turn/start', { sessionId: 'live', turn: 1 })
-    expect(metricsOf(handle).select(pool, []).length).toBe(1)
+    // 归属只认"这次是谁"：不传会话 → 读数缺失 → 宽松档、不施压
+    // （旧行为是借用 live 的压力去塑形本次注入——那正是交错会话下的错误来源）
+    expect(metricsOf(handle).select(pool, []).length).toBe(0)
+    const noSession = pressureOf(handle).read()
+    expect(noSession.pressure.fillRatio).toBeNull()
+    expect(noSession.band).toBe('relaxed')
+    // 显式给会话 → 读到它的真实压力（0.45 在缺省阈值下是 moderate）
+    expect(pressureOf(handle).read('live').pressure.fillRatio).toBeCloseTo(0.45, 6)
     handle.dispose()
   })
 
@@ -241,7 +255,7 @@ describe('档位驱动注入裁决（select）', () => {
 })
 
 describe('拉取台账与杀死判据', () => {
-  it('记录拉取后计数、轮次与 pullsPerTurn 都可读', () => {
+  it('记录拉取后计数、轮次与 pullsPerTurn 都可读（按会话口径）', () => {
     const { handle } = start()
     const metrics = metricsOf(handle)
     handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
@@ -250,32 +264,49 @@ describe('拉取台账与杀死判据', () => {
     metrics.recordPull('omb_recall', 's')
     metrics.recordPull('omb_method', 's')
 
-    const snapshot: PullSnapshot = metrics.snapshot()
+    const snapshot: PullSnapshot = metrics.snapshot('s')
     expect(snapshot.turns).toBe(2)
     expect(snapshot.totalPulls).toBe(3)
     expect(snapshot.views.find(view => view.view === 'omb_recall')?.pulls).toBe(2)
     expect(snapshot.views.find(view => view.view === 'omb_recall')?.lastTurn).toBe(2)
-    expect(metrics.views().map(view => view.view)).toEqual([...VIEW_TOOLS].sort())
+    expect(metrics.views('s').map(view => view.view)).toEqual([...VIEW_TOOLS].sort())
+    // 缺省口径是**未知会话**（不挑"当前会话"）：这条断言就是"不猜"的机器化
+    expect(metrics.snapshot().session).toBeNull()
+    expect(metrics.snapshot().totalPulls).toBe(0)
     handle.dispose()
   })
 
-  it('长期 0 拉取 → health().detail 里写明待删除视图（杀死判据可见）', () => {
+  it('长期 0 拉取 → 该会话的杀死判据可读（状态面逐会话列出）', () => {
     const { handle } = start()
     for (let turn = 1; turn <= 20; turn += 1) handle.kernel.emit('turn/start', { sessionId: 's', turn })
-    const health = handle.health()[MODULE_ID]
-    expect(health?.detail).toContain('待删除视图')
-    expect(health?.detail).toContain('omb_files')
-    expect(metricsOf(handle).killList()).toContain('omb_recall')
-    expect(health?.metrics?.deadViews).toBe(5)
+    const metrics = metricsOf(handle)
+    // 判据挂在会话上：显式会话才给结论
+    expect(metrics.killList('s')).toContain('omb_recall')
+    expect(metrics.snapshot('s').deadViews).toHaveLength(5)
+    expect(metrics.snapshot().deadViews).toEqual([]) // 未知会话桶永远不下结论
+    // 状态面：分会话一行一行列出（读者不需要猜这个数是谁的）
+    const text = handle.status().join('\n')
+    expect(text).toContain('分会话拉取台账')
+    expect(text).toContain('- s：')
+    expect(text).toContain('待删除视图')
+    expect(text).toContain('omb_files')
+    // 模块行只说"分会话计 N 个会话"，不再冒充"本会话"
+    const detail = handle.health()[MODULE_ID]?.detail ?? ''
+    expect(detail).toContain('分会话计 1 个会话')
     handle.dispose()
   })
 
-  it('轮数不足时 detail 如实说"暂不下删除结论"（不把样本不够说成一切正常）', () => {
+  it('轮数不足时该会话的判据如实说"暂不下删除结论"（不把样本不够说成一切正常）', () => {
     const { handle } = start()
     handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
-    const detail = handle.health()[MODULE_ID]?.detail ?? ''
-    expect(detail).toContain('轮数不足')
-    expect(detail).not.toContain('无视图趋近 0')
+    const verdict = metricsOf(handle).snapshot('s').verdict
+    expect(verdict).toContain('暂不下')
+    // 理由必须钉住：旧文案写"轮数不足"，新文案写"已观察 1 轮（判定需 20 轮）"。
+    // 只断"暂不下"是不够的——那样文案退化成一句空洞的"暂不下"也照样绿。
+    expect(verdict).toContain('本会话已观察 1 轮')
+    expect(verdict).toContain('判定需 20 轮')
+    expect(verdict).not.toContain('无视图趋近 0')
+    expect(metricsOf(handle).snapshot('s').deadViews).toEqual([])
     handle.dispose()
   })
 
@@ -339,28 +370,36 @@ describe('台账按会话隔离（本会话口径）', () => {
     expect(a.views.find(view => view.view === 'omb_recall')?.pulls).toBe(0)
     expect(metrics.views('A').find(view => view.view === 'omb_recall')?.pulls).toBe(0)
 
-    // 缺省口径 = 最近活跃会话（B），不是"A + B 的总和"
-    expect(metrics.snapshot().session).toBe('B')
-    expect(metrics.snapshot().totalPulls).toBe(3)
+    // 缺省口径 = **未知会话**（不再挑"最近活跃会话"）——B 的账不会被当成"当前会话"
+    expect(metrics.snapshot().session).toBeNull()
+    expect(metrics.snapshot().totalPulls).toBe(0)
     const detail = handle.health()[MODULE_ID]?.detail ?? ''
-    expect(detail).toContain('本会话拉取 3 次 / 1 轮')
-    expect(detail).toContain('轮数不足')
+    expect(detail).toContain('分会话计 2 个会话')
     expect(detail).not.toContain('待删除视图')
+    // 逐会话读数在状态面里（A 的判据与 B 的"轮数不足"都在）
+    const text = handle.status().join('\n')
+    expect(text).toContain('待删除视图')
+    expect(text).toContain('轮数不足')
     handle.dispose()
   })
 
-  it('内核活跃会话登记处优先（模块收不到 turn/start 时也能归属正确）', () => {
+  it('归属来自调用方而不是任何"登记处"：不传会话就落未知桶（不借用内核当前会话）', () => {
     const { handle } = start()
     const metrics = metricsOf(handle)
-    // 模块自己订阅到的最近回合是 from-event
+    // 模块订阅到的回合 + 内核登记处都指向具体会话
     handle.kernel.emit('turn/start', { sessionId: 'from-event', turn: 1 })
-    // 内核登记处说是 from-kernel（模块经收养视图收不到事件时，这是唯一可信来源）
     handle.kernel.service<{ remember(session: string): void }>(SERVICES.activeSession)?.remember('from-kernel')
 
+    // 但调用方没给会话 → 记进未知桶，**不**记到 from-event / from-kernel 名下
     metrics.recordPull('omb_recall')
-    expect(metrics.snapshot('from-kernel').totalPulls).toBe(1)
     expect(metrics.snapshot('from-event').totalPulls).toBe(0)
-    expect(metrics.snapshot().session).toBe('from-kernel')
+    expect(metrics.snapshot('from-kernel').totalPulls).toBe(0)
+    expect(metrics.snapshot().session).toBeNull()
+    expect(metrics.snapshot().totalPulls).toBe(1)
+
+    // 显式给会话时才是那个会话的账
+    metrics.recordPull('omb_recall', 'from-event')
+    expect(metrics.snapshot('from-event').totalPulls).toBe(1)
     handle.dispose()
   })
 
@@ -408,14 +447,20 @@ describe('台账按会话隔离（本会话口径）', () => {
 })
 
 describe('状态面段落与热插拔', () => {
-  it('段落内容包括档位行为、拉取台账与降级原因', () => {
+  it('段落内容包括档位行为、分会话台账与降级原因', () => {
     const { handle } = start({ fillRatio: 0.8 })
     handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
     const text = handle.status().join('\n')
     expect(text).toContain('### 上下文优化（omb-context）')
-    expect(text).toContain('压力档位：tight')
-    expect(text).toContain('只保留索引')
+    // 压力读数**按会话**给（不再挑"当前会话"）：这一行就是 s 的读数，
+    // 而且必须**连塑形后果一起给**——只写"压力 tight"读者不知道行为会怎么变。
+    // 顶层的"档位行为"行是**无会话口径**（relaxed / pushLimit 0），代表不了 s，
+    // 所以"有读数 → 有后果"这一点只能钉在分会话行上。
+    expect(text).toContain('压力 tight（只保留索引）｜')
+    // 服务面同一口径（面板若退化成"只有档位、没有后果"，上面那条会红）
+    expect(pressureOf(handle).read('s').behavior.indexOnly).toBe(true)
     expect(text).toContain('拉取台账')
+    expect(text).toContain('分会话拉取台账')
     handle.dispose()
   })
 
@@ -437,7 +482,11 @@ describe('状态面段落与热插拔', () => {
     const second = start()
     first.handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
     metricsOf(first.handle).recordPull('omb_recall', 's')
-    expect(metricsOf(first.handle).snapshot().totalPulls).toBe(1)
+    // 这次拉取**只**落在（实例一，会话 s）这一格上：别的格必须仍是 0。
+    // 既验"两个实例不共享"，也验"没有溅进未知会话桶"。
+    expect(metricsOf(first.handle).snapshot('s').totalPulls).toBe(1)
+    expect(metricsOf(first.handle).snapshot().totalPulls).toBe(0)
+    expect(metricsOf(second.handle).snapshot('s').totalPulls).toBe(0)
     expect(metricsOf(second.handle).snapshot().totalPulls).toBe(0)
     first.handle.dispose()
     second.handle.dispose()

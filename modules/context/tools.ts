@@ -8,7 +8,7 @@
  * 组装必须能承受**任何模块缺席**：模块健康缺失、度量桥缺失、台账为空，
  * 都只是少几行，并且**如实写出原因**（"无空降级"）。
  */
-import type { ContextPressure, ModuleHealth, StatusContributor } from '../../kernel/abi/index.js'
+import type { ContextPressure, ModuleHealth, PressureBand, SessionRef, StatusContributor } from '../../kernel/abi/index.js'
 import type { BandBehavior } from './pressure.js'
 import { behaviorFor } from './pressure.js'
 import type { PullSnapshot } from './watch.js'
@@ -23,6 +23,18 @@ export interface StatusPanelInput {
   readonly behavior?: BandBehavior | null
   /** 拉取计数台账快照。 */
   readonly pulls?: PullSnapshot | null
+  /**
+   * **各会话**的台账快照（含"未知会话"桶）。
+   *
+   * 为什么要有它：会话归属只认"这次是谁"，没有"当前会话"可挑。若只渲染一份
+   * `pulls`，读者无法判断那个数是哪个会话的——而那正是被投诉过的"这个数是谁的"。
+   */
+  readonly sessions?: readonly {
+    readonly session: SessionRef | null
+    /** 该会话的压力档位（有读数时）；没有就省略——**不借用别人的读数**。 */
+    readonly band?: string
+    readonly pulls: PullSnapshot
+  }[] | null
   readonly budgets?: Readonly<Record<string, { readonly used: number; readonly limit: number }>> | null
   /** 本模块自己的降级原因（逐条写出，绝不折叠成"不可用"）。 */
   readonly degradations?: readonly string[] | null
@@ -128,6 +140,23 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
       }
     }
 
+    // **分会话列账**：没有"当前会话"可挑，就把每个会话各自一行摆出来——
+    // 读者因此永远知道"这个数是哪个会话的"（未知会话桶也单列，不并进任何一行）。
+    //
+    // **档位必须连塑形后果一起写**：只说"压力 tight"读者不知道行为会怎么变。
+    // 顶层的"档位行为"行是**无会话口径**（拿不到会话=（relaxed, none）），
+    // 不能代表任何具体会话的塑形——所以后果必须落在**该会话这一行**上。
+    const sessions = input.sessions ?? null
+    if (sessions !== null && sessions.length > 0) {
+      lines.push('分会话拉取台账（每行一个会话，互不合并）：')
+      for (const entry of sessions) {
+        const who = entry.session === null ? '未知会话' : entry.session
+        // 没有该会话的读数就**不写档位**（`band` 缺席）：不借用别人的档位
+        const shaping = entry.band === undefined ? '' : `压力 ${entry.band}（${shapingOf(entry.band)}）｜`
+        lines.push(`  - ${who}：${shaping}${healthDetail(entry.pulls)}`)
+      }
+    }
+
     const budgetKeys = Object.keys(input.budgets ?? {}).sort()
     if (budgetKeys.length > 0) {
       const rendered = budgetKeys.map(key => {
@@ -182,6 +211,19 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
 /** 渲染组装结果。纯投影，不做二次计算。 */
 export function renderStatusPanel(panel: StatusPanel): string {
   return panel.lines.join('\n')
+}
+
+/**
+ * 档位 → 一句**塑形后果**（进状态面的分会话行）。
+ *
+ * 状态面只说"压力 tight"是不够的：读者要知道这个档位**会怎么改变行为**。
+ * 未知档位由 `behaviorFor` 回落 relaxed（纯函数不抛），因此这里不会抛。
+ */
+export function shapingOf(band: PressureBand | string): string {
+  const behavior = behaviorFor(band as PressureBand)
+  if (behavior.indexOnly) return '只保留索引'
+  if (behavior.pushLimit > 0) return `最多推 ${behavior.pushLimit} 条`
+  return '不做主动推'
 }
 
 /**

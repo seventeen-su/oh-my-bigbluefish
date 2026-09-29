@@ -22,6 +22,7 @@ import * as reasoning from '../modules/reasoning/index.js'
 import * as context from '../modules/context/index.js'
 import * as artifact from '../modules/artifact/module.js'
 import * as notify from '../modules/notify/index.js'
+import * as privacy from '../modules/privacy/index.js'
 
 /**
  * 入口路径 → 已加载命名空间。
@@ -42,4 +43,5 @@ export const MODULE_ENTRIES: ReadonlyMap<string, unknown> = new Map<string, unkn
   ['modules/context/index', context],
   ['modules/artifact/module', artifact],
   ['modules/notify/index', notify],
+  ['modules/privacy/index', privacy],
 ])

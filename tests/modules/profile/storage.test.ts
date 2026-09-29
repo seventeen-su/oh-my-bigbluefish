@@ -162,16 +162,19 @@ describe('取库：会话 → cwd → 套件（异步、可能未就绪）', () 
     expect(storage.availability().detail).toContain('cwd')
   })
 
-  it('setSession 后按会话取库；显式 setProject 时按 cwd 取库', async () => {
+  it('显式传会话才按会话取库（不传就只查用户库）；setProject 时按 cwd 取库', async () => {
     const stores = new FakeStores()
     const storage = storageWith(stores)
 
-    storage.setSession('s1')
+    // 不传会话：**不猜**——按"未登记 cwd"降级（空会话），不借用任何"最近会话"
     await storage.load()
-    expect(stores.sessionCalls).toEqual(['s1'])
+    expect(stores.sessionCalls).toEqual([''])
+
+    await storage.load('s1')
+    expect(stores.sessionCalls).toEqual(['', 's1'])
 
     storage.setProject('D:/proj/x')
-    await storage.load()
+    await storage.load('s2')
     expect(stores.projectCalls).toEqual(['D:/proj/x'])
     expect(stores.projectCalls).toHaveLength(1)
   })
