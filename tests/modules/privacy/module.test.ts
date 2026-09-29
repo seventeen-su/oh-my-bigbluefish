@@ -393,73 +393,37 @@ describe('健康面与状态面', () => {
  *
  * 这样"隐私是用户的决定"在**行为层面**被钉住——比"没有工具"更难绕过：
  * 将来若有人加了一条能放宽的工具，这条测试会立刻红。
+/**
+ * **不变量：模型不能自己解除限制。**
+ *
+ * ## 这一段的历史（值得留着，因为它记录了一次设计反复）
+ *
+ * 最初模块**刻意不注册任何工具**，理由是"隐私模式是**用户**的决定，不该由模型自己改"。
+ *
+ * 后来我实测发现 Web 里够不着命令，于是**加了 `omb_privacy` 工具**，用结构性手段
+ * （只能收紧 / 放宽需 `allowLoosen`）保住原意图。
+ *
+ * 再后来用户报告"`/omb-privacy` 能用，`/omb-privacy xxx` 不能用"，查出根因是
+ * **注册时没声明 `input` 描述符**——DSH 客户端只在 `desc.input !== undefined` 时
+ * 才认领命令后面的参数（`packages/client/ui-commands/src/client/service.ts:269`）。
+ * 补上 `input` 后命令带参数可用。
+ *
+ * **于是工具就没有存在理由了**——用户决定移除它，回到原设计：
+ * **隐私只由用户通过命令改，模型既不在工具面也不在命令面碰它。**
+ *
+ * 这条不变量现在靠"**根本没有那条路**"成立，比"有路但拦住"更硬：
+ * 将来若有人加回一条能改隐私的工具，下面的断言会立刻红。
  */
 describe('不变量：模型不能自己解除限制', () => {
-  it('工具已注册（Web 界面里命令够不着，工具是唯一可用入口）', () => {
+  it('模块不注册任何工具——隐私模式不由模型改', () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
       const toolServices = booted.kernel.services().filter(name => name.startsWith('tools:'))
-      expect(toolServices, '没有工具 = 隐私模式在 Web 里不可用').toEqual(['tools:omb-privacy'])
-      booted.dispose()
-    } finally {
-      ws.cleanup()
-    }
-  })
-
-  it('收紧可以直接做；放宽没有 allowLoosen 就被拒；trust 不提供', () => {
-    const ws = tempWorkspace('omb-privacy-mod-')
-    try {
-      const booted = boot({ path: join(ws.dir, 'm.json') })
-      const tools = booted.kernel.service<readonly { name: string; execute: (a: unknown, c?: unknown) => { kind: string; text: string } }[]>(
-        'tools:omb-privacy',
-      )
-      expect(tools, '工具服务必须存在').toBeDefined()
-      const tool = tools?.find(t => t.name === 'omb_privacy')
-      expect(tool, 'omb_privacy 必须注册').toBeDefined()
-
-      const call = (args: unknown): { kind: string; text: string } =>
-        tool!.execute(args, { sessionId: 'sess-guard' })
-
-      // ① 收紧：normal → sealed，可直接做
-      const tighten = call({ mode: 'sealed' })
-      expect(tighten.kind, '收紧不该被拒').not.toBe('error')
-      expect(tighten.text).toContain('sealed')
-
-      // ② 放宽：sealed → normal，**没有 allowLoosen 必须被拒**
-      const loosen = call({ mode: 'normal' })
-      expect(loosen.kind, '放宽必须被拒').toBe('error')
-      expect(loosen.text, '拒绝理由要可读，且说明怎么才能放宽').toContain('放宽')
-      // 拒绝之后模式必须**没变**
-      expect(call({}).text, '被拒后模式不许被改').toContain('sealed')
-
-      // ③ trust 不提供：工具只接受 mode/session/allowLoosen/reason，没有 trust 通道
-      const fakeTrust = call({ mode: 'trust' })
-      expect(fakeTrust.kind, 'trust 不是模型能做的事').toBe('error')
-
-      booted.dispose()
-    } finally {
-      ws.cleanup()
-    }
-  })
-
-  it('allowLoosen 是显式授权通道：带上它才允许放宽，且回执留审计痕迹', () => {
-    const ws = tempWorkspace('omb-privacy-mod-')
-    try {
-      const booted = boot({ path: join(ws.dir, 'm.json') })
-      const tools = booted.kernel.service<readonly { name: string; execute: (a: unknown, c?: unknown) => { kind: string; text: string } }[]>(
-        'tools:omb-privacy',
-      )
-      const tool = tools!.find(t => t.name === 'omb_privacy')!
-      const call = (args: unknown): { kind: string; text: string } =>
-        tool.execute(args, { sessionId: 'sess-audit' })
-
-      call({ mode: 'sealed' })
-      const loosened = call({ mode: 'normal', allowLoosen: true, reason: '用户在本轮明确要求' })
-      expect(loosened.kind, '用户明确要求时应当允许').not.toBe('error')
-      expect(loosened.text, '放宽必须留下审计痕迹').toContain('放宽')
-      expect(loosened.text, '理由要记进回执').toContain('用户在本轮明确要求')
-
+      expect(
+        toolServices,
+        '一旦出现 tools:omb-privacy，模型就多了一条改隐私的路——那是刻意不要的',
+      ).toEqual([])
       booted.dispose()
     } finally {
       ws.cleanup()
