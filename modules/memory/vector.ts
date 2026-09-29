@@ -886,9 +886,58 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
     let disposed = false
 
+    /**
+     * **前置条件检查：`omb-memory` 没开时，如实点名。**
+     *
+     * 向量通道的库访问走 `SERVICES.stores`（见 `defaultResolveStoreSets`），
+     * 而那个服务由 `omb-memory` 提供。所以"记忆库被关掉"是**可检测的事实**，
+     * 不该让它表现成"通道自己的权重目录不存在"——使用者会去修错的东西。
+     *
+     * ## 为什么这不是"运行时硬阻断"
+     *
+     * 它**不阻止模块挂载**，也不 `apply` 之后再注册任何东西（H-2 不受影响）。
+     * 它做的是：**让依赖方不假装正常**——健康面上直接写"缺哪个依赖"。
+     * 这正是用户要的"依赖没开 → 依赖方自动关闭"在没有前端时的等价形态：
+     * 能力不可用、且**原因可读**，而不是静默降级成别的理由。
+     *
+     * ## 为什么在 `report()` 里查，而不是 `apply` 时查一次
+     *
+     * 模块行的挂载顺序**没有保证**（行间只有 `inject: ['omb:kernel']` 一道门）：
+     * 向量行可能先于记忆行挂载。apply 时查一次会把"晚一点就绪"误判成"缺失"。
+     * 每次上报时实时查，两种情况都得到正确结论。
+     */
+    const missingDependency = (): string | null => {
+      try {
+        return kernel.service<unknown>(SERVICES.stores) === undefined
+          ? '缺少必需依赖：omb-memory（stores 服务不存在）——记忆库被关掉时向量通道无法工作'
+          : null
+      } catch {
+        // 服务表读取失败一律当"查不出来"：不制造假缺失
+        return null
+      }
+    }
+
     const report = (): void => {
       try {
-        kernel.report(health())
+        const base = health()
+        /**
+         * **只在模块活跃时查前置条件。**
+         *
+         * 已 `dispose` 的模块报的是"已关闭"——那时说它"缺少必需依赖"是错的：
+         * 它本来就不再需要那个依赖了。这一条是实测发现的：加上检查后，
+         * `apply 与 dispose 都会上报健康` 那条测试从 `ok（已关闭）` 变成
+         * `degraded`，而那不是使用者该看到的信息。
+         */
+        const missing = disposed ? null : missingDependency()
+        kernel.report(
+          missing === null
+            ? base
+            : {
+                state: base.state === 'failed' ? 'failed' : 'degraded',
+                detail: `${missing}；${base.detail}`,
+                ...base.metrics === undefined ? {} : { metrics: base.metrics },
+              },
+        )
       } catch {
         // 上报失败不得影响模块可用性（健康面是观测，不是控制面）
       }
