@@ -96,6 +96,17 @@ interface CommandsLike {
     readonly definitionId: string
     readonly name: string
     readonly description: string
+    /**
+     * **可选，但"带参数的命令能用"必须声明它。**
+     *
+     * 形状取 DSH 的 `CommandInputDescriptor`（`packages/interaction/commands/src/types.ts:20`）：
+     * `{ hint: string; attachments?: boolean }`。只要 `hint`。
+     *
+     * 为什么必须有：DSH 客户端 `ui-commands` 只在 `desc.input !== undefined` 时
+     * 才认领命令后面的参数（`client/service.ts:269` 与 `:282`）。
+     * 没声明时，`/omb-privacy read-only` 会被当成普通文本送进模型。
+     */
+    readonly input?: { readonly hint: string; readonly attachments?: boolean }
     readonly handler: (invocation: CommandInvocationLike) => CommandResultLike | Promise<CommandResultLike>
   }): unknown
 }
@@ -376,6 +387,36 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
             description:
               '隐私模式：read-only（可读不可写）/ sealed（不可读不可写）/ normal；'
               + '按会话生效、子代理继承、重启不丢。',
+            /**
+             * ⚠️ **声明 `input` 是"带参数的命令能用"的前提**——这一行是缺了它才出的 bug。
+             *
+             * ## 实测症状（用户报告，2026-09-30）
+             *
+             * `/omb-privacy`（不带参数）**可用**，回执正常显示；
+             * `/omb-privacy read-only`（带参数）**不可用**——被当成普通文本送进模型，没有回执。
+             *
+             * ## 根因（DSH 客户端 `ui-commands` 的判定表）
+             *
+             * `packages/client/ui-commands/src/client/service.ts`：
+             * ```ts
+             * if (desc.input !== undefined) return { claim: this.leadingClaim(…) }   // 认领参数
+             * …
+             * if (desc === undefined || desc.input === undefined) return undefined    // 空格不认领
+             * ```
+             * 以及注释写明的决策表：
+             * `host input → claim; host bare → detached execute`。
+             *
+             * **不带参数走 `host bare`（直接执行），带参数走 `host input → claim`——
+             * 而 claim 只在命令声明了 `input` 时才成立。** 没声明时，
+             * 带参数的行**不被认领为命令**，于是照常作为文本提交给模型。
+             *
+             * 这也解释了为什么我之前扫会话日志找不到 `command/run`：
+             * 我试的那几条**恰好都带参数**（`status` / `normal` / `read-only`），
+             * 全都没进命令执行器；而不带参数的那次进了。
+             *
+             * `hint` 会在输入框里作为占位提示显示，也顺便告诉用户参数怎么给。
+             */
+            input: { hint: '[status | normal | read-only | sealed | trust]' },
             handler: (invocation: CommandInvocationLike): CommandResultLike => {
               // 用户手打的命令：先把血缘登记下来（子代理的父链），再执行。
               const session = sessionOfInvocation(invocation)

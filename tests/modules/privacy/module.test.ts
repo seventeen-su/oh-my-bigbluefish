@@ -25,6 +25,11 @@ interface FakeCommands {
   readonly definitions: {
     readonly name: string
     readonly definitionId: string
+    /**
+     * 必须能被读出来：`input` 缺了会让**带参数**的命令失效，
+     * 而不带参数的路径照常工作——正是那种只在真实使用时才暴露的静默回退。
+     */
+    readonly input?: { readonly hint: string; readonly attachments?: boolean }
     readonly handler: (invocation: unknown) => CommandResultLike | Promise<CommandResultLike>
   }[]
   readonly service: { register(definition: unknown): () => void }
@@ -107,6 +112,26 @@ describe('注册面', () => {
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeDefined()
       expect(booted.kernel.service(SESSION_RUNTIME_SERVICE)).toBeDefined()
       expect(booted.commands.definitions.map(d => d.name)).toContain('omb-privacy')
+      /**
+       * **必须声明 `input`——否则带参数的命令用不了。**
+       *
+       * 实测症状（用户报告，2026-09-30）：`/omb-privacy`（不带参数）正常，
+       * `/omb-privacy read-only`（带参数）被当成普通文本送进模型。
+       *
+       * 根因在 DSH 客户端 `ui-commands` 的判定表
+       * （`packages/client/ui-commands/src/client/service.ts:269` 与 `:282`）：
+       * 只有 `desc.input !== undefined` 时前端才"认领"命令后面的参数；
+       * 决策表注释写的是 `host input → claim; host bare → detached execute`。
+       *
+       * 这条断言看着琐碎，但它挡的是一个**只影响带参数路径**的静默回退——
+       * 不带参数的测试全都会通过，只有真去用参数才会发现。
+       */
+      const privacyCommand = booted.commands.definitions.find(d => d.name === 'omb-privacy')
+      expect(
+        privacyCommand?.input,
+        '未声明 input → 前端不认领参数 → /omb-privacy read-only 会被当文本送给模型',
+      ).toBeDefined()
+      expect(privacyCommand?.input?.hint, 'hint 要在输入框里提示参数怎么给').toContain('read-only')
       const registry = booted.kernel.service<StatusRegistry>(SERVICES.statusContributor)
       expect(registry?.list().map(c => c.name)).toContain('隐私')
 
