@@ -139,12 +139,21 @@ export function createFilesTool(deps: FilesToolDeps): ToolDefinition {
     name: FILES_TOOL_NAME,
     description: FILES_TOOL_DESCRIPTION,
     parameters: filesParameters(),
-    execute(args: unknown): ToolOutcome {
+    execute(args: unknown, context?: { readonly sessionId?: string }): ToolOutcome {
       try {
         const input = parseFilesInput(args)
-        return { kind: 'text', text: formatFilesResult(deps.index.topFor(input.query, input.limit), input.query) }
+        // **会话归属一路带到数据边界**：隐私判定在 `ArtifactIndex.topFor` 里做，
+        // 这里只负责把"这次是谁在读"传过去（归属未知时由那边按最严处理）。
+        return {
+          kind: 'text',
+          text: formatFilesResult(
+            deps.index.topFor(input.query, input.limit, context?.sessionId),
+            input.query,
+          ),
+        }
       } catch (error) {
         // 执行体绝不抛异常：模型看到的是可读文本，不是中断的回合。
+        // 隐私拒绝正是从这条路径出来的（索引抛可读原因 → 这里转成 error 结果）。
         return { kind: 'error', text: `制品索引读取失败：${messageOf(error)}` }
       }
     },

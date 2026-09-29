@@ -41,10 +41,53 @@ export interface ArtifactEntry {
   readonly at: number
 }
 
+/**
+ * 隐私判定端口（**结构契约**；由 `omb-privacy` 提供）。
+ *
+ * 定义在这里而不是 import `modules/privacy/`：分层规则禁止模块互相 import
+ * （`eslint.config.mjs` 的 `no-layer-violation`），双方只认形状——与
+ * `modules/memory/store.ts` 的 `PrivacyGatePort` 同一处理方式。
+ *
+ * **为什么制品索引也要过隐私闸门**（Lead 裁决）：制品索引就是一份**阅读痕迹**
+ * （本会话读过/写过哪些文件）。把它排除在隐私之外，会得到
+ * "记忆读不到、但你的文件足迹照样列得出来"的半个隐私。
+ */
+export interface ArtifactPrivacyDecision {
+  readonly allowRead: boolean
+  readonly allowWrite: boolean
+  readonly readReason: string
+  readonly writeReason: string
+}
+
+export interface ArtifactPrivacyPort {
+  decide(sessionId: string): ArtifactPrivacyDecision
+  decideUnattributed(): ArtifactPrivacyDecision
+  /**
+   * 是否存在任何受限会话（或受限基线）。
+   *
+   * 用途只有一个：**归属未知的"读"**判定。记忆侧的 `decideUnattributed()` 是
+   * "禁写不禁读"（写不可逆、读可恢复）；而制品索引返回的是**阅读痕迹**，
+   * 归属未知时读同样可能泄露受限会话的足迹，因此这里按 Lead 的裁决取更严的一侧：
+   * 只要存在受限会话就拒绝读。没有任何受限会话时照常放行——
+   * 否则隐私模块会把一个正常功能变成永久故障。
+   */
+  restricted?(): boolean
+}
+
 export interface ArtifactIndexDeps {
   readonly maxEntries?: number
   readonly logger?: Logger
+  /**
+   * 惰性解析隐私判定端口（行序无关：`omb-privacy` 可能后于本模块挂载）。
+   * 取不到 = 不受限（隐私模块被关掉 = 没有隐私模式）。
+   */
+  readonly privacy?: () => ArtifactPrivacyPort | undefined
 }
+
+/** 归属未知（调用方拿不到会话）时的说明，与记忆侧同口径。 */
+export const ARTIFACT_UNATTRIBUTED_READ_DENIED =
+  '无法确定本次调用的会话归属（宿主未提供 agent），因此无法证明它不属于受限会话：'
+  + '按最严处理，拒绝读取制品索引（阅读痕迹同样属于隐私）。'
 
 /** 匹配用路径：小写 + 统一分隔符（Windows 反斜杠）。展示仍用原路径。 */
 function matchPath(path: string): string {
@@ -102,22 +145,61 @@ export class ArtifactIndex {
   readonly #index = new Map<string, ArtifactEntry>()
   readonly #maxEntries: number
   readonly #logger: Logger | undefined
+  readonly #privacy: (() => ArtifactPrivacyPort | undefined) | undefined
 
   constructor(deps: ArtifactIndexDeps = {}) {
     this.#maxEntries = Math.max(1, Math.trunc(deps.maxEntries ?? ARTIFACT_DEFAULT_MAX))
     this.#logger = deps.logger
+    this.#privacy = deps.privacy
+  }
+
+  /**
+   * 读判定。**这是本模块的数据边界**：工具（`omb_files`）与服务（`ArtifactService`）
+   * 都只能经这里拿数据，所以判定放在这一层就不存在"某条入口绕过"的可能。
+   *
+   * - 给了会话 → 按会话判定（sealed 禁读；子代理已经由隐私侧解析成父的模式）
+   * - 没给会话 → 归属未知：**存在任何受限会话时禁读**（scoped fail-closed）。
+   *   为什么不是"永远禁读"：没有任何受限会话时禁读等于把功能做成了故障；
+   *   为什么不是"永远放行"：那会让 sealed 会话的足迹照样列得出来。
+   */
+  #readDenial(sessionId: string | undefined): string | null {
+    const port = this.#privacy?.()
+    if (port === undefined) return null // 没有隐私模块 → 不受限
+    if (sessionId === undefined || sessionId.length === 0) {
+      // 归属未知：存在受限会话时**禁读**（制品索引＝阅读痕迹，见端口注释）。
+      if (port.restricted?.() === true) return ARTIFACT_UNATTRIBUTED_READ_DENIED
+      return port.decideUnattributed().allowRead ? null : ARTIFACT_UNATTRIBUTED_READ_DENIED
+    }
+    const decision = port.decide(sessionId)
+    return decision.allowRead ? null : decision.readReason
+  }
+
+  /** 写判定（记录制品＝写一份阅读痕迹）。 */
+  #writeDenial(sessionId: string | undefined): string | null {
+    const port = this.#privacy?.()
+    if (port === undefined) return null
+    const decision = sessionId === undefined || sessionId.length === 0
+      ? port.decideUnattributed()
+      : port.decide(sessionId)
+    return decision.allowWrite ? null : decision.writeReason
   }
 
   /**
    * 记录/更新一条制品。同路径 upsert（不产生重复条目）。
    * @returns 写入的条目；路径为空时返回 undefined（不臆造条目）
+   * @throws 隐私模式禁止写入时抛**可读**错误（调用方如实上报，见 `dsh/hooks.ts` 的隔离）
    */
-  record(input: {
-    readonly path: string
-    readonly kind?: unknown
-    readonly contentHash?: unknown
-    readonly at: number
-  }): ArtifactEntry | undefined {
+  record(
+    input: {
+      readonly path: string
+      readonly kind?: unknown
+      readonly contentHash?: unknown
+      readonly at: number
+    },
+    sessionId?: string,
+  ): ArtifactEntry | undefined {
+    const denial = this.#writeDenial(sessionId)
+    if (denial !== null) throw new Error(denial)
     const path = input.path.trim()
     if (path.length === 0) return undefined
     const previous = this.#index.get(path)
@@ -141,8 +223,14 @@ export class ArtifactIndex {
    * 按需查询：最多 1~3 条（**上限写死为 3**）。
    * - 无 query：按最近排序（调用方明确要"最近"）
    * - 有 query：按相关性排序；**无相关结果返回空数组**（不拿最近的顶替）
+   *
+   * @param sessionId 本次读取的会话归属（工具从 `ToolCallContext` 传进来）；
+   *   省略即"归属未知"，判定见 `#readDenial`
+   * @throws 隐私模式禁止读取时抛**可读**错误（工具层转成可读的 error 结果）
    */
-  topFor(query?: string, limit?: number): readonly ArtifactEntry[] {
+  topFor(query?: string, limit?: number, sessionId?: string): readonly ArtifactEntry[] {
+    const denial = this.#readDenial(sessionId)
+    if (denial !== null) throw new Error(denial)
     const capped = clampTopLimit(limit)
     const wanted = (query ?? '').trim()
     if (wanted.length === 0) {
@@ -162,8 +250,13 @@ export class ArtifactIndex {
       .map(item => item.entry)
   }
 
-  /** 全量快照（状态面/审计用）。**不用于注入**。 */
-  list(): readonly ArtifactEntry[] {
+  /**
+   * 全量快照（状态面/审计用）。**不用于注入**，但它返回的是**路径清单**——
+   * 因此同样过读判定（Lead 明确要求核对所有出口，不要只堵 `topFor`）。
+   */
+  list(sessionId?: string): readonly ArtifactEntry[] {
+    const denial = this.#readDenial(sessionId)
+    if (denial !== null) throw new Error(denial)
     return [...this.#index.values()].sort(byRecency)
   }
 

@@ -1267,6 +1267,20 @@ export interface StoresServiceOptions {
   /** 注入时钟（内核 `kernel.clock`），传给每个库句柄。 */
   readonly clock: Clock
   /**
+   * **隐私判定端口**（由 `omb-privacy` 提供，服务名 `SERVICES.privacy`）。
+   *
+   * 为什么是**惰性函数**而不是一次取好的对象：宿主按行加载模块，
+   * `omb-privacy` 行可能在本行**之后**才挂载；一次取好会永久拿到 undefined，
+   * 表现为"隐私模式设了但库照样被写"。惰性解析让顺序无关。
+   *
+   * 缺省（不注入）→ 一切不受限（模块被关掉 = 没有隐私模式，这是诚实的语义）。
+   *
+   * ⚠️ **这是隐私的强制点**：判定发生在**库访问边界**（每个读写方法入口），
+   * 不在工具层、不在服务装饰层——因此没有"装饰被重挂挤掉"的窗口，
+   * 直接 `service.forSession(id).store('user').put(...)` 也一样被拒。
+   */
+  readonly privacy?: () => PrivacyGatePort | undefined
+  /**
    * 解析宿主存储端口。每次需要时调用；返回 undefined 表示宿主尚未注入
    * （**不缓存失败**：宿主可能在 apply 之后才注册端口）。
    */
@@ -1334,12 +1348,161 @@ export interface MemoryStoresService extends StoresService {
 /** 项目库默认缓存上限。 */
 const DEFAULT_MAX_OPEN_PROJECTS = MAX_OPEN_PROJECTS
 
+// ────────────────────────────────────────────────────────────────────────────
+// 隐私强制点（唯一一处；见 `StoresServiceOptions.privacy`）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 一次库访问的判定结果（由 `omb-privacy` 给出）。 */
+export interface PrivacyDecisionPort {
+  readonly allowRead: boolean
+  readonly allowWrite: boolean
+  readonly readReason: string
+  readonly writeReason: string
+}
+
+/**
+ * 隐私判定端口的结构契约。
+ *
+ * **定义在这里而不是 import `modules/privacy/`**：分层规则禁止模块之间互相 import
+ * （`eslint.config.mjs` 的 `no-layer-violation`），双方只认形状——与
+ * `SecondaryChannelRegistry<T>` 的处理方式一致。
+ */
+export interface PrivacyGatePort {
+  /** 按会话判定；拿不到会话 id 时调用方用 `decideUnattributed()`。 */
+  decide(sessionId: string): PrivacyDecisionPort
+  /** 归属未知时的判定：**禁写不禁读**（见 `modules/privacy/modes.ts` 的说明）。 */
+  decideUnattributed(): PrivacyDecisionPort
+}
+
+/**
+ * 库方法 → 访问类别。
+ *
+ * **表里没有的方法一律按 `write` 处理**（fail-closed）：将来库里新增一个方法而忘了
+ * 在这里登记时，隐私模式下它会被拒绝而不是悄悄放行。漏登记的代价是"多禁了一个"，
+ * 而多禁是可恢复的。
+ */
+const STORE_ACCESS: Readonly<Record<string, 'read' | 'write' | 'transaction'>> = {
+  // ── 读 ──
+  get: 'read',
+  getMany: 'read',
+  searchLexical: 'read',
+  searchOverturned: 'read',
+  walkGraph: 'read',
+  stats: 'read',
+  embeddingMeta: 'read',
+  getEmbeddings: 'read',
+  listEmbeddings: 'read',
+  searchVector: 'read',
+  countEmbeddings: 'read',
+  // ── 写 ──
+  put: 'write',
+  upsertEdge: 'write',
+  forget: 'write',
+  putEmbedding: 'write',
+  setEmbeddingMeta: 'write',
+  // ── 事务 ──
+  // 按"读"放行：事务里的**每一次库调用**都会各自过闸（调用方拿到的是本视图），
+  // 所以只读事务能跑、写操作照样被拒。全禁会让 read-only 下的检索路径直接断掉。
+  transaction: 'transaction',
+}
+
+/** 生命周期方法：与记忆内容无关，不受隐私模式限制。 */
+const STORE_LIFECYCLE: ReadonlySet<string> = new Set(['close', 'checkpointAfterForgetFailed'])
+
+/** 收集一个库对象上的全部方法名（含原型链，去重）。 */
+function methodNamesOf(store: object): readonly string[] {
+  const names = new Set<string>()
+  let cursor: object | null = store
+  while (cursor !== null && cursor !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(cursor)) {
+      if (name === 'constructor') continue
+      if (names.has(name)) continue
+      const value = (cursor as Record<string, unknown>)[name]
+      if (typeof value === 'function') names.add(name)
+    }
+    cursor = Object.getPrototypeOf(cursor) as object | null
+  }
+  return [...names]
+}
+
+/**
+ * 造一个**受隐私闸门约束的库视图**。
+ *
+ * 用 `Object.create(inner)` 而不是普通包装对象：视图与内层库是同一原型链，
+ * 于是 `asVectorStore` / `asMemoryStore` 的 `instanceof` 判定照常命中——
+ * 否则向量通道会因为"不是本实现"而静默降级（检索悄悄少一条通道）。
+ * 私有字段（`#db`）不会被继承，因此**每个方法都必须显式转发**（这正是下面的循环做的事），
+ * 转发时以 `this = inner` 调用，私有字段照常可用。
+ */
+function gateStore(inner: MemoryStore, decide: () => PrivacyDecisionPort): MemoryStore {
+  const view = Object.create(inner) as MemoryStore
+  for (const name of methodNamesOf(inner)) {
+    if (STORE_LIFECYCLE.has(name)) continue
+    const kind = STORE_ACCESS[name] ?? 'write' // 表外方法按写入（fail-closed）
+    const original = (inner as unknown as Record<string, unknown>)[name] as (
+      ...args: unknown[]
+    ) => unknown
+    Object.defineProperty(view, name, {
+      value: (...args: unknown[]) => {
+        const decision = decide()
+        if (kind === 'write' && !decision.allowWrite) {
+          // 拒绝用**可读的 Error**：它会被上层（工具执行体 / 检索降级 / 整合）如实携带，
+          // 因此"拒绝原因可读"不依赖任何一层额外的装饰。
+          return Promise.reject(new Error(decision.writeReason))
+        }
+        if (kind !== 'write' && !decision.allowRead) {
+          return Promise.reject(new Error(decision.readReason))
+        }
+        return original.apply(inner, args)
+      },
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    })
+  }
+  return view
+}
+
+/**
+ * 给一个库套件套上隐私闸门。
+ *
+ * @param sessionId 该套件被谁取用；**null = 归属未知**（`forProject` / `snapshot`），
+ *   此时用 `decideUnattributed()`（禁写不禁读）。
+ */
+function gateSet(
+  set: StoreSet | undefined,
+  sessionId: string | null,
+  resolve: () => PrivacyGatePort | undefined,
+): StoreSet | undefined {
+  if (set === undefined) return undefined
+  const port = resolve()
+  if (port === undefined) return set // 没有隐私模块：零开销、行为与从前完全一致
+  const decide = (): PrivacyDecisionPort =>
+    sessionId === null ? port.decideUnattributed() : port.decide(sessionId)
+  const view = (store: MemoryStore): MemoryStore => gateStore(store, decide)
+
+  return {
+    projectScope: set.projectScope,
+    // `stores` 数组同样要套：检索/整合是直接迭代 `set.stores` 拿库的
+    stores: set.stores.map(tagged => ({ scope: tagged.scope, store: view(tagged.store) })),
+    store: scope => {
+      const found = set.store(scope)
+      return found === undefined ? undefined : view(found)
+    },
+    migrated: set.migrated,
+    // 关闭是生命周期：不拦（否则隐私模式会让库关不掉）
+    close: () => set.close(),
+  }
+}
+
 export function createStoresService(options: StoresServiceOptions): MemoryStoresService {
   const logger = options.logger
   const config = options.config ?? {}
   const maxOpenProjects = Math.max(1, options.maxOpenProjects ?? DEFAULT_MAX_OPEN_PROJECTS)
   const retryDelays = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS
   const readyWaitMs = options.readyWaitMs ?? DEFAULT_READY_WAIT_MS
+  /** 隐私闸门的惰性解析（见 `StoresServiceOptions.privacy`：行加载顺序不确定）。 */
+  const privacyGate = (): PrivacyGatePort | undefined => options.privacy?.()
 
   /** 已打开的项目库套件，插入顺序 = LRU 顺序。 */
   const projects = new Map<string, StoreSet>()
@@ -1721,9 +1884,10 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         // 按需向**唯一来源**查（不缓存）：宿主刚告知 cwd，这里立刻就能取到项目库。
         const cwd = sessionCwdOf(sessionId)
         // 宿主尚未告知 cwd：降级为"仅用户库"，projectScope=null 是给调用方的显式信号
-        if (cwd === undefined) return user
+        // 出口一律过隐私闸门：这是"直接调库也必须被拒"的那一道。
+        if (cwd === undefined) return gateSet(user, sessionId, privacyGate)
         const project = await ensureProject(cwd)
-        return project ?? user
+        return gateSet(project ?? user, sessionId, privacyGate)
       } catch (error) {
         unexpectedFailure = `会话 ${sessionId} 取库失败：${messageOf(error)}`
         logger.warn(`OMB 记忆库：${unexpectedFailure}`)
@@ -1733,7 +1897,8 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
 
     async forProject(cwd: string): Promise<StoreSet | undefined> {
       try {
-        return await ensureProject(cwd)
+        // `forProject` 只有 cwd，**没有会话归属** → 归属未知（禁写不禁读）
+        return gateSet(await ensureProject(cwd), null, privacyGate)
       } catch (error) {
         unexpectedFailure = `项目 ${cwd} 取库失败：${messageOf(error)}`
         logger.warn(`OMB 记忆库：${unexpectedFailure}`)
@@ -1742,7 +1907,13 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
     },
 
     snapshot() {
-      return { user: userSet, projects: [...projects.values()] }
+      // `snapshot()` 没有会话归属（向量编码队列只带 {id, scope}）→ 归属未知。
+      // **不返回空集**：空集会让调用方以为"库没打开"并做别的降级决定；
+      // 用"归属未知的视图"表达，读照常、写被拒，作用域精确到这一次访问。
+      return {
+        user: gateSet(userSet, null, privacyGate),
+        projects: [...projects.values()].map(set => gateSet(set, null, privacyGate) as StoreSet),
+      }
     },
 
     peek(sessionId: string): StoreSet | undefined {
@@ -1754,10 +1925,10 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         if (set !== undefined) {
           projects.delete(key)
           projects.set(key, set) // LRU 触碰：正在被用的库不该被淘汰
-          return set
+          return gateSet(set, sessionId, privacyGate)
         }
       }
-      return userSet
+      return gateSet(userSet, sessionId, privacyGate)
     },
 
     failure(): string | undefined {

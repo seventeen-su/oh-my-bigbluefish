@@ -10,10 +10,10 @@
  * ③ 把服务与 `omb_files` 工具声明出去，由 `dsh/` 侧注册到宿主
  */
 import { z } from 'zod'
-import { SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
+import { SERVICES, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
 import type { Clock, Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import type { ToolDefinition } from '../../kernel/abi/index.js'
-import type { ArtifactEntry, ArtifactKind } from './index.js'
+import type { ArtifactEntry, ArtifactKind, ArtifactPrivacyPort } from './index.js'
 import { ARTIFACT_DEFAULT_MAX, ARTIFACT_TOP_MAX, ArtifactIndex } from './index.js'
 import { createFilesTool } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
@@ -51,13 +51,21 @@ export interface ArtifactService {
    * 由 `dsh/hooks.ts` 从宿主会话事件（`tool/call` 参数）提取路径后调用；
    * 模块自身**不从 `evidence/observed` 推导**（该载荷没有路径，Lead 已裁决不扩展 ABI）。
    *
+   * @param sessionId 写入的会话归属（能拿到就传；拿不到＝归属未知，隐私侧按最严处理）
    * @returns 写入的条目；路径为空时返回 undefined（不臆造条目）
+   * @throws 隐私模式禁止写入时抛**可读**错误（`dsh/hooks.ts` 逐条隔离，不影响其余）
    */
-  record(path: string, options?: ArtifactRecordOptions): ArtifactEntry | undefined
-  /** 按需查询：最多 3 条，不含内容。 */
-  topFor(query?: string, limit?: number): readonly ArtifactEntry[]
-  /** 全量快照（状态面/审计用，不用于注入）。 */
-  list(): readonly ArtifactEntry[]
+  record(path: string, options?: ArtifactRecordOptions, sessionId?: string): ArtifactEntry | undefined
+  /**
+   * 按需查询：最多 3 条，不含内容。
+   * @param sessionId 本次读取的会话归属；判定在索引这一层（数据边界）
+   */
+  topFor(query?: string, limit?: number, sessionId?: string): readonly ArtifactEntry[]
+  /**
+   * 全量快照（状态面/审计用，不用于注入）——**返回路径清单，因此同样过读判定**。
+   * 状态面只读 `size()`/`status()`（计数），所以 sealed 下它不会把路径泄给模型。
+   */
+  list(sessionId?: string): readonly ArtifactEntry[]
   size(): number
   clear(): void
   status(): { readonly available: boolean; readonly detail: string }
@@ -76,10 +84,12 @@ function messageOf(error: unknown): string {
 export function createArtifactService(deps: ArtifactRuntimeDeps): ArtifactService {
   const { index, clock } = deps
   return {
-    record: (path, options) =>
-      index.record({ path, kind: options?.kind, contentHash: options?.contentHash, at: clock.now() }),
-    topFor: (query, limit) => index.topFor(query, limit),
-    list: () => index.list(),
+    // 会话归属一路透传到索引：判定只在数据边界做一次（服务本身不做判定，
+    // 因此不存在"服务与工具判定不一致"的分叉）。
+    record: (path, options, sessionId) =>
+      index.record({ path, kind: options?.kind, contentHash: options?.contentHash, at: clock.now() }, sessionId),
+    topFor: (query, limit, sessionId) => index.topFor(query, limit, sessionId),
+    list: sessionId => index.list(sessionId),
     size: () => index.size(),
     clear: () => index.clear(),
     status: () => ({
@@ -108,8 +118,8 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
   const manifest: ModuleManifest<ArtifactConfig> = {
     id: ARTIFACT_MODULE_ID,
     version: ARTIFACT_VERSION,
-    requires: ['omb-kernel'],
-    capabilities: ['artifact.index'],
+    requires: derivedRequires(ARTIFACT_MODULE_ID),
+    capabilities: derivedCapabilities(ARTIFACT_MODULE_ID),
     configSchema: artifactConfigSchema,
     health,
   }
@@ -117,7 +127,13 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
   return {
     manifest,
     apply(kernel: Kernel, config: ArtifactConfig) {
-      const index = new ArtifactIndex({ maxEntries: config.maxEntries, logger: kernel.logger })
+      const index = new ArtifactIndex({
+        maxEntries: config.maxEntries,
+        logger: kernel.logger,
+        // **隐私闸门的注入处**（惰性解析：`omb-privacy` 可能后于本模块挂载）。
+        // 判定发生在索引这一层（数据边界），因此工具与服务两个入口都逃不掉。
+        privacy: () => kernel.service<ArtifactPrivacyPort>(SERVICES.privacy),
+      })
       const service = createArtifactService({ index, clock: kernel.clock })
       const tools: readonly ToolDefinition[] = [createFilesTool({ index })]
       runtime = { index, service }
