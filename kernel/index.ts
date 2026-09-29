@@ -309,13 +309,29 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
    *
    * 挂载 `id` 时，若账本里已有模块声明依赖它，那些依赖方就是在依赖之前启动的
    * （它们启动时拿不到服务，会降级或空转）——这是**启动瞬间就能发现**的顺序违规。
+   *
+   * ## 幂等：同一个 id 只占一个位置
+   *
+   * 热开关一个插件行会让同一个模块**再挂一次**。原来直接 `push`，于是账本里出现
+   * 两条同名记录——实测到的输出是依赖图里同一个依赖被报两遍：
+   *
+   * ```
+   * - omb-artifact ← omb-kernel
+   * - omb-artifact ← omb-kernel      ← 重复
+   * ```
+   *
+   * 账本记的是"**当前装上了哪些模块**"（`moduleGraphReport` 用它判 `missingDependencies`），
+   * 同一个 id 出现两次没有任何意义，只会让计数和违规列表失真。
+   * 重新挂载应当**替换**原记录（顺序也更新为重挂的位置）。
    */
   function recordMount(id: string, requires: readonly string[]): void {
     const late: string[] = []
     for (const entry of mountLedger) {
-      if (entry.requires.includes(id)) late.push(entry.id)
+      if (entry.id !== id && entry.requires.includes(id)) late.push(entry.id)
     }
-    mountLedger.push({ id, requires: [...requires] })
+    const existing = mountLedger.findIndex(entry => entry.id === id)
+    if (existing === -1) mountLedger.push({ id, requires: [...requires] })
+    else mountLedger[existing] = { id, requires: [...requires] }
     if (late.length === 0) return
     logger.warn(
       `内核：⚠ 模块挂载顺序违反依赖图——${late.join('、')} 依赖 ${id}，但 ${id} 挂载得更晚；`
