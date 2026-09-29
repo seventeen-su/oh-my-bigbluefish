@@ -17,6 +17,7 @@ import { createRememberTool, type MemoryWriteDeps } from '../../../modules/memor
 import { retrieve } from '../../../modules/memory/retrieve.js'
 import type { RetrieveResult } from '../../../modules/memory/retrieve.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
+import { toolCallContext } from '../../../kernel/sessionRuntime.js'
 import {
   capturingLogger,
   fixedClock,
@@ -45,7 +46,6 @@ function fixture(): SupersedeFixture {
     resolveStore: async (scope): Promise<SqliteMemoryStore | undefined> =>
       scope === 'user' ? store : undefined,
     clock,
-    currentSession: () => 'selftest-session',
     currentTurn: () => 1,
     onWritten: () => {},
     onAbstained: () => {},
@@ -62,8 +62,11 @@ function fixture(): SupersedeFixture {
   }
 }
 
+/** 本文件默认的调用归属：会话 `selftest-session`（= 宿主 `exec.agent.id`）。 */
+const SESSION_CALL = toolCallContext({ sessionId: 'selftest-session', callId: 'call-1' })
+
 async function run(tool: ToolDefinition, args: unknown): Promise<ToolOutcome> {
-  return await tool.execute(args)
+  return await tool.execute(args, SESSION_CALL)
 }
 
 /** 唯一一条含该关键词的 id（FTS 真实命中，不写死 id 生成规则）。 */

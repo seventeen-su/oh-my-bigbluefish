@@ -26,6 +26,7 @@ import {
 } from '../../../modules/memory/index.js'
 import { asMemoryStore, type MemoryStoresService } from '../../../modules/memory/store.js'
 import { projectIdentity } from '../../../modules/memory/paths.js'
+import { toolCallContext, type ToolCallContext } from '../../../kernel/sessionRuntime.js'
 import {
   type CapturingLogger,
   capturingLogger,
@@ -101,6 +102,17 @@ function rememberSessionCwd(
   )
   expect(sessions, '内核必须提供活跃会话登记处（SERVICES.activeSession）').toBeDefined()
   sessions?.remember(sessionId, cwd)
+}
+
+/**
+ * 工具调用的会话归属（生产里由 `dsh/` 从宿主 `exec.agent` 投影，见
+ * `kernel/sessionRuntime.ts` 的 `ToolCallContext`）。
+ *
+ * 工具**不再**从"最近一次 turn/start"猜会话：测试必须像宿主一样把归属传进去，
+ * 否则那些用例测的就是一条生产上不存在的路径。
+ */
+function sessionCall(sessionId = 's1'): ToolCallContext {
+  return toolCallContext({ sessionId, callId: `call-${sessionId}` })
 }
 
 /**
@@ -376,7 +388,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     expect(service?.peek('s1')?.projectScope).toBeTruthy()
 
     const recall = toolsOf(handle)?.find(tool => tool.name === 'omb_recall')
-    const outcome = await recall?.execute({ query: 'pnpm verify', limit: 5 })
+    const outcome = await recall?.execute({ query: 'pnpm verify', limit: 5 }, sessionCall())
     expect(outcome?.kind).toBe('text')
     expect(outcome?.kind === 'text' ? outcome.text : '').toContain('pnpm verify')
     // 溯源随行：消费者免费拿到 sourceRef 与 observedAt（逐字 + 溯源，不再需要额外查询）
@@ -406,7 +418,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
       text: '提交前先跑 pnpm verify，全绿才算完成',
       kind: 'semantic',
       userAsserted: true,
-    })
+    }, sessionCall())
     expect(written?.kind).toBe('text')
     expect(written?.kind === 'text' ? written.text : '').toContain('已记住')
     // 事件在 put 成功之后发：它是向量落盘的唯一触发源
@@ -420,7 +432,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     expect((await projectSet?.store('project')?.stats())?.rows).toBe(0)
 
     const recall = tools?.find(tool => tool.name === 'omb_recall')
-    const recalled = await recall?.execute({ query: 'pnpm verify', limit: 5 })
+    const recalled = await recall?.execute({ query: 'pnpm verify', limit: 5 }, sessionCall())
     expect(recalled?.kind).toBe('text')
     expect(recalled?.kind === 'text' ? recalled.text : '').toContain('提交前先跑 pnpm verify，全绿才算完成')
     expect(recalled?.kind === 'text' ? recalled.text : '').toContain('observedAt=')
@@ -444,8 +456,8 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
 
     const remember = toolsOf(handle)?.find(tool => tool.name === 'omb_remember')
-    await remember?.execute({ text: '今天定位了一个端口冲突', kind: 'episodic', userAsserted: true })
-    const rejected = await remember?.execute({ text: '用户大概是个喜欢安静的人吧。', kind: 'semantic' })
+    await remember?.execute({ text: '今天定位了一个端口冲突', kind: 'episodic', userAsserted: true }, sessionCall())
+    const rejected = await remember?.execute({ text: '用户大概是个喜欢安静的人吧。', kind: 'semantic' }, sessionCall())
 
     expect(rejected?.kind).toBe('text')
     expect(rejected?.kind === 'text' ? rejected.text : '').toContain('未写入（准入弃权）')
@@ -470,7 +482,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const tools = toolsOf(handle)
     expect(tools).toHaveLength(4)
     for (const tool of tools ?? []) {
-      const outcome = await tool.execute({ query: '任意', id: '任意', ids: ['任意'] })
+      const outcome = await tool.execute({ query: '任意', id: '任意', ids: ['任意'] }, sessionCall('s1'))
       expect(outcome.kind).toBe('error')
     }
 
@@ -512,13 +524,13 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     })
 
     const recall = toolsOf(handle)?.find(tool => tool.name === 'omb_recall')
-    const withChannel = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' })
+    const withChannel = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' }, sessionCall())
     expect(withChannel?.kind).toBe('text')
     expect(withChannel?.kind === 'text' ? withChannel.text : '').toContain('词法上完全不同的内容')
 
     // 关掉第二通道（注销登记）→ 同一次查询退回纯词法：召回不到（§5.7 完整可用）
     offChannel?.()
-    const lexicalOnly = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' })
+    const lexicalOnly = await recall?.execute({ query: '查询里不出现任何相同字词 zzzz' }, sessionCall())
     expect(lexicalOnly?.kind).toBe('text')
     expect(lexicalOnly?.kind === 'text' ? lexicalOnly.text : '').not.toContain('词法上完全不同的内容')
 
