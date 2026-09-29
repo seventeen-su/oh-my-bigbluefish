@@ -96,4 +96,31 @@ describe('依赖图自检不得误报', () => {
     expect(graph.missingDependencies).toEqual([])
     handle.dispose()
   })
+
+  it('热开关同一个模块 → 账本不重复计数（同一个 id 只占一个位置）', () => {
+    // **实测来源**：用 `plugin_manager` 把 `omb-artifact` 关掉再打开之后，
+    // 依赖图里出现了重复条目：
+    //   - omb-artifact ← omb-kernel
+    //   - omb-artifact ← omb-kernel      ← 重复
+    // 账本记的是"当前装上了哪些模块"，同一个 id 出现两次没有意义，
+    // 只会让计数与违规列表失真。
+    const handle = createKernel()
+    const dispose = handle.mount(moduleRequiring('omb-artifact', ['omb-kernel']), undefined)
+    expect(handle.moduleGraph().mounted.filter(id => id === 'omb-artifact')).toHaveLength(1)
+
+    // 热开关：注销后重新挂载（宿主就是这么做的）
+    dispose()
+    handle.mount(moduleRequiring('omb-artifact', ['omb-kernel']), undefined)
+
+    const graph = handle.moduleGraph()
+    expect(
+      graph.mounted.filter(id => id === 'omb-artifact'),
+      '重挂不该让同一个 id 在账本里出现两次',
+    ).toHaveLength(1)
+    expect(
+      graph.missingDependencies,
+      '也不该因此报两条相同的缺失',
+    ).not.toContain('omb-artifact ← omb-artifact')
+    handle.dispose()
+  })
 })
