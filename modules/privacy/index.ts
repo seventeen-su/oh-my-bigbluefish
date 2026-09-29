@@ -34,13 +34,14 @@ import type {
   StatusRegistry,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
-import { derivedCapabilities, derivedRequires, SERVICES } from '../../kernel/abi/index.js'
+import { derivedCapabilities, derivedRequires, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
 import { SessionRuntimeTable } from '../../kernel/sessionRuntime.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 import type { PrivacyMode } from './modes.js'
 import { modeTitle, originTitle, type ResolvedPrivacy } from './modes.js'
 import { PrivacyState } from './state.js'
 import { PrivacyGate } from './gate.js'
+import { createPrivacyTool } from './tools.js'
 import type { PrivacyDoc } from './codec.js'
 import { createPrivacyDurable, resolvePrivacyPath, STORAGE_HOST_SERVICE } from './durable.js'
 import type { CommandInvocationLike, CommandResultLike, PrivacyCommandApi } from './command.js'
@@ -338,12 +339,18 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       }
 
       // ── 4) 命令注册（宿主能力；缺失时如实说明，不抛）──────────────────
+      //
+      // ⚠️ 实测（2026-09-30，真实 Web GUI）：**这条命令在 Web 界面里够不着**——
+      // 在会话里发出 `/omb-privacy normal` 后，`omb_status` 显示
+      // `显式设置 0 个会话`、状态文件从未被创建；grep 整个 DSH Web 客户端
+      // **没有任何斜杠命令处理**。所以命令保留（TUI/CLI 可用），
+      // 但**不再是唯一入口**——下面第 4b 步补一条模型可调用的工具。
       try {
         const commands = kernel.service<CommandsLike>(COMMANDS_SERVICE)
         if (commands === undefined || typeof commands.register !== 'function') {
           logger.warn(
             'OMB 隐私：宿主 commands 服务不可用（行缺 inject: commands？）——'
-            + '隐私模式仍会被强制，但用户无法用 /omb-privacy 切换。',
+            + '隐私模式仍会被强制，用户无法用 /omb-privacy 切换（工具面不受影响）。',
           )
         } else {
           const returned = commands.register({
@@ -371,6 +378,30 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
         }
       } catch (error) {
         logger.warn(`OMB 隐私：命令注册失败（已隔离）——${messageOf(error)}`)
+      }
+
+      // ── 4b) 工具面：Web 界面里唯一能用的控制入口 ──────────────────────
+      //
+      // 原设计刻意不给工具（"隐私模式是用户的决定，不该由模型自己改"）——那个意图
+      // **是对的**，但它假定命令够得着，而实测证明 Web 里够不着。
+      // 所以补工具，同时用**结构性手段**保住原意图：
+      //   · 模型只能**收紧**（normal→read-only→sealed）；
+      //   · **放宽必须传 `allowLoosen: true`**（用户明确要求时才可传），回执留审计痕迹；
+      //   · `trust`（清 fail-closed 粘性）**不提供**——那是人类动作。
+      // 于是"模型无法把自己放出来"这条约束在结构上成立。
+      try {
+        const privacyTool = createPrivacyTool({
+          statusText: sessionId => renderStatus(sessionId),
+          setMode: (sessionId, mode) => api.setMode(sessionId, mode),
+          // 用**当前生效的**模式比较，而不是模型以为的模式——后者可以被谎报。
+          modeOf: sessionId => (sessionId === null ? 'normal' : created.resolve(sessionId).mode),
+          // 工具调用带自己的会话（`dsh/tools.ts` 从宿主 `exec.agent` 取，见 task-7）。
+          // 工具执行体自己从 call.sessionId 取会话（见 tools.ts 的说明）；xecute 拿不到时才走这里。
+          currentSession: () => null,
+        })
+        disposers.push(kernel.provide(toolsServiceFor(MODULE_ID), [privacyTool]))
+      } catch (error) {
+        logger.warn(`OMB 隐私：工具面注册失败（已隔离）——${messageOf(error)}`)
       }
 
       // ── 5) 血缘登记：宿主会话头是 `parentSession` 的唯一来源 ──────────
