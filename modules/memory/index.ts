@@ -22,10 +22,10 @@ import type {
   TaggedStore,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
-import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../kernel/abi/index.js'
+import { SERVICES, catalogEntryOf, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
-import { createStoresService, type MemoryStoresService } from './store.js'
+import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import type { ArtifactKind } from './remember.js'
@@ -71,9 +71,10 @@ export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   embeddingThreads: 2,
 }
 
-const CATALOG = MODULE_CATALOG.find(entry => entry.id === MODULE_ID)
-const REQUIRES: readonly string[] = CATALOG?.requires ?? ['omb-kernel']
-const CAPABILITIES: readonly string[] = CATALOG?.capabilities ?? []
+// requires/capabilities 从模块目录派生：**唯一真源是 `kernel/abi/catalog.ts`**。
+// 不再用 `?? ['omb-kernel']` 这类静默兜底——猜出来的依赖图比没有更坏。
+const REQUIRES: readonly string[] = derivedRequires(MODULE_ID)
+const CAPABILITIES: readonly string[] = derivedCapabilities(MODULE_ID)
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -190,8 +191,11 @@ async function describeHealth(
     metrics['abstentions'] = ledger.abstentions
   }
 
-  const catalogNote =
-    CATALOG === undefined ? '；⚠ 模块目录里缺少 omb-memory 登记项（契约漂移）' : ''
+  // 目录漂移是**契约问题**，必须留声（task-6 把 requires/capabilities 改成从目录派生后，
+  // 这里不再有一个 `CATALOG` 变量，直接查目录本身）。
+  const catalogNote = catalogEntryOf(MODULE_ID) === undefined
+    ? '；⚠ 模块目录里缺少 omb-memory 登记项（契约漂移）'
+    : ''
   const ledgerNote =
     ledger === undefined || (ledger.writes === 0 && ledger.abstentions === 0)
       ? ''
@@ -260,6 +264,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         config: { ...config },
         maxOpenProjects: options.maxOpenProjects,
         resolvePort: () => options.storageHost ?? kernel.service<StorageHostPort>(STORAGE_HOST_SERVICE),
+        // **隐私强制点的唯一注入处**：惰性解析（`omb-privacy` 行可能在本行之后挂载）。
+        // 取不到 = 不受限——模块被关掉时语义就是"没有隐私模式"。
+        privacy: () => kernel.service<PrivacyGatePort>(SERVICES.privacy),
         // 「会话 → cwd」不再由本模块存：唯一来源是内核登记处（见 sessionCwdSource 的说明）
         ...sessionCwdSource(kernel),
       })
@@ -272,11 +279,17 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 工具**定义**在 `recall.ts`/`graph.ts`，**装配**在本模块的 apply：
       // 这是仓库既有模式（reasoning/context/artifact 都这么做），也是 H-2 的要求
       // （注册必须在 apply 返回前完成，且只有 dsh/ 能接触宿主）。
-      let lastActiveSession: string | null = null
-      let lastTurn: number | undefined
+      //
+      // **会话归属来自每次调用自己的 `call.sessionId`**（宿主 `exec.agent` 投影，
+      // 见 `kernel/sessionRuntime.ts`）。这里**不再有 `lastActiveSession`**：
+      // "最近看到的会话"在两个会话交错时会把 A 的记忆写进 B 的项目库，
+      // 而工具调用本来就带着确切归属，没有理由去猜。
+      //
+      // `turnBySession` 只用来把**回合号**写进 `sourceRef`（宿主 `step/start` 的 step）：
+      // 它是**按会话**键控的表，不是一个"最近回合"变量。
+      const turnBySession = new Map<string, number>()
       const offTurn = kernel.on('turn/start', payload => {
-        lastActiveSession = payload.sessionId
-        lastTurn = payload.turn
+        turnBySession.set(payload.sessionId, payload.turn)
         // 预热该会话的项目库：打开是异步的，工具执行体只能同步取库（`peek`）。
         // 失败由服务记入状态面（`status().detail`），这里吞掉是刻意的。
         void service.forSession(payload.sessionId)
@@ -288,8 +301,15 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
        */
       const ledger: MemoryWriteLedger = { writes: 0, abstentions: 0, lastAbstention: '' }
       ledgerRef = ledger
-      const resolveStores = (): readonly TaggedStore[] | undefined => {
-        const set = lastActiveSession === null ? undefined : service.peek(lastActiveSession)
+
+      /**
+       * 解析本次调用该用哪些库。
+       *
+       * 有会话 → 该会话的项目库（`peek` 只在已打开时命中）；没有会话 → **只给用户库**，
+       * 调用方会在回执里写明"归属未知"。**绝不**退化成"最近一个会话"的库。
+       */
+      const resolveStores = (sessionId?: string): readonly TaggedStore[] | undefined => {
+        const set = sessionId === undefined ? undefined : service.peek(sessionId)
         return (set ?? service.snapshot().user)?.stores
       }
 
@@ -312,26 +332,28 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
               ...(channels === undefined || channels.length === 0 ? {} : { channels }),
             }
           },
-          pressureBand: () =>
-            lastActiveSession === null ? undefined : kernel.pressure(lastActiveSession).band,
+          // 压力是**按会话**的读数：没有会话就不施压（不拿别人的读数塑形本次检索）
+          pressureBand: sessionId =>
+            sessionId === undefined ? undefined : kernel.pressure(sessionId).band,
         }),
         createRelateTool({ resolveStores }),
         // ── 写入路径（规划 §5.6 在线部分）：不写，两个库永远是空的 ──────────────
         createRememberTool({
           // 写入可**等库打开**（读路径不行，它有延迟预算）：项目库尚未预热也能落库
-          resolveStore: async (scope: MemoryScope) => {
+          resolveStore: async (scope: MemoryScope, sessionId?: string) => {
             const set =
-              lastActiveSession === null
+              sessionId === undefined
                 ? service.snapshot().user
-                : (await service.forSession(lastActiveSession)) ?? service.snapshot().user
+                : (await service.forSession(sessionId)) ?? service.snapshot().user
             return set?.store(scope)
           },
           clock: kernel.clock,
-          currentSession: () => lastActiveSession ?? undefined,
-          currentTurn: () => lastTurn,
+          // 回合号按会话取（查不到就是 undefined：`sourceRef` 会退化成 `session:<id>`）
+          currentTurn: sessionId =>
+            sessionId === undefined ? undefined : turnBySession.get(sessionId),
           // 项目身份：套件的 projectScope 就是规范化 cwd（§5.3）
-          currentProject: () =>
-            lastActiveSession === null ? undefined : service.peek(lastActiveSession)?.projectScope ?? undefined,
+          currentProject: sessionId =>
+            sessionId === undefined ? undefined : service.peek(sessionId)?.projectScope ?? undefined,
           degradeReason: () => service.failure(),
           /**
            * 工件存在性核验——准入判据里"可由具体工件复现"**真的去核验**。
@@ -340,11 +362,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
            * 编造的 `does-not-exist-9f3a.json` 与真实文件名拿到同一个准入结论，
            * 字段却叫 `reproducible-artifact`。**名不副实的闸门等于没有闸门。**
            *
-           * 这里按语义解析相对路径，主查 cwd，再退项目根（`currentProject`）。
+           * 这里按语义解析相对路径，主查 cwd。**基准目录优先本次调用的会话**：
+           * 拿错 cwd 只会让核验更保守（判成不存在 → 不算依据），不会收下假事实。
            * 只做同步 `existsSync`：一次系统调用，准入路径上可接受。
            * 任何异常都返回 `undefined`（=核验不了 → 不算依据），绝不抛。
            */
-          verifyArtifact: (candidate: string, kind: ArtifactKind) => {
+          verifyArtifact: (candidate: string, kind: ArtifactKind, sessionId?: string) => {
             if (kind !== 'path' && kind !== 'line') return undefined
             /**
              * **用 git 索引核验，不做文件系统遍历**。
@@ -359,14 +382,21 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
              *
              * 会话 cwd 优先于宿主进程 cwd：前者才是用户眼里的"当前目录"。
              */
-            const sessionCwd = kernel
-              .service<{ cwd(): string | null }>(SERVICES.activeSession)
-              ?.cwd() ?? null
+            const registry = kernel.service<{ cwd(session?: string): string | null }>(
+              SERVICES.activeSession,
+            )
+            // 优先本次调用所属会话的 cwd；没有会话/查不到才退回内核登记处的当前会话。
+            let sessionCwd: string | null = null
+            if (sessionId !== undefined) sessionCwd = registry?.cwd(sessionId) ?? null
+            if (sessionCwd === null) sessionCwd = registry?.cwd() ?? null
             return verifyArtifactExists(candidate, sessionCwd)
           },
           /**
            * `memory/written` 是**向量落盘的唯一触发源**：embed-dev 订阅它做批量编码。
            * 在 put 成功之后发；订阅者异常由事件总线隔离，`emit` 自身也不会抛。
+           *
+           * ⚠️ 载荷里**没有会话**（`kernel/abi/kernel.ts` 的 `memory/written`）：
+           * 编码按 memory id 从库里取文本，本就不需要会话，但**不得**把它当会话信号。
            */
           onWritten: payload => {
             ledger.writes += 1

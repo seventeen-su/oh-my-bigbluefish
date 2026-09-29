@@ -24,6 +24,7 @@ import type {
   ToolOutcome,
 } from '../../kernel/abi/index.js'
 import type { TaggedStore } from '../../kernel/abi/index.js'
+import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { EDGE_TYPES } from '../../kernel/abi/index.js'
 import { isoUtc } from './retrieve.js'
 
@@ -382,10 +383,13 @@ function invalidityMark(supersededBy: string | null, validTo: number | null): st
 
 export interface RelateToolDeps {
   /**
-   * 解析当前可用的库。未就绪返回 undefined（不抛）——
+   * 解析**某会话**可用的库。未就绪返回 undefined（不抛）——
    * 宿主/项目库可能尚未打开，工具必须能降级（热插拔契约）。
+   *
+   * `sessionId` 来自本次工具调用的归属（`ToolCallContext.sessionId`）；
+   * 缺省 = 归属未知 → 只查用户库，**不得**退化成"最近一个会话"的库。
    */
-  readonly resolveStores: () => readonly TaggedStore[] | undefined
+  readonly resolveStores: (sessionId?: string) => readonly TaggedStore[] | undefined
   readonly limits?: WalkLimits
 }
 
@@ -431,12 +435,14 @@ export function createRelateTool(deps: RelateToolDeps): ToolDefinition {
       '只有当你确实需要"这条结论是被谁取代的""还有哪些观察与它冲突"时才调用。' +
       '参数：{ id, depth?: 1|2, types?: ["supersedes","conflicts_with","derived_from"] }。',
     parameters,
-    async execute(args: unknown): Promise<ToolOutcome> {
+    async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       const parsed = parseRelateArgs(args)
       if (!parsed.ok) return { kind: 'error', text: `omb_relate 参数非法：${parsed.error}` }
+      // 归属只在确定时使用；不确定 → 只查用户库（并在回执里明说）
+      const sessionId = call?.attribution === 'session' ? call.sessionId : undefined
       let stores: readonly TaggedStore[] | undefined
       try {
-        stores = deps.resolveStores()
+        stores = deps.resolveStores(sessionId)
       } catch (err) {
         return { kind: 'error', text: `omb_relate 无法解析记忆库：${messageOf(err)}` }
       }
@@ -447,7 +453,11 @@ export function createRelateTool(deps: RelateToolDeps): ToolDefinition {
       }
       const outcome = await walkGraph(stores, parsed.value, deps.limits ?? {})
       if (!outcome.ok) return { kind: 'error', text: `omb_relate 失败：${outcome.error}` }
-      return { kind: 'text', text: renderRelate(outcome.result) }
+      const unknownNote =
+        sessionId === undefined
+          ? '\n（归属未知：本次调用没有会话身份，**只查了用户库**——项目库的关联没有被检索。）'
+          : ''
+      return { kind: 'text', text: renderRelate(outcome.result) + unknownNote }
     },
   }
 }

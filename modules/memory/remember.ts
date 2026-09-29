@@ -32,6 +32,7 @@ import type {
   ToolOutcome,
 } from '../../kernel/abi/index.js'
 import { MEMORY_KINDS, MEMORY_SCOPES, RESERVED_SOURCE_PREFIX, SCOPE_BY_KIND } from '../../kernel/abi/index.js'
+import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 
 /** 工具名 = `MODULE_CATALOG` 里 `omb-memory` 的 tools 之一（目录是唯一契约）。 */
 export const REMEMBER_TOOL = 'omb_remember'
@@ -513,20 +514,21 @@ export interface MemoryWriteDeps {
    * 解析目标库。**可异步**：写入路径允许等库打开（读路径不行，它有延迟预算）。
    * 未就绪返回 undefined（**不抛**），工具据此给出可读错误。
    *
+   * `sessionId` 是**本次调用**的会话（`ToolCallContext.sessionId`，归属确定时才有）：
+   * 没有会话 → 调用方只给用户库，不猜"最近一个会话"的项目库。
+   *
    * `supersedes` 的旧条目可能在**另一个库**（如新条目落项目库、旧结论在用户库），
    * 因此本函数会被按两个作用域各问一次；实现必须能对任一作用域给出句柄或 undefined。
    */
-  readonly resolveStore: (scope: MemoryScope) => Promise<MemoryStore | undefined>
+  readonly resolveStore: (scope: MemoryScope, sessionId?: string) => Promise<MemoryStore | undefined>
   /** 时钟。模块层不读墙钟，一律由 `dsh/` 传 `kernel.clock`。 */
   readonly clock: Clock
-  /** 当前会话 id（来自回合事件）；用于默认 `sourceRef` 与"用户陈述"核对。 */
-  readonly currentSession?: () => string | undefined
-  /** 当前回合号；用于默认 `sourceRef`。 */
-  readonly currentTurn?: () => number | undefined
+  /** 某会话的回合号；用于默认 `sourceRef`（拿不到就退化成 `session:<id>`）。 */
+  readonly currentTurn?: (sessionId?: string) => number | undefined
   /** 会话里最近一条用户消息（宿主能力可得时提供；缺省即"自报未核对"）。 */
   readonly lastUserMessage?: () => string | undefined
-  /** 当前项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
-  readonly currentProject?: () => string | undefined
+  /** 某会话的项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
+  readonly currentProject?: (sessionId?: string) => string | undefined
   /**
    * **工件存在性核验**（准入判据的"可复现"靠它）。
    *
@@ -534,10 +536,13 @@ export interface MemoryWriteDeps {
    * `does-not-exist-9f3a.json` 这种编造的文件名与真实文件名得到同一个准入结论，
    * 字段却叫 `reproducible-artifact`。
    *
+   * `sessionId` 是本次调用的会话：核验基准目录应当是**这个会话**的 cwd，
+   * 而不是别的会话的（拿错 cwd 只会让核验更保守：判成不存在 → 不算依据）。
+   *
    * 缺省时**文件类工件一律不算依据**（fail closed）：宁可让用户补一个可核验的引用，
    * 也不要收下一条引用不存在工件的事实。
    */
-  readonly verifyArtifact?: (candidate: string, kind: ArtifactKind) => boolean | undefined
+  readonly verifyArtifact?: (candidate: string, kind: ArtifactKind, sessionId?: string) => boolean | undefined
   /**
    * 库未就绪时的可读原因（来自 `stores.status()`），拼进错误文本。
    */
@@ -804,22 +809,35 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
       '模糊印象与推测会被拒绝（会给出原因）。写入是即时生效的，不需要额外确认。',
     parameters,
 
-    async execute(args: unknown): Promise<ToolOutcome> {
+    async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       try {
         const parsed = rememberArgsSchema.safeParse(args)
         if (!parsed.success) {
           return { kind: 'error', text: `omb_remember 参数非法：${parsed.error.issues.map(i => i.message).join('；')}` }
         }
         const input = parsed.data
+        /**
+         * **本次调用**的会话（宿主 `exec.agent` → `ToolCallContext`）。
+         *
+         * 归属不确定时是 `undefined`：此时默认 `sourceRef` 也拿不到，
+         * 准入会如实弃权（"缺少来源引用"）——**不编造**一个别的会话的溯源。
+         */
+        const sessionId = call?.attribution === 'session' ? call.sessionId : undefined
 
         const scope: MemoryScope = input.scope ?? SCOPE_BY_KIND[input.kind]
-        const sourceRef = input.sourceRef ?? defaultSourceRef(deps.currentSession?.(), deps.currentTurn?.())
+        const sourceRef = input.sourceRef ?? defaultSourceRef(sessionId, deps.currentTurn?.(sessionId))
         const decision = decideAdmission({
           text: input.text,
           sourceRef: sourceRef ?? '',
           claimedUserAssertion: input.userAsserted === true,
           ...(deps.lastUserMessage?.() === undefined ? {} : { userMessage: deps.lastUserMessage?.() }),
-          ...(deps.verifyArtifact === undefined ? {} : { verifyArtifact: deps.verifyArtifact }),
+          // 核验基准目录用**本次调用的会话**（判据本身不变，只是把会话传进去）
+          ...(deps.verifyArtifact === undefined
+            ? {}
+            : {
+                verifyArtifact: (candidate: string, kind: ArtifactKind) =>
+                  deps.verifyArtifact?.(candidate, kind, sessionId),
+              }),
           // 自动生成的来源（`session:<uuid>#turn-N`）不算工件；显式给的才算。
           sourceRefExplicit: input.sourceRef !== undefined && input.sourceRef.length > 0,
         })
@@ -844,7 +862,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           }
         }
 
-        const store = await deps.resolveStore(scope)
+        const store = await deps.resolveStore(scope, sessionId)
         if (store === undefined) {
           const why = deps.degradeReason?.()
           return {
@@ -871,7 +889,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           supersededBy: null,
           lastUsedAt: now,
           useCount: 0,
-          project: deps.currentProject?.() ?? null,
+          project: deps.currentProject?.(sessionId) ?? null,
         }
 
         await store.put(record)
