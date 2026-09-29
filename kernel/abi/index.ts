@@ -64,6 +64,9 @@ export {
   SCOPE_BY_KIND,
   SERVICES,
   STATUS_TOOL,
+  catalogEntryOf,
+  derivedCapabilities,
+  derivedRequires,
   toolsServiceFor,
   validateCatalog,
 } from './catalog.js'
@@ -85,3 +88,18 @@ export type {
   ContextRenderInput,
 } from './host.js'
 export { RESIDENT_HINT_MAX } from './host.js'
+
+/**
+ * 会话运行态（归属与回合信封）。
+ *
+ * 类型住在实现文件 `kernel/sessionRuntime.ts` 而不是 `abi/` 里的独立类型文件，
+ * 是为了让"形状 + 不变式（不猜会话）"读在同一处；这里是**类型-only** 再导出，
+ * 不产生运行时依赖。
+ */
+export type {
+  SessionRuntime,
+  ToolCallContext,
+  TurnEnvelope,
+  TurnObservation,
+  TurnSource,
+} from '../sessionRuntime.js'

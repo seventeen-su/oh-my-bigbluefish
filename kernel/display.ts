@@ -122,6 +122,15 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     enDescription: 'Pushes a few noteworthy events to the host desktop notification service, throttled and deduplicated.',
     kind: 'module',
   },
+  {
+    rowId: 'omb-privacy',
+    packageName: '@omb/privacy',
+    zh: '隐私模式',
+    en: 'Privacy modes',
+    zhDescription: '一条斜杠命令控制记忆的读/写：read-only 可读不可写、sealed 不可读不可写。按会话生效、子代理继承、重启不丢，读不到状态时按最严兜底。',
+    enDescription: 'One slash command controls memory reads and writes per session (read-only / sealed), inherited by subagents, persisted across restarts, and fail-closed when the state cannot be read.',
+    kind: 'module',
+  },
 ]
 
 /** 按行 id 取显示元数据。 */
