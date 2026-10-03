@@ -29,7 +29,7 @@ import { cardById, residentHint } from '../../../modules/reasoning/methods.js'
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.3.0',
+    version: '3.4.0',
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health'],
     configSchema: { parse: () => ({}) },

@@ -146,7 +146,7 @@ describe('内核启动路径 —— 无 config 行不得让模块 failed（assem
   const memoryStub: ModuleRegistration<unknown> = {
     manifest: {
       id: 'omb-memory',
-      version: '3.3.0',
+      version: '3.4.0',
       requires: [],
       capabilities: [],
       configSchema: { parse: () => ({}) },

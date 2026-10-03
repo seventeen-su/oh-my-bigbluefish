@@ -22,7 +22,7 @@ import { VIEW_TOOLS } from '../../../modules/context/watch.js'
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.3.0',
+    version: '3.4.0',
     requires: [],
     capabilities: ['kernel.services'],
     configSchema: { parse: () => ({}) },
