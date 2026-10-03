@@ -55,13 +55,23 @@ function promptModule(name: string, contribution: PromptContribution): ModuleReg
   }
 }
 
-function fakeSystemPrompt(): { calls: unknown[]; context: (entry: unknown) => unknown } {
+function fakeSystemPrompt(): {
+  calls: unknown[]
+  context: (entry: unknown) => unknown
+  /** 宿主每轮装配上下文时取一次注入文本的那个入口。 */
+  text: (ctx?: unknown) => string
+} {
   const calls: unknown[] = []
   return {
     calls,
     context(entry: unknown) {
       calls.push(entry)
       return () => {}
+    },
+    text(ctx: unknown = {}) {
+      const entry = calls.at(-1) as { text?: (c: unknown) => string } | undefined
+      if (typeof entry?.text !== 'function') throw new Error('宿主没有拿到 text 回调——注入根本没注册')
+      return entry.text(ctx)
     },
   }
 }
@@ -311,6 +321,64 @@ describe('wirePromptInjection：超限留声，但不让插件加载失败', () 
     expect(entry).toContain('omb-aaa 104/104')
     expect(entry).toContain('omb-zzz 15/104')
 
+    dispose()
+  })
+
+  /**
+   * 账目从"装配时算一次"改成"每次渲染现算"（模块行由宿主**异步**挂载，
+   * 装配那一刻集合必然是空的——这正是整条提示链路曾经从未生效的根因）之后，
+   * 新的风险是**刷屏**：若不去重，一个超限配置会在每一轮装配、每次 `omb_status`
+   * 里各 warn 一次。告警是稀缺资源，刷屏等于没有告警——真正的新问题会被淹没。
+   *
+   * 契约：**同一份报告只 warn 一次，内容变了再报**。
+   */
+  it('超限只 warn 一次：同一份超限跨多次渲染不刷屏', () => {
+    const warn = vi.fn()
+    const h = createKernel({ logger: { debug() {}, info() {}, warn } })
+    const sp = fakeSystemPrompt()
+    const over = (): unknown[][] =>
+      warn.mock.calls.filter(call => String(call[0]).includes('超预算'))
+
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: () => OVER,
+      systemPrompt: sp,
+      clock: h.kernel.clock,
+    })
+
+    // 宿主每轮装配都要取一次注入文本；运维可能反复打开状态面
+    sp.text({}); sp.text({}); sp.text({})
+    h.status(); h.status()
+
+    expect(over()).toHaveLength(1)
+    expect(String(over()[0]?.[0])).toContain('omb-context')
+    dispose()
+  })
+
+  it('超限内容变了再报：去重按报告内容，不是"报过一次就永远闭嘴"', () => {
+    const warn = vi.fn()
+    const h = createKernel({ logger: { debug() {}, info() {}, warn } })
+    const sp = fakeSystemPrompt()
+    const over = (): unknown[][] =>
+      warn.mock.calls.filter(call => String(call[0]).includes('超预算'))
+    let current: readonly PromptContribution[] = OVER
+
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: () => current,
+      systemPrompt: sp,
+      clock: h.kernel.clock,
+    })
+
+    sp.text({})
+    expect(over()).toHaveLength(1)
+
+    // 又多了一个模块被挤出去：账目变了，必须再报一次——否则"变了"这件事没人知道
+    current = [...OVER, { id: 'omb-third', resident: 'z'.repeat(10) }]
+    sp.text({})
+
+    expect(over()).toHaveLength(2)
+    expect(String(over()[1]?.[0])).toContain('omb-third')
     dispose()
   })
 })
