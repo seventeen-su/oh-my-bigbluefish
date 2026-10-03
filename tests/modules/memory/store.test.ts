@@ -856,3 +856,95 @@ describe('MemoryStore：stats 与类型守卫', () => {
     ws.cleanup()
   })
 })
+
+/**
+ * 「待重建」是换嵌入器之后唯一的待办来源（`modules/memory/vector.ts` 的回填据此发起），
+ * 因此它的**判定**必须是可核对的：
+ * - 待重建 = **当前身份下没有向量的记忆**（不是"有多少行不属于当前身份"）；
+ * - 旧行保留（可查询、可换回原嵌入器），但不再计入待办——否则待办永远不清零，
+ *   每轮回填都会重编码同一批，读数变成噪音；
+ * - 列出必须**只取 id 且可分页**：回填的上界是条数，不是"把整个库的 BLOB 拉进内存"。
+ */
+describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', () => {
+  const vector = (overrides: Partial<Parameters<SqliteMemoryStore['putEmbedding']>[0]> = {}) => ({
+    memoryId: 'm1',
+    modelId: 'hash-bow-256',
+    dim: 256,
+    revision: '1',
+    vector: new Float32Array(256),
+    ...overrides,
+  })
+  const legacy = { modelId: 'hash-bow-256', dim: 256, revision: '1' } as const
+  const neural = { modelId: 'bge-small-zh-v1.5-512', dim: 512, revision: '1' } as const
+
+  it('待重建 = 当前身份下没有向量的记忆；重建后旧行仍在，但待办清零', async () => {
+    const { store, ws } = fixtureOf()
+    await store.putEmbedding(vector({ memoryId: 'm1' }))
+    expect(await store.countStaleEmbeddings(neural)).toBe(1)
+    expect(await store.listStaleEmbeddingIds(neural)).toEqual(['m1'])
+    // 当前身份自己的行不欠账
+    expect(await store.countStaleEmbeddings(legacy)).toBe(0)
+
+    await store.setEmbeddingMeta(neural)
+    await store.putEmbedding({ memoryId: 'm1', ...neural, vector: new Float32Array(neural.dim) })
+
+    expect(await store.countEmbeddings()).toBe(2) // 旧行**留着**（可查询、可换回）
+    expect(await store.countStaleEmbeddings(neural)).toBe(0) // 但待办已清零
+    expect(await store.listEmbeddings({ modelId: legacy.modelId })).toHaveLength(1)
+    ws.cleanup()
+  })
+
+  it('换修订号也算待重建（同模型不同 revision 不可比）', async () => {
+    const { store, ws } = fixtureOf()
+    await store.putEmbedding(vector({ memoryId: 'm1', revision: '1' }))
+    expect(await store.countStaleEmbeddings({ ...legacy, revision: '2' })).toBe(1)
+    // 同模型同修订（只是维度写错的情形由写入口拒绝）→ 不欠账
+    expect(await store.countStaleEmbeddings(legacy)).toBe(0)
+    ws.cleanup()
+  })
+
+  it('键集分页：按 memory_id 升序、`afterId` 之后取，取不满即到表尾；一条查询取回', async () => {
+    const { store, db, ws } = fixtureOf()
+    for (const id of ['m3', 'm1', 'm2']) await store.putEmbedding(vector({ memoryId: id }))
+
+    const before = snapshotCounters(db.counters)
+    const first = await store.listStaleEmbeddingIds(neural, { limit: 2 })
+    const spent = delta(db.counters, before)
+
+    expect(first).toEqual(['m1', 'm2'])
+    expect(spent.all).toBe(1) // 一次 SQL（不是每 id 一次），且**只取 id**（不读 BLOB）
+    expect(await store.listStaleEmbeddingIds(neural, { afterId: 'm2', limit: 2 })).toEqual(['m3'])
+    expect(await store.listStaleEmbeddingIds(neural, { afterId: 'm3', limit: 2 })).toEqual([])
+    expect(await store.countStaleEmbeddings(neural)).toBe(3)
+    ws.cleanup()
+  })
+
+  it('回收：deleteStaleEmbeddings 只删**非当前身份**的行，当前身份的行一字不动', async () => {
+    const { store, ws } = fixtureOf()
+    await store.putEmbedding(vector({ memoryId: 'm1' })) // 旧身份
+    await store.setEmbeddingMeta(neural)
+    await store.putEmbedding({ memoryId: 'm1', ...neural, vector: new Float32Array(neural.dim) })
+
+    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(1)
+    const rows = await store.getEmbeddings(['m1'])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.modelId).toBe(neural.modelId)
+    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(0) // 幂等：再删 0 行
+    expect(await store.deleteStaleEmbeddings([], neural)).toBe(0)
+    ws.cleanup()
+  })
+
+  it('待重建查询的身份非法 → 明确拒绝（不返回"0 条"这种看起来正常的假读数）', async () => {
+    const { store, ws } = fixtureOf()
+    await expect(store.countStaleEmbeddings({ modelId: '', dim: 256, revision: '1' })).rejects.toThrow(
+      /model_id/,
+    )
+    await expect(store.listStaleEmbeddingIds({ modelId: 'x', dim: 0, revision: '1' })).rejects.toThrow(
+      /维度非法/,
+    )
+    await expect(store.deleteStaleEmbeddings(['m1'], { modelId: 'x', dim: 4, revision: '' })).rejects.toThrow(
+      /revision/,
+    )
+    ws.cleanup()
+  })
+})

@@ -2,10 +2,18 @@
  * 向量通道模块入口（`omb-memory-vector`）。
  *
  * 这是一个**可关模块**（规划 §5.7）：关掉它 → 检索退化为**完整的纯词法版本**。
- * 因此本模块只做三件事，且都不改动词法路径：
+ * 因此本模块只做四件事，且都不改动词法路径：
  * ① 把嵌入器注册为内核服务 `embedder`（`SERVICES.embedder`，见 `kernel/abi/catalog.ts`）；
  * ② 尝试装载 BGE-small-zh ONNX，失败则留在**哈希词袋**这条诚实降级路径上；
- * ③ 把"当前通道 + 降级原因"写进 `health()` 与状态面贡献（无空降级）。
+ * ③ 把"当前通道 + 降级原因"写进 `health()` 与状态面贡献（无空降级）；
+ * ④ **回合边界的陈旧向量回填**：换嵌入器后，库里"当前身份下没有向量"的记忆被重新编码
+ *    （有上界、可重入、不阻塞回合、嵌入器不可用时停住）。见 `scanRebuild` 与 `encodePending`。
+ *
+ * ④ 存在的理由（缺陷 A）：归属标签（`model_id`/`dim`/`revision`）让换嵌入器后的旧向量
+ * **不再参与检索**（`store.ts:172`），而唯一的编码入口只由 `memory/written` 喂——
+ * 也就是**只编码新写入的记忆**。于是把兜底的 `hash-bow-256` 换成真正的
+ * `bge-small-zh-v1.5-512` 时，全部存量向量一夜之间失效且**永远不会被重建**：
+ * 检索不报错（词法通道还在），只是向量通道对旧记忆静默返回空。
  *
  * **同步注册（热插拔 H-2）**：`apply` 里 `kernel.provide` / `statusRegistry.register` 必须同步完成
  * ——宿主挂载审计只查一次，返回后再注册会触发进程级失败告警。而 ONNX 的装载是异步的，
@@ -40,7 +48,7 @@ import {
   type StoresService,
   type VectorAttribution,
 } from '../../kernel/abi/index.js'
-import { HASH_BOW_COSINE_FLOOR, blobDecodeFailureCount, hashBagEmbedder } from './embed.js'
+import { HASH_BOW_COSINE_FLOOR, blobDecodeFailureCount, checkEmbedderCompat, hashBagEmbedder } from './embed.js'
 import {
   BGE_COSINE_FLOOR,
   BGE_EMBEDDER_ID,
@@ -50,7 +58,12 @@ import {
   type OnnxLoad,
 } from './onnx.js'
 import type { ChannelQuery, RetrievalChannel } from './retrieve.js'
-import { asVectorStore, type VectorStoreApi } from './store.js'
+import {
+  asMemoryStore,
+  asVectorStore,
+  type EmbeddingMeta,
+  type VectorStoreApi,
+} from './store.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 /** 模块 id = `cordis.patch.yml` 行 id = 插件页开关 id（`kernel/abi/catalog.ts`）。 */
@@ -65,6 +78,17 @@ export const EMBEDDER_SERVICE = SERVICES.embedder
 export const VECTOR_ENCODER_SERVICE = SERVICES.vectorEncoder
 /** 待编码队列的默认上界（`maxPending` 配置的缺省值）。 */
 export const DEFAULT_MAX_PENDING = 256
+/**
+ * 一次回合边界最多把多少条**待重建**（陈旧）向量放进队列（`maxBackfill` 配置的缺省值）。
+ *
+ * 为什么有上界而不是"一次重建全库"：换嵌入器后整个库都成了待重建，一次全塞进队列意味着
+ * ① 一次 `getMany` 把整库正文拉进内存 ② 单次 `embed` 批过大而卡住事件循环。
+ *
+ * 为什么取 32（= 宿主每回合的编码预算，`dsh/session.ts:635` 传 32）：**扫描上界大于它不会更快**——
+ * 每回合真正编码多少由那次 `encodePending(limit)` 决定。多塞的只会堆在队列里，
+ * 让新写入更容易撞上"队满丢最旧"，而吞吐一模一样。
+ */
+export const DEFAULT_MAX_BACKFILL = 32
 
 /**
  * 配置 schema（缺省值必须完整：`apply` 永远收到完整配置）。
@@ -91,6 +115,22 @@ export const vectorConfigSchema = z.preprocess(
      * 写入多、冲刷慢时队列不能无界增长：超界丢**最旧**的并计数（可见，不静默）。
      */
     maxPending: z.number().int().positive().default(DEFAULT_MAX_PENDING),
+    /**
+     * 一次回合边界最多让多少条**待重建**（陈旧）向量入队（默认 {@link DEFAULT_MAX_BACKFILL}）。
+     *
+     * 上界同时受 `maxPending` 的**余量**约束：回填只填空位，绝不挤掉"写了但还没落盘"的写入
+     * （那些条目丢了就没有第二次机会，而回填条目丢了下一遍扫描会重新列出）。
+     */
+    maxBackfill: z.number().int().positive().default(DEFAULT_MAX_BACKFILL),
+    /**
+     * 是否允许**降级通道**（哈希词袋）发起回填。默认 **false**。
+     *
+     * 回填的第一步是把库的嵌入器归属切到当前身份，老向量随之不再参与检索。
+     * ONNX 装不上时当前身份就是哈希词袋——自动切过去等于用"字符匹配"替换库里的语义向量，
+     * 而且会在权重"忽有忽无"之间反复改写。默认停住并把原因写在状态面上；
+     * 真要把库降到兜底空间，那是使用者的显式决定（开这个开关）。
+     */
+    allowFallbackRebuild: z.boolean().default(false),
   }),
 )
 
@@ -116,6 +156,93 @@ export interface VectorEncoderStats {
   /** 被库拒绝的写入数（如归属不符）——重试不会成功，故出队并计数。 */
   readonly rejected: number
   readonly lastReason: string | null
+  /** 陈旧向量回填的读数（见 {@link VectorRebuildStats}）。 */
+  readonly rebuild: VectorRebuildStats
+}
+
+/**
+ * 陈旧向量回填的读数。**每个字段都回答一个具体问题**（这块读数存在的理由见本文件头部 ④）：
+ * 还有多少条记忆的向量通道是空的、已经补上多少、失败多少、这一刻为什么没在补。
+ */
+export interface VectorRebuildStats {
+  /**
+   * **待重建**条数：当前身份下没有向量的记忆（= 向量通道对它们恒返回空）。
+   *
+   * `null` = 尚未测量（本进程还没完成一次回填统计），**不是零**——一次都没扫过时报 0
+   * 会把"没测"说成"没有"（本仓库的硬规矩，见 `status-honesty.test.ts`）。
+   */
+  readonly stale: number | null
+  /**
+   * `stale` 是不是**这一刻在库上重算出来的**。
+   *
+   * `false` 表示它来自本轮回填的记账（周期开始时的实测基准减去已完成的量）：数字仍然精确，
+   * 但它不是"刚刚又扫了一遍库"。状态面据此说清这个数是怎么来的——否则"0"会同时意味着
+   * "刚刚扫过，确实没有"和"上次扫过是 0，之后一直没再看"，那是两种不同的事实。
+   */
+  readonly staleFromScan: boolean
+  /** 累计已重建（陈旧向量重新编码并落盘）的条数。 */
+  readonly rebuilt: number
+  /** 累计重建失败（整批编码抛错或单条写入被拒）；陈旧行仍在库里，下一轮/下一遍再试。 */
+  readonly failures: number
+  /**
+   * 累计回收的残留向量行数（正文已不存在 → 那些行没有消费者）。
+   * 这些条目的"跳过"同时计入 `skipped`（队列口径 = 逐条处理结果）。
+   */
+  readonly scavenged: number
+  /** 非 null = 这一刻没有在回填，值是可读原因（"为什么没在回填"必须能回答）。 */
+  readonly blocked: string | null
+}
+
+/**
+ * 待编码队列的条目。
+ *
+ * `rebuildFrom` 非空 = 这条是**陈旧回填**（不是新写入）：值是列出它的那个库，
+ * 正文已不存在时据此回收残留向量行（`store.ts` 的 `deleteStaleEmbeddings`）。
+ * 两者分开计数——"落盘了多少新写入"与"补回了多少旧记忆"不是同一个数字。
+ */
+interface PendingEntry {
+  readonly scope: MemoryScope | null
+  readonly rebuildFrom: VectorStoreApi | null
+}
+
+/** 回填扫描看到的一个库：去重后的向量面 + 身份键 + 可读标签。 */
+interface VectorStoreRef {
+  /** 库身份（库文件路径）：游标与去重都按它。 */
+  readonly key: string
+  readonly scope: MemoryScope
+  readonly api: VectorStoreApi
+  /** 可读标签（写进原因与状态面时用，别让使用者对着一串 hex 猜）。 */
+  readonly label: string
+}
+
+/**
+ * 枚举"已打开库"里的向量面，**按库去重**。
+ *
+ * 为什么必须去重：`snapshot()` 里每个项目套件都**同时含用户库**（`store.ts:1733` 的
+ * `projectSet` 会把用户库一起放进 `stores`），不去重就会对着同一个库扫两遍——
+ * 待重建数翻倍、游标互相覆盖（状态面显示"待重建 200 条"而实际只有 100）。
+ *
+ * 身份键用**库文件路径**而不是作用域：作用域只有 `user`/`project` 两个值，
+ * 同时打开多个项目库时它们会共用一个游标（一个库扫完把另一个库的进度顶掉）。
+ */
+function vectorStoreRefs(sets: readonly StoreSet[]): readonly VectorStoreRef[] {
+  const seen = new Set<string>()
+  const refs: VectorStoreRef[] = []
+  for (const set of sets) {
+    for (const scope of MEMORY_SCOPES) {
+      const target = set.store(scope)
+      if (target === undefined) continue
+      const api = asVectorStore(target)
+      if (api === undefined) continue
+      // 库路径要经 `asMemoryStore`：`asVectorStore` 只承诺向量面，路径是诊断字段。
+      // 隐私闸门视图是 `Object.create(inner)`（同一条原型链），因此这里照常命中。
+      const key = asMemoryStore(target)?.dbPath ?? `${set.projectScope ?? 'user'}\u0000${scope}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      refs.push({ key, scope: target.scope, api, label: `${target.scope} 库（${key}）` })
+    }
+  }
+  return refs
 }
 
 /**
@@ -126,14 +253,20 @@ export interface VectorEncoderStats {
  * 因此写入只**入队**（`memory/written`），编码由 `dsh/` 在回合边界调 `encodePending()` 批量做。
  */
 export interface VectorEncoder {
-  /** 待编码条目数。 */
+  /** 待编码条目数（新写入 + 已入队的待重建）。 */
   pending(): number
   /**
-   * 批量冲刷：`getMany` 读文本（**禁 N+1**）→ `embed` **一次批编码** → 逐条落盘。
+   * 回合边界入口，两件事（`dsh/` 只在回合边界调这一个方法，见 `dsh/session.ts:736`）：
    *
-   * 归属标签取**当前嵌入器身份**（`modelId`/`dim`/`revision`），库侧会拒绝不符的写入。
-   * 无嵌入器 / 库不支持向量 / 编码失败 → 返回可读 `reason` 且**保留队列**（下次再试）；
-   * 文本为空或记录已不存在 → 跳过并计数；被库拒绝的单条 → 出队并计数（重试不会成功）。
+   * ① **冲刷**：`getMany` 读文本（**禁 N+1**）→ `embed` **一次批编码** → 逐条落盘。
+   *    归属标签取**当前嵌入器身份**（`modelId`/`dim`/`revision`），库侧会拒绝不符的写入。
+   *    无嵌入器 / 库不支持向量 / 编码失败 → 返回可读 `reason` 且**保留队列**（下次再试）；
+   *    文本为空或记录已不存在 → 跳过并计数；被库拒绝的单条 → 出队并计数（重试不会成功）。
+   * ② **回填扫描**：把库里"当前身份下没有向量"的记忆按 `maxBackfill` 放进同一个队列，
+   *    下一轮由 ① 编码——这样陈旧向量与普通写入走**同一条**批通路，不另起并发编码。
+   *
+   * 不阻塞回合：两件事都在本方法内，没有额外定时器/循环；签名与返回结构未变
+   * （宿主侧 `flushVectorEncoder` 不知道回填的存在，因此不必改它）。
    */
   encodePending(limit?: number): Promise<VectorEncodeOutcome>
   stats(): VectorEncoderStats
@@ -289,6 +422,15 @@ function channelMetrics(
     encodeFailures: enc.failures,
     encodeRejected: enc.rejected,
     encodeDropped: enc.dropped,
+    // 回填读数：换嵌入器之后"有多少条记忆的向量通道是空的"必须是一个数字，
+    // 而不是一句"检索没报错"。`-1` = 尚未测量（**不是零**：没测过与测到 0 必须能区分）。
+    staleEmbeddings: enc.rebuild.stale ?? -1,
+    /** 这个数是不是刚刚在库上重算的（0 = 本轮回填记账，1 = 本回合实测）。 */
+    staleFromScan: enc.rebuild.staleFromScan ? 1 : 0,
+    rebuiltEmbeddings: enc.rebuild.rebuilt,
+    rebuildFailures: enc.rebuild.failures,
+    rebuildScavenged: enc.rebuild.scavenged,
+    rebuildBlocked: enc.rebuild.blocked === null ? 0 : 1,
     // 损坏 BLOB 计数：让"某条记忆就是搜不到"变成可读数字（旧实现静默返回 null）。
     blobDecodeFailures: blobDecodeFailureCount(),
   }
@@ -461,11 +603,13 @@ function baseHealth(
 }
 
 /**
- * 健康面 = 装载期状态（`baseHealth`）+ **检索期**降级 + **落盘期**读数。
+ * 健康面 = 装载期状态（`baseHealth`）+ **检索期**降级 + **落盘期**读数 + **回填期**读数。
  *
- * 两类运行期问题都必须显式呈现（而不是被"通道可用"盖住）：
+ * 三类运行期问题都必须显式呈现（而不是被"通道可用"盖住）：
  * ① 通道选型正常但某次检索返回空（语义召回实际没发生）；
- * ② 待编码队列积压或被拒（记忆写进去了却没有向量 → `searchVector` 结构上查不到）。
+ * ② 待编码队列积压或被拒（记忆写进去了却没有向量 → `searchVector` 结构上查不到）；
+ * ③ **问得出多少条记忆在当前嵌入器下没有向量**（换嵌入器之后的存量失效——
+ *    这是"检索不报错但什么都搜不到"的根源，必须是一个可读数字而不是一片沉默）。
  */
 function renderHealth(
   state: VectorChannelState,
@@ -484,6 +628,21 @@ function renderHealth(
     degraded = true
   }
   if (enc.pending > 0) notes.push(`待编码 ${enc.pending} 条（回合边界由 dsh 冲刷）`)
+  const rb = enc.rebuild
+  if (rb.stale !== null && rb.stale > 0) {
+    notes.push(
+      `陈旧待重建 ${rb.stale} 条（这些记忆在当前嵌入器下没有向量，向量通道对它们为空；` +
+        `${rb.staleFromScan ? '本回合在库上实测' : '本轮回填记账'}）`,
+    )
+    if (rb.blocked !== null) {
+      // 待办还在、而回填**停着**：那是一个会一直存在的状态，健康面不能报"正常"
+      notes.push(`回填停住：${rb.blocked}`)
+      degraded = true
+    }
+  } else if (rb.stale === null && rb.blocked !== null) {
+    // 测不出来 ≠ 没有问题：原因照写，但不据此判降级（那是拿没测到的东西下结论）
+    notes.push(`回填未测量：${rb.blocked}`)
+  }
   if (notes.length === 0) return base
   return {
     state: base.state === 'failed' ? 'failed' : degraded ? 'degraded' : base.state,
@@ -491,7 +650,6 @@ function renderHealth(
     metrics: base.metrics,
   }
 }
-
 /**
  * 状态面段落。**多行、可读、含原因**——`omb_status` 会原样拼接。
  * 为什么需要它：内核 `start()` 在 `apply` 之后会写入一句通用的"模块已启动"，
@@ -525,6 +683,22 @@ function renderStatus(
     `向量落盘：待编码 ${enc.pending} 条；已编码 ${enc.encoded}；跳过 ${enc.skipped}；` +
       `失败 ${enc.failures}（其中被拒 ${enc.rejected}）；超界丢弃 ${enc.dropped}`,
   )
+  // 回填读数：**"尚未测量"与"0 条"必须看着不一样**（前者是本进程还没统计过，后者是统计过且确实没有）；
+  // 同样，"刚刚重算的 0"与"上轮统计后的记账值"也要看着不一样——否则同一个 0 会同时意味着两件事。
+  // 换嵌入器之后这块数字就是"向量通道对多少条记忆是空的"，是缺陷 A 唯一可见的形态。
+  const rb = enc.rebuild
+  const staleText =
+    rb.stale === null
+      ? '尚未测量（本进程还没有完成一次回填统计）'
+      : rb.staleFromScan
+        ? `${rb.stale} 条（本回合在库上实测）`
+        : rb.stale === 0
+          ? '0 条（已对齐：最近一次统计未发现待重建，此后嵌入器身份未变）'
+          : `${rb.stale} 条（本轮回填记账：实测基准减去已完成的量）`
+  lines.push(
+    `向量回填：待重建 ${staleText}；已重建 ${rb.rebuilt}；失败 ${rb.failures}；回收残留 ${rb.scavenged} 行`,
+  )
+  if (rb.blocked !== null) lines.push(`回填停住：${rb.blocked}`)
   if (enc.lastReason !== null) lines.push(`落盘最近原因：${enc.lastReason}`)
   if (current !== undefined) lines.push(`余弦下限：${cosineFloorFor(current)}（按当前嵌入器标定）`)
   lines.push(`损坏 BLOB（解码失败计数）：${blobDecodeFailureCount()}`)
@@ -588,20 +762,55 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
   // `memory/written` 回调里**只入队**；编码在 `encodePending()` 里批量做。
   // 为什么不在回调里编码：嵌入是一次真实推理（ONNX 毫秒级，且原生绑定阻塞事件循环），
   // 把它压进写入路径会让每次记忆写入都变慢——而写入路径的正确性并不依赖向量。
-  /** 队列：`Map` 保序 + 去重；值 = 事件声明的作用域（无法识别 → null，冲刷时两个作用域都试）。 */
-  const queue = new Map<string, MemoryScope | null>()
+  /** 队列：`Map` 保序 + 去重；值 = 来源（事件声明的作用域或"待重建"及其来源库）。 */
+  const queue = new Map<string, PendingEntry>()
   let maxPending = DEFAULT_MAX_PENDING
+  let maxBackfill = DEFAULT_MAX_BACKFILL
+  let allowFallbackRebuild = false
   let droppedOldest = 0
   let encodedTotal = 0
   let skippedTotal = 0
   let failureTotal = 0
   let rejectedTotal = 0
   let lastEncodeReason: string | null = null
+  // ── 陈旧回填读数（"还有多少条待重建 / 补回多少 / 失败多少 / 为什么停住"） ──
+  let rebuiltTotal = 0
+  let rebuildFailureTotal = 0
+  let scavengedTotal = 0
+  /**
+   * 回填的**周期记账**：周期开始时的实测基准 + 本周期已从"待重建"里移除的条数。
+   *
+   * 为什么不每回合都去库上重算"待重建多少条"：那个查询要在整表上逐行判定归属，
+   * 而 `embedding` 行的负载是 1~2KB 的向量 BLOB——实测 1 万条 ≈ 200~400ms，且随库线性增长。
+   * 每回合都跑一次，等于给会话挂上一个随记忆增长的常数；而**回填是后台增益，不该有这个代价**。
+   *
+   * 记账是精确的：重建成功让那条记忆多了一条当前身份的行（待重建 −1），
+   * 回收把没有正文的残留行删掉（待重建 −1），失败不减（它仍然是待重建）。
+   * 于是"基准 − 已完成"就是此刻库里的待重建条数，归零即**对齐**（此后不再碰库）。
+   * 身份一变（换模型/换维度/换修订）整个集合就变了 → 基准作废，下回合重新实测。
+   * 唯一测不到的情形是**别的进程**在同一时间改这个库：那会在下一次身份变化或重启时被重新实测纠正
+   * （本进程的回填不会因此写错东西，只是读数需要一次重测）。
+   */
+  let staleBase: number | null = null
+  let staleDone = 0
+  /** 本回合是否真的在库上重算过基准（`staleFromScan` 的来源；不参与记账）。 */
+  let staleFromScan = false
+  let rebuildBlocked: string | null = null
+  /** 回填游标：库身份（库文件路径）→ 上次扫到的 `memory_id`（键集分页，避免整表入内存）。 */
+  const rebuildCursors = new Map<string, string>()
+  /** 游标与基准对应的嵌入器身份；身份一变（换模型/换修订/换维度）两者一起作废。 */
+  let rebuildCursorIdentity: string | null = null
+  /** 冲刷重入闸：两次冲刷并行会让"已重建"翻倍计数、同一条被编码两次（读数因此说谎）。 */
+  let flushing = false
   /** apply 装上的内核句柄（冲刷时解析嵌入器与库）；卸载后置空。 */
   let kernelRef: Kernel | undefined
   let installedEncoder: VectorEncoder | undefined
 
   const health = (): ModuleHealth => renderHealth(state, installed, encoderStats())
+
+  /** 本轮的待重建读数：未测过 → null（**不是零**）；否则 = 实测基准 − 已完成。 */
+  const staleRemaining = (): number | null =>
+    staleBase === null ? null : Math.max(0, staleBase - staleDone)
 
   const encoderStats = (): VectorEncoderStats => ({
     pending: queue.size,
@@ -611,13 +820,21 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     dropped: droppedOldest,
     rejected: rejectedTotal,
     lastReason: lastEncodeReason,
+    rebuild: {
+      stale: staleRemaining(),
+      staleFromScan,
+      rebuilt: rebuiltTotal,
+      failures: rebuildFailureTotal,
+      scavenged: scavengedTotal,
+      blocked: rebuildBlocked,
+    },
   })
 
   const isMemoryScope = (value: string): value is MemoryScope =>
     (MEMORY_SCOPES as readonly string[]).includes(value)
 
   /**
-   * 入队（去重、保序、超界丢最旧并计数）。
+   * 新写入入队（去重、保序、超界丢最旧并计数）。
    * **纯内存操作**：不做 I/O、不编码——这是"写入路径不变慢"的全部机制。
    */
   const enqueueWritten = (payload: { readonly id: string; readonly scope: string }): void => {
@@ -630,16 +847,73 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       queue.delete(oldest)
       droppedOldest += 1
     }
-    queue.set(id, isMemoryScope(payload.scope) ? payload.scope : null)
+    queue.set(id, { scope: isMemoryScope(payload.scope) ? payload.scope : null, rebuildFrom: null })
+  }
+
+  /**
+   * 回填条目入队：**绝不挤掉待落盘的写入**。
+   *
+   * 与 `enqueueWritten` 的关键差别是超界时**放弃入队**而不是丢最旧：
+   * 队列里最旧的那些是"记忆写进去了却还没有向量"的待办，丢掉它们没有第二次机会
+   * （没有任何地方会重新入队）；而回填条目丢了毫无损失——向量行仍是待重建的，
+   * 下一遍扫描会重新列出（幂等、可重入正是靠这个性质）。
+   */
+  const enqueueRebuild = (id: string, scope: MemoryScope | null, from: VectorStoreApi): boolean => {
+    if (typeof id !== 'string' || id.length === 0) return false
+    if (queue.has(id)) return false
+    if (queue.size >= maxPending) return false
+    queue.set(id, { scope, rebuildFrom: from })
+    return true
+  }
+
+  /**
+   * 把各库声明的嵌入器归属切到当前身份（幂等：已一致时一个字节都不写）。
+   *
+   * 调用点只有一处：**本批编码成功之后、落盘之前**（见 `flushQueue` 的 ③.5）。
+   * 库侧 `setEmbeddingMeta` 会数出因此成为待重建的条数并记日志（`store.ts:704`），
+   * 那是切换的唯一记录点，这里不重复报一遍。
+   *
+   * 失败不致命：单条落盘会照常被拒并计数（原因可读），**绝不吞、也绝不抛**——
+   * 切换是后台增益的前置条件，不该让一次冲刷整体失败。
+   */
+  const alignEmbeddingMeta = async (
+    apis: readonly VectorStoreApi[],
+    embedder: Embedder,
+  ): Promise<void> => {
+    const current: EmbeddingMeta = {
+      modelId: embedder.id,
+      dim: embedder.dimensions,
+      revision: embedder.revision,
+    }
+    const seen = new Set<VectorStoreApi>()
+    for (const api of apis) {
+      if (seen.has(api)) continue
+      seen.add(api)
+      try {
+        const meta = await api.embeddingMeta()
+        // 未声明（meta 行缺失/为空）：首次落盘会自行声明身份，这里不必也不能代劳
+        if (meta === null) continue
+        // 复用 `embed.ts` 的兼容判定：三个字段（dim/model/revision）的**同一个**真源，
+        // 免得"什么算同一个向量空间"在这里再写一遍、并且写得不一样
+        const compat = checkEmbedderCompat(meta, embedder)
+        if (compat.ok) continue
+        await api.setEmbeddingMeta(current)
+      } catch (error) {
+        lastEncodeReason = `切换嵌入器归属失败（${messageOf(error)}）——本批按原归属落盘，原因见库侧拒绝`
+      }
+    }
   }
 
   /**
    * 批量冲刷待编码队列：`getMany`（每库一次）→ `embed`（**一次**，N 条不是 N 次）→ 逐条落盘。
    *
+   * 队列里可能是两种条目：新写入（`memory/written`）与**待重建**（陈旧回填），两者的编码通路
+   * 完全一样——这正是"复用既有批处理通路"的含义（另起一套并发编码必然与这一套漂移）。
+   *
    * 归属标签取当前嵌入器身份，库侧会拒绝不符的写入（D2：写入时拒绝无法归属的向量）。
    * 绝不抛：整批失败给 `reason` 且**保留队列**；单条被库拒绝则出队并计数（重试不会成功）。
    */
-  const encodePending = async (limit?: number): Promise<VectorEncodeOutcome> => {
+  const flushQueue = async (limit?: number): Promise<VectorEncodeOutcome> => {
     const kernel = kernelRef
     const nothing = (reason?: string): VectorEncodeOutcome => ({
       encoded: 0,
@@ -655,6 +929,11 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     const embedder = kernel.service<Embedder>(EMBEDDER_SERVICE)
     if (embedder === undefined) {
       return nothing('嵌入器服务不可用（omb-memory-vector 未启动）；待编码队列保留')
+    }
+    const currentIdentity: EmbeddingMeta = {
+      modelId: embedder.id,
+      dim: embedder.dimensions,
+      revision: embedder.revision,
     }
     const sets = resolveStoreSets(kernel)
     if (sets.length === 0) {
@@ -681,8 +960,8 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         if (api !== undefined) vectorCapable = true
         const ids = batch
           .filter(
-            ([id, queuedScope]) =>
-              !found.has(id) && (queuedScope === null || queuedScope === scope),
+            ([id, entry]) =>
+              !found.has(id) && (entry.scope === null || entry.scope === scope),
           )
           .map(([id]) => id)
         if (ids.length === 0) continue
@@ -699,10 +978,43 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     const uncoveredScopes = (): readonly MemoryScope[] => [
       ...new Set(
         batch
-          .map(([, queuedScope]) => queuedScope)
+          .map(([, entry]) => entry.scope)
           .filter((scope): scope is MemoryScope => scope !== null && !coveredScopes.has(scope)),
       ),
     ]
+
+    /**
+     * 回填条目"正文已不存在"的登记与回收。
+     *
+     * 为什么必须回收而不是留在表里：待重建的判定是"当前身份下没有向量的记忆"
+     * （`store.ts` 的 `countStaleEmbeddings`），没有正文的行永远重建不出来——
+     * 留着它们，同一批 id 会每轮被重新列出、重新入队、再被跳过：待办数永远不清零，
+     * 真正的积压反而看不见（读数变成噪音）。
+     * 只删**非当前身份**的行（`deleteStaleEmbeddings` 的谓词），因此绝不会删掉刚写好的新向量。
+     * 先登记、循环结束后**按库一次删完**（与读取侧同一条规矩：禁 N+1）。
+     */
+    const goneByStore = new Map<VectorStoreApi, string[]>()
+    const markGone = (api: VectorStoreApi, id: string): void => {
+      const ids = goneByStore.get(api)
+      if (ids === undefined) goneByStore.set(api, [id])
+      else ids.push(id)
+    }
+    const scavengeGone = async (): Promise<void> => {
+      for (const [api, ids] of goneByStore) {
+        try {
+          scavengedTotal += await api.deleteStaleEmbeddings(ids, currentIdentity)
+          // 记账：这些 id 不再"在当前身份下缺向量"（回收按**条**算，不按删掉的行数）
+          staleDone += ids.length
+        } catch (error) {
+          // 回收失败 → 这些 id 会一直被列为待重建：计数一次失败，别让它们静默地烂在那里
+          rebuildFailureTotal += 1
+          lastEncodeReason =
+            `回收残留向量失败（${ids.length} 条）：${messageOf(error)}；它们会一直被列为待重建`
+        }
+      }
+      goneByStore.clear()
+    }
+
     if (found.size === 0) {
       if (hydrateError !== null) return nothing(`${hydrateError}；待编码队列保留`)
       if (!vectorCapable) return nothing('库不支持向量写入（asVectorStore 未命中）；待编码队列保留')
@@ -712,20 +1024,23 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
           `库尚未就绪（${pendingScopes.join('、')} 作用域的库还没打开）；待编码队列保留`,
         )
       }
-      // 记录已不存在（被删除）：出队并计数——既不是失败，也不是可重试的状态
+      // 整批记录都已不存在：出队并计数——既不是失败，也不是可重试的状态
+      const gone = batch.filter(([, entry]) => entry.rebuildFrom !== null)
       for (const [id] of batch) queue.delete(id)
+      for (const [id, entry] of gone) if (entry.rebuildFrom !== null) markGone(entry.rebuildFrom, id)
+      await scavengeGone()
       skippedTotal += batch.length
       return { encoded: 0, skipped: batch.length, failures: 0 }
     }
 
     // ② 分类：空文本 / 无向量口 → 跳过；其余待编码
-    const encodable: { id: string; text: string; api: VectorStoreApi }[] = []
+    const encodable: { id: string; text: string; api: VectorStoreApi; rebuild: boolean }[] = []
     const queuedScopeOf = new Map(batch)
     let skipped = 0
-    for (const [id] of batch) {
+    for (const [id, entry] of batch) {
       const hit = found.get(id)
       if (hit === undefined) {
-        const queuedScope = queuedScopeOf.get(id) ?? null
+        const queuedScope = queuedScopeOf.get(id)?.scope ?? null
         if (queuedScope !== null && !coveredScopes.has(queuedScope)) {
           // 该条所在作用域的库还没打开（例如项目库晚于用户库就绪）→ 不是"已删除"，保留重试
           callReason = `库尚未就绪（${queuedScope} 作用域的库还没打开）；待编码队列保留`
@@ -734,11 +1049,16 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         }
         queue.delete(id) // 库里确实没有这条（已删除）
         skipped += 1
+        // 正文没了 → 残留向量行没有消费者（换回原嵌入器也搜不出东西：检索要 JOIN memory）
+        if (entry.rebuildFrom !== null) markGone(entry.rebuildFrom, id)
         continue
       }
       if (hit.record.text.trim().length === 0) {
-        queue.delete(id) // 空文本没有可编码的内容
+        queue.delete(id) // 空文本没有可编码的内容（上面就是这个既定语义）
         skipped += 1
+        // 同一个判定对回填条目也成立：这条正文**永远不会有**当前身份的向量，
+        // 留着它只会让"待重建"永远挂在计数里 —— 回收它。
+        if (entry.rebuildFrom !== null) markGone(entry.rebuildFrom, id)
         continue
       }
       if (hit.api === undefined) {
@@ -749,8 +1069,14 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         lastEncodeReason = callReason
         continue
       }
-      encodable.push({ id, text: hit.record.text, api: hit.api })
+      encodable.push({
+        id,
+        text: hit.record.text,
+        api: hit.api,
+        rebuild: entry.rebuildFrom !== null,
+      })
     }
+    await scavengeGone()
 
     // ③ 一次批编码（N 条 → 一次 embed）
     let vectors: readonly Float32Array[] = []
@@ -759,22 +1085,50 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         vectors = await embedder.embed(encodable.map((entry) => entry.text))
       } catch (error) {
         failureTotal += encodable.length
+        rebuildFailureTotal += encodable.filter((entry) => entry.rebuild).length
         lastEncodeReason = `编码失败（${messageOf(error)}）；待编码队列保留`
         reportHealth?.()
         return { encoded: 0, skipped, failures: encodable.length, reason: lastEncodeReason }
       }
       if (vectors.length !== encodable.length) {
         failureTotal += encodable.length
+        rebuildFailureTotal += encodable.filter((entry) => entry.rebuild).length
         lastEncodeReason =
           `嵌入器 ${embedder.id} 返回 ${vectors.length} 条向量、期望 ${encodable.length} 条；` +
           '待编码队列保留'
         reportHealth?.()
         return { encoded: 0, skipped, failures: encodable.length, reason: lastEncodeReason }
       }
+
+      /**
+       * ③.5 **身份对齐**：编码成功之后、落盘之前，把各库的嵌入器归属切到当前身份。
+       *
+       * 为什么必须正好在这个位置（三个约束同时成立）：
+       * ① 不切 → `putEmbedding` 会拒绝与 `meta` 不符的向量（`store.ts:688`），整批被判"被拒"出队，
+       *    等于把待办**静默丢掉**（`store.ts:691` 那句"换模型请先 setEmbeddingMeta 并重建"就是这个坑：
+       *    在此之前全仓没有任何地方调用 `setEmbeddingMeta`）；
+       * ② 切早了（编码之前）→ 嵌入器其实算不出来时也把库里的旧向量标成陈旧，
+       *    向量通道对旧记忆静默返回空——那正是本次要修的缺陷，不能用一个新缺陷去修它；
+       * ③ 切晚了（落盘之后）→ 这一批已经被拒了。
+       * 于是"**本批编码成功**"本身就是"当前嵌入器真的能用"的证据，切换以它为条件。
+       *
+       * 还多一道**维度自检**：嵌入器说谎（输出长度 ≠ 声明的 `dimensions`）时同样不切——
+       * 那些向量会被库逐条拒绝（`store.ts:458`），而归属一旦切了，库里的旧向量就白白不再参与检索。
+       * 宁可这一批失败（队列保留、原因由库的拒绝给出），也不要制造"切了却写不进去"的空窗。
+       *
+       * 通道不可信时（探测中 / 降级路径）一律不切：理由见 `rebuildStopReason`。
+       */
+      const dimensionsAgree = vectors.every(
+        vector => vector instanceof Float32Array && vector.length === embedder.dimensions,
+      )
+      if (dimensionsAgree && rebuildStopReason() === null) {
+        await alignEmbeddingMeta(encodable.map((entry) => entry.api), embedder)
+      }
     }
 
     // ④ 逐条落盘（归属标签 = 当前嵌入器身份）
     let encoded = 0
+    let rebuilt = 0
     let failures = 0
     for (let i = 0; i < encodable.length; i++) {
       const entry = encodable[i]
@@ -793,16 +1147,25 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         })
         queue.delete(entry.id)
         encoded += 1
+        if (entry.rebuild) {
+          rebuilt += 1
+          // 记账：这条记忆从此有了当前身份的行（见 `staleBase` 的说明）
+          staleDone += 1
+        }
       } catch (error) {
         // 单条被库拒绝（归属不符 / 维度不符）→ 重试不会成功：出队并计数，原因留在状态面
         queue.delete(entry.id)
         failures += 1
         rejectedTotal += 1
+        // 回填条目被拒**不等于待办丢了**：那条记忆仍是"当前身份下没有向量"，
+        // 下一遍扫描会重新列出（键集游标扫到表尾就回头）。绝不把它写进"已重建"。
+        if (entry.rebuild) rebuildFailureTotal += 1
         callReason = `向量写入被拒（${entry.id}）：${messageOf(error)}`
         lastEncodeReason = callReason
       }
     }
     encodedTotal += encoded
+    rebuiltTotal += rebuilt
     skippedTotal += skipped
     failureTotal += failures
     if (failures === 0 && callReason === null) lastEncodeReason = null // 本批干净 → 清掉上一次的原因
@@ -812,6 +1175,186 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       skipped,
       failures,
       ...(callReason !== null ? { reason: callReason } : {}),
+    }
+  }
+
+  /**
+   * 回填停住的原因（`null` = 可以回填）。**每个分支都要说得出为什么**（无空降级）。
+   *
+   * 两条与本次机制直接相关的约束，都在这里：
+   * - `probing`：ONNX 还在装载，此刻的身份（哈希词袋）**随时会被换掉**，
+   *   这时候切归属等于一次启动里连切两次，而第一次切换已经把旧向量作废了；
+   * - **降级通道**（`hash-bow` 且带原因）：把库的归属切到哈希词袋 = 用"字符匹配"替换库里的
+   *   语义向量。ONNX 只是**暂时**装不上（权重没下好、原生绑定缺失）时这么做尤其糟，
+   *   而且会在权重"忽有忽无"之间反复改写整个库。默认停住，`allowFallbackRebuild` 是显式那扇门。
+   */
+  const rebuildStopReason = (): string | null => {
+    if (state.probing) {
+      return `通道身份未定型（ONNX 仍在装载，此刻很可能回落哈希词袋）——不切归属，避免一次启动内切两次`
+    }
+    if (state.channel === 'onnx') return null
+    if (state.channel === 'off') return '向量通道未启动'
+    if (allowFallbackRebuild) return null
+    return (
+      `当前通道是降级路径（${state.reason ?? '原因未知'}）——` +
+      `不自动把库里的语义向量改写成哈希词袋（那会替换掉语义召回；要这么做请显式开 allowFallbackRebuild）`
+    )
+  }
+
+  /**
+   * 回合边界的**陈旧向量回填扫描**（本文件头部 ④ 的落地）。
+   *
+   * 为什么寄生在 `encodePending` 里而不是另开驱动入口：`dsh/` 只在回合边界调那一个方法
+   * （`dsh/session.ts:736` 的 `flushVectorEncoder`）。另开入口**没人驱动**——那正是缺陷 A 的形态
+   * （`listEmbeddings` 写好了"供陈旧度查询与重建"，全仓没有一个调用方）。
+   *
+   * 三步，各自有界：
+   * ① 一个周期的开头在库上**实测一次**待重建条数（`staleBase`；此后按已完成的量递减，
+   *    见 `staleBase` 的说明——全表统计一次就要 200~400ms/万条，不能每回合做）；
+   * ② 按 `maxBackfill`（并受队列余量约束）取下一批 **id** 入队——只取 id，正文留到下一次冲刷批量水合；
+   * ③ 编码由下一次 `encodePending` 走既有批通路（`embed` 一次 N 条）完成。
+   *
+   * 幂等且可重入：入队用的是"当前身份下没有向量"这个**库内事实**，不是内存里的差集，
+   * 所以中途失败/进程重启之后，下一遍扫描自然会把没做完的继续列出来。
+   * 键集游标只影响**顺序**（避免每轮都从表头开始），不影响正确性。
+   *
+   * 本机制判的是**归属**，不是**内容**：记忆正文被改写（`put`）而嵌入器身份没变时不会重编码
+   * ——`embedding` 表里没有 `content_hash`，"正文改了但向量没跟上"是另一个缺陷，不在本次范围内。
+   *
+   * 绝不抛：任何失败转成 `rebuild.blocked` 或累计计数（回填是后台增益，不得影响会话）。
+   */
+  const scanRebuild = async (kernel: Kernel | undefined): Promise<void> => {
+    if (kernel === undefined) {
+      rebuildBlocked = '模块未启动或已关闭（无内核句柄）；待办保留在库里，下次启动继续'
+      return
+    }
+    const embedder = kernel.service<Embedder>(EMBEDDER_SERVICE)
+    if (embedder === undefined) {
+      // 身份都拿不到：这一回合**没测**（读数保持"未测量"或上一次的记账值），原因写清
+      rebuildBlocked = '嵌入器服务不可用（omb-memory-vector 未启动）——无法判定当前身份'
+      return
+    }
+    const current: EmbeddingMeta = {
+      modelId: embedder.id,
+      dim: embedder.dimensions,
+      revision: embedder.revision,
+    }
+    const sets = resolveStoreSets(kernel)
+    if (sets.length === 0) {
+      rebuildBlocked = '记忆库未就绪（stores.snapshot() 没有可用库）——待重建条数无法测量'
+      return
+    }
+    const stop = rebuildStopReason()
+
+    // 身份一变（换模型/换维度/换修订），"陈旧"的集合整个变了 → 游标与记账一起作废
+    const identityKey = `${current.modelId}\u0000${current.dim}\u0000${current.revision}`
+    if (identityKey !== rebuildCursorIdentity) {
+      rebuildCursorIdentity = identityKey
+      rebuildCursors.clear()
+      staleBase = null
+      staleDone = 0
+    }
+
+    staleFromScan = false
+    // 已对齐（上个周期实测的基准全部处理完）→ **不碰库**。这是"不每回合做全表统计"的兑现处：
+    // 只有身份变化才会让这个结论失效，而身份变化在上面已经把基准清空了。
+    if (staleBase !== null && staleBase - staleDone <= 0) {
+      rebuildBlocked = null
+      return
+    }
+
+    // 基准只在周期开头实测一次
+    const needBase = staleBase === null
+    let base = 0
+    let measured = needBase
+    let scanReason: string | null = null
+    // 队列余量：回填只填**空位**，绝不挤掉待落盘的写入（见 `enqueueRebuild`）
+    let budget = Math.min(maxBackfill, Math.max(0, maxPending - queue.size))
+
+    for (const ref of vectorStoreRefs(sets)) {
+      if (needBase) {
+        try {
+          base += await ref.api.countStaleEmbeddings(current)
+        } catch (error) {
+          // 有一个库数不出来 → 基准不成立：宁可继续报"未测量"，也不拿一个偏小的数当基准
+          measured = false
+          scanReason = `统计待重建条数失败（${ref.label}）：${messageOf(error)}`
+          continue
+        }
+      }
+      if (stop !== null || budget <= 0) continue
+      const want = Math.min(budget, maxBackfill)
+      try {
+        const ids = await ref.api.listStaleEmbeddingIds(current, {
+          afterId: rebuildCursors.get(ref.key) ?? '',
+          limit: want,
+        })
+        for (const id of ids) {
+          if (enqueueRebuild(id, ref.scope, ref.api)) budget -= 1
+        }
+        // 游标推进；取不满 `want` 说明这个库的待重建集合已到表尾 → 下一遍从头再扫。
+        // 表尾回头是刻意的：失败（编码抛错 / 写入被拒）的条目仍是待重建，要靠下一遍重来。
+        const last = ids[ids.length - 1]
+        rebuildCursors.set(ref.key, ids.length < want || last === undefined ? '' : last)
+      } catch (error) {
+        scanReason = `列出待重建 id 失败（${ref.label}）：${messageOf(error)}`
+      }
+    }
+
+    if (needBase) {
+      if (measured) {
+        staleBase = base
+        staleDone = 0
+        staleFromScan = true
+      } else {
+        staleBase = null // 基准不成立 → 保持"未测量"，下一回合重试
+      }
+    }
+
+    const stale = staleRemaining()
+    // "停住"只在**真有活要干**时才上报：库里一条待重建都没有时，那是没有信息量的噪音
+    // （"有没有活"这一刻也说不清时例外：原因必须写出来）。
+    rebuildBlocked =
+      stale === null
+        ? (scanReason ?? '待重建条数未能测量')
+        : stale === 0
+          ? null
+          : (scanReason ??
+            stop ??
+            (budget <= 0
+              ? `待编码队列已满（${queue.size}/${maxPending}）——本轮不扫描，待办仍在库里`
+              : null))
+  }
+
+  /**
+   * 回合边界的唯一入口：先冲刷已有队列，再扫一遍陈旧向量。
+   *
+   * 顺序是刻意的：① 先落盘已有的待办，队列腾出空位；② 回填的入队与普通写入走**同一条**批通路，
+   * 下一轮一起被编码——不另起并发编码（两套通路必然漂移，而且会互相抢同一个库的写锁）。
+   *
+   * 返回值与从前完全一致（宿主只知道"冲刷结果"）：回填读数在 `stats().rebuild` 与状态面上，
+   * 因此 `dsh/` 不需要改一行（`dsh/session.ts:736` 只调 `encodePending(limit)`）。
+   *
+   * **重入闸**：两个回合边界叠在一起时（`dsh` 是 `void` 调用的），并行冲刷会把同一条记忆编码两次、
+   * 把"已重建"记两遍——读数因此说谎。撞上时**跳过这一轮并说明**，队列与待办一个都不丢。
+   */
+  const encodePending = async (limit?: number): Promise<VectorEncodeOutcome> => {
+    if (flushing) {
+      return { encoded: 0, skipped: 0, failures: 0, reason: '上一次冲刷仍在进行；本轮跳过，队列保留' }
+    }
+    flushing = true
+    try {
+      const outcome = await flushQueue(limit)
+      try {
+        await scanRebuild(kernelRef)
+      } catch (error) {
+        // 扫描异常不得让冲刷结果变成失败（它已经落盘了）：说清是扫描没走通
+        rebuildBlocked = `回填扫描异常：${messageOf(error)}`
+      }
+      return outcome
+    } finally {
+      flushing = false
+      reportHealth?.()
     }
   }
 
@@ -948,6 +1491,8 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     //    回调里只入队，绝不在这里编码——嵌入是真实推理，不能压进写入路径。
     kernelRef = kernel
     maxPending = config.maxPending
+    maxBackfill = config.maxBackfill
+    allowFallbackRebuild = config.allowFallbackRebuild
     const offWritten = kernel.on('memory/written', payload => {
       if (disposed) return
       enqueueWritten(payload)

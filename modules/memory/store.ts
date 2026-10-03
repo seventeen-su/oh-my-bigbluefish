@@ -122,6 +122,14 @@ export interface EmbeddingVector {
 /** `meta` 表记录的当前嵌入器身份（与 ABI 的 `VectorAttribution` 同构，直接复用）。 */
 export type EmbeddingMeta = VectorAttribution
 
+/** 「待重建」列表的分页参数（键集分页，见 `VectorStoreApi.listStaleEmbeddingIds`）。 */
+export interface StaleEmbeddingPage {
+  /** 游标：只取 `memory_id > afterId` 的行。缺省 = 从头开始（空串等价于"从头"）。 */
+  readonly afterId?: string
+  /** 本页至多几条。缺省 = 不限（调用方**必须**给上界，否则就是把整个库拉进内存）。 */
+  readonly limit?: number
+}
+
 /**
  * 某个库的向量读写面。
  *
@@ -139,11 +147,39 @@ export interface VectorStoreApi {
     readonly revision?: string
     readonly limit?: number
   }): Promise<readonly EmbeddingVector[]>
+  /**
+   * **待重建**条数：在当前身份（`model_id`/`dim`/`revision` 三者）下**没有**向量的记忆条数。
+   *
+   * 这个数是换嵌入器之后唯一有行动含义的读数：它等于"向量通道对这些记忆恒返回空"的规模。
+   * 为什么不是"有多少行不属于当前身份"——见 `STALE_WHERE_SQL` 的说明。
+   */
+  countStaleEmbeddings(current: EmbeddingMeta): Promise<number>
+  /**
+   * 列出待重建的 `memory_id`（判定同 `countStaleEmbeddings`），按 `memory_id` 升序分页。
+   *
+   * **只取 id**：重建的输入是记忆**正文**（下一次冲刷时按 id 批量水合），旧向量对重建毫无用处——
+   * 把 BLOB 读进内存只会让"一次把整个库拉进内存"成为可能。
+   * 键集分页（`afterId`）而不是 `OFFSET`：游标前进时 OFFSET 会随集合缩小而**漏行**，
+   * 而回填正好会让集合在扫描过程中不断缩小。
+   */
+  listStaleEmbeddingIds(
+    current: EmbeddingMeta,
+    page?: StaleEmbeddingPage,
+  ): Promise<readonly string[]>
   countEmbeddings(): Promise<number>
   /** 当前嵌入器身份；未声明返回 null（此时任何向量都不可归属）。 */
   embeddingMeta(): Promise<EmbeddingMeta | null>
   /** 声明/切换当前嵌入器。已有向量随之成为"陈旧"（可查询、可重建，但不再被使用）。 */
   setEmbeddingMeta(meta: EmbeddingMeta): Promise<void>
+  /**
+   * 回收若干条记忆里**不属于当前身份**的向量行（当前身份的行一律不动）。
+   *
+   * 用途只有一个：正文已不存在（`forget` 删了正文却没删到向量行）或正文为空（没有可编码的内容）
+   * 时，那些行的确没有消费者，而它们会让"待重建"永远数得出来、每轮扫描重复列出同一条 id。
+   * 与"陈旧向量一律保留"不矛盾：保留的前提是**正文还在**（换回原嵌入器仍可用）。
+   * @returns 实际删除的行数
+   */
+  deleteStaleEmbeddings(ids: readonly string[], current: EmbeddingMeta): Promise<number>
 }
 
 /** 具体实现类型。除端口外还暴露状态面需要的诊断字段。 */
@@ -199,6 +235,47 @@ const UPSERT_EMBEDDING_SQL = `
 INSERT INTO embedding (memory_id, model_id, dim, revision, vector) VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(memory_id, model_id, revision) DO UPDATE SET
   dim = excluded.dim, vector = excluded.vector`
+
+/**
+ * 「待重建」的判定（**唯一一处**：`countStaleEmbeddings` 与 `listStaleEmbeddingIds` 共用，
+ * 两个读数不可能漂移）。别名 `e` = 外层 `embedding` 行。
+ *
+ * 语义：**这条记忆在当前身份下没有向量行**——也就是"向量通道对它恒返回空"的那些记忆，
+ * 正是换嵌入器之后要回填的全部待办。
+ *
+ * 为什么不写成"有多少行不属于当前身份"：回填写的是一条**当前身份的新行**，而旧行按设计留着
+ * （可查询、可换回原嵌入器，见 `setEmbeddingMeta` 的说明）。按行数算的话待办永远不清零——
+ * 每轮扫描都会重新列出已经重建过的记忆、把它们重新编码一遍：读数变成噪音，真正的积压反而看不见，
+ * 而"重复重编码全库"本身就是一台停不下来的机器。
+ *
+ * 外层不必再写 `model_id <> ?`：行是从 `embedding` 里选出来的，必有行；
+ * 而"没有任何当前身份的行"已经蕴含"现有的行都不是当前身份"。
+ * 子查询走主键 `(memory_id, model_id, revision)`（`migrate.ts:236`，WITHOUT ROWID 表 = 聚簇键）。
+ */
+const STALE_WHERE_SQL = `NOT EXISTS (
+      SELECT 1 FROM embedding cur
+       WHERE cur.memory_id = e.memory_id
+         AND cur.model_id = ?
+         AND cur.dim = ?
+         AND cur.revision = ?
+    )`
+
+/** 待重建条数（一次 COUNT，不读 BLOB）。 */
+const COUNT_STALE_SQL = `SELECT COUNT(DISTINCT e.memory_id) AS c FROM embedding e WHERE ${STALE_WHERE_SQL}`
+
+/** 待重建的 id 页（键集分页：`memory_id > ?`，升序，至多 `?` 条）。 */
+const LIST_STALE_SQL = `SELECT DISTINCT e.memory_id AS memory_id FROM embedding e
+ WHERE e.memory_id > ? AND ${STALE_WHERE_SQL}
+ ORDER BY e.memory_id ASC LIMIT ?`
+
+/** 回收：删掉这些记忆里**不属于** `current` 的向量行（当前身份的行一律不动）。 */
+const DELETE_STALE_SQL = `DELETE FROM embedding
+ WHERE memory_id IN ({IDS}) AND NOT (model_id = ? AND dim = ? AND revision = ?)`
+
+/** 一条身份的绑定参数（`STALE_WHERE_SQL` / `DELETE_STALE_SQL` 的顺序一致）。 */
+function identityParams(meta: EmbeddingMeta): readonly unknown[] {
+  return [meta.modelId, meta.dim, meta.revision]
+}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -383,6 +460,20 @@ function validateVectorAttribution(vector: EmbeddingVector): string | undefined 
   for (const component of vector.vector) {
     if (!Number.isFinite(component)) return '向量含 NaN/Infinity——不可用于距离计算'
   }
+  return undefined
+}
+
+/**
+ * 嵌入器身份校验：返回拒绝原因，或 undefined 表示可用。
+ *
+ * 为什么**读取侧**（待重建计数/列表）也要校验，而不是只在写入侧校验：
+ * 身份非法时 SQL 会安静地匹配不到任何行，于是"待重建 0 条"看起来像个测到的结论——
+ * 那是拿假读数冒充测量结果（本仓库的硬规矩：未测量 ≠ 测量为零）。
+ */
+function vetEmbeddingMeta(meta: EmbeddingMeta): string | undefined {
+  if (typeof meta.modelId !== 'string' || meta.modelId.trim().length === 0) return '缺少 model_id'
+  if (!Number.isInteger(meta.dim) || meta.dim <= 0) return `维度非法（${String(meta.dim)}）`
+  if (typeof meta.revision !== 'string' || meta.revision.trim().length === 0) return '缺少 revision'
   return undefined
 }
 
@@ -612,32 +703,56 @@ class SqliteStore implements SqliteMemoryStore {
 
   async setEmbeddingMeta(meta: EmbeddingMeta): Promise<void> {
     this.#assertUsable()
-    const problem =
-      typeof meta.modelId !== 'string' || meta.modelId.trim().length === 0
-        ? '缺少 model_id'
-        : !Number.isInteger(meta.dim) || meta.dim <= 0
-          ? `维度非法（${String(meta.dim)}）`
-          : typeof meta.revision !== 'string' || meta.revision.trim().length === 0
-            ? '缺少 revision'
-            : undefined
+    const problem = vetEmbeddingMeta(meta)
     if (problem !== undefined) throw new VectorAttributionError(problem)
     await this.#enqueue(() => {
       this.#assertOpen()
-      const stale = countOf(
-        this.#get('SELECT COUNT(*) AS c FROM embedding WHERE model_id <> ? OR dim <> ?', [
-          meta.modelId,
-          meta.dim,
-        ])?.['c'],
-      )
+      const stale = this.#countStale(meta)
       if (this.#writeEmbeddingMeta(meta) !== 1) {
         throw new VectorAttributionError('meta 表缺失或为空——无法声明嵌入器身份（库结构已损坏，请重建）')
       }
       if (stale > 0) {
         this.#logger.info(
           `OMB：嵌入器切换为 ${meta.modelId}/${meta.dim}（rev ${meta.revision}）；` +
-            `${stale} 条向量成为陈旧——它们仍可查询与重建，但不参与检索`,
+            `${stale} 条记忆的向量成为待重建（当前身份下没有向量 → 不参与检索；` +
+            `旧行保留，仍可查询与换回）`,
         )
       }
+    })
+  }
+
+  /**
+   * 待重建条数（**同步版**：`setEmbeddingMeta` 在自己的写操作里就地统计，
+   * 不能借道异步公开方法——那会排到自己的队尾上，互相等死）。
+   */
+  #countStale(meta: EmbeddingMeta): number {
+    return countOf(this.#get(COUNT_STALE_SQL, identityParams(meta))?.['c'])
+  }
+
+  /**
+   * 回收若干条记忆里**不属于当前身份**的向量行。
+   *
+   * `NOT (model_id = ? AND dim = ? AND revision = ?)` 而不是"按 id 全删"：
+   * 回收的判据必须是"这行在当前空间里没用"，**绝不能**顺手删掉一条刚写好的当前身份向量
+   * （列出待重建与执行删除之间隔着若干次 await，中间可能有别的写入落盘）。
+   */
+  async deleteStaleEmbeddings(ids: readonly string[], current: EmbeddingMeta): Promise<number> {
+    this.#assertUsable()
+    const problem = vetEmbeddingMeta(current)
+    if (problem !== undefined) throw new VectorAttributionError(problem)
+    const unique = [...new Set(ids)].filter(id => typeof id === 'string' && id.length > 0)
+    if (unique.length === 0) return 0
+    return await this.#enqueue(() => {
+      this.#assertOpen()
+      let removed = 0
+      for (const chunk of chunkArray(unique, MAX_SQL_VARS)) {
+        const placeholders = chunk.map(() => '?').join(', ')
+        removed += this.#run(DELETE_STALE_SQL.replace('{IDS}', placeholders), [
+          ...chunk,
+          ...identityParams(current),
+        ])
+      }
+      return removed
     })
   }
 
@@ -943,6 +1058,38 @@ class SqliteStore implements SqliteMemoryStore {
       if (embedding !== null) result.push(embedding)
     }
     return result
+  }
+
+  /**
+   * 待重建条数。**不读 BLOB**：回填只需要知道"有多少条记忆在当前空间里搜不到"。
+   *
+   * 与 `setEmbeddingMeta` 的日志读数同一口径（同一个 `STALE_WHERE_SQL`），
+   * 因此"切换时报了 N 条"与"回填扫描看到 N 条"必然一致——两处口径漂移过一次就很难再信。
+   */
+  async countStaleEmbeddings(current: EmbeddingMeta): Promise<number> {
+    this.#assertUsable()
+    const problem = vetEmbeddingMeta(current)
+    if (problem !== undefined) throw new VectorAttributionError(problem)
+    return this.#countStale(current)
+  }
+
+  async listStaleEmbeddingIds(
+    current: EmbeddingMeta,
+    page: StaleEmbeddingPage = {},
+  ): Promise<readonly string[]> {
+    this.#assertUsable()
+    const problem = vetEmbeddingMeta(current)
+    if (problem !== undefined) throw new VectorAttributionError(problem)
+    const afterId = typeof page.afterId === 'string' ? page.afterId : ''
+    // 缺省"不限"是给诊断用的；回填侧**必须**给上界（否则一次扫描就把整个库的 id 拉进内存）
+    const limit =
+      page.limit === undefined
+        ? -1
+        : Number.isFinite(page.limit)
+          ? Math.max(0, Math.floor(page.limit))
+          : 0
+    const rows = this.#all(LIST_STALE_SQL, [afterId, ...identityParams(current), limit])
+    return rows.map(row => textOf(asRow(row, '待重建行')['memory_id'], 'memory_id'))
   }
 
   /**
@@ -1392,6 +1539,8 @@ const STORE_ACCESS: Readonly<Record<string, 'read' | 'write' | 'transaction'>> =
   embeddingMeta: 'read',
   getEmbeddings: 'read',
   listEmbeddings: 'read',
+  countStaleEmbeddings: 'read',
+  listStaleEmbeddingIds: 'read',
   searchVector: 'read',
   countEmbeddings: 'read',
   // ── 写 ──
@@ -1400,6 +1549,8 @@ const STORE_ACCESS: Readonly<Record<string, 'read' | 'write' | 'transaction'>> =
   forget: 'write',
   putEmbedding: 'write',
   setEmbeddingMeta: 'write',
+  // 回收残留向量行是一次真正的删除（只删"不属于当前身份"的行），按写处理
+  deleteStaleEmbeddings: 'write',
   // ── 事务 ──
   // 按"读"放行：事务里的**每一次库调用**都会各自过闸（调用方拿到的是本视图），
   // 所以只读事务能跑、写操作照样被拒。全禁会让 read-only 下的检索路径直接断掉。
