@@ -5,7 +5,7 @@
  * 都只是少几行并**写明原因**，不是抛异常、也不是输出假读数。
  */
 import { describe, expect, it } from 'vitest'
-import type { ContextPressure, ModuleHealth } from '../../../kernel/abi/index.js'
+import type { ContextPressure, ModuleHealth, SessionRef } from '../../../kernel/abi/index.js'
 import { behaviorFor } from '../../../modules/context/pressure.js'
 import { buildStatusPanel, createStatusContributor, renderStatusPanel, shapingOf } from '../../../modules/context/tools.js'
 import { EMPTY_LEDGER, MIN_TURNS_FOR_VERDICT, VIEW_TOOLS, noteTurn, recordPull, summarize } from '../../../modules/context/watch.js'
@@ -257,5 +257,43 @@ describe('createStatusContributor', () => {
     })
     expect(contributor.render()).toContain('存储炸了')
     expect(contributor.metrics?.()).toEqual({ renderError: 1 })
+  })
+
+  /**
+   * 会话形参**必须一路传到 `read`**——这正是这个 helper 曾经变成僵尸接缝的原因。
+   *
+   * `read` 旧签名是 `() => StatusPanelInput`：它把状态面传进来的会话**吃掉**，
+   * 于是上下文模块只能自己再造一份贡献者（`modules/context/index.ts`），
+   * helper 剩在原测试里"绿着"，却没有任何生产调用方。
+   *
+   * 代价不是"多写几行"：会话是**段落与顶层读数一致的唯一来源**（`dsh/status-tool.ts`
+   * 把顶层「## 上下文」用的同一个会话交给各段），吞掉它就退回实测过的那次矛盾——
+   * 顶层 `moderate / 0.343`，模块段 `relaxed（fillRatio 未知）`，读者无从判断该信哪个。
+   *
+   * 判据是"同一个会话原样交出去"：两次调用各自的实参都要到位；没有会话时交
+   * `undefined`（= 真的没有会话，模块据此走"未测量"，不许自己挑一个）。
+   */
+  it('状态面传进来的会话原样传给 read（render 与 metrics 都不许吞掉会话实参）', () => {
+    const seen: (SessionRef | undefined)[] = []
+    const contributor = createStatusContributor((session?: SessionRef) => {
+      seen.push(session)
+      return { pressure: pressure(), behavior: behaviorFor('moderate') }
+    })
+
+    expect(contributor.render('s1')).toContain('压力档位：moderate')
+    expect(contributor.metrics?.('s1').pushLimit).toBe(1)
+    expect(seen, '两次调用各自交出自己的会话').toEqual(['s1', 's1'])
+
+    // 没有会话时交 `undefined`：这是"未测量"的事实，不是"随便挑一个最近看到的"
+    expect(contributor.render()).toContain('压力档位：moderate')
+    expect(seen).toEqual(['s1', 's1', undefined])
+
+    // 会话必须传进**组装**而不是只用来做旁路：read 收到的会话决定面板里的读数。
+    // 这里用"传入会话 → 读数变成该会话的值"把这条链路钉死。
+    const sessionScoped = createStatusContributor((session?: SessionRef) => ({
+      pressure: session === undefined ? null : pressure({ fillRatio: 0.9, band: 'tight' }),
+    }))
+    expect(sessionScoped.render('s2')).toContain('压力档位：tight')
+    expect(sessionScoped.render()).toContain('压力读数：不可用')
   })
 })

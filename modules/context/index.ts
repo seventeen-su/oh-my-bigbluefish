@@ -19,7 +19,6 @@ import type {
   ModuleManifest,
   ModuleRegistration,
   SessionRef,
-  StatusContributor,
   StatusRegistry,
   ToolDefinition,
 } from '../../kernel/abi/index.js'
@@ -42,7 +41,7 @@ import {
   summarize,
 } from './watch.js'
 import type { StatusPanelInput } from './tools.js'
-import { buildStatusPanel, renderStatusPanel } from './tools.js'
+import { buildStatusPanel, createStatusContributor } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
@@ -511,34 +510,26 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     /**
-     * 状态段：**渲染前先把会话接过来**（`render(session)`）。
+     * 状态段：**直接复用 `./tools.ts` 的 `createStatusContributor`**。
      *
-     * 这里没有直接复用 `./tools.ts` 的 `createStatusContributor`：它的 `read` 形参是
-     * `() => StatusPanelInput`，会把状态面传进来的会话吃掉——而那个会话正是本段与
-     * 顶层读数一致的唯一来源（吞掉它就退回了上面记的那次矛盾）。隔离要求照旧：
+     * ## 这里曾经自己造一份贡献者（那次重复的代价）
+     *
+     * helper 的 `read` 旧签名是 `() => StatusPanelInput`，会把状态面传进来的会话吃掉；
+     * 而那个会话正是本段与顶层读数一致的唯一来源（吞掉它就退回了上面记的那次矛盾）。
+     * 于是本文件只能**再写一份** `render` / `metrics` + 两层隔离的贡献者字面量：
+     * 同一段组装逻辑有两份实现，改一处忘一处就是下一次"两个面互相矛盾"；
+     * 而 helper 自己既没有生产调用方、又没有测试之外的存在理由——**僵尸接缝**的典型形态
+     * （仍导出、仍被原测试覆盖，于是谁也不敢删）。
+     *
+     * 现在 `read` 的形参是 `(session?: SessionRef)`：会话一路传到 `panelInput`，
+     * 本文件不再有第二份贡献者实现。隔离要求照旧（都在 helper 里）：
      * `render` / `metrics` 绝不抛，单个段落失败不得弄坏整份状态面。
      *
      * 注：内核登记处的汇总口径（`handle.status()`）**不传会话**——它没有"这次是谁"
      * 这件事实。那条路径下本段如实呈现"未测量"（`fillRatio 未知`），不借用任何读数；
      * 模型可见的 `omb_status` 走的是 `dsh/status-tool.ts`，那里会话显式传入。
      */
-    const statusContributor: StatusContributor = {
-      name: '上下文优化（omb-context）',
-      render: (session?: SessionRef): string => {
-        try {
-          return renderStatusPanel(buildStatusPanel(panelInput(session)))
-        } catch (error) {
-          return `渲染失败（已隔离）：${messageOf(error)}`
-        }
-      },
-      metrics: (session?: SessionRef): Readonly<Record<string, number>> => {
-        try {
-          return buildStatusPanel(panelInput(session)).metrics
-        } catch {
-          return { renderError: 1 }
-        }
-      },
-    }
+    const statusContributor = createStatusContributor(session => panelInput(session))
 
     provide(SERVICES.contextPressure, pressureService)
     provide(SERVICES.contextMetrics, metricsService)
