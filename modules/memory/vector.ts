@@ -161,17 +161,37 @@ export interface VectorEncoderStats {
 }
 
 /**
+ * 待重建的**两类原因**读数（状态面/健康面据此区分）。
+ *
+ * 为什么必须分开：两类待办的"下一步"完全不同——`缺当前身份`只要等回填跑完；
+ * `正文已改写`说明**有人在改写正文而向量没跟上**（要去查是谁在改写）。
+ * 合成一个数字时，"检索结果莫名其妙"的现场无法判断是哪一类（本仓库的规矩：降级必须可读）。
+ *
+ * `null` = 尚未测量（不是零），与 `stale` 同一口径。
+ */
+export interface StaleEmbeddingCauses {
+  /** 当前身份下**没有**向量的记忆条数（换嵌入器之后的存量失效，缺陷 A）。 */
+  readonly lackingIdentity: number | null
+  /** 有当前身份的行、但 `content_hash` 与此刻正文不符（含 NULL = 未知）的条数（缺陷 B）。 */
+  readonly contentChanged: number | null
+}
+
+/**
  * 陈旧向量回填的读数。**每个字段都回答一个具体问题**（这块读数存在的理由见本文件头部 ④）：
- * 还有多少条记忆的向量通道是空的、已经补上多少、失败多少、这一刻为什么没在补。
+ * 还有多少条记忆的向量通道是空的或过时的、已经补上多少、失败多少、这一刻为什么没在补。
  */
 export interface VectorRebuildStats {
   /**
-   * **待重建**条数：当前身份下没有向量的记忆（= 向量通道对它们恒返回空）。
+   * **待重建**条数：向量通道对它们**恒返回空或返回过时向量**的记忆条数。
+   *
+   * 两类合计（见 {@link StaleEmbeddingCauses}）：① 当前身份下没有向量 ② 有向量但正文已改写。
    *
    * `null` = 尚未测量（本进程还没完成一次回填统计），**不是零**——一次都没扫过时报 0
    * 会把"没测"说成"没有"（本仓库的硬规矩，见 `status-honesty.test.ts`）。
    */
   readonly stale: number | null
+  /** `stale` 的**原因拆分**（与它同一次统计得到；未测量时两个字段都是 null）。 */
+  readonly causes: StaleEmbeddingCauses
   /**
    * `stale` 是不是**这一刻在库上重算出来的**。
    *
@@ -350,6 +370,22 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * 两类待重建原因的**一句话描述**（状态面渲染与健康面共用，避免两处口径漂移）。
+ *
+ * 未测量时返回空串：调用方据此**什么也不写**——绝不把"没测过"写成"0 条"
+ * （那正是本仓库最忌讳的那种读数：拿未测量冒充测量结果）。
+ * 原因都在 0 条时也返回空串：没有积压时列一堆"0 条"只是噪音。
+ */
+function causeText(causes: StaleEmbeddingCauses): string {
+  const { lackingIdentity, contentChanged } = causes
+  if (lackingIdentity === null || contentChanged === null) return ''
+  const parts: string[] = []
+  if (lackingIdentity > 0) parts.push(`缺当前身份 ${lackingIdentity} 条（换嵌入器后的存量）`)
+  if (contentChanged > 0) parts.push(`正文已改写 ${contentChanged} 条（向量编码的是旧正文）`)
+  return parts.join('、')
+}
+
 /** 解析"当前已就绪的库套件"（编码队列据此定位某条 id 在哪个库）。 */
 export type StoreSetResolver = (kernel: Kernel) => readonly StoreSet[]
 
@@ -422,9 +458,14 @@ function channelMetrics(
     encodeFailures: enc.failures,
     encodeRejected: enc.rejected,
     encodeDropped: enc.dropped,
-    // 回填读数：换嵌入器之后"有多少条记忆的向量通道是空的"必须是一个数字，
+    // 回填读数：换嵌入器之后"有多少条记忆的向量通道是空的或过时的"必须是一个数字，
     // 而不是一句"检索没报错"。`-1` = 尚未测量（**不是零**：没测过与测到 0 必须能区分）。
     staleEmbeddings: enc.rebuild.stale ?? -1,
+    // 两类原因分开报（同一口径的两个数）：`-1` = 本进程还没测过原因拆分。
+    // 合成一个数字时，"换了模型"与"有人改写了正文"在读数上无法区分，
+    // 而这两件事的处置完全不同（前者等回填，后者要查改写来源）。
+    staleLackingIdentity: enc.rebuild.causes.lackingIdentity ?? -1,
+    staleContentChanged: enc.rebuild.causes.contentChanged ?? -1,
     /** 这个数是不是刚刚在库上重算的（0 = 本轮回填记账，1 = 本回合实测）。 */
     staleFromScan: enc.rebuild.staleFromScan ? 1 : 0,
     rebuiltEmbeddings: enc.rebuild.rebuilt,
@@ -630,9 +671,12 @@ function renderHealth(
   if (enc.pending > 0) notes.push(`待编码 ${enc.pending} 条（回合边界由 dsh 冲刷）`)
   const rb = enc.rebuild
   if (rb.stale !== null && rb.stale > 0) {
+    // 两类原因分开写：把"换了模型"与"有人改写了正文"说成同一件事，
+    // 使用者就没有任何线索去查后者的来源（而它才是"检索结果莫名其妙"的那种）。
+    const causes = causeText(rb.causes)
     notes.push(
-      `陈旧待重建 ${rb.stale} 条（这些记忆在当前嵌入器下没有向量，向量通道对它们为空；` +
-        `${rb.staleFromScan ? '本回合在库上实测' : '本轮回填记账'}）`,
+      `陈旧待重建 ${rb.stale} 条（这些记忆在当前嵌入器下要么没有向量、要么向量编码的是旧正文；` +
+        `${rb.staleFromScan ? '本回合在库上实测' : '本轮回填记账'}${causes === '' ? '' : `；${causes}`}）`,
     )
     if (rb.blocked !== null) {
       // 待办还在、而回填**停着**：那是一个会一直存在的状态，健康面不能报"正常"
@@ -698,6 +742,10 @@ function renderStatus(
   lines.push(
     `向量回填：待重建 ${staleText}；已重建 ${rb.rebuilt}；失败 ${rb.failures}；回收残留 ${rb.scavenged} 行`,
   )
+  // 原因拆分行**只在测到原因时出现**（未测量时不写，免得"0 条"与"没测过"看着一样）。
+  // 这一行是缺陷 B 唯一的可见位置：正文被改写时向量通道不会报错，只是悄悄继续用旧向量。
+  const causes = causeText(rb.causes)
+  if (causes !== '') lines.push(`待重建原因：${causes}`)
   if (rb.blocked !== null) lines.push(`回填停住：${rb.blocked}`)
   if (enc.lastReason !== null) lines.push(`落盘最近原因：${enc.lastReason}`)
   if (current !== undefined) lines.push(`余弦下限：${cosineFloorFor(current)}（按当前嵌入器标定）`)
@@ -790,9 +838,22 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
    * 身份一变（换模型/换维度/换修订）整个集合就变了 → 基准作废，下回合重新实测。
    * 唯一测不到的情形是**别的进程**在同一时间改这个库：那会在下一次身份变化或重启时被重新实测纠正
    * （本进程的回填不会因此写错东西，只是读数需要一次重测）。
+   *
+   * ⚠️ **内容哈希那一类（缺陷 B）不在这本账里**：正文改写发生在库的写入侧，本进程看不见，
+   * 因此它不会让基准失效。代价是"正文被改写"要等到下一轮实测（重启/换身份）才被发现——
+   * 而单条被改写的记忆，只要它走了写入通路（`memory/written` → 编码），新向量会带着新哈希落盘，
+   * 顺手把那一类就地修好。真正的兜底是下一轮实测，方向是**多测一次**而不是漏判。
    */
   let staleBase: number | null = null
   let staleDone = 0
+  /**
+   * 基准那一刻的**原因拆分**（`缺当前身份` / `正文已改写`）。
+   *
+   * 只在实测那一回合更新（与 `staleBase` 同源、同一次 SQL），此后保持不变：
+   * 它回答的是"这个积压长什么样"，而 `stale` 回答的是"还剩多少"。两者口径不同，
+   * 所以不做"基准减已完成"的推算——那会把两类混成一个无法拆分的数。
+   */
+  let staleCauses: StaleEmbeddingCauses = { lackingIdentity: null, contentChanged: null }
   /** 本回合是否真的在库上重算过基准（`staleFromScan` 的来源；不参与记账）。 */
   let staleFromScan = false
   let rebuildBlocked: string | null = null
@@ -822,6 +883,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     lastReason: lastEncodeReason,
     rebuild: {
       stale: staleRemaining(),
+      causes: staleCauses,
       staleFromScan,
       rebuilt: rebuiltTotal,
       failures: rebuildFailureTotal,
@@ -1034,7 +1096,14 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     }
 
     // ② 分类：空文本 / 无向量口 → 跳过；其余待编码
-    const encodable: { id: string; text: string; api: VectorStoreApi; rebuild: boolean }[] = []
+    const encodable: {
+      id: string
+      text: string
+      api: VectorStoreApi
+      rebuild: boolean
+      /** 这条向量即将编码的正文的哈希（落盘时一并写入，见 `putEmbedding` 的 `contentHash`）。 */
+      contentHash: string
+    }[] = []
     const queuedScopeOf = new Map(batch)
     let skipped = 0
     for (const [id, entry] of batch) {
@@ -1072,6 +1141,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       encodable.push({
         id,
         text: hit.record.text,
+        contentHash: hit.record.contentHash,
         api: hit.api,
         rebuild: entry.rebuildFrom !== null,
       })
@@ -1144,6 +1214,11 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
           dim: embedder.dimensions,
           revision: embedder.revision,
           vector,
+          // **这条向量编码的是哪份正文**：取刚刚水合到的那份记录的 `contentHash`。
+          // 与归属标签同等重要——正文改写而嵌入器没换时，只有它能让旧向量被认出来
+          // （`store.ts` 的 `STALE_WHERE_SQL` 比的就是这一列与 `memory.content_hash`）。
+          // 库侧仍会以自己那列为准（不认识的调用方给错值时不会被写坏）。
+          contentHash: entry.contentHash,
         })
         queue.delete(entry.id)
         encoded += 1
@@ -1214,12 +1289,13 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
    * ② 按 `maxBackfill`（并受队列余量约束）取下一批 **id** 入队——只取 id，正文留到下一次冲刷批量水合；
    * ③ 编码由下一次 `encodePending` 走既有批通路（`embed` 一次 N 条）完成。
    *
-   * 幂等且可重入：入队用的是"当前身份下没有向量"这个**库内事实**，不是内存里的差集，
-   * 所以中途失败/进程重启之后，下一遍扫描自然会把没做完的继续列出来。
+   * 幂等且可重入：入队用的是"当前身份下没有向量**或向量编码的是旧正文**"这个**库内事实**，
+   * 不是内存里的差集，所以中途失败/进程重启之后，下一遍扫描自然会把没做完的继续列出来。
    * 键集游标只影响**顺序**（避免每轮都从表头开始），不影响正确性。
    *
-   * 本机制判的是**归属**，不是**内容**：记忆正文被改写（`put`）而嵌入器身份没变时不会重编码
-   * ——`embedding` 表里没有 `content_hash`，"正文改了但向量没跟上"是另一个缺陷，不在本次范围内。
+   * 本机制判的是**归属 + 内容**：换了嵌入器（归属不符）与正文被改写（`content_hash` 不符，
+   * 含 v2 迁移前的历史行 = 未知）都在待重建集合里。后一类之所以必须有，
+   * 是因为它在旧实现里**完全不可见**：向量会一直拿着过时正文参与检索，不报错、只是排名莫名其妙。
    *
    * 绝不抛：任何失败转成 `rebuild.blocked` 或累计计数（回填是后台增益，不得影响会话）。
    */
@@ -1246,13 +1322,14 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     }
     const stop = rebuildStopReason()
 
-    // 身份一变（换模型/换维度/换修订），"陈旧"的集合整个变了 → 游标与记账一起作废
+    // 身份一变（换模型/换维度/换修订），"陈旧"的集合整个变了 → 游标、记账与原因拆分一起作废
     const identityKey = `${current.modelId}\u0000${current.dim}\u0000${current.revision}`
     if (identityKey !== rebuildCursorIdentity) {
       rebuildCursorIdentity = identityKey
       rebuildCursors.clear()
       staleBase = null
       staleDone = 0
+      staleCauses = { lackingIdentity: null, contentChanged: null }
     }
 
     staleFromScan = false
@@ -1266,6 +1343,9 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     // 基准只在周期开头实测一次
     const needBase = staleBase === null
     let base = 0
+    // 原因拆分与基准**同一次 SQL** 得到（`countStaleEmbeddingsByCause` 一条查询里两个求和项），
+    // 所以这里不会为"读数更细"多付一次全表统计的代价。
+    let causes: StaleEmbeddingCauses = { lackingIdentity: 0, contentChanged: 0 }
     let measured = needBase
     let scanReason: string | null = null
     // 队列余量：回填只填**空位**，绝不挤掉待落盘的写入（见 `enqueueRebuild`）
@@ -1274,7 +1354,12 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     for (const ref of vectorStoreRefs(sets)) {
       if (needBase) {
         try {
-          base += await ref.api.countStaleEmbeddings(current)
+          const counts = await ref.api.countStaleEmbeddingsByCause(current)
+          base += counts.total
+          causes = {
+            lackingIdentity: (causes.lackingIdentity ?? 0) + counts.lackingIdentity,
+            contentChanged: (causes.contentChanged ?? 0) + counts.contentChanged,
+          }
         } catch (error) {
           // 有一个库数不出来 → 基准不成立：宁可继续报"未测量"，也不拿一个偏小的数当基准
           measured = false
@@ -1305,9 +1390,13 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       if (measured) {
         staleBase = base
         staleDone = 0
+        // 原因拆分与基准同源同时刻：它说的是"这个积压长什么样"（不随 `staleDone` 递减——
+        // 那是另一个问题："还剩多少"）。测不出来时两个字段保持 null（未测量 ≠ 0）。
+        staleCauses = causes
         staleFromScan = true
       } else {
         staleBase = null // 基准不成立 → 保持"未测量"，下一回合重试
+        staleCauses = { lackingIdentity: null, contentChanged: null }
       }
     }
 
@@ -1324,6 +1413,31 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
             (budget <= 0
               ? `待编码队列已满（${queue.size}/${maxPending}）——本轮不扫描，待办仍在库里`
               : null))
+  }
+
+  /**
+   * **孤儿向量行的清理**：正文已不存在的行者没有消费者（`searchVector` 要 JOIN `memory`）。
+   *
+   * 为什么它有独立入口（而不是等着"待重建"把 id 列出来）：待重建的判定以 `memory` 为外层
+   * （情形②要 join 正文的当前哈希），而孤儿行**没有正文**，因此在判定里根本不可见——
+   * 上一版靠"外层是 `embedding`"碰巧覆盖了它们，本次换判定式之后那条巧合没有了。
+   *
+   * 为什么每回合都能做：一条走 `embedding` 主键的 DELETE（无匹配 `memory` 的行），
+   * 不读 BLOB、不随库增长做全表物化。已经对齐（不扫库）时它也只在有行要删时才有写代价。
+   * 计数进 `rebuild.scavenged`——与"回收残留"同一本账（都是"没有消费者的向量行"）。
+   */
+  const scavengeOrphans = async (apis: readonly VectorStoreApi[]): Promise<void> => {
+    const seen = new Set<VectorStoreApi>()
+    for (const api of apis) {
+      if (seen.has(api)) continue
+      seen.add(api)
+      try {
+        scavengedTotal += await api.deleteOrphanEmbeddings()
+      } catch (error) {
+        // 清理失败不致命：孤儿行留在库里不影响检索（它们召不回来），下一轮再试
+        lastEncodeReason = `清理残留向量行失败：${messageOf(error)}`
+      }
+    }
   }
 
   /**
@@ -1345,6 +1459,17 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     flushing = true
     try {
       const outcome = await flushQueue(limit)
+      try {
+        // 孤儿行清理**不受"已对齐就跳过扫描"那条优化影响**：它是另一本账（没有正文的行），
+        // 而"对齐"说的是"有正文的记忆都有当前向量"。两者互不蕴含。
+        // 内核句柄缺失（已卸载）时没有库可清——不是失败，只是没得清。
+        if (kernelRef !== undefined) {
+          await scavengeOrphans(vectorStoreRefs(resolveStoreSets(kernelRef)).map(ref => ref.api))
+        }
+      } catch (error) {
+        // 清理异常不得影响冲刷结果（它已经落盘了）
+        lastEncodeReason = `清理残留向量行异常：${messageOf(error)}`
+      }
       try {
         await scanRebuild(kernelRef)
       } catch (error) {

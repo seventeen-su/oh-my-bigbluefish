@@ -60,15 +60,15 @@ describe('存储服务的自述：不再出现第二份会话→cwd / 已打开�
     const ws = tempWorkspace('omb-status-')
     const port = testPort(ws.dir)
     const first = createStoresService({ logger: capturingLogger(), clock: fixedClock(), resolvePort: () => port })
-    await first.forProject(ws.dir) // 首次打开：v0→v1，真的迁移了
-    expect(first.status().detail).toContain('迁移 v0→v1')
+    await first.forProject(ws.dir) // 首次打开：v0→v2（v1 建表 + v2 加 embedding.content_hash），真的迁移了
+    expect(first.status().detail).toContain('迁移 v0→v2')
     await first.close()
 
     // 第二次打开：库已是最新，没有任何迁移发生 —— 这里绝不能写 v0→v0
     const second = createStoresService({ logger: capturingLogger(), clock: fixedClock(), resolvePort: () => port })
     await second.forProject(ws.dir)
     const detail = second.status().detail
-    expect(detail).toContain('本次打开未迁移：schema v1')
+    expect(detail).toContain('本次打开未迁移：schema v2')
     expect(detail).not.toContain('迁移 v0→v0')
     await second.close()
     ws.cleanup()

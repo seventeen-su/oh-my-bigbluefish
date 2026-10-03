@@ -38,6 +38,7 @@ import {
   type StoreSet,
 } from '../../../kernel/abi/index.js'
 import { hashBagEmbedder } from '../../../modules/memory/embed.js'
+import { contentHashOf } from '../../../modules/memory/remember.js'
 import {
   BGE_DIMENSIONS,
   BGE_EMBEDDER_ID,
@@ -143,7 +144,7 @@ function recordOf(id: string, text: string, scope: MemoryScope = 'user'): Memory
     scope,
     kind: 'semantic',
     text,
-    contentHash: `h-${id}`,
+    contentHash: contentHashOf(text),
     sourceRef: 'session:t1',
     assertedBy: 'user',
     observedAt: 1,
@@ -325,7 +326,9 @@ describe('换嵌入器：陈旧向量在回合边界被重建', () => {
       limit: 5,
     })
     expect(hits.map(hit => hit.id)).toContain('m1')
-    expect(booted.status().join('\n')).toContain('待重建 0 条')
+    // 状态面：对齐之后是"记账口径的 0"（不是"刚刚又扫了一遍"），来源写在括号里
+    const statusText = booted.status().join('\n')
+    expect(statusText).toContain('向量回填：待重建 0 条（已对齐')
     booted.dispose()
   })
 
@@ -394,13 +397,19 @@ describe('换嵌入器：陈旧向量在回合边界被重建', () => {
     // 关键：这个 0 是"本轮回填记账"的结论，不是"刚刚又扫了一遍库"（状态面据此说清来源）
     expect(booted.encoder.stats().rebuild.staleFromScan).toBe(false)
 
-    // 对齐态下再走一个回合边界：一条 SQL 都不该发出去
+    // 对齐态下再走一个回合边界：**不做全表统计**（一次 COUNT/LIST 都不发）。
     // （全表统计一次就要 200~400ms/万条 —— 每回合做一次等于给会话挂一个随记忆增长的常数）
+    //
+    // 唯一允许的那条语句是**孤儿行清理**（`DELETE ... WHERE NOT EXISTS (memory)`，
+    // 走 `embedding` 主键、不读 BLOB、不随库做全表物化）：它是另一本账——
+    // "对齐"说的是"有正文的记忆都有当前向量"，而"没有正文的行"在本次的判定里根本不可见
+    // （判定以 `memory` 为外层），所以它必须有自己的清理入口，且必须是 O(库) 的一条 SQL
+    // 而不是"每回合重扫一遍待重建集合"。
     const before = snapshotCounters(db.counters)
     const outcome = await booted.encoder.encodePending()
     const spent = delta(db.counters, before)
     expect(outcome.encoded).toBe(0)
-    expect(spent.all + spent.get + spent.prepare).toBe(0)
+    expect(spent.all + spent.get + spent.prepare).toBe(1) // 只有孤儿清理那一条
     booted.dispose()
   })
 })
@@ -457,18 +466,20 @@ describe('幂等与可重入：失败保留待办，绝不静默丢', () => {
     await seedLegacyVector(store, 'm1', '长期记忆系统')
     // 一条**没有正文**的向量行（`forget` 中途崩掉就是这个形态：`store.ts:628` 删了向量、还没删正文，
     // 或者反过来正文被别的路径删掉）。它永远重建不出来，留着只会每轮被重新列出。
+    // 它带着一个内容哈希（那时正文还在，编码是 → 哈希也是），这样它在库里**只**因为
+    // "没有正文"而成为待办——正是这条用例要测的那一类。
     await api.putEmbedding({
       memoryId: 'ghost',
       modelId: HASH_IDENTITY.modelId,
       dim: HASH_IDENTITY.dim,
       revision: HASH_IDENTITY.revision,
       vector: new Float32Array(HASH_IDENTITY.dim),
+      contentHash: 'h-ghost',
     })
 
     const booted = boot(() => [storeSetOf('user', store)])
     await settle(booted.instance)
     const perTurn = await runTurns(booted)
-
     expect(perTurn).toEqual([0, 1]) // 只重建得出一条（另一条没有可编码的正文）
     expect(booted.encoder.stats().rebuild.rebuilt).toBe(1)
     expect(booted.encoder.stats().rebuild.scavenged).toBe(1)
@@ -624,7 +635,11 @@ describe('兜底不许变成灾难：嵌入器不可用时回填停住', () => {
     booted.kernel.emit('memory/written', written('m2'))
     await booted.encoder.encodePending() // 冲刷失败 → m2 留在队列（已占满 maxPending=1）
     expect(booted.encoder.pending()).toBe(1)
-    expect(booted.encoder.stats().rebuild.stale).toBe(1)
+    // 待重建 2 条：m1（换嵌入器后的存量）+ m2（刚写入、还没有向量）。
+    // 后者也算——"这条记忆的当前向量不可用"正是待重建的语义，而它此刻确实没有向量。
+    expect(booted.encoder.stats().rebuild.stale).toBe(2)
+    expect(booted.encoder.stats().rebuild.causes.lackingIdentity).toBe(2)
+    // 队列没有余量 → 本轮不扫描（回填绝不挤掉待落盘的写入）
     expect(booted.encoder.stats().rebuild.blocked).toContain('队列已满')
     expect(booted.encoder.stats().rebuild.rebuilt).toBe(0)
 
@@ -659,5 +674,48 @@ describe('状态面：待重建条数必须"测到了才报"', () => {
     expect(instance.encoder()?.stats().rebuild.stale).toBeNull()
     expect(instance.encoder()?.stats().rebuild.blocked).toContain('记忆库未就绪')
     dispose()
+  })
+
+  /**
+   * 两类待重建必须**在读数上分得开**（本仓库的规矩：降级必须可读）。
+   *
+   * 合成一个数字时，"换了嵌入器"（等回填即可）与"正文被人改写而向量没跟上"
+   * （要查是谁在改写）在状态面上长得一模一样——而后者才是"检索结果莫名其妙"的那一类。
+   */
+  it('换嵌入器 vs 正文已改写：状态面、健康面与 metrics 都分得开', async () => {
+    const store = realStore()
+    const api = asVectorStore(store)
+    if (api === undefined) throw new Error('夹具必须用真实库')
+    await seedLegacyVector(store, 'm1', '长期记忆系统') // 存量：神经身份下"缺当前身份"
+    await store.put(recordOf('m2', '这条的正文会被改写'))
+    // 先声明当前身份是神经嵌入器，才能给 m2 落一条"当前身份、但编码的是旧正文"的行
+    await api.setEmbeddingMeta(NEURAL_IDENTITY)
+    await api.putEmbedding({
+      memoryId: 'm2',
+      modelId: NEURAL_IDENTITY.modelId,
+      dim: NEURAL_IDENTITY.dim,
+      revision: NEURAL_IDENTITY.revision,
+      vector: new Float32Array(NEURAL_IDENTITY.dim),
+      contentHash: '旧正文的哈希',
+    })
+
+    const booted = boot(() => [storeSetOf('user', store)])
+    await settle(booted.instance)
+    await booted.encoder.encodePending() // 一次扫描：只测量、只入队
+
+    const stats = booted.encoder.stats().rebuild
+    expect(stats.stale).toBe(2)
+    expect(stats.causes).toEqual({ lackingIdentity: 1, contentChanged: 1 })
+
+    const status = booted.status().join('\n')
+    expect(status).toContain('缺当前身份 1 条')
+    expect(status).toContain('正文已改写 1 条')
+    const health = booted.instance.manifest.health()
+    expect(health.detail).toContain('缺当前身份 1 条')
+    expect(health.detail).toContain('正文已改写 1 条')
+    expect(health.metrics?.['staleEmbeddings']).toBe(2)
+    expect(health.metrics?.['staleLackingIdentity']).toBe(1)
+    expect(health.metrics?.['staleContentChanged']).toBe(1)
+    booted.dispose()
   })
 })

@@ -27,6 +27,7 @@ import {
   type StorageHostPort,
   type StoreSet,
 } from '../../../kernel/abi/index.js'
+import { contentHashOf } from '../../../modules/memory/remember.js'
 import { asVectorStore, openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { retrieve, type RetrievalChannel } from '../../../modules/memory/retrieve.js'
 import {
@@ -99,7 +100,7 @@ function recordOf(id: string, text: string, scope: MemoryScope = 'user'): Memory
     scope,
     kind: 'semantic',
     text,
-    contentHash: `h-${id}`,
+    contentHash: contentHashOf(text),
     sourceRef: 'session:t1',
     assertedBy: 'user',
     observedAt: 1,

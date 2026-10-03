@@ -175,10 +175,24 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
   db.prepare('UPDATE meta SET schema_version = ?').run(version)
 }
 
-/** 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。 */
+/**
+ * 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。
+ *
+ * ⚠️ **当前最高版本 2 与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（仍为 1）不一致。**
+ * 这不是笔误：`kernel/**` 此刻由另一个 agent 在改，本轮不许碰。而 `migrate()` 在
+ * **缺省步骤表**下会做一次契约漂移自检（`target !== SCHEMA_VERSION` → 抛），
+ * 于是唯一诚实的走法是：打开库的一方把本表**显式**传进去（`store.ts` 的 `openMemoryStore`），
+ * 让自检在"显式给了步骤表"这条分支上按设计跳过。
+ *
+ * 为什么仍然要加这一步而不是等 ABI：库结构缺口（`embedding` 没有 `content_hash`）是**真实缺陷**，
+ * 会让"正文被改写但嵌入器没换"的记忆永远拿着过时的向量参与检索（检索结果莫名其妙，且不报错）。
+ * 迁移是**加法**的（新列可空），旧库原地升级、不重建；代价只是上面这条待收口的版本号差异。
+ */
 export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 1, name: 'initial-schema', up: applySchemaV1 },
+  { version: 2, name: 'embedding-content-hash', up: applySchemaV2 },
 ]
+
 
 /**
  * v1 结构（规划 §5.2）。
@@ -283,4 +297,42 @@ function applySchemaV1(db: SqliteLike): void {
         `缺失时宁可拒绝打开，也不要静默退化成"没有任何检索能力"。`,
     )
   }
+}
+
+/**
+ * v2：`embedding` 表补一列 `content_hash`（**纯加法迁移**）。
+ *
+ * ## 这一列存在的理由（缺陷 B）
+ *
+ * v1 的归属标签只有 `model_id`/`dim`/`revision`——它们描述的是**谁来编码**，
+ * 不描述**编码的是哪一份正文**。于是"正文被改写（`put` 同一 id）但嵌入器身份没变"时，
+ * 旧向量既不属于"当前身份下没有向量"，也就不会被判定为陈旧：它会一直拿着**过时正文**的向量
+ * 参与检索。症状是"检索结果莫名其妙"，而不是报错——比报错难查得多。
+ *
+ * ## 为什么必须是加法（可空、不设默认值、不回填）
+ *
+ * - **可空**：`ADD COLUMN` 在 SQLite 里对已有行是 O(1) 的元数据改动（不重写表、不复制数据），
+ *   因此**旧库原地升级**，不要求重建库——库里的向量是重建一次很贵的资产，
+ *   而 `NOT NULL` 且无默认值的加列在旧库上会直接失败（表非空时 SQLite 拒绝）。
+ * - **不设默认值**：历史行"不知道自己编码的是哪份正文"，这是**未知**，不是"内容没变"。
+ *   任何哨兵默认值都会把未知伪装成已知，而判定侧只能二选一：
+ *   把未知当"未变"（静默的错误方向，正是本次要修的缺陷本身）或当"已变"（需要重建）。
+ *   这里让**结构**如实表达未知：`NULL`。
+ * - **不回填**：迁移里没有"把 `memory.content_hash` 抄进所有 `embedding` 行"这一步——
+ *   那等于替历史行**断言**"这条向量编码的正是此刻的正文"。迁移看不到"当时的正文"，
+ *   所以那个断言是编的。宁可让它们在下一次回填扫描里按"未知 → 需要重建"被重新编码
+ *   （一次性、有上界、可中断的代价），也不写一个假的事实进库。
+ *
+ * ## 为什么不建索引
+ *
+ * 陈旧判定按 `memory_id` 关联 `memory` 表（`store.ts` 的 `STALE_WHERE_SQL`），
+ * 而 `embedding` 的主键 `(memory_id, model_id, revision)` 就是聚簇键（WITHOUT ROWID），
+ * 按 `memory_id` 取行已经走主键。给 `content_hash` 单独建索引对这条查询没有增益，
+ * 却要在每次向量落盘时多维护一棵 B 树——向量落盘本来就是这条通路里最贵的一步。
+ */
+function applySchemaV2(db: SqliteLike): void {
+  db.exec(`
+    -- NULL = 未知（迁移前写入的历史行），不是"内容未变"
+    ALTER TABLE embedding ADD COLUMN content_hash TEXT;
+  `)
 }
