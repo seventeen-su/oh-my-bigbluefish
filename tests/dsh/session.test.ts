@@ -84,7 +84,9 @@ describe('collectPromptContributions：按前缀发现服务', () => {
       },
       apply: (k) => { k.provide('prompt:x', { resident: '来自 x' }) },
     }])
-    expect(collectPromptContributions(h.kernel)).toEqual([{ resident: '来自 x' }])
+    // 署名由服务名兜底（`prompt:x` → `x`）：超限报告要能点名到模块，不能靠模块自觉
+    //（预算账目与超限留声的完整断言见 `tests/dsh/resident-budget.test.ts`）
+    expect(collectPromptContributions(h.kernel)).toEqual([{ resident: '来自 x', id: 'x' }])
   })
 
   it('非 prompt: 前缀的服务不被收集', () => {
