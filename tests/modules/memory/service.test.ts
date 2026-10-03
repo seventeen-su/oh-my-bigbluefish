@@ -64,7 +64,8 @@ describe('StoresService：双库与 cwd 身份', () => {
     expect(set?.store('project')).toBeDefined()
     expect(set?.store('project')).not.toBe(set?.store('user'))
     expect(set?.migrated.map(entry => entry.scope).sort()).toEqual(['project', 'user'])
-    expect(set?.migrated.every(entry => entry.from === 0 && entry.to === 1)).toBe(true)
+    // 0 → 2：v1 建表 + v2 给 `embedding` 加 `content_hash`（加法迁移，旧库原地升级）
+    expect(set?.migrated.every(entry => entry.from === 0 && entry.to === 2)).toBe(true)
 
     // 路径遵循规划 §5.3 的布局
     expect(port.opened).toEqual([port.userDbPath, projectDbPathFor(ws.dir)])

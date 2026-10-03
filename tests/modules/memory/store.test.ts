@@ -20,6 +20,7 @@ import {
   asMemoryStore,
   asVectorStore,
   openMemoryStore,
+  type EmbeddingMeta,
   type SqliteMemoryStore,
 } from '../../../modules/memory/store.js'
 import { asOverturnedProbe } from '../../../modules/memory/overturned.js'
@@ -823,7 +824,7 @@ describe('MemoryStore：stats 与类型守卫', () => {
     const { store, ws } = fixtureOf('project')
     await putAll(store, [makeRecord({ scope: 'project', id: 'p1' }), makeRecord({ scope: 'project', id: 'p2' })])
     const stats = await store.stats()
-    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 1, vectors: null })
+    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 2, vectors: null })
     ws.cleanup()
   })
 
@@ -850,19 +851,25 @@ describe('MemoryStore：stats 与类型守卫', () => {
     ws.cleanup()
   })
 
-  it('打开时就完成迁移：migrated 记录 0 → 最新', async () => {
+  it('打开时就完成迁移：migrated 记录 0 → 最新（含 v2 的 embedding.content_hash）', async () => {
     const { store, ws } = fixtureOf()
-    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 1 })
+    // 0 → 2：v1 建表 + v2 加列。断言用**结构实际版本**（2），不用 ABI 的 SCHEMA_VERSION——
+    // 那个常量此刻仍写着 1（`kernel/**` 由另一个 agent 在改），而库结构确实已经是 v2。
+    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 2 })
     ws.cleanup()
   })
 })
 
 /**
- * 「待重建」是换嵌入器之后唯一的待办来源（`modules/memory/vector.ts` 的回填据此发起），
- * 因此它的**判定**必须是可核对的：
- * - 待重建 = **当前身份下没有向量的记忆**（不是"有多少行不属于当前身份"）；
- * - 旧行保留（可查询、可换回原嵌入器），但不再计入待办——否则待办永远不清零，
- *   每轮回填都会重编码同一批，读数变成噪音；
+ * 「待重建」是回填唯一的待办来源（`modules/memory/vector.ts` 据此发起），因此它的**判定**
+ * 必须是可核对的。两类待办都在这里钉住：
+ * - **缺当前身份**：当前身份下没有向量行的记忆（换嵌入器之后的存量失效）；
+ * - **正文已改写**：有当前身份的行、但它的 `content_hash` 与此刻正文不符（含 NULL = 未知，
+ *   即 v2 迁移前的历史行）——`model_id`/`dim`/`revision` 看不见这一类，
+ *   而它会让旧向量一直参与检索（检索结果莫名其妙、且不报错）。
+ * 另外两条性质：
+ * - 旧行保留（可查询、可换回原嵌入器），但一旦补齐当前身份的行就不再计入待办——
+ *   否则待办永远不清零，每轮回填都会重编码同一批，读数变成噪音；
  * - 列出必须**只取 id 且可分页**：回填的上界是条数，不是"把整个库的 BLOB 拉进内存"。
  */
 describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', () => {
@@ -877,16 +884,55 @@ describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', ()
   const legacy = { modelId: 'hash-bow-256', dim: 256, revision: '1' } as const
   const neural = { modelId: 'bge-small-zh-v1.5-512', dim: 512, revision: '1' } as const
 
+  /**
+   * 造一条记忆 + 它所声明的向量行（**待重建的判定必须能 join 到正文**，所以夹具也要有正文）。
+   *
+   * `contentHash` 缺省 = 用库里那份（`put` 写下的），也就是"向量与正文相符"的常态。
+   * 显式传一个别的值 = 造出"向量编码的是另一份正文"的现场（缺陷 B）。
+   */
+  async function seedVector(
+    store: SqliteMemoryStore,
+    options: {
+      readonly id: string
+      readonly text?: string
+      readonly contentHash?: string
+      readonly meta?: EmbeddingMeta
+    },
+  ): Promise<void> {
+    const contentHash = options.contentHash ?? `h-${options.id}`
+    await store.put(
+      makeRecord({
+        id: options.id,
+        text: options.text ?? `记忆 ${options.id}`,
+        contentHash,
+      }),
+    )
+    const meta = options.meta ?? legacy
+    await store.putEmbedding({
+      memoryId: options.id,
+      modelId: meta.modelId,
+      dim: meta.dim,
+      revision: meta.revision,
+      vector: new Float32Array(meta.dim),
+      contentHash,
+    })
+  }
+
   it('待重建 = 当前身份下没有向量的记忆；重建后旧行仍在，但待办清零', async () => {
     const { store, ws } = fixtureOf()
-    await store.putEmbedding(vector({ memoryId: 'm1' }))
+    await seedVector(store, { id: 'm1' })
     expect(await store.countStaleEmbeddings(neural)).toBe(1)
     expect(await store.listStaleEmbeddingIds(neural)).toEqual(['m1'])
     // 当前身份自己的行不欠账
     expect(await store.countStaleEmbeddings(legacy)).toBe(0)
 
     await store.setEmbeddingMeta(neural)
-    await store.putEmbedding({ memoryId: 'm1', ...neural, vector: new Float32Array(neural.dim) })
+    await store.putEmbedding({
+      memoryId: 'm1',
+      ...neural,
+      vector: new Float32Array(neural.dim),
+      contentHash: 'h-m1',
+    })
 
     expect(await store.countEmbeddings()).toBe(2) // 旧行**留着**（可查询、可换回）
     expect(await store.countStaleEmbeddings(neural)).toBe(0) // 但待办已清零
@@ -894,43 +940,139 @@ describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', ()
     ws.cleanup()
   })
 
-  it('换修订号也算待重建（同模型不同 revision 不可比）', async () => {
+  it('回收：deleteStaleEmbeddings 只删**当前身份但正文已改**的行；其他行一字不动', async () => {
     const { store, ws } = fixtureOf()
-    await store.putEmbedding(vector({ memoryId: 'm1', revision: '1' }))
+    await seedVector(store, { id: 'm1' }) // 旧身份（内容相符的那一行）
+    await store.setEmbeddingMeta(neural)
+    await store.putEmbedding({
+      memoryId: 'm1',
+      ...neural,
+      vector: new Float32Array(neural.dim),
+      contentHash: 'h-m1',
+    })
+
+    // 旧身份的行**不删**：它是"换回原嵌入器"的退路（`setEmbeddingMeta` 的既有承诺）。
+    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(0)
+    expect(await store.getEmbeddings(['m1'])).toHaveLength(2)
+
+    // 当前身份的正文被改写之后，那一行才是"没有消费者"的：删它、留旧的
+    await store.put(makeRecord({ id: 'm1', text: '改写后的正文', contentHash: 'h-m1-v2' }))
+    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(1)
+    const rows = await store.getEmbeddings(['m1'])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.modelId).toBe(legacy.modelId)
+    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(0) // 幂等：再删 0 行
+    expect(await store.deleteStaleEmbeddings([], neural)).toBe(0)
+    ws.cleanup()
+  })
+
+  it('上一轮的归属谓词看不见"正文改写"（这条用例把它钉住：缺陷 B 的回归门禁）', async () => {
+    const { store, db, ws } = fixtureOf()
+    await seedVector(store, { id: 'm1', text: '第一版正文' })
+    await store.put(makeRecord({ id: 'm1', text: '第二版正文', contentHash: 'h-m1-v2' }))
+
+    // 上一轮的判定（v1 时代）：只看归属三元组，没有任何内容维度的条件
+    const oldRow = db.raw
+      .prepare(
+        `SELECT COUNT(DISTINCT e.memory_id) AS c FROM embedding e WHERE NOT EXISTS (
+           SELECT 1 FROM embedding cur
+            WHERE cur.memory_id = e.memory_id AND cur.model_id = ? AND cur.dim = ? AND cur.revision = ?)`,
+      )
+      .get(legacy.modelId, legacy.dim, legacy.revision) as { c?: number } | undefined
+    const oldStale = Number(oldRow?.c ?? 0)
+    // 旧谓词给出 **0 条待重建**：向量明明编码的是旧正文，它却认为一切正常。
+    // 这就是"检索结果莫名其妙"而没有任何报错的来源——正是本次要修的缺口。
+    expect(oldStale).toBe(0)
+
+    // 新谓词（带内容判据）给出 1 条，且原因可读
+    const counts = await store.countStaleEmbeddingsByCause(legacy)
+    expect(counts).toEqual({ lackingIdentity: 0, contentChanged: 1, total: 1 })
+    expect(counts.total).toBeGreaterThan(oldStale)
+    ws.cleanup()
+  })
+
+  it('换修订号也算待重建（同模型不同 revision 不可比）', async () => {    const { store, ws } = fixtureOf()
+    await seedVector(store, { id: 'm1' })
+    // 同模型、不同 revision：那条行不属于这个身份 → 这一类是"缺当前身份"
     expect(await store.countStaleEmbeddings({ ...legacy, revision: '2' })).toBe(1)
+    expect(await store.countStaleEmbeddingsByCause({ ...legacy, revision: '2' })).toEqual({
+      lackingIdentity: 1,
+      contentChanged: 0,
+      total: 1,
+    })
     // 同模型同修订（只是维度写错的情形由写入口拒绝）→ 不欠账
     expect(await store.countStaleEmbeddings(legacy)).toBe(0)
     ws.cleanup()
   })
 
-  it('键集分页：按 memory_id 升序、`afterId` 之后取，取不满即到表尾；一条查询取回', async () => {
-    const { store, db, ws } = fixtureOf()
-    for (const id of ['m3', 'm1', 'm2']) await store.putEmbedding(vector({ memoryId: id }))
+  it('两类待办分开计数：换嵌入器与正文改写各算各的，总数是它们的和', async () => {
+    const { store, ws } = fixtureOf()
+    // m1：正文改写过（同身份的行，哈希不符）
+    await seedVector(store, { id: 'm1', text: '第一版' })
+    await store.put(makeRecord({ id: 'm1', text: '第二版', contentHash: 'h-m1-v2' }))
+    // m2：只有旧身份的向量 → 在 `neural` 身份下缺行（内容本身相符）
+    await seedVector(store, { id: 'm2', text: '另一条记忆' })
 
-    const before = snapshotCounters(db.counters)
-    const first = await store.listStaleEmbeddingIds(neural, { limit: 2 })
-    const spent = delta(db.counters, before)
-
-    expect(first).toEqual(['m1', 'm2'])
-    expect(spent.all).toBe(1) // 一次 SQL（不是每 id 一次），且**只取 id**（不读 BLOB）
-    expect(await store.listStaleEmbeddingIds(neural, { afterId: 'm2', limit: 2 })).toEqual(['m3'])
-    expect(await store.listStaleEmbeddingIds(neural, { afterId: 'm3', limit: 2 })).toEqual([])
-    expect(await store.countStaleEmbeddings(neural)).toBe(3)
+    // 换到神经身份：两条都缺当前身份的行（旧向量在 `neural` 下不算数）
+    expect(await store.countStaleEmbeddingsByCause(neural)).toEqual({
+      lackingIdentity: 2,
+      contentChanged: 0,
+      total: 2,
+    })
+    // 回到原身份：m2 完全对齐，m1 是"内容已改写"
+    expect(await store.countStaleEmbeddingsByCause(legacy)).toEqual({
+      lackingIdentity: 0,
+      contentChanged: 1,
+      total: 1,
+    })
     ws.cleanup()
   })
 
-  it('回收：deleteStaleEmbeddings 只删**非当前身份**的行，当前身份的行一字不动', async () => {
-    const { store, ws } = fixtureOf()
-    await store.putEmbedding(vector({ memoryId: 'm1' })) // 旧身份
-    await store.setEmbeddingMeta(neural)
-    await store.putEmbedding({ memoryId: 'm1', ...neural, vector: new Float32Array(neural.dim) })
+  it('历史行（content_hash 为 NULL = 未知）算待重建，不冒充"内容未变"', async () => {
+    const { store, db, ws } = fixtureOf()
+    await seedVector(store, { id: 'm1' })
+    expect(await store.countStaleEmbeddings(legacy)).toBe(0)
 
-    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(1)
-    const rows = await store.getEmbeddings(['m1'])
-    expect(rows).toHaveLength(1)
-    expect(rows[0]?.modelId).toBe(neural.modelId)
-    expect(await store.deleteStaleEmbeddings(['m1'], neural)).toBe(0) // 幂等：再删 0 行
-    expect(await store.deleteStaleEmbeddings([], neural)).toBe(0)
+    // 模拟 v2 迁移之前落下的行：当前身份、但不知道它编码的是哪份正文。
+    // 注意 SQL 三值逻辑：`NULL = m.content_hash` 求值为 NULL（不是假），
+    // 若判定里没有显式排除 NULL，这一行会被静默当成"内容未变"——正是要修的错误方向。
+    db.raw.prepare("UPDATE embedding SET content_hash = NULL WHERE memory_id = 'm1'").run()
+    expect(await store.countStaleEmbeddings(legacy)).toBe(1)
+    expect(await store.listStaleEmbeddingIds(legacy)).toEqual(['m1'])
+    expect(await store.countStaleEmbeddingsByCause(legacy)).toEqual({
+      lackingIdentity: 0,
+      contentChanged: 1,
+      total: 1,
+    })
+    // 重建落盘后再次清零（NULL 只是"未知"，补上就完事）
+    await store.putEmbedding({ ...vector({ memoryId: 'm1' }), contentHash: 'h-m1' })
+    expect(await store.countStaleEmbeddings(legacy)).toBe(0)
+    ws.cleanup()
+  })
+
+  it('批量性：一次调用一条 SQL、不读 BLOB（回填的代价与库的字节数无关）', async () => {
+    const { store, db, ws } = fixtureOf()
+    for (const id of ['m1', 'm2', 'm3']) {
+      await seedVector(store, { id })
+      // 三条的正文都被改写 → 三条都欠账（且都是"内容已改写"这一类）
+      await store.put(makeRecord({ id, text: `改写过的记忆 ${id}`, contentHash: `h-${id}-v2` }))
+    }
+
+    // 计数与按原因计数：**一条 SQL**（不是每 id 一次）。这条查询只读计数，
+    // 因此一次 `prepare + get`（`2`）；若退化成 N+1（每 id 一次）这里会随库增长。
+    const beforeCount = snapshotCounters(db.counters)
+    expect(await store.countStaleEmbeddingsByCause(legacy)).toEqual({
+      lackingIdentity: 0,
+      contentChanged: 3,
+      total: 3,
+    })
+    const counted = delta(db.counters, beforeCount)
+    expect(counted.all + counted.get + counted.prepare).toBe(2)
+
+    const beforeList = snapshotCounters(db.counters)
+    expect(await store.listStaleEmbeddingIds(legacy, { limit: 2 })).toEqual(['m1', 'm2'])
+    const spent = delta(db.counters, beforeList)
+    expect(spent.all).toBe(1) // 一条 SQL，且**只取 id**（不把 1KB/条的向量 BLOB 读进内存）
     ws.cleanup()
   })
 
@@ -944,6 +1086,9 @@ describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', ()
     )
     await expect(store.deleteStaleEmbeddings(['m1'], { modelId: 'x', dim: 4, revision: '' })).rejects.toThrow(
       /revision/,
+    )
+    await expect(store.countStaleEmbeddingsByCause({ modelId: '', dim: 256, revision: '1' })).rejects.toThrow(
+      /model_id/,
     )
     ws.cleanup()
   })
