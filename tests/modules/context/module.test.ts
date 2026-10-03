@@ -464,6 +464,30 @@ describe('状态面段落与热插拔', () => {
     handle.dispose()
   })
 
+  it('说明由**本次**读数推出：拿到会话后不再留"无活跃会话"（旧结论不许累积）', () => {
+    const { handle } = start({ fillRatio: 0.45 })
+    const contributor = handle.kernel
+      .service<StatusRegistry>(SERVICES.statusContributor)
+      ?.list()
+      .find(c => c.name === '上下文优化（omb-context）')
+    expect(contributor, '上下文模块必须登记状态段').toBeDefined()
+    // 状态面（`dsh/status-tool.ts`）渲染时会把本次会话作为第一个实参传进来
+    const renderWith = (session?: string): string =>
+      (contributor!.render as (session?: string) => string)(session)
+
+    // 没有会话：读数缺失，且说明里明写原因（这是"未测量"的正确呈现）
+    expect(renderWith()).toContain('fillRatio 未知')
+    expect(renderWith()).toContain('无活跃会话：压力读数缺失')
+
+    // 有会话：**同一段**必须整体切到实时读数，且不许再留着上面那句旧结论。
+    // 旧实现把它 push 进累积的 `notes`，于是拿到会话后同一次输出里一边报
+    // 真实 fillRatio、一边说"无活跃会话：读数缺失"——两个相反的说法。
+    const live = renderWith('s')
+    expect(live).toContain('fillRatio 0.450')
+    expect(live).not.toContain('无活跃会话')
+    handle.dispose()
+  })
+
   it('卸载后零残留；重复卸载不抛', () => {
     const { handle } = start()
     const kernel = handle.kernel

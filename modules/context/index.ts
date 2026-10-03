@@ -41,11 +41,22 @@ import {
   sessionOfKey,
   summarize,
 } from './watch.js'
-import { buildStatusPanel, createStatusContributor } from './tools.js'
+import type { StatusPanelInput } from './tools.js'
+import { buildStatusPanel, renderStatusPanel } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
 export const MODULE_VERSION = '3.3.0'
+
+/**
+ * 「真的没有会话」时面板上的那一句说明。
+ *
+ * 它必须由**本次渲染**的会话解析结果推出（`panelInput`），**不做累积**：
+ * 累积写法会把"当时没有会话"永久留在面板上，于是拿到会话之后，同一段里
+ * 一边报 `moderate / 0.343`、一边说"无活跃会话：读数缺失"——同一次输出里
+ * 两个相反的说法，读者无法判断该信哪个。
+ */
+const NO_SESSION_NOTE = '无活跃会话：压力读数缺失，按宽松档处理'
 
 /** 配置：`cordis.patch.yml` 的 `config` 段。 */
 export interface ContextConfig {
@@ -235,8 +246,10 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     const pressureOf = (session?: SessionRef): ContextPressure => {
       const target = resolveSession(session)
       if (target === null) {
-        const note = '无活跃会话：压力读数缺失，按宽松档处理'
-        if (!notes.includes(note)) notes.push(note)
+        // **这里不写 `notes`**：那句话必须由**这一次**的读数推出（见 `panelInput`）。
+        // 曾经它在这里 `notes.push(...)`，于是"没有会话"那一刻的说明会一直挂在面板上——
+        // 拿到会话之后，同一段里一边报 `moderate / 0.343`、一边说"无活跃会话：读数缺失"。
+        // 累积的说明与实时读数混在一起，就是"快照 vs 实时"这一类缺陷的另一种形态。
         return { totalTokens: 0, fillRatio: null, band: 'relaxed', cacheReadTokens: 0, cacheWriteTokens: 0, nodes: [] }
       }
       try {
@@ -449,9 +462,39 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     // 保留位：上下文模块当前没有模型可见工具（`omb_status` 由 dsh/ 注册，属 omb-kernel）
     provide(toolsServiceFor(MODULE_ID), tools)
 
-    const statusContributor: StatusContributor = createStatusContributor(() => {
-      const pressure = pressureOf()
+    /**
+     * 状态面板的输入组装。`session` 是**状态面渲染时给出的本次会话**
+     * （`dsh/status-tool.ts` 把顶层「## 上下文」段用的同一个会话标识传进来）。
+     *
+     * ## 为什么必须与顶层共用同一个会话（实测矛盾）
+     *
+     * 这里曾经不接收会话，于是同一次 `omb_status` 里两个读数相反：
+     *
+     * ```
+     * ## 上下文            压力档位：moderate / 窗口占用：0.343   ← 顶层拿到了会话
+     * ### 上下文优化（…）  压力档位：relaxed（fillRatio 未知…）     ← 模块没拿到
+     * ```
+     *
+     * 后果不只是难看：本模块的塑形（`pushLimit` / `indexOnly`）按 relaxed 走，
+     * **"紧张就少说"在模块层面等于没生效**；而顶层还显示 moderate——读者无法判断
+     * 该信哪个，整个状态面（唯一的模型可见诊断入口）一起失去可信度。
+     *
+     * ## 为什么不能让模块自己去问内核登记处
+     *
+     * `SERVICES.activeSession.current()` 是"最后一次观测到的会话"，**读历史可以、
+     * 当归属不行**（`kernel/abi/catalog.ts:279-281`、`kernel/activeSession.ts:17-18`）；
+     * 模块自己挑就会重演 `lastActiveSession` 那类跨会话污染（交错会话时把别人的读数
+     * 当成自己的）。所以会话**只认调用方显式传入**——见 `resolveSession` 的契约，
+     * 拿不到（`undefined`）就如实按"未测量"处理，不借用任何人的读数。
+     *
+     * 拉取台账**不跟着会话走**：它按会话分列（`sessionsSnapshot`）并在主行写清口径，
+     * 既有的"不挑当前会话、不合并"语义保持不变；会话只用于上面那条会被顶层重复
+     * 印出来的压力读数（两处必须是同一个数）。
+     */
+    const panelInput = (session?: SessionRef): StatusPanelInput => {
+      const pressure = pressureOf(session)
       const reading = readingOf(pressure, bands)
+      const noSession = resolveSession(session) === null
       return {
         // 模块健康由 omb_status 顶部统一呈现（模块拿不到全局健康面，不假装有）
         pressure,
@@ -460,9 +503,42 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         pulls: snapshotFor(),
         sessions: sessionsSnapshot(),
         degradations,
-        notes,
+        // 「说明」按**本次渲染**算，不做累积：没有会话才有那一句。
+        // 累积写法会让旧结论一直挂在面板上，与同一段里的实时读数打架
+        // （见 `pressureOf` 的说明）——状态面里"两边各说一套"就是这么长出来的。
+        notes: noSession ? [...notes, NO_SESSION_NOTE] : notes,
       }
-    })
+    }
+
+    /**
+     * 状态段：**渲染前先把会话接过来**（`render(session)`）。
+     *
+     * 这里没有直接复用 `./tools.ts` 的 `createStatusContributor`：它的 `read` 形参是
+     * `() => StatusPanelInput`，会把状态面传进来的会话吃掉——而那个会话正是本段与
+     * 顶层读数一致的唯一来源（吞掉它就退回了上面记的那次矛盾）。隔离要求照旧：
+     * `render` / `metrics` 绝不抛，单个段落失败不得弄坏整份状态面。
+     *
+     * 注：内核登记处的汇总口径（`handle.status()`）**不传会话**——它没有"这次是谁"
+     * 这件事实。那条路径下本段如实呈现"未测量"（`fillRatio 未知`），不借用任何读数；
+     * 模型可见的 `omb_status` 走的是 `dsh/status-tool.ts`，那里会话显式传入。
+     */
+    const statusContributor: StatusContributor = {
+      name: '上下文优化（omb-context）',
+      render: (session?: SessionRef): string => {
+        try {
+          return renderStatusPanel(buildStatusPanel(panelInput(session)))
+        } catch (error) {
+          return `渲染失败（已隔离）：${messageOf(error)}`
+        }
+      },
+      metrics: (session?: SessionRef): Readonly<Record<string, number>> => {
+        try {
+          return buildStatusPanel(panelInput(session)).metrics
+        } catch {
+          return { renderError: 1 }
+        }
+      },
+    }
 
     provide(SERVICES.contextPressure, pressureService)
     provide(SERVICES.contextMetrics, metricsService)

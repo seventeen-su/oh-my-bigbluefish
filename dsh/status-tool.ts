@@ -10,7 +10,13 @@
  * **这是唯一的模型可见诊断入口**，因此它必须在任何模块缺席时仍然可用——
  * 状态面本身挂了是最难排查的故障。
  */
-import type { ContextPressure, ModuleHealth, StatusRegistry, StoresService } from '../kernel/abi/index.js'
+import type {
+  ContextPressure,
+  ModuleHealth,
+  StatusContributor,
+  StatusRegistry,
+  StoresService,
+} from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
 import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
@@ -45,12 +51,74 @@ function activeSessionsOf(handle: KernelHandle): ActiveSessionsLike | undefined 
   return handle.kernel.service<ActiveSessionsLike>(SERVICES.activeSession)
 }
 
+/**
+ * 状态贡献者的**可选会话形参**（ABI 之外的一处显式扩展）。
+ *
+ * `StatusContributor.render` 在 ABI 里是 `() => string`（`kernel/abi/catalog.ts:372-379`）。
+ * 而"少形参"的实现本来就满足"多一个**可选**形参"的签名（函数类型允许调用方少传参数），
+ * 所以这处扩展**不必改 ABI、也不强制任何模块接受它**：需要会话的模块写
+ * `render(session?)`，不需要的照旧写 `render()`——两者都满足 `StatusContributor`，
+ * 登记处（`kernel/status.ts`）那一侧因此一行都不用动。
+ *
+ * ## 为什么必须由这里传，不能让模块自己问内核
+ *
+ * 内核登记处的 `current()` 是"**最后一次观测到**的会话"，不是"这次是谁"
+ * （`kernel/abi/catalog.ts:279-281`、`kernel/activeSession.ts:17-18`）。模块拿它当归属，
+ * 两个会话交错时 A 的读数就会被记到 B 头上——那正是 `lastActiveSession` 那类
+ * 跨会话污染。唯一知道"这次是谁"的地方就是本文件（顶层「## 上下文」段用的
+ * 也正是这个值），所以会话只能由调用方显式给出。
+ *
+ * 传 `undefined` 表示"**真的没有会话**"：模块据此走自己的"未测量"路径，
+ * 而不是措辞优美地借用别人的读数。
+ */
+interface SessionAwareContributor extends StatusContributor {
+  render(session?: string): string
+}
+
 /** 组装 `omb_status` 的输出文本。纯组装，无副作用，便于测试。 */
 export function renderStatus(options: StatusToolOptions, sessionId?: string): string {
   const { handle } = options
   const kernel = handle.kernel
   const sessions = activeSessionsOf(handle)
   const lines: string[] = ['# OMB 状态', '']
+
+  // ── 会话口径：**一次渲染只解析一次**，顶层与模块段共用同一个 ──────────────
+  // 会话优先级：显式参数 → 内核登记处的当前会话 → 任一已知会话（诊断兜底）。
+  // 读数只来自 `kernel.pressure/focus`，本文件不自己存会话事实。
+  const activeSession = sessionId ?? sessions?.current() ?? sessions?.sessions()[0] ?? ''
+
+  // ── 组件自述：**必须先渲染**（顺序契约，理由见下）───────────────────────
+  //
+  // ## 顺序为什么是正确性的一部分
+  //
+  // 模块行的文字来自内核健康面保存的**上报快照**（`kernel/health.ts:12-37`），
+  // 而 `omb_status` **不会**调用模块的 health 函数（`handle.health()` 只给快照）。
+  // 会动的模块（制品索引、通知桥……）因此只能在自己的状态段 `render` 里
+  // "先自报一次"来刷新那一行——刷新点既然在 `render` 里，**渲染顺序就决定了
+  // 这次输出里模块行是新是旧**。
+  //
+  // 先取快照、后渲染段落时，模块行是上一次渲染刷新的结果，于是同一次输出里出现：
+  //
+  // ```
+  // - omb-artifact：正常——制品索引 0/500 条        ← 快照（落后一次调用）
+  // ### 制品索引（omb-artifact）  已索引 2 条        ← 实时
+  // ```
+  //
+  // **这不是"数字旧了"这么轻**：一个"正常"的模块行配一个降级/不可用的组件自述
+  // （或反过来，一个可用的组件被模块行说成"宿主未安装"），读者无法判断该信哪个；
+  // 而 `omb_status` 是唯一的模型可见诊断入口，两个面互相矛盾会让整个状态面
+  // 一起失去可信度（实测踩过三次：上下文压力、制品条数、通知可用性——
+  // `modules/notify/index.ts` 里"同一次 `omb_status` 里"那段注释记的正是第三次复发）。
+  //
+  // 修法是结构性的：**先渲染全部贡献者（= 跑完所有刷新点），再取健康面快照**。
+  // 于是两个面在同一次调用内读到同一份状态，不再依赖"上一次调用碰巧刷过"。
+  // 会刷新自己的模块必须遵守同一条契约：`render` 里先 `kernel.report(health())`，
+  // 再读实时状态生成文字（见 `modules/artifact/module.ts` 的注释）。
+  const registry = kernel.service<StatusRegistry>(SERVICES.statusContributor)
+  // `StatusContributor` 天然满足 `SessionAwareContributor`（少形参可实现多可选形参），
+  // 所以这里不需要 cast：不接受会话的贡献者照样在列表里，只是忽略那个实参。
+  const contributors: readonly SessionAwareContributor[] = registry?.list() ?? []
+  const contributedSections = contributors.length > 0 ? registryLines(contributors, activeSession) : []
 
   // ── 构建代数 ──────────────────────────────────────────────────────────
   // **这一行是防误判的关键**：插件行能免重启动态增删，但模块代码走 Node ESM
@@ -68,6 +136,9 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   )
 
   // ── 模块健康 ──────────────────────────────────────────────────────────
+  //
+  // 快照取在**全部贡献者渲染之后**（见上方"组件自述：必须先渲染"）：
+  // 这一步的先后就是"模块行会不会停在最后一次上报那一刻"的全部差别。
   const health = handle.health()
   const ids = Object.keys(health).sort()
   lines.push('## 模块', '')
@@ -128,9 +199,8 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   }
 
   // ── 上下文度量（软压力，不是上限）─────────────────────────────────────
-  // 会话优先级：显式参数 → 内核登记处的当前会话 → 任一已知会话（诊断兜底）。
-  // 读数只来自 `kernel.pressure/focus`，本文件不自己存会话事实。
-  const activeSession = sessionId ?? sessions?.current() ?? sessions?.sessions()[0] ?? ''
+  // 会话在上面解析过一次（`activeSession`）；顶层与模块段共用它，
+  // 否则就会出现"顶层 moderate / 0.343，模块段 relaxed / 未测量"这种同一次输出里的矛盾。
   lines.push('## 上下文', '')
   if (activeSession.length === 0) {
     lines.push(
@@ -179,11 +249,11 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     lines.push('')
   }
 
-  // ── 模块贡献的段落 ────────────────────────────────────────────────────
-  const registry = kernel.service<StatusRegistry>(SERVICES.statusContributor)
-  const contributed = registry?.list() ?? []
-  if (contributed.length > 0) {
-    lines.push(...registryLines(registry))
+  // ── 模块贡献的段落（内容已在上面渲染，这里只落位）─────────────────────
+  // 落位顺序不变（模块行在前、组件自述在后），变的只是**渲染时机**：
+  // 它们在取健康面快照之前就跑完了，所以模块行与组件自述说的是同一份状态。
+  if (contributors.length > 0) {
+    lines.push(...contributedSections)
   } else {
     lines.push('## 组件自述', '', '（尚无模块贡献状态段落）', '')
   }
@@ -191,13 +261,13 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   return lines.join('\n')
 }
 
-function registryLines(registry: StatusRegistry | undefined): readonly string[] {
-  if (registry === undefined) return []
+function registryLines(contributors: readonly SessionAwareContributor[], session: string): readonly string[] {
   // 渲染由登记处负责（它已隔离单个贡献者的异常）；这里只加一层小标题
   const rendered: string[] = ['## 组件自述', '']
-  for (const c of registry.list()) {
+  for (const c of contributors) {
     try {
-      rendered.push(`### ${c.name}`, c.render(), '')
+      // 空串 = 内核里根本没有活跃会话：传 `undefined`，模块据此走"未测量"
+      rendered.push(`### ${c.name}`, c.render(session === '' ? undefined : session), '')
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       rendered.push(`### ${c.name}`, `（渲染失败：${message}）`, '')
