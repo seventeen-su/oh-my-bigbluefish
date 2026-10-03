@@ -205,14 +205,41 @@ export function isKernel(value: unknown): value is Kernel {
  * 推断宿主 ctx 语义而反复返工。心跳把这条链路变成可读事实。
  *
  * 写文件失败一律忽略：诊断不得影响功能。
+ *
+ * ## 落点必须由自身位置推导，不许写死绝对路径
+ *
+ * 旧实现写死 `'<repo>/.omb-heartbeat.jsonl'`——那是**开发机
+ * 上的一次性路径**。代价有两层：
+ *   ① 任何非开发机的部署都会往一个不存在（或无权限）的路径写，心跳静默全丢，
+ *      而它恰好是排查宿主加载问题的唯一工具；
+ *   ② 更隐蔽的一层：把插件装成**独立副本**（不指向开发仓库）时，副本会**持续写入
+ *      开发仓库**——"副本与开发仓库互不影响"当场破功。冻结副本那轮实测到过这一点。
+ *
+ * 现在的落点是「本文件所在位置向上找到的第一个含 `package.json` 的祖先」，
+ * 也就是**这份代码自己所属的那个包**。仓库里跑就写仓库根，副本里跑就写副本根。
  */
 export function heartbeat(stage: string, detail: Record<string, unknown> = {}): void {
   try {
-    // 动态 import 会变成异步，这里用同步写入；路径固定在仓库根，方便直接查看
+    // 动态 import 会变成异步，这里用同步写入
     const line = `${JSON.stringify({ at: new Date().toISOString(), stage, ...detail })}\n`
-     
-    const fs = require('node:fs') as { appendFileSync(p: string, d: string): void }
-    fs.appendFileSync('<repo>/.omb-heartbeat.jsonl', line)
+
+    const fs = require('node:fs') as { appendFileSync(p: string, d: string): void; existsSync(p: string): boolean }
+    const path = require('node:path') as { dirname(p: string): string; join(...parts: string[]): string }
+    const url = require('node:url') as { fileURLToPath(u: string): string }
+
+    /** 从当前模块位置向上找第一个含 `package.json` 的目录（= 本代码所属的包根）。 */
+    const ownPackageRoot = (): string => {
+      let dir = path.dirname(url.fileURLToPath(import.meta.url))
+      for (let i = 0; i < 8; i++) {
+        if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+        const parent = path.dirname(dir)
+        if (parent === dir) break
+        dir = parent
+      }
+      return process.cwd()
+    }
+
+    fs.appendFileSync(path.join(ownPackageRoot(), '.omb-heartbeat.jsonl'), line)
   } catch {
     // 诊断失败不影响功能
   }
