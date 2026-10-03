@@ -280,9 +280,66 @@ export function renderContext(
   return parts.join('\n\n')
 }
 
+/**
+ * 提示贡献集合的来源：**数组**（此刻已固定）或**惰性提供者**（每次需要时重新解析）。
+ *
+ * ## 为什么必须允许提供者（这正是本次修的缺陷）
+ *
+ * `dsh/plugin.ts` 在**内核行的 `apply` 里同步**调用 `wirePromptInjection`，
+ * 而模块行由宿主**异步**挂载（Cordis 先等 `inject: ['omb:kernel']` 就绪，再在微任务里挂载）。
+ * 那一刻服务表里一个 `prompt:*` 都还没有——"一次性收集"拿到的必然是**空集**：
+ *
+ * - 推理模块的常驻提示（R1）、用户画像的冲突摘要（R8）、任何模块的 `context()` 易变段
+ *   **从未到达模型**；
+ * - 而所有健康面都是绿的、服务都注册了、工具都能调
+ *   ——"所有健康面是绿的、能力都注册了，只是从未生效"。
+ *
+ * 这与工具面已经修过的根因**是同一个**（见 `dsh/plugin.ts` 的 `disposeToolResync`：
+ * 一次性收集的结果是只有内核自带的 `omb_status` 进了工具面，其余 7 个工具全部消失，
+ * 而健康面一切正常）。修法同构：传提供者，每次真正需要文本时重新扫服务表。
+ *
+ * 传数组仍然工作（向后兼容）：那是"集合此刻已固定"的语义，
+ * 装配时就知道全部贡献的调用方（以及大量测试）可以继续这么传。
+ */
+export type PromptContributionSource =
+  | readonly PromptContribution[]
+  | (() => readonly PromptContribution[])
+
+/**
+ * 解析贡献集合：数组原样返回，提供者**每次调用都重新求值**（这就是本类型存在的理由）。
+ *
+ * 为什么这里要吞掉异常并不抛：取贡献要遍历服务表、包装模块给的对象，
+ * 而模块可以随时挂上/卸下、形状也可能不符。提示注入是**增益**，不是会话的前置条件——
+ * 解析失败不许把整条链路打掉；留声（`onError`）后按空集合处理，
+ * 状态面因此会如实显示"无贡献者"（看着不对，但比"看着对却没注入"强得多）。
+ *
+ * ⚠️ 惰性化把这段代码挪进了**宿主的每轮渲染路径**：在这里抛出去会打断会话的
+ * 上下文装配，所以兜底必须在本层完成。
+ */
+function resolveContributions(
+  source: PromptContributionSource,
+  onError: (error: unknown) => void,
+): readonly PromptContribution[] {
+  if (typeof source !== 'function') return source
+  try {
+    const resolved = source()
+    return Array.isArray(resolved) ? resolved : []
+  } catch (error) {
+    onError(error)
+    return []
+  }
+}
+
 export interface SessionWiringOptions {
   readonly kernel: Kernel
-  readonly contributions: readonly PromptContribution[]
+  /**
+   * 贡献集合：数组（已固定）或提供者（每次渲染现算）。
+   *
+   * ⚠️ **真实调用点（`dsh/plugin.ts`）必须传提供者**：模块行由宿主异步挂载，
+   * 装配那一刻集合必然是空的——传数组等于让整条提示链路从未生效。
+   * 详见 `PromptContributionSource`。
+   */
+  readonly contributions: PromptContributionSource
   readonly systemPrompt: SystemPromptLike | undefined
   readonly clock: { now(): number }
 }
@@ -347,14 +404,27 @@ export const RESIDENT_BUDGET_STATUS_NAME = '常驻提示预算（omb 提示注�
  * **合并结果只有这里看得到**——模块手上只有自己那一条，它无从知道别人占了多少、
  * 自己有没有被截。这正是"看着对 ≠ 生效"的藏身处，账目必须记在能看见全局的地方。
  *
+ * ## 为什么入参是**提供者**，而不是一份现成的报告
+ *
+ * 装配那一刻模块行还没挂上，报告必然是"常驻提示 0/120 字符（无贡献者）"。
+ * 若把那份快照登记上去，真机上就出现两个面互相矛盾：状态面说 `0/120`，
+ * 而 `omb-reasoning` 自己报 `104/120`——两个数字都对，只是不同时刻的事实。
+ * 而读者无从判断该信哪个：`omb_status` 是唯一的模型可见诊断入口，
+ * 两个面互相矛盾会让**整个状态面**一起失去可信度。
+ *
+ * 现在渲染时才现算，且**与真正注入的文本走同一个函数**
+ * （`wirePromptInjection` 里的 `snapshotNow`），所以两处永远是同一份事实。
+ * 同源不是"复制一份数字"，而是"只有这一个来源"。
+ *
  * 登记是同步的（H-2：宿主挂载审计只查一次）且**绝不抛**：登记处缺席或登记失败
  * 都只记日志——诊断失败不得让提示注入失败，更不得让插件加载失败。
  *
+ * @param reportNow 现算账目：**注入文本用的就是它算出来的那一份**。
  * @returns 注销函数（幂等、绝不抛）。
  */
 function registerResidentBudget(
   kernel: Kernel,
-  report: ResidentHintReport,
+  reportNow: () => ResidentHintReport,
   wiring: WiringState,
 ): () => void {
   try {
@@ -367,22 +437,26 @@ function registerResidentBudget(
     }
     const unregister = registry.register({
       name: RESIDENT_BUDGET_STATUS_NAME,
-      // 数据在装配时快照（与**实际注入的那一份**同源），渲染时只读它——
-      // 若渲染时重算，状态面就可能与真正注入的文本不是同一份事实（本项目吃过这个亏）。
-      render: () => [
-        report.report,
-        // 说清这是"装配时那一份"：与真正注入的文本**同源**（不重算，否则两处数字会漂）。
-        `注入：${wiring.injected ? `已接入（order ${CONTEXT_ORDER}；本段为装配时快照）` : `未接入——${wiring.detail}`}`,
-      ].join('\n'),
+      // 渲染时现算：这一段必须反映**此刻真正会被注入的那一份**。
+      render: () => {
+        const report = reportNow()
+        return [
+          report.report,
+          `注入：${wiring.injected ? `已接入（order ${CONTEXT_ORDER}）` : `未接入——${wiring.detail}`}`,
+        ].join('\n')
+      },
       // 机器可读的同一份数字（供 omb_status 之外的消费者按数判断，不用解析中文）。
-      metrics: () => ({
-        residentChars: report.used,
-        residentLimit: report.limit,
-        residentTotal: report.total,
-        residentTruncated: report.truncated ? 1 : 0,
-        residentClipped: report.clipped.length,
-        residentContributors: report.entries.length,
-      }),
+      metrics: () => {
+        const report = reportNow()
+        return {
+          residentChars: report.used,
+          residentLimit: report.limit,
+          residentTotal: report.total,
+          residentTruncated: report.truncated ? 1 : 0,
+          residentClipped: report.clipped.length,
+          residentContributors: report.entries.length,
+        }
+      },
     })
     return () => {
       try {
@@ -398,27 +472,45 @@ function registerResidentBudget(
 }
 
 /**
- * 把预算事实写进日志：未超限走 debug（每次装配一行账目），超限走 warn。
+ * 造一个预算留声器：把账目事实写进日志，且**同一份报告只写一次**。
  *
- * 为什么**不抛异常**：超预算是**配置/文案问题**——抛出去会让整行插件加载失败，
- * 把"某句话写长了"升级成"插件用不了"。要的是如实上报，不是拒绝服务
- * （与 H-1「disposer 绝不抛」同源：加载路径同理）。
+ * ## 为什么要按内容去重（惰性化的代价）
  *
- * 为什么未超限也要记一行：余量只剩 16 字符时，风险必须在**爆掉之前**就看得见
+ * 账目从"装配时算一次"改成"每次渲染现算"之后，同一份超限会在每一轮上下文装配、
+ * 每次 `omb_status` 里各看一眼。若照旧每看必喊，一个写长了的文案就变成刷屏——
+ * 而告警是稀缺资源，**刷屏等于没有告警**（真正的新问题会被淹没）。
+ * 契约：同一份报告 warn 一次；**内容变了再报**（多一个模块被挤掉就是新事实）。
+ *
+ * ## 为什么未超限也要记一行 debug
+ *
+ * 余量只剩 16 字符时，风险必须在**爆掉之前**就看得见
  * （`omb_status` 与 debug 日志都能读到"余量 16"）。
+ *
+ * ## 为什么**不抛异常**
+ *
+ * 超预算是**配置/文案问题**——抛出去会让整行插件加载失败，把"某句话写长了"
+ * 升级成"插件用不了"。要的是如实上报，不是拒绝服务
+ * （与 H-1「disposer 绝不抛」同源：加载路径同理）。
  */
-function announceResidentBudget(kernel: Kernel, report: ResidentHintReport): void {
-  try {
-    if (!report.truncated) {
-      kernel.logger.debug(`OMB：常驻提示账目——${report.report}`)
-      return
+function createResidentBudgetAnnouncer(kernel: Kernel): (report: ResidentHintReport) => void {
+  let lastReport: string | undefined
+  return (report) => {
+    try {
+      // 同一份事实已经说过了。比较**报告内容**而不是"喊过没有"：
+      // 内容变了（新的模块被截、余量变了）就是新事实，必须再报一次。
+      if (report.report === lastReport) return
+      lastReport = report.report
+      if (!report.truncated) {
+        kernel.logger.debug(`OMB：常驻提示账目——${report.report}`)
+        return
+      }
+      kernel.logger.warn(
+        `OMB：常驻提示超预算（合计 ${report.total} > 上限 ${report.limit}）——${report.report}；`
+        + '已按上限截断，被截的模块不会生效——请改短文案或调低各模块自己的常驻预算',
+      )
+    } catch {
+      // 日志失败不影响注入（诊断不得成为新的失败源）
     }
-    kernel.logger.warn(
-      `OMB：常驻提示超预算（合计 ${report.total} > 上限 ${report.limit}）——${report.report}；`
-      + '已按上限截断，被截的模块不会生效——请改短文案或调低各模块自己的常驻预算',
-    )
-  } catch {
-    // 日志失败不影响注入（诊断不得成为新的失败源）
   }
 }
 
@@ -428,20 +520,80 @@ function announceResidentBudget(kernel: Kernel, report: ResidentHintReport): voi
  * 注册时机：**同步**完成（热插拔 H-2——宿主挂载审计只查一次，
  * 事后异步注册会触发进程级失败告警）。
  *
+ * ## 贡献集合是**每次渲染现算**的（这条链路曾经从未生效）
+ *
+ * 模块行都 `inject: ['omb:kernel']`，必须等内核发布该服务之后才挂载，
+ * 因此**不可能**在本函数那次同步调用中途挂上。装配时收集一次并捕获下来，
+ * 结果就是只有常驻提示与易变段的**空集**被注入：推理模块的 R1、用户画像的 R8、
+ * 一切 `context()` 段从未到达模型，而所有健康面都是绿的、能力都注册了。
+ * 所以这里只捕获**提供者**，每次真正要文本时重新解析（与工具面 `toolBridge.sync()`
+ * 在 `turn/start` 上重放是同一个修法、同一个根因）。
+ *
  * 常驻提示的预算账目在这里留声（日志 + 状态面）：
  * 合并结果只有本函数看得到，因此"谁被截了"也只有这里能说清。
+ * 账目与注入文本**走同一个 `snapshotNow`**，不存在两套数字。
  *
  * @returns 幂等 disposer；**绝不抛异常**（H-1）。
  */
 export function wirePromptInjection(options: SessionWiringOptions): () => void {
   const { kernel, contributions, systemPrompt, clock } = options
 
+  /** 留声器自带内容去重：惰性账目每轮都算，同一份超限只 warn 一次（否则就是刷屏）。 */
+  const announceBudget = createResidentBudgetAnnouncer(kernel)
+
+  /** 提供者解析失败的原因（去重，防止坏提供者每轮刷一条 warn）。 */
+  let lastFailure: string | undefined
+  const reportContributionFailure = (error: unknown): void => {
+    try {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message === lastFailure) return
+      lastFailure = message
+      kernel.logger.warn(
+        'OMB：提示贡献集合处理失败（本次按空集合处理，注入与状态面都会如实显示「无贡献者」）'
+        + `——${message}`,
+      )
+    } catch {
+      // 留声失败不得影响注入
+    }
+  }
+
+  /**
+   * 取**此刻**的贡献集合并现算账目。
+   *
+   * **注入文本与状态面都走这一个函数**——同源不是"两边各算一遍但算法相同"，
+   * 而是"只有这一个来源"，所以不可能再出现"注入 104/120、状态面 0/120"
+   * 那种两个面互相矛盾的局面。
+   *
+   * 一次调用只解析一次集合：常驻文本与易变段必须来自同一份快照，
+   * 否则同一次渲染里两段话可能说的不是同一时刻的事实。
+   */
+  const snapshotNow = (): {
+    readonly report: ResidentHintReport
+    readonly current: readonly PromptContribution[]
+  } => {
+    const current = resolveContributions(contributions, reportContributionFailure)
+    let report: ResidentHintReport
+    try {
+      report = residentHintReport(current)
+    } catch (error) {
+      // 模块给了形状不对的贡献（例如 `resident` 不是字符串）时记账会抛。
+      // 惰性化把这段代码挪进了宿主**每轮**的渲染路径，在这里抛出去会打断
+      // 会话的上下文装配——所以退回空账目并留声：宁可少注入，不可打断会话。
+      reportContributionFailure(error)
+      report = residentHintReport([])
+    }
+    announceBudget(report)
+    return { report, current }
+  }
+
   // ① **先记账再接线**。顺序刻意如此：即使宿主那边接不上，
   //    "各模块贡献了多少、有没有被截、被截的是谁"也已经在状态面上了。
-  const budget = residentHintReport(contributions)
+  //
+  //    这里先看一眼：此刻集合通常还是空的（模块行尚未挂载），
+  //    留声由 announcer 按内容去重，所以这一次与之后每轮的现算不会重复告警。
   const wiring: WiringState = { injected: false, detail: '尚未接线' }
-  const disposeStatus = registerResidentBudget(kernel, budget, wiring)
-  announceResidentBudget(kernel, budget)
+  const disposeStatus = registerResidentBudget(kernel, () => snapshotNow().report, wiring)
+  snapshotNow()
 
   if (systemPrompt === undefined || typeof systemPrompt.context !== 'function') {
     wiring.detail = '宿主 systemPrompt 服务不可用'
@@ -462,15 +614,22 @@ export function wirePromptInjection(options: SessionWiringOptions): () => void {
           depth: kernel.focus(sessionId),
           band: kernel.pressure(sessionId).band,
         }
-        // 易变快照里也带常驻提示：宿主对运行时上下文的语义是
+        // **每次渲染现算**（不是装配时那一份）：模块行可能在上一轮之后才挂上，
+        // 也可能刚被关掉。易变快照里也带常驻提示：宿主对运行时上下文的语义是
         // 「本快照取代此前的运行时上下文快照」，所以完整自包含比精简更重要。
-        const dynamic = renderContext(contributions, input)
-        return [budget.text, dynamic].filter(p => p.length > 0).join('\n\n')
+        const { report, current } = snapshotNow()
+        const dynamic = renderContext(current, input)
+        return [report.text, dynamic].filter(p => p.length > 0).join('\n\n')
       },
     })
     wiring.injected = true
-    // 记录一次注入时间，供诊断（不进入提示文本，因此不影响缓存）
-    kernel.logger.debug(`OMB：认知投影已注入（常驻 ${budget.used}/${budget.limit} 字符，order ${CONTEXT_ORDER}，t=${clock.now()}）`)
+    // 只记"接线成功"这一事实与顺序，**不在这里记字符数**：
+    // 装配这一刻模块行通常还没挂上，记下来的必然是 0——那正是本次缺陷里
+    // "两个面互相矛盾"的源头。实时账目在状态面（`RESIDENT_BUDGET_STATUS_NAME`），
+    // 与真正注入的文本同源。
+    kernel.logger.debug(
+      `OMB：认知投影已注入（order ${CONTEXT_ORDER}，t=${clock.now()}；常驻提示的实时账目见状态面）`,
+    )
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     wiring.detail = `注册失败：${message}`

@@ -45,6 +45,7 @@ import {
   wirePromptInjection,
   wireSessionEvents,
 } from './session.js'
+import type { SessionWiringOptions } from './session.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { createPressureBridge } from './pressure.js'
 import { wireArtifactIndex } from './hooks.js'
@@ -254,12 +255,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   handle.kernel.report({ state: 'ok', detail: `微内核已就绪（产物代数 ${generationFromUrl(import.meta.url) ?? '未知'}）` })
 
   // ── 3) 提示注入（同步注册）────────────────────────────────────────────
-  const disposePrompt = wirePromptInjection({
-    kernel: handle.kernel,
-    contributions: collectPromptContributions(handle.kernel),
-    systemPrompt: readSystemPrompt(ctx),
-    clock,
-  })
+  const disposePrompt = wirePromptInjection(promptWiringOptions({ handle, ctx, clock }))
 
   // 回合边界再重放一次工具注册。
   //
@@ -295,9 +291,12 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     })
 
   if (config.debug === true) {
+    // 这三个数字都是**装配这一刻**的快照：模块行由宿主异步挂载，内核 apply 里看不到它们。
+    // 所以"此刻可见的提示贡献 0 个"在正常启动里是预期值，不是缺陷——
+    // 实时账目看状态面（`RESIDENT_BUDGET_STATUS_NAME` 段落）。
     logger.info(
       `OMB：已装配 ${loaded.modules.length} 个模块、已注册工具 ${toolBridge.registered().length} 个、`
-      + `${collectPromptContributions(handle.kernel).length} 个提示贡献`,
+      + `此刻可见的提示贡献 ${collectPromptContributions(handle.kernel).length} 个（模块行尚未挂载，实时账目见状态面）`,
     )
   }
 
@@ -375,6 +374,45 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 export function testHostContext(handle: KernelHandle): { get(name: string): unknown } {
   return {
     get: (name: string) => (name === SERVICES.kernel ? handle.kernel : handle.kernel.service(name)),
+  }
+}
+
+/**
+ * 提示注入的接线选项。
+ *
+ * ## 为什么单独成函数
+ *
+ * 为了让"**必须传提供者**"这条纪律有一个会失败的断言。
+ *
+ * `contributions` 一旦写成 `collectPromptContributions(handle.kernel)`（一次性收集的数组），
+ * 整条提示链路就**从未生效**：内核 `apply` 是同步的，而模块行由宿主异步挂载
+ * （Cordis 先等 `inject: ['omb:kernel']` 就绪，再在微任务里挂载），
+ * 那一刻服务表里一个 `prompt:*` 都没有——推理模块的 R1 常驻提示、用户画像的 R8
+ * 冲突摘要、任何模块的 `context()` 易变段全部到不了模型。
+ *
+ * 代价不止"少了几句话"：状态面因此长期显示「常驻提示 0/120 字符（无贡献者）」，
+ * 而 `omb-reasoning` 同时显示「104/120」且「上次注入：尚无」——两个面互相矛盾，
+ * `omb_status` 作为唯一的模型可见诊断入口会跟着一起失去可信度；
+ * 所有健康面都是绿的、能力也都注册了，**只是从未生效**，
+ * 排查时没有任何一条线索指向这里。
+ *
+ * 这个根因在工具面上先踩过一次（7 个工具全部消失、只有内核自带的 `omb_status` 在），
+ * 提示面上又踩了第二次——所以它不能再只靠注释里的告诫。
+ */
+export function promptWiringOptions(input: {
+  readonly handle: KernelHandle
+  readonly ctx: HostContextLike
+  readonly clock: { now(): number }
+}): SessionWiringOptions {
+  const { handle, ctx, clock } = input
+  return {
+    kernel: handle.kernel,
+    // **提供者，不是一次性收集的数组**：每次要文本时重新扫服务表，
+    // 于是"接线之后才挂上的模块"照样进得了注入（与 `disposeToolResync` 在
+    // `turn/start` 上重放工具注册是同一个修法、同一个根因）。
+    contributions: () => collectPromptContributions(handle.kernel),
+    systemPrompt: readSystemPrompt(ctx),
+    clock,
   }
 }
 
