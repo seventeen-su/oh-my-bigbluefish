@@ -8,6 +8,44 @@
 packages:
   - 'packages/*'
 
+# 不自动安装 peer 依赖。
+#
+# ## 为什么
+#
+# 本仓库把 34 个 `@deepseek-ai/*` 声明为 peer，用途是**兼容性契约**——声明"我在哪个宿主
+# 版本上验证过"。它们**不是运行期依赖**：全仓库对这些包零 import，`dsh/` 一律经结构化
+# 接口访问宿主（见 `dsh/plugin.ts` 顶部的三条硬约束）。
+#
+# 而 pnpm 默认 `autoInstallPeers: true` 会把整套宿主依赖树**物理装进** `node_modules`。
+# 实测代价（2026-10-01）：
+#
+#   ① `node_modules/.pnpm` 里躺着两代宿主包并存——`@deepseek-ai+dsh-llm@0.1.7-rc.2` 与
+#      `@0.2.0-rc.2`，`dsh-agent` / `dsh-brand` / `dsh-scope` / `dsh-tools` 同样各两份，
+#      数百个包；
+#   ② 于是"本仓库解析不到它们"这句纪律**失去依托**——它们就在那里，能被 import。
+#      零 import 因此从"物理不可能"退化成"靠自觉"（现已由
+#      `tests/dsh/no-host-imports.test.ts` 变成会失败的断言）；
+#   ③ 最危险的一条：任何一次 `pnpm install` 都可能从 npm 拉一个**同名但不是同一个程序**
+#      的包。`dsh-desktop-notify` 这个名字在 npm 上已被他人占用，而本插件真正要对接的是
+#      用户本地安装的 Cordis 插件（对外 API 基线 `1.0.0`，随 `dsh-desktop-notify` 2.0.0 发布）。
+#      装上抢注包不会有任何报错，只会让通知桥探测到一个形状不对的服务并静默降级。
+#
+# ## 关掉之后
+#
+# - peer 声明**全部保留**（文档价值与版本范围校验不变）；
+# - 不再有任何宿主包被拉进本仓库，"不 import 宿主包"重新**物理成立**；
+# - `dsh-desktop-notify` 已从 `peerDependencies` **整个移除**（不是因为可选，而是因为
+#   这个名字在 npm 上不是我们要的东西）——对接关系改由 `modules/notify/bridge.ts`
+#   的结构探测与文档记录，不写进依赖清单。
+#
+# 代价与兜底：若哪天真有代码需要 `@deepseek-ai/*` 的类型，它会解析失败并**当场报错**，
+# 而不是悄悄用上一份可能过期的副本。这正是我们要的方向。
+#
+# 为什么写在这里而不是 `.npmrc`：npm 也会读 `.npmrc`，而它不认识这个键，
+# 于是每次 `npx` 都打一条 `Unknown project config` 警告。pnpm 11 的设置位置已经
+# 迁到本文件（同 `allowBuilds`），放这里两边都干净。
+autoInstallPeers: false
+
 # pnpm 11 构建脚本策略（settings 已从 package.json 的 "pnpm" 字段迁移至 pnpm-workspace.yaml，见 https://pnpm.io/settings）
 # 批准 esbuild 的构建脚本（vitest/vite 工具链的传递依赖，install.js 仅校验平台二进制）
 # koffi（T0.5 沙盒 FFI）：install 脚本 cnoke.cjs 安装/构建其原生二进制（win32-x64 预编译，实测结论见 task-0.5-report.md）

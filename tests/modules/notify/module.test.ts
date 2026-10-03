@@ -119,7 +119,8 @@ describe('零改码自动接上', () => {
 
     expect(service.status().available).toBe(true)
     expect(service.push('any', '现在能发了')).toBe(true)
-    expect(sent).toEqual([{ title: '现在能发了', urgency: 'normal' }])
+    // 载荷带上 `v`：本桥按 2.0.0 协议声明对外 API 基线版本（见 bridge.ts 的说明）
+    expect(sent).toEqual([{ title: '现在能发了', urgency: 'normal', v: '1.0.0' }])
   })
 })
 

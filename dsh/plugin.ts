@@ -22,8 +22,13 @@
  *   （`packages/preset/agent-preset-registry/src/invariant.ts:33-44`）。
  * - **H-3**：服务缺失返回可读错误而非抛异常——模块可能在下一刻被卸下。
  *
- * 本文件**不 import 任何 `@deepseek-ai/*`**（本仓库解析不到它们），
- * 全部经结构化接口访问宿主。
+ * 本文件**不 import 任何 `@deepseek-ai/*`**，全部经结构化接口访问宿主。
+ *
+ * 这句话曾经的理由是"本仓库解析不到它们"——**那个理由已经不成立**：pnpm 的
+ * `auto-install-peers` 默认会把整套宿主依赖树装进 `node_modules`（实测两代并存）。
+ * 现在的理由是**纪律 + 护栏**：`.npmrc` 关掉了自动装 peer，让"解析不到"重新物理成立；
+ * `tests/dsh/no-host-imports.test.ts` 把这条纪律变成会失败的断言——
+ * 否则它只是注释里的一句愿望。
  */
 import { createKernel, type KernelHandle } from '../kernel/index.js'
 import type { Kernel, ModuleRegistration, ToolDefinition } from '../kernel/abi/index.js'
