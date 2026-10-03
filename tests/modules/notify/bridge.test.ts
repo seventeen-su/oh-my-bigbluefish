@@ -212,7 +212,9 @@ describe('零改码自动接上', () => {
     hostSlot.value = { push: (payload: { title: string; urgency?: string }) => { sent.push(payload) } }
     expect(bridge.status().available).toBe(true)
     expect(bridge.push('k', '装之后')).toBe(true)
-    expect(sent).toEqual([{ title: '装之后', urgency: 'normal' }])
+    // `v` 是本桥按 2.0.0 协议声明的对外 API 基线版本：声明了才能观测到
+    // 对方的 `unsupportedVersion`（不声明就永远是"没意见"）。
+    expect(sent).toEqual([{ title: '装之后', urgency: 'normal', v: '1.0.0' }])
     expect(bridge.status().detail).toContain('已接上宿主 desktopNotify')
   })
 

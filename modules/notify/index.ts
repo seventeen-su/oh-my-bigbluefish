@@ -10,7 +10,7 @@ import { z } from 'zod'
 import type { Kernel, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
 import type { StatusContributor, StatusRegistry } from '../../kernel/abi/index.js'
 import { SERVICES, derivedCapabilities, derivedRequires } from '../../kernel/abi/index.js'
-import type { DesktopNotifyLike, NotifyUrgency } from './bridge.js'
+import type { DesktopNotifyLike, NotifyClick, NotifyUrgency } from './bridge.js'
 import { DEFAULT_NOTIFY_SESSION, NOTIFY_SESSION_LIMIT, NOTIFY_THROTTLE_MS, NotifyBridge } from './bridge.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
@@ -74,6 +74,7 @@ export interface NotifyService {
    * @param kind 节流与去重用的类型键（不给人看）。
    * @param title **必填**——宿主对空标题一律拒绝。
    * @param message 正文，可选。
+   * @param click 点击通知后的行为（`dsh-desktop-notify` 2.0.0 四态）；不给则点了不跳转。
    */
   push(
     kind: string,
@@ -81,6 +82,7 @@ export interface NotifyService {
     message?: string,
     sessionId?: string,
     urgency?: NotifyUrgency,
+    click?: NotifyClick,
   ): boolean
   status(): { readonly available: boolean; readonly detail: string; readonly sent: number; readonly suppressed: number }
 }
@@ -136,8 +138,8 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
       bridge = created
 
       const service: NotifyService = {
-        push: (kind, title, message, sessionId = DEFAULT_NOTIFY_SESSION, urgency = 'normal') =>
-          created.push(kind, title, message, sessionId, urgency),
+        push: (kind, title, message, sessionId = DEFAULT_NOTIFY_SESSION, urgency = 'normal', click) =>
+          created.push(kind, title, message, sessionId, urgency, click),
         status: () => {
           const status = created.status()
           return {
@@ -268,6 +270,10 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
             + `要恢复：在插件页把 ${payload.id} 那一行重新打开。`,
           undefined,
           'normal',
+          // 正文里让用户"去插件页把那一行打开"——那就把入口一起给上。
+          // 2.0.0 的 `click` 四态里 `page` 正是为这种跳转准备的；
+          // 老版本不认识它，按协议忽略未知字段，不会因此拒绝。
+          { type: 'page', page: 'plugins' },
         )
       })
       kernel.report(health())
