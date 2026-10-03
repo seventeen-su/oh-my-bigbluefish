@@ -23,6 +23,7 @@ import type {
   ContextRenderInput,
   Kernel,
   PromptContribution,
+  StatusRegistry,
 } from '../kernel/abi/index.js'
 import { RESIDENT_HINT_MAX, SERVICES } from '../kernel/abi/index.js'
 import { heartbeat } from '../kernel/hostEntry.js'
@@ -64,20 +65,185 @@ export function fingerprint(...parts: readonly string[]): string {
   return createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 16)
 }
 
+/** 提示贡献的服务名前缀（`kernel/abi/catalog.ts:195` 的命名约定）。 */
+const PROMPT_SERVICE_PREFIX = 'prompt:'
+
 /**
  * 收集内核服务表里所有 `prompt:*` 贡献。
  *
  * 为什么按前缀扫描而不是硬编码名字：新增模块不应改 `dsh/`。
  * 这也是"模块化"在集成层的体现——加一个模块只需它自己 provide 一个 `prompt:<id>`。
+ *
+ * **顺带补上署名**：`prompt:<id>` 里的 `<id>` 就是模块自己声明的身份，
+ * 因此超限报告能点名到模块，而**不依赖模块主动配合**（`PromptContribution.id` 是可选的）。
+ * "署不署名"这种自觉性靠不住——真出事时说不清是谁被截了，这次就白踩一遍。
+ *
+ * 返回的是**副本**：模块读自己那份服务时不该看见别人塞进去的字段
+ * （`kernel.service('prompt:x')` 返回的仍是它 provide 的那个对象本身）。
  */
 export function collectPromptContributions(kernel: Kernel): readonly PromptContribution[] {
   const contributions: PromptContribution[] = []
   for (const name of kernel.services()) {
-    if (!name.startsWith('prompt:')) continue
-    const value = kernel.service<PromptContribution>(name)
-    if (value !== undefined) contributions.push(value)
+    if (!name.startsWith(PROMPT_SERVICE_PREFIX)) continue
+    // 服务表按名字排序（`kernel/services.ts:33`），因此贡献顺序跨次稳定。
+    // 类型里带上 `null`：模块 provide 什么运行时都可能，诊断路径不许因此抛。
+    const value = kernel.service<PromptContribution | null>(name)
+    if (value === undefined || value === null) continue
+    const derived = name.slice(PROMPT_SERVICE_PREFIX.length)
+    const declared = typeof value.id === 'string' && value.id.trim().length > 0 ? value.id : undefined
+    const id = declared ?? (derived.length > 0 ? derived : undefined)
+    contributions.push(id === undefined ? { ...value } : { ...value, id })
   }
   return contributions
+}
+
+/**
+ * 一个贡献者在常驻提示合并里的账目。
+ *
+ * 为什么需要它：`resident` 的上限是**合计**的（`RESIDENT_HINT_MAX`），
+ * 而每个模块手上只有自己那一条——"我被截了多少"只有合并处知道。
+ * 这个结构就是把合并处知道的事交出来。
+ */
+export interface ResidentHintEntry {
+  /** 贡献者标识：模块自报的 `id`、从服务名推出的名字，都没有则按序号点名。 */
+  readonly id: string
+  /** 本贡献者规范化后的字符数（截断前）。 */
+  readonly chars: number
+  /** 实际进入常驻文本的字符数；`0` = 整条被挤掉了。 */
+  readonly kept: number
+  /** 是否被截（`kept < chars`）。 */
+  readonly truncated: boolean
+}
+
+/** 常驻提示的预算账目。见 `residentHintReport`。 */
+export interface ResidentHintReport {
+  /** 实际注入的文本：逐字节稳定，长度 ≤ `limit`。 */
+  readonly text: string
+  readonly limit: number
+  /** 实际用掉的字符数（`text.length`）。 */
+  readonly used: number
+  /** 截断前把全部贡献拼起来的长度（含分隔符）。 */
+  readonly total: number
+  /** 是否有内容被截掉（`total > limit`）。 */
+  readonly truncated: boolean
+  /** 逐项账目，顺序 = 贡献顺序（服务名排序，跨次稳定）。 */
+  readonly entries: readonly ResidentHintEntry[]
+  /** 被截的贡献者（含整条被挤掉的）——`entries` 的子集。 */
+  readonly clipped: readonly ResidentHintEntry[]
+  /** 一行可读报告：谁贡献了多少、合计多少、被截的是谁、丢了多少字符。日志与状态面都用它。 */
+  readonly report: string
+}
+
+/** 贡献之间的分隔符。改这里会让常驻文本变样 → 前缀缓存失效，所以刻意写成常量。 */
+const RESIDENT_SEPARATOR = '\n'
+
+/** 匿名贡献的点名格式（`未署名#2` = 贡献集合里第 2 条）——宁可点名到位置，也不要"某一条"。 */
+const ANONYMOUS_PREFIX = '未署名'
+
+/**
+ * 按上限截断，但不切出"半个字符"。
+ *
+ * `slice` 按 UTF-16 码元切：截断点落在代理对（emoji 等）中间时会留下一个孤立的高位代理，
+ * 那是非法字符串，进系统提示会变成替换字符。少一个码元比给出半个字符好。
+ */
+function cutWholeCharacters(text: string, max: number): string {
+  const cut = text.slice(0, max)
+  const last = cut.charCodeAt(cut.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut
+}
+
+/** 一行可读账目。**不含时钟/计数**——同一份输入必须得到同一行文本（便于断言与比对）。 */
+function residencyLine(input: {
+  readonly limit: number
+  readonly used: number
+  readonly total: number
+  readonly truncated: boolean
+  readonly entries: readonly ResidentHintEntry[]
+  readonly clipped: readonly ResidentHintEntry[]
+}): string {
+  const { limit, used, total, truncated, entries, clipped } = input
+  if (entries.length === 0) return `常驻提示 0/${limit} 字符（无贡献者）`
+  const ledger = entries.map(e => `${e.id} ${e.kept}/${e.chars}`).join('、')
+  if (!truncated) {
+    return `常驻提示 ${used}/${limit} 字符（未截断，余量 ${limit - used}）｜逐项：${ledger}`
+  }
+  const lost = clipped.map(e => `${e.id} 丢 ${e.chars - e.kept}/${e.chars}`).join('、')
+  return `常驻提示 ${used}/${limit} 字符（超限：截断前 ${total}，丢掉 ${total - used}）`
+    + `｜被截的是：${lost}｜逐项：${ledger}`
+}
+
+/**
+ * 合并常驻提示并**如实记账**。
+ *
+ * ## 为什么要有这个函数（这次踩的坑）
+ *
+ * 旧实现只有一句 `joined.length <= MAX ? joined : joined.slice(0, MAX)`：
+ * 超限一刀切掉尾巴，不报错、不告警、不改健康面。实测推理模块一条就占 104/120
+ * （`modules/reasoning/methods.ts:152` 的变体选择），**只剩 16 字符余量**——
+ * 任何模块多写一句文案，就会悄悄吃掉排在它后面的模块的常驻提示，
+ * 而被吃掉的模块**完全不知道自己被截了**（它只看得见自己那一条）。
+ * 症状是"某个能力莫名其妙不生效"，而所有模块健康面都是绿的。
+ *
+ * ## 现在的契约
+ *
+ * ① 截断**保留**（总得有个上限），但返回值把这件事说清楚：
+ *    `truncated` + 逐项 `entries` + 被截的 `clipped` + 一行可读 `report`
+ * ② 绝不抛：超预算是**配置/文案问题**，不是崩溃；调用方（`wirePromptInjection`）
+ *    把它写进 `kernel.logger` 与状态面，而**不是**让插件加载失败（与 H-1 同源）
+ * ③ 逐字节稳定不变：同一输入 → 同一文本、同一报告
+ *
+ * @param contributions 贡献集合。
+ * @param limit 合计上限；非有限值退回 `RESIDENT_HINT_MAX`
+ *   （模块层同样这么兜底：`modules/reasoning/methods.ts:153`）。
+ */
+export function residentHintReport(
+  contributions: readonly PromptContribution[],
+  limit: number = RESIDENT_HINT_MAX,
+): ResidentHintReport {
+  const max = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : RESIDENT_HINT_MAX
+
+  // 匿名贡献也**必须留位**：否则它的字符数会变成没有主的数字，
+  // 超限时就说不清"被吃掉的到底是谁"——那正是这次要修的静默。
+  const parts: { id: string; text: string }[] = []
+  contributions.forEach((c, index) => {
+    const text = c.resident?.trim()
+    if (text === undefined || text.length === 0) return
+    const declared = typeof c.id === 'string' ? c.id.trim() : ''
+    parts.push({ id: declared.length > 0 ? declared : `${ANONYMOUS_PREFIX}#${index + 1}`, text })
+  })
+
+  const joined = parts.map(p => p.text).join(RESIDENT_SEPARATOR)
+  const truncated = joined.length > max
+  const text = truncated ? cutWholeCharacters(joined, max) : joined
+
+  // 逐项归属：按拼接顺序累计偏移算出"谁进去多少"——算出来的账，不是估的。
+  const entries: ResidentHintEntry[] = []
+  let offset = 0
+  for (const part of parts) {
+    const start = offset
+    offset += part.text.length + RESIDENT_SEPARATOR.length
+    const kept = Math.max(0, Math.min(part.text.length, text.length - start))
+    entries.push({ id: part.id, chars: part.text.length, kept, truncated: kept < part.text.length })
+  }
+  const clipped = entries.filter(e => e.truncated)
+
+  return {
+    text,
+    limit: max,
+    used: text.length,
+    total: joined.length,
+    truncated,
+    entries,
+    clipped,
+    report: residencyLine({
+      limit: max,
+      used: text.length,
+      total: joined.length,
+      truncated,
+      entries,
+      clipped,
+    }),
+  }
 }
 
 /**
@@ -86,13 +252,12 @@ export function collectPromptContributions(kernel: Kernel): readonly PromptContr
  * **逐字节稳定是硬要求**：常驻提示进入系统提示的稳定前缀，
  * 任何跨轮变化都会使其后的整段前缀缓存失效（规划 §6.5）。
  * 因此这里不注入时间戳、计数器，也不随会话变化——只有内容真的变了才变。
+ *
+ * 只返回文本（旧契约，调用方拿不到账目）；要诊断就调 `residentHintReport`——
+ * 文本与账目**同源**（这里直接取报告的 `text`），不可能出现"说的"与"做的"两套数字。
  */
 export function residentHint(contributions: readonly PromptContribution[]): string {
-  const parts = contributions
-    .map(c => c.resident?.trim())
-    .filter((v): v is string => typeof v === 'string' && v.length > 0)
-  const joined = parts.join('\n')
-  return joined.length <= RESIDENT_HINT_MAX ? joined : joined.slice(0, RESIDENT_HINT_MAX)
+  return residentHintReport(contributions).text
 }
 
 /**
@@ -165,22 +330,125 @@ export function rememberCwdFrom(
   return cwd
 }
 
+/** 注入接线状态：状态面必须能分辨"记了账"与"真的接上了"（看着对 ≠ 生效）。 */
+interface WiringState {
+  injected: boolean
+  /** 未接入时的可读原因（不写"未知"，写清是服务缺失还是注册被拒）。 */
+  detail: string
+}
+
+/** 状态面段落名：常驻提示预算账目（`omb_status` 里可见）。 */
+export const RESIDENT_BUDGET_STATUS_NAME = '常驻提示预算（omb 提示注入）'
+
+/**
+ * 把常驻提示预算账目登记进状态面。
+ *
+ * 为什么在 `wirePromptInjection` 里登记（而不是让模块各自上报）：
+ * **合并结果只有这里看得到**——模块手上只有自己那一条，它无从知道别人占了多少、
+ * 自己有没有被截。这正是"看着对 ≠ 生效"的藏身处，账目必须记在能看见全局的地方。
+ *
+ * 登记是同步的（H-2：宿主挂载审计只查一次）且**绝不抛**：登记处缺席或登记失败
+ * 都只记日志——诊断失败不得让提示注入失败，更不得让插件加载失败。
+ *
+ * @returns 注销函数（幂等、绝不抛）。
+ */
+function registerResidentBudget(
+  kernel: Kernel,
+  report: ResidentHintReport,
+  wiring: WiringState,
+): () => void {
+  try {
+    const registry = kernel.service<StatusRegistry>(SERVICES.statusContributor)
+    if (registry === undefined) {
+      kernel.logger.warn(
+        `OMB：状态面登记处 ${SERVICES.statusContributor} 不可用，常驻提示预算账目不会出现在 omb_status`,
+      )
+      return () => {}
+    }
+    const unregister = registry.register({
+      name: RESIDENT_BUDGET_STATUS_NAME,
+      // 数据在装配时快照（与**实际注入的那一份**同源），渲染时只读它——
+      // 若渲染时重算，状态面就可能与真正注入的文本不是同一份事实（本项目吃过这个亏）。
+      render: () => [
+        report.report,
+        // 说清这是"装配时那一份"：与真正注入的文本**同源**（不重算，否则两处数字会漂）。
+        `注入：${wiring.injected ? `已接入（order ${CONTEXT_ORDER}；本段为装配时快照）` : `未接入——${wiring.detail}`}`,
+      ].join('\n'),
+      // 机器可读的同一份数字（供 omb_status 之外的消费者按数判断，不用解析中文）。
+      metrics: () => ({
+        residentChars: report.used,
+        residentLimit: report.limit,
+        residentTotal: report.total,
+        residentTruncated: report.truncated ? 1 : 0,
+        residentClipped: report.clipped.length,
+        residentContributors: report.entries.length,
+      }),
+    })
+    return () => {
+      try {
+        unregister()
+      } catch {
+        // H-1：注销失败不得向上传播
+      }
+    }
+  } catch (error) {
+    kernel.logger.warn(`OMB：常驻提示预算账目登记失败（已隔离）——${String(error)}`)
+    return () => {}
+  }
+}
+
+/**
+ * 把预算事实写进日志：未超限走 debug（每次装配一行账目），超限走 warn。
+ *
+ * 为什么**不抛异常**：超预算是**配置/文案问题**——抛出去会让整行插件加载失败，
+ * 把"某句话写长了"升级成"插件用不了"。要的是如实上报，不是拒绝服务
+ * （与 H-1「disposer 绝不抛」同源：加载路径同理）。
+ *
+ * 为什么未超限也要记一行：余量只剩 16 字符时，风险必须在**爆掉之前**就看得见
+ * （`omb_status` 与 debug 日志都能读到"余量 16"）。
+ */
+function announceResidentBudget(kernel: Kernel, report: ResidentHintReport): void {
+  try {
+    if (!report.truncated) {
+      kernel.logger.debug(`OMB：常驻提示账目——${report.report}`)
+      return
+    }
+    kernel.logger.warn(
+      `OMB：常驻提示超预算（合计 ${report.total} > 上限 ${report.limit}）——${report.report}；`
+      + '已按上限截断，被截的模块不会生效——请改短文案或调低各模块自己的常驻预算',
+    )
+  } catch {
+    // 日志失败不影响注入（诊断不得成为新的失败源）
+  }
+}
+
 /**
  * 把提示注入接到宿主。
  *
  * 注册时机：**同步**完成（热插拔 H-2——宿主挂载审计只查一次，
  * 事后异步注册会触发进程级失败告警）。
  *
+ * 常驻提示的预算账目在这里留声（日志 + 状态面）：
+ * 合并结果只有本函数看得到，因此"谁被截了"也只有这里能说清。
+ *
  * @returns 幂等 disposer；**绝不抛异常**（H-1）。
  */
 export function wirePromptInjection(options: SessionWiringOptions): () => void {
   const { kernel, contributions, systemPrompt, clock } = options
+
+  // ① **先记账再接线**。顺序刻意如此：即使宿主那边接不上，
+  //    "各模块贡献了多少、有没有被截、被截的是谁"也已经在状态面上了。
+  const budget = residentHintReport(contributions)
+  const wiring: WiringState = { injected: false, detail: '尚未接线' }
+  const disposeStatus = registerResidentBudget(kernel, budget, wiring)
+  announceResidentBudget(kernel, budget)
+
   if (systemPrompt === undefined || typeof systemPrompt.context !== 'function') {
+    wiring.detail = '宿主 systemPrompt 服务不可用'
     kernel.logger.warn('OMB：宿主 systemPrompt 服务不可用，认知投影未注入（状态面已记录）')
-    return () => {}
+    return disposeStatus
   }
 
-  const resident = residentHint(contributions)
   let disposer: unknown
   try {
     disposer = systemPrompt.context({
@@ -197,15 +465,17 @@ export function wirePromptInjection(options: SessionWiringOptions): () => void {
         // 易变快照里也带常驻提示：宿主对运行时上下文的语义是
         // 「本快照取代此前的运行时上下文快照」，所以完整自包含比精简更重要。
         const dynamic = renderContext(contributions, input)
-        return [resident, dynamic].filter(p => p.length > 0).join('\n\n')
+        return [budget.text, dynamic].filter(p => p.length > 0).join('\n\n')
       },
     })
+    wiring.injected = true
     // 记录一次注入时间，供诊断（不进入提示文本，因此不影响缓存）
-    kernel.logger.debug(`OMB：认知投影已注入（常驻 ${resident.length} 字符，order ${CONTEXT_ORDER}，t=${clock.now()}）`)
+    kernel.logger.debug(`OMB：认知投影已注入（常驻 ${budget.used}/${budget.limit} 字符，order ${CONTEXT_ORDER}，t=${clock.now()}）`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    wiring.detail = `注册失败：${message}`
     kernel.logger.warn(`OMB：认知投影注册失败——${message}`)
-    return () => {}
+    return disposeStatus
   }
 
   let disposed = false
@@ -217,6 +487,8 @@ export function wirePromptInjection(options: SessionWiringOptions): () => void {
     } catch {
       // H-1：回收失败不得向上传播
     }
+    // 状态面段落随注入一起撤掉（幂等、内部已隔离）——热插拔不残留
+    disposeStatus()
   }
 }
 
