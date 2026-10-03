@@ -28,8 +28,14 @@ import {
   wirePromptInjection,
 } from '../../dsh/session.js'
 import { createKernel } from '../../kernel/index.js'
+import { buildStatusTool } from '../../dsh/status-tool.js'
 import { RESIDENT_HINT_MAX, SERVICES } from '../../kernel/abi/index.js'
-import type { ModuleRegistration, PromptContribution, StatusRegistry } from '../../kernel/abi/index.js'
+import type {
+  ModuleRegistration,
+  PromptContribution,
+  StatusContributor,
+  StatusRegistry,
+} from '../../kernel/abi/index.js'
 
 /** 推理模块当前占用的字符数（实测值：见文件头）。留作"余量很小"的活证据。 */
 const REASONING_CHARS = 104
@@ -380,5 +386,220 @@ describe('wirePromptInjection：超限留声，但不让插件加载失败', () 
     expect(over()).toHaveLength(2)
     expect(String(over()[1]?.[0])).toContain('omb-third')
     dispose()
+  })
+})
+
+/** 状态面里常驻预算那一段（`omb_status` 的组件自述之一）。 */
+function residentSection(h: ReturnType<typeof createKernel>): StatusContributor | undefined {
+  const registry = h.kernel.service<StatusRegistry>(SERVICES.statusContributor)
+  return registry?.list().find(c => c.name === RESIDENT_BUDGET_STATUS_NAME)
+}
+
+/**
+ * 一次状态面渲染**只解析一次**贡献集合。
+ *
+ * ## 这次要修的浪费
+ *
+ * 账目改成惰性现算（每次渲染时重新扫 `prompt:*` 服务表，这是"模块晚挂载也能到达模型"
+ * 的前提，不能退回快照）之后，`registerResidentBudget` 的 `render()` 与 `metrics()`
+ * **各现算一次**：谁把这两面成对消费，一次状态面渲染就把服务表扫两遍
+ * （`dsh/status-tool.ts` 目前只调 `render()`，所以这条浪费落在"渲染 + 机器可读指标"
+ * 的那次消费上——下面最后一条用例把工具路径的现状也钉住了）。
+ * 8 模块量级可忽略，但这是白花的——而且两个面本来就必须是**同一份事实**
+ * （`metrics` 说的是"这一次渲染那行字背后的数"，不是"另一次现算的数"）。
+ *
+ * ## 判据为什么是"计数"而不是"数字相等"
+ *
+ * 数字相等在两次现算下**照样成立**（集合没变时两次结果一样），挡不住复发；
+ * 计数用的贡献提供者数的是"服务表被扫了几次"，正好是这次要消掉的那件事。
+ *
+ * ## 反面同样要钉住：一次性的交接**不得**退化成"旧账缓存"
+ *
+ * 复用只发生在"同一次消费"里（渲染入口算一次、紧随其后的 `metrics()` 取用那一份）。
+ * 没有 render 打头的 `metrics()` 必须现算，否则又回到 `dsh/session.ts` 反复记的
+ * 那个老缺陷：状态面说 `0/120`、模块自己说 `104/120`，两个面互相矛盾。
+ */
+describe('常驻提示账目：一次状态面渲染只解析一次贡献集合', () => {
+  /** 计数用的提供者：`contributions` 的真实调用点就是这么扫服务表的。 */
+  function counting(
+    h: ReturnType<typeof createKernel>,
+    fixed?: readonly PromptContribution[],
+  ): { scans(): number; reset(): void; source(): readonly PromptContribution[] } {
+    let count = 0
+    return {
+      scans: () => count,
+      reset: () => { count = 0 },
+      source: () => {
+        count += 1
+        return fixed ?? collectPromptContributions(h.kernel)
+      },
+    }
+  }
+
+  it('渲染入口算一次、metrics() 复用：一次渲染只扫一遍服务表', () => {
+    const h = createKernel()
+    const counter = counting(h)
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: counter.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    h.start([promptModule('omb-reasoning', { resident: 'x'.repeat(REASONING_CHARS) })])
+    counter.reset()
+
+    // 一次完整的状态面消费：段落文本 + 同一次的机器可读指标
+    const text = h.status().join('\n')
+    const section = residentSection(h)
+    const metrics = section?.metrics?.()
+
+    expect(text).toContain(`常驻提示 ${REASONING_CHARS}/${RESIDENT_HINT_MAX} 字符`)
+    expect(metrics).toMatchObject({ residentChars: REASONING_CHARS, residentContributors: 1 })
+    expect(counter.scans(), '一次状态面渲染只该解析一次贡献集合').toBe(1)
+    dispose()
+  })
+
+  it('交接只服务一次：之后再来一次 metrics() 必须现算（下一次消费拿新账）', () => {
+    const h = createKernel()
+    const counter = counting(h)
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: counter.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    h.start([promptModule('omb-reasoning', { resident: 'x'.repeat(REASONING_CHARS) })])
+    counter.reset()
+
+    const section = residentSection(h)
+    h.status()
+    expect(counter.scans()).toBe(1)
+    expect(section?.metrics?.()).toMatchObject({ residentContributors: 1 })
+    expect(counter.scans(), '紧随 render 的那一次 metrics 复用同一份账目').toBe(1)
+    expect(section?.metrics?.()).toMatchObject({ residentContributors: 1 })
+    expect(counter.scans(), '复用只有一次：第二次 metrics 必须自己现算').toBe(2)
+    dispose()
+  })
+
+  it('metrics() 单独调用（没有 render 打头）必须现算：模块晚挂上要看得见', () => {
+    const h = createKernel()
+    const counter = counting(h)
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: counter.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    const section = residentSection(h)
+    counter.reset()
+
+    expect(section?.metrics?.()).toMatchObject({ residentContributors: 0 })
+
+    // 宿主稍后才挂上模块行：第二次 metrics 必须看到它。
+    // 若复用退化成了"缓存上一份账目"，这里就会仍然报 0——那正是两个面互相矛盾的老缺陷。
+    h.start([promptModule('omb-late', { resident: '迟到的模块' })])
+    expect(section?.metrics?.()).toMatchObject({ residentContributors: 1 })
+    expect(counter.scans(), '两次独立消费 = 两次现算').toBe(2)
+    dispose()
+  })
+
+  it('复用的那一份与渲染文本同源：数字不是"另算一遍碰巧相同"', () => {
+    const h = createKernel()
+    const counter = counting(h)
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: counter.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    h.start([promptModule('omb-late', { resident: '迟到的模块' })])
+    counter.reset()
+
+    const section = residentSection(h)
+    const text = h.status().join('\n')
+    const metrics = section?.metrics?.()
+    // 段落的余量与该次消费的 metrics 必须自洽（字符数直接来自同一份账目）
+    expect(metrics?.residentChars).toBe('迟到的模块'.length)
+    expect(text).toContain(`常驻提示 ${'迟到的模块'.length}/${RESIDENT_HINT_MAX} 字符`)
+    expect(text).toContain(`余量 ${RESIDENT_HINT_MAX - '迟到的模块'.length}`)
+    dispose()
+  })
+
+  /**
+   * 模型可见的那条路（`omb_status` 工具）**现在**只扫一次：这条是"当前事实"的存档。
+   *
+   * 记下它是因为修法必须与调用形状匹配：`dsh/status-tool.ts` 目前只调每段的 `render()`
+   * （机器可读面由消费者另外取），所以"一次渲染两遍服务表"只在 **render 与 metrics 成对消费**
+   * 时出现。这条用例把"工具路径是一次"钉住——将来谁在渲染路径里加上 metrics 调用，
+   * 上面那两条计数断言就会告诉他必须共用同一份账目。
+   */
+  it('omb_status 工具路径（只走 render）一次渲染只扫一次服务表', () => {
+    const h = createKernel()
+    const counter = counting(h)
+    const dispose = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: counter.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    h.start([promptModule('omb-reasoning', { resident: 'x'.repeat(REASONING_CHARS) })])
+    counter.reset()
+
+    const outcome = buildStatusTool(h).run({}) as { kind: string; text: string }
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('常驻提示')
+    expect(counter.scans(), 'omb_status 只渲染段落，因此只该扫一遍').toBe(1)
+    dispose()
+  })
+
+  /**
+   * 热重载的**真实时序**（段落层面）：第二次接线时旧实例尚未退场，
+   * 于是登记处里同时存在两个同名贡献者——症状是状态面里同名段落出现两条，
+   * 一条说 `0/120（无贡献者）`、一条说 `104/120`，读者无从判断哪条是活的；
+   * 而且两条各扫一遍服务表，正是一次 `omb_status` 解析两遍的由来。
+   */
+  it('热重载：同名段落只出现一条、只扫一遍服务表，旧实例随后退场也不带走新段', () => {
+    const h = createKernel()
+    const stale = counting(h) // 旧实例（尚未退场）
+    const live = counting(h, [{ id: 'omb-new', resident: '新实例的常驻提示' }])
+    const first = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: stale.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    const second = wirePromptInjection({
+      kernel: h.kernel,
+      contributions: live.source,
+      systemPrompt: fakeSystemPrompt(),
+      clock: h.kernel.clock,
+    })
+    stale.reset()
+    live.reset()
+
+    /** 一次状态面渲染：同名段落的条数与整份文本都来自**这一次**输出。 */
+    const renderOnce = (): { headings: number; text: string } => {
+      const lines = h.status()
+      return {
+        headings: lines.filter(line => line === `### ${RESIDENT_BUDGET_STATUS_NAME}`).length,
+        text: lines.join('\n'),
+      }
+    }
+
+    const rendered = renderOnce()
+    expect(rendered.headings, '同名段落只许出现一条').toBe(1)
+    expect(rendered.text).toContain('omb-new')
+    expect(rendered.text, '旧实例的账目不许再渲染').not.toContain('无贡献者')
+    // 旧段不再渲染 = 它连服务表都不会去扫：两条同名段落正是"扫两遍"的由来
+    expect(stale.scans(), '被顶替的旧段不许再被渲染（它一次都不该扫服务表）').toBe(0)
+    expect(live.scans(), '活的那一段扫一次').toBe(1)
+
+    // 旧实例稍后才退场（宿主的 dispose 与 apply 不同步）：它的注销动作必须是无操作
+    first()
+    expect(h.statusNames()).toContain(RESIDENT_BUDGET_STATUS_NAME)
+    const after = renderOnce()
+    expect(after.headings).toBe(1)
+    expect(after.text).toContain('omb-new')
+    second()
   })
 })

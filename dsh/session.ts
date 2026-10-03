@@ -435,11 +435,38 @@ function registerResidentBudget(
       )
       return () => {}
     }
+    /**
+     * 本次渲染算出的账目：**一次性交接**给同一次消费的 `metrics()`。
+     *
+     * ## 为什么要交接（一次渲染扫两遍服务表）
+     *
+     * 账目是惰性现算的（`reportNow` → `snapshotNow` → 扫一遍 `prompt:*` 服务表，
+     * 这是"模块晚于接线挂载也能到达模型"的前提，不能退回装配时的快照）。
+     * 而状态面消费一次会**同时**要文字与数字：`render()` 与 `metrics()` 过去各现算一次，
+     * 于是同一次 `omb_status` 把整张服务表解析两遍。8 模块量级可以忽略，但这是白花的；
+     * 更要紧的是**两个面本该是同一份事实**——`metrics` 说的是"刚才那行字背后的数"，
+     * 复用它之后，"数字与文字描述同一时刻"不再依赖"两次现算碰巧一致"。
+     *
+     * ## 为什么只交接一次，而且只有 `render()` 会放进来
+     *
+     * 取走即清空：紧接着的那一次 `metrics()` 用掉它，之后任何一次消费都必须重新现算。
+     * 没有 render 打头的 `metrics()`（例如某个消费者只读机器可读面）同样必须现算——
+     * 否则就退回本文件反复记的那个老缺陷：状态面说 `0/120`、模块自己说 `104/120`，
+     * 两个面互相矛盾而读者无从判断该信哪个。
+     *
+     * ⚠️ 已知取舍：`render()` 与紧随其后的 `metrics()` 必须属于**同一次消费**
+     * （`dsh/status-tool.ts` 渲染段落、消费者随后读同一次的数字）。若将来出现
+     * "先渲染、很久以后才单独读 metrics"的调用方，这个窗口需要更紧的边界——
+     * 它宁可多扫一遍服务表，也不能把旧账当成新事实。
+     */
+    let renderedReport: ResidentHintReport | undefined
     const unregister = registry.register({
       name: RESIDENT_BUDGET_STATUS_NAME,
       // 渲染时现算：这一段必须反映**此刻真正会被注入的那一份**。
       render: () => {
         const report = reportNow()
+        // 交给同一次消费的机器可读面（见 `renderedReport` 的说明）
+        renderedReport = report
         return [
           report.report,
           `注入：${wiring.injected ? `已接入（order ${CONTEXT_ORDER}）` : `未接入——${wiring.detail}`}`,
@@ -447,7 +474,9 @@ function registerResidentBudget(
       },
       // 机器可读的同一份数字（供 omb_status 之外的消费者按数判断，不用解析中文）。
       metrics: () => {
-        const report = reportNow()
+        // 同一次消费：复用渲染那一份；否则现算（一次交接只服务一次消费）
+        const report = renderedReport ?? reportNow()
+        renderedReport = undefined
         return {
           residentChars: report.used,
           residentLimit: report.limit,

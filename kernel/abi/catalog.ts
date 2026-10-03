@@ -357,7 +357,19 @@ export const RESERVED_SOURCE_PREFIX = 'omb-doc:'
  * 由微内核 `provide`（服务名 `SERVICES.statusContributor`），模块 `apply` 里同步 `register`。
  */
 export interface StatusRegistry {
-  /** 登记一个贡献者。@returns 注销函数（幂等）。 */
+  /**
+   * 登记一个贡献者。@returns 注销函数（幂等）。
+   *
+   * **同名替换**：同一个 `name` 再登记会**顶替**旧的那一个，渲染只出现一条。
+   * 为什么：热重载时新实例先 `register`、旧实例的 disposer 稍后才跑（两者不在同一个
+   * 同步块里），中间任何一次 `omb_status` 都会把同名段落渲染两遍——两段数字互相矛盾，
+   * 而状态面是唯一的诊断入口，自相矛盾等于整段失去可信度。顶替者的 disposer
+   * 因此变成**无操作**（否则它会把新段删掉）。
+   *
+   * 已知取舍：去重同时遮住了一个信号——"旧实例还没退场"原本是可见的（双段），
+   * 现在不显示了。旧实例若真的还活着（服务/订阅未撤），要靠 StatusTable 的顶替计数
+   * 才能发现；那需要扩这个接口，暂未做。
+   */
   register(contributor: StatusContributor): () => void
   /** 当前全部贡献者，按 `name` 稳定排序（输出确定，便于测试与阅读）。 */
   list(): readonly StatusContributor[]

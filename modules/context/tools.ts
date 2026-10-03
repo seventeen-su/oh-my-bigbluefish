@@ -227,27 +227,59 @@ export function shapingOf(band: PressureBand | string): string {
 }
 
 /**
+ * 带**可选会话形参**的状态贡献者。
+ *
+ * `StatusContributor` 在 ABI 里是 `render(): string`（`kernel/abi/catalog.ts:372-379`），
+ * 而"少形参"的实现天然满足"多一个**可选**形参"的签名，所以状态面
+ * （`dsh/status-tool.ts` 的 `SessionAwareContributor`）能在**不改 ABI、不动内核登记处**
+ * 的前提下把"这次是谁"交给需要它的段落。这里把那个约定写成类型：
+ * 上下文段的压力读数与顶层「## 上下文」必须来自**同一个会话**，会话因此必须能传进来。
+ */
+export interface SessionAwareStatusContributor extends StatusContributor {
+  render(session?: SessionRef): string
+  /** 机器可读面收同一个会话——两处不许各读各的（否则就是"两个面互相矛盾"）。 */
+  metrics?(session?: SessionRef): Readonly<Record<string, number>>
+}
+
+/**
  * 造一个 `StatusContributor`（注册进 `StatusRegistry`）。
+ *
+ * ## 为什么 `read` 必须能收到**这一次**的会话
+ *
+ * 它曾经是 `() => StatusPanelInput`：状态面（`dsh/status-tool.ts`）把本次会话作为
+ * `render` 的第一个实参传进来，而 `read` 接不住它，于是会话被**吞掉**——上下文模块
+ * 只好自己重造一份贡献者（`modules/context/index.ts` 的 `statusContributor`），
+ * 本函数则沦为"仍导出、仍被测试覆盖、没有生产调用方"的僵尸接缝。
+ *
+ * 吞掉会话的代价不是"少一个参数"：会话是段落与顶层读数一致的**唯一来源**，
+ * 丢了它就退回实测过的那次矛盾——顶层 `moderate / 0.343`，模块段
+ * `relaxed（fillRatio 未知）`。读者无从判断该信哪个，而本模块的塑形
+ * （`pushLimit` / `indexOnly`）按 relaxed 走，"紧张就少说"等于没生效。
+ *
+ * 拿不到会话时交 `undefined`（= 真的没有会话）：模块据此走"未测量"，
+ * **不借用任何别的会话的读数**（见 `modules/context/index.ts` 的 `resolveSession`）。
  *
  * `read` 允许抛异常——`render`/`metrics` 都兜住，因为登记处的调用方
  * 不该为某个模块的内部故障付出整份状态面的代价。
+ *
+ * @param read 组装入口；**必须把会话原样用上**（形参可省，旧调用方不破）。
  */
 export function createStatusContributor(
-  read: () => StatusPanelInput,
+  read: (session?: SessionRef) => StatusPanelInput,
   name = '上下文优化（omb-context）',
-): StatusContributor {
+): SessionAwareStatusContributor {
   return {
     name,
-    render: (): string => {
+    render: (session?: SessionRef): string => {
       try {
-        return renderStatusPanel(buildStatusPanel(read()))
+        return renderStatusPanel(buildStatusPanel(read(session)))
       } catch (error) {
         return `渲染失败（已隔离）：${error instanceof Error ? error.message : String(error)}`
       }
     },
-    metrics: (): Readonly<Record<string, number>> => {
+    metrics: (session?: SessionRef): Readonly<Record<string, number>> => {
       try {
-        return buildStatusPanel(read()).metrics
+        return buildStatusPanel(read(session)).metrics
       } catch {
         return { renderError: 1 }
       }
