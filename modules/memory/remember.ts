@@ -474,17 +474,41 @@ export type SupersedeStatus =
   | 'superseded'
   /** 旧条目早已在取代链里：**保留原标注**（改写会让"谁取代了谁"失真），只补 supersedes 边。 */
   | 'already-superseded'
-  /** 找不到这条 id（拼错、已被隐私擦除，或不在任何已打开的库里）。 */
+  /**
+   * 找不到这条 id。**只在两个作用域都真的查过之后才会出现**（见 `findSupersedeTarget`）：
+   * 少查一个库就报 missing，等于把"我没看"说成"它不存在"——回执给的理由会全是假的。
+   */
   | 'missing'
-  /** 找得到但标注/建边失败。**新条目已写入**，但旧条目没有被标为已推翻——回执必须说清。 */
+  /** 没做成。**新条目已写入**；"没做成"发生在哪一步决定旧条目当前是否仍会被注入（见 `stage`）。 */
   | 'failed'
 
-export interface SupersedeEntry {
+/**
+ * 失败发生在哪一步。**它决定回执能对"旧条目现在是否仍会被注入召回"说什么**：
+ *
+ * - `lookup`：这条 id **根本没查全**（库没打开、或查询抛错）→ 状态未知，
+ *   既不能说它仍有效、也不能说已标掉，回执必须如实说"无法确认"；
+ * - `mark`：查到了，但 `validTo`/`supersededBy` 没写成 → 它**仍会**作为有效结论注入；
+ * - `edge`：标注已写成，只有 `supersedes` 边没建成 → 它**已不会**再被注入；
+ *   缺的只是 `omb_relate` 能走的那一跳（追溯历史痕迹），不是"当前结论对不对"。
+ *
+ * 为什么必须分档：把三种失败压成一句"这些旧条目没有被标为已推翻"，
+ * 对 `edge` 那一类恰好说反——同一份回执的 detail 还会自相矛盾（M4）。
+ */
+export type SupersedeStage = 'lookup' | 'mark' | 'edge'
+
+interface SupersedeEntryBase {
   readonly id: string
-  readonly status: SupersedeStatus
   /** `already-superseded` 时是既有的取代者 id；`failed` 时是失败原因。 */
   readonly detail?: string
 }
+
+/**
+ * 判别式联合而不是可选字段：**`failed` 必须带 `stage`**，
+ * 这样"没分档的失败"在类型层就不可能出现（宁编译不过，不要回执说谎）。
+ */
+export type SupersedeEntry =
+  | (SupersedeEntryBase & { readonly status: 'superseded' | 'already-superseded' | 'missing' })
+  | (SupersedeEntryBase & { readonly status: 'failed'; readonly stage: SupersedeStage })
 
 export interface SupersedeReport {
   /** 去重后的请求列表（顺序即调用方给的顺序，便于逐条核对）。 */
@@ -517,8 +541,13 @@ export interface MemoryWriteDeps {
    * `sessionId` 是**本次调用**的会话（`ToolCallContext.sessionId`，归属确定时才有）：
    * 没有会话 → 调用方只给用户库，不猜"最近一个会话"的项目库。
    *
-   * `supersedes` 的旧条目可能在**另一个库**（如新条目落项目库、旧结论在用户库），
+   * `supersedes` 的旧条目可能在**另一个库**（如新条目落用户库、旧结论在项目库），
    * 因此本函数会被按两个作用域各问一次；实现必须能对任一作用域给出句柄或 undefined。
+   *
+   * ⚠️ 调用方**必须**把本次调用的 `sessionId` 一起传下来：真实实现
+   * （`modules/memory/index.ts`）在 `sessionId === undefined` 时只解析得用户库，
+   * 传丢了会话就等于第二个作用域永远打不开——那会让"跨库取代"永远报 missing（M2）。
+   * 拿不到句柄时回执说"无法确认"（不猜），见 `findSupersedeTarget` 的判据。
    */
   readonly resolveStore: (scope: MemoryScope, sessionId?: string) => Promise<MemoryStore | undefined>
   /** 时钟。模块层不读墙钟，一律由 `dsh/` 传 `kernel.clock`。 */
@@ -597,12 +626,21 @@ function echoLines(text: string, contentHash: string | undefined): readonly stri
 /**
  * 推翻标注的逐条回执。**只列实际发生过的事**：
  * "没标上"绝不写成"已标"——那会让下一个会话以为旧结论已被处理，比不标更坏。
+ *
+ * 反过来同样成立（M4）：**"标注已写成、只有边失败"也绝不能写成"没有被标为已推翻"**。
+ * 所以失败的断言按 `stage` 分三档说，每档都只说自己知道的那部分：
+ * `lookup` = 没查全（状态未知，两个方向都不许断言）、`mark` = 仍会注入、
+ * `edge` = 不再注入、只是追不到那一跳。
  */
 function renderSupersede(report: SupersedeReport): readonly string[] {
   const marked = report.entries.filter(entry => entry.status === 'superseded')
   const already = report.entries.filter(entry => entry.status === 'already-superseded')
   const missing = report.entries.filter(entry => entry.status === 'missing')
   const failed = report.entries.filter(entry => entry.status === 'failed')
+  const unknown = failed.filter(entry => entry.stage === 'lookup')
+  const unmarked = failed.filter(entry => entry.stage === 'mark')
+  const edgesOnly = failed.filter(entry => entry.stage === 'edge')
+  const detailOf = (entry: SupersedeEntry): string => entry.detail ?? '未知原因'
   const lines: string[] = []
   if (marked.length > 0) {
     lines.push(
@@ -622,13 +660,27 @@ function renderSupersede(report: SupersedeReport): readonly string[] {
   if (missing.length > 0) {
     lines.push(
       `推翻标注：未找到 ${missing.length} 条：${missing.map(entry => entry.id).join('、')}` +
-        '（id 拼错、已被隐私擦除，或不在任何已打开的库里）',
+        '（用户库与项目库都查过了：id 拼错，或已被隐私擦除）',
     )
   }
-  if (failed.length > 0) {
+  if (unknown.length > 0) {
     lines.push(
-      `推翻标注**未完成** ${failed.length} 条（新条目已写入，但这些旧条目没有被标为已推翻）：` +
-        failed.map(entry => `${entry.id}（${entry.detail ?? '未知原因'}）`).join('、'),
+      `推翻标注：无法确认 ${unknown.length} 条（这次**没能查全**它们可能所在的库，` +
+        `所以既不能说它们仍会作为有效结论注入，也不能说已被标掉）：` +
+        unknown.map(entry => `${entry.id}（${detailOf(entry)}）`).join('、'),
+    )
+  }
+  if (unmarked.length > 0) {
+    lines.push(
+      `推翻标注**未完成** ${unmarked.length} 条（新条目已写入，但这些旧条目没有被标为已推翻——` +
+        `**它们仍会作为有效结论注入召回**）：${unmarked.map(entry => `${entry.id}（${detailOf(entry)}）`).join('、')}`,
+    )
+  }
+  if (edgesOnly.length > 0) {
+    lines.push(
+      `推翻标注：${edgesOnly.length} 条旧条目已标为"被本条取代"（新条目已写入；**已不再作为有效结论注入召回**），` +
+        `但 supersedes 边未建成——omb_relate 追不到这一跳：` +
+        edgesOnly.map(entry => `${entry.id}（${detailOf(entry)}）`).join('、'),
     )
   }
   return lines
@@ -659,42 +711,82 @@ export function renderRemember(outcome: RememberOutcome): string {
 // 推翻标注（supersedes）
 // ────────────────────────────────────────────────────────────────────────────
 
-/** 旧条目在哪：三态而不是 `undefined | MemoryRecord`——"查库失败"与"没有这条"必须分开。 */
+/**
+ * 旧条目在哪：三态而不是 `undefined | MemoryRecord`——"查库失败"与"没有这条"必须分开。
+ *
+ * `missing` 的语义被收紧成**"两个作用域都真的查过、都没有"**：
+ * 另一个库没打开（或拿不到句柄）时只能说 `error`（回执渲染成"无法确认"）。
+ * 把"我没查"说成"它不存在"会让回执给出的三个理由全是假的（M2 的真机后果）。
+ */
 type SupersedeLookup =
   | { readonly kind: 'found'; readonly store: MemoryStore; readonly record: MemoryRecord }
   | { readonly kind: 'missing' }
   | { readonly kind: 'error'; readonly reason: string }
+
+/** 作用域的中文名。回执要指名道姓地说"哪个库没查到/没查过"。 */
+function scopeLabel(scope: MemoryScope): string {
+  return scope === 'user' ? '用户库' : '项目库'
+}
 
 /**
  * 找一条旧记忆：先在新条目所在的库找，再问另一个作用域。
  *
  * 为什么允许跨库：结论按 kind 路由（semantic→用户库、episodic/procedural→项目库），
  * 而"这条结论被推翻"完全可能跨库发生（项目里实测推翻了用户库里记下的偏好）。
- * 找不到就如实报 missing，不猜。
+ *
+ * **判据：只有两个作用域都真的查过，才允许返回 missing。**
+ * 另一个库的门必须用**本次调用的 `sessionId`** 去开：`resolveStore('project', undefined)`
+ * 在真实实现（`index.ts`）里只会拿到 userOnlySet → 恒 undefined，
+ * 于是"新条目落用户库、旧结论在项目库"这个方向**永远报 missing**（M2）。
+ * 而 missing 的三条理由全是假的，库里 validTo/supersededBy 一个字没改——
+ * 被推翻的结论继续作为有效结论注入召回。找不到就如实报，不猜：
+ * 没查过的库只能报"无法确认"。
  */
 async function findSupersedeTarget(
   deps: MemoryWriteDeps,
   primary: MemoryStore,
   id: string,
+  sessionId: string | undefined,
 ): Promise<SupersedeLookup> {
-  const stores: MemoryStore[] = [primary]
   const otherScope: MemoryScope = primary.scope === 'user' ? 'project' : 'user'
-  try {
-    const other = await deps.resolveStore(otherScope)
-    if (other !== undefined && other !== primary) stores.push(other)
-  } catch {
-    // 另一个库拿不到不影响在本库找；找不到会如实报 missing
-  }
   const failures: string[] = []
-  for (const store of stores) {
-    try {
-      const record = await store.get(id)
-      if (record !== undefined) return { kind: 'found', store, record }
-    } catch (error) {
-      failures.push(`库 ${store.scope} 查询失败（${messageOf(error)}）`)
-    }
+
+  // ① 先在新条目自己的库里找（这也是唯一一个不依赖 sessionId 的库）
+  try {
+    const record = await primary.get(id)
+    if (record !== undefined) return { kind: 'found', store: primary, record }
+  } catch (error) {
+    failures.push(`${scopeLabel(primary.scope)}查询失败（${messageOf(error)}）`)
   }
-  return failures.length > 0 ? { kind: 'error', reason: failures.join('；') } : { kind: 'missing' }
+
+  // ② 再问另一个作用域。**必须带上本次调用的会话**，否则拿不到项目库。
+  let other: MemoryStore | undefined
+  try {
+    other = await deps.resolveStore(otherScope, sessionId)
+  } catch (error) {
+    failures.push(`${scopeLabel(otherScope)}解析失败（${messageOf(error)}）`)
+  }
+
+  if (other !== undefined && other !== primary) {
+    try {
+      const record = await other.get(id)
+      if (record !== undefined) return { kind: 'found', store: other, record }
+    } catch (error) {
+      failures.push(`${scopeLabel(otherScope)}查询失败（${messageOf(error)}）`)
+    }
+    // 两个作用域都真的查过了，才允许说"没有这条"
+    return failures.length > 0 ? { kind: 'error', reason: failures.join('；') } : { kind: 'missing' }
+  }
+
+  // ③ 另一个库没拿到句柄（或解析回了同一个实例）→ 这个作用域**根本没查过**
+  failures.push(
+    other === primary
+      ? `${scopeLabel(otherScope)}解析回了同一个库实例，第二个作用域没有被真正查询`
+      : `${scopeLabel(otherScope)}尚未打开（本次调用${
+          sessionId === undefined ? '没有会话归属' : `的会话 ${sessionId} 下解析不到它`
+        }），该作用域没有被查询`,
+  )
+  return { kind: 'error', reason: failures.join('；') }
 }
 
 /** 建 `supersedes` 边（newer → older）。失败返回可读原因，**不抛**。 */
@@ -720,7 +812,12 @@ async function linkSupersedes(
  * ② 边方向 `newer → older`，便于 `omb_relate` 顺着链往下走
  * ③ 已在取代链里的条目**不改写**既有标注（改写会让"谁取代了谁"失真），只补边
  *
- * 任何一条失败都不影响新条目已写入这个事实，但结果必须如实回执。
+ * 任何一条失败都不影响新条目已写入这个事实，但结果必须如实回执——
+ * 而且要说清失败**发生在哪一步**（`stage`），否则回执对"旧条目现在还回不回被注入"
+ * 的断言会与库里的实际值相反（M4）。
+ *
+ * `sessionId` 是**本次调用**的会话：跨库找旧条目必须用它去开另一个库的门
+ * （真实实现里 `resolveStore('project', undefined)` 恒拿不到项目库，见 `findSupersedeTarget`）。
  */
 async function applySupersedes(
   deps: MemoryWriteDeps,
@@ -728,6 +825,7 @@ async function applySupersedes(
   requested: readonly string[],
   record: MemoryRecord,
   now: number,
+  sessionId: string | undefined,
 ): Promise<SupersedeReport> {
   const ids: string[] = []
   for (const raw of requested) {
@@ -739,16 +837,22 @@ async function applySupersedes(
   for (const id of ids) {
     if (id === record.id) {
       // 极端防御：新 id 由时钟 + 序号 + 内容哈希生成，撞上既有 id 实际上不可能。
-      entries.push({ id, status: 'failed', detail: '目标 id 与本条新记录相同，不能自己取代自己' })
+      entries.push({
+        id,
+        status: 'failed',
+        stage: 'mark',
+        detail: '目标 id 与本条新记录相同，不能自己取代自己（它仍是有效结论）',
+      })
       continue
     }
-    const lookup = await findSupersedeTarget(deps, primary, id)
+    const lookup = await findSupersedeTarget(deps, primary, id, sessionId)
     if (lookup.kind === 'missing') {
       entries.push({ id, status: 'missing' })
       continue
     }
     if (lookup.kind === 'error') {
-      entries.push({ id, status: 'failed', detail: lookup.reason })
+      // 没查全：库里什么都没改，但"它现在是否仍会被注入"**未知**——交给渲染层说"无法确认"
+      entries.push({ id, status: 'failed', stage: 'lookup', detail: lookup.reason })
       continue
     }
     const target = lookup.record
@@ -762,6 +866,7 @@ async function applySupersedes(
         entries.push({
           id,
           status: 'failed',
+          stage: 'edge',
           detail: `旧条目早已被 ${target.supersededBy} 取代（保留原标注），但补 supersedes 边失败：${problem}`,
         })
       } else {
@@ -778,7 +883,8 @@ async function applySupersedes(
         supersededBy: record.id,
       })
     } catch (error) {
-      entries.push({ id, status: 'failed', detail: `标注旧条目失败：${messageOf(error)}` })
+      // 查到但没标上 → 它**仍会**作为有效结论注入（stage: 'mark'）
+      entries.push({ id, status: 'failed', stage: 'mark', detail: `标注旧条目失败：${messageOf(error)}` })
       continue
     }
 
@@ -786,7 +892,8 @@ async function applySupersedes(
     const crossError = crossStore === undefined ? undefined : await linkSupersedes(crossStore, record.id, target.id, now)
     const problem = edgeError ?? crossError
     if (problem !== undefined) {
-      entries.push({ id, status: 'failed', detail: `旧条目已标为被取代，但 supersedes 边写入失败：${problem}` })
+      // 标注已写成 → 它**已不会**再被注入；缺的只是可追溯的那条边（stage: 'edge'）
+      entries.push({ id, status: 'failed', stage: 'edge', detail: `旧条目已标为被取代，但 supersedes 边写入失败：${problem}` })
     } else {
       entries.push({ id, status: 'superseded' })
     }
@@ -907,7 +1014,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         const supersede =
           input.supersedes === undefined || input.supersedes.length === 0
             ? undefined
-            : await applySupersedes(deps, store, input.supersedes, record, now)
+            : await applySupersedes(deps, store, input.supersedes, record, now, sessionId)
 
         return {
           kind: 'text',
