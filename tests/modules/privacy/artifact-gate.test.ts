@@ -39,7 +39,12 @@ function fixture(): Fixture {
     clock,
     baseline: () => ({ mode: 'normal', origin: 'default', detail: '测试基线：未配置' }),
   })
-  const gate = new PrivacyGate({ state, baselineRestricted: () => false })
+  const gate = new PrivacyGate({
+    state,
+    baselineRestricted: () => false,
+    isActive: sessionId => state.isActive(sessionId),
+    hasRestrictedActiveSession: () => state.hasRestrictedActiveSession(),
+  })
   const index = new ArtifactIndex({ logger: capturingLogger(), privacy: () => gate })
   return {
     index,
@@ -108,8 +113,22 @@ describe('归属未知：存在受限会话时禁读（scoped fail-closed）', (
     const f = fixture()
     seed(f)
     f.state.setOverride('s1', 'sealed')
+    // **活跃**的受限会话：判据是"本进程内真的活跃过"（`PrivacyState.isActive`），
+    // 因此这里要先有一次观测——与生产一致（命令/`session/event` 都会走 `note()`）。
+    f.state.noteLineage({ sessionId: 's1', source: 'session-event' })
     expect(() => f.index.topFor(undefined, 3)).toThrow(ARTIFACT_UNATTRIBUTED_READ_DENIED)
     expect(() => f.index.list()).toThrow(/阅读痕迹/)
+  })
+
+  it('只留在状态文件里的受限记录（本进程从未活跃）→ 归属未知的读不再被永久掐住', () => {
+    const f = fixture()
+    seed(f)
+    // 重启后重放进来的形态：`setOverride` 建了条目，但没有任何观测
+    f.state.setOverride('s1', 'sealed')
+    expect(f.index.topFor(undefined, 3).length).toBe(2)
+    expect(() => f.index.list()).not.toThrow()
+    // 而该会话自己的判定不受影响：真的用它读，仍然是 sealed
+    expect(() => f.index.topFor('secret', 3, 's1')).toThrow(/sealed/)
   })
 
   it('A 的 sealed 不掐 B 的读（范围按会话）', () => {
@@ -169,7 +188,12 @@ describe('装配路径：模块把 privacy 注入进去（不是测试里手搭�
         clock,
         baseline: () => ({ mode: 'normal', origin: 'default', detail: '未配置' }),
       })
-      handle.kernel.provide('privacy', new PrivacyGate({ state, baselineRestricted: () => false }))
+      handle.kernel.provide('privacy', new PrivacyGate({
+        state,
+        baselineRestricted: () => false,
+        isActive: sessionId => state.isActive(sessionId),
+        hasRestrictedActiveSession: () => state.hasRestrictedActiveSession(),
+      }))
 
       const module = createArtifactModule()
       const applied = module.apply(handle.kernel, { maxEntries: 500 })

@@ -18,6 +18,9 @@
  *   约束；写不可逆、读可恢复，所以只堵不可逆的那边（详见 `modes.ts` 的文件头）。
  *   注意：**只有在真的存在受限会话（或基线本身就是受限档）时才禁写**——
  *   否则"从没用过隐私模式"的用户会连向量编码都用不了，那是把安全做成了功能故障。
+ *   而"存在受限会话"的判据是**本进程内真的活跃过**（`isActive` 端口），
+ *   不是"状态文件里还留着某条历史记录"——理由见 `#anyRestricted()` 与
+ *   `state.ts` 的 `isActive()`。
  *
  * ## 计数
  *
@@ -61,6 +64,25 @@ export interface PrivacyGateDeps {
   readonly state: PrivacyState
   /** 基线是否受限（fail-closed 兜底时为真）——`decideUnattributed` 用。 */
   readonly baselineRestricted: () => boolean
+  /**
+   * 该会话在**本进程内**是否真的活跃过（`index.ts` 用会话运行态回答，
+   * 判据见 `state.ts` 的 `isActive()`）。
+   *
+   * 用途：状态面逐条标注"活跃/已结束"，以及 `restrictedCounts()` 里的活跃条数。
+   *
+   * **必填**：漏传等于把 G1 那个 P0（历史受限记录永久粘住全进程）留在原地，
+   * 因此不设默认值、不靠调用方自觉。
+   */
+  readonly isActive: (sessionId: string) => boolean
+  /**
+   * 本进程内是否存在**活跃且生效模式受限**的会话（含继承）——`#anyRestricted()` 的判据。
+   *
+   * 为什么需要独立于 `isActive` 的第二个端口：受限会话未必有自己的显式设置
+   * （子代理**继承**父会话的模式，而继承不写回子会话），因此"有没有受限的活会话"
+   * 不能靠"遍历 overrides() 再逐个问是否活跃"回答。由 `PrivacyState`
+   * 的 `hasRestrictedActiveSession()` 提供，与 `decide()` 共用同一套解析。
+   */
+  readonly hasRestrictedActiveSession: () => boolean
 }
 
 export class PrivacyGate implements PrivacyGatePort {
@@ -131,19 +153,58 @@ export class PrivacyGate implements PrivacyGatePort {
     }
   }
 
-  /** 是否存在任何受限（非 normal）的会话或受限基线。 */
+  /** 是否存在**本进程内活跃**的受限会话或受限基线。 */
   restricted(): boolean {
     return this.#anyRestricted()
   }
 
-  /** 是否存在任何受限（非 normal）的会话或受限基线。 */
+  /**
+   * 受限会话的两个数：**历史记录**条数（状态文件里全部非 normal 的条目）
+   * 与**本进程活跃**条数（`#anyRestricted()` 真正看的那一部分）。
+   *
+   * 为什么要分开报：`overrides()` 里既有本进程设的，也有启动时从状态文件
+   * 重放进来的已结束会话。把两者混成一个数，等于让状态面替读者承诺
+   * "这些限制都在生效"——而 G1 那个 P0 正是这么长出来的（见 `#anyRestricted`）。
+   *
+   * 返回 `null` = **未测量**（读会话状态失败）：此时不许写 0，
+   * 否则"读不出来"会被渲染成"一条都没有"（硬不变量：区分未测量与测到 0）。
+   */
+  restrictedCounts(): { readonly history: number; readonly active: number } | null {
+    try {
+      let history = 0
+      let active = 0
+      for (const entry of this.#deps.state.overrides()) {
+        if (entry.mode === 'normal') continue
+        history += 1
+        if (this.#deps.isActive(entry.sessionId)) active += 1
+      }
+      return { history, active }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 是否存在任何**本进程内活跃**的受限会话，或受限基线。
+   *
+   * 为什么按活跃判定、而不是遍历全部历史记录（G1，P0）：
+   * `overrides()` 里有启动时从状态文件重放进来的条目。只要用户**曾经**在任何一个
+   * 会话里设过一次 `read-only`/`sealed`，那条记录就永久留在文件里，每次启动都被
+   * 重放进运行态表，于是本判据从此恒真——此后**每一个**新会话的"归属未知写"
+   * （向量编码队列经 `stores.snapshot()` 落盘 `putEmbedding`）都被拒，
+   * 语义召回静默退化成词法召回，而健康面仍是 ok。
+   *
+   * 已结束的会话不可能再产生新内容，它的限制不该继续掐住全进程；
+   * 而**真的活着**的受限会话仍然必须拒绝——fail-closed 没有放宽：
+   * - 本进程内设过模式的会话（命令面走 `noteLineage()` → `note()`）→ 活跃 → 拒；
+   * - 从文件重放进来、随后又真的活跃起来的会话 → 重新武装 → 拒；
+   * - **继承**了受限档的活跃子会话（父会话可能已结束）→ 拒（判据含继承）。
+   * 判定不了时按受限处理（安全方向）。
+   */
   #anyRestricted(): boolean {
     try {
       if (this.#deps.baselineRestricted()) return true
-      for (const entry of this.#deps.state.overrides()) {
-        if (entry.mode !== 'normal') return true
-      }
-      return false
+      return this.#deps.hasRestrictedActiveSession()
     } catch {
       // 判定不了 → 按受限处理（安全方向）
       return true

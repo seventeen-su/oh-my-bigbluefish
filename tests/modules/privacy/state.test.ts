@@ -63,6 +63,86 @@ describe('按会话键控', () => {
   })
 })
 
+/**
+ * `isActive` 是 G1（P0）修法的唯一判据：`PrivacyGate.#anyRestricted()` 只看它。
+ *
+ * 两种"条目在容器里"的形态必须被分开：
+ * - **活跃**：本进程内 `note()`/`accept()` 过（真有观测）→ 限制必须继续生效；
+ * - **历史记录**：只 `setOverride()`（= 启动时从状态文件重放）→ 不得掐住全进程。
+ */
+describe('isActive：本进程活跃过 vs 只是重放的历史记录', () => {
+  it('只有 note() 过的会话才算活跃；只 setOverride 的不算', () => {
+    const { state, sessions } = build()
+    state.setOverride('restored', 'sealed')
+    expect(state.isActive('restored'), '重放进来的条目没有任何观测，是历史记录').toBe(false)
+
+    state.noteLineage({ sessionId: 'live', source: 'session-event' })
+    state.setOverride('live', 'sealed')
+    expect(state.isActive('live')).toBe(true)
+
+    // 重放的会话随后真的活跃起来 → 立刻算活跃（重新武装，fail-closed 不放宽）
+    sessions.note({ sessionId: 'restored', source: 'session-event' })
+    expect(state.isActive('restored')).toBe(true)
+  })
+
+  it('从未见过的会话 / 空 id 都不是活跃', () => {
+    const { state } = build()
+    expect(state.isActive('nobody')).toBe(false)
+    expect(state.isActive('')).toBe(false)
+  })
+
+  it('容器读不出来 → 按活跃处理（安全方向：宁可不放行归属未知的写）', () => {
+    const broken = new Proxy({} as SessionRuntimeTable, {
+      get: () => {
+        throw new Error('容器坏了')
+      },
+    })
+    const state = new PrivacyState({
+      sessions: broken,
+      clock: fixedClock(),
+      baseline: () => ({ mode: 'normal', origin: 'default', detail: '未配置' }),
+    })
+    expect(state.isActive('A')).toBe(true)
+  })
+})
+
+/**
+ * `hasRestrictedActiveSession()` 是"归属未知的写是否被禁"的判据（`#anyRestricted()`）。
+ *
+ * 它必须**含继承**：子代理继承不写回子会话，所以"父会话已结束、子会话仍在跑"
+ * 这种情形下，受限的那个会话根本不在 `overrides()` 里。
+ */
+describe('hasRestrictedActiveSession：活跃 + 生效模式受限（含继承）', () => {
+  it('只有历史记录（本进程未活跃）→ false；活跃起来 → true', () => {
+    const { state, sessions } = build()
+    state.setOverride('A', 'sealed')
+    expect(state.hasRestrictedActiveSession()).toBe(false)
+    sessions.note({ sessionId: 'A', source: 'session-event' })
+    expect(state.hasRestrictedActiveSession()).toBe(true)
+  })
+
+  it('本进程设过 normal 的活跃会话不算受限（别把闸门焊死）', () => {
+    const { state, sessions } = build()
+    state.setOverride('A', 'normal')
+    sessions.note({ sessionId: 'A', source: 'session-event' })
+    expect(state.hasRestrictedActiveSession()).toBe(false)
+  })
+
+  it('父会话已结束、子会话仍活跃并继承受限档 → true（漏掉它=归属未知写被静默放行）', () => {
+    const { state } = build()
+    state.setOverride('parent', 'sealed') // 只是历史记录（未活跃）
+    // 子会话活了：血缘 + 观测都来自本进程
+    state.noteLineage({ sessionId: 'child', parentSessionId: 'parent', source: 'session-event' })
+    expect(state.overrides().map(entry => entry.sessionId), '子会话没有自己的记录').toEqual(['parent'])
+    expect(state.hasRestrictedActiveSession()).toBe(true)
+  })
+
+  it('基线受限时也由调用方兜住（这里只看会话）', () => {
+    const { state } = build({ mode: 'sealed', origin: 'fail-closed', detail: '损坏' })
+    expect(state.hasRestrictedActiveSession(), '基线不是"会话"，由 gate 的 baselineRestricted 管').toBe(false)
+  })
+})
+
 describe('子代理继承（读时解析）', () => {
   it('子会话没有自己的设置 → 继承父会话', () => {
     const { state } = build()
