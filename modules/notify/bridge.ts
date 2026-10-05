@@ -43,6 +43,22 @@ export const NOTIFY_THROTTLE_MS = 30 * 60 * 1000
 /** 单会话推送上限。 */
 export const NOTIFY_SESSION_LIMIT = 10
 
+/**
+ * 分会话去重表的 **LRU 上界**（会话数）。
+ *
+ * 为什么需要：`#sentContent` / `#sentPerSession` 按会话建键，而它们**只在
+ * `resetSession()` 里被清**——那个方法的全仓调用方只有测试（宿主不发会话结束事件
+ * 给本模块，本片刻意不依赖它，见规划 §4 S3-f）。没有上界时，长跑宿主上
+ * 这两个表随历史会话数单调增长。
+ *
+ * 取值理由（32）：与 `modules/context` 的 `SESSION_TABLE_MAX` 同值。
+ * 真实同时活跃的会话是个位数；32 给足余量，而每份记录只有"一个内容键集合
+ * （≤ 单会话上限 10 条）+ 一个计数"，代价可忽略。淘汰按**最久未活动**，
+ * 被淘汰的会话其"同内容只发一次"记忆随之失效（可能多发一条），
+ * 这是有界性的可见代价——写在这里以免被当成缺陷。
+ */
+export const NOTIFY_SESSION_TABLE_MAX = 32
+
 /** 未显式给会话时的默认键（`push(kind, message)` 仍可直接用）。 */
 export const DEFAULT_NOTIFY_SESSION = 'default'
 
@@ -189,6 +205,12 @@ export interface NotifyStatus {
   readonly suppressed: number
   /** 最近一次被抑制的原因（诊断用；无抑制时为 null）。 */
   readonly lastReason: string | null
+  /** 分会话去重表当前的会话数（**0 = 真的一张会话记录都没有**）。 */
+  readonly sessions: number
+  /** 分会话去重表的 LRU 上界（见 `NOTIFY_SESSION_TABLE_MAX`）。 */
+  readonly sessionTableMax: number
+  /** 因 LRU 上界被淘汰的会话数（累计；>0 表示"更早的会话记忆已经不再保留"）。 */
+  readonly sessionsEvicted: number
 }
 
 function messageOf(error: unknown): string {
@@ -215,6 +237,15 @@ export class NotifyBridge {
   /** 会话 → 已发过的内容键。内容去重不随时间失效，只随会话重置。 */
   readonly #sentContent = new Map<string, Set<string>>()
   readonly #sentPerSession = new Map<string, number>()
+  /**
+   * 会话的**最近活动顺序**（LRU，末尾最新）。
+   *
+   * 单独一张顺序表而不是复用 `#sentPerSession` 的插入序：命中去重、被节流拒绝
+   * 这些路径也要算"活动"（否则一个一直在推、一直被判重的会话会被当成不活跃而淘汰，
+   * 它的去重记忆就白丢了）。淘汰时三张表一起删。
+   */
+  readonly #sessionOrder = new Map<string, true>()
+  #sessionsEvicted = 0
   #sent = 0
   #suppressed = 0
   #lastReason: string | null = null
@@ -258,6 +289,9 @@ export class NotifyBridge {
 
       const now = this.#deps.clock.now()
       this.#prune(now)
+      // 每次推送（无论最后发不发得出去）都算这个会话"活动过"，
+      // 并用 LRU 上界淘汰最久未活动的会话（见 NOTIFY_SESSION_TABLE_MAX）。
+      this.#touchSession(sessionId)
 
       const lastKind = this.#lastByKind.get(kind)
       if (lastKind !== undefined && now - lastKind < NOTIFY_THROTTLE_MS) {
@@ -349,13 +383,19 @@ export class NotifyBridge {
   /** 可用性与原因。**原因必填**（无空降级）。 */
   status(): NotifyStatus {
     const target = this.#target()
+    const table = {
+      sessions: this.#sessionOrder.size,
+      sessionTableMax: NOTIFY_SESSION_TABLE_MAX,
+      sessionsEvicted: this.#sessionsEvicted,
+    }
     if (target === undefined) {
       return {
         available: false,
-        detail: this.#unavailableReason(),
+        detail: this.#unavailableReason() + this.#sessionTableNote(),
         sent: this.#sent,
         suppressed: this.#suppressed,
         lastReason: this.#lastReason,
+        ...table,
       }
     }
     // 通道名必须与**实际会用的那个方法**一致：`chooseSend` 才是唯一真源。
@@ -381,10 +421,12 @@ export class NotifyBridge {
       detail:
         `已接上宿主 desktopNotify（通道 ${channel}${versionNote}）；节流：同类型 30 分钟 1 条、同会话内同内容只发一次、` +
         `单会话上限 ${NOTIFY_SESSION_LIMIT} 条。已发 ${this.#sent} 条、抑制 ${this.#suppressed} 条`
-        + (relevant === undefined || relevant.length === 0 ? '' : `；对方能力：${relevant.join('、')}`),
+        + (relevant === undefined || relevant.length === 0 ? '' : `；对方能力：${relevant.join('、')}`)
+        + this.#sessionTableNote(),
       sent: this.#sent,
       suppressed: this.#suppressed,
       lastReason: this.#lastReason,
+      ...table,
     }
   }
 
@@ -392,6 +434,41 @@ export class NotifyBridge {
   resetSession(sessionId: string): void {
     this.#sentPerSession.delete(sessionId)
     this.#sentContent.delete(sessionId)
+    // 顺序表也要删：否则"已重置的会话"仍然占着一个 LRU 名额，
+    // 新会话会因此提前把别人挤掉。
+    this.#sessionOrder.delete(sessionId)
+  }
+
+  /**
+   * 记一次会话活动并执行 LRU 淘汰（三张分会话表一起删）。
+   *
+   * 淘汰按**最久未活动**而不是"最早插入"：一直在推的会话可能很早就插入了，
+   * 按插入序淘汰会把它的去重记忆丢掉（表现为同内容被重复推送）。
+   */
+  #touchSession(sessionId: string): void {
+    this.#sessionOrder.delete(sessionId)
+    this.#sessionOrder.set(sessionId, true)
+    while (this.#sessionOrder.size > NOTIFY_SESSION_TABLE_MAX) {
+      const oldest = this.#sessionOrder.keys().next().value
+      if (oldest === undefined) break
+      this.#sessionOrder.delete(oldest)
+      this.#sentContent.delete(oldest)
+      this.#sentPerSession.delete(oldest)
+      this.#sessionsEvicted += 1
+    }
+  }
+
+  /**
+   * 分会话去重表的口径说明。
+   *
+   * **只在真发生过会话活动或淘汰时才附加**：`0/32` 这种读数对诊断没有信息量，
+   * 写上去只是噪音；而"已淘汰 N 个更早的会话"必须说出来——它意味着
+   * 那些会话的"同内容只发一次"记忆已经不再保留。两个数含义不同，不合并。
+   */
+  #sessionTableNote(): string {
+    if (this.#sessionOrder.size === 0 && this.#sessionsEvicted === 0) return ''
+    return `；分会话去重表 ${this.#sessionOrder.size}/${NOTIFY_SESSION_TABLE_MAX} 个会话（LRU 上界）`
+      + (this.#sessionsEvicted > 0 ? `，已淘汰 ${this.#sessionsEvicted} 个更早的会话` : '')
   }
 
   #target(): DesktopNotifyLike | undefined {
