@@ -6,8 +6,11 @@
  *
  * 目标形态：**一行、简练、不用破折号、少用括号**。
  *
- * 用法：`node scripts/condense-messages.mjs`（dry-run，只打印前后对照）
- *       `node scripts/condense-messages.mjs --apply`（交给 git filter-branch 改写历史）
+ * **它只是一个库，没有 CLI**：唯一的消费者是 `scripts/msg-filter.mjs`
+ * （`git filter-branch --msg-filter` 的过滤器）。
+ * 这里曾经写着"用法：`node scripts/condense-messages.mjs`（dry-run）/ `--apply`"，
+ * 但那两个模式在文件里**根本不存在**（全文只有一个 `export function`）——
+ * 直接跑它是"无输出、退出码 0"，看起来像成功。声明已删除，别再加回来。
  */
 
 /** 把一条提交信息压缩成简练单行。 */

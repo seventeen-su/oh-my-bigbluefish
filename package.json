@@ -16,8 +16,9 @@
     "typecheck:ts7": "node scripts/ts7-canary.mjs",
     "lint": "eslint .",
     "build": "node scripts/build.mjs",
+    "check-resolution": "node scripts/check-resolution.mjs",
     "fetch-embedding-model": "node scripts/fetch-embedding-model.mjs",
-    "verify": "pnpm typecheck && pnpm lint && pnpm test"
+    "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm check-resolution"
   },
   "dependencies": {
     "@omb/artifact": "workspace:*",
