@@ -210,6 +210,10 @@ export function applyFocus(
  *
  * v3.1 起回执的主语是**控制参数**（验证预算 / 证据要求 / 分支 / 复核 / 收尾），
  * 不再是"给你更多规则文本"：档位换的是行为门槛，不是字数。
+ *
+ * ⚠️ 措辞必须与 `index.ts` 的渲染**逐字对应**。这里以前写的是
+ * "上下文紧张时只给读数、不给卡片"，而渲染在紧张档把读数整段丢掉了——
+ * 承诺与实现相反（G2）。现在两边说的是同一件事：**读数照给，卡片正文降级为索引**。
  */
 export function describeDepthEffect(depth: FocusDepth): string {
   if (depth === 'quick') {
@@ -217,9 +221,12 @@ export function describeDepthEffect(depth: FocusDepth): string {
   }
   if (depth === 'deep') {
     const card = controlOf(depth).injectCard
+    const declared = CARDS_BY_DEPTH.deep ?? []
+    const others = declared.filter(id => id !== card)
     return [
       `此后每轮请求注入控制读数与规则卡 ${card ?? '（无）'}；控制：${describeControl(depth)}。`,
-      `其余声明的规则卡（${(CARDS_BY_DEPTH.deep ?? []).filter(id => id !== card).join('/')}）用 omb_method 取；上下文紧张时只给读数、不给卡片。`,
+      `其余声明的规则卡（${others.join('/')}）用 omb_method 取；`,
+      `上下文紧张时读数照给、卡片正文降级为索引（${declared.join('/')} 的「编号 标题｜何时用」），正文一律用 omb_method 取。`,
     ].join('')
   }
   return `此后每轮不再主动注入规则卡正文；控制：${describeControl(depth)}。需要规则卡时用 omb_method 取。`

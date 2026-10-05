@@ -23,7 +23,7 @@ import {
   createReasoningModule,
   reasoningConfigSchema,
 } from '../../../modules/reasoning/index.js'
-import { cardById, residentHint } from '../../../modules/reasoning/methods.js'
+import { cardById, cardsFor, renderIndex, residentHint } from '../../../modules/reasoning/methods.js'
 
 /** `omb-kernel` 占位注册：本测试只验证 reasoning 模块，不重复测内核。 */
 const KERNEL_STUB: ModuleRegistration<unknown> = {
@@ -258,14 +258,31 @@ describe('提示贡献：三档行为 + 压力塑形', () => {
     handle.dispose()
   })
 
-  it('deep + tight：只留索引（内容全部转工具拉取，不静默丢弃）', () => {
+  it('deep + tight：读数保留 + 真的给索引（正文仍不给，全部转工具拉取）', () => {
     const { handle } = start()
     const render = contributionOf(handle).context!
     const text = render({ sessionId: 's', depth: 'deep', band: 'tight' })
+    /**
+     * 这三条一起才叫"兑现承诺"（G2）：
+     * ① 读数在——它是档位差异的唯一载体，紧张档压缩的是卡片正文，不是读数。
+     *    此前这里断言的恰好相反（`not.toContain(controlLine)`），把错误行为钉住了。
+     * ② 索引真的渲染出来（编号 + 标题 + 何时用），而不是一句"改用 omb_method 取"——
+     *    那句承诺的索引此前**从未被渲染过**。
+     * ③ 正文仍然不给：紧张档的本意没变。
+     */
+    expect(text).toContain(controlLine('deep', 0))
+    expect(text).toContain('R3 备选再收敛')
+    expect(text).toContain('R4 结论可检验')
+    expect(text).toContain('R5 锚定具体')
+    expect(text).toContain('何时用：')
     expect(text).toContain('omb_method')
-    expect(text).toContain('omb_verify')
+    expect(text).not.toContain(cardById('R3')?.text ?? '不可能匹配')
     expect(text).not.toContain(cardById('R4')?.text ?? '不可能匹配')
-    expect(text).not.toContain(controlLine('deep', 0))
+    expect(text).not.toContain(cardById('R5')?.text ?? '不可能匹配')
+    // 预算：紧张档增量 = 一行读数（≤CONTROL_LINE_MAX）+ 索引（deep 三行），仅此而已
+    expect(text.length).toBeLessThanOrEqual(CONTROL_LINE_MAX + renderIndex(cardsFor('deep')).length + 1)
+    // 留痕如实：读数真的进了上下文（记账 0 字符会与文本自相矛盾）
+    expect(handle.health()[MODULE_ID]?.metrics?.lastRenderControlChars).toBe(controlLine('deep', 0).length)
     handle.dispose()
   })
 
@@ -309,11 +326,12 @@ describe('注入可核验：渲染留痕与失败留声', () => {
     handle.dispose()
   })
 
-  it('deep + tight：请求了卡却没进上下文——留痕如实说"只给了指令未含卡片"', () => {
+  it('deep + tight：请求了卡却没进上下文——留痕如实说进了什么（读数+索引）', () => {
     const { handle } = start()
     contributionOf(handle).context!({ sessionId: 's', depth: 'deep', band: 'tight' })
     const line = statusText(handle)
-    expect(line).toContain('上次注入：只给了指令未含卡片')
+    // 标签必须与内容对得上：紧张档进的是读数+索引，不是"只给了指令"
+    expect(line).toContain('上次注入：只给了读数+索引、未含卡片正文')
     expect(line).toContain('请求 R3/R4/R5')
     expect(handle.health()[MODULE_ID]?.metrics?.lastRenderCards).toBe(0)
     handle.dispose()
@@ -414,6 +432,33 @@ describe('deep 正证：设 → 读 → 内容含卡号', () => {
     const text = contributionOf(handle).context!({ sessionId: 's', depth: 'deep', band: 'relaxed' })
     expect(text).toContain('【R4 ')
     expect(text).toContain(controlLine('deep', 0))
+    handle.dispose()
+  })
+})
+
+/**
+ * 承诺一致性（G2 的另一半）：**回执说的、工具描述说的、渲染做的必须是同一件事**。
+ *
+ * 此前回执写"上下文紧张时只给读数、不给卡片"，而渲染在紧张档把读数整段丢掉、
+ * 索引也从没渲染过——承诺与实现相反。这条测试把三者钉在一起。
+ */
+describe('回执 / 工具描述 / 渲染：紧张档说的是同一件事', () => {
+  it('回执承诺"读数照给、正文降级为索引"，渲染侧兑现同一件事', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 'live', turn: 1 })
+    const focusTool = toolsOf(handle).find(tool => tool.name === 'omb_focus')
+    const outcome = await focusTool?.execute({ depth: 'deep', reason: '承诺一致性' })
+    const receipt = outcome?.text ?? ''
+    expect(receipt).toContain('上下文紧张时读数照给')
+    expect(receipt).toContain('索引')
+    // 工具描述也这么说（模型是先看描述、后看回执的）
+    expect(focusTool?.description).toContain('上下文紧张时控制读数照给、规则卡只给索引')
+
+    // 渲染侧：读数在、索引在、正文不在
+    const tight = contributionOf(handle).context!({ sessionId: 'live', depth: 'deep', band: 'tight' })
+    expect(tight).toContain(controlLine('deep', 0))
+    expect(tight).toContain('何时用：')
+    expect(tight).not.toContain(cardById('R4')?.text ?? '不可能匹配')
     handle.dispose()
   })
 })
@@ -604,6 +649,64 @@ describe('Verify 可观测：验证段、台账、状态面与健康面', () => 
     handle.kernel.emit('turn/start', { sessionId: 's2', turn: 1 })
     await verifyToolOf(handle)?.execute({ claim: '乙的结论' })
     expect(handle.health()[MODULE_ID]?.metrics?.verifyCalls).toBe(2)
+    handle.dispose()
+  })
+
+  /**
+   * G3（P1）：次数被 32 条台账上限截断后开始谎报。
+   *
+   * 现场：第 33 次之后回执永远说"这是第 33 次"，状态面会话行永远停在
+   * "验证：32 次"，而同一次输出里的健康行是真实累计数——两个面互相矛盾。
+   */
+  it('同一会话核对 40 次：回执说"这是第 40 次"，状态面与健康面同为 40（不再互相矛盾）', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    let last = ''
+    for (let index = 1; index <= 40; index += 1) {
+      const outcome = await verifyToolOf(handle)?.execute({
+        claim: `c${index}`,
+        evidence: 'modules/reasoning/verify.ts:1',
+        falsifier: '看到 Y 就说明这条不成立',
+      })
+      last = outcome?.text ?? ''
+    }
+    // 回执：这是第 40 次（此前永远是"第 33 次"）
+    expect(last).toContain('这是第 40 次')
+    const status = handle.status().join('\n')
+    // 状态面会话行：验证 40 次（此前停在 32）
+    expect(status).toContain('验证：40 次')
+    // 健康行与状态行同口径：同一次输出里两个"验证次数"必须一样
+    expect(status).toContain('验证 40 次')
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyCalls).toBe(40)
+    // 超预算计数同样不能再被窗口截断（它此前是台账内的计数，会与健康面差 7）
+    expect(status).toContain('超预算 39')
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyOverBudget).toBe(39)
+    handle.dispose()
+  })
+
+  it('未闭合结论不随台账滚动消失：被挤出 32 条窗口的结论仍留在验证段与健康面里', async () => {
+    const { handle } = start()
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    for (let index = 1; index <= 40; index += 1) {
+      // 无来源 → needs-evidence（未闭合）
+      await verifyToolOf(handle)?.execute({ claim: `c${index}` })
+    }
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyUnresolved).toBe(40)
+
+    const render = contributionOf(handle).context!
+    const text = render({ sessionId: 's', depth: 'standard', band: 'relaxed' })
+    // 验证段还在（此前台账一滚，unresolved 掉到 0，这一段直接消失）
+    expect(text).toContain('未过形式核对')
+    expect(text).toContain('40 条结论未过形式核对')
+
+    // 补上来源重核其中一条 → 未闭合按**最新判定**降到 39（待办不是历史）
+    await verifyToolOf(handle)?.execute({
+      claim: 'c1',
+      evidence: 'modules/reasoning/verify.ts:1',
+      falsifier: '看不到就说明这条不成立',
+    })
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyUnresolved).toBe(39)
+    expect(handle.health()[MODULE_ID]?.metrics?.verifyCalls).toBe(41)
     handle.dispose()
   })
 })

@@ -17,7 +17,7 @@ import {
   PRIVACY_SERVICE,
   SESSION_RUNTIME_SERVICE,
 } from '../../../modules/privacy/index.js'
-import type { PrivacyGatePort } from '../../../modules/privacy/gate.js'
+import type { PrivacyGate, PrivacyGatePort } from '../../../modules/privacy/gate.js'
 import type { CommandResultLike } from '../../../modules/privacy/command.js'
 import { capturingLogger, tempWorkspace } from '../memory/helpers.js'
 
@@ -218,6 +218,187 @@ describe('命令 → 生效 → 持久化', () => {
   })
 })
 
+/**
+ * G1（P0）：受限记录不再永久粘性。
+ *
+ * 现场：任一会话被设过 `read-only`/`sealed`，该条目就永久留在 `session-modes.json`，
+ * 每次启动被重放进运行态表 → `#anyRestricted()` 从此恒真 → **所有**后续会话的
+ * "归属未知写"（向量编码队列经 `stores.snapshot()` 落盘 `putEmbedding`）一律被拒，
+ * 语义召回静默退化成词法召回，而健康面仍是 ok。
+ *
+ * 修法**不是放宽 fail-closed**：判据收紧到"本进程内真的活跃过"，
+ * 并给用户补上清除入口（`forget` / `clear`）与状态面的两个数。
+ */
+describe('受限记录不再永久粘性（G1 / P0）', () => {
+  const gateOf = (booted: { kernel: Kernel }): PrivacyGatePort | undefined =>
+    booted.kernel.service<PrivacyGatePort>(PRIVACY_SERVICE)
+
+  it('重启后不对旧会话做任何操作 → 归属未知的写放行，而该会话自己的判定仍然生效', async () => {
+    const ws = tempWorkspace('omb-privacy-sticky-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'A' })
+      // 反向断言之一：A 在**本进程内**设过模式（命令走 noteLineage → note）→ 仍然拒
+      expect(gateOf(first)?.decideUnattributed()).toMatchObject({ allowRead: true, allowWrite: false })
+      expect(readFileSync(path, 'utf8')).toContain('"A": "sealed"')
+      first.dispose()
+
+      // 模拟 dsh 重启：全新内核 + 全新模块实例，只有磁盘上的状态文件是共享的
+      const second = boot({ path })
+      // **不对 A 做任何操作**：它只是状态文件里的一条历史记录
+      expect(gateOf(second)?.decideUnattributed()).toEqual({
+        allowRead: true,
+        allowWrite: true,
+        readReason: '',
+        writeReason: '',
+      })
+      // 按会话的判定不受影响：真的回到 A 时，sealed 照旧生效
+      expect(gateOf(second)?.decide('A')).toMatchObject({ allowRead: false, allowWrite: false })
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('反向断言：从状态文件重放进来的会话**重新活跃**后，归属未知的写必须再次被拒', async () => {
+    const ws = tempWorkspace('omb-privacy-sticky-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'read-only', { id: 'A' })
+      first.dispose()
+
+      const second = boot({ path })
+      const gate = gateOf(second)
+      expect(gate?.decideUnattributed().allowWrite).toBe(true) // 尚未活跃
+
+      // 宿主会话事件（生产路径由 adopt 的 on 路由到宿主事件面）→ 该会话真的活了
+      const emitSessionEvent = second.kernel.emit as unknown as (event: string, payload: unknown) => void
+      emitSessionEvent('session/event', { header: { id: 'A' } })
+      expect(gate?.decideUnattributed()).toMatchObject({ allowRead: true, allowWrite: false })
+      // 计数如实上涨：状态面能看出"这次拒绝是因为真的存在受限会话"
+      expect(second.kernel.service<PrivacyGate>(PRIVACY_SERVICE)?.stats().unattributedWriteDenials).toBeGreaterThan(0)
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('反向断言：从已结束会话**继承**受限档的活跃子会话，同样禁住归属未知的写', async () => {
+    const ws = tempWorkspace('omb-privacy-sticky-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'parent' })
+      first.dispose()
+
+      const second = boot({ path })
+      const gate = gateOf(second)
+      expect(gate?.decideUnattributed().allowWrite, '父会话只是历史记录').toBe(true)
+
+      // 子代理会话活了：父会话（已结束）没有再发任何事件，但子在跑并继承 sealed
+      const emitSessionEvent = second.kernel.emit as unknown as (event: string, payload: unknown) => void
+      emitSessionEvent('session/event', { header: { id: 'child', parentSession: 'parent', delegationDepth: 1 } })
+      expect(gate?.decide('child')).toMatchObject({ allowRead: false, allowWrite: false })
+      expect(
+        gate?.decideUnattributed(),
+        '受限会话是"继承来的"，它不出现在显式记录里——漏掉它等于静默放行',
+      ).toMatchObject({ allowRead: true, allowWrite: false })
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('命令面有清除入口：forget <id> 清掉单条记录并落盘，该会话回到基线', async () => {
+    const ws = tempWorkspace('omb-privacy-forget-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const booted = boot({ path })
+      await runCommand(booted.commands, 'sealed', { id: 'A' })
+      expect(gateOf(booted)?.decide('A')).toMatchObject({ allowWrite: false })
+
+      const result = await runCommand(booted.commands, 'forget A')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('A')
+      expect(gateOf(booted)?.decide('A')).toMatchObject({ allowRead: true, allowWrite: true })
+      expect(readFileSync(path, 'utf8')).not.toContain('"A"')
+
+      // 落盘生效：同一条记录不会再被下一次启动重放
+      booted.dispose()
+      const again = boot({ path })
+      expect(gateOf(again)?.decide('A')).toMatchObject({ allowRead: true, allowWrite: true })
+      again.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('对没有设置的会话 forget：如实说"没有可清除的记录"，不假装清过', async () => {
+    const ws = tempWorkspace('omb-privacy-forget-')
+    try {
+      const booted = boot({ path: join(ws.dir, 'm.json') })
+      const result = await runCommand(booted.commands, 'forget 查无此会话')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('没有显式隐私设置')
+      booted.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('clear 只清**已结束**的会话：本进程内活跃会话的设置原样保留', async () => {
+    const ws = tempWorkspace('omb-privacy-clear-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'dead' })
+      first.dispose()
+
+      const second = boot({ path })
+      await runCommand(second.commands, 'read-only', { id: 'live' }) // 本进程内活跃
+      const result = await runCommand(second.commands, 'clear')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('已清除 1 个已结束会话')
+
+      expect(gateOf(second)?.decide('dead'), '已结束会话的记录该被清掉').toMatchObject({ allowRead: true, allowWrite: true })
+      expect(gateOf(second)?.decide('live'), '活跃会话的限制不许被批量清理顺手放宽').toMatchObject({ allowRead: true, allowWrite: false })
+      const doc = JSON.parse(readFileSync(path, 'utf8')) as { modes: Record<string, string> }
+      expect(Object.keys(doc.modes)).toEqual(['live'])
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('状态面把两个数分开说：历史受限记录 N 条（其中本进程活跃 M 条）', async () => {
+    const ws = tempWorkspace('omb-privacy-counts-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'old' })
+      first.dispose()
+
+      const second = boot({ path })
+      await runCommand(second.commands, 'sealed', { id: 'live' })
+      const text = (await runCommand(second.commands, 'status')).text
+      expect(text).toContain('历史受限记录 2 条（其中本进程活跃 1 条）')
+      expect(text).toContain('old=sealed（已结束）')
+      expect(text).toContain('live=sealed（活跃）')
+      // 出口本身也要在状态面里点得到名，否则用户不知道有这条命令
+      expect(text).toContain('/omb-privacy clear')
+
+      const registry = second.kernel.service<StatusRegistry>(SERVICES.statusContributor)
+      const rendered = registry?.list().find(c => c.name === '隐私')?.render() ?? ''
+      expect(rendered).toContain('历史受限记录 2 条（其中本进程活跃 1 条）')
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+})
+
 describe('子代理继承（血缘来自宿主会话头）', () => {
   it('宿主 session/event 登记 parentSession → 子会话继承父会话的模式', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
@@ -347,6 +528,28 @@ describe('健康面与状态面', () => {
       expect(health.detail).toContain('基线')
       expect(health.detail).toContain(path)
       expect(health.metrics?.sessionsWithMode).toBeTypeOf('number')
+      dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('health detail 把"历史 N 条 / 本进程活跃 M 条"分开写（混报就是下一轮的自相矛盾）', async () => {
+    const ws = tempWorkspace('omb-privacy-health-')
+    const path = join(ws.dir, 'm.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'old' })
+      first.dispose()
+
+      // 重启后：文件里还有 old，但本进程里它从未活跃
+      const handle = createKernel({ logger: capturingLogger() })
+      const registration = createPrivacyRegistration()
+      const dispose = mount(handle.kernel, registration, { failClosedMode: 'sealed', path })
+      const health = await registration.manifest.health()
+      expect(health.detail).toContain('历史受限记录 1 条（其中本进程活跃 0 条）')
+      expect(health.metrics?.restrictedSessions).toBe(1)
+      expect(health.metrics?.restrictedSessionsActive).toBe(0)
       dispose()
     } finally {
       ws.cleanup()

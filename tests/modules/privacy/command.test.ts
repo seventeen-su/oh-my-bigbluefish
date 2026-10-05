@@ -16,15 +16,26 @@ import {
 function api(overrides: Partial<PrivacyCommandApi> = {}): PrivacyCommandApi & {
   readonly setMode: ReturnType<typeof vi.fn>
   readonly trust: ReturnType<typeof vi.fn>
+  readonly forget: ReturnType<typeof vi.fn>
+  readonly clearInactive: ReturnType<typeof vi.fn>
 } {
   const setMode = vi.fn((): CommandResultLike => ({ kind: 'success', text: 'set ok' }))
   const trust = vi.fn((): CommandResultLike => ({ kind: 'success', text: 'trust ok' }))
+  const forget = vi.fn((): CommandResultLike => ({ kind: 'success', text: 'forget ok' }))
+  const clearInactive = vi.fn((): CommandResultLike => ({ kind: 'success', text: 'clear ok' }))
   return {
     statusText: (sessionId: string | null) => `status:${sessionId ?? 'none'}`,
     setMode,
     trust,
+    forget,
+    clearInactive,
     ...overrides,
-  } as PrivacyCommandApi & { readonly setMode: ReturnType<typeof vi.fn>; readonly trust: ReturnType<typeof vi.fn> }
+  } as PrivacyCommandApi & {
+    readonly setMode: ReturnType<typeof vi.fn>
+    readonly trust: ReturnType<typeof vi.fn>
+    readonly forget: ReturnType<typeof vi.fn>
+    readonly clearInactive: ReturnType<typeof vi.fn>
+  }
 }
 
 const withSession = { sessionId: 's1', parentSessionId: null, delegationDepth: null }
@@ -83,6 +94,31 @@ describe('命令语法', () => {
     const a = api()
     expect(runPrivacyCommand('trust', withSession, a)).toEqual({ kind: 'success', text: 'trust ok' })
     expect(a.trust).toHaveBeenCalledTimes(1)
+  })
+
+  it('forget 把会话 id 透传给 api；不带 id 时给可读用法（不猜是哪个会话）', () => {
+    const withId = api()
+    expect(runPrivacyCommand('forget sess-A', withSession, withId)).toEqual({ kind: 'success', text: 'forget ok' })
+    expect(withId.forget).toHaveBeenCalledWith('sess-A')
+    expect(withId.clearInactive).not.toHaveBeenCalled()
+
+    const noId = api()
+    const result = runPrivacyCommand('forget', withSession, noId)
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('forget <会话id>')
+    expect(noId.forget).not.toHaveBeenCalled()
+  })
+
+  it('clear 走"清全部已结束会话"的通道', () => {
+    const a = api()
+    expect(runPrivacyCommand('clear', withSession, a)).toEqual({ kind: 'success', text: 'clear ok' })
+    expect(a.clearInactive).toHaveBeenCalledTimes(1)
+  })
+
+  it('用法文本点名 forget / clear（用户要在输入框里看得到出口）', () => {
+    expect(PRIVACY_USAGE).toContain('forget')
+    expect(PRIVACY_USAGE).toContain('clear')
+    expect(runPrivacyCommand('help', withSession, api()).text).toContain('forget <会话id>')
   })
 
   it('拿不到会话 → 拒绝执行并说明原因（不猜是哪个会话）', () => {

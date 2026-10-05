@@ -15,7 +15,9 @@
  *    "直接用 `service.forSession(id).store('user').put(...)` 写库"同样被拒。
  *    本模块**不做任何服务装饰**——装饰会被别人的重挂挤掉，那会留下"强制失效的窗口"。
  * 5. **可读性**：`omb_status` 里有一段（状态面贡献者），显示当前会话的模式、
- *    **来源**（命令设置 / 继承自谁 / 默认 / fail-closed）、状态文件与拒绝计数。
+ *    **来源**（命令设置 / 继承自谁 / 默认 / fail-closed）、状态文件与拒绝计数，
+ *    并把受限记录分成**历史 N 条**与**本进程活跃 M 条**两个数——
+ *    混成一个数就是 G1 那条 P0 在状态面上的形态（见 `gate.ts` 的 `#anyRestricted()`）。
  *
  * ## 命令从哪注册
  *
@@ -119,6 +121,22 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * 受限会话的两个数：**历史记录**条数 与 **本进程活跃**条数。
+ *
+ * 措辞只写在这里，健康面与状态面共用——两处各写一遍就会漂移成两种说法，
+ * 而这个模块已经出现过一次"同一个事实在三个面上口径不同"的缺陷（G1）。
+ *
+ * `counts === null` = **未测量**（读会话状态失败）：这时不许写 0。
+ * "读不出来"与"一条都没有"是两件事，混报就是下一轮的自相矛盾。
+ */
+function describeRestrictedCounts(
+  counts: { readonly history: number; readonly active: number } | null,
+): string {
+  if (counts === null) return '历史受限记录 **未测量**（读取会话状态失败）'
+  return `历史受限记录 ${counts.history} 条（其中本进程活跃 ${counts.active} 条）`
+}
+
 export interface PrivacyModuleOptions {
   readonly version?: string
 }
@@ -161,7 +179,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       return { state: 'degraded', detail: '模块未启动：apply 尚未执行（或已被卸载）' }
     }
     const entries = current.overrides()
-    const restricted = entries.filter(entry => entry.mode !== 'normal').length
+    const counts = gate?.restrictedCounts() ?? null
     const stats = gate?.stats()
     const fileState = durableError !== null
       ? `状态文件降级：${durableError}`
@@ -172,7 +190,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       ? `基线=${modeTitle(config.failClosedMode)}（fail-closed 粘性标记生效）`
       : '基线=normal（从未配置过）'
     const detail =
-      `${entries.length} 个会话有显式设置（其中受限 ${restricted} 个）；${baseline}；${fileState}；`
+      `${entries.length} 个会话有显式设置；${describeRestrictedCounts(counts)}；${baseline}；${fileState}；`
       + `拒绝计数：读 ${stats?.readDenials ?? 0}、写 ${stats?.writeDenials ?? 0}、`
       + `归属未知写 ${stats?.unattributedWriteDenials ?? 0}`
     return {
@@ -180,7 +198,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       detail,
       metrics: {
         sessionsWithMode: entries.length,
-        restrictedSessions: restricted,
+        ...(counts === null ? {} : { restrictedSessions: counts.history, restrictedSessionsActive: counts.active }),
         readDenials: stats?.readDenials ?? 0,
           writeDenials: stats?.writeDenials ?? 0,
           unattributedWriteDenials: stats?.unattributedWriteDenials ?? 0,
@@ -251,6 +269,12 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
       const created = new PrivacyState({ sessions: runtimeTable, clock: kernel.clock, baseline })
       state = created
       for (const [sessionId, mode] of Object.entries(loaded.doc.modes)) {
+        // 重放进来的条目**只建容器条目、不标活跃**（`setOverride` → `ensure()`，
+        // 没有任何 `note()` 观测）。这是刻意的：
+        // ① 它们必须能被 `resolve()` 命中——用户在新进程里真的回到同一个会话时，
+        //    限制照旧生效（`decide()` 不看活跃）；
+        // ② 但它们**不得**再参与 `#anyRestricted()`——已结束的会话不该继续
+        //    掐住全进程的归属未知写（G1，P0）。判据见 `PrivacyState.isActive()`。
         created.setOverride(sessionId, mode)
       }
 
@@ -262,6 +286,11 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
         // 所以这里**不能再判一次 `!== 'normal'`**：那个分支永远为真，
         // 写上去会让人误以为"配置成 normal 时基线不受限"（配置项根本不允许 normal）。
         baselineRestricted: () => stickyFailClosed,
+        // "是否存在受限会话"只看**本进程内真的活跃过**的会话（G1 的修法核心）。
+        isActive: sessionId => created.isActive(sessionId),
+        // 判据本身走 `PrivacyState`（与 `decide()` 同一套解析，含继承）：
+        // 继承不写回子会话，所以"活跃的受限会话"不能靠扫 overrides() 找齐。
+        hasRestrictedActiveSession: () => created.hasRestrictedActiveSession(),
       })
       gate = createdGate
       try {
@@ -307,10 +336,22 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
           if (parent !== null) lines.push(` 父会话：${parent}（子代理继承父会话的模式）`)
         }
         const entries = created.overrides()
+        const counts = createdGate.restrictedCounts()
         if (entries.length > 0) {
+          // 逐条标出"本进程活跃/已结束"：读者要能自己看出哪些记录还在生效，
+          // 而不是从"受限 N 个"里猜（G1 的状态面修法）。
           lines.push(
             ' 有显式设置的会话：'
-            + entries.map(entry => `${entry.sessionId}=${entry.mode}`).join('、'),
+            + entries
+              .map(entry => `${entry.sessionId}=${entry.mode}${created.isActive(entry.sessionId) ? '（活跃）' : '（已结束）'}`)
+              .join('、'),
+          )
+        }
+        lines.push(` ${describeRestrictedCounts(counts)}`)
+        if (counts !== null && counts.history > counts.active) {
+          lines.push(
+            ' 已结束会话的记录不再掐住新会话；要清掉它们：'
+            + '/omb-privacy clear（全部已结束的）或 /omb-privacy forget <会话id>（单条）。',
           )
         }
         lines.push(
@@ -330,6 +371,39 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
         lines.push(` 命令面：/omb-privacy —— ${commandState}`)
         lines.push(` ${PRIVACY_USAGE}`)
         return lines.join('\n')
+      }
+
+      /**
+       * 该会话是不是**本进程内活跃会话的父会话**（血缘来源）。
+       *
+       * 批量清理**不得**碰它：父会话的模式是子会话继承的**唯一来源**
+       * （`state.ts` 的读时解析），清掉它会让仍在跑的子孙会话静默失去继承——
+       * 那是 fail-open。
+       *
+       * 而留着它不堵任何东西：归属未知的写只看活跃会话（`#anyRestricted()`），
+       * 这个已结束的父会话本身不算数；它留下的唯一作用就是给子孙继承。
+       */
+      const isInheritanceSource = (sessionId: string): boolean =>
+        runtimeTable.list().some(
+          runtime => runtime.parentSessionId === sessionId && created.isActive(runtime.sessionId),
+        )
+
+      /**
+       * 清除一个会话的显式设置，并**尽量**回收它的运行态条目。
+       *
+       * 不回收的两种情形（都必须留着）：
+       * ① 活跃会话——那张表是全内核共享的，条目里还有别的模块的槽与血缘，
+       *    删掉会连别人的状态一起删；
+       * ② 活跃会话的父会话——见 `isInheritanceSource()`。
+       *
+       * `SessionRuntimeTable.forget()` 在生产代码里此前**零消费者**，历史会话
+       * 因此在表里只增不减；这里是它的第一个真实调用点。
+       */
+      const clearOne = (sessionId: string): void => {
+        created.clearOverride(sessionId)
+        if (!created.isActive(sessionId) && !isInheritanceSource(sessionId)) {
+          runtimeTable.forget(sessionId)
+        }
       }
 
       const api: PrivacyCommandApi = {
@@ -362,6 +436,72 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
               + `\n${persisted.text}`,
           }
         },
+        forget: rawSessionId => {
+          const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : ''
+          if (sessionId.length === 0) {
+            return {
+              kind: 'error',
+              text: 'forget 需要指明会话：/omb-privacy forget <会话id>（/omb-privacy status 可以列出有哪些）。',
+            }
+          }
+          const before = created.overrideOf(sessionId)
+          if (before === undefined) {
+            return {
+              kind: 'success',
+              text: `会话 ${sessionId} 没有显式隐私设置（本来就走继承/基线，没有可清除的记录）。`,
+            }
+          }
+          const wasActive = created.isActive(sessionId)
+          const keptForInheritance = isInheritanceSource(sessionId)
+          clearOne(sessionId)
+          const persisted = persist()
+          const notes: string[] = []
+          if (wasActive) {
+            notes.push('注意：该会话在本进程内是活跃的，这条清除对它立即生效（若它还在跑，请重新设档）。')
+          }
+          if (keptForInheritance) {
+            notes.push('它的运行态条目已保留：本进程内有活跃会话正从它继承模式，删掉会让那些会话静默失去继承。')
+          }
+          return {
+            kind: persisted.kind,
+            text:
+              `已清除会话 ${sessionId} 的受限记录（原为 ${modeTitle(before.mode)}）：该会话回到继承/基线。`
+              + (notes.length === 0 ? '' : `\n${notes.join('')}`)
+              + `\n${persisted.text}`,
+          }
+        },
+        clearInactive: () => {
+          const entries = created.overrides()
+          const removed: string[] = []
+          const activeKept: string[] = []
+          const inheritanceKept: string[] = []
+          for (const entry of entries) {
+            if (created.isActive(entry.sessionId)) {
+              activeKept.push(entry.sessionId)
+              continue
+            }
+            if (isInheritanceSource(entry.sessionId)) {
+              // 活跃会话正从它继承：批量清理不碰它（否则是静默放宽一条正在生效的限制）
+              inheritanceKept.push(entry.sessionId)
+              continue
+            }
+            clearOne(entry.sessionId)
+            removed.push(entry.sessionId)
+          }
+          const summary =
+            `已清除 ${removed.length} 个已结束会话的受限记录`
+            + (removed.length === 0 ? '' : `（${removed.join('、')}）`)
+            + `；本进程内活跃的 ${activeKept.length} 个会话的设置原样保留`
+            + (inheritanceKept.length === 0
+              ? ''
+              : `；另有 ${inheritanceKept.length} 个已结束会话是活跃会话的继承来源，保留（${inheritanceKept.join('、')}）`)
+          if (removed.length === 0) {
+            // 没有可清的就不写盘：避免为一次空操作刷新状态文件时间戳
+            return { kind: 'success', text: `${summary}。` }
+          }
+          const persisted = persist()
+          return { kind: persisted.kind, text: `${summary}。\n${persisted.text}` }
+        },
       }
 
       // ── 4) 命令注册（宿主能力；缺失时如实说明，不抛）──────────────────
@@ -385,7 +525,8 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
             name: PRIVACY_COMMAND_NAME,
             description:
               '隐私模式：read-only（可读不可写）/ sealed（不可读不可写）/ normal；'
-              + '按会话生效、子代理继承、重启不丢。',
+              + '按会话生效、子代理继承、重启不丢；'
+              + 'forget <会话id> / clear 清除已结束会话留下的受限记录。',
             /**
              * ⚠️ **声明 `input` 是"带参数的命令能用"的前提**——这一行是缺了它才出的 bug。
              *
@@ -415,7 +556,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
              *
              * `hint` 会在输入框里作为占位提示显示，也顺便告诉用户参数怎么给。
              */
-            input: { hint: '[status | normal | read-only | sealed | trust]' },
+            input: { hint: '[status | normal | read-only | sealed | trust | forget <会话id> | clear]' },
             handler: (invocation: CommandInvocationLike): CommandResultLike => {
               // 用户手打的命令：先把血缘登记下来（子代理的父链），再执行。
               const session = sessionOfInvocation(invocation)
@@ -500,21 +641,25 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
               try {
                 const entries = created.overrides()
                 const stats = createdGate.stats()
+                const counts = createdGate.restrictedCounts()
                 const restricted = entries.filter(entry => entry.mode !== 'normal')
                 const baseline = stickyFailClosed
                   ? `基线 ${modeTitle(parsed.failClosedMode)}（fail-closed）`
                   : '基线 normal'
                 const listed = restricted.length === 0
-                  ? '无受限会话'
-                  : restricted.map(entry => `${entry.sessionId}=${entry.mode}`).join('、')
+                  ? '：无'
+                  : `：${restricted
+                    .map(entry => `${entry.sessionId}=${entry.mode}${created.isActive(entry.sessionId) ? '（活跃）' : '（已结束）'}`)
+                    .join('、')}`
                 return [
-                  `${baseline}；显式设置 ${entries.length} 个会话（受限 ${restricted.length} 个：${listed}）`,
+                  `${baseline}；显式设置 ${entries.length} 个会话；${describeRestrictedCounts(counts)}${listed}`,
                   `拒绝计数：读 ${stats.readDenials}、写 ${stats.writeDenials}、`
                   + `归属未知写 ${stats.unattributedWriteDenials}`,
                   durablePath === null
                     ? '状态文件不可用（**未持久化**）'
                     : `状态文件 ${durablePath}${durableError === null ? '（正常）' : `（降级：${durableError}）`}`,
                   '当前会话的模式：用 /omb-privacy status 查看（状态面拿不到"这次是谁在问"）',
+                  '清理已结束会话的记录：/omb-privacy clear 或 /omb-privacy forget <会话id>',
                 ].join('；')
               } catch (error) {
                 return `隐私状态渲染失败：${messageOf(error)}`
@@ -523,9 +668,10 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
             metrics: () => {
               const entries = created.overrides()
               const stats = createdGate.stats()
+              const counts = createdGate.restrictedCounts()
               return {
                 sessionsWithMode: entries.length,
-                restrictedSessions: entries.filter(entry => entry.mode !== 'normal').length,
+                ...(counts === null ? {} : { restrictedSessions: counts.history, restrictedSessionsActive: counts.active }),
                 readDenials: stats.readDenials,
                 writeDenials: stats.writeDenials,
                 unattributedWriteDenials: stats.unattributedWriteDenials,
