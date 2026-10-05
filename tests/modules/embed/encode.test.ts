@@ -309,6 +309,65 @@ describe('冲刷：批量读 → 一次批编码 → 逐条落盘（带归属标
   })
 })
 
+describe('库身份：待编码队列按**库**判存活（被淘汰的库不得被当成"已删除"）', () => {
+  it('两个项目库同时打开、其中一个被 LRU 淘汰 → 属于它的条目保留队列，不计 skipped', async () => {
+    const projectA = realStore('project')
+    const projectB = realStore('project')
+    await projectA.put(recordOf('m-a', 'A 项目的记忆', 'project'))
+    await projectB.put(recordOf('m-b', 'B 项目的记忆', 'project'))
+    let sets: readonly StoreSet[] = [storeSetOf('project', projectA), storeSetOf('project', projectB)]
+    const booted = boot(() => sets)
+
+    booted.kernel.emit('memory/written', written('m-a', 'project'))
+    booted.kernel.emit('memory/written', written('m-b', 'project'))
+
+    // A 被淘汰（关掉、从"已打开"里消失），B 还在——这正是 M7 的形状：
+    // 作用域名 'project' 仍被 B 覆盖，按作用域名判会把 A 的那条当成"已删除"出队。
+    sets = [storeSetOf('project', projectB)]
+
+    const evicted = await booted.encoder.encodePending()
+    expect(evicted.encoded).toBe(1) // B 的那条照常编码
+    expect(evicted.skipped).toBe(0) // A 的那条**不许**计成"跳过"
+    expect(booted.encoder.pending()).toBe(1) // 它还在队列里
+    expect(booted.encoder.stats().skipped).toBe(0)
+    const status = booted.status().join('\n')
+    expect(status).toContain('库尚未就绪')
+    expect(status).toContain('待编码 1 条')
+
+    // A 回来（同一个库文件重新打开）→ 那条照常编码，一条都没丢
+    sets = [storeSetOf('project', projectA), storeSetOf('project', projectB)]
+    const back = await booted.encoder.encodePending()
+    expect(back.encoded).toBe(1)
+    expect(booted.encoder.pending()).toBe(0)
+    const stored = await asVectorStore(projectA)!.getEmbeddings(['m-a'])
+    expect(stored.map(v => v.memoryId)).toEqual(['m-a'])
+    booted.dispose()
+    await projectA.close()
+    await projectB.close()
+  })
+
+  it('整批都查不到、但有一个库没打开：只出队**确认过**的那些，其余保留队列', async () => {
+    const projectA = realStore('project')
+    const projectB = realStore('project')
+    await projectA.put(recordOf('m-a', 'A 项目的记忆', 'project'))
+    let sets: readonly StoreSet[] = [storeSetOf('project', projectA), storeSetOf('project', projectB)]
+    const booted = boot(() => sets)
+    booted.kernel.emit('memory/written', written('m-a', 'project'))
+    booted.kernel.emit('memory/written', written('m-已删除', 'project'))
+
+    // A 被淘汰；m-已删除 在**任何打开着的库里**都不存在，但它可能落在 A 里 → 不许出队
+    sets = [storeSetOf('project', projectB)]
+    const outcome = await booted.encoder.encodePending()
+    expect(outcome.skipped).toBe(0)
+    expect(booted.encoder.pending()).toBe(2)
+    expect(outcome.reason).toContain('库尚未就绪')
+    booted.dispose()
+    await projectA.close()
+    await projectB.close()
+  })
+})
+
+
 describe('缺省库套件解析：stores.snapshot()（生产路径，不注入 resolveStoreSets）', () => {
   it('从 stores 服务的 snapshot() 取库并完成编码', async () => {
     const store = realStore()

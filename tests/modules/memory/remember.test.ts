@@ -7,7 +7,14 @@
  */
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { MemoryStore, ToolCallContext, ToolDefinition, ToolOutcome } from '../../../kernel/abi/index.js'
+import type {
+  MemoryRecord,
+  MemoryScope,
+  MemoryStore,
+  ToolCallContext,
+  ToolDefinition,
+  ToolOutcome,
+} from '../../../kernel/abi/index.js'
 import {
   MAX_TEXT_CHARS,
   RECEIPT_ECHO_CHARS,
@@ -311,8 +318,18 @@ function writeFixture(
   const abstained: { reason: string; text: string }[] = []
 
   const deps: MemoryWriteDeps = {
-    resolveStore: async (scope): Promise<MemoryStore | undefined> =>
-      scope === 'user' ? wrapStore(user) : wrapStore(project),
+    /**
+     * 与生产实现（`modules/memory/index.ts` 的 `resolveStore`）**同语义**：
+     * 会话缺失时只解析得用户库（`sessionId === undefined → userOnlySet`）。
+     *
+     * 旧夹具的签名是 `async (scope) => …`——**结构上不可能暴露"跨库丢会话"这个缺陷**（M2）：
+     * 它无论如何都能给出两个库，于是 `resolveStore('project', undefined)`
+     * 在生产里恒为 undefined 这件事在测试里根本不存在。
+     */
+    resolveStore: async (scope: MemoryScope, sessionId?: string): Promise<MemoryStore | undefined> => {
+      if (scope === 'user') return wrapStore(user)
+      return sessionId === undefined ? undefined : wrapStore(project)
+    },
     clock,
     // 会话不再来自 deps：它来自**本次工具调用**的归属（`call.sessionId`），
     // 由 `run()` 传进来（见下面的 `SESSION_CALL`）。夹具也必须按会话取值——
@@ -635,6 +652,42 @@ function readOnlyEdgeStore(inner: SqliteMemoryStore): MemoryStore {
   }) as MemoryStore
 }
 
+/**
+ * 标注写不进去的库：`put` 只在**更新已带取代标注的行**时失败
+ * （模拟 record 表只读 / SQLITE_FULL）。首次插入不受影响——否则连旧条目都写不进去，
+ * 就测不到"查到了但没标上"这一档。
+ */
+function markFailsStore(inner: SqliteMemoryStore): MemoryStore {
+  return new Proxy(inner, {
+    get(target, property, receiver): unknown {
+      if (property === 'put') {
+        return async (record: MemoryRecord): Promise<void> => {
+          if (record.supersededBy !== null) throw new Error('record 表只读：UPDATE 被拒')
+          await target.put(record)
+        }
+      }
+      const value = Reflect.get(target, property, receiver) as unknown
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as MemoryStore
+}
+
+/** 记账 `get(id)` 落在哪个库上——用于断言"两个作用域都真的查过"。 */
+function countingGetStore(inner: SqliteMemoryStore, log: string[]): MemoryStore {
+  return new Proxy(inner, {
+    get(target, property, receiver): unknown {
+      if (property === 'get') {
+        return async (id: string): Promise<MemoryRecord | undefined> => {
+          log.push(`${target.scope}:${id}`)
+          return await target.get(id)
+        }
+      }
+      const value = Reflect.get(target, property, receiver) as unknown
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as MemoryStore
+}
+
 async function edgesOf(store: SqliteMemoryStore, fromId: string): Promise<readonly string[]> {
   const walk = await store.walkGraph({ fromId, depth: 1, types: ['supersedes'] })
   return walk.edges.map(edge => `${edge.fromId}->${edge.toId}:${edge.type}`)
@@ -668,8 +721,9 @@ describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
     await fixture.close()
   })
 
-  it('目标不存在：新条目照写，回执如实写"未找到"，绝不抛', async () => {
-    const fixture = writeFixture()
+  it('目标不存在：**两个作用域都查过**才报"未找到"，新条目照写，绝不抛', async () => {
+    const looked: string[] = []
+    const fixture = writeFixture({}, store => countingGetStore(store, looked))
     const outcome = await run(fixture.tool, {
       text: '更正（见 src/config/server.ts）：端口实测是 9090。',
       kind: 'semantic',
@@ -677,7 +731,33 @@ describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
     })
     expect(outcome.kind).toBe('text')
     expect(outcome.text).toContain('推翻标注：未找到 1 条：mem_不存在_1')
+    // 判据：missing 只在两个作用域都真的查过之后才允许出现（文本的承诺必须与行为一致）
+    expect(looked).toContain('user:mem_不存在_1')
+    expect(looked).toContain('project:mem_不存在_1')
     expect((await fixture.user.stats()).rows).toBe(1) // 新条目仍然写进去了
+    await fixture.close()
+  })
+
+  it('没查全就不许说"未找到"：没有会话归属时项目库打不开，回执只能说"无法确认"', async () => {
+    const fixture = writeFixture()
+    const outcome = await run(
+      fixture.tool,
+      {
+        text: '更正（见 src/config/server.ts）：端口实测不是 8080。',
+        kind: 'semantic',
+        sourceRef: 'file:docs/x.md#L1',
+        supersedes: ['mem_可能在项目库_1'],
+      },
+      UNKNOWN_CALL,
+    )
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('无法确认 1 条')
+    expect(outcome.text).not.toContain('未找到')
+    expect(outcome.text).toContain('项目库尚未打开')
+    // 不许对"它现在是否仍会被注入"做任何方向的断言
+    expect(outcome.text).not.toContain('仍会作为有效结论注入召回')
+    expect(outcome.text).not.toContain('已不再作为有效结论注入召回')
+    expect((await fixture.user.stats()).rows).toBe(1) // 新条目照写
     await fixture.close()
   })
 
@@ -708,7 +788,7 @@ describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
     await fixture.close()
   })
 
-  it('建边失败：旧条目已标注但回执**明说未完成**（不把没做成说成做成了）', async () => {
+  it('建边失败：标注**其实成功了**，回执就必须说"已不再注入、只缺那一跳"，不许说"没有被标为已推翻"', async () => {
     const fixture = writeFixture({}, readOnlyEdgeStore)
     await run(fixture.tool, { text: '旧的端口结论是 8080。', kind: 'semantic', userAsserted: true })
     const old = await onlyRecord(fixture.user, '8080')
@@ -719,11 +799,39 @@ describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
       supersedes: [old?.id ?? ''],
     })
     expect(outcome.kind).toBe('text')
-    expect(outcome.text).toContain('推翻标注**未完成** 1 条')
-    expect(outcome.text).toContain('edge 表只读')
-    expect(outcome.text).toContain('新条目已写入')
+    // 库里的事实：validTo/supersededBy 已经写上 → 它不会再被注入
     const marked = await fixture.user.get(old?.id ?? '')
     expect(marked?.supersededBy).not.toBeNull() // 记录标注其实成功了，只有边失败
+
+    // 回执对"现在是否仍会被注入"的断言必须与上面那个实际值一致
+    expect(outcome.text).not.toContain('没有被标为已推翻')
+    expect(outcome.text).not.toContain('仍会作为有效结论注入召回')
+    expect(outcome.text).toContain('已不再作为有效结论注入召回')
+    expect(outcome.text).toContain('supersedes 边未建成')
+    expect(outcome.text).toContain('新条目已写入')
+    expect(outcome.text).toContain('edge 表只读')
+    await fixture.close()
+  })
+
+  it('标注失败（put 抛错）：回执明说"仍会作为有效结论注入"，与库里的 null 一致', async () => {
+    const fixture = writeFixture({}, markFailsStore)
+    await run(fixture.tool, { text: '旧的端口结论是 8080。', kind: 'semantic', userAsserted: true })
+    const old = await onlyRecord(fixture.user, '8080')
+
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测不是 8080。',
+      kind: 'semantic',
+      supersedes: [old?.id ?? ''],
+    })
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('推翻标注**未完成** 1 条')
+    expect(outcome.text).toContain('仍会作为有效结论注入召回')
+    expect(outcome.text).toContain('record 表只读')
+
+    // 库里的事实与回执一致：没标上
+    const marked = await fixture.user.get(old?.id ?? '')
+    expect(marked?.supersededBy).toBeNull()
+    expect(marked?.validTo).toBeNull()
     await fixture.close()
   })
 
@@ -746,6 +854,39 @@ describe('omb_remember：supersedes 推翻标注（非破坏性）', () => {
     // 边要落在**两个库**：从旧条目所在的用户库能找到，从新条目所在的项目库也能找到
     expect(await edgesOf(fixture.user, old?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
     expect(await edgesOf(fixture.project, fresh?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
+    await fixture.close()
+  })
+
+  it('跨库取代（**反方向**）：新条目落用户库、旧结论在项目库 —— 会话贯通后旧条目照样被标掉', async () => {
+    // 这个方向在生产里曾经**永远报 missing**：findSupersedeTarget 调
+    // `resolveStore('project', undefined)` → userOnlySet → 恒 undefined，
+    // 旧条目根本没被查过就被判"不存在"，库里 validTo/supersededBy 一个字没改，
+    // 于是被推翻的结论继续作为有效结论注入召回（M2）。
+    const fixture = writeFixture()
+    // 旧结论是 episodic → 按 SCOPE_BY_KIND 落**项目库**
+    await run(fixture.tool, { text: '实测结论：本地端口固定 8080。', kind: 'episodic', userAsserted: true })
+    const old = await onlyRecord(fixture.project, '8080')
+    expect(old?.scope).toBe('project')
+    expect(old?.supersededBy).toBeNull()
+
+    // 更正落**用户库**（semantic）→ 目标在另一个库
+    const outcome = await run(fixture.tool, {
+      text: '更正（见 src/config/server.ts）：端口实测不是 8080，而是 9090。',
+      kind: 'semantic',
+      supersedes: [old?.id ?? ''],
+    })
+    expect(outcome.kind).toBe('text')
+    expect(outcome.text).toContain('落库=用户库')
+    expect(outcome.text).not.toContain('未找到')
+    expect(outcome.text).not.toContain('无法确认')
+    expect(outcome.text).toContain('推翻标注：1 条旧记忆已标为"被本条取代"')
+
+    const fresh = await onlyRecord(fixture.user, '9090')
+    const marked = await fixture.project.get(old?.id ?? '')
+    expect(marked?.supersededBy).toBe(fresh?.id)
+    expect(marked?.validTo).not.toBeNull()
+    expect(marked?.text).toBe(old?.text) // 非破坏性：正文一字未改
+    expect(await edgesOf(fixture.project, old?.id ?? '')).toEqual([`${fresh?.id}->${old?.id}:supersedes`])
     await fixture.close()
   })
 

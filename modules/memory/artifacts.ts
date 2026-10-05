@@ -24,6 +24,10 @@
  * 不是 git 仓库、或 git 不可执行时返回 `undefined`（=核验不了）。
  * 调用方对 `undefined` 按**保守**处理：不算依据。宁可让用户补一个可核验的引用，
  * 也不要收下一条引用不存在工件的事实。
+ *
+ * **降级本身也是读数**：负结果（核验不了）与正结果一样进缓存，窗口内只 spawn 一次；
+ * 原因经 `artifactVerificationDegradeReason()` 暴露给健康面——否则宿主每写一条
+ * 含文件名的记忆就静默卡一次，而状态面只会说"这条不算依据"。
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
@@ -40,26 +44,69 @@ const GIT_TIMEOUT_MS = 4_000
  * 核验只是"文件在不在"的判断，用"最近 N 次核验内复用"就够了，
  * 不需要精确的秒级 TTL。
  */
-const INDEX_REUSE_WINDOW = 64
+export const INDEX_REUSE_WINDOW = 64
+
+/** 空的索引：表示"这个 cwd 核验不了"（见 `IndexCache.unavailable`）。 */
+const EMPTY_INDEX: ReadonlySet<string> = new Set()
 
 interface IndexCache {
   readonly files: ReadonlySet<string>
   /** 上次构建索引时的核验序号。 */
   readonly at: number
+  /**
+   * `null` = 索引可用；非 null = 这个 cwd **核验不了**，值是原因。
+   *
+   * 为什么负结果也要缓存：非 git 工作目录（或 git 不在 PATH）下 `git ls-files`
+   * 每次都会失败——不缓存就变成"每写一条含文件名的记忆，同步 spawn 一次子进程并等它失败"
+   * （Windows 每次进程创建几十毫秒，最坏撞 4 秒超时，期间整个宿主进程停住）。
+   */
+  readonly unavailable: string | null
 }
 
 const caches = new Map<string, IndexCache>()
 let verificationCount = 0
 
+/**
+ * 最近一次核验为什么"核验不了"（`null` = 最近一次拿到了可用索引）。
+ *
+ * 降级必须可见（硬不变量）：失败被吞成 `undefined` 之后，状态面上只剩
+ * "这条不算依据"这一个后果，没人知道是**核验不了**还是**文件不存在**。
+ */
+let lastUnavailableReason: string | null = null
+
+/** 供健康面读取的只读访问器（模块层不导出可变状态）。 */
+export function artifactVerificationDegradeReason(): string | null {
+  return lastUnavailableReason
+}
+
 /** 测试用：清掉缓存，避免上一个用例的索引影响下一个。 */
 export function clearArtifactIndexCache(): void {
   caches.clear()
   verificationCount = 0
+  lastUnavailableReason = null
+}
+
+/** 把 `execFileSync` 的失败翻译成可读原因（降级必须给原因，不能只是一片沉默）。 */
+function unavailableReasonOf(error: unknown): string {
+  const failure = error as { code?: unknown; status?: unknown; signal?: unknown; message?: unknown } | null
+  const code = typeof failure?.code === 'string' ? failure.code : undefined
+  if (code === 'ENOENT') return 'git 不可执行（PATH 里找不到 git）'
+  if (code === 'ETIMEDOUT' || failure?.signal === 'SIGTERM') return `git ls-files 超时（>${GIT_TIMEOUT_MS}ms）`
+  const status = typeof failure?.status === 'number' ? failure.status : undefined
+  const message = typeof failure?.message === 'string' ? failure.message : String(error)
+  if (status === undefined) return `git ls-files 失败：${message}`
+  if (status === 128) return '不是 git 仓库（git ls-files 退出码 128）'
+  return `git ls-files 退出码 ${status}：${message}`
 }
 
 function indexOf(cwd: string, tick: number): ReadonlySet<string> | undefined {
   const cached = caches.get(cwd)
-  if (cached !== undefined && tick - cached.at < INDEX_REUSE_WINDOW) return cached.files
+  if (cached !== undefined && tick - cached.at < INDEX_REUSE_WINDOW) {
+    lastUnavailableReason = cached.unavailable
+    // 负结果复用：窗口内**一次都不再 spawn**（这正是"卡一下"消失的地方）
+    return cached.unavailable === null ? cached.files : undefined
+  }
+  let files: ReadonlySet<string>
   try {
     const out = execFileSync('git', ['ls-files'], {
       cwd,
@@ -67,14 +114,24 @@ function indexOf(cwd: string, tick: number): ReadonlySet<string> | undefined {
       timeout: GIT_TIMEOUT_MS,
       stdio: ['ignore', 'pipe', 'ignore'],
     })
-    const files = new Set(out.split('\n').map(line => line.trim()).filter(line => line.length > 0))
-    if (files.size === 0) return undefined
-    caches.set(cwd, { files, at: tick })
-    return files
-  } catch {
-    // 不是 git 仓库 / git 不在 / 超时：一律"核验不了"
+    files = new Set(out.split('\n').map(line => line.trim()).filter(line => line.length > 0))
+  } catch (error) {
+    // 不是 git 仓库 / git 不在 / 超时：一律"核验不了"，**但记住这个结论与原因**
+    const reason = unavailableReasonOf(error)
+    caches.set(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
+    lastUnavailableReason = reason
     return undefined
   }
+  if (files.size === 0) {
+    // 空索引（仓库里没有受管文件，或输出为空）：同样核验不了 —— 也缓存
+    const reason = 'git 索引为空（该目录下没有受管文件）'
+    caches.set(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
+    lastUnavailableReason = reason
+    return undefined
+  }
+  caches.set(cwd, { files, at: tick, unavailable: null })
+  lastUnavailableReason = null
+  return files
 }
 
 /**
