@@ -84,7 +84,16 @@ export interface NotifyService {
     urgency?: NotifyUrgency,
     click?: NotifyClick,
   ): boolean
-  status(): { readonly available: boolean; readonly detail: string; readonly sent: number; readonly suppressed: number }
+  status(): {
+    readonly available: boolean
+    readonly detail: string
+    readonly sent: number
+    readonly suppressed: number
+    /** 分会话去重表的会话数与 LRU 口径（见 `bridge.ts` 的 `NOTIFY_SESSION_TABLE_MAX`）。 */
+    readonly sessions: number
+    readonly sessionTableMax: number
+    readonly sessionsEvicted: number
+  }
 }
 
 export function createNotifyModule(): ModuleRegistration<NotifyConfig> {
@@ -111,7 +120,14 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
     return {
       state: 'ok',
       detail: status.detail,
-      metrics: { available: status.available ? 1 : 0, sent: status.sent, suppressed: status.suppressed },
+      metrics: {
+        available: status.available ? 1 : 0,
+        sent: status.sent,
+        suppressed: status.suppressed,
+        // 分会话去重表的规模（有 LRU 上界）：让"会不会无界增长"可核对
+        sessions: status.sessions,
+        sessionsEvicted: status.sessionsEvicted,
+      },
     }
   }
 
@@ -147,6 +163,9 @@ let config: NotifyConfig = NOTIFY_DEFAULT_CONFIG
             detail: status.detail,
             sent: status.sent,
             suppressed: status.suppressed,
+            sessions: status.sessions,
+            sessionTableMax: status.sessionTableMax,
+            sessionsEvicted: status.sessionsEvicted,
           }
         },
       }

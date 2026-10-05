@@ -217,6 +217,62 @@ describe('buildStatusPanel：分会话台账（归属与塑形一起给）', () 
   })
 })
 
+/**
+ * S3-a / S3-d / S3-f 的状态面判据。
+ *
+ * - S3-a：头条分子与杀死判据同口径，且**自报口径**；
+ * - S3-d：注入裁决零消费者必须在状态面上说出来（否则"最多推 1 条"是空头承诺）；
+ * - S3-f：分会话台账的**截断口径**（未列出 vs 已淘汰）必须写出来。
+ */
+describe('buildStatusPanel：口径 / 无调用方 / 截断（S3-a、S3-d、S3-f）', () => {
+  it('头条口径自报：分子只算拉取式视图，非视图工具的调用只进明细', () => {
+    const panel = buildStatusPanel({ pulls: pullsAfter({ read: 27, omb_recall: 1 }, 22) })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain(`口径：只计 ${VIEW_TOOLS.length} 个拉取式视图的调用`)
+    expect(text).toContain('read/pwsh 等非视图工具')
+    // 机器可读面同口径：totalPulls 修复前是 28
+    expect(panel.metrics.totalPulls).toBe(1)
+    expect(panel.metrics.pullScopedToViews).toBe(1)
+    expect(panel.metrics.pullCountedViews).toBe(VIEW_TOOLS.length)
+  })
+
+  it('注入裁决无调用方：档位行为那一行自己就写明（不是另起一行糊过去）', () => {
+    const text = renderStatusPanel(buildStatusPanel({ pressure: pressure(), behavior: behaviorFor('moderate') }))
+    const behaviorLine = text.split('\n').find(line => line.startsWith('档位行为：')) ?? ''
+    expect(behaviorLine).toContain('最多推 1 条')
+    expect(behaviorLine).toContain('无调用方')
+    expect(behaviorLine).toContain('不是正在发生的行为')
+  })
+
+  it('分会话截断口径：未列出与已淘汰分开说，机器可读面同步', () => {
+    const panel = buildStatusPanel({
+      sessions: [
+        { session: 'A', pulls: pullsAfter({ omb_recall: 1 }, 1, 'A') },
+        { session: 'B', pulls: pullsAfter({ omb_recall: 1 }, 1, 'B') },
+      ],
+      sessionsScope: { listed: 2, hidden: 24, evicted: 8, tableMax: 32 },
+    })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('截断口径')
+    expect(text).toContain('另有 24 个未列出')
+    expect(text).toContain('已淘汰 8 个')
+    expect(text).toContain('最多 32 个')
+    expect(panel.metrics.sessionsListed).toBe(2)
+    expect(panel.metrics.sessionsHidden).toBe(24)
+    expect(panel.metrics.sessionsEvicted).toBe(8)
+  })
+
+  it('没有被截断 → 不写截断说明（不制造噪音）', () => {
+    const panel = buildStatusPanel({
+      sessions: [{ session: 'A', pulls: pullsAfter({ omb_recall: 1 }, 1, 'A') }],
+      sessionsScope: { listed: 1, hidden: 0, evicted: 0, tableMax: 32 },
+    })
+    const text = renderStatusPanel(panel)
+    expect(text).toContain('- A：')
+    expect(text).not.toContain('截断口径')
+  })
+})
+
 describe('buildStatusPanel：预算与健壮性', () => {
   it('预算面与 metrics 都是数字', () => {
     const panel = buildStatusPanel({ budgets: { calls: { used: 3, limit: 10 } } })

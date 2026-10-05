@@ -523,3 +523,93 @@ describe('状态面段落与热插拔', () => {
     expect(health.detail).toContain('已卸载')
   })
 })
+
+/**
+ * S3-d：**注入裁决零消费者**必须如实标注。
+ *
+ * 现状（全仓 grep 收口）：`SERVICES.contextPressure` 零生产消费者；
+ * `SERVICES.contextMetrics` 的生产消费者只有 `dsh/session.ts` 的 `recordPull`；
+ * `select`/`marginalValue`/`measuredCost`/`announcePressure` 都没有调用方。
+ * 不标注，"行为 single-best（最多推 1 条）"就是在承诺一件不发生的事。
+ */
+describe('注入裁决零消费者：如实标注（S3-d）', () => {
+  it('模块行明写「注入裁决：当前无调用方（仅拉取计数在线）」', () => {
+    const { handle } = start({ fillRatio: 0.45 })
+    const detail = handle.health()[MODULE_ID]?.detail ?? ''
+    expect(detail).toContain('注入裁决：当前无调用方（仅拉取计数在线）')
+    // 档位行为仍在同一行（"接上后会怎样"），但读者不会被误导成"正在推"。
+    // 这里是无会话口径（模块不挑"当前会话"）→ relaxed / none。
+    expect(detail).toContain('行为 none（最多推 0 条）')
+    handle.dispose()
+  })
+
+  it('状态面：pushLimit > 0 的档位描述与"无调用方"同屏', () => {
+    const { handle } = start({ fillRatio: 0.45 })
+    // 分会话行按**该会话**的压力给档位后果（无会话口径永远是 relaxed）
+    handle.kernel.emit('turn/start', { sessionId: 's', turn: 1 })
+    const text = handle.status().join('\n')
+    expect(text).toContain('压力 moderate（最多推 1 条）')
+    expect(text).toContain('无调用方')
+    handle.dispose()
+  })
+})
+
+/**
+ * S3-f：分会话表**只增不减**是本片按内存泄漏处理的一条。
+ *
+ * 宿主不给模块发会话结束事件，因此本轮做**自包含的有界化**：
+ * 三张表（ledgers / sessionTurns / sessionPressure）共用一条 LRU 顺序，
+ * 上界 `SESSION_TABLE_MAX = 32`；面板只列最近 8 个并写明截断口径。
+ */
+describe('分会话表 LRU 上界（S3-f）', () => {
+  const emitTurns = (handle: ReturnType<typeof createKernel>, ids: readonly string[], turn = 1): void => {
+    for (const id of ids) handle.kernel.emit('turn/start', { sessionId: id, turn })
+  }
+
+  it('超过上界后按最久未活动淘汰，模块行报出"已淘汰 N 个更早的会话"', () => {
+    const { handle } = start()
+    const ids = Array.from({ length: 40 }, (_, index) => `s${String(index + 1).padStart(2, '0')}`)
+    emitTurns(handle, ids)
+
+    const detail = handle.health()[MODULE_ID]?.detail ?? ''
+    expect(detail).toContain('分会话计 32 个会话')
+    expect(detail).toContain('已淘汰 8 个更早的会话')
+    // 被淘汰的会话再被查询时表现为"未测量"（不假装还记得）
+    expect(metricsOf(handle).snapshot('s01').turns).toBe(0)
+    expect(metricsOf(handle).snapshot('s40').turns).toBe(1)
+    handle.dispose()
+  })
+
+  it('淘汰的是最久未活动而不是最早插入：刚用过的老会话不被新会话挤掉', () => {
+    const { handle } = start()
+    // 填满 32 个（s1..s32）
+    emitTurns(handle, Array.from({ length: 32 }, (_, index) => `s${index + 1}`))
+    // 老会话 s1 再活动一次 → 它变成"最近活动"
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 2 })
+    // 新会话进来：该被淘汰的是现在最久未活动的 s2，而不是 s1
+    emitTurns(handle, ['s33'])
+
+    const metrics = metricsOf(handle)
+    expect(metrics.snapshot('s1').turns).toBe(2)
+    expect(metrics.snapshot('s33').turns).toBe(1)
+    expect(metrics.snapshot('s2').turns).toBe(0)
+    expect(handle.health()[MODULE_ID]?.detail).toContain('已淘汰 1 个更早的会话')
+    handle.dispose()
+  })
+
+  it('状态面只列最近 8 个会话，并写出"另有 M 个未列出 / 已淘汰 N 个"', () => {
+    const { handle } = start()
+    emitTurns(handle, Array.from({ length: 40 }, (_, index) => `s${String(index + 1).padStart(2, '0')}`))
+
+    const text = handle.status().join('\n')
+    const rows = text.split('\n').filter(line => /^ {2}- .+拉取/.test(line))
+    expect(rows).toHaveLength(8)
+    expect(text).toContain('截断口径')
+    expect(text).toContain('另有 24 个未列出')
+    expect(text).toContain('已淘汰 8 个')
+    // 最近活动的 s40 在列；已被淘汰的 s01 不在列
+    expect(text).toContain('- s40：')
+    expect(text).not.toContain('- s01：')
+    handle.dispose()
+  })
+})

@@ -94,6 +94,22 @@ describe('behaviorFor：档位是行为切换，不是丢弃', () => {
   it('未知档位回落宽松（不抛、不猜）', () => {
     expect(behaviorFor('bogus' as never).band).toBe('relaxed')
   })
+
+  /**
+   * S3-d：`announcePressure` 与"按边际价值推一条"都**没有生产消费者**。
+   *
+   * 字段保留（设计意图有价值），但文案必须把"当前无调用方"说出来——
+   * 否则状态面/文档里的档位描述就是在承诺一件不发生的事。
+   */
+  it('无调用方的路径在文案里点名（select / announcePressure 尚未接线）', () => {
+    expect(behaviorFor('moderate').detail).toContain('当前无调用方')
+    expect(behaviorFor('moderate').detail).toContain('select')
+    expect(behaviorFor('tight').detail).toContain('当前无调用方')
+    expect(behaviorFor('tight').detail).toContain('announcePressure')
+    // 字段本身不变（设计意图保留）：接线之后删文案即可，不用改行为表
+    expect(behaviorFor('tight').announcePressure).toBe(true)
+    expect(behaviorFor('moderate').pushLimit).toBe(1)
+  })
 })
 
 describe('normalizeBands / bandsFromPair', () => {

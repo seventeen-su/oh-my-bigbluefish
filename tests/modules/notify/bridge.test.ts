@@ -13,6 +13,7 @@ import {
   DEFAULT_NOTIFY_SESSION,
   isDesktopNotifyLike,
   NOTIFY_SESSION_LIMIT,
+  NOTIFY_SESSION_TABLE_MAX,
   NOTIFY_THROTTLE_MS,
   NotifyBridge,
 } from '../../../modules/notify/bridge.js'
@@ -263,5 +264,85 @@ describe('零改码自动接上', () => {
       logger: logger(),
     })
     expect(bridge.status().available).toBe(true)
+  })
+})
+
+/**
+ * S3-f：`#sentContent` / `#sentPerSession` 只增不减是本片按内存泄漏处理的一条。
+ *
+ * 修复前：这两张表只在 `resetSession()` 里清，而它的全仓调用方只有测试
+ * （宿主不给模块发会话结束事件）→ 长跑宿主上随历史会话数单调增长。
+ * 现在按 **LRU 上界 32** 淘汰，且淘汰的是**最久未活动**的会话。
+ */
+describe('分会话去重表：LRU 上界（S3-f）', () => {
+  const bridgeWith = (time: { now(): number; advance(ms: number): void }, sent: string[]): NotifyBridge =>
+    new NotifyBridge({
+      notify: { push: (payload: { title: string }) => { sent.push(payload.title) } },
+      clock: time,
+      logger: logger(),
+    })
+
+  it('超过 32 个会话后按最久未活动淘汰；最近会话的去重记忆保留', () => {
+    const time = clock()
+    const sent: string[] = []
+    const bridge = bridgeWith(time, sent)
+    for (let index = 1; index <= 40; index += 1) {
+      expect(bridge.push(`kind-${index}`, `消息 ${index}`, undefined, `session-${index}`)).toBe(true)
+    }
+
+    const status = bridge.status()
+    expect(status.sessions).toBe(NOTIFY_SESSION_TABLE_MAX)
+    expect(status.sessionsEvicted).toBe(40 - NOTIFY_SESSION_TABLE_MAX)
+    expect(status.detail).toContain('LRU 上界')
+    expect(status.detail).toContain('已淘汰 8 个更早的会话')
+
+    // 越过同 kind 节流窗口（否则"发送"会被节流挡住，测不出内容去重的差别）
+    time.advance(NOTIFY_THROTTLE_MS * 2)
+    // 被淘汰的 session-1：去重记忆不再保留 → 同 kind 同内容可以再发
+    expect(bridge.push('kind-1', '消息 1', undefined, 'session-1')).toBe(true)
+    // 最近活动过的 session-40：去重记忆仍在 → 同 kind 同内容被拒
+    expect(bridge.push('kind-40', '消息 40', undefined, 'session-40')).toBe(false)
+    expect(bridge.status().lastReason).toContain('内容重复')
+  })
+
+  it('淘汰的是最久未活动而不是最早插入：老会话再活动一次就不会被新会话挤掉', () => {
+    const time = clock()
+    const sent: string[] = []
+    const bridge = bridgeWith(time, sent)
+    for (let index = 1; index <= NOTIFY_SESSION_TABLE_MAX; index += 1) {
+      bridge.push(`k-${index}`, `t-${index}`, undefined, `s-${index}`)
+    }
+    // s-1 再活动一次（它是最早插入的，但现在是最近活动过的之一）
+    bridge.push('k-revive', 't-revive', undefined, 's-1')
+    // 新会话进来 → 该被淘汰的是现在最久未活动的 s-2
+    bridge.push('k-new', 't-new', undefined, 's-new')
+    expect(bridge.status().sessions).toBe(NOTIFY_SESSION_TABLE_MAX)
+    expect(bridge.status().sessionsEvicted).toBe(1)
+
+    time.advance(NOTIFY_THROTTLE_MS * 2)
+    expect(bridge.push('k-1', 't-1', undefined, 's-1')).toBe(false) // s-1 记忆还在
+    expect(bridge.push('k-2', 't-2', undefined, 's-2')).toBe(true) // s-2 记忆已淘汰
+  })
+
+  it('resetSession 同时释放 LRU 名额（不留幽灵会话占位）', () => {
+    const time = clock()
+    const sent: string[] = []
+    const bridge = bridgeWith(time, sent)
+    for (let index = 1; index <= NOTIFY_SESSION_TABLE_MAX; index += 1) {
+      bridge.push(`k-${index}`, `t-${index}`, undefined, `s-${index}`)
+    }
+    bridge.resetSession('s-1')
+    bridge.push('k-extra', 't-extra', undefined, 's-extra')
+    const status = bridge.status()
+    expect(status.sessions).toBe(NOTIFY_SESSION_TABLE_MAX)
+    expect(status.sessionsEvicted).toBe(0) // 释放了名额，因此没有淘汰发生
+  })
+
+  it('从未推送过任何会话时，表口径不出现（0/32 不写进 detail，但字段可读）', () => {
+    const bridge = new NotifyBridge({ notify: undefined, clock: clock(), logger: logger() })
+    const status = bridge.status()
+    expect(status.sessions).toBe(0)
+    expect(status.sessionsEvicted).toBe(0)
+    expect(status.detail).not.toContain('LRU 上界')
   })
 })
