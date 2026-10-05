@@ -7,7 +7,9 @@
  * ③ 一条 `record` 的单一入口（不从事件推导）
  */
 import { describe, expect, it } from 'vitest'
+import type { Logger } from '../../../kernel/abi/index.js'
 import { ARTIFACT_TOP_MAX, ArtifactIndex, clampTopLimit, isArtifactKind } from '../../../modules/artifact/index.js'
+import type { ArtifactPrivacyPort } from '../../../modules/artifact/index.js'
 
 describe('record：同路径 upsert', () => {
   it('同路径不产生重复条目，且更新 at/hash', () => {
@@ -135,5 +137,87 @@ describe('单一入口：没有事件推导', () => {
     index.clear()
     expect(index.size()).toBe(0)
     expect(index.topFor()).toEqual([])
+  })
+})
+
+/**
+ * S3-c：**写入被隐私闸门拒绝时必须留声**。
+ *
+ * 修复前的形态（审计 C3）：`record` 抛可读错误 → `dsh/hooks.ts` 的订阅回调吞掉
+ * → 索引静默停更，`omb_files` 与状态面却都写"本会话还没有观察到任何制品"
+ * （错误暗示），唯一线索在另一个模块（privacy）的计数里。
+ *
+ * 现在索引自己记住：拒绝**次数** + **最近原因**。`0` 与 `null` 是真实读数
+ * （本实例从构造起一直在数），不是"未测量"。
+ */
+describe('写入被拒：留声（S3-c）', () => {
+  /** 隐私替身：只实现判定面（结构契约），`deny` 里的会话禁写，其余放行。 */
+  const privacyDenying = (deny: readonly string[]): ArtifactPrivacyPort => ({
+    decide: sessionId =>
+      deny.includes(sessionId)
+        ? { allowRead: false, allowWrite: false, readReason: `${sessionId} 已 sealed：禁止读取`, writeReason: `${sessionId} 已 sealed：禁止写入` }
+        : { allowRead: true, allowWrite: true, readReason: '', writeReason: '' },
+    decideUnattributed: () => ({
+      allowRead: true,
+      allowWrite: false,
+      readReason: '',
+      writeReason: '归属未知且存在受限会话：禁止写入',
+    }),
+    restricted: () => true,
+  })
+
+  const capturingLogger = (): { logger: Logger; warns: string[] } => {
+    const warns: string[] = []
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (message: string) => {
+        warns.push(message)
+      },
+    }
+    return { logger, warns }
+  }
+
+  it('拒绝时抛可读错误、计数递增、最近原因可读；放行的会话照常写入（反向断言）', () => {
+    const { logger, warns } = capturingLogger()
+    const index = new ArtifactIndex({ privacy: () => privacyDenying(['s1']), logger })
+    expect(index.writeRejection()).toEqual({ count: 0, lastReason: null })
+
+    expect(() => index.record({ path: 'src/a.ts', kind: 'file', at: 1 }, 's1')).toThrow(/sealed/)
+    expect(index.size()).toBe(0)
+    expect(index.rejectedWrites()).toBe(1)
+    expect(index.lastWriteRejection()).toContain('禁止写入')
+
+    // 归属未知（拿不到会话）同样按最严处理，并留声
+    expect(() => index.record({ path: 'src/b.ts', kind: 'file', at: 2 })).toThrow(/归属未知/)
+    expect(index.rejectedWrites()).toBe(2)
+    expect(index.lastWriteRejection()).toContain('归属未知')
+
+    // **第一次拒绝必须写日志**（否则这个降级最初就是静默的）；
+    // 同类失败随后只计数，不逐条刷屏（否则每次工具调用都 warn）
+    expect(warns).toHaveLength(1)
+    expect(warns[0]).toContain('写入被隐私闸门拒绝')
+
+    // 反向断言：放行的会话说写就写，拒绝计数不变
+    expect(index.record({ path: 'src/c.ts', kind: 'file', at: 3 }, 's2')?.path).toBe('src/c.ts')
+    expect(index.size()).toBe(1)
+    expect(index.rejectedWrites()).toBe(2)
+  })
+
+  it('clear 清条目但**不清拒绝计数**（拒绝是"发生过什么"，不是"现在有什么"）', () => {
+    const index = new ArtifactIndex({ privacy: () => privacyDenying(['s1']) })
+    expect(() => index.record({ path: 'a', at: 1 }, 's1')).toThrow()
+    index.clear()
+    expect(index.size()).toBe(0)
+    expect(index.rejectedWrites()).toBe(1)
+    expect(index.lastWriteRejection()).not.toBeNull()
+  })
+
+  it('没有隐私端口 = 不受限：拒绝计数恒为 0，且不写任何日志', () => {
+    const { logger, warns } = capturingLogger()
+    const index = new ArtifactIndex({ logger })
+    index.record({ path: 'a', kind: 'file', at: 1 }, 'anything')
+    expect(index.writeRejection()).toEqual({ count: 0, lastReason: null })
+    expect(warns).toEqual([])
   })
 })

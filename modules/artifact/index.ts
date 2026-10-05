@@ -89,6 +89,25 @@ export const ARTIFACT_UNATTRIBUTED_READ_DENIED =
   '无法确定本次调用的会话归属（宿主未提供 agent），因此无法证明它不属于受限会话：'
   + '按最严处理，拒绝读取制品索引（阅读痕迹同样属于隐私）。'
 
+/**
+ * 「写入被拒绝」的**留声**：一次拒绝必须留下可读痕迹，否则就是静默失效。
+ *
+ * 背景（审计 C3 + Lead 的复核）：`ArtifactIndex.record()` 在隐私闸门禁止写入时
+ * 抛可读错误，而 `dsh/hooks.ts` 的订阅回调把异常吞掉 → 用户把任何一个会话设为
+ * sealed 之后，**所有会话**的制品索引静默停更，`omb_files` 永远回答
+ * "本会话还没有观察到任何制品"——**这是错误暗示**（真因是写入被拒），
+ * 而当时唯一的线索在另一个模块（privacy）的计数里。
+ *
+ * 因此索引自己记住：拒绝**次数**（累计）、**最近一次原因**（可读）。
+ * 两者都进 `module.ts` 的状态面与 `omb_files` 的空结果文案。
+ */
+export interface ArtifactWriteRejection {
+  /** 本实例启动以来的拒绝次数（**0 = 真的没被拒过**，不是"未测量"）。 */
+  readonly count: number
+  /** 最近一次拒绝原因；从未被拒为 `null`（**null ≠ 空串**）。 */
+  readonly lastReason: string | null
+}
+
 /** 匹配用路径：小写 + 统一分隔符（Windows 反斜杠）。展示仍用原路径。 */
 function matchPath(path: string): string {
   return path.replace(/\\/g, '/').toLowerCase()
@@ -146,6 +165,9 @@ export class ArtifactIndex {
   readonly #maxEntries: number
   readonly #logger: Logger | undefined
   readonly #privacy: (() => ArtifactPrivacyPort | undefined) | undefined
+  /** 写入被隐私闸门拒绝的次数（见 {@link ArtifactWriteRejection}）。 */
+  #rejectedWrites = 0
+  #lastWriteRejection: string | null = null
 
   constructor(deps: ArtifactIndexDeps = {}) {
     this.#maxEntries = Math.max(1, Math.trunc(deps.maxEntries ?? ARTIFACT_DEFAULT_MAX))
@@ -186,8 +208,14 @@ export class ArtifactIndex {
 
   /**
    * 记录/更新一条制品。同路径 upsert（不产生重复条目）。
+   *
+   * `kind` 由**调用方**给出（`dsh/hooks.ts` 按工具名映射：read/write/edit/read_image
+   * → `'file'`，glob/grep → `'dir'`；白名单之外的调用方拿不到类型，落回 `'unknown'`）。
+   * 模块侧看不到工具名，因此**不做映射**，只保证给出的合法值被原样保留。
+   *
    * @returns 写入的条目；路径为空时返回 undefined（不臆造条目）
-   * @throws 隐私模式禁止写入时抛**可读**错误（调用方如实上报，见 `dsh/hooks.ts` 的隔离）
+   * @throws 隐私模式禁止写入时抛**可读**错误（调用方如实上报，见 `dsh/hooks.ts` 的隔离）；
+   *   每次拒绝都会在 {@link rejectedWrites} / {@link lastWriteRejection} 留声
    */
   record(
     input: {
@@ -199,7 +227,20 @@ export class ArtifactIndex {
     sessionId?: string,
   ): ArtifactEntry | undefined {
     const denial = this.#writeDenial(sessionId)
-    if (denial !== null) throw new Error(denial)
+    if (denial !== null) {
+      this.#rejectedWrites += 1
+      this.#lastWriteRejection = denial
+      // **只在第一次拒绝时写日志**：每次工具调用都拒的时候逐条 warn 会淹没日志，
+      // 而"留声"的目的已经由计数 + 最近原因 + 状态面达成（`dsh/hooks.ts` 另有
+      // 同类失败只报一次的 warn）。第一次必须说，否则这个降级最初就是静默的。
+      if (this.#rejectedWrites === 1) {
+        this.#logger?.warn(
+          `制品索引：写入被隐私闸门拒绝（本次不记录，索引因此停更）——${denial}；`
+          + '后续同类拒绝只累计计数（见 omb_status 的制品索引段与 omb-files 的空结果文案）',
+        )
+      }
+      throw new Error(denial)
+    }
     const path = input.path.trim()
     if (path.length === 0) return undefined
     const previous = this.#index.get(path)
@@ -266,6 +307,26 @@ export class ArtifactIndex {
 
   maxEntries(): number {
     return this.#maxEntries
+  }
+
+  /**
+   * 写入被隐私闸门拒绝的次数（**本实例启动以来累计**）。
+   *
+   * 语义边界：`clear()` **不**清零这个计数——它描述的是"发生过什么"，
+   * 而不是"索引里现在有什么"；把它和条目一起清掉就等于把拒绝痕迹也抹了。
+   */
+  rejectedWrites(): number {
+    return this.#rejectedWrites
+  }
+
+  /** 最近一次写入被拒的可读原因；从未被拒为 `null`。 */
+  lastWriteRejection(): string | null {
+    return this.#lastWriteRejection
+  }
+
+  /** 拒绝留声的两个数，一次取全（供状态面与 `omb_files` 的空结果文案）。 */
+  writeRejection(): ArtifactWriteRejection {
+    return { count: this.#rejectedWrites, lastReason: this.#lastWriteRejection }
   }
 
   clear(): void {

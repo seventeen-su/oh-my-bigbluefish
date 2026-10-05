@@ -10,7 +10,7 @@
  */
 import { z } from 'zod'
 import type { ToolDefinition, ToolInputSchema, ToolOutcome } from '../../kernel/abi/index.js'
-import type { ArtifactEntry } from './index.js'
+import type { ArtifactEntry, ArtifactWriteRejection } from './index.js'
 import { ARTIFACT_TOP_MAX, type ArtifactIndex } from './index.js'
 
 export const FILES_TOOL_NAME = 'omb_files'
@@ -116,11 +116,27 @@ function civilFromDays(days: number): { year: number; month: number; day: number
 }
 
 /** 渲染索引条目。**只有路径/类型/时间**——不含任何文件内容。 */
-export function formatFilesResult(entries: readonly ArtifactEntry[], query?: string): string {
+export function formatFilesResult(
+  entries: readonly ArtifactEntry[],
+  query?: string,
+  rejection?: ArtifactWriteRejection | null,
+): string {
   if (entries.length === 0) {
-    return query === undefined || query.trim().length === 0
-      ? '制品索引为空：本会话还没有观察到任何制品。'
-      : `制品索引没有匹配「${query.trim()}」的条目（最近 ≠ 相关：宁可空手，也不塞无关路径）。`
+    if (query === undefined || query.trim().length === 0) {
+      // **两种空必须分开说**（审计 C3）：索引为空到底是"本会话真的没观察到制品"，
+      // 还是"写入被隐私闸门拒绝、索引停更了"？不区分的话，后者会被读成前者——
+      // 用户会以为这个工具坏了或自己没用过工具，而真因在隐私模式里。
+      // 后者必须**点名隐私模式**，否则读者不知道该去哪里查。
+      const rejected = rejection?.count ?? 0
+      if (rejected > 0) {
+        return `制品索引为空——但原因**不是**"没有观察到制品"：自本模块启动以来有 ${rejected} 次写入被隐私闸门拒绝`
+          + `（最近一次：${rejection?.lastReason ?? '（隐私端口未给出原因）'}）。`
+          + '索引因此停更；请检查 omb-privacy 的隐私模式（本索引只在获得写许可时才记录，'
+          + '设过 sealed/read-only 的会话会连累全部会话的归属未知写入）。'
+      }
+      return '制品索引为空：本会话还没有观察到任何制品。'
+    }
+    return `制品索引没有匹配「${query.trim()}」的条目（最近 ≠ 相关：宁可空手，也不塞无关路径）。`
   }
   const header = `制品索引命中 ${entries.length} 条（上限 ${ARTIFACT_TOP_MAX} 条；只有路径/类型/时间，内容请用读取类工具按需取）：`
   const lines = entries.map(
@@ -144,13 +160,13 @@ export function createFilesTool(deps: FilesToolDeps): ToolDefinition {
         const input = parseFilesInput(args)
         // **会话归属一路带到数据边界**：隐私判定在 `ArtifactIndex.topFor` 里做，
         // 这里只负责把"这次是谁在读"传过去（归属未知时由那边按最严处理）。
-        return {
-          kind: 'text',
-          text: formatFilesResult(
-            deps.index.topFor(input.query, input.limit, context?.sessionId),
-            input.query,
-          ),
-        }
+        const entries = deps.index.topFor(input.query, input.limit, context?.sessionId)
+        // 索引为空时才有必要区分"两种空"；顺手防住只实现了 topFor 的替身
+        // （测试里用残缺索引验证 error 分支时，不该因为多问一个计数而换一条报错）。
+        const rejection = entries.length === 0 && typeof deps.index.writeRejection === 'function'
+          ? deps.index.writeRejection()
+          : null
+        return { kind: 'text', text: formatFilesResult(entries, input.query, rejection) }
       } catch (error) {
         // 执行体绝不抛异常：模型看到的是可读文本，不是中断的回合。
         // 隐私拒绝正是从这条路径出来的（索引抛可读原因 → 这里转成 error 结果）。
