@@ -221,3 +221,59 @@ describe('cacheHitRate：前缀稳定性的健康度', () => {
     expect(cacheHitRate(undefined)).toBeNull()
   })
 })
+
+/**
+ * S3-a：**头条与杀死判据必须同口径**。
+ *
+ * 真机矛盾读数（22 轮、28 次工具调用）：
+ * ```
+ * 本会话拉取 28 次 / 22 轮 = 1.27 次/轮；待删除视图：omb_files、omb_relate、…
+ * ```
+ * 判据本身没误判视图——是头条分子把 `read`/`pwsh` 这类**非视图工具**也算进去了。
+ * 修复前：`totalPulls` = 28（台账全部工具名求和）→ 下面第一条断言直接红。
+ */
+describe('summarize：头条与杀死判据同一口径（S3-a）', () => {
+  it('给了 views 时分子只算登记的视图：非视图工具的调用不进 totalPulls', () => {
+    const ledger = ledgerAfter({ read: 27, omb_recall: 1 }, 22)
+    const snapshot = summarize(ledger, { views: VIEW_TOOLS }, 's')
+
+    expect(snapshot.totalPulls).toBe(1) // 修复前是 28
+    expect(snapshot.pullsPerTurn).toBeCloseTo(1 / 22, 6) // 修复前是 1.27
+    expect(snapshot.scopedToViews).toBe(true)
+    expect(snapshot.countedViews).toBe(VIEW_TOOLS.length)
+
+    // **明细保留全部工具名**（watch.test.ts:166-167 钉过的行为，不许动）
+    expect(snapshot.views.map(view => view.view)).toContain('read')
+    expect(snapshot.views.find(view => view.view === 'read')?.pulls).toBe(27)
+    expect(snapshot.views).toHaveLength(VIEW_TOOLS.length + 1)
+  })
+
+  it('"含待删除视图"与"头条 ≥ 阈值"不同屏：五个视图全判死时头条也低于阈值', () => {
+    const snapshot = summarize(ledgerAfter({ read: 27, omb_recall: 1 }, 22), { views: VIEW_TOOLS }, 's')
+    expect(snapshot.settled).toBe(true)
+    expect(snapshot.deadViews).toEqual([...VIEW_TOOLS].sort())
+    expect(snapshot.pullsPerTurn).toBeLessThan(DEAD_VIEW_PULLS_PER_TURN)
+    const detail = healthDetail(snapshot)
+    expect(detail).toContain('待删除视图')
+    expect(detail).toContain(`只计 ${VIEW_TOOLS.length} 个拉取式视图`)
+  })
+
+  it('头条自报口径：给了 views 说"只计 N 个拉取式视图"，没给说"全部工具名"', () => {
+    const scoped = summarize(ledgerAfter({ read: 3, omb_recall: 2 }, 10), { views: VIEW_TOOLS }, 's')
+    expect(healthDetail(scoped)).toContain(`（口径：只计 ${VIEW_TOOLS.length} 个拉取式视图的调用，非视图工具不计入这个分子）`)
+    expect(scoped.verdict).toContain('口径：只计')
+
+    const all = summarize(ledgerAfter({ read: 3, omb_recall: 2 }, 10), {}, 's')
+    expect(all.totalPulls).toBe(5)
+    expect(all.scopedToViews).toBe(false)
+    expect(all.countedViews).toBe(2)
+    expect(healthDetail(all)).toContain('（口径：台账里出现过的全部工具名，共 2 个）')
+  })
+
+  it('轮数未知时也带口径（不因为换分支就把口径丢掉）', () => {
+    const ledger = recordPull(EMPTY_LEDGER, 'read', 0)
+    const detail = healthDetail(summarize(ledger, { views: VIEW_TOOLS }, 's'))
+    expect(detail).toContain('轮数未知')
+    expect(detail).toContain('口径：只计')
+  })
+})
