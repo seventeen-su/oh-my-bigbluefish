@@ -38,6 +38,7 @@ import {
   type Kernel,
   type MemoryRecord,
   type MemoryScope,
+  type MemoryStore,
   type ModuleHealth,
   type ModuleManifest,
   type ModuleRegistration,
@@ -193,6 +194,17 @@ export interface VectorRebuildStats {
   /** `stale` 的**原因拆分**（与它同一次统计得到；未测量时两个字段都是 null）。 */
   readonly causes: StaleEmbeddingCauses
   /**
+   * 本周期在库上**实测**的基准条数（`null` = 还没测过）。
+   *
+   * 为什么渲染层需要它：`causes` 是**基准那一刻**的快照（此后保持不变），
+   * 而 `stale = 基准 − 已完成` 是当下还剩多少。两者口径不同，所以
+   * "两类原因之和"只有**未完成任何一条**时才等于 `stale`；一旦补齐过，
+   * 那份原因说的就是**过去**的积压构成，渲染时必须标成过去时并点名这个基准——
+   * 否则同一段里会同时出现「待重建 0 条」与「待重建原因：缺当前身份 5 条、正文已改写 7 条」
+   * 这种互相打脸的读数（用户真机复现过）。
+   */
+  readonly staleBase: number | null
+  /**
    * `stale` 是不是**这一刻在库上重算出来的**。
    *
    * `false` 表示它来自本轮回填的记账（周期开始时的实测基准减去已完成的量）：数字仍然精确，
@@ -223,6 +235,35 @@ export interface VectorRebuildStats {
 interface PendingEntry {
   readonly scope: MemoryScope | null
   readonly rebuildFrom: VectorStoreApi | null
+  /**
+   * 这条记录**可能所在的库身份**（`storeKeyOf` 的键），入队那一刻定下。
+   *
+   * 为什么必须按库身份而不是作用域名：作用域只有 `user`/`project` 两个值，
+   * 而同时可以打开多个项目库。上次冲刷"在某个 project 库里没查到"就判"已删除"，
+   * 在**属于另一个（例如被 LRU 淘汰的）项目库**的条目上恰好是错的——
+   * 它会被出队并计入 `skipped`，而库里那条记忆仍然没有向量（M7）。
+   *
+   * `null` = 入队时拿不到库清单（服务不可用/抛错）：**不知道它在哪，就不判"已删除"**，
+   * 退回按作用域名判定（旧口径）并在原因里说明。
+   */
+  readonly candidateKeys: readonly string[] | null
+}
+
+/**
+ * 库身份键。**判"这条属于哪个库"必须用它**（作用域名不够，见 `PendingEntry`）。
+ *
+ * 用库文件路径（`dbPath`）而不是对象身份：`stores.snapshot()` 每次调用都会重建一层
+ * 隐私闸门视图（`gateSet` 是 `Object.create(inner)`），因此同一个库在两次 `snapshot()`
+ * 之间**不是同一个对象**——按 `===` 判存活会把"库好好的"误判成"库没打开"，
+ * 那会让队列永远清不掉（比 M7 更难发现的坏法）。
+ */
+function storeKeyOf(set: StoreSet, scope: MemoryScope, target: MemoryStore): string {
+  return asMemoryStore(target)?.dbPath ?? `${set.projectScope ?? 'user'}\u0000${scope}`
+}
+
+/** 作用域的中文名（保留队列的原因要指名道姓，别让使用者对着 `project` 猜是哪个库）。 */
+function scopeLabel(scope: MemoryScope): string {
+  return scope === 'user' ? '用户库' : '项目库'
 }
 
 /** 回填扫描看到的一个库：去重后的向量面 + 身份键 + 可读标签。 */
@@ -256,7 +297,7 @@ function vectorStoreRefs(sets: readonly StoreSet[]): readonly VectorStoreRef[] {
       if (api === undefined) continue
       // 库路径要经 `asMemoryStore`：`asVectorStore` 只承诺向量面，路径是诊断字段。
       // 隐私闸门视图是 `Object.create(inner)`（同一条原型链），因此这里照常命中。
-      const key = asMemoryStore(target)?.dbPath ?? `${set.projectScope ?? 'user'}\u0000${scope}`
+      const key = storeKeyOf(set, scope, target)
       if (seen.has(key)) continue
       seen.add(key)
       refs.push({ key, scope: target.scope, api, label: `${target.scope} 库（${key}）` })
@@ -384,6 +425,22 @@ function causeText(causes: StaleEmbeddingCauses): string {
   if (lackingIdentity > 0) parts.push(`缺当前身份 ${lackingIdentity} 条（换嵌入器后的存量）`)
   if (contentChanged > 0) parts.push(`正文已改写 ${contentChanged} 条（向量编码的是旧正文）`)
   return parts.join('、')
+}
+
+/**
+ * 原因拆分能不能用**现在时**（状态面与健康面共用这一处判定，避免两处口径漂移）。
+ *
+ * 判据（总纲）：**任何现在时的待重建读数，其两类原因之和必须等于 `stale`**。
+ * 相等 → 这份原因描述的就是**当前**积压；不等（已经补齐/回收过若干条，或基准是过去测的）
+ * → 它只是**基准那一刻**的构成，必须写成过去时并点名基准。
+ *
+ * 反例就是用户真机看到的那两行：「待重建 0 条（已对齐）」与「待重建原因：缺当前身份 5 条、
+ * 正文已改写 7 条」同屏——同一个 0 与 12 都来自同一次实测，却一个说现在、一个说过去。
+ */
+function causesDescribeCurrent(rb: VectorRebuildStats): boolean {
+  const { lackingIdentity, contentChanged } = rb.causes
+  if (rb.stale === null || lackingIdentity === null || contentChanged === null) return false
+  return lackingIdentity + contentChanged === rb.stale
 }
 
 /** 解析"当前已就绪的库套件"（编码队列据此定位某条 id 在哪个库）。 */
@@ -673,10 +730,19 @@ function renderHealth(
   if (rb.stale !== null && rb.stale > 0) {
     // 两类原因分开写：把"换了模型"与"有人改写了正文"说成同一件事，
     // 使用者就没有任何线索去查后者的来源（而它才是"检索结果莫名其妙"的那种）。
+    // 时态同样分开：原因之和 ≠ stale 时它描述的是**基准那一刻**，不许写成现在时（见 causesDescribeCurrent）。
     const causes = causeText(rb.causes)
+    const causePart =
+      causes === ''
+        ? ''
+        : causesDescribeCurrent(rb)
+          ? `；当前原因拆分：${causes}`
+          : `；上一轮实测的积压构成（基准 ${rb.staleBase ?? '?'} 条、已处理 ${
+              rb.staleBase === null ? '?' : rb.staleBase - rb.stale
+            } 条，与剩余量不是同一时刻）：${causes}`
     notes.push(
       `陈旧待重建 ${rb.stale} 条（这些记忆在当前嵌入器下要么没有向量、要么向量编码的是旧正文；` +
-        `${rb.staleFromScan ? '本回合在库上实测' : '本轮回填记账'}${causes === '' ? '' : `；${causes}`}）`,
+        `${rb.staleFromScan ? '本回合在库上实测' : '本轮回填记账'}${causePart}）`,
     )
     if (rb.blocked !== null) {
       // 待办还在、而回填**停着**：那是一个会一直存在的状态，健康面不能报"正常"
@@ -731,21 +797,36 @@ function renderStatus(
   // 同样，"刚刚重算的 0"与"上轮统计后的记账值"也要看着不一样——否则同一个 0 会同时意味着两件事。
   // 换嵌入器之后这块数字就是"向量通道对多少条记忆是空的"，是缺陷 A 唯一可见的形态。
   const rb = enc.rebuild
+  const base = rb.staleBase
   const staleText =
     rb.stale === null
       ? '尚未测量（本进程还没有完成一次回填统计）'
       : rb.staleFromScan
         ? `${rb.stale} 条（本回合在库上实测）`
         : rb.stale === 0
-          ? '0 条（已对齐：最近一次统计未发现待重建，此后嵌入器身份未变）'
-          : `${rb.stale} 条（本轮回填记账：实测基准减去已完成的量）`
+          ? base === 0
+            ? '0 条（已对齐：本周期实测基准 0 条，此后未再扫库；嵌入器身份未变）'
+            : `0 条（已对齐：实测基准 ${base ?? '?'} 条已全部补齐/回收，此后嵌入器身份未变）`
+          : `${rb.stale} 条（本轮回填记账：实测基准 ${base ?? '?'} 减去已完成的量）`
   lines.push(
     `向量回填：待重建 ${staleText}；已重建 ${rb.rebuilt}；失败 ${rb.failures}；回收残留 ${rb.scavenged} 行`,
   )
   // 原因拆分行**只在测到原因时出现**（未测量时不写，免得"0 条"与"没测过"看着一样）。
   // 这一行是缺陷 B 唯一的可见位置：正文被改写时向量通道不会报错，只是悄悄继续用旧向量。
+  //
+  // **时态必须与 stale 一致**（总纲判据）：两类原因之和 = stale 时才是"当前待办的原因"；
+  // 一旦补齐/回收过，那份原因快照说的就是基准那一刻的构成，必须写成过去时并点名基准——
+  // 否则同一个 0 会同时被说成"没有待办"和"还有 12 条"（用户真机复现过的自相矛盾）。
   const causes = causeText(rb.causes)
-  if (causes !== '') lines.push(`待重建原因：${causes}`)
+  if (causes !== '') {
+    lines.push(
+      causesDescribeCurrent(rb)
+        ? `待重建原因：${causes}`
+        : `上一轮实测的积压构成（实测基准 ${base ?? '?'} 条、已处理 ${
+            base === null || rb.stale === null ? '?' : base - rb.stale
+          } 条，**不是当前待办**）：${causes}`,
+    )
+  }
   if (rb.blocked !== null) lines.push(`回填停住：${rb.blocked}`)
   if (enc.lastReason !== null) lines.push(`落盘最近原因：${enc.lastReason}`)
   if (current !== undefined) lines.push(`余弦下限：${cosineFloorFor(current)}（按当前嵌入器标定）`)
@@ -884,6 +965,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     rebuild: {
       stale: staleRemaining(),
       causes: staleCauses,
+      staleBase,
       staleFromScan,
       rebuilt: rebuiltTotal,
       failures: rebuildFailureTotal,
@@ -896,8 +978,42 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     (MEMORY_SCOPES as readonly string[]).includes(value)
 
   /**
+   * 入队那一刻，该作用域下**已打开的库身份**有哪些。
+   *
+   * 新写入必然落在其中之一，所以"这些库都查过、都没有"才是"已删除"的证据；
+   * 少查一个就判删除，等于把"我没看"说成"它不存在"（M7）。
+   * 拿不到库清单时返回 `null`（= 不知道），调用方据此退回按作用域名判定而不是乱判。
+   */
+  const candidateKeysFor = (scope: MemoryScope | null): readonly string[] | null => {
+    const kernel = kernelRef
+    if (kernel === undefined) return null
+    try {
+      const sets = resolveStoreSets(kernel)
+      if (sets.length === 0) return null
+      const keys: string[] = []
+      for (const set of sets) {
+        for (const wanted of scope === null ? MEMORY_SCOPES : [scope]) {
+          const target = set.store(wanted)
+          if (target === undefined) continue
+          const key = storeKeyOf(set, wanted, target)
+          if (!keys.includes(key)) keys.push(key)
+        }
+      }
+      // 空清单 = 一个库都没打开 → 与"拿不到清单"同义（都不知道），不当作"它不可能在别处"
+      return keys.length === 0 ? null : keys
+    } catch {
+      // 库清单不可得：退回按作用域名判定（旧口径），原因里会写清是哪个库没查过
+      return null
+    }
+  }
+
+  /**
    * 新写入入队（去重、保序、超界丢最旧并计数）。
    * **纯内存操作**：不做 I/O、不编码——这是"写入路径不变慢"的全部机制。
+   *
+   * 唯一新增的代价是 `resolveStoreSets()`（一次 `snapshot()`，无 I/O）：它记下
+   * "这条可能落在哪些已打开的库"，供冲刷时按**库身份**判"已删除"（见 `PendingEntry`）。
+   * 记忆写入是低频操作（每条一次 INSERT），这一次快照远小于写入本身的代价。
    */
   const enqueueWritten = (payload: { readonly id: string; readonly scope: string }): void => {
     const id = payload.id
@@ -909,7 +1025,8 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       queue.delete(oldest)
       droppedOldest += 1
     }
-    queue.set(id, { scope: isMemoryScope(payload.scope) ? payload.scope : null, rebuildFrom: null })
+    const scope = isMemoryScope(payload.scope) ? payload.scope : null
+    queue.set(id, { scope, rebuildFrom: null, candidateKeys: candidateKeysFor(scope) })
   }
 
   /**
@@ -920,11 +1037,13 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
    * （没有任何地方会重新入队）；而回填条目丢了毫无损失——向量行仍是待重建的，
    * 下一遍扫描会重新列出（幂等、可重入正是靠这个性质）。
    */
-  const enqueueRebuild = (id: string, scope: MemoryScope | null, from: VectorStoreApi): boolean => {
+  const enqueueRebuild = (id: string, ref: VectorStoreRef): boolean => {
     if (typeof id !== 'string' || id.length === 0) return false
     if (queue.has(id)) return false
     if (queue.size >= maxPending) return false
-    queue.set(id, { scope, rebuildFrom: from })
+    // 库身份精确到**列出它的那个库**：回填条目的候选库只有它自己，
+    // 因此它被回收/关闭时不会被"另一个 project 库开着"掩盖成已删除（M7）。
+    queue.set(id, { scope: ref.scope, rebuildFrom: ref.api, candidateKeys: [ref.key] })
     return true
   }
 
@@ -1009,6 +1128,13 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
     const found = new Map<string, { record: MemoryRecord; api: VectorStoreApi | undefined }>()
     /** 本次真正检查过的作用域。**没被检查 ≠ 记录已删除**：项目库可能尚未预热。 */
     const coveredScopes = new Set<MemoryScope>()
+    /**
+     * 本次真正检查过的**库身份**（`storeKeyOf` 的键）。
+     *
+     * 判"这条已删除"只能靠它：作用域名只有 `user`/`project` 两个值，
+     * "另一个项目库开着"会让被淘汰的那个库里的待编码条目被误判成已删除（M7）。
+     */
+    const openKeys = new Set<string>()
     let vectorCapable = false
     let hydrateError: string | null = null
     for (const set of sets) {
@@ -1018,6 +1144,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
         // 覆盖与能力是**库的属性**，与本批是否有该作用域的候选无关：
         // 先判定，再决定要不要 getMany（否则"项目库还没打开"会被误判成"库不支持向量"）。
         coveredScopes.add(scope)
+        openKeys.add(storeKeyOf(set, scope, target))
         const api = asVectorStore(target)
         if (api !== undefined) vectorCapable = true
         const ids = batch
@@ -1044,6 +1171,28 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
           .filter((scope): scope is MemoryScope => scope !== null && !coveredScopes.has(scope)),
       ),
     ]
+
+    /**
+     * 这条"查不到"的记录，是否还有**库没被查到**？返回可读原因（`null` = 可以判"已删除"）。
+     *
+     * 判据（M7）：**只有它可能所在的库全部被本次冲刷真正查询过，才能说它是已删除**。
+     * 按作用域名判会让"另一个项目库开着"冒充"它所在的库开着"：属于被淘汰库的条目
+     * 会被出队并计入 `skipped`——读数上表现为"跳过"，而它其实还在库里等着编码。
+     *
+     * 入队时拿不到库清单（`candidateKeys === null`）时退回按作用域名判定（旧口径）：
+     * 那种情况下"它可能在哪"本来就没有记录，假装知道会更坏。
+     */
+    const coverageGapOf = (entry: PendingEntry | undefined): string | null => {
+      const candidates = entry?.candidateKeys ?? null
+      if (candidates === null || candidates.length === 0) {
+        const scope = entry?.scope ?? null
+        // 作用域也未知：整批已按两个作用域都查过（每个已打开库都问过）→ 沿用旧口径
+        if (scope === null) return null
+        return coveredScopes.has(scope) ? null : `${scopeLabel(scope)}尚未打开`
+      }
+      const missing = candidates.filter(key => !openKeys.has(key))
+      return missing.length === 0 ? null : `${missing.join('、')}尚未打开`
+    }
 
     /**
      * 回填条目"正文已不存在"的登记与回收。
@@ -1083,16 +1232,35 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       const pendingScopes = uncoveredScopes()
       if (pendingScopes.length > 0) {
         return nothing(
-          `库尚未就绪（${pendingScopes.join('、')} 作用域的库还没打开）；待编码队列保留`,
+          `库尚未就绪（${pendingScopes.map(scopeLabel).join('、')}作用域的库还没打开）；待编码队列保留`,
         )
       }
-      // 整批记录都已不存在：出队并计数——既不是失败，也不是可重试的状态
-      const gone = batch.filter(([, entry]) => entry.rebuildFrom !== null)
-      for (const [id] of batch) queue.delete(id)
-      for (const [id, entry] of gone) if (entry.rebuildFrom !== null) markGone(entry.rebuildFrom, id)
+      /**
+       * 作用域名层面都覆盖了，但**库身份**层面未必（M7）：逐条核对，
+       * 只有"它可能所在的库都查过、都没有"的那些才是真的已删除。
+       * 整批无差别出队会把被淘汰库里的待办静默丢掉（读数上只表现为 skipped 变大）。
+       */
+      let goneCount = 0
+      let firstGap: string | null = null
+      for (const [id, entry] of batch) {
+        const gap = coverageGapOf(entry)
+        if (gap !== null) {
+          firstGap ??= gap
+          continue
+        }
+        queue.delete(id)
+        if (entry.rebuildFrom !== null) markGone(entry.rebuildFrom, id)
+        goneCount += 1
+      }
       await scavengeGone()
-      skippedTotal += batch.length
-      return { encoded: 0, skipped: batch.length, failures: 0 }
+      skippedTotal += goneCount
+      if (goneCount < batch.length) {
+        const retained = batch.length - goneCount
+        const reason = `库尚未就绪（${firstGap ?? '库身份未能核对'}）；${retained} 条未确认的待编码条目保留队列`
+        lastEncodeReason = reason
+        return { encoded: 0, skipped: goneCount, failures: 0, reason }
+      }
+      return { encoded: 0, skipped: goneCount, failures: 0 }
     }
 
     // ② 分类：空文本 / 无向量口 → 跳过；其余待编码
@@ -1104,15 +1272,14 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
       /** 这条向量即将编码的正文的哈希（落盘时一并写入，见 `putEmbedding` 的 `contentHash`）。 */
       contentHash: string
     }[] = []
-    const queuedScopeOf = new Map(batch)
     let skipped = 0
     for (const [id, entry] of batch) {
       const hit = found.get(id)
       if (hit === undefined) {
-        const queuedScope = queuedScopeOf.get(id)?.scope ?? null
-        if (queuedScope !== null && !coveredScopes.has(queuedScope)) {
-          // 该条所在作用域的库还没打开（例如项目库晚于用户库就绪）→ 不是"已删除"，保留重试
-          callReason = `库尚未就绪（${queuedScope} 作用域的库还没打开）；待编码队列保留`
+        const gap = coverageGapOf(entry)
+        if (gap !== null) {
+          // 它可能所在的库这次没被查询（例如项目库被 LRU 淘汰、尚未预热）→ 不是"已删除"，保留重试
+          callReason = `库尚未就绪（${gap}）；待编码队列保留`
           lastEncodeReason = callReason
           continue
         }
@@ -1375,7 +1542,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
           limit: want,
         })
         for (const id of ids) {
-          if (enqueueRebuild(id, ref.scope, ref.api)) budget -= 1
+          if (enqueueRebuild(id, ref)) budget -= 1
         }
         // 游标推进；取不满 `want` 说明这个库的待重建集合已到表尾 → 下一遍从头再扫。
         // 表尾回头是刻意的：失败（编码抛错 / 写入被拒）的条目仍是待重建，要靠下一遍重来。
