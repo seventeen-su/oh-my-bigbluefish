@@ -29,7 +29,7 @@ import { cardById, cardsFor, renderIndex, residentHint } from '../../../modules/
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.4.0',
+    version: '3.5.0',
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health'],
     configSchema: { parse: () => ({}) },

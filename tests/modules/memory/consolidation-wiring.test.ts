@@ -29,7 +29,7 @@ const ECHO_TEXT = '回响：同一条错事被同一个会话重复写下的痕�
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.4.0',
+    version: '3.5.0',
     requires: [],
     capabilities: [],
     configSchema: { parse: () => ({}) },

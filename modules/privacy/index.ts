@@ -208,7 +208,7 @@ export function createPrivacyRegistration(options: PrivacyModuleOptions = {}): M
 
   const manifest: ModuleManifest<PrivacyConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '3.4.0',
+    version: options.version ?? '3.5.0',
     requires: derivedRequires(MODULE_ID),
     capabilities: derivedCapabilities(MODULE_ID),
     configSchema: privacyConfigSchema,
