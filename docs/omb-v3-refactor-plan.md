@@ -164,6 +164,21 @@ v1 内外核成立的前提是「内核加载失败不得阻塞宿主」，为�
 
 **内核代码预算 ≤350 行。** 超出即设计错误，必须把逻辑移入模块。
 
+三处**明文豁免**（不拆的理由，不写在这里就等于没有豁免）：
+
+| 豁免 | 为什么它不该被拆 |
+| --- | --- |
+| `kernel/abi/` | 契约声明：把宿主与模块提供的全部服务/事件/能力列成表。它是"名字表"不是逻辑，拆开只会让 ABI 的形状更难一眼看全 |
+| `kernel/index.ts` | 装配：内核与宿主、模块的接线点都在这里，行数随模块数增长（业务逻辑一律在 `modules/`） |
+| `kernel/hostEntry.ts` | 宿主入口：DSH 生命周期与内核之间的适配层，行数随宿主 API 面增长 |
+
+**判据是代码里的静态断言**，不是本文件的这句话：`eslint.config.mjs` 的
+`omb/kernel-purity` 对 `kernel/` 下每个文件查三条——文件名含业务词汇、
+**标识符**含业务词汇（带位置）、行数超过 `KERNEL_LINE_BUDGET`（豁免名单
+`KERNEL_LINE_BUDGET_EXEMPT`，与上表逐字一致）。
+上限数字、豁免名单都是那个文件里**导出的常量**，`tests/kernel/kernel-purity.test.ts`
+会把它们与本文件逐字核对——所以"文档写了上限、代码不查"这种中间态会当场失败。
+
 ### 3.3 微内核 ABI
 
 ```ts
@@ -753,10 +768,11 @@ export function marginalValue(
 | 1.1 | `kernel/abi/`：清单、Kernel 接口、事件表、`ContextPressure` | ABI 契约测试 |
 | 1.2 | `kernel/{registry,bus,budget,status}.ts` | **≤350 行**；依赖拓扑 + 环检测测试 |
 | 1.3 | **`kernel/meter.ts`：接宿主 `tokenMeter.measure()` 与会话投影** | 能读到 `totalTokens`/`fillRatio`/`nodes`/`cacheRead` |
-| 1.4 | 静态断言：内核无业务符号 | 故意加一个"检索"符号 → 断言失败 |
+| 1.4 | 静态断言：内核无业务符号（**文件名与标识符**） | 故意加一个业务词汇标识符 → `omb/kernel-purity` 报错并给出位置 |
 | 1.5 | 模块独立性矩阵测试骨架 | 空模块 × 开关组合全部正常 |
 
-**门禁 G1**：内核 ≤350 行；度量桥能读到事实 D 的全部量。
+**门禁 G1**：内核 ≤350 行（豁免名单见 §3.2 与 `eslint.config.mjs` 的 `KERNEL_LINE_BUDGET_EXEMPT`）；
+内核文件名与标识符均无业务词汇（`omb/kernel-purity`）；度量桥能读到事实 D 的全部量。
 
 ### 阶段 2 — 记忆库
 
@@ -986,7 +1002,7 @@ export function marginalValue(
 | R4 | 软压力档位阈值标定不当 → 抖动 | 中 | 中 | 阈值从测量标定；压力回落时不主动补回 |
 | R5 | 通用性不足：某机制只在编程域有效 | 中 | 中 | §11.4 四域验收；情感域是最强检验 |
 | R6 | 删除 6 万行后失去回归能力 | 高 | 高 | §11.3 移植清单 + 逐阶段门禁 |
-| R7 | 微内核扩张成第二个 `assembly.ts` | 中 | 高 | 内核 ≤350 行硬上限 + 静态断言 |
+| R7 | 微内核扩张成第二个 `assembly.ts` | 中 | 高 | `omb/kernel-purity` 静态断言：≤350 行（豁免 `kernel/abi/`、`kernel/index.ts`、`kernel/hostEntry.ts`，见 §3.2）+ 文件名与标识符不得含业务词汇 |
 | R8 | 两个 SQLite 库并发写阻塞事件循环 | 中 | 中 | 一库一连接；`busy_timeout` 1000ms + `BEGIN IMMEDIATE`；写队列串行 |
 | R9 | `sessionProjections.apply` 异步或返回新引用 → 静默丢状态 | 中 | 中 | 专门的不变量测试（同步性 + 同一引用） |
 | R10 | 23GB `.onnx_data` 被误提交 | 中 | 高 | 阶段 0 就写 `.gitignore` |
