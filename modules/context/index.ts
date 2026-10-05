@@ -31,6 +31,8 @@ import type { PullLedger, PullSnapshot, ViewPullStats, WatchOptions } from './wa
 import {
   EMPTY_LEDGER,
   MIN_TURNS_FOR_VERDICT,
+  SESSION_TABLE_MAX,
+  SESSIONS_LIST_MAX,
   UNKNOWN_SESSION_KEY,
   VIEW_TOOLS,
   cacheHitRate,
@@ -45,7 +47,7 @@ import { buildStatusPanel, createStatusContributor } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
-export const MODULE_VERSION = '3.4.0'
+export const MODULE_VERSION = '3.5.0'
 
 /**
  * 「真的没有会话」时面板上的那一句说明。
@@ -101,6 +103,15 @@ export interface ContextPressureService {
  *
  * 拉取计数与 admission 合并在一个观测面服务里（`abi/catalog.ts` 的约定：
  * 一个模块一个观测面服务，不为一个指标开一个服务）。
+ *
+ * ## 生产消费者只有 `recordPull` 一个（S3-d 的如实标注）
+ *
+ * 全仓 grep 的事实：生产代码里只有 `dsh/session.ts` 调 `recordPull`；
+ * `select` / `marginalValue` / `measuredCost` / `snapshot` / `killList` /
+ * `views` / `focusState` 都**没有生产调用方**（只有测试与手动排查在调）。
+ * 因此"注入裁决"（moderate 推一条、tight 主动提示）从未发生——
+ * 状态面（`healthNow` 与 `tools.ts` 的档位行为行）必须把这一点写出来，
+ * 不许让读者以为它在工作。接上真实消费者之后，同步删掉那些标注。
  */
 export interface ContextMetricsService {
   /**
@@ -207,6 +218,35 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     const sessionTurns = new Map<SessionRef, number>()
     const sessionPressure = new Map<SessionRef, SessionPressure>()
 
+    /**
+     * 最近活动顺序（**LRU**）：末尾最新，三张分会话表共用同一个顺序。
+     *
+     * 为什么必须有：宿主**不会**把会话结束事件交给模块（本片刻意不依赖它，
+     * 见规划 §4 S3-f），旧实现只在 dispose 时清空 → 长跑宿主上三张表随历史会话数
+     * 单调增长，"分会话拉取台账"段越用越长、每次渲染全量排序。
+     * 上界与取值理由见 `watch.ts` 的 `SESSION_TABLE_MAX`。
+     *
+     * 淘汰必须按"最久未活动"而不是"最早插入"：一个老会话可能正在被使用
+     * （交错会话/长会话），按插入序淘汰会把**正在用的账**清掉。
+     */
+    const sessionOrder = new Map<SessionRef, true>()
+    let evictedSessions = 0
+
+    /** 把某个会话标记为"刚活动过"，并淘汰最久未活动的会话（三张表一起删，不留半份账）。 */
+    const touchSession = (key: SessionRef): void => {
+      sessionOrder.delete(key)
+      sessionOrder.set(key, true)
+      while (sessionOrder.size > SESSION_TABLE_MAX) {
+        const oldest = sessionOrder.keys().next().value
+        if (oldest === undefined) break
+        sessionOrder.delete(oldest)
+        ledgers.delete(oldest)
+        sessionTurns.delete(oldest)
+        sessionPressure.delete(oldest)
+        evictedSessions += 1
+      }
+    }
+
     const ledgerFor = (key: SessionRef): PullLedger => ledgers.get(key) ?? EMPTY_LEDGER
 
     /**
@@ -274,18 +314,24 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     }
 
     /**
-     * **各会话**的台账快照（含"未知会话"桶），确定性排序。
+     * **各会话**的台账快照（含"未知会话"桶），按**最近活动先后**排列（最旧在前）。
      *
      * 这是"归属"在状态面上的呈现方式：既然没有"当前会话"可挑，就把每一份账
      * 连同它的主人一起摆出来——读者不需要猜"这个数是谁的"。
+     * 排列顺序与 LRU 顺序同源，因此"最近用过的会话在最后一行"，且是确定性的
+     * （同一串事件 → 同一份输出，不依赖 Map 的偶然顺序）。
+     *
+     * **只列最近活动的 `SESSIONS_LIST_MAX` 个**：分会话表本身有 LRU 上界，
+     * 但即使 32 份全列出来也会把状态面撑成几十行；
+     * 截断数量由 {@link sessionsScope} 给出并在渲染时写明。
      */
     const sessionsSnapshot = (options?: WatchOptions): readonly {
       readonly session: SessionRef | null
       readonly band?: string
       readonly pulls: PullSnapshot
     }[] =>
-      [...ledgers.keys()]
-        .sort()
+      [...sessionOrder.keys()]
+        .slice(-SESSIONS_LIST_MAX)
         .map(key => {
           const session = sessionOfKey(key)
           // 压力读数**按该会话**取；拿不到就省略（不借用别人的读数）
@@ -296,6 +342,22 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
             pulls: summarize(ledgerFor(key), options ?? { views: VIEW_TOOLS }, session),
           }
         })
+
+    /**
+     * 分会话台账的**截断口径**（状态面照实写出"另有 M 个未列出"）。
+     *
+     * `hidden` = 还在内存表里但这次没列出；`evicted` = 已被 LRU 淘汰、
+     * **连计数都不在了**。两个数含义不同，不许合并成一个"省略 N 个"。
+     */
+    const sessionsScope = (): { listed: number; hidden: number; evicted: number; tableMax: number } => {
+      const listed = Math.min(sessionOrder.size, SESSIONS_LIST_MAX)
+      return {
+        listed,
+        hidden: Math.max(0, sessionOrder.size - listed),
+        evicted: evictedSessions,
+        tableMax: SESSION_TABLE_MAX,
+      }
+    }
 
     /**
      * **某一个会话**的台账快照。会话口径由 `resolveSession` 定（只认显式传入），
@@ -317,6 +379,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
           ? '拉取台账：尚无可读账（未观测到任何会话的回合或拉取）'
           : `拉取台账：分会话计 ${known.length} 个会话`
             + `${unknown.totalPulls === 0 ? '' : ` + 未知会话桶 ${unknown.totalPulls} 次`}`
+            + (evictedSessions === 0 ? '' : `（表上限 ${SESSION_TABLE_MAX}，已淘汰 ${evictedSessions} 个更早的会话）`)
             + '（**不挑"当前会话"**：逐会话计数与杀死判据见「组件自述」）'
       const parts = [
         `软档位 ${band}`,
@@ -324,6 +387,10 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
           ? 'fillRatio 未知（宿主未声明窗口）→ 按宽松档，不施压'
           : `fillRatio ${pressure.fillRatio.toFixed(3)}`,
         `行为 ${behaviorFor(band).mode}（最多推 ${behaviorFor(band).pushLimit} 条）`,
+        // **如实标注**（S3-d）：`select`/`marginalValue`/`measuredCost`/
+        // `announcePressure` 都没有生产消费者，在线的是拉取计数。不写这一句，
+        // 上面那句"行为 single-best（最多推 1 条）"就是在承诺一件不发生的事。
+        '注入裁决：当前无调用方（仅拉取计数在线）',
         ledgerLine,
       ]
       if (degradations.length > 0) parts.push(`降级：${degradations.join('；')}`)
@@ -371,6 +438,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     disposers.push(
       kernel.on('turn/start', payload => {
         const key = sessionKeyOf(payload.sessionId)
+        touchSession(key)
         // 回合数**按本会话**推进：跨会话的总数不能当分母。
         // 用"观察到的回合边界数"而不是事件里的 `turn` 值，因为 `dsh/` 传的是
         // 0 基的 `step`（`dsh/session.ts` 的 `step/start` 分支）——直接用会把
@@ -385,6 +453,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     disposers.push(
       kernel.on('focus/changed', payload => {
         const key = sessionKeyOf(payload.sessionId)
+        touchSession(key)
         sessionPressure.set(key, {
           band: sessionPressure.get(key)?.band ?? 'relaxed',
           depth: payload.depth,
@@ -397,6 +466,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
     disposers.push(
       kernel.on('pressure/band-changed', payload => {
         const key = sessionKeyOf(payload.sessionId)
+        touchSession(key)
         const reading = readingOf(payload.pressure, bands)
         sessionPressure.set(key, {
           band: reading.band,
@@ -423,6 +493,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
       recordPull: (view, session) => {
         try {
           const key = sessionKeyOf(resolveSession(session))
+          touchSession(key)
           // 本会话的回合数；未知时传 0（= "轮次未知"），**不用别的会话或全局轮数顶替**。
           const turn = sessionTurns.get(key) ?? 0
           ledgers.set(key, recordPull(ledgerFor(key), view, turn))
@@ -501,6 +572,7 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
         // 本模块**不再挑"当前会话"**：计入"未知会话"桶的读数单列，分会话台账全列出
         pulls: snapshotFor(),
         sessions: sessionsSnapshot(),
+        sessionsScope: sessionsScope(),
         degradations,
         // 「说明」按**本次渲染**算，不做累积：没有会话才有那一句。
         // 累积写法会让旧结论一直挂在面板上，与同一段里的实时读数打架
@@ -562,6 +634,9 @@ export function createContextModule(): ModuleRegistration<ContextConfig> {
       ledgers.clear()
       sessionTurns.clear()
       sessionPressure.clear()
+      // LRU 顺序与淘汰计数一起清掉：卸载后不留任何会话残留（H-2）
+      sessionOrder.clear()
+      evictedSessions = 0
       lastHealth = { state: 'ok', detail: `模块已卸载；历史拉取计数已清空（杀死判据的观察从零开始）` }
     }
   }

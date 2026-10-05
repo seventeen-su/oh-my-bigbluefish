@@ -14,6 +14,25 @@ import { behaviorFor } from './pressure.js'
 import type { PullSnapshot } from './watch.js'
 import { cacheHitRate, healthDetail } from './watch.js'
 
+/**
+ * 「注入裁决当前无调用方」的**如实标注**（规划 §4 S3-d）。
+ *
+ * 全仓 grep 的事实：`SERVICES.contextPressure` 零生产消费者；`SERVICES.contextMetrics`
+ * 的生产消费者只有 `dsh/session.ts` 的 `recordPull` 一处——`select` / `marginalValue` /
+ * `measuredCost` / `snapshot` / `killList` / `views` / `focusState` 都没有生产调用方，
+ * `BandBehavior.announcePressure` 更是只被测试读过。
+ *
+ * 因此状态面必须把话说全：**"档位行为"描述的是"接上后会怎样"，不是正在发生的行为**。
+ * 不写这一句，读者（与模型）会把 `最多推 1 条` 当成真的在推——
+ * 这是"声明了但电不会来"的典型形态，而状态面是唯一的模型可见诊断入口。
+ *
+ * 接上真实消费者之后，这句话就不再成立，**必须同时删掉**（见规划 §4 S3-d 的"缓做"）。
+ */
+export const INJECTION_UNWIRED_NOTE =
+  '注入裁决：当前无调用方（select / marginalValue / measuredCost / pushLimit / indexOnly / announcePressure '
+  + '在生产代码里零消费者，只有测试与手动调用；在线的是拉取计数 recordPull）'
+  + '——上面这句是"接上后会怎样"，不是正在发生的行为。'
+
 export interface StatusPanelInput {
   /** 全部模块的健康面（来自内核 HealthTable 快照）。 */
   readonly health?: Readonly<Record<string, ModuleHealth>> | null
@@ -35,6 +54,21 @@ export interface StatusPanelInput {
     readonly band?: string
     readonly pulls: PullSnapshot
   }[] | null
+  /**
+   * `sessions` 的**截断口径**：{@link SESSIONS_LIST_MAX} 只控制"列几个"，
+   * 分会话表本身另有 LRU 上界（`SESSION_TABLE_MAX`）。省略/为 null = 不说明
+   * （老调用方与纯组装场景），不伪造一个"没有截断"的结论。
+   */
+  readonly sessionsScope?: {
+    /** 实际列出的会话数。 */
+    readonly listed: number
+    /** 仍在内存表里、但这次没列出来的会话数。 */
+    readonly hidden: number
+    /** 被 LRU 淘汰掉的会话数（**计数已不再保留**）。 */
+    readonly evicted: number
+    /** 分会话表的 LRU 上界。 */
+    readonly tableMax: number
+  } | null
   readonly budgets?: Readonly<Record<string, { readonly used: number; readonly limit: number }>> | null
   /** 本模块自己的降级原因（逐条写出，绝不折叠成"不可用"）。 */
   readonly degradations?: readonly string[] | null
@@ -96,7 +130,8 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
     }
     lines.push(
       `档位行为：${behavior.mode}，最多推 ${behavior.pushLimit} 条${behavior.indexOnly ? '，只保留索引' : ''}`
-      + `${behavior.pushAllowed ? '' : '，不做主动推'}；被推迟的内容仍可通过工具取回（无静默丢失）。`,
+      + `${behavior.pushAllowed ? '' : '，不做主动推'}；被推迟的内容仍可通过工具取回（无静默丢失）。`
+      + INJECTION_UNWIRED_NOTE,
     )
 
     const hit = cacheHitRate(pressure)
@@ -124,6 +159,15 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
       } else if (!pulls.turnsKnown) {
         lines.push(`  口径：本会话回合数未知（本会话内未观察到回合边界）——pullsPerTurn 分母未知，判定需 ${pulls.minTurns} 轮`)
       }
+      // **分子口径也要自报**（healthDetail 里已带一句，这里给出它的推算方式）：
+      // 头条只算登记的拉取式视图，而下面的明细里还有 read/pwsh 这类非视图工具——
+      // 两者混在一起就是"1.27 次/轮 与 五个视图全待删 同屏"那类矛盾。
+      lines.push(
+        pulls.scopedToViews
+          ? `  口径：头条的 ${pulls.totalPulls} 次只计 ${pulls.countedViews} 个拉取式视图的调用；`
+            + 'read/pwsh 等非视图工具的调用仍列在下面的明细里，但不进这个分子'
+          : `  口径：头条计的是台账里出现过的全部工具名（${pulls.countedViews} 个）——没有视图清单时无法把"该删的视图"与"别的工具"分开`,
+      )
       // **零拉取视图列表同样要过判定门槛**：刚开的新会话里五个视图必然全是 0，
       // 那不是"该删"，是"还没样本"。轮数不足时只写"不下结论"，不给列表。
       //
@@ -154,6 +198,17 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
         // 没有该会话的读数就**不写档位**（`band` 缺席）：不借用别人的档位
         const shaping = entry.band === undefined ? '' : `压力 ${entry.band}（${shapingOf(entry.band)}）｜`
         lines.push(`  - ${who}：${shaping}${healthDetail(entry.pulls)}`)
+      }
+      // **截断要说出来**：读者必须能分清"只有这几个会话"与"只列了这几个"。
+      // 分会话表本身另有 LRU 上界，被淘汰的连计数都不在了——那也要点名。
+      const scope = input.sessionsScope ?? null
+      if (scope !== null && (scope.hidden > 0 || scope.evicted > 0)) {
+        lines.push(
+          `  截断口径：本段只列最近 ${scope.listed} 个会话（另有 ${scope.hidden} 个未列出）`
+          + `；分会话表按最近活动保留最多 ${scope.tableMax} 个`
+          + (scope.evicted > 0 ? `，已淘汰 ${scope.evicted} 个更早的会话（其计数不再保留）` : '')
+          + '。',
+        )
       }
     }
 
@@ -194,6 +249,16 @@ export function buildStatusPanel(input: StatusPanelInput = {}): StatusPanel {
       metrics.totalPulls = pulls.totalPulls
       metrics.pullsPerTurn = pulls.pullsPerTurn
       metrics.deadViews = pulls.deadViews.length
+      // 分子口径也进机器可读面：`pullCountedViews` 与 `deadViews` 的判定集合同源
+      metrics.pullCountedViews = pulls.countedViews
+      metrics.pullScopedToViews = pulls.scopedToViews ? 1 : 0
+    }
+    // 截断口径进机器可读面（未提供 `sessionsScope` 时这些键不出现 = "未测量"）
+    const sessionsScope = input.sessionsScope ?? null
+    if (sessionsScope !== null) {
+      metrics.sessionsListed = sessionsScope.listed
+      metrics.sessionsHidden = sessionsScope.hidden
+      metrics.sessionsEvicted = sessionsScope.evicted
     }
 
     return { lines, metrics, cacheHitRate: hit, degradations }

@@ -11,6 +11,14 @@
  * ③ 能力轴默认关闭且**永不落盘**：即使 `inferCapabilityAxis: true`，
  *    观察也只进当前会话内存（`CapabilityMemory`），不产生任何存储写入。
  *    `health().detail` 如实写明当前处于哪种状态。
+ *
+ * ## 写入面的**事实**（S3-e）
+ *
+ * `declare` / `infer` / `clearDeduced` / `observeCapability` 在当前生产代码里
+ * **零消费点**：全仓 grep 的命中只在 `tests/modules/profile/**`。
+ * 于是"显式条目 0 条"有两种可能——**没人写过**与**没有写入口**——
+ * 状态面必须把它们分开说（见 {@link PROFILE_WRITE_FACE_NOTE}），
+ * 否则读者会把"服务已声明、等待消费方"读成"用户没有偏好"。
  */
 import { z } from 'zod'
 import type { Clock, Kernel, Logger, ModuleHealth, ModuleManifest, ModuleRegistration } from '../../kernel/abi/index.js'
@@ -23,7 +31,7 @@ import {
   renderConflicts as renderConflictsText,
   renderDeclared as renderDeclaredText,
 } from './entries.js'
-import { CapabilityMemory } from './capability.js'
+import { CAPABILITY_ENTRIES_PER_SESSION, CapabilityMemory } from './capability.js'
 import type { ProfileStoresServicePort } from './storage.js'
 import { ProfileStorage } from './storage.js'
 import type { ClearResult } from './clear.js'
@@ -35,15 +43,29 @@ export const PROFILE_MODULE_ID = 'omb-profile'
 export const PROFILE_SERVICE = SERVICES.profile
 /** 提示贡献服务名：`prompt:<模块 id>`（只输出未裁决冲突，见 `conflictDigest`）。 */
 export const PROFILE_PROMPT_SERVICE = `prompt:${PROFILE_MODULE_ID}`
-export const PROFILE_VERSION = '3.4.0'
+export const PROFILE_VERSION = '3.5.0'
 
 /** 记忆模块提供的服务名（**ABI 契约**，不是本地约定）。 */
 export const MEMORY_STORES_SERVICE = SERVICES.stores
 
+/**
+ * 「写入面暂无调用方」的**固定说法**（S3-e）。
+ *
+ * 用词必须与事实一致：服务的**声明**是真的（`kernel.provide(PROFILE_SERVICE, …)`
+ * 在 `apply` 里同步完成），缺的只是**消费方**（`declare`/`infer`/`clearDeduced`
+ * 在生产代码里零调用点）。所以这句写"暂无调用方（服务已声明，等待消费方）"，
+ * 不写"功能不可用"——后者会把"没接上"说成"坏了"。
+ *
+ * 它是**动态文案的一半**：`writeFaceNote()` 在这个基础上按实际收到的调用数
+ * 切换说法（0 次 = 本条；>0 次 = 如实报请求数），因此接线之后这句话会自动消失，
+ * 不会变成过期承诺。
+ */
+export const PROFILE_WRITE_FACE_NOTE = '写入面暂无调用方（服务已声明，等待消费方）'
+
 export interface ProfileConfig {
   /**
-   * 能力轴开关。**默认 false**；即使为 true，能力观察也只存在于会话内存与
-   * `sessionProjections`，绝不写入任何存储（D4）。
+   * 能力轴开关。**默认 false**；即使为 true，能力观察也只存在于会话内存
+   * （`CapabilityMemory`，**没有** `sessionProjections` 投影），绝不写入任何存储（D4）。
    */
   readonly inferCapabilityAxis: boolean
 }
@@ -112,7 +134,10 @@ export interface ProfileService {
    * @returns 是否真的记录（false = 开关关闭或参数非法）
    */
   observeCapability(sessionId: string, observation: { key: string; value: string; evidence?: readonly string[] }): boolean
-  /** 会话能力快照（内容未变时返回同一引用，供 sessionProjections 使用）。 */
+  /**
+   * 会话能力快照。内容未变时返回**同一引用**（重复观察不该让消费者引用抖动；
+   * **当前没有任何消费者**——这是留给将来消费者的稳定契约，见 `capability.ts`）。
+   */
   capability(sessionId: string): readonly ProfileEntry[]
   /** 一键清空全部**推断型**条目（含会话能力观察）；显式条目不动。 */
   clearDeduced(sessionId?: string): Promise<ClearResult>
@@ -174,6 +199,18 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   let capabilityAttempts = 0
   let capabilityRejectedBySwitch = 0
   let capabilityRecorded = 0
+  /**
+   * 写入面的**实际调用计数**（`declare` / `infer` / `clearDeduced`）。
+   *
+   * 为什么要数：`declared = 0` 时状态面必须能回答"是没人写、还是没写入口"。
+   * 全仓的生产调用点是 0（只有测试在调），但**用计数而不是硬编码结论**——
+   * 一旦有真实消费者接上，文案自动变成"收到 N 次写入请求"，
+   * 不会留下一句已经过期的"暂无调用方"（过期的承诺比没有承诺更坏）。
+   */
+  let writeFaceCalls = 0
+  let declareCalls = 0
+  let inferCalls = 0
+  let clearCalls = 0
   let lastError: string | null = null
   /**
    * 冲突文本缓存（同步可读）。R8 要求把冲突**摆出来**，而提示注入的渲染函数
@@ -202,6 +239,33 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     return found
   }
 
+  /**
+   * 写入面的一句话（**与事实同步**）。
+   *
+   * 0 次调用时给 {@link PROFILE_WRITE_FACE_NOTE} 的固定说法；有调用之后
+   * 换成实际请求数——`declared = 0` 的两种可能因此永远可分辨。
+   */
+  function writeFaceNote(): string {
+    if (writeFaceCalls === 0) {
+      return `${PROFILE_WRITE_FACE_NOTE}：declare/infer/clearDeduced 自本模块启动以来收到 0 次请求`
+        + '——"0 条"不等于"用户没有偏好"，是**没有写入口**（observeCapability 另有自己的计数）'
+    }
+    return `写入面：自本模块启动以来收到 ${writeFaceCalls} 次写入请求`
+      + `（declare ${declareCalls} / infer ${inferCalls} / clearDeduced ${clearCalls}）`
+  }
+
+  /**
+   * 能力轴的会话表口径（**有 LRU 上界**，见 `CAPABILITY_SESSION_MAX`）。
+   *
+   * 两个数含义不同、不合并：当前表里有几个会话 vs 已被淘汰几个会话。
+   */
+  function capabilityScope(): string {
+    const sessions = capability.sessionCount()
+    const evicted = capability.evictedSessions()
+    return `能力观察会话表 ${sessions}/${capability.sessionMax()} 个会话（LRU 上界，每会话最多 ${CAPABILITY_ENTRIES_PER_SESSION} 条）`
+      + (evicted > 0 ? `，已淘汰 ${evicted} 个更早的会话` : '')
+  }
+
   function health(): ModuleHealth {
     const availability = storage.availability()
     /**
@@ -216,7 +280,7 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
      * 有了后两个，`0 条目` 就永远能归因。
      */
     const capabilityState = config.inferCapabilityAxis
-      ? '能力轴已开启：观察只存在于当前会话内存与 sessionProjections，不写任何存储（D4）'
+      ? '能力轴已开启：观察只存在于当前会话内存（**没有** sessionProjections 投影），不写任何存储（D4）'
       : '能力轴关闭（默认，D4）：不产生任何能力相关条目'
     const capabilityTraffic = capabilityAttempts === 0
       ? '能力观察：从未收到过调用（0 次请求）——这是"没触发"，不是"被关闭"'
@@ -226,23 +290,30 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
       inferred,
       conflicts,
       capabilitySessionEntries: capability.entryCount(),
+      capabilitySessions: capability.sessionCount(),
+      capabilitySessionsEvicted: capability.evictedSessions(),
       capabilityAttempts,
       capabilityRejectedBySwitch,
       capabilityRecorded,
+      // 写入面的请求数（0 = 真的没有调用方，见 writeFaceNote）
+      writeFaceCalls,
     }
+    // 三个分支都带上写入面与能力表口径：**0 条永远可归因**，
+    // 不允许出现"数字是 0，但没人知道为什么"的状态面。
+    const suffix = `${capabilityState}；${capabilityTraffic}；${capabilityScope()}；${writeFaceNote()}`
     if (!availability.ok) {
       return {
         state: 'degraded',
-        detail: `显式条目读写不可用——${availability.detail}；${capabilityState}；${capabilityTraffic}`,
+        detail: `显式条目读写不可用——${availability.detail}；${suffix}`,
         metrics,
       }
     }
     if (lastError !== null) {
-      return { state: 'degraded', detail: `最近一次画像操作失败：${lastError}；${capabilityState}；${capabilityTraffic}`, metrics }
+      return { state: 'degraded', detail: `最近一次画像操作失败：${lastError}；${suffix}`, metrics }
     }
     return {
       state: 'ok',
-      detail: `显式条目 ${declared} 条、推断条目 ${inferred} 条、未裁决冲突 ${conflicts} 组；${capabilityState}；${capabilityTraffic}`,
+      detail: `显式条目 ${declared} 条、推断条目 ${inferred} 条、未裁决冲突 ${conflicts} 组；${suffix}`,
       metrics,
     }
   }
@@ -305,6 +376,8 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     },
 
     declare(input, sessionId?: string) {
+      writeFaceCalls += 1
+      declareCalls += 1
       // 能力轴**永不落盘**（D4）：这里必须拒绝，否则调用方会以为"声明成功"而实际什么都没写。
       if ((input.axis as string) === 'capability') {
         return Promise.resolve({
@@ -325,6 +398,8 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     },
 
     infer(input, sessionId?: string) {
+      writeFaceCalls += 1
+      inferCalls += 1
       // 类型层已排除 capability，但运行期调用方可能绕过类型——这里是结构性兜底。
       if ((input.axis as string) === 'capability') {
         return Promise.resolve({
@@ -365,6 +440,8 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
     capability: sessionId => capability.list(sessionId),
 
     async clearDeduced(sessionId?: string): Promise<ClearResult> {
+      writeFaceCalls += 1
+      clearCalls += 1
       if (disposed) return { ok: false, removed: 0, error: '画像模块已卸载' }
       const capabilityRemoved = capability.entryCount()
       capability.clearAll()
@@ -392,7 +469,9 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
       const availability = storage.availability()
       return {
         available: availability.ok,
-        detail: availability.detail,
+        // 存储可用性 + 写入面事实：`available: true` 只说明"库能读能写"，
+        // 不说明"有人在写"——两件事必须分开说（见 PROFILE_WRITE_FACE_NOTE）。
+        detail: `${availability.detail}；${writeFaceNote()}`,
         capabilityAxis: config.inferCapabilityAxis ? 'on-session-only' : 'off',
         declared,
         inferred,

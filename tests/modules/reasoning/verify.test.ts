@@ -19,6 +19,9 @@ import {
   judgeClaim,
   recordVerify,
   summarizeVerify,
+  trackVerify,
+  createVerifyTracker,
+  summarizeTracker,
   verifyLine,
 } from '../../../modules/reasoning/verify.js'
 
@@ -201,5 +204,65 @@ describe('verifyLine / describeVerify：注入与状态面', () => {
 
   it('还没核对过时状态面如实说"尚无"', () => {
     expect(describeVerify(summarizeVerify([], 1))).toContain('尚无')
+  })
+})
+
+/**
+ * G3（P1）：台账的 32 条上限**只限制复盘窗口**，累计读数与未闭合数不受它影响。
+ *
+ * 修复前：`summarizeVerify(ledger,…).calls` 就是被 `slice` 后的长度，
+ * 于是第 33 次之后回执永远说"这是第 33 次"、状态面永远"验证：32 次"。
+ */
+describe('trackVerify / summarizeTracker：窗口滚动不改累计（G3）', () => {
+  it('超过 VERIFY_LEDGER_MAX 之后：台账只留最近 32 条，累计数仍是真实累计', () => {
+    const tracker = createVerifyTracker()
+    const total = VERIFY_LEDGER_MAX + 8
+    for (let index = 0; index < total; index += 1) {
+      trackVerify(tracker, record({ claim: `c${index}`, verdict: 'needs-evidence', overBudget: true }))
+    }
+    expect(tracker.ledger.length).toBe(VERIFY_LEDGER_MAX)
+    const summary = summarizeTracker(tracker, 1)
+    expect(summary.calls).toBe(total)
+    expect(summary.overBudget).toBe(total)
+    expect(summary.unresolved).toBe(total)
+    // 状态面这一行以前会停在 32
+    expect(describeVerify(summary)).toContain(`验证：${total} 次`)
+    expect(describeVerify(summary)).toContain(`超预算 ${total}`)
+  })
+
+  it('未闭合结论不随台账滚动消失；同一条结论重核后可核对 → 未闭合降下来', () => {
+    const tracker = createVerifyTracker()
+    trackVerify(tracker, record({ claim: 'c1', verdict: 'needs-evidence' }))
+    for (let index = 0; index < VERIFY_LEDGER_MAX + 4; index += 1) {
+      trackVerify(tracker, record({ claim: `later${index}`, verdict: 'checkable' }))
+    }
+    // c1 早已滚出窗口，但它仍是"未闭合的待办"
+    expect(tracker.ledger.some(item => item.claim === 'c1')).toBe(false)
+    expect(summarizeTracker(tracker, 3).unresolved).toBe(1)
+    // 补上来源重核 c1 → 待办清掉（数字按最新判定算，不是历史）
+    trackVerify(tracker, record({ claim: 'c1', verdict: 'checkable' }))
+    expect(summarizeTracker(tracker, 3).unresolved).toBe(0)
+  })
+
+  it('累计可核对数与"本回合几次"各自按自己的口径给：前者不滚动，后者按回合复位', () => {
+    const tracker = createVerifyTracker()
+    trackVerify(tracker, record({ claim: 'a', verdict: 'checkable', turn: 1 }))
+    trackVerify(tracker, record({ claim: 'b', verdict: 'checkable', turn: 1 }))
+    trackVerify(tracker, record({ claim: 'c', verdict: 'needs-evidence', turn: 2 }))
+    const summary = summarizeTracker(tracker, 3, 2)
+    expect(summary.calls).toBe(3)
+    expect(summary.checkable).toBe(2)
+    expect(summary.thisTurn).toBe(1)
+    // 换到第 3 回合：本回合 0 次（不是"上一次那个回合的数"）
+    expect(summarizeTracker(tracker, 3, 3).thisTurn).toBe(0)
+    // 不给回合号 → null（不猜、也不写 0）
+    expect(summarizeTracker(tracker, 3).thisTurn).toBeNull()
+  })
+
+  it('畸形记录也照常计数（累计不能因为一条脏数据丢数）', () => {
+    const tracker = createVerifyTracker()
+    trackVerify(tracker, { claim: 1, verdict: '瞎写' } as never)
+    expect(tracker.total).toBe(1)
+    expect(summarizeTracker(tracker, 1).lastVerdict).toBe('needs-evidence')
   })
 })

@@ -14,6 +14,7 @@ import type {
   Embedder,
   Kernel,
   MemoryScope,
+  MemoryStore,
   ModuleHealth,
   ModuleManifest,
   ModuleRegistration,
@@ -25,12 +26,13 @@ import type {
 import { SERVICES, catalogEntryOf, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
-import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
+import { createStoresService, asMemoryStore, asRecordScanner, type MemoryStoresService, type PrivacyGatePort } from './store.js'
+import { planConsolidation } from './consolidate.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import type { ArtifactKind } from './remember.js'
 import { createRememberTool } from './remember.js'
-import { verifyArtifactExists } from './artifacts.js'
+import { artifactVerificationDegradeReason, verifyArtifactExists } from './artifacts.js'
 import type { RetrievalChannel } from './retrieve.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
@@ -135,6 +137,131 @@ export interface MemoryWriteLedger {
 }
 
 /**
+ * 使用计数账本（M5）。
+ *
+ * 为什么单独记账：`use_count`/`last_used_at` 有了生产者之后，**写不成**也必须看得见——
+ * 否则"这条记忆被用过几次"又变回一个没有来源的数字（只是这次错在另一个方向）。
+ */
+export interface MemoryUsageLedger {
+  failures: number
+  /** 最近一次没写成的可读原因。 */
+  lastFailure: string
+}
+
+/**
+ * 离线整合的运行台账（M3）。
+ *
+ * 为什么要它：整合曾经**全链零生产消费者**（只在测试里存在），而状态面/健康面
+ * 一个字都不提——没人能看出"这件事没接线"。现在它每次运行（或失败）都留读数，
+ * 于是"没跑"与"跑了但没找到可合并的东西"在读数上是两件不同的事。
+ */
+export interface ConsolidationLedger {
+  /** 触发节奏（回合边界数），来自配置——写进读数，免得使用者去翻 cordis.patch.yml。 */
+  everyTurns: number
+  runs: number
+  /** 本次实际标失效（`validTo`+`supersededBy`）的条数（非破坏性，不删行）。 */
+  lastSuperseded: number
+  /** 本次实际发出的新边数（`supersedes` / `conflicts_with`）。 */
+  lastEdges: number
+  /** 本次参与塌缩的合并组数。 */
+  lastMergedGroups: number
+  /**
+   * 本次"独立来源 ≥ 2"的组数 = **够格谈晋升**的独立单元。
+   * 同源回响（`independentSources === 1`）不计入——这就是假晋升防线在读数上的形态。
+   */
+  lastIndependentUnits: number
+  /** 最近一次运行遇到的问题（空串 = 没有）。按库累积，绝不静默。 */
+  lastError: string
+}
+
+/** 单次整合扫描的条数上界：让每次运行的代价与库大小无关（见 `listRecentRecords`）。 */
+export const CONSOLIDATION_SCAN_LIMIT = 500
+
+/**
+ * 跑一轮离线整合（M3）：**离线、无 LLM、非破坏性**。
+ *
+ * 为什么按**库**分别规划而不是把所有库合起来：记录只属于一个库，
+ * 跨库合并既写不进去（`put` 会拒 scope 不符），也会让"谁取代了谁"跨库失真。
+ *
+ * 写侧严格按 `planConsolidation` 的产物执行：
+ * - `supersessions` → `put({...原记录, validTo, supersededBy})`：**只标失效、不删行**
+ *   （"我当时相信什么"必须仍可回答）；
+ * - `edges` → `upsertEdge`；
+ * - `decay` **不落盘**（它只是排序先验）；
+ * - `erasures` **不由本驱动器执行**：硬删除只走用户显式要求的 `omb_forget`
+ *   （本驱动不给 `erasureIds`，因此 `plan.erasures` 恒为空）。
+ *
+ * 绝不抛：任何一步失败都记进 `ledger.lastError`（状态面/健康面可见），
+ * 且单库失败不影响其它库。**重入由调用方保证**（`consolidating` 闸）。
+ */
+async function runConsolidationOnce(
+  kernel: Kernel,
+  service: MemoryStoresService,
+  ledger: ConsolidationLedger,
+): Promise<void> {
+  const now = kernel.clock.now()
+  const snapshot = service.snapshot()
+  /** 去重后的库（`snapshot()` 里每个项目套件都含用户库，不去重会白跑一遍）。 */
+  const targets = new Map<string, MemoryStore>()
+  for (const set of [snapshot.user, ...snapshot.projects]) {
+    if (set === undefined) continue
+    for (const tagged of set.stores) {
+      const key = asMemoryStore(tagged.store)?.dbPath
+      if (key !== undefined && !targets.has(key)) targets.set(key, tagged.store)
+    }
+  }
+
+  const problems: string[] = []
+  let superseded = 0
+  let edges = 0
+  let mergedGroups = 0
+  let independentUnits = 0
+
+  for (const [key, store] of targets) {
+    const scanner = asRecordScanner(store)
+    if (scanner === undefined) {
+      problems.push(`${key}：库不提供记录扫描面（asRecordScanner 未命中），本轮跳过`)
+      continue
+    }
+    try {
+      const records = await scanner.listRecentRecords({ limit: CONSOLIDATION_SCAN_LIMIT })
+      if (records.length < 2) continue
+      const plan = planConsolidation({ records }, { now })
+      mergedGroups += plan.merges.length
+      independentUnits += plan.stats.independentUnits
+      const byId = new Map(records.map(record => [record.id, record]))
+      for (const item of plan.supersessions) {
+        const target = byId.get(item.id)
+        if (target === undefined) continue
+        try {
+          await store.put({ ...target, validTo: item.validTo, supersededBy: item.supersededBy })
+          superseded += 1
+        } catch (error) {
+          problems.push(`${key}：标失效 ${item.id} 失败（${messageOf(error)}）`)
+        }
+      }
+      for (const edge of plan.edges) {
+        try {
+          await store.upsertEdge(edge)
+          edges += 1
+        } catch (error) {
+          problems.push(`${key}：写边 ${edge.fromId}→${edge.toId} 失败（${messageOf(error)}）`)
+        }
+      }
+    } catch (error) {
+      problems.push(`${key}：读取或规划失败（${messageOf(error)}）`)
+    }
+  }
+
+  ledger.runs += 1
+  ledger.lastSuperseded = superseded
+  ledger.lastEdges = edges
+  ledger.lastMergedGroups = mergedGroups
+  ledger.lastIndependentUnits = independentUnits
+  ledger.lastError = problems.join('；')
+}
+
+/**
  * 健康面。
  *
  * ## 这里**不再**报库路径/行数/已打开项目库/会话→cwd 计数
@@ -151,6 +278,8 @@ export interface MemoryWriteLedger {
 async function describeHealth(
   service: MemoryStoresService,
   ledger: MemoryWriteLedger | undefined,
+  usage: MemoryUsageLedger | undefined,
+  consolidation: ConsolidationLedger | undefined,
 ): Promise<ModuleHealth> {
   const status = service.status()
   const snapshot = service.snapshot()
@@ -190,6 +319,7 @@ async function describeHealth(
     metrics['writes'] = ledger.writes
     metrics['abstentions'] = ledger.abstentions
   }
+  if (usage !== undefined && usage.failures > 0) metrics['usageFailures'] = usage.failures
 
   // 目录漂移是**契约问题**，必须留声（task-6 把 requires/capabilities 改成从目录派生后，
   // 这里不再有一个 `CATALOG` 变量，直接查目录本身）。
@@ -207,7 +337,33 @@ async function describeHealth(
   // 「无空降级」：降级时原因仍写在本行，只是**不抄计数**。
   const why = service.failure()
   const pointer = '库、路径与计数见「存储」段（本行是健康上报快照，不重复报实时读数）'
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}`
+  // 工件核验的降级也要可见：核验不了时准入结论只会表现为"这条不算依据"，
+  // 而真因（不是 git 仓库 / git 不可执行 / 超时）没有任何别的地方说。
+  const artifactWhy = artifactVerificationDegradeReason()
+  const artifactNote =
+    artifactWhy === null ? '' : `；⚠ 最近一次工件核验降级（该条的工件不算依据）：${artifactWhy}`
+  // 使用计数是唯一能回答"这条记忆被用过几次"的账；它写不成时照样要有人喊
+  const usageNote =
+    usage === undefined || usage.failures === 0
+      ? ''
+      : `；⚠ 使用计数未写成 ${usage.failures} 次（最近：${usage.lastFailure.slice(0, 60)}${
+          usage.lastFailure.length > 60 ? '…' : ''
+        }）`
+  // 离线整合（M3）：曾经全链零生产消费者，读数上一个字都没有——现在跑没跑、跑了什么都在这里
+  const consolidationNote =
+    consolidation === undefined
+      ? ''
+      : consolidation.runs === 0
+        ? `；离线整合：已接线（每 ${consolidation.everyTurns} 个回合边界跑一次；本进程尚未到点）`
+        : `；离线整合：已运行 ${consolidation.runs} 次（最近一次合并 ${consolidation.lastMergedGroups} 组、` +
+          `标失效 ${consolidation.lastSuperseded} 条、新边 ${consolidation.lastEdges} 条；` +
+          `独立来源≥2 的组 ${consolidation.lastIndependentUnits} 个）` +
+          (consolidation.lastError.length === 0
+            ? ''
+            : `；⚠ 整合最近一次有失败：${consolidation.lastError.slice(0, 120)}${
+                consolidation.lastError.length > 120 ? '…' : ''
+              }`)
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${consolidationNote}`
 
   if (why === undefined && status.ready) {
     return { state: 'ok', detail, metrics }
@@ -233,10 +389,12 @@ export interface MemoryModuleOptions {
 export function createMemoryRegistration(options: MemoryModuleOptions = {}): ModuleRegistration<MemoryConfig> {
   let current: MemoryStoresService | undefined
   let ledgerRef: MemoryWriteLedger | undefined
+  let usageRef: MemoryUsageLedger | undefined
+  let consolidationRef: ConsolidationLedger | undefined
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '3.4.0',
+    version: options.version ?? '3.5.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,
@@ -246,7 +404,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         return { state: 'degraded', detail: '模块未启动：apply 尚未执行（或已被卸载）' }
       }
       try {
-        return await describeHealth(service, ledgerRef)
+        return await describeHealth(service, ledgerRef, usageRef, consolidationRef)
       } catch (error) {
         // health() 自身绝不抛：状态面拿不到原因比拿到"检查失败"更糟
         return { state: 'degraded', detail: `健康检查失败：${messageOf(error)}` }
@@ -296,11 +454,64 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       })
 
       /**
+       * 离线整合的**回合边界驱动**（M3）。
+       *
+       * ## 事实核验（本轮实读代码，不是照抄规划稿）
+       *
+       * `kernel/abi/kernel.ts:29` 声明了 `'turn/end': { sessionId, turn }`，
+       * 而 `dsh/session.ts:815` 在宿主 `step/end` 时把它发到**内核总线**上
+       * （紧邻那行就是 `flushVectorEncoder`）。因此本模块可以直接订阅它——
+       * 不需要 `dsh/` 配合，也就不必动 S1 的文件。
+       * 规划稿的退路（"以下一个 `turn/start` 作为上一回合边界"）因此**不必用**：
+       * 这里用的是真正的回合结束事件。
+       *
+       * ## 口径
+       *
+       * - 计数是**全局**的（跨会话）：整合遍历所有已打开库，不按会话分片；
+       * - 每 `consolidationEveryTurns` 个回合边界跑一次（`consolidationEveryTurns`
+       *   从此是**活的**配置，不再是只进一条 debug 日志的死旋钮）；
+       * - 回调**立即返回**，真正的活在 `void` 起的异步链里：回合边界绝不能被整合拖住；
+       * - 重入闸：上一轮还在跑时不再启动新的一轮（不重复标失效、不重复发边）。
+       */
+      /** 离线整合台账（见 `ConsolidationLedger`）：跑没跑、跑了什么、出没出错都在这里。 */
+      const consolidationLedger: ConsolidationLedger = {
+        everyTurns: config.consolidationEveryTurns,
+        runs: 0,
+        lastSuperseded: 0,
+        lastEdges: 0,
+        lastMergedGroups: 0,
+        lastIndependentUnits: 0,
+        lastError: '',
+      }
+      consolidationRef = consolidationLedger
+      let turnsSinceConsolidation = 0
+      let consolidating = false
+      const offTurnEnd = kernel.on('turn/end', () => {
+        turnsSinceConsolidation += 1
+        if (consolidating) return
+        if (turnsSinceConsolidation < config.consolidationEveryTurns) return
+        turnsSinceConsolidation = 0
+        consolidating = true
+        void runConsolidationOnce(kernel, service, consolidationLedger)
+          .catch((error: unknown) => {
+            // 驱动器自己绝不抛；这一层只是防未来的改动引入未捕获的 rejection
+            consolidationLedger.runs += 1
+            consolidationLedger.lastError = `整合运行异常（已隔离）：${messageOf(error)}`
+          })
+          .finally(() => {
+            consolidating = false
+          })
+      })
+
+      /**
        * 写入账本。**弃权必须可审计**（§5.6）：弃权率是发现"该记的没记"的唯一手段。
        * 通过 health 的 metrics 与 detail 暴露给状态面。
        */
       const ledger: MemoryWriteLedger = { writes: 0, abstentions: 0, lastAbstention: '' }
       ledgerRef = ledger
+      /** 使用计数账本（见 `MemoryUsageLedger`）：写不成也要可见。 */
+      const usageLedger: MemoryUsageLedger = { failures: 0, lastFailure: '' }
+      usageRef = usageLedger
 
       /**
        * 解析本次调用该用哪些库。
@@ -335,6 +546,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           // 压力是**按会话**的读数：没有会话就不施压（不拿别人的读数塑形本次检索）
           pressureBand: sessionId =>
             sessionId === undefined ? undefined : kernel.pressure(sessionId).band,
+          // 使用计数写不成：计数 + 原因进健康面（记账失败不改变召回结果，但绝不静默）
+          onUsageFailure: info => {
+            usageLedger.failures += 1
+            usageLedger.lastFailure = info.reason
+            kernel.logger.warn(`OMB：使用计数未写成（${info.ids.length} 条）——${info.reason}`)
+          },
         }),
         createRelateTool({ resolveStores }),
         // ── 写入路径（规划 §5.6 在线部分）：不写，两个库永远是空的 ──────────────
@@ -364,7 +581,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
            *
            * 这里按语义解析相对路径，主查 cwd。**基准目录优先本次调用的会话**：
            * 拿错 cwd 只会让核验更保守（判成不存在 → 不算依据），不会收下假事实。
-           * 只做同步 `existsSync`：一次系统调用，准入路径上可接受。
+           * 代价是**一次同步 `git ls-files`**（不是 `existsSync`）：
+           * 按 cwd 复用索引窗口 64 次核验，**负结果同样缓存**（非 git 目录下不会每条都 spawn），
+           * 降级原因见 `./artifacts.ts` 的 `artifactVerificationDegradeReason()`（进健康面）。
            * 任何异常都返回 `undefined`（=核验不了 → 不算依据），绝不抛。
            */
           verifyArtifact: (candidate: string, kind: ArtifactKind, sessionId?: string) => {
@@ -440,8 +659,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         })
 
       kernel.logger.debug(
-        `omb-memory：consolidationEveryTurns=${config.consolidationEveryTurns}，` +
-          `embeddingThreads=${config.embeddingThreads}（存储层不消费，供整合与向量子能力读取）`,
+        `omb-memory：consolidationEveryTurns=${config.consolidationEveryTurns}（已接线：每这么多个回合边界` +
+          `跑一次离线整合，见 apply 里的 turn/end 订阅），` +
+          `embeddingThreads=${config.embeddingThreads}（存储层不消费，供向量子能力读取）`,
       )
 
       return async (): Promise<void> => {
@@ -449,6 +669,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         for (const [label, close] of [
           ['工具服务', offTools],
           ['回合订阅', offTurn],
+          ['回合结束订阅', offTurnEnd],
           ['stores 服务', off],
         ] as const) {
           try {
@@ -459,6 +680,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         }
         if (current === service) current = undefined
         if (ledgerRef === ledger) ledgerRef = undefined
+        if (usageRef === usageLedger) usageRef = undefined
+        if (consolidationRef === consolidationLedger) consolidationRef = undefined
         await service.dispose()
       }
     },

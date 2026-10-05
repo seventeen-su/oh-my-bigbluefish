@@ -178,15 +178,15 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
 /**
  * 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。
  *
- * ⚠️ **当前最高版本 2 与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（仍为 1）不一致。**
- * 这不是笔误：`kernel/**` 此刻由另一个 agent 在改，本轮不许碰。而 `migrate()` 在
- * **缺省步骤表**下会做一次契约漂移自检（`target !== SCHEMA_VERSION` → 抛），
- * 于是唯一诚实的走法是：打开库的一方把本表**显式**传进去（`store.ts` 的 `openMemoryStore`），
- * 让自检在"显式给了步骤表"这条分支上按设计跳过。
+ * **当前最高版本 2，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 2）一致。**
+ * 这条一致性是**有自检的**：`migrate()` 在缺省步骤表下会比对"表最高版本 vs `SCHEMA_VERSION`"，
+ * 不一致就抛"契约漂移"。而打开库的一方（`store.ts` 的 `openMemoryStore`）**不传步骤表**，
+ * 正是为了让这条自检继续跑——所以**不许**再靠"显式传表"绕过它：
+ * 那等于把自检关掉，"迁移表与 ABI 漂移"这件事从此没人喊（v2 落地时踩过这个坑，现已收口）。
  *
- * 为什么仍然要加这一步而不是等 ABI：库结构缺口（`embedding` 没有 `content_hash`）是**真实缺陷**，
+ * 为什么当初要加 v2 而不是等 ABI：库结构缺口（`embedding` 没有 `content_hash`）是**真实缺陷**，
  * 会让"正文被改写但嵌入器没换"的记忆永远拿着过时的向量参与检索（检索结果莫名其妙，且不报错）。
- * 迁移是**加法**的（新列可空），旧库原地升级、不重建；代价只是上面这条待收口的版本号差异。
+ * 迁移是**加法**的（新列可空），旧库原地升级、不重建。
  */
 export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 1, name: 'initial-schema', up: applySchemaV1 },

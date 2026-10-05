@@ -49,15 +49,23 @@ import {
 import type { LoopSignal, TurnFingerprint } from './loop.js'
 import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } from './loop.js'
 import type { MethodCard, RuleId } from './methods.js'
-import { CARDS_BY_DEPTH, METHOD_CARDS, cardById, cardsFor, residentHint } from './methods.js'
+import { CARDS_BY_DEPTH, METHOD_CARDS, cardById, cardsFor, renderIndex, residentHint } from './methods.js'
 import type { VerifyInput, VerifyOutcome } from './tools.js'
 import { createReasoningTools } from './tools.js'
-import type { VerifyLedger } from './verify.js'
-import { VERDICT_TEXT, describeVerify, judgeClaim, recordVerify, summarizeVerify, verifyLine } from './verify.js'
+import type { VerifyTracker } from './verify.js'
+import {
+  VERDICT_TEXT,
+  createVerifyTracker,
+  describeVerify,
+  judgeClaim,
+  summarizeTracker,
+  trackVerify,
+  verifyLine,
+} from './verify.js'
 import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
-export const MODULE_VERSION = '3.4.0'
+export const MODULE_VERSION = '3.5.0'
 
 /** 配置：`cordis.patch.yml` 的 `config` 段。 */
 export interface ReasoningConfig {
@@ -110,8 +118,11 @@ interface SessionState {
   explicitDepth: FocusDepth | undefined
   lastReason: string
   lastSignal: LoopSignal | null
-  /** Verify 台账：本会话核对过的结论（形式核对，见 `verify.ts`）。 */
-  verify: VerifyLedger
+  /**
+   * Verify 读数：**滚动台账 + 单调累计 + 每条结论的最新判定**（见 `verify.ts` 的
+   * `VerifyTracker`）。累计与未闭合不随台账的 32 条上限消失——那是 G3 的修法核心。
+   */
+  verify: VerifyTracker
   /** 当前回合号（`turn/start` 推进）；状态面据它回答"本回合验证了几次"。 */
   turn: number
 }
@@ -121,7 +132,14 @@ function messageOf(error: unknown): string {
 }
 
 function newSessionState(): SessionState {
-  return { window: [], explicitDepth: undefined, lastReason: '', lastSignal: null, verify: [], turn: 0 }
+  return {
+    window: [],
+    explicitDepth: undefined,
+    lastReason: '',
+    lastSignal: null,
+    verify: createVerifyTracker(),
+    turn: 0,
+  }
 }
 
 /**
@@ -142,6 +160,14 @@ interface RenderTrace {
   readonly delivered: readonly RuleId[]
   /** 产出的 context 字符数；0 = 本轮确实什么都没注入。 */
   readonly chars: number
+  /**
+   * 真的进了上下文的东西（`指令`/`读数`/`索引`/`卡片`/`验证段`/`循环提示` 的组合）。
+   *
+   * 为什么留这个痕：状态面原来把"没含卡片正文"一律说成"只给了指令"，
+   * 而紧张档改后进的是**读数+索引**、`standard` 有未闭合结论时进的是**验证段**——
+   * 标签与内容对不上，正是本模块要消灭的那类"读数说谎"。
+   */
+  readonly form: string
   /** 控制读数（参数行）占的字符数——档位差异的文本成本，恒定一行。 */
   readonly controlChars: number
   /** 验证段占的字符数（有未闭合项才出现）。 */
@@ -192,7 +218,9 @@ function describeLastRender(trace: RenderTrace | null, failures: number, lastFai
     )
   } else if (trace.delivered.length === 0) {
     bits.push(
-      `上次注入：只给了指令未含卡片（${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；请求 ${idList(trace.requested)}；会话 ${trace.session}）`,
+      `上次注入：只给了${trace.form === '' ? '指令' : trace.form}、未含卡片正文`
+      + `（${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}；`
+      + `请求 ${idList(trace.requested)}；会话 ${trace.session}）`,
     )
   } else {
     // 声明数 > 注入数不是失败：自动注入钉死在 1 张以内，其余按需拉取
@@ -249,6 +277,11 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
 
     /** 渲染留痕与失败计数：状态面据此把"说了要注入"变成可核验的事实。 */
     let lastRender: RenderTrace | null = null
+    /**
+     * 还没有会话状态时的空读数组（渲染是热路径，别每轮新建一个 Map）。
+     * `summarizeTracker` 不改它，所以可以共用。
+     */
+    const emptyVerify = createVerifyTracker()
     let renderFailures = 0
     let lastRenderFailure = ''
     /** Verify 读数（模块级累计 + 最近一次），状态面与健康面共用。 */
@@ -285,7 +318,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
       for (const [session, state] of sessions) {
         if (state.lastSignal !== null) withSignal += 1
         const depth = peekFocus(kernel, session) ?? state.explicitDepth ?? 'standard'
-        unresolved += summarizeVerify(state.verify, controlOf(depth).verifyBudget, state.turn).unresolved
+        unresolved += summarizeTracker(state.verify, controlOf(depth).verifyBudget, state.turn).unresolved
       }
       const classified = [...failureCounts.values()].reduce((sum, count) => sum + count, 0)
       const parts = [
@@ -437,9 +470,16 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
 
         if (input.claim !== undefined) {
           const judgement = judgeClaim({ claim: input.claim, evidence: input.evidence, falsifier: input.falsifier })
-          const used = summarizeVerify(state.verify, control.verifyBudget, state.turn).calls
+          /**
+           * 次数读**单调累计**，不读台账长度（G3）。
+           *
+           * 台账上限 32 条只影响"最近发生了什么"；此前这里读的是被 `slice` 后的长度，
+           * 于是第 33 次之后回执永远说"这是第 33 次"、`overBudget` 判据也永远停在第 33 次，
+           * 而同一次 `omb_status` 的健康行报的是模块级真实累计——两个面互相矛盾。
+           */
+          const used = state.verify.total
           const overBudget = control.verifyBudget <= 0 || used + 1 > control.verifyBudget
-          state.verify = recordVerify(state.verify, {
+          trackVerify(state.verify, {
             claim: judgement.claim,
             verdict: judgement.verdict,
             at: now(),
@@ -507,7 +547,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
      * ④ 验证段：**有未闭合结论才出现**，与档位无关（是状态，不是档位）
      * ⑤ 循环提示：有信号才出现（≤80 字符）
      *
-     * 紧张档只留索引行（内容全部转工具拉取），与既有语义一致。
+     * 紧张档：**读数保留 + 真的给索引**（内容全部转工具拉取）。
      * 档位来源的裁决见 `resolveRenderDepth`；两者分歧必定留痕。
      */
     const contribution: PromptContribution = {
@@ -525,31 +565,64 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           if (depthDivergence !== '') kernel.logger.warn(`${MODULE_ID}：${depthDivergence}`)
 
           const control: DepthControl = controlOf(depth)
-          const ledger = state?.verify ?? []
-          const verifySummary = summarizeVerify(ledger, control.verifyBudget)
+          const verifySummary = summarizeTracker(state?.verify ?? emptyVerify, control.verifyBudget, state?.turn)
           const projection = projectFocus(depth, verifySummary.calls)
           const tight = input.band === 'tight'
 
           const parts: string[] = []
+          /** 真的进了上下文的东西（状态面留痕用）——标签必须与内容对得上。 */
+          const given: string[] = []
           let verifyOnly = ''
+          let verifyChars = 0
+          // 紧张档的判据：这一档本来就有可注入内容（读数或卡片），压缩才有意义
           const substantive = projection.controlText !== '' || projection.cards.length > 0
           if (tight) {
-            // quick 的抑制指令是"少想"，压力再大也不该被吞掉
-            if (projection.directive !== '') parts.push(projection.directive)
-            if (substantive) parts.push('上下文紧张：规则卡与验证改用 omb_method / omb_verify 取。')
+            // ① quick 的抑制指令是"少想"，压力再大也不该被吞掉
+            if (projection.directive !== '') {
+              parts.push(projection.directive)
+              given.push('指令')
+            }
+            // ② 控制读数是**档位差异的唯一载体**（`control.ts` 的 `controlLine`），
+            //    且受 CONTROL_LINE_MAX 约束只有一行——紧张档压缩的是卡片正文，
+            //    不是读数。此前这里把读数整段丢掉，deep 在压力过 0.6 后退化成与
+            //    standard 无差别，而回执与工具描述承诺的恰好相反（G2）。
+            if (projection.controlText !== '') {
+              parts.push(projection.controlText)
+              given.push('读数')
+            }
+            // ③ 承诺"规则卡只给索引"就**真的给索引**：
+            //    `renderIndex()` 只给编号+标题+何时用，不含正文（正文仍用 omb_method 取）。
+            //    只在本来就有可注入内容的档位给——`standard` 是基线（常驻提示已逐字承载
+            //    R1 的动作），紧张档不为它额外塞文本。
+            if (substantive && projection.needs.length > 0) {
+              parts.push(renderIndex(cardsFor(depth)))
+              given.push('索引')
+            }
           } else {
             const body = renderProjection(projection, true)
-            if (body !== '') parts.push(body)
+            if (body !== '') {
+              parts.push(body)
+              if (projection.directive !== '') given.push('指令')
+              if (projection.controlText !== '') given.push('读数')
+              if (projection.cards.length > 0) given.push('卡片')
+            }
             // 验证段是**状态**驱动：有未闭合结论才出现，不随档位增减
             if (control.verifyBudget > 0) {
               verifyOnly = verifyLine(verifySummary)
-              if (verifyOnly !== '') parts.push(verifyOnly)
+              if (verifyOnly !== '') {
+                parts.push(verifyOnly)
+                given.push('验证段')
+                verifyChars = verifyOnly.length
+              }
             }
           }
 
           const signal = state?.lastSignal ?? null
           const loopLine = renderLoopSignal(signal)
-          if (loopLine !== '') parts.push(loopLine)
+          if (loopLine !== '') {
+            parts.push(loopLine)
+            given.push('循环提示')
+          }
           const text = parts.join('\n')
 
           // 可核验留痕：按正文逐张确认卡真的进了上下文，而不是"我们打算注入"。
@@ -561,11 +634,12 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
             requested: CARDS_BY_DEPTH[depth] ?? [],
             delivered: projection.cards.filter(card => text.includes(card.text)).map(card => card.id),
             chars: text.length,
+            form: given.join('+'),
             controlChars:
               projection.controlText !== '' && text.includes(projection.controlText)
                 ? projection.controlText.length
                 : 0,
-            verifyChars: verifyOnly !== '' && text.includes(verifyOnly) ? verifyOnly.length : 0,
+            verifyChars: verifyOnly !== '' && text.includes(verifyOnly) ? verifyChars : 0,
             depthDivergence,
           }
           // 上报一次：否则内核健康面停留在上一次事件的快照，与 omb_status 里的
@@ -608,15 +682,16 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
             // 只写"有事发生"的会话：显式设过档位（含理由，供事后判断旋钮是否有用）、
             // 检出过循环信号、或核对过结论。安静的会话不占行。
             const signal = state.lastSignal
-            if (signal === null && state.explicitDepth === undefined && state.verify.length === 0) continue
+            if (signal === null && state.explicitDepth === undefined && state.verify.total === 0) continue
             const bits: string[] = []
             if (state.explicitDepth !== undefined) {
               bits.push(`深度 ${state.explicitDepth}${state.lastReason === '' ? '' : `（理由：${state.lastReason}）`}`)
             }
             if (signal !== null) bits.push(`${signal.kind}——${signal.detail}`)
-            if (state.verify.length > 0) {
+            if (state.verify.total > 0) {
               const depth = peekFocus(kernel, session) ?? state.explicitDepth ?? 'standard'
-              bits.push(describeVerify(summarizeVerify(state.verify, controlOf(depth).verifyBudget, state.turn)))
+              // 累计量取自 tracker 的单调计数器：台账 32 条上限不再让这一行"停在 32"
+              bits.push(describeVerify(summarizeTracker(state.verify, controlOf(depth).verifyBudget, state.turn)))
             }
             lines.push(`会话 ${session}：${bits.join('；')}`)
           }

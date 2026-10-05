@@ -22,9 +22,36 @@
 import type { Kernel } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
 
-/** `ArtifactService` 中本层用到的那一部分。 */
+/** `ArtifactService` 中本层用到的那一部分（结构面，与 `modules/artifact` 的真实签名一致）。 */
 interface ArtifactRecorder {
-  record(path: string, options?: { readonly kind?: string }): unknown
+  record(path: string, options?: { readonly kind?: string }, sessionId?: string): unknown
+}
+
+/**
+ * 工具名 → 制品类型。
+ *
+ * 为什么不交给模块侧推：**模块看不到工具名**（它只收到一条路径）。而"这条路径是
+ * 一次 `read` 给的还是一个目录"这个信息只在事件载荷里，所以映射必须发生在本层。
+ * 白名单之外的工具一律不猜（模块侧落回 `unknown`）。
+ */
+const TOOL_KINDS: ReadonlyMap<string, string> = new Map([
+  ['read', 'file'],
+  ['write', 'file'],
+  ['edit', 'file'],
+  ['read_image', 'file'],
+  ['glob', 'dir'],
+  ['grep', 'dir'],
+])
+
+/** 取一个非空字符串字段。取不到返回 `undefined`——**不猜**（与 `pathsFromToolCall` 同一条纪律）。 */
+function pickString(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  try {
+    const raw = (value as Record<string, unknown>)[key]
+    return typeof raw === 'string' && raw.length > 0 ? raw : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -71,6 +98,26 @@ export function wireArtifactIndex(options: {
   const { ctx, kernel } = options
   if (typeof ctx.on !== 'function') return () => {}
 
+  /**
+   * 写入失败**必须留声**，但只留一次：观察者挂在事件总线上，刷屏比不说话更坏。
+   *
+   * 旧实现这里是纯 `catch {}`——于是"索引一条都没进"这件事在日志里、
+   *  健康面里、状态面里**都没有任何字样**，用户只能看到 `omb_files` 说"没有制品"。
+   */
+  let recordFailureNoted = false
+  const noteRecordFailure = (error: unknown): void => {
+    if (recordFailureNoted) return
+    recordFailureNoted = true
+    try {
+      kernel.logger.warn(
+        'OMB：制品索引写入失败（同类失败本会话只报一次）——'
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    } catch {
+      // 日志本身失败不得影响观察者
+    }
+  }
+
   let off: (() => void) | undefined
   try {
     /**
@@ -116,11 +163,25 @@ export function wireArtifactIndex(options: {
         if (paths.length === 0) return
         const artifact = kernel.service<ArtifactRecorder>(SERVICES.artifact)
         if (artifact === undefined || typeof artifact.record !== 'function') return
+        /**
+         * 会话归属与类型**载荷里就有**，旧实现一个都没传：
+         *
+         * - 不传 `sessionId` → 模块侧的隐私闸门把每次写入都判成"归属未知"，
+         *   于是只要**存在任一受限会话**，所有会话的制品索引就静默停更
+         *   （`modules/artifact/index.ts` 的 `#writeDenial`）；
+         * - 不传 `kind` → 索引里的类型恒为 `unknown`，而 `omb_files` 的输出里
+         *   有"类型"这一列。
+         *
+         * `session/event` 的第一参就是 session 对象（`packages/core/session/src/types.ts:361`）。
+         */
+        const sessionId = pickString(args[0], 'id')
+        const kind = TOOL_KINDS.get(name)
         for (const path of paths) {
           try {
-            artifact.record(path)
-          } catch {
-            // 单条失败不得影响其余，也不得把异常带回事件总线
+            artifact.record(path, kind === undefined ? undefined : { kind }, sessionId)
+          } catch (error) {
+            // 单条失败不得影响其余，也不得把异常带回事件总线；但要留声
+            noteRecordFailure(error)
           }
         }
       } catch {

@@ -148,7 +148,18 @@ export interface VerifyRecord {
 
 export type VerifyLedger = readonly VerifyRecord[]
 
-/** 台账上限：只用于状态面复盘，不参与判定。 */
+/**
+ * 台账上限：**它只限制"复盘窗口"**（最近 `VERIFY_LEDGER_MAX` 条记录）。
+ *
+ * ⚠️ 这句话以前与实现相反（G3）：回执里的"这是第 N 次"、`overBudget` 判据、
+ * 状态面的"验证 N 次"读的都是被这个上限截断后的长度，于是同一个会话里
+ * 第 33 次之后永远说"这是第 33 次"、状态面永远停在"验证：32 次"，
+ * 而同一次输出里健康行报的是模块级真实累计——两个面互相矛盾。
+ *
+ * 现在**累计量一律走 `VerifyTracker` 的单调计数器**（`total`/`checkable`/`overBudget`），
+ * 台账只回答"最近发生了什么"（最近结论、最近判定、本回合几次）。
+ * 改这个数字前请先看：它只影响复盘窗口的深度，不影响任何判定。
+ */
 export const VERIFY_LEDGER_MAX = 32
 
 /** 追加一条记录，保留最近 `max` 条。纯函数。 */
@@ -163,8 +174,64 @@ export function recordVerify(
   return next.length > limit ? next.slice(next.length - limit) : next
 }
 
+/**
+ * 每会话的验证读数（`SessionState` 持有）。**两套记账，回答两个不同的问题**：
+ *
+ * - `ledger`：**滚动窗口**（最近 `VERIFY_LEDGER_MAX` 条）——复盘"最近发生了什么"；
+ * - `total` / `checkable` / `overBudget`：**单调累计**——回答"这个会话一共核对了几次"；
+ * - `latest`：每条结论的**最新判定**，只增改、不随窗口滚动淘汰——未闭合结论是
+ *   **待办**，待办不该因为发生得早而被忘掉（否则它被挤出窗口后，注入里的验证段
+ *   会直接消失，模型再也不会被提醒还有没核对的结论）。
+ *
+ * 可变对象（与 `PrivacyState` 的槽持有者同一处理方式）：`apply` 内每会话一份。
+ */
+export interface VerifyTracker {
+  ledger: VerifyLedger
+  /** 累计核对次数（**不受台账上限影响**）。 */
+  total: number
+  /** 累计判定为"形式可核对"的次数。 */
+  checkable: number
+  /** 累计超预算次数。 */
+  overBudget: number
+  /** 结论 → 最新判定（键与 `summarizeVerify` 内部同一把，见 `claimKey`）。 */
+  latest: Map<string, VerifyVerdict>
+  /** 最近一条记录所在的回合号。 */
+  turn: number
+  /** 该回合内的核对次数。 */
+  thisTurn: number
+}
+
+export function createVerifyTracker(): VerifyTracker {
+  return { ledger: [], total: 0, checkable: 0, overBudget: 0, latest: new Map(), turn: 0, thisTurn: 0 }
+}
+
+/** 记一条核对：窗口照旧滚动，**累计与最新判定只增不减**。变异同一个 tracker 并返回。 */
+export function trackVerify(
+  tracker: VerifyTracker,
+  record: VerifyRecord,
+  max: number = VERIFY_LEDGER_MAX,
+): VerifyTracker {
+  const normalized = normalizeRecord(record)
+  tracker.ledger = recordVerify(tracker.ledger, normalized, max)
+  tracker.total += 1
+  if (normalized.verdict === 'checkable') tracker.checkable += 1
+  if (normalized.overBudget) tracker.overBudget += 1
+  tracker.latest.set(claimKey(normalized.claim), normalized.verdict)
+  if (normalized.turn !== tracker.turn) {
+    tracker.turn = normalized.turn
+    tracker.thisTurn = 0
+  }
+  tracker.thisTurn += 1
+  return tracker
+}
+
 export interface VerifySummary {
-  /** 台账里的调用次数（本会话累计）。 */
+  /**
+   * 核对次数（本会话累计）。
+   *
+   * 由 `summarizeTracker` 汇总时是**单调累计**（不受台账上限影响）；
+   * 直接传台账给 `summarizeVerify` 时是窗口内的条数。
+   */
   readonly calls: number
   /**
    * **本回合**的调用次数；调用方没给回合号时为 null（不猜、不写 0）。
@@ -175,6 +242,8 @@ export interface VerifySummary {
   /**
    * **未闭合**的结论数：按结论文本取最新一条，仍未过形式核对的条数。
    * 同一条结论补上来源后重核，数字会降下来——它衡量的是待办，不是历史。
+   *
+   * 由 `summarizeTracker` 汇总时取自"最新判定表"，**不随台账滚动消失**（G3）。
    */
   readonly unresolved: number
   /** 超预算的调用次数。 */
@@ -217,6 +286,35 @@ export function summarizeVerify(ledger: VerifyLedger, budget: number, currentTur
     budget: Number.isFinite(budget) ? Math.max(0, Math.floor(budget)) : 0,
     lastVerdict: last === null ? null : last.verdict,
     lastClaim: last === null ? '' : last.claim,
+  }
+}
+
+/**
+ * 汇总 **tracker**：累计量取单调计数器，窗口量取台账。
+ *
+ * 台账能回答的问题（最近结论、最近判定、本回合几次）从台账取；
+ * 累计量（一共几次 / 可核对几次 / 超预算几次 / 还有几条未闭合）从计数器取——
+ * 被 `slice` 掉的记录只影响"最近"，不影响"一共"（G3）。
+ *
+ * `currentTurn` 给定时 `thisTurn` 是**该回合**的累计（回合没变才用计数器）；
+ * 不给时为 null（不猜、也不写 0）。
+ */
+export function summarizeTracker(
+  tracker: VerifyTracker,
+  budget: number,
+  currentTurn?: number,
+): VerifySummary {
+  const base = summarizeVerify(tracker.ledger, budget, currentTurn)
+  const trackTurn = typeof currentTurn === 'number' && Number.isFinite(currentTurn)
+  let unresolved = 0
+  for (const verdict of tracker.latest.values()) if (verdict !== 'checkable') unresolved += 1
+  return {
+    ...base,
+    calls: tracker.total,
+    checkable: tracker.checkable,
+    overBudget: tracker.overBudget,
+    thisTurn: trackTurn ? (tracker.turn === currentTurn ? tracker.thisTurn : 0) : null,
+    unresolved,
   }
 }
 

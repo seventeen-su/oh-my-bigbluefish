@@ -109,6 +109,58 @@ export class PrivacyState {
     return this.#deps.sessions.for(sessionId) ?? null
   }
 
+  /**
+   * 该会话在**本进程内**是否真的活跃过。
+   *
+   * 判据只有一条：运行态条目上有没有**真的接受过观测**——
+   * `SessionRuntimeTable.note()` → `accept()` 才会写 `lastTurn` / `observations`。
+   * 从状态文件重放进来的条目只 `ensure()` 了容器条目、没有任何观测，
+   * 因此它是"历史记录"，不是"活着的会话"。
+   *
+   * 用途：`PrivacyGate` 的 `isActive` 端口（`#anyRestricted()` 的唯一判据）。
+   * 已结束的会话不可能再产生新内容，它的限制不该继续掐住**全进程**；
+   * 而真的活着的受限会话必须继续拒绝（fail-closed 不放宽）。
+   *
+   * 拿不准时返回 `true`：判不出来就按活跃处理，安全方向是宁可不放行归属未知的写。
+   */
+  isActive(sessionId: string): boolean {
+    try {
+      const runtime = this.#deps.sessions.for(sessionId)
+      if (runtime === undefined) return false
+      return runtime.lastTurn !== null || runtime.observations > 0
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * 本进程内是否存在**活跃且生效模式受限**的会话（**含继承**）。
+   *
+   * 与 `isActive()` 的分工：那个只回答"这条记录还活着吗"，这个回答
+   * "现在是否真的有受限会话在跑"——判据用 `decide()` 的**同一套解析**（本会话显式
+   * → 沿血缘向上 → 基线），因此"按会话的判定"与"归属未知的判定"不可能建立在
+   * 互相矛盾的前提上。
+   *
+   * 为什么不能只扫 `overrides()` 里的活跃条目：子代理继承**不写回子会话**
+   * （见文件头），所以"父会话已结束、子会话仍在跑并从它继承受限档"这一种情形里，
+   * 受限的那个会话根本不在 `overrides()` 里。漏掉它 = 归属未知的写被静默放行。
+   *
+   * 代价是每次判定遍历一次活跃会话并各解析一次（`resolve` 是深度受限的向上查找）：
+   * 归属未知的写只发生在向量编码队列与无会话归属的制品读上，不是热路径。
+   * 拿不准（容器抛错）时返回 `true`——安全方向是宁可不放行。
+   */
+  hasRestrictedActiveSession(): boolean {
+    try {
+      for (const runtime of this.#deps.sessions.list()) {
+        if (!this.isActive(runtime.sessionId)) continue
+        if (this.resolve(runtime.sessionId).mode !== 'normal') return true
+      }
+      return false
+    } catch {
+      return true
+    }
+  }
+
   /** 本会话的**显式**设置（不含继承）。 */
   overrideOf(sessionId: string): PrivacyOverride | undefined {
     const runtime = this.#deps.sessions.for(sessionId)

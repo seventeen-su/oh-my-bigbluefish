@@ -181,13 +181,13 @@ export function createMethodTool(ports: ReasoningToolPorts): ToolDefinition {
  * `reason` 建议给（会进审计与状态面）；缺省时记为"模型未给理由"，不因此拒绝调用。
  *
  * 描述还要交代**注入的边界**：档位从下一轮起才影响注入，且紧张档会把规则卡
- * 降级成索引——模型看到回执里"请求注入 R3/R4/R5"时，得知道那不等于已经读到，
- * 紧张档要自己用 `omb_method` 取全文。
+ * 降级成索引（**控制读数照给**）——模型看到回执里"请求注入 R3/R4/R5"时，
+ * 得知道那不等于已经读到，紧张档要自己用 `omb_method` 取全文。
  */
 export function createFocusTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_focus',
-    description: `设定本会话的推理深度档位：${FOCUS_DEPTHS.join(' / ')}。quick=直接回答（简单确认/闲聊），standard=默认，deep=展开备选与可检验性。档位从下一轮起影响注入；上下文紧张时规则卡只给索引，正文用 omb_method 取。reason 说明为什么调档（便于事后核对档位是否有用）。`,
+    description: `设定本会话的推理深度档位：${FOCUS_DEPTHS.join(' / ')}。quick=直接回答（简单确认/闲聊），standard=默认，deep=展开备选与可检验性。档位从下一轮起影响注入；上下文紧张时控制读数照给、规则卡只给索引（编号+标题+何时用），正文用 omb_method 取。reason 说明为什么调档（便于事后核对档位是否有用）。`,
     parameters: focusParams,
     execute(args: unknown): ToolOutcome {
       try {

@@ -122,7 +122,7 @@ function sessionCall(sessionId = 's1'): ToolCallContext {
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.4.0',
+    version: '3.5.0',
     requires: [],
     capabilities: [],
     configSchema: { parse: () => ({}) },
@@ -144,7 +144,7 @@ describe('omb-memory 清单', () => {
     expect(registration.manifest.requires).toEqual(['omb-kernel'])
     expect(entry?.tools).toEqual(expect.arrayContaining(['omb_recall', 'omb_forget']))
     expect(entry?.capabilities).toEqual(expect.arrayContaining(['memory.write', 'memory.recall']))
-    expect(registration.manifest.version).toBe('3.4.0')
+    expect(registration.manifest.version).toBe('3.5.0')
   })
 
   it('服务名契约为 stores（与 ABI 的 SERVICES 一致）', () => {
@@ -442,6 +442,53 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const health = await registration.manifest.health()
     expect(health.metrics?.['writes']).toBe(1)
     expect(health.metrics?.['rows.total']).toBe(1)
+
+    handle.dispose()
+    await service?.close()
+    ws.cleanup()
+  })
+
+  it('端到端跨库取代（反方向）：新条目落用户库、旧结论在项目库 —— sessionId 贯通后旧条目被标掉', async () => {
+    // 这一条钉的是**装配**那一半：`index.ts` 的 `resolveStore(scope, sessionId)` 在
+    // `sessionId === undefined` 时只给用户库，所以只要 applySupersedes 没把会话传下去，
+    // "旧结论在项目库"这个方向就永远报 missing（M2）。夹具级用例已经钉了判据，
+    // 这里钉"真实装配下会话确实被传到了"。
+    const ws = tempWorkspace()
+    const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
+    const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+    handle.start([kernelRow, registration])
+    const service = handle.kernel.service<MemoryStoresService>(SERVICES.stores)
+    rememberSessionCwd(handle, 's1', ws.dir)
+    handle.kernel.emit('turn/start', { sessionId: 's1', turn: 1 })
+
+    const remember = toolsOf(handle)?.find(tool => tool.name === 'omb_remember')
+    // 旧结论是 episodic → 按 SCOPE_BY_KIND 落**项目库**
+    await remember?.execute({ text: '实测：本地端口固定 8080。', kind: 'episodic', userAsserted: true }, sessionCall())
+    const project = (await service?.forSession('s1'))?.store('project')
+    const hits = await project?.searchLexical({ text: '8080', scope: 'project', limit: 5 })
+    const oldId = hits?.[0]?.id ?? ''
+    expect(oldId).not.toBe('')
+
+    // 更正落**用户库**（semantic）→ 目标在另一个库
+    const corrected = await remember?.execute(
+      {
+        text: '更正（见 src/config/server.ts）：端口实测不是 8080，而是 9090。',
+        kind: 'semantic',
+        // 临时目录不是 git 仓库 → 工件核验核不了，这里用"用户显式陈述"这条准入依据
+        userAsserted: true,
+        supersedes: [oldId],
+      },
+      sessionCall(),
+    )
+    const text = corrected?.kind === 'text' ? corrected.text : ''
+    expect(corrected?.kind).toBe('text')
+    expect(text).toContain('推翻标注：1 条旧记忆已标为"被本条取代"')
+    expect(text).not.toContain('未找到')
+    expect(text).not.toContain('无法确认')
+    // 库里的事实：旧条目不再作为有效结论注入
+    const marked = await project?.get(oldId)
+    expect(marked?.supersededBy).not.toBeNull()
+    expect(marked?.validTo).not.toBeNull()
 
     handle.dispose()
     await service?.close()

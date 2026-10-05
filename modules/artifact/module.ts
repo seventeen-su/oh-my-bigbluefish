@@ -26,7 +26,7 @@ export const ARTIFACT_SERVICE = SERVICES.artifact
  * 模块**不自己注册宿主工具**——只声明，由 `dsh/` 侧在正确的生命周期里注册（ABI host.ts）。
  */
 export const ARTIFACT_TOOLS_SERVICE = toolsServiceFor(ARTIFACT_MODULE_ID)
-export const ARTIFACT_VERSION = '3.4.0'
+export const ARTIFACT_VERSION = '3.5.0'
 
 export interface ArtifactConfig {
   /** 索引簿记上限（不是上下文预算）。 */
@@ -68,7 +68,24 @@ export interface ArtifactService {
   list(sessionId?: string): readonly ArtifactEntry[]
   size(): number
   clear(): void
-  status(): { readonly available: boolean; readonly detail: string }
+  status(): {
+    readonly available: boolean
+    readonly detail: string
+    /**
+     * 写入被隐私闸门拒绝的次数（本实例启动以来累计）。
+     *
+     * 为什么必须能出现：索引恒为空时，"没人用过工具"与"写入全被拒"
+     * 长得一模一样——旧实现只有另一个模块（privacy）的计数在动，
+     * 而 `omb_files` 会回答"本会话还没有观察到任何制品"（错误暗示）。
+     *
+     * **可选**：第三方/测试的最小同构实现（只透传 record/topFor）不必实现它。
+     * `undefined` = 该实现没有留声（**未测量**）；`0` = 真的没被拒过。
+     * 本模块自己的实现在 `detail` 与 `health().metrics.rejectedWrites` 里都给出这个数。
+     */
+    readonly rejectedWrites?: number
+    /** 最近一次拒绝原因；从未被拒为 null。同样可选（`undefined` = 未测量）。 */
+    readonly lastWriteRejection?: string | null
+  }
 }
 
 export interface ArtifactRuntimeDeps {
@@ -92,11 +109,29 @@ export function createArtifactService(deps: ArtifactRuntimeDeps): ArtifactServic
     list: sessionId => index.list(sessionId),
     size: () => index.size(),
     clear: () => index.clear(),
-    status: () => ({
-      available: true,
-      detail: `内存索引 ${index.size()}/${index.maxEntries()} 条；**不注入清单**（无提示段贡献），只有 omb_files 按需拉取，单次最多 ${ARTIFACT_TOP_MAX} 条且不含内容`,
-    }),
+    status: () => {
+      const rejection = index.writeRejection()
+      return {
+        available: true,
+        detail: `内存索引 ${index.size()}/${index.maxEntries()} 条；**不注入清单**（无提示段贡献），只有 omb_files 按需拉取，单次最多 ${ARTIFACT_TOP_MAX} 条且不含内容`
+          + rejectionNote(rejection),
+        rejectedWrites: rejection.count,
+        lastWriteRejection: rejection.lastReason,
+      }
+    },
   }
+}
+
+/**
+ * 「写入被拒」的一句话说明（**只在真的被拒过时才出现**）。
+ *
+ * 0 次不是"测不到"：本实例从 apply 起就一直在数，0 = 真的没被拒过。
+ * 但为 0 时也不写"被拒 0 次"——那是噪音；`status()` 的字段里照样能读到这个 0。
+ */
+function rejectionNote(rejection: { readonly count: number; readonly lastReason: string | null }): string {
+  if (rejection.count === 0) return ''
+  return `；**写入被隐私闸门拒绝 ${rejection.count} 次**（最近一次：${rejection.lastReason ?? '（未给出原因）'}）`
+    + '——索引条目因此可能少于实际发生的读写，请检查 omb-privacy 的隐私模式'
 }
 
 export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
@@ -108,10 +143,18 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
       return { state: 'ok', detail: `模块未启动（内核未 apply）：暂无制品索引；不注入任何清单` }
     }
     const { index } = runtime
+    const rejection = index.writeRejection()
     return {
       state: 'ok',
-      detail: `制品索引 ${index.size()}/${index.maxEntries()} 条（仅内存，**不注入上下文**；内容由读取类工具按需取）`,
-      metrics: { indexed: index.size(), maxEntries: index.maxEntries(), topLimit: ARTIFACT_TOP_MAX },
+      detail: `制品索引 ${index.size()}/${index.maxEntries()} 条（仅内存，**不注入上下文**；内容由读取类工具按需取）`
+        + rejectionNote(rejection),
+      metrics: {
+        indexed: index.size(),
+        maxEntries: index.maxEntries(),
+        topLimit: ARTIFACT_TOP_MAX,
+        // 0 = 真的没被拒过（本实例从 apply 起一直在数），不是"未测量"
+        rejectedWrites: rejection.count,
+      },
     }
   }
 
@@ -195,9 +238,18 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
               // 自报失败不得影响状态面渲染
             }
             const size = index.size()
-            return size === 0
-              ? '制品索引为空（本会话还没有观察到任何制品；制品路径由工具调用参数提取）'
-              : `已索引 ${String(size)} 条；最近见 omb_files，内容请用读取类工具按需取`
+            const rejection = index.writeRejection()
+            // **空索引必须区分两种空**（与 omb_files 的空结果文案同一口径）：
+            // "本会话没观察到制品" vs "写入被隐私闸门拒绝、索引停更"。
+            // 旧文案无条件写前者，于是 sealed 之后整段状态面在说错误的话。
+            if (size === 0) {
+              return rejection.count > 0
+                ? `制品索引为空——不是"没有观察到制品"：写入被隐私闸门拒绝 ${rejection.count} 次`
+                  + `（最近一次：${rejection.lastReason ?? '（未给出原因）'}）；`
+                  + '请检查 omb-privacy 的隐私模式（设过 sealed/read-only 的会话会让归属未知的写入一并被拒）'
+                : '制品索引为空（本会话还没有观察到任何制品；制品路径由工具调用参数提取）'
+            }
+            return `已索引 ${String(size)} 条${rejection.count > 0 ? `；另有 ${rejection.count} 次写入被隐私闸门拒绝（最近：${rejection.lastReason ?? '未给出原因'}）` : ''}；最近见 omb_files，内容请用读取类工具按需取`
           },
         })
       } catch {

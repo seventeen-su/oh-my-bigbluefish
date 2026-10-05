@@ -28,9 +28,22 @@ export interface BandBehavior {
   readonly pushAllowed: boolean
   /** 一次最多推几条（适中档 = 1；宽松/紧张 = 0）。 */
   readonly pushLimit: number
-  /** 只保留索引视图（"有什么可用"），内容全部转工具拉取。 */
+  /**
+   * 只保留索引视图（"有什么可用"），内容全部转工具拉取。
+   *
+   * ⚠️ **当前无调用方**：生产代码里没有任何路径读这个字段去改注入内容
+   * （它只出现在状态面渲染与 `context:pressure` 服务里，而那个服务本身零消费者）。
+   * 状态面因此同时写明"这是接上后会怎样"，不是正在发生的行为。
+   */
   readonly indexOnly: boolean
-  /** 是否主动提示模型当前上下文紧张。提示是**信号**，不是内容，故不受 `pushAllowed` 约束。 */
+  /**
+   * 是否主动提示模型当前上下文紧张。提示是**信号**，不是内容，故不受 `pushAllowed` 约束。
+   *
+   * ⚠️ **未接线（当前无调用方）**：没有任何生产路径消费它——tight 档的
+   * "主动提示模型上下文紧张"至今**没有发生**。保留字段是为了留住设计意图，
+   * 但状态面必须把"未接线"说出来（否则就是在承诺一件不发生的事，
+   * 见规划 `docs/3.5-work-plan.md` §4 S3-d）。
+   */
   readonly announcePressure: boolean
   /**
    * 被推迟的内容仍可通过工具取回。**任何档位都是 true**——
@@ -50,7 +63,7 @@ const BEHAVIORS: Readonly<Record<PressureBand, BandBehavior>> = {
     indexOnly: false,
     announcePressure: false,
     recoverable: true,
-    detail: '宽松：不做任何注入裁决，不主动推；规则卡与记忆全部按需拉取。',
+    detail: '宽松：不做任何注入裁决，不主动推；规则卡与记忆全部按需拉取。（宽松档本就没有可裁决的路径，所以"无调用方"在这里不改变任何行为。）',
   },
   moderate: {
     band: 'moderate',
@@ -60,7 +73,7 @@ const BEHAVIORS: Readonly<Record<PressureBand, BandBehavior>> = {
     indexOnly: false,
     announcePressure: false,
     recoverable: true,
-    detail: '适中：按边际价值只推最有价值的一条，其余留给模型自己拉。',
+    detail: '适中：**若接上**注入裁决，按边际价值只推最有价值的一条，其余留给模型自己拉；当前无调用方（生产中没有任何推送路径调用 select，见模块状态面与 healthNow）。',
   },
   tight: {
     band: 'tight',
@@ -70,7 +83,7 @@ const BEHAVIORS: Readonly<Record<PressureBand, BandBehavior>> = {
     indexOnly: true,
     announcePressure: true,
     recoverable: true,
-    detail: '紧张：只留索引视图，内容全部转为工具拉取，并主动提示模型上下文紧张。',
+    detail: '紧张：**若接上**塑形，只留索引视图、内容全部转为工具拉取，并主动提示模型上下文紧张；当前无调用方——`indexOnly` 与 `announcePressure` 都还没有消费者，"主动提示"不会发生。',
   },
 }
 

@@ -268,6 +268,44 @@ async function runTurns(booted: Booted, maxTurns = 12): Promise<readonly number[
   return encoded
 }
 
+describe('库身份：回填条目按**列出它的库**判存活', () => {
+  it('那个库被淘汰时保留队列（不得出队计 skipped），回来后照常重建', async () => {
+    const projectA = realStore('project')
+    const projectB = realStore('project')
+    await seedLegacyVector(projectA, 'm-a', 'A 项目里的旧身份向量记忆', 'project')
+    let sets: readonly StoreSet[] = [storeSetOf('project', projectA), storeSetOf('project', projectB)]
+    const booted = boot(() => sets)
+    await settle(booted.instance)
+
+    // 第一轮：扫描把 A 的陈旧条目放进队列（此刻 A 还开着）
+    await booted.encoder.encodePending()
+    expect(booted.encoder.pending()).toBe(1)
+
+    // A 被淘汰 → 只剩 B。作用域名 'project' 仍被 B 覆盖，但 **A 没被查询过**：
+    // 按作用域名判会把这条当成"已删除"，那条记忆就再也拿不到向量了（M7）。
+    sets = [storeSetOf('project', projectB)]
+    const evicted = await booted.encoder.encodePending()
+    expect(evicted.skipped).toBe(0)
+    expect(booted.encoder.pending()).toBe(1)
+    expect(booted.encoder.stats().skipped).toBe(0)
+    expect(booted.encoder.stats().lastReason).toContain('库尚未就绪')
+    expect(booted.status().join('\n')).toContain('库尚未就绪')
+
+    // A 回来 → 照常重建，并且这一次真的落盘了
+    sets = [storeSetOf('project', projectA), storeSetOf('project', projectB)]
+    const back = await booted.encoder.encodePending()
+    expect(back.encoded).toBe(1)
+    expect(booted.encoder.pending()).toBe(0)
+    // 旧身份行按设计保留（非破坏性），但当前身份的向量确实补上了
+    const stored = await asVectorStore(projectA)!.getEmbeddings(['m-a'])
+    expect(stored.some(v => v.modelId === NEURAL_IDENTITY.modelId && v.dim === NEURAL_IDENTITY.dim)).toBe(true)
+    booted.dispose()
+    await projectA.close()
+    await projectB.close()
+  })
+})
+
+
 describe('换嵌入器：陈旧向量在回合边界被重建', () => {
   it('哈希词袋 → 512 维神经嵌入器：逐批重建、归属切换、旧行保留、重建后可检索', async () => {
     const store = realStore()
@@ -329,6 +367,81 @@ describe('换嵌入器：陈旧向量在回合边界被重建', () => {
     // 状态面：对齐之后是"记账口径的 0"（不是"刚刚又扫了一遍"），来源写在括号里
     const statusText = booted.status().join('\n')
     expect(statusText).toContain('向量回填：待重建 0 条（已对齐')
+    booted.dispose()
+  })
+
+  it('对齐之后的读数不得自相矛盾：0 条必须点名**实测基准**，原因快照必须标成过去时', async () => {
+    const store = realStore()
+    for (const [id, text] of [
+      ['m1', '长期记忆系统'],
+      ['m2', 'FTS5 词法检索'],
+      ['m3', '向量通道与余弦'],
+    ] as const) {
+      await seedLegacyVector(store, id, text)
+    }
+    const booted = boot(() => [storeSetOf('user', store)])
+    await settle(booted.instance)
+
+    await booted.encoder.encodePending() // 第 1 个边界：实测基准 3、入队
+    expect(booted.encoder.stats().rebuild.stale).toBe(3)
+    const rebuilt = await booted.encoder.encodePending() // 第 2 个边界：编码 3 条
+    expect(rebuilt.encoded).toBe(3)
+
+    const stats = booted.encoder.stats().rebuild
+    expect(stats.stale).toBe(0)
+    // 这个 0 是**记账**推出来的（基准 3 − 已完成 3），不是这一刻又扫了一遍库
+    expect(stats.staleFromScan).toBe(false)
+
+    const statusText = booted.status().join('\n')
+    // ① "0 条"那行必须点名实测基准，且**不许**声称"最近一次统计未发现待重建"
+    //    （最近一次统计实测到的正是 3 条——写成"未发现"就是来源谎报）
+    const zeroLine = statusText.split('\n').find(line => line.includes('向量回填：待重建 0 条'))
+    expect(zeroLine).toBeDefined()
+    expect(zeroLine).toContain('实测基准 3')
+    expect(statusText).not.toContain('最近一次统计未发现待重建')
+
+    // ② 现在时的「待重建原因：」不许出现：那 3 条原因之和（=3）≠ 当前 stale（=0）
+    expect(statusText).not.toMatch(/^待重建原因：/m)
+    // ③ 过去时那一行必须点名基准与"不是当前待办"，原因拆分照样可读
+    expect(statusText).toMatch(
+      /^上一轮实测的积压构成（实测基准 3 条、已处理 3 条，\*\*不是当前待办\*\*）：/m,
+    )
+    expect(statusText).toContain('缺当前身份 3 条')
+    booted.dispose()
+  })
+
+  it('补齐了一部分时：原因快照写成过去时并给出基准（健康面也不许把它说成当前）', async () => {
+    const store = realStore()
+    for (const [id, text] of [
+      ['m1', '长期记忆系统'],
+      ['m2', 'FTS5 词法检索'],
+      ['m3', '向量通道与余弦'],
+    ] as const) {
+      await seedLegacyVector(store, id, text)
+    }
+    const booted = boot(() => [storeSetOf('user', store)], { maxBackfill: 1 })
+    await settle(booted.instance)
+
+    await booted.encoder.encodePending() // 基准 3、入队 1 条
+    const encoded = await booted.encoder.encodePending() // 编码 1 条 → 还剩 2 条
+    expect(encoded.encoded).toBe(1)
+
+    const rb = booted.encoder.stats().rebuild
+    expect(rb.stale).toBe(2)
+    expect(rb.staleBase).toBe(3)
+    expect(rb.staleFromScan).toBe(false)
+
+    // 状态面：读数仍是现在时的"2 条"（记账精确），但原因快照是过去时
+    const statusText = booted.status().join('\n')
+    expect(statusText).toContain('待重建 2 条（本轮回填记账：实测基准 3 减去已完成的量）')
+    expect(statusText).not.toMatch(/^待重建原因：/m)
+    expect(statusText).toContain('实测基准 3 条、已处理 1 条，**不是当前待办**')
+
+    // 健康面同一口径（两处渲染不许各说各话）
+    const health = booted.instance.manifest.health()
+    expect(health.detail).toContain('陈旧待重建 2 条')
+    expect(health.detail).toContain('上一轮实测的积压构成（基准 3 条、已处理 1 条')
+    expect(health.detail).not.toContain('当前原因拆分')
     booted.dispose()
   })
 

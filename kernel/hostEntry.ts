@@ -197,14 +197,66 @@ export function isKernel(value: unknown): value is Kernel {
   }
 }
 
+/** 心跳单文件上限。超过就轮转一次（旧文件改名 `.1`，只留一份）→ 磁盘占用硬上界 = 2× 本值。 */
+const HEARTBEAT_MAX_BYTES = 4 * 1024 * 1024
+
+/** 默认落点（相对本包根）。 */
+const HEARTBEAT_FILE = '.omb-heartbeat.jsonl'
+
+/** 只用到这几个同步 API；`require` 在文件顶部由 `createRequire` 建好。 */
+interface HeartbeatFs {
+  appendFileSync(path: string, data: string): void
+  existsSync(path: string): boolean
+  statSync(path: string): { size: number }
+  renameSync(from: string, to: string): void
+}
+
+interface HeartbeatState {
+  readonly fs: HeartbeatFs
+  readonly file: string
+  /** 本进程已写入的字节数（初值取自文件大小，**跨进程也算数**）。 */
+  written: number
+}
+
+/** 环境变量三态：假值 = 关；真值 = 开（默认落点）；其它 = 当成路径。 */
+const HEARTBEAT_OFF = new Set(['', '0', 'off', 'false', 'no'])
+const HEARTBEAT_ON = new Set(['1', 'on', 'true', 'yes'])
+
+let heartbeatState: HeartbeatState | undefined
+/** 只解析一次（含"解析失败"与"因轮转失败而停写"）：诊断不得每回合反复付出代价。 */
+let heartbeatResolved = false
+
 /**
- * 心跳日志（诊断用）。
+ * 心跳日志（诊断用，**默认关闭**）。
  *
  * 为什么保留：宿主按行加载时，"内核行到底有没有把服务发布出去""模块行有没有
  * 取到内核"这两件事在宿主内部发生，**不写日志就只能靠推断**——本项目已经因为
  * 推断宿主 ctx 语义而反复返工。心跳把这条链路变成可读事实。
  *
- * 写文件失败一律忽略：诊断不得影响功能。
+ * ## 为什么改成默认关闭（实测数字，不是洁癖）
+ *
+ * 旧实现**无条件写**，而且写在**每回合热路径**上：`dsh/session.ts` 每个 `session/event`
+ * 一行、每个 `step/start` 一行，`kernel/adopt.ts` 每个模块的**每次事件订阅**一行，
+ * `modules/reasoning/index.ts` 每个 `turn/start` 一行。实测（开发机，2026-10-03）：
+ *
+ * - `.omb-heartbeat.jsonl` 在 4.6 天长到 **19,779,245 字节**；
+ * - 抽样前 66,807 行里 `session-event` 33,090 行、`adopt-on` 15,579 行、
+ *   `reasoning-turn` 6,323 行、`step-start` 5,803 行——**78.7% 的行来自每回合/每订阅**；
+ * - 单日 37,727 行；装成独立副本时这份文件长在 `node_modules/@omb/plugin/` 下（实测 545KB 且在长）。
+ *
+ * 代价是三重的：事件循环上的**同步写盘**、**无上限**的磁盘占用、以及诊断价值被高频行淹没
+ * （要查一次加载问题得先翻几万行每回合噪音）。所以改成显式开启，并给开启状态也加上界：
+ *
+ * | `OMB_HEARTBEAT` | 行为 |
+ * | --- | --- |
+ * | 未设置 / `0` / `off` / `false` / `no` | **不写**（`heartbeat()` 是零 IO 的空操作） |
+ * | `1` / `on` / `true` / `yes` | 写 `<本包根>/.omb-heartbeat.jsonl` |
+ * | 其它非空值 | 当成路径写（相对路径按本包根解析；**保留原样大小写**） |
+ *
+ * 开启后单文件超过 4MB 就轮转（`.omb-heartbeat.jsonl` → `.omb-heartbeat.jsonl.1`，只保留一份旧文件），
+ * **轮转失败就停写**——"上限守不住还继续写"比"没有日志"更坏。
+ *
+ * 写文件失败一律忽略：诊断不得影响功能（H-1 同源）。
  *
  * ## 落点必须由自身位置推导，不许写死绝对路径
  *
@@ -215,33 +267,120 @@ export function isKernel(value: unknown): value is Kernel {
  *   ② 更隐蔽的一层：把插件装成**独立副本**（不指向开发仓库）时，副本会**持续写入
  *      开发仓库**——"副本与开发仓库互不影响"当场破功。冻结副本那轮实测到过这一点。
  *
- * 现在的落点是「本文件所在位置向上找到的第一个含 `package.json` 的祖先」，
- * 也就是**这份代码自己所属的那个包**。仓库里跑就写仓库根，副本里跑就写副本根。
+ * 现在的落点是「本文件所在位置向上找到的第一个含 `package.json` 的祖先」，也就是
+ * **这份代码自己所属的那个包**。仓库里跑就写仓库根，副本里跑就写副本根。
+ * 这个推导**每进程只做一次**：旧实现每次调用都重新 `require` 三个内建模块并逐级
+ * `existsSync` 向上找（最多 8 次同步 stat），而结果在进程内恒定不变。
  */
 export function heartbeat(stage: string, detail: Record<string, unknown> = {}): void {
   try {
-    // 动态 import 会变成异步，这里用同步写入
+    const state = resolveHeartbeat()
+    if (state === undefined) return
     const line = `${JSON.stringify({ at: new Date().toISOString(), stage, ...detail })}\n`
-
-    const fs = require('node:fs') as { appendFileSync(p: string, d: string): void; existsSync(p: string): boolean }
-    const path = require('node:path') as { dirname(p: string): string; join(...parts: string[]): string }
-    const url = require('node:url') as { fileURLToPath(u: string): string }
-
-    /** 从当前模块位置向上找第一个含 `package.json` 的目录（= 本代码所属的包根）。 */
-    const ownPackageRoot = (): string => {
-      let dir = path.dirname(url.fileURLToPath(import.meta.url))
-      for (let i = 0; i < 8; i++) {
-        if (fs.existsSync(path.join(dir, 'package.json'))) return dir
-        const parent = path.dirname(dir)
-        if (parent === dir) break
-        dir = parent
-      }
-      return process.cwd()
-    }
-
-    fs.appendFileSync(path.join(ownPackageRoot(), '.omb-heartbeat.jsonl'), line)
+    const bytes = byteLengthOf(line)
+    if (state.written + bytes > HEARTBEAT_MAX_BYTES && !rotateHeartbeat(state)) return
+    state.fs.appendFileSync(state.file, line)
+    state.written += bytes
   } catch {
     // 诊断失败不影响功能
+  }
+}
+
+/**
+ * 让下一次 `heartbeat()` 重新读环境、重新解析落点。
+ *
+ * 消费者是**测试**（同一进程里要分别验证"关"与"开"两条路径）。生产不需要它：
+ * 换代产物的 URL 变了 = 模块实例是新的，状态天然是空的。
+ */
+export function resetHeartbeat(): void {
+  heartbeatResolved = false
+  heartbeatState = undefined
+}
+
+/** 当前心跳状态（供测试与诊断断言）。`undefined` = 关闭、解析失败或已停写。 */
+export function heartbeatSink(): { readonly file: string; readonly written: number } | undefined {
+  const state = resolveHeartbeat()
+  return state === undefined ? undefined : { file: state.file, written: state.written }
+}
+
+/** 解析一次并缓存。关闭/失败都缓存成 `undefined`，之后零成本。 */
+function resolveHeartbeat(): HeartbeatState | undefined {
+  if (heartbeatResolved) return heartbeatState
+  heartbeatResolved = true
+  try {
+    const raw = process.env['OMB_HEARTBEAT']
+    if (raw === undefined) return undefined
+    const flag = raw.trim()
+    if (HEARTBEAT_OFF.has(flag.toLowerCase())) return undefined
+
+    // 动态 import 会变成异步，这里用同步 API（`require` 已在文件顶部建好）
+    const fs = require('node:fs') as HeartbeatFs
+    const path = require('node:path') as {
+      dirname(p: string): string
+      join(...parts: string[]): string
+      isAbsolute(p: string): boolean
+    }
+    const url = require('node:url') as { fileURLToPath(u: string): string }
+    const root = ownPackageRoot(fs, path, url)
+    const file = HEARTBEAT_ON.has(flag.toLowerCase())
+      ? path.join(root, HEARTBEAT_FILE)
+      : path.isAbsolute(flag)
+        ? flag
+        : path.join(root, flag)
+
+    // 起点算上**已有文件的大小**：否则上一个进程留下的 19MB 会被当成 0 继续追加
+    let written = 0
+    try {
+      if (fs.existsSync(file)) written = fs.statSync(file).size
+    } catch {
+      written = 0
+    }
+    heartbeatState = { fs, file, written }
+    return heartbeatState
+  } catch {
+    heartbeatState = undefined
+    return undefined
+  }
+}
+
+/** 从当前模块位置向上找第一个含 `package.json` 的目录（= 本代码所属的包根）。 */
+function ownPackageRoot(
+  fs: { existsSync(p: string): boolean },
+  path: { dirname(p: string): string; join(...parts: string[]): string },
+  url: { fileURLToPath(u: string): string },
+): string {
+  let dir = path.dirname(url.fileURLToPath(import.meta.url))
+  for (let i = 0; i < 8; i++) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return process.cwd()
+}
+
+/**
+ * 轮转一次。
+ *
+ * @returns 轮转后能否继续写。**失败就停写**（清掉状态、不再重试）——"上限守不住还继续
+ *   无上限追加"正是本条要修的缺陷，不能一边修一边留着后门。
+ */
+function rotateHeartbeat(state: HeartbeatState): boolean {
+  try {
+    if (state.fs.existsSync(state.file)) state.fs.renameSync(state.file, `${state.file}.1`)
+    state.written = 0
+    return true
+  } catch {
+    heartbeatState = undefined // 停写；`heartbeatResolved` 保持 true → 不再重试
+    return false
+  }
+}
+
+function byteLengthOf(line: string): number {
+  try {
+    return Buffer.byteLength(line)
+  } catch {
+    return line.length
   }
 }
 

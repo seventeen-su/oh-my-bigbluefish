@@ -78,7 +78,7 @@ export const inject = ['commands']
 export const KERNEL_SELF: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.4.0',
+    version: '3.5.0',
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health', 'kernel.metrics'],
     configSchema: { parse: (input: unknown) => input ?? {} },
@@ -104,8 +104,13 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   const handle = createKernel({ logger, clock, measure: pressure.measure })
 
   // 把"内核就绪"发布到宿主 ctx：模块行由宿主独立加载，需要经宿主 ctx 取内核。
-  // 见 `docs/host-wiring-handoff.md`——这一步在真实宿主上**尚未验证成功**，
-  // 因此模块行目前会走空转兜底（如实不提供能力，不抛）。
+  //
+  // **这一步已在真实宿主上验证成功**（`docs/v3-ten-item-plan.md` §六 记的是 g61 那轮
+  // 逐项实测：8 个模块装载、工具面与提示注入都在位）。取不到内核时模块行会走空转兜底
+  // （如实不提供能力、不抛）——那是**设计好的降级路径**，不是"尚未接上"的中间态。
+  //
+  // 注：旧注释在这里指向 `docs/host-wiring-handoff.md`，那个文件**从未存在**
+  // （悬空引用）。要查这条线的证据请看上面那节实测记录。
   let markReady!: () => void
   const ready = new Promise<void>(resolve => {
     markReady = resolve
@@ -171,11 +176,10 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       ? (services as { provide?(name: string, value: unknown): unknown })
       : undefined
     if (typeof table?.provide === 'function') {
-      const hostOf = (): { push?: unknown; pushAlways?: unknown } | undefined => {
+      const hostOf = (): Record<string, unknown> | undefined => {
         try {
-          return (typeof ctx.get === 'function' ? ctx.get('desktopNotify') : undefined) as
-            | { push?: unknown; pushAlways?: unknown }
-            | undefined
+          const found = typeof ctx.get === 'function' ? ctx.get('desktopNotify') : undefined
+          return typeof found === 'object' && found !== null ? (found as Record<string, unknown>) : undefined
         } catch {
           // Guard 拒绝（该行没 inject 这个服务）→ 不可用，不是错误
           return undefined
@@ -192,7 +196,36 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
         if (typeof method !== 'function') return false
         return (method as (this: unknown, p: unknown) => unknown).call(host, payload)
       }
-      table.provide('desktopNotify', { push: forward('push'), pushAlways: forward('pushAlways') })
+      /**
+       * 兜底对象**必须把 2.0.0 的三件也带上**（`notify` / `apiVersion` / `capabilities`）。
+       *
+       * 生产路径上 `kernel.service('desktopNotify')` 是 **`readHost` 优先**（`kernel/adopt.ts`：
+       * `readHost(name) ?? core.services.get(name)`），所以拿到的通常是宿主原对象、什么都有；
+       * 但**兜底表只在 readHost 取不到时才被读到**——那时若只有 `push`/`pushAlways`，
+       * 消费方（`modules/notify`）会据此把宿主判成"旧版本或非官方实现"，
+       * **一次取不到就变成一句对宿主的错判**。
+       *
+       * 所以：能转发的一律转发；`notify` 用 getter（宿主没有这个能力时属性为 `undefined`，
+       * 让消费方**看得出缺失**，而不是拿到一个永远返回 undefined 的函数）；版本与能力同理——
+       * 与"每次重新问宿主"同一口径，不缓存也不能缓存。
+       */
+      table.provide('desktopNotify', {
+        push: forward('push'),
+        pushAlways: forward('pushAlways'),
+        get notify() {
+          const host = hostOf()
+          const method = host?.['notify']
+          if (typeof method !== 'function') return undefined
+          return (payload: unknown): unknown =>
+            (method as (this: unknown, p: unknown) => unknown).call(host, payload)
+        },
+        get apiVersion() {
+          return hostOf()?.['apiVersion']
+        },
+        get capabilities() {
+          return hostOf()?.['capabilities']
+        },
+      })
     }
   } catch (error) {
     logger.warn(`OMB：通知服务接线失败（桌面通知将不可用）——${String(error)}`)

@@ -16,11 +16,20 @@
  * /omb-privacy read-only    本会话可读不可写
  * /omb-privacy sealed       本会话不可读不可写
  * /omb-privacy trust        清除 fail-closed 粘性标记（**只有人能按**）
+ * /omb-privacy forget <id>  清除某个会话的受限记录（该会话回到继承/基线）
+ * /omb-privacy clear        清除全部**已结束**会话的受限记录（活跃会话不动）
  * ```
  *
  * `trust` 的存在理由：状态文件损坏后基线被钉成最严（见 `codec.ts`），
  * 若没有任何解除途径，用户会在修好文件后仍然被最严档位锁住——那会让人绕过整个
  * 机制（直接删文件），比给一个显式的、可审计的解除动作更糟。
+ *
+ * `forget` / `clear` 的存在理由（G1，P0）：受限记录是**持久化**的，而判定
+ * "是否存在受限会话"曾遍历全部历史记录 → 只要设过一次 `sealed`，
+ * 此后每个新会话的"归属未知写"都被永久拒绝。`trust` 那条逃生口只清
+ * fail-closed 标记，按会话的受限记录此前**一条出口都没有**。
+ * 现在判定按"本进程内是否真的活跃过"收紧了（见 `gate.ts`），
+ * 这两个分支用于让用户把历史记录本身也清掉——用户手打，模型碰不到。
  *
  * ## 会话身份从哪来
  *
@@ -51,8 +60,9 @@ export const PRIVACY_COMMAND_NAME = 'omb-privacy'
 export const PRIVACY_COMMAND_ID = '@omb/privacy'
 
 export const PRIVACY_USAGE =
-  '用法：/omb-privacy [status | normal | read-only | sealed | trust]'
-  + '（不带参数 = status；只影响当前会话，子代理继承；trust 只清除 fail-closed 兜底标记）'
+  '用法：/omb-privacy [status | normal | read-only | sealed | trust | forget <会话id> | clear]'
+  + '（不带参数 = status；只影响当前会话，子代理继承；trust 只清除 fail-closed 兜底标记；'
+  + 'forget/clear 清除已结束会话留下的受限记录——它们不再掐住后续会话）'
 
 export interface InvocationSession {
   readonly sessionId: string | null
@@ -88,6 +98,19 @@ export interface PrivacyCommandApi {
   setMode(sessionId: string, mode: 'normal' | 'read-only' | 'sealed'): CommandResultLike
   /** 清除 fail-closed 粘性标记（显式的人类动作）。 */
   trust(): CommandResultLike
+  /**
+   * 清除**某一个**会话的受限记录：该会话回到继承/基线。
+   *
+   * 与 `trust` 同一条原则——这是**用户**的动作，用来收拾自己设过的限制；
+   * 模型没有工具面入口（`privacyTools` 是空数组）。
+   */
+  forget(sessionId: string): CommandResultLike
+  /**
+   * 清除全部**已结束**会话的受限记录（本进程内活跃的会话不动）。
+   *
+   * 批量清理不碰活跃会话：那等于在用户没点名的情况下静默放宽一条正在生效的限制。
+   */
+  clearInactive(): CommandResultLike
 }
 
 /** 命令名 → 是否本命令（宿主按 name 注册，这里只用于自检与测试）。 */
@@ -132,6 +155,21 @@ export function runPrivacyCommand(
 
       case 'trust':
         return api.trust()
+
+      case 'forget': {
+        const target = words[1]
+        if (target === undefined) {
+          return {
+            kind: 'error',
+            text: 'forget 需要指明会话：/omb-privacy forget <会话id>'
+              + '（哪些会话有显式设置见 /omb-privacy status）。',
+          }
+        }
+        return api.forget(target)
+      }
+
+      case 'clear':
+        return api.clearInactive()
 
       case 'help':
       case '?':

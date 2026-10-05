@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { ArtifactIndex } from '../../../modules/artifact/index.js'
-import type { ArtifactEntry } from '../../../modules/artifact/index.js'
+import type { ArtifactEntry, ArtifactPrivacyPort } from '../../../modules/artifact/index.js'
 import {
   createFilesTool,
   FILES_TOOL_NAME,
@@ -114,5 +114,78 @@ describe('createFilesTool', () => {
     const outcome = await tool.execute({})
     expect(outcome.kind).toBe('error')
     if (outcome.kind === 'error') expect(outcome.text).toContain('索引坏了')
+  })
+})
+
+/**
+ * S3-c：`omb_files` 的"索引为空"必须区分**两种空**。
+ *
+ * 修复前的形态：无论什么原因，空索引一律回答"本会话还没有观察到任何制品"。
+ * 存在被拒写入时，那是**错误暗示**——真因是隐私闸门禁止写入，索引停更
+ * （用户设过一次 sealed 就会这样，且连累全部会话的归属未知写入）。
+ */
+describe('omb_files：两种空与本会话无关的三件事（S3-c）', () => {
+  /** 隐私替身：归属未知禁写（存在受限会话），`sealed` 的会话连读也禁。 */
+  const privacyPort = (sealed: readonly string[]): ArtifactPrivacyPort => ({
+    decide: sessionId =>
+      sealed.includes(sessionId)
+        ? { allowRead: false, allowWrite: false, readReason: `${sessionId} 已 sealed：禁止读取`, writeReason: `${sessionId} 已 sealed：禁止写入` }
+        : { allowRead: true, allowWrite: true, readReason: '', writeReason: '' },
+    decideUnattributed: () => ({
+      allowRead: false,
+      allowWrite: false,
+      readReason: '归属未知且存在受限会话：拒绝读取',
+      writeReason: '归属未知且存在受限会话：禁止写入',
+    }),
+    restricted: () => true,
+  })
+
+  it('真没观察到 → 原话照旧（不提隐私，不制造恐慌）', async () => {
+    const tool = createFilesTool({ index: new ArtifactIndex() })
+    const outcome = await tool.execute({})
+    expect(outcome.kind).toBe('text')
+    if (outcome.kind === 'text') {
+      expect(outcome.text).toContain('索引为空')
+      expect(outcome.text).toContain('还没有观察到任何制品')
+      expect(outcome.text).not.toContain('隐私')
+    }
+  })
+
+  it('写入被拒导致停更 → 空结果点名隐私模式、拒绝次数与最近原因', async () => {
+    const index = new ArtifactIndex({ privacy: () => privacyPort(['s1']) })
+    // 归属未知的写入被拒（真实形态：dsh/hooks 拿不到会话、或存在受限会话）
+    expect(() => index.record({ path: 'src/a.ts', kind: 'file', at: 1 })).toThrow()
+    const tool = createFilesTool({ index })
+    // 读的是不受限的会话 s2：读放行，于是能走到"空索引"这条文案
+    const outcome = await tool.execute({}, { sessionId: 's2', attribution: 'session' })
+    expect(outcome.kind).toBe('text')
+    if (outcome.kind === 'text') {
+      expect(outcome.text).toContain('索引为空')
+      expect(outcome.text).toContain('不是')
+      expect(outcome.text).toContain('1 次写入被隐私闸门拒绝')
+      expect(outcome.text).toContain('禁止写入')
+      expect(outcome.text).toContain('omb-privacy')
+    }
+  })
+
+  it('查询没匹配 ≠ 空索引 ≠ 被拒停更：三种说法互不冒充', async () => {
+    const index = new ArtifactIndex({ privacy: () => privacyPort(['s1']) })
+    const tool = createFilesTool({ index })
+    const outcome = await tool.execute({ query: 'nope' }, { sessionId: 's2', attribution: 'session' })
+    expect(outcome.kind).toBe('text')
+    if (outcome.kind === 'text') {
+      expect(outcome.text).toContain('最近 ≠ 相关')
+      expect(outcome.text).not.toContain('隐私闸门拒绝')
+    }
+  })
+
+  it('类型列真的有内容：kind=file / dir 直接渲染（不再恒为 unknown）', () => {
+    const index = new ArtifactIndex()
+    index.record({ path: 'src/a.ts', kind: 'file', at: 1_700_000_000_000 })
+    index.record({ path: 'D:/proj/src', kind: 'dir', at: 1_700_000_000_000 })
+    const text = formatFilesResult(index.topFor())
+    expect(text).toContain('src/a.ts（file，')
+    expect(text).toContain('D:/proj/src（dir，')
+    expect(text).not.toContain('（unknown，')
   })
 })

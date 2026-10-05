@@ -183,7 +183,8 @@
           #   · command-compact   只由人打 `/compact` 触发，无自主行为。
           # 为什么与 OMB 的上下文优化不冲突：OMB **只读** tokenMeter、**从不改会话历史**
           # （`modules/context/index.ts:249` 读压力；拉取台账只累计 pulls/turns），
-          # 且在 fillRatio 0.6 就转"只给索引"，早于压缩的 ~0.8 阈值——互补而非互斥。
+          # 且在 fillRatio 0.6 就转"读数 + 索引"（规则卡正文改按需用 omb_method 拉取），
+          # 早于压缩的 ~0.8 阈值——互补而非互斥。
           # 详情：`docs/dsh-compatibility.md` §4。
           - id: compaction
             name: cordis:group

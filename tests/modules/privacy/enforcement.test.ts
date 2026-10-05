@@ -40,7 +40,13 @@ function fixture(): Fixture {
     clock,
     baseline: () => ({ mode: 'normal', origin: 'default', detail: '测试基线：未配置' }),
   })
-  const gate = new PrivacyGate({ state, baselineRestricted: () => false })
+  const gate = new PrivacyGate({
+    state,
+    baselineRestricted: () => false,
+    // 与生产同义：两个端口都由 `PrivacyState` 回答
+    isActive: sessionId => state.isActive(sessionId),
+    hasRestrictedActiveSession: () => state.hasRestrictedActiveSession(),
+  })
   const stores = createStoresService({
     logger,
     clock,
@@ -168,7 +174,7 @@ describe('单一强制点：sealed 下直接调库被拒', () => {
     }
   })
 
-  it('向量编码路径（snapshot，归属未知）：有受限会话时禁写、无受限会话时照常', async () => {
+  it('向量编码路径（snapshot，归属未知）：活着的受限会话禁写；只留在状态文件里的历史记录不再禁写', async () => {
     const f = fixture()
     try {
       await f.stores.start() // snapshot 只给"已打开的库"
@@ -177,8 +183,15 @@ describe('单一强制点：sealed 下直接调库被拒', () => {
       expect(free).toBeDefined()
       await free?.put(record('m-free', '没有隐私会话时，向量编码路径必须能写'))
 
-      // 出现一个 sealed 会话 → 同一条写入被拒（这一条编码无法证明不属于那个会话）
+      // ① 只设了模式、本进程内没有任何观测——这正是"重启后从状态文件重放进来的条目"
+      //    的形态。已结束的会话不该继续掐住全进程（G1 那个 P0 的判据）。
       f.state.setOverride('s1', 'sealed')
+      const historical = f.stores.snapshot().user?.store('user')
+      await expect(historical?.put(record('m-historical'))).resolves.toBeUndefined()
+
+      // ② 同一个会话在本进程内真的活跃起来（生产路径：宿主 session/event 会走 note()）→
+      //    重新武装：fail-closed 没有放宽，这条编码仍无法证明不属于它。
+      f.sessions.note({ sessionId: 's1', source: 'session-event' })
       const blocked = f.stores.snapshot().user?.store('user')
       await expect(blocked?.put(record('m-blocked'))).rejects.toThrow(/归属/)
       // 读仍允许：快照的读路径不该被掐（否则状态面与编码水合都会失败）
@@ -286,7 +299,12 @@ describe('行序无关（惰性解析，没有"等模块挂载"的窗口）', ()
       await expect(before?.put(record('m-before'))).resolves.toBeUndefined()
 
       // "隐私模块挂载完成"：此刻起同一个 stores 实例就必须开始拒绝
-      available = new PrivacyGate({ state, baselineRestricted: () => false })
+      available = new PrivacyGate({
+        state,
+        baselineRestricted: () => false,
+        isActive: sessionId => state.isActive(sessionId),
+        hasRestrictedActiveSession: () => state.hasRestrictedActiveSession(),
+      })
       state.setOverride('s1', 'sealed')
       const after = (await stores.forSession('s1'))?.store('user')
       await expect(after?.put(record('m-after'))).rejects.toThrow(/sealed/)

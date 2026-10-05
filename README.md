@@ -94,6 +94,25 @@ pnpm install      # 建出 node_modules/@omb/<组件> → packages/<组件> 的�
 | 构建代数 | `build-generation.json` |
 | 产物 | `lib-gen/g<N>/`（不入库） |
 | 组件包 | `packages/<组件>/`（`locale/` 入库，`lib-gen/` 不入库） |
+| 诊断心跳 | `<本包根>/.omb-heartbeat.jsonl` —— **默认不产生**，见下 |
+
+### 诊断心跳（默认关闭）
+
+心跳是排查"模块到底有没有被装上/被调用"用的追加式日志。它**默认一行都不写**：
+早期版本每回合都同步追加，实测 4.6 天涨到 19MB（单日 37,727 行），
+而绝大多数部署从不需要它。
+
+要开就设环境变量 `OMB_HEARTBEAT`（重启宿主后生效）：
+
+| 值 | 行为 |
+| --- | --- |
+| 未设置 / `0` / `off` / `false` / `no` | **不写**——心跳是零 IO 的空操作（默认） |
+| `1` / `on` / `true` / `yes` | 写 `<本包根>/.omb-heartbeat.jsonl` |
+| 其它非空值 | 当成路径写（相对路径按本包根解析） |
+
+开了也不会无限涨：单文件超过 **4MB** 轮转成 `.1`（只保留一份），磁盘占用硬上界 8MB；
+轮转失败就停写，而不是回到"无上限追加"。**默认落点**已在 `.gitignore` 里
+（改成自定义路径的话，忽略规则自负）。
 
 ## 构建
 
@@ -121,14 +140,18 @@ DSH 的**插件行**可以免重启动态增删，但**模块代码走 Node ESM 
 改了源码而产物路径没变时，宿主加载的仍是**旧模块实例**——于是"功能没生效"
 这类现象可能只是陈旧代码，极易误判。
 
-构建脚本还会做**陈旧检测**：产物比源码旧就报错，不让"改了源码忘了重建"混过去。
+构建脚本还会做**陈旧检测**（两条判据，都会让构建当场失败）：
+① 源码目录下每个 `.ts` 都必须在产物里有同名 `.js`——`tsconfig` 的 include/exclude
+漏了文件时，点名到具体文件（这类缺陷装到宿主后表现为"某个模块凭空消失"，
+而构建本身是绿的）；
+② 源码 mtime 晚于**本次构建开始时刻**——构建过程中还有人改源码，那份产物是旧快照。
 
 ### 开发循环
 
 ```bash
-pnpm verify          # typecheck + lint + test
+pnpm verify          # typecheck + lint + test + check-resolution
 node scripts/build.mjs
-node scripts/check-resolution.mjs   # 8 行可解析、可加载、有中文名（不碰 profile）
+node scripts/check-resolution.mjs   # 全部行名可解析/可加载、OMB 行有中文名（不碰 profile）
 plugin_manager remove_bundle @omb/plugin && plugin_manager install_bundle <路径>
 ```
 
@@ -164,7 +187,7 @@ node scripts/build.mjs    # 由 display.ts 生成 packages/<组件>/locale/{zh,e
 pnpm test        # vitest
 pnpm typecheck
 pnpm lint
-pnpm verify      # 上面三件一起
+pnpm verify      # 上面三件 + check-resolution（行名解析是发布前必须过的一关）
 node scripts/check-resolution.mjs   # 行名解析 + 中文名（不需要装进 profile）
 ```
 

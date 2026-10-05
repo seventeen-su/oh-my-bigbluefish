@@ -19,18 +19,45 @@
  * `package.json` 的 `main`/`exports` 指向 `lib-gen/g<N>/` 承担——
  * 见 `scripts/build.mjs`。
  *
- * 本文件是**唯一**的代数来源：`scripts/build.mjs` 写它，
- * `dsh/plugin.ts` 读它并把代数带进 `apply` 的返回值上，供运行期核对。
+ * 本文件是**唯一**的代数真源：`BUILD_ROOT` / `OUT_DIR_PATTERN` / `GENERATION_FILE` /
+ * `outDirFor` 由 `scripts/build.mjs` 消费（它连 tsc 的 `--outDir` 都由 `BUILD_ROOT` 推出），
+ * 运行期只经 `generationFromUrl`（自己的 URL 里就带代数）核对。
+ *
+ * **不要**在这里写"代数会随 `apply` 的返回值带出去"这类话：代码里从来没有这件事
+ * （`apply` 的返回值是宿主插件的清单，代数只从 URL 或代数文件读）。
+ * 曾经存在过这句假陈述，读到它的人会以为运行期读的是"返回值里的代数"而不再核对，
+ * 而真正唯一的核对路径是下面的 `generationFromUrl` 与 `parseGeneration`。
  */
 
-/** 产物根目录（相对仓库根）。 */
+/**
+ * 产物根目录（相对仓库根）。
+ *
+ * 改它必须**同时**满足两件事，否则 `scripts/build.mjs` 会当场报错而不是静默跑偏：
+ *   ① `scripts/build.mjs` 用它推 tsc 的 `--outDir` 与代数目录；
+ *   ② `OUT_DIR_PATTERN` 由它派生，于是目录形状自动跟着变。
+ * 唯一的例外是 `tsconfig.build.json` 的 `outDir` 字面量——那条配置在构建时被
+ * `--outDir` 覆盖，只对"手工直接跑 tsc"有意义。
+ */
 export const BUILD_ROOT = 'lib-gen'
 
-/** 产物目录名的形状：`lib-gen/g<代数>`。 */
-export const OUT_DIR_PATTERN = /^lib-gen\/g\d+$/
+/** 把常量里的正则元字符转义掉（目录名按字面量匹配，不做模式解释）。 */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * 产物目录名的形状：`<BUILD_ROOT>/g<代数>`。
+ *
+ * **由 `BUILD_ROOT` 派生**，不写死 `lib-gen`：写死会让"改 BUILD_ROOT"变成
+ * 改一处、静默跑偏一处。`scripts/build.mjs` 在写任何文件之前断言它。
+ */
+export const OUT_DIR_PATTERN = new RegExp(`^${escapeRegExp(BUILD_ROOT)}/g\\d+$`)
 
 /** 代数文件的路径（相对仓库根）。 */
 export const GENERATION_FILE = 'build-generation.json'
+
+/** 产物 URL 里的代数片段：`/<BUILD_ROOT>/g<代数>/`。同样由 `BUILD_ROOT` 派生。 */
+const GENERATION_IN_URL = new RegExp(`/${escapeRegExp(BUILD_ROOT)}/g(\\d+)/`)
 
 export interface BuildGeneration {
   /** 产物目录（相对仓库根），例如 `lib-gen/g3`。 */
@@ -73,7 +100,7 @@ export function parseGeneration(raw: unknown): BuildGeneration | undefined {
  * 缓存旧代码"变成一个可观测事实，而不是靠推断。这正是不重启部署下最容易误判的一点。
  */
 export function generationFromUrl(url: string): number | undefined {
-  const match = /\/lib-gen\/g(\d+)\//.exec(url)
+  const match = GENERATION_IN_URL.exec(url)
   if (match?.[1] === undefined) return undefined
   const value = Number.parseInt(match[1], 10)
   return Number.isFinite(value) ? value : undefined

@@ -9,8 +9,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
-import { MODULE_CATALOG } from '../../../kernel/abi/index.js'
-import type { Kernel, ModuleRegistration, ToolDefinition } from '../../../kernel/abi/index.js'
+import { MODULE_CATALOG, SERVICES } from '../../../kernel/abi/index.js'
+import type { Kernel, ModuleRegistration, StatusRegistry, ToolDefinition } from '../../../kernel/abi/index.js'
 import {
   ARTIFACT_SERVICE,
   ARTIFACT_TOOLS_SERVICE,
@@ -24,7 +24,7 @@ import { FILES_TOOL_NAME } from '../../../modules/artifact/tools.js'
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.4.0',
+    version: '3.5.0',
     requires: [],
     capabilities: ['kernel.services'],
     configSchema: { parse: () => ({}) },
@@ -164,5 +164,95 @@ describe('健康面与热插拔', () => {
       new Map([['omb-artifact', { maxEntries: -1 }]]),
     )
     expect(handle.health()['omb-artifact']?.state).toBe('failed')
+  })
+})
+
+/**
+ * S3-c：写入被隐私闸门拒绝时，**状态面必须留声**。
+ *
+ * 审计给的链条：`record` 抛可读错误 → `dsh/hooks.ts` 吞掉 → 索引静默停更，
+ * 而 `omb_files` 与组件自述都说"本会话还没有观察到任何制品"（错误暗示），
+ * 唯一线索在另一个模块（privacy）的计数里。修复后：
+ * ① 服务面 `status().rejectedWrites/lastWriteRejection`；
+ * ② `health().detail` 与 `metrics.rejectedWrites`；
+ * ③ 组件自述在"索引为空"时点名隐私模式。
+ */
+describe('写入被拒的留声：状态面（S3-c）', () => {
+  /** 隐私替身：只实现制品索引用到的那一面（结构契约，不 import privacy 模块）。 */
+  function privacyStub(allowWrite: boolean, writeReason: string): ModuleRegistration<unknown> {
+    return {
+      manifest: {
+        id: 'omb-privacy',
+        version: '1.0.0',
+        requires: [],
+        capabilities: [],
+        configSchema: { parse: (input: unknown) => input },
+        health: () => ({ state: 'ok', detail: '测试用隐私替身' }),
+      },
+      apply: (kernel: Kernel) => {
+        const decision = { allowRead: true, allowWrite, readReason: '', writeReason }
+        kernel.provide(SERVICES.privacy, {
+          decide: () => decision,
+          decideUnattributed: () => decision,
+          restricted: () => false,
+        })
+      },
+    }
+  }
+
+  it('被拒 → 服务面与健康面都出现次数与可读原因，组件自述不再说"没观察到制品"', () => {
+    const handle = createKernel({ clock: fakeClock() })
+    handle.start([
+      KERNEL_STUB,
+      privacyStub(false, '会话已被设为 sealed：禁止写入（测试）'),
+      createArtifactModule() as ModuleRegistration<unknown>,
+    ])
+    const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
+    expect(service?.status().rejectedWrites).toBe(0)
+    expect(() => service?.record('src/a.ts', { kind: 'file' }, 's1')).toThrow(/sealed/)
+
+    const status = service?.status()
+    expect(status?.rejectedWrites).toBe(1)
+    expect(status?.lastWriteRejection).toContain('sealed')
+    expect(status?.detail).toContain('写入被隐私闸门拒绝 1 次')
+
+    // 组件自述：索引为空时必须说清"不是没观察到制品"，并点名隐私模块。
+    // **必须先渲染这一段**：模块行读的是 `kernel.report()` 的快照，
+    // 而刷新点就在这个 `render` 里（见 `modules/artifact/module.ts` 的顺序说明）。
+    const registry = handle.kernel.service<StatusRegistry>(SERVICES.statusContributor)
+    const section = registry?.list().find(c => c.name.includes('制品索引'))
+    expect(section).toBeDefined()
+    const rendered = section?.render() ?? ''
+    expect(rendered).toContain('不是')
+    expect(rendered).toContain('隐私')
+    expect(rendered).toContain('omb-privacy')
+    expect(rendered).not.toContain('本会话还没有观察到任何制品')
+
+    const health = handle.health()['omb-artifact']
+    expect(health?.metrics?.rejectedWrites).toBe(1)
+    expect(health?.detail).toContain('写入被隐私闸门拒绝 1 次')
+    handle.dispose()
+  })
+
+  it('反向断言：放行时索引照常增长，拒绝计数不涨、文案不出现拒绝字样', () => {
+    const handle = createKernel({ clock: fakeClock() })
+    handle.start([
+      KERNEL_STUB,
+      privacyStub(true, ''),
+      createArtifactModule() as ModuleRegistration<unknown>,
+    ])
+    const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
+    expect(service?.record('src/a.ts', { kind: 'file' }, 's1')?.kind).toBe('file')
+    expect(service?.size()).toBe(1)
+    expect(service?.status().rejectedWrites).toBe(0)
+    expect(service?.status().detail).not.toContain('写入被隐私闸门拒绝')
+    expect(handle.health()['omb-artifact']?.detail).not.toContain('写入被隐私闸门拒绝')
+    handle.dispose()
+  })
+
+  it('没有隐私模块时 = 不受限：拒绝计数为 0（不是"未测量"）', () => {
+    const { service } = start()
+    expect(service.record('src/a.ts', { kind: 'file' })?.kind).toBe('file')
+    expect(service.status().rejectedWrites).toBe(0)
   })
 })
