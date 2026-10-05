@@ -131,6 +131,52 @@ export function adoptContext(
 
   const logger = adoptLogger(ctx.logger) ?? core.logger
 
+  /**
+   * 宿主独有事件**没订上宿主事件面**时的记录（粘性）。
+   *
+   * ## 为什么必须留声，而不是静默回落
+   *
+   * `HOST_ONLY_EVENTS` 里的事件只发在**宿主事件面**（`dsh/hooks.ts`、`dsh/session.ts`
+   * 都是 `ctx.on`），内核总线上永远不会有它们。所以一旦宿主侧没订上：
+   *
+   * - 订阅注册"成功"（我们返回了一个合法的 disposer）；
+   * - 事件**永远不会来**；
+   * - 而健康面、状态面、日志**三处都没有任何字样**。
+   *
+   * 这正是本项目最难排查的失败形态（"订阅成功、事件不来"已经踩过两次，见下面 `on` 的说明）。
+   * 所以这里记下事件名，并让**该模块之后的每一次健康上报都带上这条事实**——
+   * 用粘性包装而不是"上报一次 degraded"：模块随后自报 `ok` 会把一次性上报覆盖掉，
+   * 降级又变回静默。
+   */
+  const hostFallbacks: string[] = []
+  const noteHostFallback = (event: string, why: string): void => {
+    if (hostFallbacks.includes(event)) return
+    hostFallbacks.push(event)
+    try {
+      logger.warn(
+        `OMB：宿主独有事件 ${event} 没订上宿主事件面（${why}）——已回落内核总线，`
+        + '该事件收不到宿主载荷；本模块健康面会标为降级',
+      )
+    } catch {
+      // 日志本身失败不得影响订阅路径（H-1 同源）
+    }
+  }
+
+  /** 健康上报的包装：未订上的宿主事件是**模块级降级**，不能被后续自报 `ok` 覆盖。 */
+  const report = (health: ModuleHealth): void => {
+    if (hostFallbacks.length === 0) {
+      selfReport(health)
+      return
+    }
+    selfReport({
+      state: health.state === 'ok' ? 'degraded' : health.state,
+      detail:
+        `${health.detail}；⚠ 宿主事件面订阅失败 ${hostFallbacks.length} 处`
+        + `（${hostFallbacks.join('、')}）——这些事件收不到宿主载荷（已回落内核总线）`,
+      metrics: health.metrics,
+    })
+  }
+
   const kernel: Kernel = {
     /** 宿主服务优先（真宿主提供 tools/systemPrompt 等），否则内核自有表。 */
     service: <T,>(name: string) => (readHost(name) ?? core.services.get<T>(name)) as T | undefined,
@@ -155,6 +201,10 @@ export function adoptContext(
       //    会话状态机从未被喂到，于是**循环检测事实上空转**，健康面却报"正常"。
       //
       // 判据是"这个事件名是不是宿主独有"，不是"宿主能不能订上"。
+      //
+      // ⚠ 但"订不上"这件事**必须留声**：宿主 `ctx.on` 返回非函数、或它抛错时，
+      // 下面的回落会让这个宿主独有事件永远收不到载荷。旧实现在这里静默 `return`，
+      // 于是模块空转而健康面全绿（见 `noteHostFallback` 的说明）。
       if (hostOn !== undefined && HOST_ONLY_EVENTS.has(event)) {
         try {
           const off = hostOn(event, fn as (...args: never[]) => void)
@@ -162,8 +212,9 @@ export function adoptContext(
             heartbeat('adopt-on', { event, backend: 'host' })
             return off as () => void
           }
-        } catch {
-          // 回落内核总线
+          noteHostFallback(event, '宿主 ctx.on 没有返回 disposer')
+        } catch (error) {
+          noteHostFallback(event, `宿主 ctx.on 抛错：${error instanceof Error ? error.message : String(error)}`)
         }
       }
       heartbeat('adopt-on', { event, backend: 'kernel' })
@@ -171,7 +222,8 @@ export function adoptContext(
     },
     emit: (event, payload) => core.emit(event, payload),
     budget: (kind, amount) => core.budget(kind, amount),
-    report: selfReport,
+    // 用包装过的 `report`，不用裸 `selfReport`：未订上的宿主事件要能穿透后续自报
+    report,
     pressure: session => core.pressure(session),
     focus: session => core.focus(session) as ReturnType<Kernel['focus']>,
     setFocus: (session, depth, reason) => core.setFocus(session, depth, reason),
