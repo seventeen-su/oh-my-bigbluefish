@@ -241,8 +241,12 @@ export interface VectorStoreApi {
   deleteStaleEmbeddings(ids: readonly string[], current: EmbeddingMeta): Promise<number>
 }
 
-/** 具体实现类型。除端口外还暴露状态面需要的诊断字段。 */
-export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe {
+/**
+ * 具体实现类型。除端口外还暴露状态面需要的诊断字段，以及两个**结构面**能力
+ * （`UsageApi` 的使用计数、`RecordScanApi` 的整合扫描）——它们不进 ABI，
+ * 由 `asUsageStore` / `asRecordScanner` 按能力探测（模式同 `asVectorStore`）。
+ */
+export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe, UsageApi, RecordScanApi {
   /** 库文件路径（`:memory:` 时为该字面量）。 */
   readonly dbPath: string
   /** 打开时的迁移结果；未迁移时为 `{from: n, to: n}`。 */
@@ -256,6 +260,40 @@ export function asVectorStore(store: MemoryStore): VectorStoreApi | undefined {
 
 /** 从端口句柄取诊断面（库路径、迁移结果）；不是本实现返回 undefined。 */
 export function asMemoryStore(store: MemoryStore): SqliteMemoryStore | undefined {
+  return store instanceof SqliteStore ? store : undefined
+}
+
+/**
+ * **使用计数面**（结构探测，不进 ABI）。
+ *
+ * 为什么不进 `kernel/abi/ports.ts`：那是一个冻结契约，而这里只需要"能不能记账"这一个能力；
+ * 向量面（`asVectorStore`）已经确立了同一条模式——**按能力探测，探测不到就降级**
+ * （`markUsed` 落不成的库不影响召回本身）。ABI 上的 `use_count`/`last_used_at` 语义不变。
+ */
+export interface UsageApi {
+  /** 见 `SqliteStore.markUsed`：被注入使用的行 `use_count+1`、`last_used_at = at`。 */
+  markUsed(ids: readonly string[], at: number): Promise<number>
+}
+
+/** 从端口句柄取使用计数面；不是本实现返回 undefined（调用方跳过记账，不抛）。 */
+export function asUsageStore(store: MemoryStore): UsageApi | undefined {
+  return store instanceof SqliteStore ? store : undefined
+}
+
+/**
+ * **整合扫描面**（结构探测，不进 ABI）：能按时间倒序读回最近的记录。
+ *
+ * 与 `UsageApi` 同一条理由：`MemoryStore`（ABI）里没有"列出记录"的能力，
+ * 而离线整合需要一个输入端。探测不到就**跳过这个库**并如实计入问题，
+ * 而不是让整合悄悄什么都不做（那正是 M3"只在测试里存在"的形态）。
+ */
+export interface RecordScanApi {
+  /** 见 `SqliteStore.listRecentRecords`。 */
+  listRecentRecords(input: { readonly limit: number }): Promise<readonly MemoryRecord[]>
+}
+
+/** 从端口句柄取整合扫描面；不是本实现返回 undefined。 */
+export function asRecordScanner(store: MemoryStore): RecordScanApi | undefined {
   return store instanceof SqliteStore ? store : undefined
 }
 
@@ -801,6 +839,45 @@ class SqliteStore implements SqliteMemoryStore {
   }
 
   /**
+   * 被注入使用后的记账：`use_count += 1`、`last_used_at = at`。
+   *
+   * ## 为什么需要它（M5）
+   *
+   * `use_count` / `last_used_at` 有三个消费者，却长期**零个生产者**：
+   * - `retrieve.ts` 的重排先验 `usage = useCount/(1+useCount)` 乘 `RERANK_WEIGHTS.usage = 0.12`；
+   * - `consolidate.ts` 的 `decayPrior` usage 因子与"回响塌缩累加 useCount"。
+   *
+   * 而写入侧恒写 `useCount: 0`、`lastUsedAt: now` —— 于是 0.12 的权重永远是死分量，
+   * "多久没被用过"永远等于"多久前写的"，且**没有任何读数能看出来**（典型的静默失效）。
+   *
+   * ## 只改这两列
+   *
+   * 正文、溯源、`valid_to`/`superseded_by` 一个字节都不动：它们不是"使用"，
+   * 改了就是改写历史（本仓库的非破坏性口径）。也不动 FTS 索引（`text` 未变）。
+   *
+   * @returns 真正被更新的行数（id 不存在时不计；调用方据此判断是否"写了个寂寞"）
+   */
+  async markUsed(ids: readonly string[], at: number): Promise<number> {
+    this.#assertUsable()
+    const unique = [...new Set(ids)].filter(id => typeof id === 'string' && id.length > 0)
+    if (unique.length === 0) return 0
+    if (!Number.isInteger(at)) throw new Error(`OMB：使用时间必须是整数毫秒，收到 ${String(at)}`)
+    return await this.#enqueue(() => {
+      this.#assertOpen()
+      let updated = 0
+      // 参数是 `at` + N 个 id，所以按 MAX_SQL_VARS 的一半分块（与其它批量语句同一口径）
+      for (const chunk of chunkArray(unique, Math.floor(MAX_SQL_VARS / 2))) {
+        const placeholders = chunk.map(() => '?').join(', ')
+        updated += this.#run(
+          `UPDATE memory SET use_count = use_count + 1, last_used_at = ? WHERE id IN (${placeholders})`,
+          [at, ...chunk],
+        )
+      }
+      return updated
+    })
+  }
+
+  /**
    * 上一次 `forget` 的 WAL 截断是否失败。
    *
    * 用途：`forget` 的回执要能如实说"逻辑已删，但磁盘残留未清干净"——
@@ -981,6 +1058,27 @@ class SqliteStore implements SqliteMemoryStore {
       if (record !== undefined) result.push(record)
     }
     return result
+  }
+
+  /**
+   * 按 `observed_at` 倒序取**最近**的一批记录（离线整合的输入端；结构探测，不进 ABI）。
+   *
+   * 为什么有界、为什么倒序：整合要找的是"最近写下的痕迹里的重复与矛盾"，
+   * 而全表读会在长跑宿主上变成一次几十 MB 的物化（`memory.text` 是变长文本）。
+   * 有界读让每次运行的代价与库大小无关；倒序保证窗口里装的是刚发生的痕迹
+   * （回响天然在时间上相邻：同一条错事被同一会话在相邻回合里重复写下）。
+   *
+   * @param input.limit 条数上界；调用方给上界（缺省/非法值按 `0` 处理，即不读）
+   */
+  async listRecentRecords(input: { readonly limit: number }): Promise<readonly MemoryRecord[]> {
+    this.#assertUsable()
+    const limit = Number.isFinite(input.limit) ? Math.max(0, Math.floor(input.limit)) : 0
+    if (limit === 0) return []
+    const rows = this.#all(
+      `SELECT ${RECORD_COLUMNS} FROM memory ORDER BY observed_at DESC, id DESC LIMIT ?`,
+      [limit],
+    )
+    return rows.map(row => toRecord(row))
   }
 
   /**
@@ -1586,13 +1684,11 @@ function safeClose(db: SqliteLike, logger: Logger, where: string): void {
  * **异常一律向上抛**（打开失败、迁移失败、未来版本拒绝）：
  * 由调用方决定是降级（`StoresService` 返回 undefined）还是让整次启动失败。
  *
- * ⚠️ **显式传入 `SCHEMA_MIGRATIONS`**（而不是让 `migrate()` 用缺省值）是刻意的：
- * `migrate()` 在没有显式步骤表时会做一次契约漂移自检（步骤表最高版本必须等于
- * `kernel/abi` 的 `SCHEMA_VERSION`）。本轮的迁移是 v2（`embedding.content_hash`），
- * 而 `kernel/**` 此刻由另一个 agent 在改、不许碰，那个常量还是 1。
- * 传显式步骤表让自检按设计跳过，同时**迁移本身照常执行**——库结构因此是新的，
- * 代价是那条版本号差异要等 kernel 侧的 `SCHEMA_VERSION` 抬到 2 才能收口。
- * 传的是同一张正式表（不是另造一张），所以不存在"两套迁移"的漂移风险。
+ * ⚠️ **这里刻意不传步骤表**（`migrate()` 用缺省表 = `SCHEMA_MIGRATIONS`）：
+ * "表最高版本 vs `kernel/abi` 的 `SCHEMA_VERSION`"那条**契约漂移自检只在缺省路径上跑**。
+ * 本轮曾因常量落后于表（1 vs 2）而必须显式传表绕过——那等于把自检关掉，
+ * 于是"迁移表与 ABI 不一致"这件事就再也没人喊了。常量已收口到 2（见 `migrate.ts` 的说明），
+ * **照旧注释去做（显式传表）会重新关掉这条自检**，不要再改回去。
  */
 export function openMemoryStore(options: OpenMemoryStoreOptions): SqliteMemoryStore {
   if (options.port.createDirs) ensureStoreDirs(options)
@@ -1781,10 +1877,14 @@ const STORE_ACCESS: Readonly<Record<string, 'read' | 'write' | 'transaction'>> =
   listStaleEmbeddingIds: 'read',
   searchVector: 'read',
   countEmbeddings: 'read',
+  // 离线整合的输入端（列出最近记录）是**读**：受限会话里整合仍可运行，只是写会被拒
+  listRecentRecords: 'read',
   // ── 写 ──
   put: 'write',
   upsertEdge: 'write',
   forget: 'write',
+  // 使用计数是**写**：隐私受限的会话里不能悄悄积累"用过多少次"（它是行为痕迹）
+  markUsed: 'write',
   putEmbedding: 'write',
   setEmbeddingMeta: 'write',
   // 回收残留向量行是一次真正的删除（只删"不属于当前身份"的行），按写处理

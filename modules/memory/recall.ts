@@ -25,6 +25,7 @@ import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { MEMORY_KINDS, MEMORY_SCOPES } from '../../kernel/abi/index.js'
 import type { RetrievePorts, RetrieveQuery, RetrieveResult } from './retrieve.js'
 import { isoUtc, retrieve } from './retrieve.js'
+import { asUsageStore } from './store.js'
 
 export const RECALL_TOOL = 'omb_recall'
 export const FORGET_TOOL = 'omb_forget'
@@ -183,6 +184,13 @@ export interface MemoryToolDeps {
    * 没有会话 → `undefined`（不用别人的压力读数塑形本次检索）。
    */
   readonly pressureBand?: (sessionId?: string) => PressureBand | undefined
+  /**
+   * 使用计数（`use_count`/`last_used_at`）**没写成**时的上报口。
+   *
+   * 记账失败绝不改变召回结果，但**不许静默**：失败次数与原因要能进状态面，
+   * 否则"这条记忆被用过几次"永远是个没有来源的数字（M5 的静默失效正是这么来的）。
+   */
+  readonly onUsageFailure?: (info: { readonly reason: string; readonly ids: readonly string[] }) => void
 }
 
 export interface ForgetOutcome {
@@ -238,6 +246,63 @@ export async function forgetRecords(
   return { ok: true, value: { deleted, perScope, missing, degraded } }
 }
 
+/**
+ * 被注入的条目记一次"用过"（`use_count +1`、`last_used_at = now`）。
+ *
+ * 判据（M5）：
+ * - **只有成功注入**才写：门控跳过（`gate.retrieve === false`）或零命中时**一个字节都不写**；
+ * - 按 `item.scope` 落到对应的库（id 唯一、记录只在一个库里）；
+ * - 记账失败**绝不改变召回结果**，但必须经 `onUsageFailure` 上报（不许静默）。
+ *
+ * 为什么放在工具执行体而不是 `retrieve()` 里：读路径有延迟预算，而这是一次额外的写；
+ * 放在这里，`retrieve()` 保持纯读（`retrieve.test.ts` 的夹具也不用跟着改语义）。
+ */
+async function markInjectedAsUsed(
+  deps: MemoryToolDeps,
+  stores: readonly TaggedStore[],
+  result: RetrieveResult,
+): Promise<void> {
+  /** 记账是一条**旁路**：它自己抛出去就变成了"召回失败"，那是本末倒置。 */
+  const report = (reason: string, ids: readonly string[]): void => {
+    try {
+      deps.onUsageFailure?.({ reason, ids })
+    } catch {
+      // 上报口自己失败不得改变召回结果
+    }
+  }
+  try {
+    if (!result.gate.retrieve || result.items.length === 0) return
+    // `result.now === null` = 检索端口没给出时钟读数；那时用工具自己的时钟（同一个 `kernel.clock`）。
+    // 时钟**也可能抛**（宿主时钟未就绪）：那时整段记账跳过，只上报原因。
+    let now: number
+    try {
+      now = result.now ?? deps.clock.now()
+    } catch (error) {
+      report(`时钟不可用（${messageOf(error)}）`, [])
+      return
+    }
+    const byScope = new Map<MemoryScope, string[]>()
+    for (const item of result.items) {
+      const ids = byScope.get(item.scope)
+      if (ids === undefined) byScope.set(item.scope, [item.id])
+      else ids.push(item.id)
+    }
+    for (const tagged of stores) {
+      const ids = byScope.get(tagged.scope)
+      if (ids === undefined || ids.length === 0) continue
+      const usage = asUsageStore(tagged.store)
+      if (usage === undefined) continue // 不是本实现的库：跳过记账（不抛、不影响召回）
+      try {
+        await usage.markUsed(ids, now)
+      } catch (error) {
+        report(messageOf(error), ids)
+      }
+    }
+  } catch (error) {
+    report(messageOf(error), [])
+  }
+}
+
 /** `omb_recall` 工具定义。 */
 export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
   const parameters: ToolParameters = {
@@ -276,6 +341,8 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       const ports = resolvePorts(deps)
       const band = readPressureBand(deps, sessionId)
       const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band), ports)
+      // 记账在**结果已经成立之后**：它失败与否都不改变"检索到了什么"（也绝不抛）
+      await markInjectedAsUsed(deps, resolved.stores, result)
       return { kind: 'text', text: renderRecall(result) + unknownAttributionNote(call) }
     },
   }
