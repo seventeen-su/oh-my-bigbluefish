@@ -97,7 +97,7 @@ cordis ~4.0.4 => >=4.0.4 <4.1.0-0 | 4.0.5: true | 4.1.0: false
 - OMB 的上下文优化**只读**压力：`modules/context/index.ts:249` `kernel.pressure(target)`，`:241-249` 是唯一的压力取数路径。
 - 它**从不改会话历史**：在 `modules/context/**` 里 grep `session.append` / `surfaceOp` / 会话写操作 → **零命中**；它维护的是**内存里的**拉取台账（`:197` 的 `ledgers`、`recordPull` `:396`、`noteTurn` `:348`）。
 - 台账的判据是"拉取次数 / 轮数"（`modules/context/watch.ts:47-181`、`cacheHitRate` `:235-237`），与历史体量无关。
-- 档位阈值 `[0.3, 0.6]`（`modules/context/index.ts:60,70`）**低于**压缩阈值（~0.8 减去 headroom）：OMB 在 0.6 就转"只给索引"，压缩在更晚才动手。
+- 档位阈值 `[0.3, 0.6]`（`modules/context/index.ts:60,70`）**低于**压缩阈值（~0.8 减去 headroom）：OMB 在 0.6 就转"读数 + 索引"（规则卡正文改按需用 `omb_method` 拉取），压缩在更晚才动手。
 
 **结论**：
 1. **没有真冲突**——两者改的不是同一份东西。压缩改会话历史（surface/日志），OMB 改的是"我往提示里塞什么"（且默认不塞）；它们共享的只有**测量**（`tokenMeter` 读数）。
