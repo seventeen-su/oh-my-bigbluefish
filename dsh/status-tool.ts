@@ -21,7 +21,10 @@ import { SERVICES } from '../kernel/abi/index.js'
 import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
-import { generationFromUrl } from '../kernel/buildInfo.js'
+import { generationFromUrl, parseGeneration } from '../kernel/buildInfo.js'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
   ok: '正常',
@@ -75,6 +78,77 @@ interface SessionAwareContributor extends StatusContributor {
   render(session?: string): string
 }
 
+/**
+ * 磁盘上**仓库最新**的代数（读 `<包根>/build-generation.json`）。
+ *
+ * 为什么要读它：`omb_status` 原先只印"当前加载的是第 N 代"，而**加载的产物目录可能
+ * 已经被下一次构建删掉**——真机实测过：状态面报「第 77 代（产物目录 lib-gen/g77）」，
+ * 而磁盘上只有 g79，g77 早被清理。读者据此去仓库里找一个不存在的目录，也无从知道
+ * "我现在跑的代码落后了"。把磁盘代数并排印出来，"落后"就成了可观测事实。
+ *
+ * 包根的推导与 `kernel/hostEntry.ts` 同一口径：从本文件位置向上找第一个含
+ * `package.json` 的祖先（源码树里是仓库根，装配副本里是插件根，两种情况
+ * `build-generation.json` 都在那一层）。
+ *
+ * 读不到就返回 `undefined`，调用方如实写"未测量"——而不是省略（硬不变量 3：
+ * 未测量与"没有新代"必须看着不一样）。
+ */
+function diskGeneration(): number | undefined {
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url))
+    for (let i = 0; i < 8; i++) {
+      if (existsSync(join(dir, 'package.json'))) {
+        const file = join(dir, 'build-generation.json')
+        if (!existsSync(file)) return undefined
+        return parseGeneration(JSON.parse(readFileSync(file, 'utf8')))?.generation
+      }
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    return undefined
+  } catch {
+    // 读文件/解析失败一律当作"未测量"：诊断不得反过来打断状态面
+    return undefined
+  }
+}
+
+/**
+ * 「## 构建」段的正文（纯函数，便于逐种组合钉住）。
+ *
+ * 为什么要把**加载代数**与**磁盘代数**并排印：只印加载代数时，"我现在跑的是旧代"
+ * 这件事没有任何信号。实测：真机报「第 77 代（产物目录 lib-gen/g77）」，而磁盘上只有
+ * g79——g77 早被下一次构建清理掉了，读者据此去仓库里找一个不存在的目录，
+ * 也无从知道该重启宿主。
+ *
+ * @param loaded 从本文件 URL 解析出的代数；`undefined` = 不是换代产物（源码树里跑）
+ * @param onDisk `<包根>/build-generation.json` 里的代数；`undefined` = 读不到（**未测量**）
+ */
+export function renderBuildSection(
+  loaded: number | undefined,
+  onDisk: number | undefined,
+): readonly string[] {
+  const lines: string[] = []
+  if (loaded === undefined) {
+    lines.push('- 代数：未知（非换代产物运行，或从源码直接运行；无法据此判断代码新旧）')
+  } else {
+    lines.push(`- 代数：第 ${loaded} 代（产物目录 lib-gen/g${loaded}）`)
+  }
+  if (onDisk === undefined) {
+    lines.push('- 磁盘代数：**未测量**（读不到 build-generation.json——不是"没有新代"）')
+  } else if (loaded === undefined) {
+    lines.push(`- 磁盘代数：第 ${onDisk} 代（当前不是换代产物运行，**无法比对**）`)
+  } else if (loaded !== onDisk) {
+    lines.push(
+      `- 磁盘代数：第 ${onDisk} 代 —— **宿主加载的代码不是最新的**`
+      + `（加载的 lib-gen/g${loaded} 可能已被构建清理）；重启 dsh web 后新代才生效`,
+    )
+  } else {
+    lines.push(`- 磁盘代数：第 ${onDisk} 代（与加载代数一致）`)
+  }
+  return lines
+}
+
 /** 组装 `omb_status` 的输出文本。纯组装，无副作用，便于测试。 */
 export function renderStatus(options: StatusToolOptions, sessionId?: string): string {
   const { handle } = options
@@ -83,9 +157,19 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   const lines: string[] = ['# OMB 状态', '']
 
   // ── 会话口径：**一次渲染只解析一次**，顶层与模块段共用同一个 ──────────────
-  // 会话优先级：显式参数 → 内核登记处的当前会话 → 任一已知会话（诊断兜底）。
+  // 会话优先级：显式参数 → 内核登记处的当前会话 → 任一已知会话（**诊断兜底**）。
   // 读数只来自 `kernel.pressure/focus`，本文件不自己存会话事实。
-  const activeSession = sessionId ?? sessions?.current() ?? sessions?.sessions()[0] ?? ''
+  //
+  // ⚠ 第三臂是**防御性**的，当前经公开 API **不可达**：`ActiveSessionTable.forget()`
+  // 只删「会话→cwd」那一项、**不清** `current()`；而唯一清 `current()` 的 `clear()`
+  // 连那张表一起清。所以"current 为空而登记处非空"目前构造不出来。
+  // 保留它是因为语义上"有登记的会话、但没有当前会话"是可能的（比如将来给 forget
+  // 补上清 current 的语义）；同时**必须标注口径**——一旦它真的生效，读者拿到的就是
+  // 别的会话的读数，照原样印成"当前"会让一个精确数字冒充当前事实。
+  const explicitSession = sessionId ?? sessions?.current()
+  const fallbackSession = explicitSession === undefined ? sessions?.sessions()[0] : undefined
+  const activeSession = explicitSession ?? fallbackSession ?? ''
+  const sessionFallback = explicitSession === undefined && fallbackSession !== undefined
 
   // ── 组件自述：**必须先渲染**（顺序契约，理由见下）───────────────────────
   //
@@ -125,15 +209,11 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   // 按 URL 缓存——改了源码而 URL 没变时，宿主跑的还是**旧模块实例**，
   // 此时任何"模块异常"的报错都不反映当前源码。
   // 代数直接印在状态里，"到底跑的是哪一代"就成了可观测事实。
+  //
+  // 并且**与磁盘上的代数并排印**：只印加载代数时，"我跑的是旧代"这件事没有任何信号
+  // （实测：真机报第 77 代，磁盘早已是 g79，而 g77 的产物目录已被构建删掉）。
   const generation = generationFromUrl(import.meta.url)
-  lines.push(
-    '## 构建',
-    '',
-    generation === undefined
-      ? '- 代数：未知（非换代产物运行，或从源码直接运行；无法据此判断代码新旧）'
-      : `- 代数：第 ${generation} 代（产物目录 lib-gen/g${generation}）`,
-    '',
-  )
+  lines.push('## 构建', '', ...renderBuildSection(generation, diskGeneration()), '')
 
   // ── 模块健康 ──────────────────────────────────────────────────────────
   //
@@ -203,8 +283,15 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   // 否则就会出现"顶层 moderate / 0.343，模块段 relaxed / 未测量"这种同一次输出里的矛盾。
   lines.push('## 上下文', '')
   if (activeSession.length === 0) {
+    // **空会话也要给原因**：原先只说"取不到读数"，而"取不到"有三种成因
+    // （宿主还没观测到任何会话 / 宿主没注册 contextPressure 投影 / 宿主从没上报过 usage），
+    // 修法完全不同。原因由度量桥如实给出（`SERVICES.pressureReading`），这里只转述。
+    const why = handle.kernel.service<{ reason(): string }>(SERVICES.pressureReading)?.reason()
     lines.push(
       '（无活跃会话：**本段的所有读数都取不到**，不是读到了 0）',
+      why === undefined
+        ? '（原因不可得：度量桥未接线——这本身就是一条接线缺陷）'
+        : `（原因：${why}）`,
       '',
     )
   } else {
@@ -234,6 +321,15 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
       lines.push(`- 最贵的 ${top.length} 块：${top.map(n => `${n.name}(${n.tokens})`).join('、')}`)
     }
     lines.push(`- 推理深度档位：${kernel.focus(activeSession)}`, '')
+    // 兜底会话必须**自报口径**：它给出的读数不属于"这次是谁在问"，
+    // 不标注就会让一个精确数字冒充当前事实（硬不变量：没有静默失效）。
+    if (sessionFallback) {
+      lines.push(
+        `- ⚠ 口径：**当前活跃会话未知**——本段读数取自登记处的会话 ${activeSession}`
+        + '（它**不是**"这次是谁在问"，只作诊断兜底）',
+        '',
+      )
+    }
   }
 
   // ── 预算 ──────────────────────────────────────────────────────────────
