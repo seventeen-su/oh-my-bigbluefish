@@ -52,7 +52,7 @@ npx eslint .
 npx vitest run
 ```
 
-理由：队友的"我验证过了"是转述，不是证据。基线数字要记下来（当前 789 passed / 2 skipped），
+理由：队友的"我验证过了"是转述，不是证据。基线数字要记下来（当前 **1271 passed / 1 skipped**，2026-10-03 实测），
 数字变化必须能解释。
 
 ## 六、宿主有 ESM 缓存，验证要认代数
@@ -74,3 +74,25 @@ npx vitest run
 4. **任何没做到或不确定的点**（直说，不许美化）
 
 第 4 条最重要：本项目多条真缺陷是靠"报告里那句不确定"定位的。
+
+## 八、worktree 与 junction：一次真实事故（2026-10-03）
+
+**事故**：为了给并行 worktree 省一次安装，把它的 node_modules 做成指向主仓库的 **junction**。
+之后执行 `git worktree remove --force <探针 worktree>`，删除**穿过 junction 把主仓库的 node_modules 清空**（实测 files=0）。
+侥幸只损失依赖目录：`.omb`（记忆库 4 文件）、`models`（权重 3 文件）、`lib-gen`（86 文件）、全部源码与 `git status` 均完好，
+`pnpm install --prefer-offline` **2.1 秒**复原（store 是热的）。
+
+**规则**：
+
+1. **不用 junction 共享 node_modules**。每个 worktree 各自 `pnpm install --prefer-offline`——实测 992ms–2.1s，比一次误删便宜得多。
+2. 若已经建了 junction，删 worktree 前先 `cmd /c rmdir <junction>`（只删链接、不碰目标）；**不要用 `Remove-Item -Recurse`**。
+3. 任何递归删除之前，先确认路径里没有 reparse point。
+
+## 九、子代理 fan-out 的三条硬约束（2026-10-03 实测）
+
+1. **并发 ≤ 4，且每个代理必须把结果 write 落盘**。实测 7 并发审计整批失败：7 个子代理会话的 turn/end 全是
+   `429 GoUsageLimitError`，而 workflow 作业通知仍报 `status: completed, 7 agents`——**作业"完成"不等于代理有产出**。
+2. **后台作业的结果会丢**。长空闲（实测 2h16m）后 `job_output <id>` 报 `unknown job`、`job_list` 返回空，
+   已完成作业的结果**永久取不回**。落盘是主副本，作业返回值只是副本。
+3. **`subagent` 启动后无法中断**：`send_message` 只路由 teammate（报 `active teammate not found`）、`list_agents` 不含子代理、
+   `job_list` 不含子代理，因此 `job_kill` / `interrupt_agent` 都用不上。需要可中断的并行施工请用 `spawn_teammate`。
