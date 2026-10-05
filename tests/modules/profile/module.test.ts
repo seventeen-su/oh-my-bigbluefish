@@ -167,7 +167,7 @@ describe('能力轴：默认关闭，且永不落盘（D4）', () => {
     expect(detail).toContain('能力轴已开启')
   })
 
-  it('同一取值重复观察不改变快照引用（供 sessionProjections 的同一引用不变量）', () => {
+  it('同一取值重复观察不改变快照引用（重复观察不让消费者引用抖动）', () => {
     const { service } = startProfile(new FakeStores(), { inferCapabilityAxis: true })
     const first = service.capability('s1')
     service.observeCapability('s1', { key: 'lang', value: '中文' })
@@ -310,5 +310,54 @@ describe('降级与热插拔', () => {
     expect(after.ok).toBe(false)
     expect(after.error).toContain('已卸载')
     expect((await module.manifest.health()).detail).toContain('模块未启动')
+  })
+})
+
+/**
+ * S3-e：**写入面零消费者**必须如实标注。
+ *
+ * 审计 C5：`declare` / `infer` / `clearDeduced` / `observeCapability` 全仓
+ * 生产调用点为 0（命中只在 `tests/modules/profile/**`）。于是"显式条目 0 条"
+ * 有两种相反的含义：**没人写过** 与 **没有写入口**。状态面必须能分开说——
+ * 否则用户会以为自己从未表达过偏好，而事实是这些入口根本没接上。
+ *
+ * 修复前：健康面只有"显式条目 0 条、推断条目 0 条"，两者同形。
+ */
+describe('写入面零消费者：状态面如实标注（S3-e）', () => {
+  it('没有写入调用时，健康面与 status 都写明「写入面暂无调用方」', async () => {
+    const { service, health } = startProfile(new FakeStores())
+    const detail = (await health()).detail
+    expect(detail).toContain('写入面暂无调用方（服务已声明，等待消费方）')
+    expect(detail).toContain('收到 0 次请求')
+    expect(detail).toContain('0 条')
+    expect(service.status().detail).toContain('写入面暂无调用方')
+    expect((await health()).metrics?.writeFaceCalls).toBe(0)
+  })
+
+  it('一旦有调用，文案改成实际请求数（不留过期承诺）', async () => {
+    const { service, health } = startProfile(new FakeStores())
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    const detail = (await health()).detail
+    expect(detail).not.toContain('写入面暂无调用方')
+    expect(detail).toContain('收到 1 次写入请求')
+    expect(detail).toContain('declare 1')
+    expect((await health()).metrics?.writeFaceCalls).toBe(1)
+  })
+
+  it('能力观察会话表口径：上界与淘汰数分开报（0 与"未测量"不同）', async () => {
+    const { service, health } = startProfile(new FakeStores(), { inferCapabilityAxis: true })
+    const before = await health()
+    expect(before.detail).toContain('能力观察会话表 0/32 个会话')
+    expect(before.metrics?.capabilitySessions).toBe(0)
+    expect(before.metrics?.capabilitySessionsEvicted).toBe(0)
+
+    for (let index = 1; index <= 40; index += 1) {
+      service.observeCapability(`s${index}`, { key: 'k', value: `v${index}` })
+    }
+    const after = await health()
+    expect(after.detail).toContain('能力观察会话表 32/32 个会话')
+    expect(after.detail).toContain('已淘汰 8 个更早的会话')
+    expect(after.metrics?.capabilitySessions).toBe(32)
+    expect(after.metrics?.capabilitySessionsEvicted).toBe(8)
   })
 })
