@@ -8,8 +8,8 @@
  * ```
  * ### 模块依赖图
  * 依赖未挂载 6 处（前置条件未满足，依赖方应已自行降级）：
- * - omb-privacy ← omb-kernel
  * - omb-memory ← omb-kernel
+ * - omb-memory-vector ← omb-kernel
  * - omb-reasoning ← omb-kernel
  * …
  * ```
@@ -65,9 +65,9 @@ describe('依赖图自检不得误报', () => {
     handle.dispose()
   })
 
-  it('多个模块依赖内核时也不误报（真实形态：8 个模块都依赖它）', () => {
+  it('多个模块依赖内核时也不误报（真实形态：其余模块都依赖它）', () => {
     const handle = createKernel()
-    for (const id of ['omb-privacy', 'omb-memory', 'omb-memory-vector', 'omb-reasoning', 'omb-context']) {
+    for (const id of ['omb-memory', 'omb-memory-vector', 'omb-reasoning', 'omb-context', 'omb-notify']) {
       handle.mount(moduleRequiring(id, ['omb-kernel']), undefined)
     }
     const graph = handle.moduleGraph()

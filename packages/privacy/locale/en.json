@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Privacy modes",
-    "description": "One slash command controls memory reads and writes per session (read-only / sealed), inherited by subagents, persisted across restarts, and fail-closed when the state cannot be read."
-  }
-}

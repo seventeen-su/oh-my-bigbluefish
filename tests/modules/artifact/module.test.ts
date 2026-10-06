@@ -24,7 +24,7 @@ import { FILES_TOOL_NAME } from '../../../modules/artifact/tools.js'
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.5.0',
+    version: '3.6.0',
     requires: [],
     capabilities: ['kernel.services'],
     configSchema: { parse: () => ({}) },
@@ -33,22 +33,65 @@ const KERNEL_STUB: ModuleRegistration<unknown> = {
   apply: () => {},
 }
 
+/**
+ * `omb-memory` 占位注册。
+ *
+ * **3.6 起它不再可有可无**：制品索引显式依赖 `omb-memory`（隐私闸门由记忆库提供），
+ * 而内核的依赖规划会**阻断**依赖缺席的模块——少了这个替身，制品模块根本装不上。
+ * 它同时是 `SERVICES.privacy` 的提供者：这正是"闸门由记忆库提供"在生产里的形态，
+ * 所以以前的 `privacyStub`（id 写 `omb-privacy`）现在就是这一个替身。
+ *
+ * @param privacy 不传 = 提供**最小**记忆库（不提供 privacy）→ 用于"闸门缺席"那几条；
+ *   传 `allowWrite` = 提供 privacy 判定端口（与生产同形状）。
+ */
+function memoryStub(privacy?: { readonly allowWrite: boolean; readonly writeReason: string }): ModuleRegistration<unknown> {
+  return {
+    manifest: {
+      id: 'omb-memory',
+      version: '3.6.0',
+      requires: ['omb-kernel'],
+      capabilities: [],
+      configSchema: { parse: () => ({}) },
+      health: () => ({ state: 'ok', detail: '测试用记忆库替身' }),
+    },
+    apply: (kernel: Kernel) => {
+      if (privacy === undefined) return
+      const decision = {
+        allowRead: true,
+        allowWrite: privacy.allowWrite,
+        readReason: '',
+        writeReason: privacy.writeReason,
+      }
+      kernel.provide(SERVICES.privacy, {
+        decide: () => decision,
+        decideUnattributed: () => decision,
+        restricted: () => false,
+      })
+    },
+  }
+}
+
 const catalogEntry = MODULE_CATALOG.find(candidate => candidate.id === 'omb-artifact')
 
 function fakeClock(start = 5_000): { now(): number } {
   return { now: () => start }
 }
 
-function start(config?: unknown): { kernel: Kernel; handle: ReturnType<typeof createKernel>; service: ArtifactService } {
+function start(config?: unknown): {
+  kernel: Kernel
+  handle: ReturnType<typeof createKernel>
+  service: ArtifactService
+  module: ReturnType<typeof createArtifactModule>
+} {
   const handle = createKernel({ clock: fakeClock() })
   const module = createArtifactModule()
   handle.start(
-    [KERNEL_STUB, module as ModuleRegistration<unknown>],
+    [KERNEL_STUB, memoryStub(), module as ModuleRegistration<unknown>],
     config === undefined ? undefined : new Map([['omb-artifact', config]]),
   )
   const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
   if (service === undefined) throw new Error('制品服务未注册（测试装配有误）')
-  return { kernel: handle.kernel, handle, service }
+  return { kernel: handle.kernel, handle, service, module }
 }
 
 describe('注册面', () => {
@@ -129,7 +172,7 @@ describe('健康面与热插拔', () => {
   it('健康面写明条数与"不注入上下文"', async () => {
     const handle = createKernel()
     const module = createArtifactModule()
-    handle.start([KERNEL_STUB, module as ModuleRegistration<unknown>])
+    handle.start([KERNEL_STUB, memoryStub(), module as ModuleRegistration<unknown>])
     const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
     service?.record('src/a.ts')
 
@@ -160,7 +203,7 @@ describe('健康面与热插拔', () => {
   it('配置非法 → 模块 failed 且原因可读', () => {
     const handle = createKernel()
     handle.start(
-      [KERNEL_STUB, createArtifactModule() as ModuleRegistration<unknown>],
+      [KERNEL_STUB, memoryStub(), createArtifactModule() as ModuleRegistration<unknown>],
       new Map([['omb-artifact', { maxEntries: -1 }]]),
     )
     expect(handle.health()['omb-artifact']?.state).toBe('failed')
@@ -172,39 +215,20 @@ describe('健康面与热插拔', () => {
  *
  * 审计给的链条：`record` 抛可读错误 → `dsh/hooks.ts` 吞掉 → 索引静默停更，
  * 而 `omb_files` 与组件自述都说"本会话还没有观察到任何制品"（错误暗示），
- * 唯一线索在另一个模块（privacy）的计数里。修复后：
+ * 唯一线索在另一个模块的计数里。修复后：
  * ① 服务面 `status().rejectedWrites/lastWriteRejection`；
  * ② `health().detail` 与 `metrics.rejectedWrites`；
  * ③ 组件自述在"索引为空"时点名隐私模式。
+ *
+ * 3.6 起那个"另一个模块"是**记忆库**（它提供 `SERVICES.privacy`），
+ * 因此替身 id 也跟着从 `omb-privacy` 改成 `omb-memory`（见 `memoryStub`）。
  */
 describe('写入被拒的留声：状态面（S3-c）', () => {
-  /** 隐私替身：只实现制品索引用到的那一面（结构契约，不 import privacy 模块）。 */
-  function privacyStub(allowWrite: boolean, writeReason: string): ModuleRegistration<unknown> {
-    return {
-      manifest: {
-        id: 'omb-privacy',
-        version: '1.0.0',
-        requires: [],
-        capabilities: [],
-        configSchema: { parse: (input: unknown) => input },
-        health: () => ({ state: 'ok', detail: '测试用隐私替身' }),
-      },
-      apply: (kernel: Kernel) => {
-        const decision = { allowRead: true, allowWrite, readReason: '', writeReason }
-        kernel.provide(SERVICES.privacy, {
-          decide: () => decision,
-          decideUnattributed: () => decision,
-          restricted: () => false,
-        })
-      },
-    }
-  }
-
   it('被拒 → 服务面与健康面都出现次数与可读原因，组件自述不再说"没观察到制品"', () => {
     const handle = createKernel({ clock: fakeClock() })
     handle.start([
       KERNEL_STUB,
-      privacyStub(false, '会话已被设为 sealed：禁止写入（测试）'),
+      memoryStub({ allowWrite: false, writeReason: '会话已被设为 sealed：禁止写入（测试）' }),
       createArtifactModule() as ModuleRegistration<unknown>,
     ])
     const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
@@ -225,6 +249,8 @@ describe('写入被拒的留声：状态面（S3-c）', () => {
     const rendered = section?.render() ?? ''
     expect(rendered).toContain('不是')
     expect(rendered).toContain('隐私')
+    // 文案里点名的是**命令**（用户肌肉记忆没变），不再点名一个已经不存在的组件包
+    expect(rendered).toContain('记忆库的隐私模式')
     expect(rendered).toContain('omb-privacy')
     expect(rendered).not.toContain('本会话还没有观察到任何制品')
 
@@ -238,7 +264,7 @@ describe('写入被拒的留声：状态面（S3-c）', () => {
     const handle = createKernel({ clock: fakeClock() })
     handle.start([
       KERNEL_STUB,
-      privacyStub(true, ''),
+      memoryStub({ allowWrite: true, writeReason: '' }),
       createArtifactModule() as ModuleRegistration<unknown>,
     ])
     const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
@@ -250,9 +276,16 @@ describe('写入被拒的留声：状态面（S3-c）', () => {
     handle.dispose()
   })
 
-  it('没有隐私模块时 = 不受限：拒绝计数为 0（不是"未测量"）', () => {
-    const { service } = start()
+  it('没有闸门时 = 不受限（契约不变），但**不是静默**：写入被计成"未经闸门约束"', async () => {
+    // `memoryStub()` 不带 privacy 参数 = 记忆库那一行在，但没提供判定端口
+    // （生产里对应"闸门装失败/时序异常"）。判据见 gate-timing.test.ts。
+    const { service, module, handle } = start()
     expect(service.record('src/a.ts', { kind: 'file' })?.kind).toBe('file')
+    // 拒绝计数仍是 0：这不是"被拒"，而是"闸门不在"
     expect(service.status().rejectedWrites).toBe(0)
+    const health = await module.manifest.health()
+    expect(health.metrics?.ungatedWrites).toBe(1)
+    expect(health.detail).toContain('隐私闸门未就绪')
+    handle.dispose()
   })
 })

@@ -42,7 +42,7 @@ export interface ArtifactEntry {
 }
 
 /**
- * 隐私判定端口（**结构契约**；由 `omb-privacy` 提供）。
+ * 隐私判定端口（**结构契约**；由**记忆库**提供，v3.6 起隐私并入 `omb-memory`）。
  *
  * 定义在这里而不是 import `modules/privacy/`：分层规则禁止模块互相 import
  * （`eslint.config.mjs` 的 `no-layer-violation`），双方只认形状——与
@@ -78,7 +78,7 @@ export interface ArtifactIndexDeps {
   readonly maxEntries?: number
   readonly logger?: Logger
   /**
-   * 惰性解析隐私判定端口（行序无关：`omb-privacy` 可能后于本模块挂载）。
+   * 惰性解析隐私判定端口（行序无关：提供方 `omb-memory` 可能后于本模块挂载）。
    * 取不到 = 不受限（隐私模块被关掉 = 没有隐私模式）。
    */
   readonly privacy?: () => ArtifactPrivacyPort | undefined

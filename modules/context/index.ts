@@ -47,7 +47,7 @@ import { buildStatusPanel, createStatusContributor } from './tools.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-context'
-export const MODULE_VERSION = '3.5.0'
+export const MODULE_VERSION = '3.6.0'
 
 /**
  * 「真的没有会话」时面板上的那一句说明。

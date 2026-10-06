@@ -31,7 +31,6 @@ import * as kernelEntry from '../../packages/kernel/index.js'
 import * as memoryEntry from '../../packages/memory/index.js'
 import * as memoryVectorEntry from '../../packages/memory-vector/index.js'
 import * as notifyEntry from '../../packages/notify/index.js'
-import * as privacyEntry from '../../packages/privacy/index.js'
 import * as profileEntry from '../../packages/profile/index.js'
 import * as reasoningEntry from '../../packages/reasoning/index.js'
 
@@ -41,6 +40,8 @@ const root = fileURLToPath(new URL('../../', import.meta.url))
 /**
  * 组件包入口的**静态**清单（与 `modules/moduleEntries.ts` 同样的理由：显式一行，
  * 漏加就报错）。这里只用于测试，不带运行期含义。
+ *
+ * 3.6 起没有 `privacy` 这一项：隐私并入 `omb-memory`，`packages/privacy/**` 整包删除。
  */
 const COMPONENT_ENTRIES: Readonly<Record<string, unknown>> = {
   kernel: kernelEntry,
@@ -51,7 +52,6 @@ const COMPONENT_ENTRIES: Readonly<Record<string, unknown>> = {
   context: contextEntry,
   artifact: artifactEntry,
   notify: notifyEntry,
-  privacy: privacyEntry,
 }
 
 /** 从 YAML 里取「行 id → 行 name」的配对。 */

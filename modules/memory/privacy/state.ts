@@ -29,8 +29,9 @@
  * 这条区分是 fail-closed 的全部要害：把"文件不存在"当成"读不出来"会让首次安装的
  * 用户记忆直接不可用；把"读不出来"当成"不存在"则会让损坏悄悄放宽隐私。
  */
-import type { Clock } from '../../kernel/abi/index.js'
-import type { SessionRuntime, SessionRuntimeTable, TurnSource } from '../../kernel/sessionRuntime.js'
+// 相对深度比独立模块时多一层：本文件现在住在 `modules/memory/privacy/`（3.6 并入记忆库）。
+import type { Clock } from '../../../kernel/abi/index.js'
+import type { SessionRuntime, SessionRuntimeTable, TurnSource } from '../../../kernel/sessionRuntime.js'
 import type { PrivacyMode } from './modes.js'
 import { modeTitle, originTitle, type PrivacyOrigin, type ResolvedPrivacy } from './modes.js'
 

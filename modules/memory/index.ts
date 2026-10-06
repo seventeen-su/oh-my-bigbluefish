@@ -24,6 +24,16 @@ import type {
   ToolDefinition,
 } from '../../kernel/abi/index.js'
 import { SERVICES, catalogEntryOf, derivedCapabilities, derivedRequires, toolsServiceFor } from '../../kernel/abi/index.js'
+// 隐私闸门**并入本模块**（3.6，用户指令 1）：装配、命令、状态段全在 `./privacy/index.js`，
+// 本文件只负责"什么时候装、读数怎么并进健康面与状态面"。
+// 服务名仍是 `SERVICES.privacy`——因此两个消费者（本模块的库访问边界 `store.ts`、
+// 制品读写闸门 `modules/artifact/index.ts`）一个字都不用改。
+import {
+  installPrivacy,
+  privacyConfigSchema,
+  PRIVACY_DEFAULT_CONFIG,
+  type PrivacyInstallation,
+} from './privacy/index.js'
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { createStoresService, asMemoryStore, asRecordScanner, type MemoryStoresService, type PrivacyGatePort } from './store.js'
@@ -54,6 +64,14 @@ const rawConfigSchema = z.object({
   consolidationEveryTurns: z.number().int().min(1).default(32),
   /** 向量编码线程数（ONNX 路径用；纯 JS 路径忽略）。 */
   embeddingThreads: z.number().int().min(1).default(2),
+  /**
+   * **隐私闸门**（3.6 从独立的 `omb-privacy` 行并入本行）。
+   *
+   * 配置项本身没有改名也没有改语义：`failClosedMode`（状态读不出时的基线档位）与
+   * `path`（显式状态文件路径）原样保留，只是从"那一行的 config 块"搬到本行的
+   * `privacy` 子块——`cordis.patch.yml` 里 `omb-privacy` 那一行连同它的 config 一起删掉。
+   */
+  privacy: privacyConfigSchema,
 })
 
 /**
@@ -71,6 +89,7 @@ export type MemoryConfig = z.infer<typeof rawConfigSchema>
 export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   consolidationEveryTurns: 32,
   embeddingThreads: 2,
+  privacy: PRIVACY_DEFAULT_CONFIG,
 }
 
 // requires/capabilities 从模块目录派生：**唯一真源是 `kernel/abi/catalog.ts`**。
@@ -280,6 +299,7 @@ async function describeHealth(
   ledger: MemoryWriteLedger | undefined,
   usage: MemoryUsageLedger | undefined,
   consolidation: ConsolidationLedger | undefined,
+  privacyReadings: (() => ModuleHealth) | undefined,
 ): Promise<ModuleHealth> {
   const status = service.status()
   const snapshot = service.snapshot()
@@ -320,6 +340,25 @@ async function describeHealth(
     metrics['abstentions'] = ledger.abstentions
   }
   if (usage !== undefined && usage.failures > 0) metrics['usageFailures'] = usage.failures
+
+  /**
+   * **隐私读数（3.6 并入）**。
+   *
+   * 为什么必须并进本行：`omb-privacy` 那一行没了，本行现在同时代表隐私闸门。
+   * 不并进来，插件页会显示"记忆库正常"，而对"状态文件损坏 → 所有会话按 sealed 兜底"
+   * 或"状态文件路径解析不出 → 未持久化"只字不提——那正是"没有静默失效"要挡的形态。
+   *
+   * 读数**未接线**（`privacyReadings === undefined`）单独写一句，不假装 ok：
+   * 那种情况下闸门根本没装，模式一条都不会生效。
+   */
+  const privacyHealth = privacyReadings?.()
+  const privacyNote =
+    privacyHealth === undefined
+      ? '；⚠ 隐私闸门**未接线**（apply 没有安装它）：隐私模式不会生效'
+      : `；隐私闸门（/omb-privacy）：${privacyHealth.state === 'ok' ? '' : '⚠ '}${privacyHealth.detail}`
+  if (privacyHealth?.metrics !== undefined) {
+    for (const [key, value] of Object.entries(privacyHealth.metrics)) metrics[`privacy.${key}`] = value
+  }
 
   // 目录漂移是**契约问题**，必须留声（task-6 把 requires/capabilities 改成从目录派生后，
   // 这里不再有一个 `CATALOG` 变量，直接查目录本身）。
@@ -363,9 +402,11 @@ async function describeHealth(
             : `；⚠ 整合最近一次有失败：${consolidation.lastError.slice(0, 120)}${
                 consolidation.lastError.length > 120 ? '…' : ''
               }`)
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${consolidationNote}`
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${consolidationNote}${privacyNote}`
 
-  if (why === undefined && status.ready) {
+  // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
+  // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。
+  if (why === undefined && status.ready && privacyHealth?.state === 'ok') {
     return { state: 'ok', detail, metrics }
   }
   return { state: 'degraded', detail, metrics }
@@ -391,10 +432,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   let ledgerRef: MemoryWriteLedger | undefined
   let usageRef: MemoryUsageLedger | undefined
   let consolidationRef: ConsolidationLedger | undefined
+  /** 隐私闸门的装配产物（3.6 并入；见 `./privacy/index.js`）。 */
+  let privacyRef: PrivacyInstallation | undefined
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '3.5.0',
+    version: options.version ?? '3.6.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,
@@ -404,7 +447,14 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         return { state: 'degraded', detail: '模块未启动：apply 尚未执行（或已被卸载）' }
       }
       try {
-        return await describeHealth(service, ledgerRef, usageRef, consolidationRef)
+        return await describeHealth(
+          service,
+          ledgerRef,
+          usageRef,
+          consolidationRef,
+          // 惰性读（不是取一次存下来）：热插拔时新实例的 install 产物必须立刻被读到
+          privacyRef === undefined ? undefined : () => privacyRef!.health(),
+        )
       } catch (error) {
         // health() 自身绝不抛：状态面拿不到原因比拿到"检查失败"更糟
         return { state: 'degraded', detail: `健康检查失败：${messageOf(error)}` }
@@ -416,14 +466,42 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
     manifest,
 
     apply(kernel: Kernel, config: MemoryConfig): () => Promise<void> {
+      /**
+       * 宿主存储端口的**唯一解析点**。
+       *
+       * 隐私闸门与记忆库共用它——隐私状态文件因此落在与记忆库同一个
+       * `<dshHome>/.omb/` 下；测试注入的临时端口也会把隐私状态文件带进临时目录
+       * （见 `PrivacyInstallOptions.storagePort` 的说明）。
+       */
+      const resolveStoragePort = (): StorageHostPort | undefined =>
+        options.storageHost ?? kernel.service<StorageHostPort>(STORAGE_HOST_SERVICE)
+
+      // ── 隐私闸门（3.6 并入）：**先于 stores 装好** ─────────────────────
+      //
+      // 顺序有语义：`stores` 的库访问边界在**每一次调用**时惰性解析
+      // `SERVICES.privacy`（见下面的 `privacy:` 注入），所以只要闸门在
+      // `apply` 返回前进了服务表，"apply 之后任何一次库访问"就都过闸。
+      // 先装它可以让这个窗口不存在（而不是"很短"）。
+      //
+      // 装不上**不抛**：隐私是记忆库的一个子能力，它坏了不该把整个记忆库拖成 failed；
+      // 降级会写进健康面（`describeHealth` 的 privacyNote）与状态段。
+      // `installPrivacy` 内部就完成了 `SERVICES.privacy` 的 `provide`（连同命令面、
+      // 状态段与血缘订阅），所以这里**不再 provide 第二次**：同名重复注册虽然语义上是
+      // "替换"（ABI 契约），但会多出一个没人持有的 disposer——那正是"同一件事两处各写一遍"的开端。
+      const privacy = installPrivacy(kernel, config.privacy, { storagePort: resolveStoragePort() })
+      privacyRef = privacy
+
       const service = createStoresService({
         logger: kernel.logger,
         clock: kernel.clock,
         config: { ...config },
         maxOpenProjects: options.maxOpenProjects,
-        resolvePort: () => options.storageHost ?? kernel.service<StorageHostPort>(STORAGE_HOST_SERVICE),
-        // **隐私强制点的唯一注入处**：惰性解析（`omb-privacy` 行可能在本行之后挂载）。
-        // 取不到 = 不受限——模块被关掉时语义就是"没有隐私模式"。
+        resolvePort: resolveStoragePort,
+        // **隐私强制点的唯一注入处**：惰性解析。
+        // 3.6 起闸门由**本模块自己的 apply** 装上，所以这里取不到只可能是
+        // `installPrivacy` 没跑成（或它注册失败）——那种降级由本模块健康面
+        // （`describeHealth` 的 privacyNote）与 `modules/artifact/module.ts` 的
+        // `ungatedWrites` 双双点名，不是静默失效。
         privacy: () => kernel.service<PrivacyGatePort>(SERVICES.privacy),
         // 「会话 → cwd」不再由本模块存：唯一来源是内核登记处（见 sessionCwdSource 的说明）
         ...sessionCwdSource(kernel),
@@ -670,6 +748,10 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           ['工具服务', offTools],
           ['回合订阅', offTurn],
           ['回合结束订阅', offTurnEnd],
+          // 隐私闸门：注销服务、命令、状态段与血缘订阅。
+          // **放在同步前缀里**：`kernel.dispose()` 不等 Promise（`kernel/index.ts:109`），
+          // 而"卸载后 SERVICES.privacy 立刻消失"是测试与热插拔都依赖的可见事实。
+          ['隐私闸门', () => privacy.dispose()],
           ['stores 服务', off],
         ] as const) {
           try {
@@ -682,6 +764,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         if (ledgerRef === ledger) ledgerRef = undefined
         if (usageRef === usageLedger) usageRef = undefined
         if (consolidationRef === consolidationLedger) consolidationRef = undefined
+        if (privacyRef === privacy) privacyRef = undefined
         await service.dispose()
       }
     },

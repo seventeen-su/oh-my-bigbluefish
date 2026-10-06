@@ -8,8 +8,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import { SessionRuntimeTable } from '../../../kernel/sessionRuntime.js'
-import { PrivacyState, describeResolved, PRIVACY_SLOT } from '../../../modules/privacy/state.js'
-import type { PrivacyBaseline } from '../../../modules/privacy/state.js'
+import { PrivacyState, describeResolved, PRIVACY_SLOT } from '../../../modules/memory/privacy/state.js'
+import type { PrivacyBaseline } from '../../../modules/memory/privacy/state.js'
 import { fixedClock } from '../memory/helpers.js'
 
 function build(baseline?: PrivacyBaseline): { state: PrivacyState; sessions: SessionRuntimeTable } {

@@ -91,7 +91,8 @@ export function parseModuleRows(text: string): readonly YamlRow[] {
  * 实测过这个失败形态（`inject: ['omb:kernel']` 缺了就是"模块取不到内核"）。
  *
  * - `omb:kernel`：**每一行都必须有**（等内核把服务发布出来）
- * - `commands`：宿主斜杠命令注册表（`omb-privacy` 的控制面入口要它）
+ * - `commands`：宿主斜杠命令注册表（`/omb-privacy` 的控制面入口要它；
+ *   3.6 起隐私并入记忆库，这个键因此挂在 `omb-memory` 那一行上，不再是独立行）
  *
  * 新增键必须显式加到这里——那正是"被有意识地决定过一次"的证据。
  */
@@ -314,8 +315,8 @@ describe('守卫本身会失败（用构造出来的漂移数据证明判据不�
     const typo = parseModuleRows(
       [
         '- insert:',
-        '    - id: omb-privacy',
-        "      name: '@omb/privacy'",
+        '    - id: omb-notify',
+        "      name: '@omb/notify'",
         "      inject: ['omb:kernel', 'command']", // 少了 s → 永远等不到
         '',
       ].join('\n'),

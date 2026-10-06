@@ -34,23 +34,22 @@
       config:
         debug: false
 
-    # ── 隐私模式（放在记忆之前：库访问边界要尽早有闸门）──────────────
-    # `commands` 是**宿主**服务（斜杠命令注册表），行级 inject 在这里的作用是
-    # "等宿主门就绪"，不是模块间依赖——判据见 tests/dsh/module-graph-source.test.ts。
-    - id: omb-privacy
-      name: '@omb/privacy'
-      inject: ['omb:kernel', 'commands']
-      config:
-        # 状态读不出时的基线（fail-closed）：sealed = 最严；只想禁写可改 read-only
-        failClosedMode: sealed
-
     # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
+    # `commands` 是**宿主**服务（斜杠命令注册表）：3.6 起 `/omb-privacy` 的命令注册
+    # 从记忆库的 apply 走，因此这条行级 inject 跟着从 `omb-privacy` 那一行搬到这里。
+    # 它的作用仍是"等宿主门就绪"（**不是**模块间依赖），判据见 tests/dsh/module-graph-source.test.ts。
+    # 隐私模式（原 `omb-privacy` 行）已并入本行：服务名仍是 `SERVICES.privacy`，
+    # 制品索引（`omb-artifact`）与库访问边界两个消费者零改动。
     - id: omb-memory
       name: '@omb/memory'
-      inject: ['omb:kernel']
+      inject: ['omb:kernel', 'commands']
       config:
         consolidationEveryTurns: 32
         embeddingThreads: 2
+        # 隐私闸门（原 omb-privacy 行的 config 块，逐项照搬）
+        privacy:
+          # 状态读不出时的基线（fail-closed）：sealed = 最严；只想禁写可改 read-only
+          failClosedMode: sealed
     - id: omb-memory-vector
       name: '@omb/memory-vector'
       inject: ['omb:kernel']

@@ -12,13 +12,29 @@ import { describe, expect, it } from 'vitest'
 import { join } from 'node:path'
 import { createStoresService } from '../../../modules/memory/store.js'
 import { asVectorStore } from '../../../modules/memory/store.js'
-import { createPrivacyRegistration, MODULE_ID } from '../../../modules/privacy/index.js'
-import { PrivacyGate } from '../../../modules/privacy/gate.js'
-import { PrivacyState } from '../../../modules/privacy/state.js'
+import { PrivacyGate } from '../../../modules/memory/privacy/gate.js'
+import { PrivacyState } from '../../../modules/memory/privacy/state.js'
+import { MEMORY_CONFIG_DEFAULTS, createMemoryRegistration } from '../../../modules/memory/index.js'
 import { SessionRuntimeTable } from '../../../kernel/sessionRuntime.js'
 import { createKernel } from '../../../kernel/index.js'
-import type { MemoryRecord } from '../../../kernel/abi/index.js'
+import type { MemoryRecord, ModuleRegistration } from '../../../kernel/abi/index.js'
 import { capturingLogger, fixedClock, makeRecord, tempWorkspace, testPort } from '../memory/helpers.js'
+
+/**
+ * `omb-memory` 依赖 `omb-kernel`，装配集合里必须有内核那一行。
+ * 3.6 起隐私闸门由记忆库提供，因此最后那段装配测试起的是记忆库。
+ */
+const kernelRow: ModuleRegistration<unknown> = {
+  manifest: {
+    id: 'omb-kernel',
+    version: '3.6.0',
+    requires: [],
+    capabilities: [],
+    configSchema: { parse: () => ({}) },
+    health: () => ({ state: 'ok', detail: '测试替身' }),
+  },
+  apply: () => {},
+}
 
 interface Fixture {
   readonly stores: ReturnType<typeof createStoresService>
@@ -320,22 +336,26 @@ describe('行序无关（惰性解析，没有"等模块挂载"的窗口）', ()
   })
 })
 
-describe('模块注册项与目录一致', () => {
-  it(`模块 id 是 ${MODULE_ID}，且注册项能装配到内核、卸载后不留服务`, () => {
-    const registration = createPrivacyRegistration()
-    expect(registration.manifest.id).toBe(MODULE_ID)
-    const handle = createKernel()
-    const workspace = tempWorkspace('omb-privacy-reg-')
-    const applied = registration.apply(handle.kernel, {
-      failClosedMode: 'sealed',
-      path: join(workspace.dir, 'session-modes.json'),
-    })
-    expect(typeof applied).toBe('function')
-    // `apply` 的返回类型允许 void（内核契约如此）；测试里断言它确实给了 disposer
-    if (typeof applied !== 'function') throw new Error('模块 apply 未返回 disposer（宿主无法卸载）')
-    expect(handle.kernel.service('privacy')).toBeDefined()
-    expect(() => applied()).not.toThrow()
-    expect(handle.kernel.service('privacy')).toBeUndefined()
-    workspace.cleanup()
+describe('装配路径：闸门由记忆库装上（隐私不再是独立模块）', () => {
+  it('真内核 + 真记忆库：apply 提供 `privacy` 服务，卸载后不留服务', () => {
+    const ws = tempWorkspace('omb-privacy-reg-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const handle = createKernel({ logger: capturingLogger() })
+      const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+      const blocked = handle.start(
+        [kernelRow, registration],
+        new Map([['omb-memory', { ...MEMORY_CONFIG_DEFAULTS, privacy: { failClosedMode: 'sealed', path } }]]),
+      )
+      expect(blocked, '记忆库被依赖规划阻断').toEqual([])
+      // **服务名一个字没改**：两个消费者（库访问边界、制品索引）因此零改动
+      expect(handle.kernel.service('privacy')).toBeDefined()
+      expect(handle.kernel.service('privacy')).toBeInstanceOf(PrivacyGate)
+      // 卸载：同步路径也要立刻把服务摘掉（`kernel.dispose()` 不等 Promise）
+      expect(() => handle.dispose()).not.toThrow()
+      expect(handle.kernel.service('privacy')).toBeUndefined()
+    } finally {
+      ws.cleanup()
+    }
   })
 })

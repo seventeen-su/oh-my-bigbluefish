@@ -42,7 +42,7 @@ function twoProjects(): { readonly a: string; readonly b: string } {
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.5.0',
+    version: '3.6.0',
     requires: [],
     capabilities: [],
     configSchema: { parse: () => ({}) },

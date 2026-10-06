@@ -3,23 +3,30 @@
  *
  * 用**真内核**（`createKernel`）+ 假宿主 `commands` 服务（只记录注册项并让它可被调用），
  * 其余全是真的：真的 JSON 文件、真的 `SessionRuntimeTable`、真的 `PrivacyGate`。
+ *
+ * **3.6 起装配的是 `omb-memory`**（隐私闸门并入记忆库）：`omb-privacy` 那一行没了，
+ * 但本文件断言的行为一条都不该少——换的是装配入口，不是契约。
  */
 import { describe, expect, it } from 'vitest'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createKernel } from '../../../kernel/index.js'
-import type { Kernel, StatusRegistry } from '../../../kernel/abi/index.js'
-import { SERVICES } from '../../../kernel/abi/index.js'
+import type { Kernel, ModuleRegistration, StatusRegistry, ToolDefinition } from '../../../kernel/abi/index.js'
+import { MODULE_CATALOG, SERVICES, toolsServiceFor } from '../../../kernel/abi/index.js'
 import {
-  createPrivacyRegistration,
-  MODULE_ID,
   privacyConfigSchema,
   PRIVACY_SERVICE,
   SESSION_RUNTIME_SERVICE,
-} from '../../../modules/privacy/index.js'
-import type { PrivacyGate, PrivacyGatePort } from '../../../modules/privacy/gate.js'
-import type { CommandResultLike } from '../../../modules/privacy/command.js'
-import { capturingLogger, tempWorkspace } from '../memory/helpers.js'
+} from '../../../modules/memory/privacy/index.js'
+import type { PrivacyGate, PrivacyGatePort } from '../../../modules/memory/privacy/gate.js'
+import type { CommandResultLike } from '../../../modules/memory/privacy/command.js'
+import {
+  MEMORY_CONFIG_DEFAULTS,
+  MODULE_ID,
+  createMemoryRegistration,
+  memoryConfigSchema,
+} from '../../../modules/memory/index.js'
+import { capturingLogger, tempWorkspace, testPort } from '../memory/helpers.js'
 
 interface FakeCommands {
   readonly definitions: {
@@ -53,32 +60,63 @@ function fakeCommands(): FakeCommands {
   }
 }
 
-/** 装配并拿到 disposer（`apply` 的返回类型允许 void，测试里断言它确实给了）。 */
-function mount(
-  kernel: Kernel,
-  registration: ReturnType<typeof createPrivacyRegistration>,
-  config: { failClosedMode: 'sealed' | 'read-only'; path: string | null },
-): () => void {
-  const dispose = registration.apply(kernel, config)
-  if (typeof dispose !== 'function') throw new Error('模块 apply 未返回 disposer（宿主无法卸载）')
-  return dispose
+/**
+ * `omb-memory` 依赖 `omb-kernel`，所以装配集合里必须有内核那一行（测试替身）。
+ * 3.6 起隐私闸门由**记忆库**提供，因此这里起的是记忆库，不再是隐私模块。
+ */
+const kernelRow: ModuleRegistration<unknown> = {
+  manifest: {
+    id: 'omb-kernel',
+    version: '3.6.0',
+    requires: [],
+    capabilities: [],
+    configSchema: { parse: () => ({}) },
+    health: () => ({ state: 'ok', detail: '测试替身' }),
+  },
+  apply: () => {},
 }
 
-/** 起一个内核 + 装配隐私模块（可注入宿主命令服务与状态文件路径）。 */
+/**
+ * 记忆库注册项：存储端口指向状态文件所在目录，**隐私状态文件因此也落在临时目录里**
+ * （不然单测会去读开发者真实的 `~/.dsh/.omb/privacy/session-modes.json`）。
+ */
+function memoryRegistrationFor(path: string): ReturnType<typeof createMemoryRegistration> {
+  return createMemoryRegistration({ storageHost: testPort(dirname(path)) })
+}
+
+/** 记忆库配置：隐私子块用测试给的路径（生产里由 `cordis.patch.yml` 的同名子块给）。 */
+function memoryConfigFor(
+  path: string,
+  failClosedMode: 'sealed' | 'read-only' = 'sealed',
+): unknown {
+  return { ...MEMORY_CONFIG_DEFAULTS, privacy: { failClosedMode, path } }
+}
+
+/** 起一个内核 + 装配记忆库（可注入宿主命令服务与状态文件路径）。 */
 function boot(options: {
   readonly path: string
   readonly commands?: FakeCommands
   readonly failClosedMode?: 'sealed' | 'read-only'
-}): { kernel: Kernel; dispose: () => void; commands: FakeCommands } {
+  /** false = 宿主没有 commands 服务（命令面应如实缺席，闸门照常生效）。 */
+  readonly withCommands?: boolean
+}): {
+  kernel: Kernel
+  dispose: () => void
+  commands: FakeCommands
+  registration: ReturnType<typeof createMemoryRegistration>
+} {
   const handle = createKernel({ logger: capturingLogger() })
   const commands = options.commands ?? fakeCommands()
-  handle.kernel.provide('commands', commands.service)
-  const registration = createPrivacyRegistration()
-  const dispose = mount(handle.kernel, registration, {
-    failClosedMode: options.failClosedMode ?? 'sealed',
-    path: options.path,
-  })
-  return { kernel: handle.kernel, dispose: () => dispose(), commands }
+  if (options.withCommands !== false) handle.kernel.provide('commands', commands.service)
+  const registration = memoryRegistrationFor(options.path)
+  const blocked = handle.start(
+    [kernelRow, registration],
+    new Map([['omb-memory', memoryConfigFor(options.path, options.failClosedMode ?? 'sealed')]]),
+  )
+  if (blocked.length > 0) {
+    throw new Error(`记忆库被依赖规划阻断：${blocked.map(item => item.reason).join('；')}`)
+  }
+  return { kernel: handle.kernel, dispose: () => handle.dispose(), commands, registration }
 }
 
 async function runCommand(
@@ -92,17 +130,32 @@ async function runCommand(
 }
 
 describe('注册面', () => {
-  it('模块 id / requires / capabilities 来自目录（派生，不手写）', () => {
-    const registration = createPrivacyRegistration()
+  it('隐私能力并入 omb-memory 的目录条目（能力名不变：privacy.modes）', () => {
+    // 3.6：`omb-privacy` 不再是模块。能力的**归属**换了，**名字**没换——
+    // 名字是状态面与开关的对外契约，改它就是破坏性变更。
+    const entry = MODULE_CATALOG.find(candidate => candidate.id === MODULE_ID)
+    expect(entry).toBeDefined()
+    expect(entry?.capabilities).toContain('privacy.modes')
+    // 目录里不该再有 omb-privacy 这个模块（三方一致：目录 / MODULE_IDS / cordis.patch.yml 行）
+    expect(
+      MODULE_CATALOG.some(candidate => candidate.id === ('omb-privacy' as never)),
+      '目录里还留着 omb-privacy 条目——那一行已经删了，留着就是"看起来权威但不驱动"的声明',
+    ).toBe(false)
+    // manifest 的 capabilities 照抄目录（派生，不手写）
+    const registration = createMemoryRegistration()
     expect(registration.manifest.id).toBe(MODULE_ID)
-    expect(registration.manifest.requires).toEqual(['omb-kernel'])
-    expect(registration.manifest.capabilities).toEqual(['privacy.modes'])
+    expect(registration.manifest.requires).toEqual(entry?.requires)
+    expect(registration.manifest.capabilities).toEqual(entry?.capabilities)
   })
 
   it('配置缺省值完整，且 failClosedMode 只允许两种受限档', () => {
     expect(privacyConfigSchema.parse(undefined)).toEqual({ failClosedMode: 'sealed', path: null })
     expect(privacyConfigSchema.parse({ failClosedMode: 'read-only' })).toMatchObject({ failClosedMode: 'read-only' })
     expect(() => privacyConfigSchema.parse({ failClosedMode: 'normal' })).toThrow()
+    // 并入记忆库后，配置从**记忆库的 `privacy` 子块**进来（原 `omb-privacy` 行的 config 块）
+    expect(memoryConfigSchema.parse({ privacy: { failClosedMode: 'read-only' } }).privacy)
+      .toEqual({ failClosedMode: 'read-only', path: null })
+    expect(memoryConfigSchema.parse(undefined).privacy).toEqual({ failClosedMode: 'sealed', path: null })
   })
 
   it('装配后：判定端口、会话运行态、命令、状态面贡献都在；卸载后服务清空', () => {
@@ -143,17 +196,17 @@ describe('注册面', () => {
     }
   })
 
-  it('宿主没有 commands 服务时：闸门照常生效，只是命令缺席（不抛）', () => {
+  it('宿主没有 commands 服务时：闸门照常生效，只是命令缺席（不抛，且如实说"未注册"）', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
+    const path = join(ws.dir, 'session-modes.json')
     try {
-      const handle = createKernel({ logger: capturingLogger() })
-      const registration = createPrivacyRegistration()
-      const dispose = mount(handle.kernel, registration, {
-        failClosedMode: 'sealed',
-        path: join(ws.dir, 'session-modes.json'),
-      })
-      expect(handle.kernel.service(PRIVACY_SERVICE)).toBeDefined()
-      expect(() => dispose()).not.toThrow()
+      const booted = boot({ path, withCommands: false })
+      expect(booted.kernel.service(PRIVACY_SERVICE)).toBeDefined()
+      // 命令面缺席**必须可读**：健康面写明未注册与原因，而不是静默少一条命令
+      const health = await booted.registration.manifest.health()
+      expect(health.detail).toContain('命令面：omb-privacy **未注册**')
+      expect(health.detail).toContain('commands')
+      expect(() => booted.dispose()).not.toThrow()
     } finally {
       ws.cleanup()
     }
@@ -515,20 +568,20 @@ describe('fail-closed（读不出状态时按最严）', () => {
 })
 
 describe('健康面与状态面', () => {
-  it('health 带 metrics 与可读 detail（含基线与状态文件）', async () => {
+  it('隐私读数并进记忆库的健康面（基线、状态文件、命令面、metrics 带命名空间）', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     const path = join(ws.dir, 'm.json')
     try {
-      const handle = createKernel({ logger: capturingLogger() })
-      const registration = createPrivacyRegistration()
-      const dispose = mount(handle.kernel, registration, { failClosedMode: 'sealed', path })
-
-      const health = await registration.manifest.health()
-      expect(health.state).toBe('ok')
-      expect(health.detail).toContain('基线')
+      const booted = boot({ path })
+      const health = await booted.registration.manifest.health()
+      // 3.6：隐私不再是独立模块，读数必须出现在**记忆库那一行**里——
+      // 不并进来，插件页会显示"记忆库正常"而对隐私的降级只字不提。
+      expect(health.detail).toContain('隐私闸门（/omb-privacy）')
+      expect(health.detail).toContain('基线=normal（从未配置过）')
       expect(health.detail).toContain(path)
-      expect(health.metrics?.sessionsWithMode).toBeTypeOf('number')
-      dispose()
+      expect(health.detail).toContain('命令面：omb-privacy 已注册')
+      expect(health.metrics?.['privacy.sessionsWithMode']).toBeTypeOf('number')
+      booted.dispose()
     } finally {
       ws.cleanup()
     }
@@ -543,14 +596,12 @@ describe('健康面与状态面', () => {
       first.dispose()
 
       // 重启后：文件里还有 old，但本进程里它从未活跃
-      const handle = createKernel({ logger: capturingLogger() })
-      const registration = createPrivacyRegistration()
-      const dispose = mount(handle.kernel, registration, { failClosedMode: 'sealed', path })
-      const health = await registration.manifest.health()
+      const second = boot({ path })
+      const health = await second.registration.manifest.health()
       expect(health.detail).toContain('历史受限记录 1 条（其中本进程活跃 0 条）')
-      expect(health.metrics?.restrictedSessions).toBe(1)
-      expect(health.metrics?.restrictedSessionsActive).toBe(0)
-      dispose()
+      expect(health.metrics?.['privacy.restrictedSessions']).toBe(1)
+      expect(health.metrics?.['privacy.restrictedSessionsActive']).toBe(0)
+      second.dispose()
     } finally {
       ws.cleanup()
     }
@@ -561,7 +612,9 @@ describe('健康面与状态面', () => {
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
       const text = (await runCommand(booted.commands, 'status')).text
-      expect(text).toContain('隐私模式（omb-privacy）')
+      // 标题里写清"它是记忆库的东西"——用户看到 /omb-privacy 却找不到 omb-privacy 那一行时，
+      // 这行字就是唯一的解释
+      expect(text).toContain('隐私模式（记忆库的隐私闸门，命令 /omb-privacy）')
       expect(text).toContain('/omb-privacy')
       expect(text).toContain('状态文件')
       booted.dispose()
@@ -571,31 +624,6 @@ describe('健康面与状态面', () => {
   })
 })
 
-/**
- * 不变量：**模型不能自己解除限制**。
- *
- * ## 这条测试原来是"模块不注册任何工具"
- *
- * 那个写法守着正确的**意图**（原注释：隐私模式是**用户**的决定，不该由模型自己改），
- * 但它守的是**手段**而不是**目的**——而那个手段建立在一个不成立的前提上：
- * **命令在 Web 界面里够不着**。
- *
- * 实测证据（2026-09-30，真实 GUI）：
- * 1. 在会话里发出 `/omb-privacy normal`；
- * 2. `omb_status` → `显式设置 0 个会话`、状态文件从未被创建 → **命令没被执行**；
- * 3. grep 整个 DSH Web 客户端 → **没有任何斜杠命令处理**。
- *
- * 于是"命令是唯一入口"等于这个功能对 Web 用户**不可用**。
- *
- * ## 所以测试改成守**目的**（更强，不是更弱）
- *
- * 不再断言"没有工具"（那是手段），而是断言**模型无法自己解除限制**这条不变量：
- * - 收紧：模型可直接做；
- * - 放宽：**没有 `allowLoosen` 就必须被拒**；
- * - `trust`（清 fail-closed 粘性）：根本不提供。
- *
- * 这样"隐私是用户的决定"在**行为层面**被钉住——比"没有工具"更难绕过：
- * 将来若有人加了一条能放宽的工具，这条测试会立刻红。
 /**
  * **不变量：模型不能自己解除限制。**
  *
@@ -614,19 +642,41 @@ describe('健康面与状态面', () => {
  * **于是工具就没有存在理由了**——用户决定移除它，回到原设计：
  * **隐私只由用户通过命令改，模型既不在工具面也不在命令面碰它。**
  *
- * 这条不变量现在靠"**根本没有那条路**"成立，比"有路但拦住"更硬：
+ * ## 3.6：断言跟着"归属"搬家，强度只增不减
+ *
+ * 隐私并入记忆库后，"本模块没有工具"这句话失去了主语（没有那个模块了）。
+ * 于是判据换成**更硬也更准**的两条：记忆库的工具名是**白名单**（新增一个就红），
+ * 且每个工具的参数面里不许出现档位关键词（防"换个名字但能改隐私"）。
+ * 这两条守的是**目的**（模型无法自己解除限制），而不是"某个文件里没有某个字符串"——
  * 将来若有人加回一条能改隐私的工具，下面的断言会立刻红。
  */
 describe('不变量：模型不能自己解除限制', () => {
-  it('模块不注册任何工具——隐私模式不由模型改', () => {
+  it('记忆库的工具面里没有任何能改隐私的入口（工具名是白名单，参数面也没有档位词）', () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      const toolServices = booted.kernel.services().filter(name => name.startsWith('tools:'))
-      expect(
-        toolServices,
-        '一旦出现 tools:omb-privacy，模型就多了一条改隐私的路——那是刻意不要的',
-      ).toEqual([])
+      const tools = booted.kernel.service<readonly ToolDefinition[]>(toolsServiceFor(MODULE_ID))
+      expect(tools, '记忆库没提供工具服务（tools:omb-memory）').toBeDefined()
+      /**
+       * **白名单**，不是"过滤一下看看"：新增任何工具都会让这条红。
+       * 加之前必须先回答一个问题——"它能不能把 sealed/read-only 改回 normal"。
+       * 能，就不许加（隐私是用户的决定，模型只能收紧、不能放宽，最好连工具都没有）。
+       */
+      expect(tools?.map(tool => tool.name).sort()).toEqual([
+        'omb_forget',
+        'omb_recall',
+        'omb_relate',
+        'omb_remember',
+      ])
+      // 参数面里也不许出现档位关键词：防"换个名字但能改隐私"（例如 `mode: 'sealed'`）
+      for (const tool of tools ?? []) {
+        expect(
+          JSON.stringify(tool.parameters),
+          `${tool.name} 的参数面里出现了隐私档位关键词——模型因此可能自己改隐私`,
+        ).not.toMatch(/sealed|read-only|privacy/i)
+      }
+      // 旧形态的独立工具面（`tools:omb-privacy`）不该存在
+      expect(booted.kernel.services().filter(name => name === 'tools:omb-privacy')).toEqual([])
       booted.dispose()
     } finally {
       ws.cleanup()

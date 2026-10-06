@@ -24,7 +24,7 @@ import {
 const KERNEL_STUB: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.5.0',
+    version: '3.6.0',
     requires: [],
     capabilities: ['kernel.services'],
     configSchema: { parse: () => ({}) },

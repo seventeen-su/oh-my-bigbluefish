@@ -199,7 +199,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
    *
    * **由内核 provide，模块只复用**：这张表一旦有多份，"同一个会话的隐私/推理/记忆状态"
    * 就会被拆到不同的表里——那正是 `lastActiveSession` 那类缺陷（每个模块各记一份
-   * "当前会话"）的翻版。消费方（如 `omb-privacy` 的隐私槽）先问服务、拿不到才自建兜底。
+   * "当前会话"）的翻版。消费方（如记忆库的隐私槽）先问服务、拿不到才自建兜底。
    */
   const sessionRuntime = new SessionRuntimeTable(clock)
 
@@ -253,7 +253,7 @@ export function createKernel(options: KernelOptions = {}): KernelHandle {
    * 依赖图自检就会报 8 条假的"依赖未挂载"。
    *
    * 这不是理论风险：真实宿主实测到的输出是
-   * `依赖未挂载 6 处：omb-privacy ← omb-kernel、omb-memory ← omb-kernel …`，
+   * `依赖未挂载 6 处：omb-memory ← omb-kernel、omb-notify ← omb-kernel …`，
    * 而同一次状态面里 8 个模块全部 `正常`、0 失败——**内核显然在**。
    *
    * 教训与「制品索引空转」那次同源：**自检若把"我没记录到的"当成"不存在"，

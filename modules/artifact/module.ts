@@ -26,7 +26,7 @@ export const ARTIFACT_SERVICE = SERVICES.artifact
  * 模块**不自己注册宿主工具**——只声明，由 `dsh/` 侧在正确的生命周期里注册（ABI host.ts）。
  */
 export const ARTIFACT_TOOLS_SERVICE = toolsServiceFor(ARTIFACT_MODULE_ID)
-export const ARTIFACT_VERSION = '3.5.0'
+export const ARTIFACT_VERSION = '3.6.0'
 
 export interface ArtifactConfig {
   /** 索引簿记上限（不是上下文预算）。 */
@@ -127,33 +127,78 @@ export function createArtifactService(deps: ArtifactRuntimeDeps): ArtifactServic
  *
  * 0 次不是"测不到"：本实例从 apply 起就一直在数，0 = 真的没被拒过。
  * 但为 0 时也不写"被拒 0 次"——那是噪音；`status()` 的字段里照样能读到这个 0。
+ *
+ * 文案里点名的是**命令**（`/omb-privacy`，用户肌肉记忆没变）而不是组件名：
+ * 3.6 起隐私并入记忆库，`omb-privacy` 作为一个组件已经不存在了。
  */
 function rejectionNote(rejection: { readonly count: number; readonly lastReason: string | null }): string {
   if (rejection.count === 0) return ''
   return `；**写入被隐私闸门拒绝 ${rejection.count} 次**（最近一次：${rejection.lastReason ?? '（未给出原因）'}）`
-    + '——索引条目因此可能少于实际发生的读写，请检查 omb-privacy 的隐私模式'
+    + '——索引条目因此可能少于实际发生的读写，请检查记忆库的隐私模式（/omb-privacy status）'
+}
+
+/**
+ * 「隐私闸门**没就绪**」的台账（时序缺陷的挡板）。
+ *
+ * ## 为什么不干脆拒绝写入
+ *
+ * 闸门端口取不到有两种成因，而它们的正确处置**不同**：
+ * ① `omb-memory` 那一行没装上 / 被用户关掉 —— 此时进程里**根本没有任何隐私档位**
+ *    （状态文件都没人读），拒绝写入只是把一个正常功能变成故障；
+ * ② 装配顺序异常（artifact 先于 memory 挂载）—— 一个瞬态窗口。
+ * 两种情况下"放行"都符合既有契约（`ArtifactIndexDeps.privacy`：取不到 = 不受限），
+ * 所以**不改判定**，改的是"这件事有没有人知道"。
+ *
+ * ## 静默才是缺陷
+ *
+ * 旧实现在端口取不到时静默放行：制品照记，而状态面、健康面、日志**一个字都不提**。
+ * 于是"隐私闸门其实不在"与"一切正常"在读数上完全一样——这正是本项目反复记的
+ * "无法区分『没在工作』与『在工作』"。现在每一次这样的写入都计数、留最近时间，
+ * 并由 `health()`、组件自述段与日志三处说出**可读原因**。
+ *
+ * 判据（会失败的）：`tests/modules/artifact/gate-timing.test.ts` 断言端口缺席时的写入
+ * 使 `ungatedWrites` 上涨且文案出现在健康面/状态段里；闸门到位后计数必须冻结。
+ */
+interface GateReadiness {
+  /** 端口未就绪时**真的落进索引**的写入次数（0 = 真的没发生过，不是"未测量"）。 */
+  ungatedWrites: number
+  /** 最近一次这样的写入时间（内核时钟）；从未发生为 null。 */
+  lastUngatedAt: number | null
+}
+
+/** 闸门未就绪的留声（健康面与组件自述**共用同一份措辞**，避免两处口径漂移）。 */
+function gateMissingNote(readiness: GateReadiness): string {
+  if (readiness.ungatedWrites === 0) return ''
+  return `；⚠ 隐私闸门未就绪期间写入 ${readiness.ungatedWrites} 次`
+    + `（最近一次 ${readiness.lastUngatedAt ?? '时间未知'}）：这期间**未经闸门约束**——`
+    + '`SERVICES.privacy` 由记忆库提供，取不到说明 omb-memory 那一行没挂上（或晚于本行）'
+    + '；此时进程里没有任何隐私档位，因此不是"放行了一条已配置的限制"，'
+    + '但**也不等于一切正常**——先确认记忆库那一行的状态'
 }
 
 export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
-  let runtime: { index: ArtifactIndex; service: ArtifactService } | undefined
+  let runtime: { index: ArtifactIndex; service: ArtifactService; readiness: GateReadiness } | undefined
 
   /** 同步健康函数：既能进清单，也能直接 `report`（清单的 health 允许返回 Promise）。 */
   const health = (): ModuleHealth => {
     if (runtime === undefined) {
       return { state: 'ok', detail: `模块未启动（内核未 apply）：暂无制品索引；不注入任何清单` }
     }
-    const { index } = runtime
+    const { index, readiness } = runtime
     const rejection = index.writeRejection()
     return {
       state: 'ok',
       detail: `制品索引 ${index.size()}/${index.maxEntries()} 条（仅内存，**不注入上下文**；内容由读取类工具按需取）`
-        + rejectionNote(rejection),
+        + rejectionNote(rejection)
+        + gateMissingNote(readiness),
       metrics: {
         indexed: index.size(),
         maxEntries: index.maxEntries(),
         topLimit: ARTIFACT_TOP_MAX,
         // 0 = 真的没被拒过（本实例从 apply 起一直在数），不是"未测量"
         rejectedWrites: rejection.count,
+        // 0 = 真的没发生过"闸门缺位时的写入"；>0 时上面那句 note 一定会出现
+        ungatedWrites: readiness.ungatedWrites,
       },
     }
   }
@@ -170,18 +215,54 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
   return {
     manifest,
     apply(kernel: Kernel, config: ArtifactConfig) {
+      /**
+       * 隐私端口的**唯一解析点**（索引与下面的留声包装共用同一个函数）。
+       *
+       * 惰性解析是硬要求：`kernel.service()` 每次都重新问服务表，因此
+       * "闸门后到"与"闸门被关掉"两种情形都立刻生效，不需要任何失效逻辑。
+       */
+      const privacyPort = (): ArtifactPrivacyPort | undefined =>
+        kernel.service<ArtifactPrivacyPort>(SERVICES.privacy)
       const index = new ArtifactIndex({
         maxEntries: config.maxEntries,
         logger: kernel.logger,
-        // **隐私闸门的注入处**（惰性解析：`omb-privacy` 可能后于本模块挂载）。
+        // **隐私闸门的注入处**。3.6 起闸门由 `omb-memory` 提供（行序：memory 在 artifact 之前），
         // 判定发生在索引这一层（数据边界），因此工具与服务两个入口都逃不掉。
-        privacy: () => kernel.service<ArtifactPrivacyPort>(SERVICES.privacy),
+        privacy: privacyPort,
       })
       const service = createArtifactService({ index, clock: kernel.clock })
+      /** 「闸门缺位期间的写入」台账（见 {@link GateReadiness}）。 */
+      const readiness: GateReadiness = { ungatedWrites: 0, lastUngatedAt: null }
+      /**
+       * 给 `record` 包一层**留声**：不改判定（判定仍在索引里），只回答
+       * "这一次写入有没有闸门看着"。少了它，端口缺席就是**静默放行**（旧形态）。
+       *
+       * 计数只在本层——判定不能在本层做，否则"数据边界唯一"就不成立了。
+       */
+      const gatedService: ArtifactService = {
+        ...service,
+        record: (path, options, sessionId) => {
+          const gateMissing = privacyPort() === undefined
+          const entry = service.record(path, options, sessionId)
+          // 只在**真的落进索引**时计数：空路径写不成、被拒也写不成，两种都不算"放行了"
+          if (gateMissing && entry !== undefined) {
+            readiness.ungatedWrites += 1
+            readiness.lastUngatedAt = kernel.clock.now()
+            if (readiness.ungatedWrites === 1) {
+              kernel.logger.warn(
+                '制品索引：本次写入**没有隐私闸门**（SERVICES.privacy 取不到——omb-memory 未挂载或晚于本行）'
+                + '；写入已记录，但"闸门不在"这件事之前是静默的，后续同类写入只累计计数'
+                + '（见 omb_status 的制品索引段与其健康行）',
+              )
+            }
+          }
+          return entry
+        },
+      }
       const tools: readonly ToolDefinition[] = [createFilesTool({ index })]
-      runtime = { index, service }
+      runtime = { index, service: gatedService, readiness }
 
-      const unprovideService = kernel.provide(ARTIFACT_SERVICE, service)
+      const unprovideService = kernel.provide(ARTIFACT_SERVICE, gatedService)
       const unprovideTools = kernel.provide(ARTIFACT_TOOLS_SERVICE, tools)
       // 不订阅 evidence/observed：该事件是"动作与证据的指纹"，载荷没有路径，
       // 从它推导路径只能靠猜。路径由 dsh/hooks.ts 提取后经 service.record(path) 喂入。
@@ -239,6 +320,9 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
             }
             const size = index.size()
             const rejection = index.writeRejection()
+            // 闸门缺位的留声：**两个分支都要带上**——索引非空时它同样是一条真事实
+            // （那些条目就是没被闸门看过的），"有数据"不等于"闸门在"。
+            const gateNote = gateMissingNote(readiness)
             // **空索引必须区分两种空**（与 omb_files 的空结果文案同一口径）：
             // "本会话没观察到制品" vs "写入被隐私闸门拒绝、索引停更"。
             // 旧文案无条件写前者，于是 sealed 之后整段状态面在说错误的话。
@@ -246,10 +330,12 @@ export function createArtifactModule(): ModuleRegistration<ArtifactConfig> {
               return rejection.count > 0
                 ? `制品索引为空——不是"没有观察到制品"：写入被隐私闸门拒绝 ${rejection.count} 次`
                   + `（最近一次：${rejection.lastReason ?? '（未给出原因）'}）；`
-                  + '请检查 omb-privacy 的隐私模式（设过 sealed/read-only 的会话会让归属未知的写入一并被拒）'
+                  + '请检查记忆库的隐私模式（/omb-privacy status；设过 sealed/read-only 的会话会让归属未知的写入一并被拒）'
+                  + gateNote
                 : '制品索引为空（本会话还没有观察到任何制品；制品路径由工具调用参数提取）'
+                  + gateNote
             }
-            return `已索引 ${String(size)} 条${rejection.count > 0 ? `；另有 ${rejection.count} 次写入被隐私闸门拒绝（最近：${rejection.lastReason ?? '未给出原因'}）` : ''}；最近见 omb_files，内容请用读取类工具按需取`
+            return `已索引 ${String(size)} 条${rejection.count > 0 ? `；另有 ${rejection.count} 次写入被隐私闸门拒绝（最近：${rejection.lastReason ?? '未给出原因'}）` : ''}${gateNote}；最近见 omb_files，内容请用读取类工具按需取`
           },
         })
       } catch {
