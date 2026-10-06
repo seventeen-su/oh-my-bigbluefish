@@ -8,20 +8,25 @@
  */
 import { describe, expect, it } from 'vitest'
 import type { LoopSignal } from '../../../modules/reasoning/loop.js'
+import { NO_PROGRESS_KINDS } from '../../../modules/reasoning/loop.js'
 import {
   AUTO_INJECT_CARD_CAP,
   CONTROL_BY_DEPTH,
   CONTROL_LINE_MAX,
+  EXIT_SEGMENT_MAX,
   FAILURE_CLASSES,
   FAILURE_PLAYBOOK,
   REPEAT_WITHOUT_EVIDENCE_HINT,
   classifyFailure,
+  controlForBand,
   controlLine,
   controlOf,
   describeControl,
   failureSignalsFromLoop,
   isFailureClass,
+  pressureRaisedFloor,
   recoveryFor,
+  renderExitOptions,
   renderRecovery,
 } from '../../../modules/reasoning/control.js'
 
@@ -128,6 +133,143 @@ describe('controlLine：一行参数读数，有上限', () => {
     expect(describeControl('standard')).toContain('可并列至多 2 个互斥方案')
     expect(describeControl('deep')).toContain('指出来源并标注未验证项')
     expect(describeControl('deep')).toContain('可复核 2 次')
+  })
+})
+
+/**
+ * v3.6 A②：压力带 → 控制参数。
+ *
+ * 缺陷形态：`stopRule` / `evidenceLevel` 只由 depth 决定、与 band 无关，
+ * 于是压力最大时门槛与压力最小时**一模一样**——而证据方向相反。
+ */
+describe('压力带 → 控制参数（只升不降）', () => {
+  const EVIDENCE_RANK = ['none', 'cite-source', 'cite-and-label'] as const
+  const STOP_RANK = ['first-answer', 'evidence-backed', 'verified-or-labeled'] as const
+  const strictness = (control: { evidenceLevel: string; stopRule: string }): [number, number] => [
+    EVIDENCE_RANK.indexOf(control.evidenceLevel as never),
+    STOP_RANK.indexOf(control.stopRule as never),
+  ]
+
+  it('tight 把 quick 的证据要求与收尾条件抬到 standard 的水平（是下限，不是"越紧越好"）', () => {
+    const quickTight = controlForBand('quick', 'tight')
+    expect(quickTight.evidenceLevel).toBe(controlForBand('standard', 'relaxed').evidenceLevel)
+    expect(quickTight.stopRule).toBe(controlForBand('standard', 'relaxed').stopRule)
+    // 抬的是下限，不是连续量：不会超过 standard
+    expect(strictness(quickTight)).toEqual(strictness(controlForBand('standard', 'relaxed')))
+  })
+
+  it('standard / deep 在 tight 下逐字节不变（本来就在下限之上，抬不动）', () => {
+    expect(controlForBand('standard', 'tight')).toEqual(controlForBand('standard', 'relaxed'))
+    expect(controlForBand('deep', 'tight')).toEqual(controlForBand('deep', 'relaxed'))
+    // 同对象返回：没有变化就不产生新对象（调用方可以据此判断"这一档没被改")
+    expect(controlForBand('standard', 'tight')).toBe(CONTROL_BY_DEPTH.standard)
+  })
+
+  it('任何 depth × band 组合都不低于同档的 relaxed（只升不降）', () => {
+    for (const depth of ['quick', 'standard', 'deep'] as const) {
+      const base = strictness(controlForBand(depth, 'relaxed'))
+      for (const band of ['relaxed', 'moderate', 'tight'] as const) {
+        const current = strictness(controlForBand(depth, band))
+        expect(current[0], `${depth}/${band} 证据要求被降了`).toBeGreaterThanOrEqual(base[0])
+        expect(current[1], `${depth}/${band} 收尾条件被降了`).toBeGreaterThanOrEqual(base[1])
+      }
+    }
+  })
+
+  it('非 tight 与未知取值都不改参数、不抛', () => {
+    for (const depth of ['quick', 'standard', 'deep'] as const) {
+      expect(controlForBand(depth, 'relaxed')).toEqual(CONTROL_BY_DEPTH[depth])
+      expect(controlForBand(depth, 'moderate')).toEqual(CONTROL_BY_DEPTH[depth])
+      expect(controlForBand(depth, 'bogus' as never)).toEqual(CONTROL_BY_DEPTH[depth])
+    }
+    expect(() => controlForBand('bogus' as never, 'tight')).not.toThrow()
+    expect(controlForBand('bogus' as never, 'tight').depth).toBe('standard')
+  })
+
+  it('pressureRaisedFloor 只说"真的抬了"的那一种（quick + tight）；否则读数不许多加字', () => {
+    expect(pressureRaisedFloor('quick', 'tight')).toBe(true)
+    expect(pressureRaisedFloor('quick', 'relaxed')).toBe(false)
+    expect(pressureRaisedFloor('quick', 'moderate')).toBe(false)
+    expect(pressureRaisedFloor('standard', 'tight')).toBe(false)
+    expect(pressureRaisedFloor('deep', 'tight')).toBe(false)
+  })
+
+  it('读数把压力带读出来（来源维度），且 tight 下的证据/收尾不低于 standard 的读数', () => {
+    for (const depth of ['quick', 'standard', 'deep'] as const) {
+      for (const band of ['relaxed', 'moderate', 'tight'] as const) {
+        const line = controlLine(depth, 0, band)
+        expect(line.length, `${depth}/${band} 读数过长`).toBeLessThanOrEqual(CONTROL_LINE_MAX)
+        expect(line).toContain(`压力 ${band}`)
+      }
+    }
+    const quickTight = controlLine('quick', 0, 'tight')
+    expect(quickTight).toContain('证据 指出来源')
+    expect(quickTight).toContain('收尾 首选方案有证据支撑')
+    expect(quickTight).not.toContain('不要求')
+    expect(quickTight).not.toContain('给出答案即可')
+  })
+
+  it('describeControl 在 tight 抬了门槛时写明"只升不降"（回执与注入同一口径）', () => {
+    expect(describeControl('quick', 'tight')).toContain('门槛只升不降')
+    expect(describeControl('quick', 'tight')).toContain('指出来源')
+    expect(describeControl('quick', 'relaxed')).not.toContain('门槛只升不降')
+    expect(describeControl('standard', 'tight')).not.toContain('门槛只升不降')
+  })
+})
+
+/**
+ * v3.6 B：合法出口段。三条硬约束都要有会失败的判据：
+ * ① ≤200 字符；② 只由无进展信号触发；③ 不写反例清单里的措辞。
+ */
+describe('renderExitOptions：合法出口段（≤EXIT_SEGMENT_MAX）', () => {
+  type LoopSignalKind = LoopSignal['kind']
+  const signalOf = (kind: LoopSignalKind, hint = 'h'): LoopSignal => ({ kind, detail: '依据', hint })
+
+  it('只有 stalled / no-new-evidence 触发；其余信号与空信号都是空串（不注入废话）', () => {
+    for (const kind of NO_PROGRESS_KINDS) {
+      expect(renderExitOptions(signalOf(kind), controlOf('standard')), `${kind} 应当触发`).not.toBe('')
+    }
+    expect(renderExitOptions(signalOf('repeat-action'), controlOf('standard'))).toBe('')
+    expect(renderExitOptions(signalOf('oscillation'), controlOf('standard'))).toBe('')
+    expect(renderExitOptions(null, controlOf('standard'))).toBe('')
+    expect(renderExitOptions(undefined as never, controlOf('standard'))).toBe('')
+    // 无进展集合是两处共用的唯一真源：集合里每一个都必须有文案（加了 kind 会红）
+    expect([...NO_PROGRESS_KINDS]).toEqual(['stalled', 'no-new-evidence'])
+  })
+
+  it('每种（无进展信号 × 档位 × 压力）组合都 ≤EXIT_SEGMENT_MAX，且重述的就是读数里那套判据', () => {
+    for (const kind of NO_PROGRESS_KINDS) {
+      for (const depth of ['quick', 'standard', 'deep'] as const) {
+        for (const band of ['relaxed', 'moderate', 'tight'] as const) {
+          const control = controlForBand(depth, band)
+          const line = renderExitOptions(signalOf(kind), control)
+          expect(line.length, `${kind}/${depth}/${band} 出口段过长`).toBeLessThanOrEqual(EXIT_SEGMENT_MAX)
+          expect(line).toContain('三个合法出口')
+          // 判据重述必须与**同一档同一压力下注入的读数**一致（两个面不许各说一套）
+          const readout = controlLine(depth, 0, band)
+          const stopText = /收尾 ([^｜]+)/.exec(readout)?.[1] ?? ''
+          const evidenceText = /证据 ([^｜]+)/.exec(readout)?.[1] ?? ''
+          expect(stopText).not.toBe('')
+          expect(line).toContain(`完成判据：${stopText}；`)
+          expect(line).toContain(`证据要求：${evidenceText}。`)
+        }
+      }
+    }
+  })
+
+  it('不含"不许作弊 / 你被监控 / 加油"这类反例措辞（§3.5 有据）', () => {
+    for (const kind of NO_PROGRESS_KINDS) {
+      const line = renderExitOptions(signalOf(kind), controlOf('standard'))
+      for (const banned of ['不许', '作弊', '被监控', '监控', '评测', '加油', '很好', '努力']) {
+        expect(line.includes(banned), `出口段出现"${banned}"`).toBe(false)
+      }
+    }
+  })
+
+  it('纯函数：同参数同输出（可以安全地每轮重算）', () => {
+    expect(renderExitOptions(signalOf('stalled'), controlOf('deep'))).toBe(
+      renderExitOptions(signalOf('stalled'), controlOf('deep')),
+    )
   })
 })
 

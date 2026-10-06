@@ -31,10 +31,12 @@ import {
   AUTO_INJECT_CARD_CAP,
   FAILURE_CLASSES,
   classifyFailure,
+  controlForBand,
   controlOf,
   failureSignalsFromLoop,
   isFailureClass,
   recoveryFor,
+  renderExitOptions,
   renderRecovery,
 } from './control.js'
 import {
@@ -50,6 +52,7 @@ import type { LoopSignal, TurnFingerprint } from './loop.js'
 import { DEFAULT_WINDOW_SIZE, detectLoop, noteObservation, renderLoopSignal } from './loop.js'
 import type { MethodCard, RuleId } from './methods.js'
 import { CARDS_BY_DEPTH, METHOD_CARDS, cardById, cardsFor, renderIndex, residentHint } from './methods.js'
+import { observeGaming, renderGamingReport } from './gaming.js'
 import type { VerifyInput, VerifyOutcome } from './tools.js'
 import { createReasoningTools } from './tools.js'
 import type { VerifyTracker } from './verify.js'
@@ -65,7 +68,7 @@ import {
 import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
-export const MODULE_VERSION = '3.5.0'
+export const MODULE_VERSION = '3.6.0'
 
 /** 配置：`cordis.patch.yml` 的 `config` 段。 */
 export interface ReasoningConfig {
@@ -170,8 +173,10 @@ interface RenderTrace {
   readonly form: string
   /** 控制读数（参数行）占的字符数——档位差异的文本成本，恒定一行。 */
   readonly controlChars: number
-  /** 验证段占的字符数（有未闭合项才出现）。 */
+  /** 验证段占的字符数（有未闭合项才出现）。**压力档不影响它**（v3.6 修）。 */
   readonly verifyChars: number
+  /** 合法出口段占的字符数（只有 stalled / no-new-evidence 触发）。 */
+  readonly exitChars: number
   /** 渲染入参档位与内核读数的分歧（'' = 一致或无从比较）。 */
   readonly depthDivergence: string
 }
@@ -231,9 +236,12 @@ function describeLastRender(trace: RenderTrace | null, failures: number, lastFai
       `上次注入：成功（${idList(trace.delivered)}，${trace.chars} 字符；深度 ${trace.depth}，压力 ${trace.band}${budget}；会话 ${trace.session}）`,
     )
   }
-  // 控制读数与验证段的字符成本分开记账：这是"档位差异不是靠字数"的可核验读数
+  // 控制读数、验证段与出口段的字符成本分开记账：
+  // 这是"档位/压力差异不是靠字数"的可核验读数（哪一段进了上下文，就报哪一段）
   if (trace !== null) {
-    bits.push(`控制读数 ${trace.controlChars} 字符，验证段 ${trace.verifyChars} 字符`)
+    bits.push(
+      `控制读数 ${trace.controlChars} 字符，验证段 ${trace.verifyChars} 字符，出口段 ${trace.exitChars} 字符`,
+    )
   }
   // 失败历史不隐藏：失败过一次、后来又成功，两件事都要在状态面里看得到
   if (failures > 1 || (failures > 0 && trace !== null)) {
@@ -315,10 +323,13 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     const healthNow = (): ModuleHealth => {
       let withSignal = 0
       let unresolved = 0
+      let gamingSignals = 0
       for (const [session, state] of sessions) {
         if (state.lastSignal !== null) withSignal += 1
         const depth = peekFocus(kernel, session) ?? state.explicitDepth ?? 'standard'
         unresolved += summarizeTracker(state.verify, controlOf(depth).verifyBudget, state.turn).unresolved
+        // 糊弄倾向观察面：**只上状态面**，不进任何注入路径（研究报告 §5.2 设计 C）
+        gamingSignals += observeGaming({ signal: state.lastSignal, tracker: state.verify }).length
       }
       const classified = [...failureCounts.values()].reduce((sum, count) => sum + count, 0)
       const parts = [
@@ -347,10 +358,12 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           lastRenderCards: lastRender?.delivered.length ?? 0,
           lastRenderControlChars: lastRender?.controlChars ?? 0,
           lastRenderVerifyChars: lastRender?.verifyChars ?? 0,
+          lastRenderExitChars: lastRender?.exitChars ?? 0,
           verifyCalls,
           verifyUnresolved: unresolved,
           verifyOverBudget,
           classifiedFailures: classified,
+          gamingSignals,
         },
       }
     }
@@ -540,14 +553,18 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
     /**
      * `PromptContribution`：`resident` 是冻结的常驻提示；`context` 是每轮易变部分。
      *
-     * v3.1 的注入结构（**档位差异不是靠字数**）：
+     * v3.6 的注入结构（**档位差异不是靠字数**）：
      * ① 指令：只有 `quick` 有（"不要展开、直接回答"）
-     * ② 控制读数：只有偏离基线的档位有（`deep`），一行参数
+     * ② 控制读数：`deep` 有；此外**压力真的抬升了门槛的档位**也有
+     *    （`projectFocus` 的 `pressureRaisedFloor`）——抬了门槛却不读出来就是静默变化
      * ③ 规则卡：任何档位自动注入 **≤1 张**（`AUTO_INJECT_CARD_CAP`），其余按需拉取
-     * ④ 验证段：**有未闭合结论才出现**，与档位无关（是状态，不是档位）
+     * ④ 验证段：**有未闭合结论才出现**，由状态驱动——**不随压力档消失**（v3.6 修）
      * ⑤ 循环提示：有信号才出现（≤80 字符）
+     * ⑥ 合法出口：只有 `stalled` / `no-new-evidence` 触发（≤`EXIT_SEGMENT_MAX` 字符）
      *
-     * 紧张档：**读数保留 + 真的给索引**（内容全部转工具拉取）。
+     * 紧张档：**读数保留 + 真的给索引**（内容全部转工具拉取），
+     * 且**门槛只升不降**（`controlForBand`：tight 把证据要求与收尾条件抬到不低于
+     * `standard` 的下限）。
      * 档位来源的裁决见 `resolveRenderDepth`；两者分歧必定留痕。
      */
     const contribution: PromptContribution = {
@@ -564,9 +581,9 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
               : ''
           if (depthDivergence !== '') kernel.logger.warn(`${MODULE_ID}：${depthDivergence}`)
 
-          const control: DepthControl = controlOf(depth)
+          const control: DepthControl = controlForBand(depth, input.band)
           const verifySummary = summarizeTracker(state?.verify ?? emptyVerify, control.verifyBudget, state?.turn)
-          const projection = projectFocus(depth, verifySummary.calls)
+          const projection = projectFocus(depth, verifySummary.calls, input.band)
           const tight = input.band === 'tight'
 
           const parts: string[] = []
@@ -574,6 +591,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           const given: string[] = []
           let verifyOnly = ''
           let verifyChars = 0
+          let exitChars = 0
           // 紧张档的判据：这一档本来就有可注入内容（读数或卡片），压缩才有意义
           const substantive = projection.controlText !== '' || projection.cards.length > 0
           if (tight) {
@@ -606,27 +624,60 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
               if (projection.controlText !== '') given.push('读数')
               if (projection.cards.length > 0) given.push('卡片')
             }
-            // 验证段是**状态**驱动：有未闭合结论才出现，不随档位增减
-            if (control.verifyBudget > 0) {
-              verifyOnly = verifyLine(verifySummary)
-              if (verifyOnly !== '') {
-                parts.push(verifyOnly)
-                given.push('验证段')
-                verifyChars = verifyOnly.length
-              }
+          }
+
+          /**
+           * ④ 验证段：**状态驱动**——有未闭合结论才出现。
+           *
+           * 它为什么在这段 `if (tight) { … } else { … }` **之外**（v3.6 修的缺陷）：
+           * 此前这段写在 `else`（非紧张档）分支里，于是**压力最大时**
+           * "你还有 N 条结论未过形式核对"整段不注入，而紧挨着它的注释却写着
+           * "不随档位增减"——**注释与代码相反**。净效果是压力最大时唯一必然出现的
+           * 质量约束只剩循环提示，而证据方向恰恰相反（压力升高 → 更倾向提前收尾、
+           * 跳过验证）。
+           *
+           * 选"移出 else"而不是"在紧张档里再抄一份"：只有一个真相点，不会出现两份
+           * 各自漂移的副本——"同一件事有两份实现"正是本模块反复修的那类缺陷。
+           *
+           * 这里唯一的档位相关闸门是 `verifyBudget > 0`，它回答的是"本档要不要验证"
+           * （`quick` 不要求验证，因此也不提醒），不是"压力大就别说"。
+           */
+          if (control.verifyBudget > 0) {
+            verifyOnly = verifyLine(verifySummary)
+            if (verifyOnly !== '') {
+              parts.push(verifyOnly)
+              given.push('验证段')
+              verifyChars = verifyOnly.length
             }
           }
 
+          // ⑤ 循环提示：有信号才出现（≤LOOP_HINT_MAX 字符）
           const signal = state?.lastSignal ?? null
           const loopLine = renderLoopSignal(signal)
           if (loopLine !== '') {
             parts.push(loopLine)
             given.push('循环提示')
           }
+          /**
+           * ⑥ 合法出口 + 完成判据重述（研究报告 §5.2 设计 B）。
+           *
+           * 为什么注入的是"出口"而不是"别绕圈"：**"诚实解仍可行"是压制生效的前提**，
+           * 而"合法选项被封闭"会把 misalignment 从 0% 推到 96%。所以信号出现时要说的是
+           * "卡住了 / 需要更多信息 / 这条做不了"都可以，以及**回收尾判据是什么**。
+           *
+           * 只在 `stalled` / `no-new-evidence` 出现时注入（`renderExitOptions` 内部判定），
+           * 不是每轮常驻；无信号时是空串，不注入"没有出口"这类废话。
+           */
+          const exitLine = renderExitOptions(signal, control)
+          if (exitLine !== '') {
+            parts.push(exitLine)
+            given.push('出口段')
+            exitChars = exitLine.length
+          }
           const text = parts.join('\n')
 
           // 可核验留痕：按正文逐张确认卡真的进了上下文，而不是"我们打算注入"。
-          // 控制读数与验证段分开记账——这是"档位差异不是靠字数"的可核验读数。
+          // 控制读数 / 验证段 / 出口段分开记账——这是"档位与压力差异不是靠字数"的可核验读数。
           lastRender = {
             session: input.sessionId,
             depth,
@@ -640,6 +691,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
                 ? projection.controlText.length
                 : 0,
             verifyChars: verifyOnly !== '' && text.includes(verifyOnly) ? verifyChars : 0,
+            exitChars: exitLine !== '' && text.includes(exitLine) ? exitChars : 0,
             depthDivergence,
           }
           // 上报一次：否则内核健康面停留在上一次事件的快照，与 omb_status 里的
@@ -668,6 +720,21 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
           // 第二行是"注入到底发生了没有"的可核验痕迹：回执说会注入的卡，
           // 在这里必须能看到真进了几张；失败连原因一起留下。
           const lines = [healthNow().detail, describeLastRender(lastRender, renderFailures, lastRenderFailure)]
+          /**
+           * 糊弄倾向观察面（研究报告 §5.2 设计 C）：**只在这里出现**——
+           * 它不进 `context()`（注入路径），因为证据不支持"判定作弊"这件事：
+           * CoT 自述承认作弊 <2%、72% 的作弊者自认合理、内部压力高时输出可以毫无痕迹。
+           * 所以只报可核对的事实并标成"信号"，同时把**未测量项**一并写出来
+           * （"没测"不能被读成"没有"）。
+           */
+          lines.push(
+            renderGamingReport(
+              [...sessions].map(([session, state]) => ({
+                session,
+                signals: observeGaming({ signal: state.lastSignal, tracker: state.verify }),
+              })),
+            ),
+          )
           // 失败分类的分布与最近一次处置：这是 R6 从"固定阈值"改成分类器之后的可核验读数
           if (lastClassified !== null) {
             const spread = FAILURE_CLASSES

@@ -52,6 +52,28 @@ export const DEFAULT_LOOP_THRESHOLDS: LoopThresholds = {
 /** 提示字符上限：`hint` 是注入给模型的一句话，必须短。 */
 export const LOOP_HINT_MAX = 80
 
+/**
+ * "无进展"信号：这两类说的是同一件事——**做了动作但没有新增证据**。
+ *
+ * 单列一个集合，是因为它有两个消费者，而它们必须判同一件事：
+ * ① 注入侧的"合法出口"段（`control.ts` 的 `renderExitOptions`）——
+ *    无进展时才需要把出口写出来；
+ * ② 观察侧的状态面信号（`gaming.ts` 的 `observeGaming`）。
+ * 两处各写一份 kind 列表，就会出现"注入说这套、状态面说那套"的漂移。
+ *
+ * `repeat-action` / `oscillation` **不在此列**：它们各自的 `hint` 已经点明了一个
+ * 具体出口（"别原样再来一次" / "需要第三个选项或先向用户确认"），
+ * 属于"这一步做错了"，不属于"整体没有进展"。
+ */
+export const NO_PROGRESS_KINDS: readonly LoopKind[] = ['stalled', 'no-new-evidence']
+
+/** 是不是"无进展"信号（空信号恒为 false）。 */
+export function isNoProgressSignal(signal: LoopSignal | null | undefined): signal is LoopSignal {
+  return signal !== null
+    && signal !== undefined
+    && (NO_PROGRESS_KINDS as readonly string[]).includes(signal.kind)
+}
+
 /** 滚动窗口默认保留的指纹数（够判定四类信号，且不随会话无限增长）。 */
 export const DEFAULT_WINDOW_SIZE = 12
 
