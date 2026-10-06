@@ -26,9 +26,6 @@ importers:
       '@omb/notify':
         specifier: workspace:*
         version: link:packages/notify
-      '@omb/privacy':
-        specifier: workspace:*
-        version: link:packages/privacy
       '@omb/profile':
         specifier: workspace:*
         version: link:packages/profile
@@ -93,12 +90,6 @@ importers:
         version: 4.4.3
 
   packages/notify:
-    dependencies:
-      zod:
-        specifier: ^4.4.3
-        version: 4.4.3
-
-  packages/privacy:
     dependencies:
       zod:
         specifier: ^4.4.3

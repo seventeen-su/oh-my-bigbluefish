@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Memory store",
-    "description": "Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, and forgetting."
+    "description": "Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, forgetting, and the privacy gate (/omb-privacy: read-only / sealed per session, inherited by subagents)."
   }
 }
