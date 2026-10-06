@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="OMB 认知增强">
+  <!-- 三层叠起来的卡片，最上面那张上有两条条目与一个关联点。
+
+       为什么是这个意思：OMB 干的事是"把认知分层管起来"，而记忆本身就有三层
+       （会话 / 项目 / 用户，见 modules/memory 的双库设计）。三张卡说的是同一份认知的远近层，
+       最上面那张有人正在读写。不用鱼：项目名是 BigBlueFish，但图标要表达**功能**，不是名字。
+
+       WHY THE TOP CARD IS FULLY OPAQUE：试过把它调到 0.85，结果是两头不讨好——
+       白条目一并留 0.92 时对比度掉到 2.94:1（不过线），整张还发灰。
+       层次改由**渐变跨度**与**错位**表达，不靠透明度：后面两张仍然半透明（0.38 / 0.62），
+       越远越淡，前面那张实色，前后关系反而更清楚。
+
+       WHY THE GRADIENT SPAN IS ROUGHLY DOUBLED：原来的 #5B74F2 到 #3B55E8 亮度只差 0.0774，
+       在大尺寸下几乎看不出是渐变。现在 #7489F4 到 #3750E2，亮度差 0.1610，是原来的 2.08 倍。
+       跨度不能再大：这是被两条对比度要求夹出来的窗口——最浅端若再亮，对白底会跌破 3:1；
+       最深端若再深，对深色底会跌破 3:1（见下）。
+
+       CONTRAST（WCAG 2.2 SC 1.4.11 要求 3:1，按 sRGB 实测）：
+         最上那张（实色）：#7489F4 端 对白底 3.17:1、对深底 5.91:1
+                          #3750E2 端 对白底 6.16:1、对深底 3.04:1
+                          两端都过线，这是跨度的边界条件
+         卡上白条目：压在最浅端 3.17:1，压在最深端 6.16:1，全程过线
+         后面两张：#3A54E4 到 #2740C9，对白底 5.89:1 到 7.89:1；它们半透明，是装饰层
+
+       WHY AN EXPLICIT COLOUR (never `currentColor`)：宿主把本文件当
+       `data:image/svg+xml;base64,…` 内联后经 `<img src=…>` 渲染
+       （`boot/app-boot/src/package-meta.ts` 读取图标，插件页展示），
+       按 svg-authoring §9 那是 secure 模式下的独立文档：页面 CSS 与继承都进不来，
+       继承色会退成初始黑、在深色主题上直接消失。两个参考件同样写字面色。
+
+       WHY NO BACKGROUND PLATE：图标要贴在插件页自己的底色上，自带底色会在另一种主题里变成补丁。
+       本文件没有任何覆盖整个 viewBox 的填充，只有三张卡与卡上的内容。
+
+       WHY FILLS ONLY, NO `stroke`：描边随缩放变粗变细（16px 发虚、48px 变胖），
+       见 svg-authoring §7。圆角全部由 rx 给出。
+
+       WHY BACK CARDS ARE DEEPER, NOT LIGHTER：与 dsh-path-guard 图标同一规则
+       （"INACTIVE MEANS DEEPER"）——同一族蓝往下压明度表示"更远"。
+       后面两张用 #3A54E4 到 #2740C9 并叠透明度 0.38 / 0.62。
+
+       GRADIENTS 走左上到右下，与 DSH 自家插件美术同方向
+       （`ui-primitives/src/plugin-artwork.tsx`：#69B9FF 到 #324DE2、#45E7A4 到 #05909D）。
+
+       几何（viewBox 0 0 48 48，四周各留 8 个单位的光学边距）：
+         三层  26x26 的圆角矩形，rx 6；左上角依次 (14,8)、(11,11)、(8,14)，
+               即每张往左 3、往下 3；透明度 0.38 / 0.62 / 不透明
+         条目  白条 (12.5,20) 12x3 rx1.5 不透明；(12.5,26) 8x3 rx1.5 透明度 0.6
+         关联点 圆心 (28.5,33) 半径 2.4，透明度 0.9，表示"这一层里的一个关联"
+
+       16px 可读性：三层错位轮廓 + 最上面那张的两条白条目，缩到 16px
+       仍能读出"一摞东西、最上面那张有内容"。
+
+       本文件任何位置（含注释）都不出现连续两个连字符：XML 禁止注释里出现它，
+       强制该规则的解析器会整份拒绝，图标变成空白而不是"略有瑕疵"。 -->
+  <defs>
+    <linearGradient id="ombBack" gradientUnits="userSpaceOnUse" x1="14" y1="8" x2="40" y2="34">
+      <stop offset="0" stop-color="#3A54E4"/>
+      <stop offset="1" stop-color="#2740C9"/>
+    </linearGradient>
+    <linearGradient id="ombFront" gradientUnits="userSpaceOnUse" x1="8" y1="14" x2="34" y2="40">
+      <stop offset="0" stop-color="#7489F4"/>
+      <stop offset="1" stop-color="#3750E2"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="8" width="26" height="26" rx="6" fill="url(#ombBack)" opacity="0.38"/>
+  <rect x="11" y="11" width="26" height="26" rx="6" fill="url(#ombBack)" opacity="0.62"/>
+  <rect x="8" y="14" width="26" height="26" rx="6" fill="url(#ombFront)"/>
+  <rect x="12.5" y="20" width="12" height="3" rx="1.5" fill="#FFFFFF"/>
+  <rect x="12.5" y="26" width="8" height="3" rx="1.5" fill="#FFFFFF" opacity="0.6"/>
+  <circle cx="28.5" cy="33" r="2.4" fill="#FFFFFF" opacity="0.9"/>
+</svg>
