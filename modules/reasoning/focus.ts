@@ -9,15 +9,28 @@
  * 自动注入的卡片被钉死在 ≤1 张（`AUTO_INJECT_CARD_CAP`），
  * 且只有偏离默认基线的档位会多读一行控制参数——文本量不随档位线性增长。
  */
-import type { FocusDepth, Kernel, SessionRef } from '../../kernel/abi/index.js'
+import type { FocusDepth, Kernel, PressureBand, SessionRef } from '../../kernel/abi/index.js'
 import { FOCUS_DEPTHS } from '../../kernel/abi/index.js'
 import type { DepthControl } from './control.js'
-import { AUTO_INJECT_CARD_CAP, controlLine, controlOf, describeControl } from './control.js'
+import {
+  AUTO_INJECT_CARD_CAP,
+  controlForBand,
+  controlLine,
+  controlOf,
+  describeControl,
+  pressureRaisedFloor,
+} from './control.js'
 import type { MethodCard, RuleId } from './methods.js'
 import { CARDS_BY_DEPTH, cardById } from './methods.js'
 
 /** `quick` 档注入的动作指令：抑制过度推理（§4.4 表格原文）。 */
 export const QUICK_DIRECTIVE = '本轮不要展开，直接回答。'
+
+/** 压力带取值（与 `kernel/abi/kinds.ts` 的 `PressureBand` 同一集合，运行时校验用）。 */
+const PRESSURE_BANDS: readonly PressureBand[] = ['relaxed', 'moderate', 'tight']
+
+/** 压力读数不可用时的取值：**不施加耦合**（不是把 tight 猜成 relaxed）。 */
+export const NO_PRESSURE: PressureBand = 'relaxed'
 
 /**
  * 档位取值元组。与 `kernel/abi/kinds.ts` 的 `FOCUS_DEPTHS` 是同一集合，
@@ -58,19 +71,24 @@ export interface DepthProjection {
 }
 
 /**
- * 深度 → 投影。**纯函数**：同一 `(depth, verifyUsed)` 永远同结果。
+ * 深度 → 投影。**纯函数**：同一 `(depth, verifyUsed, band)` 永远同结果。
  *
  * `verifyUsed` 只影响控制读数里的"已用/预算"，不影响任何卡片。
+ * `band` 走 `controlForBand`：`tight` 会把证据要求与收尾条件抬到不低于 `standard`
+ * 的下限（只升不降）。**抬了就必须读出来**——所以除了本来就读数的 `deep`，
+ * 任何"压力真的抬升了这一档门槛"的组合也会带上读数（`pressureRaisedFloor`），
+ * 否则就是一处静默的门槛变化。
  */
-export function projectFocus(depth: FocusDepth, verifyUsed = 0): DepthProjection {
-  const control = controlOf(depth)
+export function projectFocus(depth: FocusDepth, verifyUsed = 0, band: PressureBand = NO_PRESSURE): DepthProjection {
+  const control = controlForBand(depth, band)
   const declared: RuleId | null = control.injectCard
   const card = declared === null ? undefined : cardById(declared)
+  const announce = ANNOUNCE_CONTROL[depth] === true || pressureRaisedFloor(depth, band)
   return {
     depth,
     directive: depth === 'quick' ? QUICK_DIRECTIVE : '',
     control,
-    controlText: ANNOUNCE_CONTROL[depth] ? controlLine(depth, verifyUsed) : '',
+    controlText: announce ? controlLine(depth, verifyUsed, band) : '',
     needs: CARDS_BY_DEPTH[depth] ?? [],
     // 上限在代码里强制，而不只是写在注释里：任何档位都不得注入超过 AUTO_INJECT_CARD_CAP 张
     cards: card === undefined ? [] : [card].slice(0, AUTO_INJECT_CARD_CAP),
@@ -128,12 +146,35 @@ export function peekFocus(kernel: Kernel, session: SessionRef): FocusDepth | nul
 }
 
 /**
+ * 内核压力读数（**不回落**）：读不到或读到非法值时返回 `null`。
+ *
+ * 与 `peekFocus` 同一分工：`null` 表示"没读到"，调用方自己决定回落，
+ * 不许把"读不到压力"静默说成"压力 relaxed"。回执与投影用它的理由是
+ * **门槛抬升必须能被说出口**：压力抬了 tight 的下限，而回执还说 relaxed 的话，
+ * 同一次调用里就会有两个相反的说法。
+ */
+export function peekBand(kernel: Kernel, session: SessionRef): PressureBand | null {
+  try {
+    const band = kernel.pressure(session)?.band
+    return typeof band === 'string' && (PRESSURE_BANDS as readonly string[]).includes(band)
+      ? (band as PressureBand)
+      : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 读当前档位。**绝不抛**：内核服务异常时回落 `standard`（默认档），
  * 并在 `projection` 里如实反映——降级不隐藏。
+ *
+ * 压力读数一并读进来（读不到按 `NO_PRESSURE`）：投影里的控制参数必须是
+ * **此刻生效的**那套，否则 `standard + tight` 下投影会显示一套没有耦合的门槛，
+ * 与渲染路径注入的读数各说一套。
  */
 export function readFocus(kernel: Kernel, session: SessionRef): FocusSnapshot {
   const depth: FocusDepth = peekFocus(kernel, session) ?? 'standard'
-  return { depth, projection: projectFocus(depth) }
+  return { depth, projection: projectFocus(depth, 0, peekBand(kernel, session) ?? NO_PRESSURE) }
 }
 
 /** 写档位的结果；`text` 直接可以作为工具回执给模型看。 */
@@ -179,11 +220,14 @@ export function applyFocus(
     }
   }
   const actual = peekFocus(kernel, session)
+  // 压力带与档位一起读：回执里的"证据要求 / 收尾"必须与下一轮注入的读数是**同一套**
+  // （压力抬了下限而回执不说，就是同一次输出里两个相反的说法）。
+  const band = peekBand(kernel, session) ?? NO_PRESSURE
   if (actual === null) {
     return {
       ok: true,
       depth: rawDepth,
-      text: `已请求把推理深度设为 ${rawDepth}（理由：${reason}），但内核读不回档位，无法核实是否生效。${describeDepthEffect(rawDepth)}`,
+      text: `已请求把推理深度设为 ${rawDepth}（理由：${reason}），但内核读不回档位，无法核实是否生效。${describeDepthEffect(rawDepth, band)}`,
     }
   }
   if (actual !== rawDepth) {
@@ -196,7 +240,7 @@ export function applyFocus(
   return {
     ok: true,
     depth: actual,
-    text: `已把推理深度设为 ${actual}（理由：${reason}；已回读核实）。${describeDepthEffect(actual)}`,
+    text: `已把推理深度设为 ${actual}（理由：${reason}；已回读核实）。${describeDepthEffect(actual, band)}`,
   }
 }
 
@@ -214,20 +258,23 @@ export function applyFocus(
  * ⚠️ 措辞必须与 `index.ts` 的渲染**逐字对应**。这里以前写的是
  * "上下文紧张时只给读数、不给卡片"，而渲染在紧张档把读数整段丢掉了——
  * 承诺与实现相反（G2）。现在两边说的是同一件事：**读数照给，卡片正文降级为索引**。
+ *
+ * `band` 是第二个来源维度：`tight` 抬了下限时，`describeControl` 会把抬升后的
+ * 证据要求与收尾条件写出来，并注明"门槛只升不降"——回执与注入同一口径。
  */
-export function describeDepthEffect(depth: FocusDepth): string {
+export function describeDepthEffect(depth: FocusDepth, band: PressureBand = NO_PRESSURE): string {
   if (depth === 'quick') {
-    return `此后每轮请求注入"不要展开、直接回答"的指令。控制：${describeControl(depth)}。`
+    return `此后每轮请求注入"不要展开、直接回答"的指令。控制：${describeControl(depth, band)}。`
   }
   if (depth === 'deep') {
     const card = controlOf(depth).injectCard
     const declared = CARDS_BY_DEPTH.deep ?? []
     const others = declared.filter(id => id !== card)
     return [
-      `此后每轮请求注入控制读数与规则卡 ${card ?? '（无）'}；控制：${describeControl(depth)}。`,
+      `此后每轮请求注入控制读数与规则卡 ${card ?? '（无）'}；控制：${describeControl(depth, band)}。`,
       `其余声明的规则卡（${others.join('/')}）用 omb_method 取；`,
       `上下文紧张时读数照给、卡片正文降级为索引（${declared.join('/')} 的「编号 标题｜何时用」），正文一律用 omb_method 取。`,
     ].join('')
   }
-  return `此后每轮不再主动注入规则卡正文；控制：${describeControl(depth)}。需要规则卡时用 omb_method 取。`
+  return `此后每轮不再主动注入规则卡正文；控制：${describeControl(depth, band)}。需要规则卡时用 omb_method 取。`
 }

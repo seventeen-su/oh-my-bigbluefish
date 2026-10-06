@@ -8,9 +8,11 @@ import {
   DEFAULT_LOOP_THRESHOLDS,
   DEFAULT_WINDOW_SIZE,
   LOOP_HINT_MAX,
+  NO_PROGRESS_KINDS,
   type TurnFingerprint,
   appendFingerprint,
   detectLoop,
+  isNoProgressSignal,
   noteObservation,
   renderLoopSignal,
 } from '../../../modules/reasoning/loop.js'
@@ -269,5 +271,28 @@ describe('noteObservation：把 call + result 两条事件归并成"一步"', ()
     const copy = [...original]
     noteObservation(original, fp('result', 'h'))
     expect(original).toEqual(copy)
+  })
+})
+
+/**
+ * v3.6 新增的共用判据：**注入侧**（合法出口段）与**观察侧**（状态面信号）
+ * 必须判同一件事。两处各写一份 kind 列表就会漂移，所以只有这一个真源。
+ */
+describe('无进展信号集合（注入侧与观察侧共用的唯一真源）', () => {
+  it('只认 stalled / no-new-evidence —— 这两类的共同含义是"没有新增证据"', () => {
+    expect([...NO_PROGRESS_KINDS]).toEqual(['stalled', 'no-new-evidence'])
+    for (const kind of NO_PROGRESS_KINDS) {
+      expect(isNoProgressSignal({ kind, detail: 'd', hint: 'h' })).toBe(true)
+    }
+    // "这一步刚做过 / 在两种做法之间来回"不属于无进展：它们各自已有具体出口
+    expect(isNoProgressSignal({ kind: 'repeat-action', detail: 'd', hint: 'h' })).toBe(false)
+    expect(isNoProgressSignal({ kind: 'oscillation', detail: 'd', hint: 'h' })).toBe(false)
+  })
+
+  it('空信号、畸形信号恒为 false（不抛）', () => {
+    expect(isNoProgressSignal(null)).toBe(false)
+    expect(isNoProgressSignal(undefined)).toBe(false)
+    expect(isNoProgressSignal({} as never)).toBe(false)
+    expect(isNoProgressSignal({ kind: 'bogus' } as never)).toBe(false)
   })
 })
