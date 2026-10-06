@@ -164,7 +164,7 @@ describe('omb_files：两种空与本会话无关的三件事（S3-c）', () => 
       expect(outcome.text).toContain('不是')
       expect(outcome.text).toContain('1 次写入被隐私闸门拒绝')
       expect(outcome.text).toContain('禁止写入')
-      expect(outcome.text).toContain('omb-privacy')
+      expect(outcome.text).toContain('/omb-privacy')
     }
   })
 

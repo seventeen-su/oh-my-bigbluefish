@@ -5,13 +5,13 @@
  * 任何输入都不抛（宿主命令处理器抛异常会影响整条命令通道）。
  */
 import { describe, expect, it, vi } from 'vitest'
-import type { CommandResultLike, PrivacyCommandApi } from '../../../modules/privacy/command.js'
+import type { CommandResultLike, PrivacyCommandApi } from '../../../modules/memory/privacy/command.js'
 import {
   PRIVACY_COMMAND_NAME,
   PRIVACY_USAGE,
   runPrivacyCommand,
   sessionOfInvocation,
-} from '../../../modules/privacy/command.js'
+} from '../../../modules/memory/privacy/command.js'
 
 function api(overrides: Partial<PrivacyCommandApi> = {}): PrivacyCommandApi & {
   readonly setMode: ReturnType<typeof vi.fn>

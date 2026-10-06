@@ -34,23 +34,22 @@
       config:
         debug: false
 
-    # ── 隐私模式（放在记忆之前：库访问边界要尽早有闸门）──────────────
-    # `commands` 是**宿主**服务（斜杠命令注册表），行级 inject 在这里的作用是
-    # "等宿主门就绪"，不是模块间依赖——判据见 tests/dsh/module-graph-source.test.ts。
-    - id: omb-privacy
-      name: '@omb/privacy'
-      inject: ['omb:kernel', 'commands']
-      config:
-        # 状态读不出时的基线（fail-closed）：sealed = 最严；只想禁写可改 read-only
-        failClosedMode: sealed
-
     # ── 记忆库（向量通道可单独关；关联扩展与多查询是它的子能力，各自提供工具）──
+    # `commands` 是**宿主**服务（斜杠命令注册表）：3.6 起 `/omb-privacy` 的命令注册
+    # 从记忆库的 apply 走，因此这条行级 inject 跟着从 `omb-privacy` 那一行搬到这里。
+    # 它的作用仍是"等宿主门就绪"（**不是**模块间依赖），判据见 tests/dsh/module-graph-source.test.ts。
+    # 隐私模式（原 `omb-privacy` 行）已并入本行：服务名仍是 `SERVICES.privacy`，
+    # 制品索引（`omb-artifact`）与库访问边界两个消费者零改动。
     - id: omb-memory
       name: '@omb/memory'
-      inject: ['omb:kernel']
+      inject: ['omb:kernel', 'commands']
       config:
         consolidationEveryTurns: 32
         embeddingThreads: 2
+        # 隐私闸门（原 omb-privacy 行的 config 块，逐项照搬）
+        privacy:
+          # 状态读不出时的基线（fail-closed）：sealed = 最严；只想禁写可改 read-only
+          failClosedMode: sealed
     - id: omb-memory-vector
       name: '@omb/memory-vector'
       inject: ['omb:kernel']
@@ -103,7 +102,23 @@
             config:
               prefix: >-
                 你是运行在「大肥鱼模式」（OMB v3 认知增强）下的智能体，基于 {{model}} 模型。
-              suffix: 你的工作目录是 {{cwd}}。
+              # **不要再加 `suffix: 你的工作目录是 {{cwd}}。`**
+              #
+              # 那句在 DSH 0.2.1-a2 上会让**整轮运行失败**：
+              #   unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix";
+              #   registered variables: provider, model
+              #
+              # 两个独立原因，任何一个都足以否掉它：
+              #   ① **`cwd` 从来不是内置变量**。DSH 核心只注册 `provider` / `model`
+              #      （`packages/core/agent-loop/src/index.ts:389-390`）；`cwd` 必须由某个插件
+              #      显式 `ctx.systemPrompt.variable('cwd', …)` 注册，而没有任何内置包这么做
+              #      （`packages/core/system-prompt/tests/system-prompt.spec.ts:205-213` 就是
+              #      拿 `{{cwd}}` 当"未注册变量"的反例来测的）。插值是**严格**的：遇到未注册
+              #      变量直接抛，不是原样保留。
+              #   ② **它本来就是多余的**。DSH 已经用一条独立通道把工作目录交给模型：
+              #      `@deepseek-ai/dsh-working-directory`（`packages/bundle/base/cordis.patch.yml:161`）
+              #      贡献上下文段 `working-directory:current`，且 `interpolate: false`。
+              #      在这里再写一遍，等于同一个事实说两遍——而第二遍还带着一个会炸的变量。
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:

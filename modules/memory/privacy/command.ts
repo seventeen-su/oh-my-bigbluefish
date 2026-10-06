@@ -54,10 +54,16 @@ export interface CommandInvocationLike {
   readonly commandId?: unknown
 }
 
-/** 命令名（用户输入 `/omb-privacy …`）。 */
+/** 命令名（用户输入 `/omb-privacy …`）。**3.6 并入记忆库后一个字都没改**（用户肌肉记忆 + 文档已写）。 */
 export const PRIVACY_COMMAND_NAME = 'omb-privacy'
-/** 定义 id：全局唯一即可。用 `@omb/privacy` 与组件包名一致，便于排查。 */
-export const PRIVACY_COMMAND_ID = '@omb/privacy'
+/**
+ * 定义 id：全局唯一即可。
+ *
+ * 3.6 起隐私并入记忆库、`packages/privacy` 整包删除，所以这里**不能再写 `@omb/privacy`**——
+ * 那会是一个指向已删除包的悬空引用。宿主只把它当不透明元数据（`register` 里原样携带，
+ * 不做替换/去重判定），因此改名不影响命令的注册与调用。
+ */
+export const PRIVACY_COMMAND_ID = 'omb-memory/privacy'
 
 export const PRIVACY_USAGE =
   '用法：/omb-privacy [status | normal | read-only | sealed | trust | forget <会话id> | clear]'

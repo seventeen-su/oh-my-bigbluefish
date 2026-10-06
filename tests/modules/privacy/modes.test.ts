@@ -19,7 +19,7 @@ import {
   UNATTRIBUTED_WRITE_DENIED,
   writeDeniedDetail,
   type ResolvedPrivacy,
-} from '../../../modules/privacy/modes.js'
+} from '../../../modules/memory/privacy/modes.js'
 
 function resolved(mode: ResolvedPrivacy['mode'], origin: ResolvedPrivacy['origin'] = 'command', inheritedFrom: string | null = null): ResolvedPrivacy {
   return { mode, origin, inheritedFrom, detail: 'test' }

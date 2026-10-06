@@ -16,8 +16,8 @@ import {
   PRIVACY_FILE_NAME,
   resolvePrivacyPath,
   STORAGE_HOST_SERVICE,
-} from '../../../modules/privacy/durable.js'
-import { emptyDoc } from '../../../modules/privacy/codec.js'
+} from '../../../modules/memory/privacy/durable.js'
+import { emptyDoc } from '../../../modules/memory/privacy/codec.js'
 import { capturingLogger, tempWorkspace } from '../memory/helpers.js'
 
 const NOW = 1_700_000_000_000

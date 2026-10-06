@@ -27,8 +27,15 @@
  *
  * 三方一致（历史契约）：① 本文件的 `id` ② `cordis.patch.yml` 的行 id ③ 插件页开关 id。
  *
- * 依赖是**树不是网**：除记忆的子能力依赖 `omb-memory` 外，其余模块只依赖内核，
- * 彼此经事件通信——这样任一模块关闭，其订阅者收到的是"事件不再来"，而不是"服务解析失败"。
+ * 依赖是**树不是网**：`omb-memory` 的子能力（向量、画像）与**制品索引**依赖它，
+ * 其余模块只依赖内核，彼此经事件通信——这样任一模块关闭，其订阅者收到的是
+ * "事件不再来"，而不是"服务解析失败"。
+ *
+ * ⚠️ 3.6 起 `omb-privacy` **不再是独立模块**：隐私闸门并入 `omb-memory`
+ * （能力名 `privacy.modes` 跟着搬进记忆库的条目，**名字不变**）。
+ * 因此 `omb-artifact` 的 `requires` 显式加上 `omb-memory`——它的制品读写闸门
+ * 就是 `SERVICES.privacy`，而那个服务现在由记忆库提供：**缺服务必须能被依赖图点名**，
+ * 而不是靠运行时降级才发现（`KernelHandle.moduleGraph()` 的 `missingDependencies`）。
  */
 import type { MemoryKind, MemoryScope } from './kinds.js'
 
@@ -42,7 +49,6 @@ export const MODULE_IDS = [
   'omb-context',
   'omb-artifact',
   'omb-notify',
-  'omb-privacy',
 ] as const
 
 export type ModuleId = (typeof MODULE_IDS)[number]
@@ -80,12 +86,18 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     requires: ['omb-kernel'],
     // 关联扩展（多跳）与多查询改写是**本模块的子能力**，各自提供工具而不是独立模块行：
     // 工具是"始终存在、按需调用"的东西，给它单独一行会让插件页多出两个没有独立资源的开关。
+    //
+    // `privacy.modes` 同理（3.6 从 `omb-privacy` 搬来，**名字一个字没改**）：
+    // 隐私闸门住在记忆库里，控制面是 `/omb-privacy` 一条用户命令（**不是**工具——
+    // 隐私是用户的决定，模型不能自己解除限制）。搬过来的只有归属，不是契约：
+    // 服务名仍是 `SERVICES.privacy`，所以制品索引与库访问边界零改动。
     capabilities: [
       'memory.write',
       'memory.recall',
       'memory.retain',
       'memory.recall.related',
       'memory.recall.multiquery',
+      'privacy.modes',
     ],
     tools: ['omb_recall', 'omb_forget', 'omb_relate', 'omb_remember'],
   },
@@ -110,7 +122,14 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     enabledByDefault: true,
     requires: ['omb-kernel'],
     capabilities: ['reasoning.methods', 'reasoning.depth', 'reasoning.loop-detect'],
-    tools: ['omb_method', 'omb_focus'],
+    // `omb_verify` 是**已经实现并注册**的第三个工具（`modules/reasoning/tools.ts:228`、
+    // `verify.ts`），此前目录里漏登记了它：而 `tests/modules/reasoning/module.test.ts`
+    // 的断言方向是"目录声明 ⊆ 实际注册"，**漏登记永远不会变红**——这正是
+    // "看起来权威、实际不驱动"的那类漂移。补登记后，`tests/dsh/assembly.smoke.test.ts`
+    // 的"目录声明的每个工具都必须真有 tools:<id> 服务"重新覆盖它。
+    // ⚠️ 反向断言（实际注册 ⊆ 目录声明）由 Lead 在两条流合并后统一补——
+    // 那才是这次漏登记的方向，别以为本行改完就永久免疫了。
+    tools: ['omb_method', 'omb_focus', 'omb_verify'],
   },
   {
     id: 'omb-context',
@@ -122,7 +141,12 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
   {
     id: 'omb-artifact',
     enabledByDefault: true,
-    requires: ['omb-kernel'],
+    // **显式依赖 omb-memory**（3.6）：制品索引的读/写都要过隐私闸门，而闸门
+    // （`SERVICES.privacy`）现在由记忆库提供。原先写成"只依赖内核"时，闸门缺席
+    // 只能靠运行时降级发现——而 design 的硬纪律是"依赖缺席必须点名"：
+    // 依赖图自检（`moduleGraph().missingDependencies`）要能说出
+    // `omb-artifact ← omb-memory`，而不是让制品索引静默地不带闸门工作。
+    requires: ['omb-kernel', 'omb-memory'],
     capabilities: ['artifact.index'],
     tools: ['omb_files'],
   },
@@ -131,15 +155,6 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     enabledByDefault: true,
     requires: ['omb-kernel'],
     capabilities: ['notify.external'],
-    tools: [],
-  },
-  {
-    id: 'omb-privacy',
-    enabledByDefault: true,
-    requires: ['omb-kernel'],
-    // 没有工具：控制面是一条斜杠命令（`/omb-privacy`），不是模型可调用的工具——
-    // 隐私模式是**用户**的决定，不该由模型自己改。
-    capabilities: ['privacy.modes'],
     tools: [],
   },
 ]
@@ -291,10 +306,18 @@ export const SERVICES = {
    * **隐私判定端口**（`PrivacyGatePort`，形状定义在 `modules/memory/store.ts`）。
    *
    * 为什么是服务而不是模块间 import：分层规则禁止模块互相 import，双方只认形状。
-   * 为什么必须存在这个服务：**库访问边界的唯一强制点**靠它——记忆模块在
-   * `forSession`/`peek`/`snapshot`/`forProject` 的出口惰性解析它，
-   * 因此直接调库（绕过工具层、绕过任何装饰）也一样被拒。
-   * 取不到 = 不受限（隐私模块被关掉时语义就是"没有隐私模式"）。
+   * 为什么必须存在这个服务：**两个数据边界的强制点**靠它——
+   * ① 记忆库在 `forSession`/`peek`/`snapshot`/`forProject` 的出口惰性解析它，
+   *    因此直接调库（绕过工具层、绕过任何装饰）也一样被拒；
+   * ② 制品索引（`modules/artifact/index.ts`）在同一层解析它，
+   *    所以"记忆读不到、但文件足迹照样列得出来"那半个隐私不存在。
+   *
+   * **谁提供**：3.6 起由 `omb-memory` 提供（隐私闸门并入记忆库；见
+   * `modules/memory/privacy/index.ts`）。服务名与形状都没变——只有归属换了地方。
+   *
+   * 取不到 = 不受限（那一行没装上时语义就是"没有隐私模式"）；
+   * 但"取不到"**必须留声**：制品索引会把它计成 `ungatedWrites` 并写进状态面
+   * （静默放行才是缺陷，见 `modules/artifact/module.ts` 的 `GateReadiness`）。
    */
   privacy: 'privacy',
   /**

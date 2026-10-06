@@ -1748,13 +1748,15 @@ export interface StoresServiceOptions {
   /** 注入时钟（内核 `kernel.clock`），传给每个库句柄。 */
   readonly clock: Clock
   /**
-   * **隐私判定端口**（由 `omb-privacy` 提供，服务名 `SERVICES.privacy`）。
+   * **隐私判定端口**（由**本模块自己的隐私闸门**提供，服务名 `SERVICES.privacy`）。
    *
-   * 为什么是**惰性函数**而不是一次取好的对象：宿主按行加载模块，
-   * `omb-privacy` 行可能在本行**之后**才挂载；一次取好会永久拿到 undefined，
-   * 表现为"隐私模式设了但库照样被写"。惰性解析让顺序无关。
+   * 为什么是**惰性函数**而不是一次取好的对象：宿主按行挂载模块，而服务表的内容
+   * 可能变（热插拔、隐私闸门被卸载）；一次取好会永久拿到 undefined，
+   * 表现为"隐私模式设了但库照样被写"。惰性解析让顺序无关
+   * （3.6 起提供者就是同一个模块：`modules/memory/privacy/index.ts` 的 `installPrivacy`，
+   * 在 `apply` 的同步前缀里完成 `provide`）。
    *
-   * 缺省（不注入）→ 一切不受限（模块被关掉 = 没有隐私模式，这是诚实的语义）。
+   * 缺省（不注入）→ 一切不受限（组件被关掉 = 没有隐私模式，这是诚实的语义）。
    *
    * ⚠️ **这是隐私的强制点**：判定发生在**库访问边界**（每个读写方法入口），
    * 不在工具层、不在服务装饰层——因此没有"装饰被重挂挤掉"的窗口，
@@ -1833,7 +1835,7 @@ const DEFAULT_MAX_OPEN_PROJECTS = MAX_OPEN_PROJECTS
 // 隐私强制点（唯一一处；见 `StoresServiceOptions.privacy`）
 // ────────────────────────────────────────────────────────────────────────────
 
-/** 一次库访问的判定结果（由 `omb-privacy` 给出）。 */
+/** 一次库访问的判定结果（由记忆库的隐私闸门 `./privacy/gate.ts` 给出）。 */
 export interface PrivacyDecisionPort {
   readonly allowRead: boolean
   readonly allowWrite: boolean
@@ -1844,14 +1846,17 @@ export interface PrivacyDecisionPort {
 /**
  * 隐私判定端口的结构契约。
  *
- * **定义在这里而不是 import `modules/privacy/`**：分层规则禁止模块之间互相 import
- * （`eslint.config.mjs` 的 `no-layer-violation`），双方只认形状——与
- * `SecondaryChannelRegistry<T>` 的处理方式一致。
+ * **定义在这里而不是 import `./privacy/`**：双方只认形状，所以"闸门实现"与
+ * "库访问边界"可以各自演化而不互相牵制（`modules/artifact/index.ts` 里另有一份
+ * 同形状的定义，它同样只认 `decide`/`decideUnattributed`/`restricted`）。
+ * 形状定义与实现分家还有一个直接好处：**测试可以注入一个最小替身**
+ * （见 `tests/modules/privacy/enforcement.test.ts` 的 fixture），
+ * 而不必把整个闸门与状态文件都搬进来。
  */
 export interface PrivacyGatePort {
   /** 按会话判定；拿不到会话 id 时调用方用 `decideUnattributed()`。 */
   decide(sessionId: string): PrivacyDecisionPort
-  /** 归属未知时的判定：**禁写不禁读**（见 `modules/privacy/modes.ts` 的说明）。 */
+  /** 归属未知时的判定：**禁写不禁读**（见 `./privacy/modes.ts` 的说明）。 */
   decideUnattributed(): PrivacyDecisionPort
 }
 

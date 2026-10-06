@@ -15,7 +15,7 @@ import {
   emptyDoc,
   encodeDoc,
   PRIVACY_DOC_VERSION,
-} from '../../../modules/privacy/codec.js'
+} from '../../../modules/memory/privacy/codec.js'
 
 const NOW = 1_700_000_000_000
 

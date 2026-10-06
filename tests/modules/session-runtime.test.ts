@@ -30,7 +30,7 @@ describe('内核接线：按会话运行态**只有一份**', () => {
     // 多个消费者（隐私、推理、记忆…）必须复用同一份：各建一份 = 同一个会话的状态
     // 被拆到不同的表里，那正是 `lastActiveSession` 那类缺陷的翻版。
     expect(handle.kernel.service(SERVICES.sessionRuntime)).toBe(table)
-    // 服务名与消费方（`omb-privacy`）用的字面量一致
+    // 服务名与消费方（记忆库的隐私闸门，`modules/memory/privacy/state.ts`）用的字面量一致
     expect(SERVICES.sessionRuntime).toBe('omb:session-runtime')
     handle.dispose()
   })

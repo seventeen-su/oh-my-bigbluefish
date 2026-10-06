@@ -131,7 +131,7 @@ export function formatFilesResult(
       if (rejected > 0) {
         return `制品索引为空——但原因**不是**"没有观察到制品"：自本模块启动以来有 ${rejected} 次写入被隐私闸门拒绝`
           + `（最近一次：${rejection?.lastReason ?? '（隐私端口未给出原因）'}）。`
-          + '索引因此停更；请检查 omb-privacy 的隐私模式（本索引只在获得写许可时才记录，'
+          + '索引因此停更；请检查记忆库的隐私闸门（`/omb-privacy` 的隐私模式；本索引只在获得写许可时才记录，'
           + '设过 sealed/read-only 的会话会连累全部会话的归属未知写入）。'
       }
       return '制品索引为空：本会话还没有观察到任何制品。'

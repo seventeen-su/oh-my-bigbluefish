@@ -122,7 +122,7 @@ function sessionCall(sessionId = 's1'): ToolCallContext {
 const kernelRow: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.5.0',
+    version: '3.6.0',
     requires: [],
     capabilities: [],
     configSchema: { parse: () => ({}) },
@@ -144,7 +144,7 @@ describe('omb-memory 清单', () => {
     expect(registration.manifest.requires).toEqual(['omb-kernel'])
     expect(entry?.tools).toEqual(expect.arrayContaining(['omb_recall', 'omb_forget']))
     expect(entry?.capabilities).toEqual(expect.arrayContaining(['memory.write', 'memory.recall']))
-    expect(registration.manifest.version).toBe('3.5.0')
+    expect(registration.manifest.version).toBe('3.6.0')
   })
 
   it('服务名契约为 stores（与 ABI 的 SERVICES 一致）', () => {
@@ -158,17 +158,24 @@ describe('omb-memory 配置', () => {
     expect(memoryConfigSchema.parse(undefined)).toEqual(MEMORY_CONFIG_DEFAULTS)
     expect(memoryConfigSchema.parse(null)).toEqual(MEMORY_CONFIG_DEFAULTS)
     expect(memoryConfigSchema.parse({})).toEqual(MEMORY_CONFIG_DEFAULTS)
-    expect(MEMORY_CONFIG_DEFAULTS).toEqual({ consolidationEveryTurns: 32, embeddingThreads: 2 })
+    // 3.6：隐私闸门并入记忆库，配置多了一个 `privacy` 子块（原 `omb-privacy` 行的 config 块）
+    expect(MEMORY_CONFIG_DEFAULTS).toEqual({
+      consolidationEveryTurns: 32,
+      embeddingThreads: 2,
+      privacy: { failClosedMode: 'sealed', path: null },
+    })
   })
 
   it('部分配置补齐其余缺省值（apply 永远收到完整配置）', () => {
     expect(memoryConfigSchema.parse({ consolidationEveryTurns: 8 })).toEqual({
       consolidationEveryTurns: 8,
       embeddingThreads: 2,
+      privacy: { failClosedMode: 'sealed', path: null },
     })
     expect(memoryConfigSchema.parse({ embeddingThreads: 4 })).toEqual({
       consolidationEveryTurns: 32,
       embeddingThreads: 4,
+      privacy: { failClosedMode: 'sealed', path: null },
     })
   })
 
@@ -176,6 +183,8 @@ describe('omb-memory 配置', () => {
     expect(() => memoryConfigSchema.parse({ consolidationEveryTurns: 0 })).toThrow()
     expect(() => memoryConfigSchema.parse({ consolidationEveryTurns: 1.5 })).toThrow()
     expect(() => memoryConfigSchema.parse({ embeddingThreads: 'many' })).toThrow()
+    // 隐私档位只允许两种受限档（`normal` 不是"基线档"，它是按会话设置的档位）
+    expect(() => memoryConfigSchema.parse({ privacy: { failClosedMode: 'normal' } })).toThrow()
   })
 
   it('readMemoryConfig：服务缺失时回落到缺省值，存在时读同一份配置', () => {
@@ -183,7 +192,11 @@ describe('omb-memory 配置', () => {
     expect(readMemoryConfig(kernel)).toEqual(MEMORY_CONFIG_DEFAULTS)
 
     services.set(SERVICES.stores, { config: { embeddingThreads: 4 } })
-    expect(readMemoryConfig(kernel)).toEqual({ consolidationEveryTurns: 32, embeddingThreads: 4 })
+    expect(readMemoryConfig(kernel)).toEqual({
+      consolidationEveryTurns: 32,
+      embeddingThreads: 4,
+      privacy: { failClosedMode: 'sealed', path: null },
+    })
   })
 })
 

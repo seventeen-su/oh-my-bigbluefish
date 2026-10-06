@@ -30,7 +30,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import type { Logger } from '../../kernel/abi/index.js'
+// 相对深度比独立模块时多一层：本文件现在住在 `modules/memory/privacy/`（3.6 并入记忆库）。
+import type { Logger } from '../../../kernel/abi/index.js'
 import type { PrivacyDecodeResult, PrivacyDoc } from './codec.js'
 import { decodeDoc, encodeDoc } from './codec.js'
 

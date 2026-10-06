@@ -59,13 +59,20 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     enDescription: 'Plugin body and required row: service bus, event bus, health, status surface, tool registration gateway.',
     kind: 'module',
   },
+  // 3.6：隐私模式并入记忆库，`omb-privacy` 那一行（连同它的组件包）已删除。
+  // 隐私的**用户可见面一个字没变**（还是 `/omb-privacy` 那条命令、还是那两种档位），
+  // 所以下面这行的说明必须写明"含隐私闸门"——否则用户会以为隐私功能没了。
+  //
+  // ⚠ 这段注释必须留在对象**外面**：`scripts/build.mjs` 用正则解析本文件
+  // （`readComponentDisplay`），它要求 `en:` 与 `zhDescription:` 紧邻，
+  // 注释插在两者之间会让整条记录解析不出来 → 构建报"行 … 没有对应组件"。
   {
     rowId: 'omb-memory',
     packageName: '@omb/memory',
     zh: '记忆库',
     en: 'Memory store',
-    zhDescription: '双库长期记忆（用户库跨项目、项目库随 cwd），含写入准入、逐字召回、关联多跳、遗忘。',
-    enDescription: 'Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, and forgetting.',
+    zhDescription: '双库长期记忆（用户库跨项目、项目库随 cwd），含写入准入、逐字召回、关联多跳、遗忘；并含隐私闸门（/omb-privacy：read-only / sealed，按会话生效、子代理继承）。',
+    enDescription: 'Dual-store long-term memory with admission control, verbatim recall, multi-hop relations, forgetting, and the privacy gate (/omb-privacy: read-only / sealed per session, inherited by subagents).',
     kind: 'module',
   },
   {
@@ -120,15 +127,6 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     en: 'Desktop notifications',
     zhDescription: '把少数值得打扰的事件推到宿主桌面通知，带节流与去重。宿主没装通知服务时全静默。',
     enDescription: 'Pushes a few noteworthy events to the host desktop notification service, throttled and deduplicated.',
-    kind: 'module',
-  },
-  {
-    rowId: 'omb-privacy',
-    packageName: '@omb/privacy',
-    zh: '隐私模式',
-    en: 'Privacy modes',
-    zhDescription: '一条斜杠命令控制记忆的读/写：read-only 可读不可写、sealed 不可读不可写。按会话生效、子代理继承、重启不丢，读不到状态时按最严兜底。',
-    enDescription: 'One slash command controls memory reads and writes per session (read-only / sealed), inherited by subagents, persisted across restarts, and fail-closed when the state cannot be read.',
     kind: 'module',
   },
 ]

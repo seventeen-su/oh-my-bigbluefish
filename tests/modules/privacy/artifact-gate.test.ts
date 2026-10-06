@@ -13,16 +13,31 @@
  * ⑤ `omb_files` 工具（把拒绝变成模型可读的 error 结果）
  */
 import { describe, expect, it } from 'vitest'
+import { join } from 'node:path'
 import { ARTIFACT_SERVICE, createArtifactModule, type ArtifactService } from '../../../modules/artifact/module.js'
 import { ArtifactIndex, ARTIFACT_UNATTRIBUTED_READ_DENIED } from '../../../modules/artifact/index.js'
 import { createFilesTool, FILES_TOOL_NAME } from '../../../modules/artifact/tools.js'
-import { PrivacyGate } from '../../../modules/privacy/gate.js'
-import { PrivacyState } from '../../../modules/privacy/state.js'
+import { PrivacyGate } from '../../../modules/memory/privacy/gate.js'
+import { PrivacyState } from '../../../modules/memory/privacy/state.js'
+import { MEMORY_CONFIG_DEFAULTS, createMemoryRegistration } from '../../../modules/memory/index.js'
 import { SessionRuntimeTable, toolCallContext } from '../../../kernel/sessionRuntime.js'
 import { createKernel } from '../../../kernel/index.js'
 import type { ModuleRegistration } from '../../../kernel/abi/index.js'
 import { toHostPlugin } from '../../../kernel/hostEntry.js'
-import { capturingLogger, fixedClock, tempWorkspace } from '../memory/helpers.js'
+import { capturingLogger, fixedClock, tempWorkspace, testPort } from '../memory/helpers.js'
+
+/** `omb-memory` 依赖 `omb-kernel`：装配集合里必须有内核那一行（测试替身）。 */
+const kernelRow: ModuleRegistration<unknown> = {
+  manifest: {
+    id: 'omb-kernel',
+    version: '3.6.0',
+    requires: [],
+    capabilities: [],
+    configSchema: { parse: () => ({}) },
+    health: () => ({ state: 'ok', detail: '测试替身' }),
+  },
+  apply: () => {},
+}
 
 interface Fixture {
   readonly index: ArtifactIndex
@@ -175,43 +190,72 @@ describe('omb_files 工具：拒绝变成模型可读的 error 结果', () => {
   })
 })
 
-describe('装配路径：模块把 privacy 注入进去（不是测试里手搭的）', () => {
-  it('真内核 + 真 ArtifactService：sealed 后经服务读被拒', () => {
+/**
+ * **并入验收**（Lead 明确要求的反向断言）：
+ *
+ * `omb-privacy` 那一行删掉之后，制品写入**仍然受闸门约束**——
+ * 闸门由记忆库提供（服务名 `SERVICES.privacy` 没变），档位由**真命令** `/omb-privacy` 改，
+ * `forget` 这个逃生口也照旧。这条测的就是"并入没有把闸门弄丢"。
+ */
+describe('并入验收：删掉 omb-privacy 行之后，制品写入仍受闸门约束', () => {
+  it('记忆库提供闸门 + 真 /omb-privacy 命令：sealed 后制品的写与读都被拒，forget 后恢复', async () => {
     const ws = tempWorkspace('omb-privacy-artifact-')
+    const privacyPath = join(ws.dir, 'session-modes.json')
     try {
       const handle = createKernel({ logger: capturingLogger() })
-      // 隐私侧：直接放一个判定端口到服务表（与 omb-privacy 的行为同构）
-      const clock = fixedClock()
-      const sessions = new SessionRuntimeTable(clock)
-      const state = new PrivacyState({
-        sessions,
-        clock,
-        baseline: () => ({ mode: 'normal', origin: 'default', detail: '未配置' }),
+      // 宿主 commands 服务（生产由宿主提供；这里只要能记录注册项并供测试调用）
+      const definitions: {
+        readonly name: string
+        readonly input?: { readonly hint: string }
+        readonly handler: (invocation: unknown) => { kind: string; text: string } | Promise<{ kind: string; text: string }>
+      }[] = []
+      handle.kernel.provide('commands', {
+        register: (definition: unknown) => {
+          definitions.push(definition as (typeof definitions)[number])
+          return () => {}
+        },
       })
-      handle.kernel.provide('privacy', new PrivacyGate({
-        state,
-        baselineRestricted: () => false,
-        isActive: sessionId => state.isActive(sessionId),
-        hasRestrictedActiveSession: () => state.hasRestrictedActiveSession(),
-      }))
 
-      const module = createArtifactModule()
-      const applied = module.apply(handle.kernel, { maxEntries: 500 })
-      if (typeof applied !== 'function') throw new Error('artifact apply 未返回 disposer')
+      const memory = createMemoryRegistration({ storageHost: testPort(ws.dir) })
+      const artifact = createArtifactModule()
+      const blocked = handle.start(
+        [kernelRow, memory, artifact as ModuleRegistration<unknown>],
+        new Map([
+          ['omb-memory', { ...MEMORY_CONFIG_DEFAULTS, privacy: { failClosedMode: 'sealed', path: privacyPath } }],
+        ]),
+      )
+      expect(blocked, '装配被依赖规划阻断').toEqual([])
+
+      // ① 闸门就位——由**记忆库**提供，不是测试手搭的
+      expect(handle.kernel.service('privacy'), '记忆库没有提供 privacy 服务 → 制品没有闸门').toBeDefined()
       const service = handle.kernel.service<ArtifactService>(ARTIFACT_SERVICE)
       expect(service).toBeDefined()
-
       service?.record('src/plan.md', undefined, 's1')
       expect(service?.topFor('plan', 3, 's1')).toHaveLength(1)
 
-      state.setOverride('s1', 'sealed')
+      // ② 命令仍在（名字没变；注册从记忆库的 apply 走），forget / clear 也在 hint 里
+      const command = definitions.find(item => item.name === 'omb-privacy')
+      expect(command, '命令没注册——并入之后用户就没有改档位的入口了').toBeDefined()
+      expect(command?.input?.hint).toContain('forget')
+      expect(command?.input?.hint).toContain('clear')
+
+      // ③ 真命令改档位 → 制品的写与读立刻被拒（闸门没丢）
+      const sealed = await command?.handler({ rawInput: 'sealed', agent: { id: 's1' } })
+      expect(sealed?.kind).toBe('success')
+      expect(() => service?.record('src/new.md', undefined, 's1')).toThrow(/sealed/)
       expect(() => service?.topFor('plan', 3, 's1')).toThrow(/sealed/)
       expect(() => service?.list('s1')).toThrow(/sealed/)
 
+      // ④ 逃生口仍在：forget 之后该会话回到基线，写入恢复
+      const forgotten = await command?.handler({ rawInput: 'forget s1', agent: { id: 's1' } })
+      expect(forgotten?.kind).toBe('success')
+      expect(service?.record('src/new.md', undefined, 's1')).toBeDefined()
+
       // 卸载后不留服务（H-1）
-      expect(() => applied()).not.toThrow()
+      expect(() => handle.dispose()).not.toThrow()
       expect(handle.kernel.service(ARTIFACT_SERVICE)).toBeUndefined()
-      expect(toHostPlugin(module as ModuleRegistration<unknown>).manifest.id).toBe('omb-artifact')
+      expect(handle.kernel.service('privacy')).toBeUndefined()
+      expect(toHostPlugin(artifact as ModuleRegistration<unknown>).manifest.id).toBe('omb-artifact')
     } finally {
       ws.cleanup()
     }
