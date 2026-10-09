@@ -102,7 +102,23 @@
             config:
               prefix: >-
                 你是运行在「大肥鱼模式」（OMB v3 认知增强）下的智能体，基于 {{model}} 模型。
-              suffix: 你的工作目录是 {{cwd}}。
+              # **不要再加 `suffix: 你的工作目录是 {{cwd}}。`**
+              #
+              # 那句在 DSH 0.2.1-a2 上会让**整轮运行失败**：
+              #   unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix";
+              #   registered variables: provider, model
+              #
+              # 两个独立原因，任何一个都足以否掉它：
+              #   ① **`cwd` 从来不是内置变量**。DSH 核心只注册 `provider` / `model`
+              #      （`packages/core/agent-loop/src/index.ts:389-390`）；`cwd` 必须由某个插件
+              #      显式 `ctx.systemPrompt.variable('cwd', …)` 注册，而没有任何内置包这么做
+              #      （`packages/core/system-prompt/tests/system-prompt.spec.ts:205-213` 就是
+              #      拿 `{{cwd}}` 当"未注册变量"的反例来测的）。插值是**严格**的：遇到未注册
+              #      变量直接抛，不是原样保留。
+              #   ② **它本来就是多余的**。DSH 已经用一条独立通道把工作目录交给模型：
+              #      `@deepseek-ai/dsh-working-directory`（`packages/bundle/base/cordis.patch.yml:161`）
+              #      贡献上下文段 `working-directory:current`，且 `interpolate: false`。
+              #      在这里再写一遍，等于同一个事实说两遍——而第二遍还带着一个会炸的变量。
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
