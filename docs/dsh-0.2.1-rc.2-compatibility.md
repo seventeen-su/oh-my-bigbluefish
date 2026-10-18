@@ -780,3 +780,37 @@ preset-omb：id=omb name=大肥鱼模式 order=10 plugins=22
 2. 工具面出现 `schedule_*`（`tool-schedule` 生效）与 `plugin_market_*`（`tool-plugin-market` 生效）。
 3. runtime context 出现当前时间段（`time-context` 生效）。
 4. 预设卡片仍显示"大肥鱼模式"、`{{model}}` 渲染为具体模型名（persona 段生效）。
+
+### 12.6 重启后实测验收（2026-10-18，已通过）
+
+用户重启 `dsh web` 后，`omb_status` 的原始关键行：
+
+```text
+## 构建
+- 代数：第 83 代（产物目录 lib-gen/g83）
+- 磁盘代数：第 83 代（与加载代数一致）          ← 重启前是"加载 82 / 磁盘 83"
+
+## 模块
+- omb-memory-vector：正常——向量通道：神经嵌入 bge-small-zh-v1.5-512（512 维，revision 1）
+...
+合计：7 个模块，0 降级，0 失败。              ← 7 个"自报模块"；内核不算模块，见下
+（模块依赖图）已按依赖顺序挂载 8 个模块；顺序自检通过（行序 = cordis.patch.yml）
+（组件自述 · omb-memory-vector）权重目录：C:\Users\SuSeventeen\.dsh\profiles\web\node_modules\@omb\plugin\models\bge-small-zh-v1.5
+（组件自述 · omb-notify）已接上宿主 desktopNotify（通道 notify（对外 API 1.1.0-led.1 …））
+```
+
+- **向量模型来自副本**：权重目录是 `…\@omb\plugin\models\bge-small-zh-v1.5`（不再是 `D:\Program\…`），
+  `id = bge-small-zh-v1.5-512`，装载期降级原因：无。
+- **8 个模块挂载、0 降级 0 失败**（`omb_status` 的模块段列 7 个自报模块，内核不参与自报，依赖图另有"挂载 8 个模块"）。
+- **`tool-schedule` 生效**：重启后的工具目录新增 `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`。
+- **`time-context` 生效**：本回合的系统提示出现 `Time sampled while preparing turn 2, step 1: 2026-10-18T13:13:40+08:00`。
+- **`tool-plugin-market` 的行为属协议预期**：该包的 tools 只在 `pluginMarket` 服务挂载时才注册
+  （`packages/boot/plugin-market/src/tools.ts:66-68` 原文："The service comes from the optional custom plugin
+  markets bundle, so a preset can keep this row without the tool appearing or the row waiting"）。
+  本 profile 的 `dshmarket` 是第三方 UI 市场，不提供该服务 → 行保留、工具不出现、行不 pending。
+  这与 DSH 自带创造模式完全同构，不是遗漏。
+- **副本 → 云端同步**：`origin/main` = `327b0dd`；副本 `fetch origin` 后 `reset --hard origin/main`
+  （因为上一提交被 amend 改写了历史，不是 fast-forward），`status` 干净；38 项安装验收全绿。
+- 重启前锁住的 `__DELETE-AFTER-DSH-RESTART__plugin-old-3.6.0` 已删除，`@omb` 下现在只有
+  9 个安装目录 + `README-CLONE.md` + `relink-components.mjs`。
+- 待人工一步：把 `dsh-path-guard` 的 `selfProtection` 开回来（改 `profile/package.json` 时临时关闭的）。
