@@ -58,7 +58,7 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.1（当前，4.1.0 / g89）** = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
+- **v4.1（当前，4.1.0 / g90）** = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
   自主捕获 = `tool/call` → `tool/result` 生命周期；`omb_project` = L0–L5 分层时空快照（≤2,400 字符，隐私先于读取）。
   契约：`docs/v4.1-spacetime.md`；审查回应：`docs/research/2026-10-18-v4-review-response.md`。
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。

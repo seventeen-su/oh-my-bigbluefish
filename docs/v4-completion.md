@@ -69,13 +69,13 @@
 | 项 | 结果 |
 | --- | --- |
 | 版本 | **4.1.0**（根包 + 7 个组件 + 模块清单） |
-| 基线 → 提交 | `18ec311`（v4.0.0 / g88）→ **`7842ab1`**（`feat: v4.1 时空坐标与并发编辑守卫`） |
-| 构建 | 目标 **g89**；`build-generation.json` 当前：`generation: 89`、`outDir: lib-gen/g89`、`builtAt: 2026-10-18T14:54:46Z` |
+| 基线 → 提交 | `18ec311`（v4.0.0 / g88）→ **`7842ab1`**（功能：`feat: v4.1 时空坐标与并发编辑守卫`）→ **`e6fbbbb`**（文档与 C1 清理）→ 发布提交（g90 构建记录，见 `git log` 最新） |
+| 构建 | 目标 **g90**；`build-generation.json` 当前：`generation: 90`、`outDir: lib-gen/g90`、`builtAt: 2026-10-18T14:59:49Z` |
 | 改动规模 | **32 files changed, +3,356 / −459**（提交 `7842ab1`；本文档的改动另计、由 Lead 统一提交） |
 | 契约 | `docs/v4.1-spacetime.md`（208 行，L0–L5 / 服务 / 判定表 / 捕获生命周期） |
 | 审查回应 | `docs/research/2026-10-18-v4-review-response.md`（逐条判定 + 证据命令） |
-| 门禁 | `npx tsc --noEmit` **0**；`npx eslint .` **0**；`npx vitest run` **107 files / 1330 passed | 1 skipped**；`node scripts/build.mjs` 成功（g89）；`node scripts/check-resolution.mjs` **7/7** |
-| 真机验收 | **待重启 `dsh web` 后核对**（本进程仍加载 g88/4.0.0；部署副本已是 4.1.0/g89，8 个入口 import 通过）。重启后核对：`omb_status` 报构建 89/89、模块版本 4.1.0；`omb_project` 返回 L0–L5；"读文件→外部改动→edit" 被 deny |
+| 门禁 | `npx tsc --noEmit` **0**；`npx eslint .` **0**；`npx vitest run` **107 files / 1330 passed | 1 skipped**；`node scripts/build.mjs` 成功（g90）；`node scripts/check-resolution.mjs` **7/7** |
+| 真机验收 | **待重启 `dsh web` 后核对**（本进程仍加载 g88/4.0.0；部署副本已是 4.1.0/g90，8 个入口 import 通过）。重启后核对：`omb_status` 报构建 90/90、模块版本 4.1.0；`omb_project` 返回 L0–L5；"读文件→外部改动→edit" 被 deny |
 
 > 数字纪律：测试通过数、门禁耗时、真机 `omb_status` 读数一律由 Lead 实测后填；本段不写未测出的数。
 
@@ -90,7 +90,7 @@
 | 包壳 | `packages/*/package.json`（版本 4.1.0 + 代数指向） |
 | 测试 | `tests/dsh/{state-machine,project-profile,project-root}.test.ts`、`tests/modules/memory/{capture,project-root,project-tool,registration}.test.ts`（合计 1,331 行变更，含新增文件）；全量 **107 files / 1330 passed | 1 skipped** |
 | 文档 | `docs/v4.1-spacetime.md`（新）、`docs/research/2026-10-18-v4-review-response.md`（新）、`docs/v4-architecture.md`（§8）、`docs/v4-decision.md`（§9）、`docs/v4-completion.md`（本节）、`README.md`、`AGENTS.md` |
-| 构建记账 | `build-generation.json`（g88 → g89） |
+| 构建记账 | `build-generation.json`（g88 → g90） |
 
 ## 结构变化（v4.1 相对 v4.0）
 
