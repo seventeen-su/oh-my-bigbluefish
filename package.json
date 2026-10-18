@@ -7,7 +7,7 @@
   },
   "type": "module",
   "icon": "./icon.svg",
-  "description": "OMB v4 通用认知增强插件：思维链改进、拓展记忆库、项目画像等多个优化组件。",
+  "description": "OMB v4 通用认知增强：记忆自主化、项目画像、过程技能与工作区状态对账。",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

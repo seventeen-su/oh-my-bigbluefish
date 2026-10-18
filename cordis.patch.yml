@@ -1,4 +1,4 @@
-# OMB v3 挂载补丁 —— profile 根层，一行一个开关。
+# OMB v4 挂载补丁 —— profile 根层，一行一个开关。
 #
 # 为什么全部行都在 profile 根层（不可放进预设声明内）：
 #   plugin-manager 的 listPlugins() 要求 entry.id === 'include' 才可寻址
@@ -62,12 +62,10 @@
         # 能力轴默认关闭，且**永不落盘**：错误成本不对称（高估用户会产生自信的错误帮助）
         inferCapabilityAxis: false
 
-    # ── 思维链质量层 ─────────────────────────────────────────────
+    # ── 过程/循环层（v4：方法卡在 skills/，这里只剩常驻入口与循环检测）──
     - id: omb-reasoning
       name: '@omb/reasoning'
       inject: ['omb:kernel']
-      config:
-        defaultDepth: standard
 
     # ── 制品索引 / 通知桥 ────────────────────────────────────────
     - id: omb-artifact
@@ -85,7 +83,7 @@
       config:
         id: omb
         name: 大肥鱼模式
-        description: 包含创造模式的所有能力，并使用OMB v3 通用认知增强。
+        description: 包含创造模式的所有能力，并使用 OMB v4 通用认知增强。
         order: 10
         plugins:
           - id: persona
