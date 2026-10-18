@@ -55,5 +55,59 @@
 ## 已知未闭合（不阻塞本目标）
 
 1. `pnpm-lock.yaml` 仍列已删除的 `@omb/context`；下次 `pnpm install` 刷新。
-2. 状态机 edit 守卫按 R10 偏差：无读取戳的 edit 只计数不拦；write 只警告；目标只消费 goal/todo。
+2. ~~状态机 edit 守卫按 R10 偏差：无读取戳的 edit 只计数不拦；write 只警告；目标只消费 goal/todo。~~
+   → **v4.1 已修**：edit+write 统一按资源级内容哈希判定；无读取戳仍放行但显式计 `blindWrites`；
+   目标来源仍是 goal/todo（契约 §8 明确不做 LLM 目标推断）。
 3. `dsh-path-guard` 的 `selfProtection` 仍为 `false`（用户设置，未改）。
+
+---
+
+# OMB v4.1 交付记录（2026-10-18 晚）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.1.0**（根包 + 7 个组件 + 模块清单） |
+| 基线 → 提交 | `18ec311`（v4.0.0 / g88）→ **`7842ab1`**（`feat: v4.1 时空坐标与并发编辑守卫`） |
+| 构建 | 目标 **g89**；`build-generation.json` 当前：`generation: 89`、`outDir: lib-gen/g89`、`builtAt: 2026-10-18T14:54:46Z` |
+| 改动规模 | **32 files changed, +3,356 / −459**（提交 `7842ab1`；本文档的改动另计、由 Lead 统一提交） |
+| 契约 | `docs/v4.1-spacetime.md`（208 行，L0–L5 / 服务 / 判定表 / 捕获生命周期） |
+| 审查回应 | `docs/research/2026-10-18-v4-review-response.md`（逐条判定 + 证据命令） |
+| 门禁 | `npx tsc --noEmit` **0**；`npx eslint .` **0**；`npx vitest run` **107 files / 1330 passed | 1 skipped**；`node scripts/build.mjs` 成功（g89）；`node scripts/check-resolution.mjs` **7/7** |
+| 真机验收 | **待重启 `dsh web` 后核对**（本进程仍加载 g88/4.0.0；部署副本已是 4.1.0/g89，8 个入口 import 通过）。重启后核对：`omb_status` 报构建 89/89、模块版本 4.1.0；`omb_project` 返回 L0–L5；"读文件→外部改动→edit" 被 deny |
+
+> 数字纪律：测试通过数、门禁耗时、真机 `omb_status` 读数一律由 Lead 实测后填；本段不写未测出的数。
+
+## 改动文件清单（按层）
+
+| 层 | 文件 |
+| --- | --- |
+| 宿主适配（新增） | `dsh/project-root.ts`（项目根解析，176 行） |
+| 宿主适配（改） | `dsh/plugin.ts`（27 行变更，接线 projectRoot / situation / privacyAllowsRead / wireEditGuard）、`dsh/state-machine.ts`（476 行变更，内容哈希守卫/situation/writeIntent 回合清空）、`dsh/project-profile.ts`（596 行变更，git root 构建 + 结构化字段）、`dsh/status-tool.ts`（80 行变更，状态/守卫/六层读数） |
+| 模块 | `modules/memory/{capture,project,store,index}.ts`（捕获生命周期 / 六层快照 / projectRootOf / situation+隐私接线）；`modules/{artifact,notify,profile,reasoning}/*` 与 `modules/memory/vector.ts` 仅版本号或一行对齐 |
+| 内核/ABI | `kernel/abi/catalog.ts`（13 行变更：`projectRoot` 服务、能力说明） |
+| 包壳 | `packages/*/package.json`（版本 4.1.0 + 代数指向） |
+| 测试 | `tests/dsh/{state-machine,project-profile,project-root}.test.ts`、`tests/modules/memory/{capture,project-root,project-tool,registration}.test.ts`（合计 1,331 行变更，含新增文件）；全量 **107 files / 1330 passed | 1 skipped** |
+| 文档 | `docs/v4.1-spacetime.md`（新）、`docs/research/2026-10-18-v4-review-response.md`（新）、`docs/v4-architecture.md`（§8）、`docs/v4-decision.md`（§9）、`docs/v4-completion.md`（本节）、`README.md`、`AGENTS.md` |
+| 构建记账 | `build-generation.json`（g88 → g89） |
+
+## 结构变化（v4.1 相对 v4.0）
+
+- **项目身份**：新增 `SERVICES.projectRoot`（`omb:project-root`），记忆库与画像统一按 **git root**；
+  子目录会话不再另起项目库。
+- **写守卫**：全局 epoch 判定 → **资源级内容哈希**（sha256 前 16，≤2MB）；edit+write 统一；
+  同路径同回合第 3 次放行（逃生门）；`post-execute` 成功刷新自身印记；`writeIntent` 按回合清空。
+- **自主捕获**：`tool/call` 只挂 pending，`tool/result` 才决定写什么；失败写 `未生效：…`，未知不写；
+  `turn/end` 未解决计 `unconfirmed`；无 callId 的旧路径显式计数。
+- **`omb_project`**：从"单段画像 + top3 记忆"改为 **L0–L5 分层时空快照（≤2,400 字符）**，
+  隐私先于读取、无会话归属只给画像、缺项写"未接线/无会话归属/状态未知"。
+- **状态面**：新增 `situation()`（L2/L3 结构化事实）与守卫计数（blind/stale/deny/gaveUp/unverifiable）。
+
+## 已知未闭合（v4.1 结束时）
+
+1. `pnpm-lock.yaml` 仍列 `@omb/context`（1 处；下次 `pnpm install` 刷新）。
+2. 缺读取戳时仍放行（计 `blindWrites`）——是否升级为硬拦需先量 shell 读占比。
+3. shell 写文件、子代理写集、`AGENTS.md` 指纹、符号级 repo-map：契约 §8 明确不做/留 v4.2。
+4. `dsh-path-guard` 的 `selfProtection` 仍为 `false`（用户设置）。
+5. **已修（v4.1 收尾）**：`situation().sideEffects.writeWarnings` 无递增点、状态面恒显 0——已从 `situation` 删除该字段，状态面回退行不再显示恒 0 的 write 警告；`SessionStateSnapshot.guard.writeWarnings` 仅作旧快照兼容保留（见审查回应 §3.1 C1）。

@@ -438,7 +438,7 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     lines.push(
       side === undefined
         ? `- 目标/待办：${state.openGoals} / ${state.openTodos}`
-          + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次、write 警告 ${guard.writeWarnings} 次`
+          + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次（旧版状态机：盲写/无法核验计数不可用）`
         : `- 目标/待办：${state.openGoals} / ${state.openTodos}`
           + `；守卫 拒写 ${side.denies} 次、放弃 ${side.gaveUps} 次、盲写 ${side.blindWrites} 次、无法核验 ${side.unverifiable} 次`,
     )

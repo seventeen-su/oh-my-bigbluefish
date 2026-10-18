@@ -184,7 +184,6 @@ export interface SessionSituation {
     readonly staleWrites: number
     readonly denies: number
     readonly gaveUps: number
-    readonly writeWarnings: number
     readonly unverifiable: number
   }
 }
@@ -1529,7 +1528,6 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
             staleWrites: record.staleWrites,
             denies: record.denies,
             gaveUps: record.gaveUps,
-            writeWarnings: record.writeWarnings,
             unverifiable: record.unverifiable,
           },
         }

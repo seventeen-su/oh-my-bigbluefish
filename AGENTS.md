@@ -1,13 +1,13 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v3/v4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
 | 层 | 目录 | 允许做什么 |
 | --- | --- | --- |
 | 内核/ABI | `kernel/` | 服务总线、事件总线、健康面、catalog、display；**零业务逻辑** |
-| 宿主适配 | `dsh/` | **唯一**接触宿主 Context/服务/文件系统/子进程的层 |
+| 宿主适配 | `dsh/` | **唯一**接触宿主 Context/服务/文件系统/子进程的层；v4.1 新增 `dsh/project-root.ts`（项目身份 = git root，供记忆库/画像/`omb_project` 共用） |
 | 模块 | `modules/` | 纯逻辑 + `kernel` 端口；**禁止 import `@deepseek-ai/*`**（ESLint 强制） |
 | 包壳 | `packages/` | 薄 re-export + `default` 宿主插件入口 |
 | 预设/补丁 | `cordis.patch.yml` | 行、组、`!!js` 表达式；改它先读 `cordis-composition-reference` |
@@ -26,6 +26,12 @@
 6. **token/注意力预算**：工具 schema 与常驻提示都是每请求成本；新能力优先做参数/按需文件，不新增常驻散文。
 7. **缓存前缀**：`systemPrompt.context()` 在 DSH 是**尾部 user/message 快照**，不是系统提示段；真正要逐字节稳定的是跨会话项目前缀（`AGENTS.md`/skills 目录/常驻句）。
 8. **构建产物最后生成一次**：`lib-gen` 换代必须全量一致；混代会产生两个内核实例。
+9. **项目身份 = git root**：记忆库、项目画像、`omb_project` 一律先 `SERVICES.projectRoot` 再按根取库；
+   子目录会话**不得**另起项目库；非 git 目录退化为 cwd。解析在 `dsh/`（模块不跑子进程），失败绝不抛。
+10. **守卫 = 资源级内容哈希 + 显式未知**：写守卫按**该文件内容哈希**（读取时固化 `sha256` 前 16，≤2MB）
+    判定，不用全局 epoch；`edit` 与 `write` 同一判定表；缺印记/超限/读失败一律放行但必须计
+    `blindWrites`/`unverifiable`，**不得静默**；fail-open 是设计（守卫不是权限边界），但异常必须留声。
+    逃生门：同路径同回合第 3 次放行并计 `gaveUps`（防死锁，参见 Claude Code issue #33856）。
 
 ## 3. 命令
 
@@ -52,6 +58,10 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-v4 = **记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零**。
-依据：`docs/v4-decision.md` 与 `docs/research/2026-10-18-*.md`（10 份，含产品/结构审计）。
-不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
+- **v4.1（当前，4.1.0 / g89）** = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
+  自主捕获 = `tool/call` → `tool/result` 生命周期；`omb_project` = L0–L5 分层时空快照（≤2,400 字符，隐私先于读取）。
+  契约：`docs/v4.1-spacetime.md`；审查回应：`docs/research/2026-10-18-v4-review-response.md`。
+- v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。
+- 依据：`docs/v4-decision.md`（含 §9 v4.1 决策）与 `docs/research/2026-10-18-*.md`（14 份，含产品/结构审计与状态机设计）。
+- 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
+- v4.1 明确不做（不要在文档里假装已做）：符号级 repo-map、三方合并、shell 写追踪、子代理写集、`AGENTS.md` 指纹。

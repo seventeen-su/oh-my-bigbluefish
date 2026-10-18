@@ -92,3 +92,20 @@
 ## 8. 不做（有证据）
 
 - 不做内在自验证/自省式质量判断；不做写入时 LLM 抽取；不做 GraphRAG/社区摘要/三级记忆；不做 repo-map 工具（本轮）；不逐回合注入压力/摘要；不替换宿主压缩/pruner/session-search；不把新会话未缓存 token 当主成本；不为「项目理解」新增大 schema 工具；不恢复 `admission` 服务面。
+
+---
+
+## 9. v4.1 决策（2026-10-18 晚，提交 `7842ab1`，版本 4.1.0 / g89）
+
+> 依据：`docs/v4.1-spacetime.md`、`docs/research/2026-10-18-v4-review-response.md`。
+> v4.0 的组件各自正确，但**各自回答半句话**；v4.1 不新增工具，只让它们共享同一套时空坐标。
+
+| # | 决策 | 为什么（证据） | 验收 | 明确不做 |
+| --- | --- | --- | --- | --- |
+| D1 | **写守卫改为资源级内容哈希**：读取时固化 `sha256` 前 16（≤2MB），`edit`+`write` 统一比较当前内容哈希；读后被改 → deny（≤120 事实句）；同路径同回合第 3 次放行计 `gaveUps`；`post-execute` 成功刷新自身印记；`writeIntent` 按 `turn/start` 清空 | v4.0 用**全局 epoch** 判定：无关文件变化会误伤、脏集不覆盖时漏判（`18ec311:dsh/state-machine.ts:38,350`）；`writeIntent` 从不清空导致外部改动被永久归因为己方 | 判定表逐行单测（`tests/dsh/state-machine.test.ts`）；真机"读后被外部改 → deny" | 缺读取戳不硬拦（shell 读不可见 + 防 #33856 死锁），只计 `blindWrites`/`unverifiable`；fail-open 保留但必须留声 |
+| D2 | **自主捕获改为 pending → result 生命周期**：`tool/call` 只挂 pending；`tool/result` 决定写什么——成功写旧文本、失败写 `未生效：…`、未知不写；`turn/end` 未解决计 `unconfirmed`；无 `callId` 退回旧行为并显式计数 | v4.0 在 `tool/call` 时写"编辑文件：x"，**尝试过被记成完成过**（`18ec311:modules/memory/capture.ts:565`） | `tests/modules/memory/capture.test.ts`；`omb_status` 记忆段新增 failed/unconfirmed/unknownResult/noPending/unconfirmedCall | 不追回已写入的错误事实（逐字保真，supersede 修正）；无 callId 的降级保留并计数 |
+| D3 | **项目身份 = git root**：新增 `SERVICES.projectRoot`（`dsh/project-root.ts`，同步 2.5s/缓存 60s·128/失败退化 cwd/绝不抛）；`stores.projectRootOf` 统一 `ensureProject/forProject/peek`；画像在根构建、`cwdRel` 保留"我在哪" | v4.0 按 cwd 开项目库，子目录会话另起一库，项目记忆被切成两半（`18ec311:modules/memory/store.ts:2031,2672,2847`） | `tests/dsh/project-root.test.ts`、`tests/modules/memory/project-root.test.ts`；子目录会话与根会话共享项目库 | 非 git 目录退化为 cwd（契约如此）；不做跨仓合并 |
+| D4 | **隐私先于读取**：`omb_project` 在任何读取前调 `privacyAllowsRead`；`sealed` 拒绝画像与记忆并说明原因；隐私服务缺席=可读，判定抛错=不可读（fail-closed） | v4.0 的 `omb_project` 无隐私判断，画像不经过库边界，sealed 会话仍可读（`18ec311:modules/memory/project.ts` 无 privacy 匹配） | `tests/modules/memory/project-tool.test.ts`（sealed 全拒/read-only 允许/无归属只画像/服务缺席可读） | 不做字段级脱敏；其它读路径仍以库边界 `gateSet` 为准 |
+| D5 | **`omb_project` 改为分层时空快照 L0–L5**（身份/结构/空间状态/时间/知识/意图），总长 ≤2,400 字符；新增 `sessionState.situation()` 供 L2/L3/L5 与状态面共用；缺项写"未接线/无会话归属/状态未知"，不写 0 | 四个组件缺同一套坐标；用户要"一次调用知道我在哪、什么变了、以前记过什么" | `tests/modules/memory/project-tool.test.ts`（六层顺序/缺服务降级/字符上限）；真机 `omb_project` 返回六层 | 符号级 repo-map、三方合并、shell 写追踪、子代理写集、`AGENTS.md` 指纹 → v4.2/不做（契约 §8） |
+
+**与 §3 的关系**：§3 的 L0–L3 分层不变；v4.1 是 L1 项目层与 L2 记忆层之间的**坐标/守卫**升级，不新增层、不新增工具。**与 §7 的关系**：§7 的不可逆项（删 `omb_verify`/`omb_method`/`omb_focus`、删 `omb-context`、技能化 8 卡、`AGENTS.md`）已在 v4.0 落地，v4.1 不重开。
