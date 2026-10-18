@@ -1,6 +1,6 @@
 {
   "name": "@omb/plugin",
-  "version": "3.6.0",
+  "version": "4.0.0",
   "private": true,
   "engines": {
     "dsh": ">=0.2.0-rc.2 <=0.2.1-rc.2"
@@ -181,3 +181,4 @@
     "locale"
   ]
 }
+

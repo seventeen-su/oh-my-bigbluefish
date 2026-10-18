@@ -612,7 +612,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '3.6.0',
+    version: options.version ?? '4.0.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,
@@ -1275,3 +1275,4 @@ export function readMemoryConfig(kernel: Kernel): MemoryConfig {
 export const registration = createMemoryRegistration()
 
 export default toHostPlugin(registration)
+
