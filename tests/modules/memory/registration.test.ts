@@ -144,7 +144,7 @@ describe('omb-memory 清单', () => {
     expect(registration.manifest.requires).toEqual(['omb-kernel'])
     expect(entry?.tools).toEqual(expect.arrayContaining(['omb_recall', 'omb_forget']))
     expect(entry?.capabilities).toEqual(expect.arrayContaining(['memory.write', 'memory.recall']))
-    expect(registration.manifest.version).toBe('4.0.0')
+    expect(registration.manifest.version).toBe('4.1.0')
   })
 
   it('服务名契约为 stores（与 ABI 的 SERVICES 一致）', () => {

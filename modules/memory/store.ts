@@ -2218,6 +2218,15 @@ export interface StoresServiceOptions {
    * 使"sqlite 就绪前预热失败"不被固化成永久缺库。缺省即"没有已知会话"。
    */
   readonly knownSessionCwds?: () => readonly string[]
+  /**
+   * 项目根解析（v4.1 §3.6）：`ensureProject` / `forProject` / `peek` 一律先解析
+   * **项目根**，`projectScope` 与项目库路径都用根；子目录会话与根会话因此共享同一个
+   * 项目库（非 git 目录退化为 cwd）。
+   *
+   * 缺省/失败/空串/相对路径 → `cwd` 本身（与 `dsh/project-root.ts` 的降级同一语义）。
+   * 生产由 `modules/memory/index.ts` 注入 `SERVICES.projectRoot`（取不到=cwd）。
+   */
+  readonly projectRootOf?: (cwd: string) => string
   /** 模块配置的只读副本，供子能力（向量线程数等）读取。 */
   readonly config?: Readonly<Record<string, unknown>>
   /** 项目库连接缓存上限。 */
@@ -2450,6 +2459,23 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
     }
   }
 
+  /**
+   * 项目根解析（v4.1 §3.6）：空间身份 = **git 仓库根**。
+   *
+   * 为什么在这里解析而不是相信传入的 cwd：项目库按 cwd 打开，同一仓库从子目录
+   * 启动的会话会另起一个库（`<subdir>/.omb/memory/`），项目记忆被切成两半。
+   * 只接受**绝对**根；上游返回相对路径/空串/抛错 → 回退 cwd（不静默采用进程 cwd）。
+   */
+  function projectRootOf(cwd: string): string {
+    try {
+      const root = options.projectRootOf?.(cwd)
+      if (typeof root === 'string' && root.length > 0 && isAbsolute(root)) return root
+    } catch {
+      // 上游失败不打断打开：cwd 即根，与 dsh/project-root 的降级同一语义
+    }
+    return cwd
+  }
+
   let userStore: SqliteMemoryStore | undefined
   let userSet: StoreSet | undefined
   let userPromise: Promise<StoreSet | undefined> | undefined
@@ -2669,7 +2695,9 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       logger.warn(`OMB 记忆库：${unexpectedFailure}`)
       return undefined
     }
-    const key = projectIdentity(cwd)
+    // v4.1 §3.6：项目身份 = 项目根（git root；非 git=cwd），不是本次 cwd。
+    const root = projectRootOf(cwd)
+    const key = projectIdentity(root)
 
     const opened = projects.get(key)
     if (opened !== undefined) {
@@ -2691,7 +2719,7 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       try {
         const store = openMemoryStore({
           scope: 'project',
-          dbPath: projectDbPathFor(key),
+          dbPath: projectDbPathFor(root),
           port: hostPort,
           logger,
           clock: options.clock,
@@ -2844,7 +2872,7 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
       if (closing) return undefined
       const cwd = sessionCwdOf(sessionId)
       if (cwd !== undefined) {
-        const key = projectIdentity(cwd)
+        const key = projectIdentity(projectRootOf(cwd))
         const set = projects.get(key)
         if (set !== undefined) {
           projects.delete(key)

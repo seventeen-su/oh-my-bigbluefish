@@ -54,6 +54,7 @@ import {
 } from './state-machine.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { createPressureBridge } from './pressure.js'
+import { createProjectRootResolver } from './project-root.js'
 import { createProjectProfile } from './project-profile.js'
 import { registerDepthCommand } from './depth-command.js'
 import { wireReasoningEffort } from './reasoning-effort.js'
@@ -87,7 +88,7 @@ export const inject = ['commands']
 export const KERNEL_SELF: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '3.6.0',
+    version: '4.1.0',
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health', 'kernel.metrics'],
     configSchema: { parse: (input: unknown) => input ?? {} },
@@ -147,9 +148,23 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   } catch (error) {
     logger.warn(`OMB：压力读数说明注册失败——${String(error)}（状态面将只说"未测量"，不说是哪种）`)
   }
+  // ── 项目根：记忆库与画像共用的**唯一空间身份**（v4.1 §3.1）──────────────
+  //
+  // 为什么独立成服务：记忆库按 cwd 开项目库，同一 git 仓库从子目录启动的会话
+  // 会另起一个库，项目记忆被切成两半。模块层不能跑子进程，所以由 `dsh/` 同步
+  // 解析（`git rev-parse --show-toplevel`，2.5s 超时，失败=cwd），模块在打开库
+  // 前调用。缓存 TTL 60s / 上界 128，绝不抛。
+  const projectRoot = createProjectRootResolver({ clock })
+  let disposeProjectRoot: (() => void) | undefined
+  try {
+    disposeProjectRoot = handle.kernel.provide(SERVICES.projectRoot, projectRoot.port)
+  } catch (error) {
+    logger.warn(`OMB：项目根服务注册失败——${String(error)}（记忆按 cwd 分库、画像无 root 层）`)
+  }
   // ── 项目画像：工作区级理解的唯一构建点 ────────────────────────────────
   // 只在 `omb_project` 调用时构建/读缓存；不参与每轮提示，不改变缓存前缀。
-  const projectProfile = createProjectProfile({ clock })
+  // 构建发生在项目根（`rootOf`）：子目录会话与根会话结构同源，只有 cwdRel 不同。
+  const projectProfile = createProjectProfile({ clock, rootOf: cwd => projectRoot.port.resolve(cwd) })
   try {
     handle.kernel.provide(SERVICES.projectProfile, projectProfile.port)
   } catch (error) {
@@ -413,6 +428,14 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       () => sessionState.dispose(),
       disposeEffort,
       disposeDepth,
+      () => {
+        try {
+          disposeProjectRoot?.()
+        } catch {
+          // H-1：注销失败不向宿主传播（内核注销时也会清理服务表）
+        }
+      },
+      () => projectRoot.dispose(),
       () => projectProfile.dispose(),
       disposeArtifactIndex,
       disposeToolResync,

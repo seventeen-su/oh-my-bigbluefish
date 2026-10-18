@@ -26,7 +26,7 @@ import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
 import { generationFromUrl, parseGeneration } from '../kernel/buildInfo.js'
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
@@ -55,6 +55,63 @@ interface ActiveSessionsLike {
 
 function activeSessionsOf(handle: KernelHandle): ActiveSessionsLike | undefined {
   return handle.kernel.service<ActiveSessionsLike>(SERVICES.activeSession)
+}
+
+/**
+ * 项目根解析端口的**结构最小面**（`SERVICES.projectRoot`，v4.1 §3.1）。
+ *
+ * 不 import `dsh/project-root.ts` 的实现类型：状态面只依赖"有一个同步
+ * `resolve(cwd) → root`"，实现被换掉/缺席时状态面照常可渲染。
+ */
+interface ProjectRootLike {
+  resolve(cwd: string): string
+}
+
+/** 读取印记的分层计数（`SessionSituation.reads`；缺字段即"未测量"）。 */
+interface ReadsLike {
+  readonly count: number
+  readonly changed: number
+  readonly unknown: number
+}
+
+/** 一条"项目根（cwd 相对）"状态行。缺端口/缺 cwd 都如实写原因，不写 0。 */
+export function renderProjectRootLine(port: ProjectRootLike | undefined, cwd: string | null): string {
+  if (port === undefined) {
+    return '- 项目根：未接线（`omb:project-root` 服务未注册——不是"没有项目根"）'
+  }
+  if (cwd === null || cwd.length === 0) {
+    return '- 项目根：无法解析（本会话没有 cwd 归属）'
+  }
+  let root: string
+  try {
+    root = port.resolve(cwd)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return `- 项目根：解析失败（${message}）`
+  }
+  if (root.length === 0) return '- 项目根：无法解析（解析器返回空路径）'
+  let rel = ''
+  try {
+    rel = relative(root, cwd).split(sep).join('/')
+  } catch {
+    rel = ''
+  }
+  return `- 项目根：${root}（cwd 相对：${rel.length === 0 ? '仓库根' : rel}）`
+}
+
+/**
+ * 一条"读取印记"状态行。
+ *
+ * 三态必须能分辨：**没有计数**（状态机未提供）≠ **0 条印记** ≠ **未接线**。
+ * 当前状态机只给 `readStamps` 计数；v4.1 的 `situation().reads` 一旦落地，
+ * 这里自动改用分层计数（已变化/无法核验）。
+ */
+export function renderReadsLine(reads: ReadsLike | undefined, stamps: number | undefined): string {
+  if (reads !== undefined) {
+    return `- 读取印记：${reads.count} 条（已变化 ${reads.changed} / 无法核验 ${reads.unknown}）`
+  }
+  if (stamps === undefined) return '- 读取印记：未接线（会话状态机无可读快照）'
+  return `- 读取印记：${stamps} 条（已变化/无法核验：未测量——状态机未提供核验计数）`
 }
 
 /**
@@ -359,9 +416,10 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   // ── 会话状态（状态机；只报可核对的事实）──────────────────────────────
   const machine = kernel.service<SessionStateService>(SERVICES.sessionState)
   const state = machine?.snapshot(activeSession)
+  const situation = machine?.situation(activeSession)
   lines.push('## 会话状态', '')
   if (state === undefined) {
-    lines.push('（状态机未接线：无法报告 epoch/空闲/外部改动——这不是"工作区没变"）', '')
+    lines.push('（状态机未接线：无法报告 epoch/空闲/外部改动——这不是"工作区没变"）')
   } else {
     const epoch = state.epoch
     lines.push(
@@ -376,13 +434,25 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
       )
     }
     const guard = state.guard
+    const side = situation?.sideEffects
     lines.push(
-      `- 目标/待办：${state.openGoals} / ${state.openTodos}`
-      + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次、write 警告 ${guard.writeWarnings} 次`,
+      side === undefined
+        ? `- 目标/待办：${state.openGoals} / ${state.openTodos}`
+          + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次、write 警告 ${guard.writeWarnings} 次`
+        : `- 目标/待办：${state.openGoals} / ${state.openTodos}`
+          + `；守卫 拒写 ${side.denies} 次、放弃 ${side.gaveUps} 次、盲写 ${side.blindWrites} 次、无法核验 ${side.unverifiable} 次`,
     )
     if (state.persistence.error !== null) lines.push(`- 持久化：${state.persistence.error}`)
-    lines.push('')
   }
+  // ── 空间坐标（v4.1 §3.1/§3.3）：项目根 + 读取印记 ─────────────────────
+  // 两行都只报可核对事实：缺服务 / 缺 cwd / 缺核验计数各有各的说法，
+  // 不写成 0，也不把"未测量"说成"没有变化"。
+  // **在状态机缺席时也要渲染**：这两行的"未接线"本身就是诊断信息。
+  const projectRootPort = kernel.service<ProjectRootLike>(SERVICES.projectRoot)
+  const sessionCwd = situation?.cwd ?? sessions?.cwd(activeSession) ?? null
+  lines.push(renderProjectRootLine(projectRootPort, sessionCwd))
+  lines.push(renderReadsLine(situation?.reads, state?.readStamps))
+  lines.push('')
 
   // ── 预算 ──────────────────────────────────────────────────────────────
   const budgets = handle.budgets()

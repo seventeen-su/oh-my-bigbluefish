@@ -344,6 +344,17 @@ export const SERVICES = {
    */
   projectProfile: 'omb:project-profile',
   /**
+   * **项目根解析**（`ProjectRootPort`，由 `dsh/project-root.ts` provide）。
+   *
+   * 为什么需要独立服务：记忆库按 cwd 开项目库，同一个 git 仓库从子目录启动的
+   * 会话会另起一个库（`<subdir>/.omb/memory/`），项目记忆因此被切成两半。
+   * 项目身份必须是 **git 仓库根**；模块层不能跑子进程，所以由 `dsh/` 解析、
+   * 以同步只读端口供记忆库在打开库前调用。
+   *
+   * 取不到 = 退回 cwd（与旧行为一致）；非 git 目录 resolve(cwd) 即身份。
+   */
+  projectRoot: 'omb:project-root',
+  /**
    * **档位 → 真实推理预算的留痕**（`EffortControlPort`，由 `dsh/reasoning-effort.ts` provide）。
    *
    * 用户命令 `/omb-depth` 写档位；本服务让状态面报"这条请求头到底改成了什么、
@@ -355,6 +366,8 @@ export const SERVICES = {
    *
    * 状态面与模块共用的唯一「世界身份 + 时间」来源：workspace epoch、空闲分级、
    * 外部改动、读取戳、目标/待办计数、edit 守卫读数。
+   * `situation()` 是 v4.1 新增的分层只读快照（会话/空闲/印记/守卫），供
+   * `omb_project` 与状态面组合成时空视图；它**不注入提示**。
    * 模型面只有 `consumeNotice()` 在真实变化时返回的一行（≤120 字符）。
    */
   sessionState: 'omb:session-state',

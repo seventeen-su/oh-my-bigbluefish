@@ -9,7 +9,9 @@ import { dirname, join } from 'node:path'
 import {
   DEFAULT_SESSION_STATE_CONFIG,
   MAX_SESSION_FILES,
+  MAX_SITUATION_ENTRIES,
   SESSION_STATE_SERVICE,
+  absPathOf,
   createSessionStateMachine,
   formatGap,
   normalizePath,
@@ -17,6 +19,7 @@ import {
   pathOfArguments,
   renderNotice,
   wireEditGuard,
+  type ContentHashResult,
   type GitResult,
   type SessionStateConfig,
   type SessionStateEvent,
@@ -122,6 +125,7 @@ function machine(options: {
   clock: FakeClock
   git?: ReturnType<typeof fakeGit>
   cwd?: string
+  content?: FakeContent
   summaries?: (sessionId: string, seq: number) => WorkspaceChangesSummaryLike | undefined
   fs?: MemFs
   stateDir?: string
@@ -139,6 +143,9 @@ function machine(options: {
     stateDirOf: options.stateDir === undefined ? undefined : () => options.stateDir,
     fs: options.fs,
     workspaceChanges,
+    ...(options.content === undefined
+      ? {}
+      : { contentHash: options.content.hashOf, fileExists: options.content.exists }),
     config: {
       persist: options.persist === true,
       persistMinIntervalMs: 0,
@@ -157,6 +164,40 @@ function event(
   seq?: number,
 ): SessionStateEvent {
   return { sessionId, type, at, ...(data === undefined ? {} : { data }), ...(seq === undefined ? {} : { seq }) }
+}
+
+/**
+ * 假内容存储：`hashOf/exists` 就是注入给状态机的 `contentHash/fileExists` 端口。
+ * 测试**不造真实文件**；`failHash` 用来触发"端口内部异常 → fail-open"一行。
+ */
+interface FakeContent {
+  readonly files: Map<string, ContentHashResult>
+  failHash: boolean
+  hashOf(absPath: string): ContentHashResult | null
+  exists(absPath: string): boolean
+  set(absPath: string, hash: string, size?: number): void
+  remove(absPath: string): void
+}
+
+function fakeContent(): FakeContent {
+  const files = new Map<string, ContentHashResult>()
+  const api: FakeContent = {
+    files,
+    failHash: false,
+    hashOf: absPath => {
+      if (api.failHash) throw new Error('hash port exploded')
+      const found = files.get(absPath)
+      return found === undefined ? null : { hash: found.hash, size: found.size }
+    },
+    exists: absPath => files.has(absPath),
+    set: (absPath, hash, size = 10) => {
+      files.set(absPath, { hash, size })
+    },
+    remove: absPath => {
+      files.delete(absPath)
+    },
+  }
+  return api
 }
 
 const S1 = 'session-1'
@@ -310,13 +351,16 @@ describe('外部改动：宿主 tree id 优先（零 subprocess），git 仅回�
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
     m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
     m.port.observe(event(S1, 'workspace/changes', clock.now(), { turn: 1 }, 5))
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'edit', arguments: { path: 'src/ours.ts' } }))
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
+    // v4.1：writeIntent 只在**成功写之后**由 post-execute 记，且 turn/start 会清空；
+    // 所以归因事件必须发生在第 2 个回合内（这里模拟第 2 回合内的一次成功 edit）。
+    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'edit', arguments: { path: 'src/ours.ts' } }))
+    m.port.observe(event(S1, 'tool/result', clock.now(), { name: 'edit', arguments: { path: 'src/ours.ts' }, ok: true }))
     m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 2, reason: 'completed' }))
     m.port.observe(event(S1, 'workspace/changes', clock.now(), { turn: 2 }, 9))
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 3 }))
     const line = m.port.consumeNotice(S1)
-    // 回合之间 tree 变了（b→b 不变；这里 before=b 与上一 after=b 相同）→ 只剩未归因文件 1
+    // 回合之间 tree 未变（before=b = 上一 after=b）→ 只剩未归因文件 1
     expect(line).toContain('外部改动 1')
     m.dispose()
   })
@@ -391,122 +435,255 @@ describe('目标台账与中断标记（R10 §6.1 / §7c）', () => {
   })
 })
 
-describe('读印记与 edit 守卫（R10 §6.5；含逃生门与 fail-open）', () => {
-  function guardMachine(): { m: SessionStateMachine; clock: FakeClock; git: ReturnType<typeof fakeGit> } {
+describe('资源级写守卫（v4.1 §4 判定表；edit+write 统一）', () => {
+  function fixture(): {
+    m: SessionStateMachine
+    clock: FakeClock
+    content: FakeContent
+    abs: (path: string) => string
+    read: (path: string, hash?: string) => void
+  } {
     const clock = new FakeClock()
     const git = fakeGit({ head: 'aaa1111', status: '' })
-    const m = machine({ clock, git, cwd: 'C:/repo' })
+    const content = fakeContent()
+    const m = machine({ clock, git, cwd: 'C:/repo', content })
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
-    return { m, clock, git }
+    const abs = (path: string): string => absPathOf('C:/repo', path) ?? path
+    const read = (path: string, hash = 'h1'): void => {
+      content.set(abs(path), hash)
+      m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path } }))
+    }
+    return { m, clock, content, abs, read }
   }
 
-  function changeWorktree(git: ReturnType<typeof fakeGit>, head: string): void {
-    git.state.head = head
-  }
+  it('判定表：无印记且文件不存在 → allow，无计数', () => {
+    const { m } = fixture()
+    expect(m.guardEdit(S1, 'edit', 'src/new.ts')).toMatchObject({ kind: 'allow' })
+    expect(m.port.snapshot(S1)?.blindWrites).toBe(0)
+    expect(m.port.snapshot(S1)?.guard.unverifiable).toBe(0)
+    m.dispose()
+  })
 
-  it('读后 epoch 未变 → edit 放行；epoch 变后 → deny，理由 ≤120 且是事实句', () => {
-    const { m, clock, git } = guardMachine()
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/a.ts' } }))
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts')).toMatchObject({ kind: 'allow' })
-    changeWorktree(git, 'bbb2222')
-    m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
-    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
-    const decision = m.guardEdit(S1, 'edit', 'src/a.ts')
+  it('判定表：无印记且文件存在 → allow + blindWrites++', () => {
+    const { m, content, abs } = fixture()
+    content.set(abs('src/existing.ts'), 'h0')
+    expect(m.guardEdit(S1, 'edit', 'src/existing.ts').kind).toBe('allow')
+    expect(m.port.snapshot(S1)?.blindWrites).toBe(1)
+    m.dispose()
+  })
+
+  it('判定表：印记 hash=null（读时读不到）→ allow + unverifiable++', () => {
+    const { m, clock } = fixture()
+    // 不 set 内容：读取时 contentHash 返回 null → 印记 hash=null
+    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/nohash.ts' } }))
+    expect(m.port.readStamps(S1)[0]?.hash).toBeNull()
+    expect(m.guardEdit(S1, 'edit', 'src/nohash.ts').kind).toBe('allow')
+    expect(m.port.snapshot(S1)?.guard.unverifiable).toBe(1)
+    m.dispose()
+  })
+
+  it('判定表：当前内容读不到/超限 → allow + unverifiable++', () => {
+    const { m, content, abs, read } = fixture()
+    read('src/gone.ts')
+    content.remove(abs('src/gone.ts'))
+    expect(m.guardEdit(S1, 'write', 'src/gone.ts').kind).toBe('allow')
+    expect(m.port.snapshot(S1)?.guard.unverifiable).toBe(1)
+    m.dispose()
+  })
+
+  it('判定表：hash 相同 → allow（edit 与 write 同表）', () => {
+    const { m, read } = fixture()
+    read('src/same.ts', 'h1')
+    expect(m.guardEdit(S1, 'edit', 'src/same.ts').kind).toBe('allow')
+    expect(m.guardEdit(S1, 'write', 'src/same.ts').kind).toBe('allow')
+    m.dispose()
+  })
+
+  it('判定表：hash 不同 → deny（≤120 事实句）', () => {
+    const { m, content, abs, read } = fixture()
+    read('src/changed.ts', 'h1')
+    content.set(abs('src/changed.ts'), 'h2')
+    const decision = m.guardEdit(S1, 'edit', 'src/changed.ts')
     expect(decision.kind).toBe('deny')
-    expect(decision.reason ?? '').toContain('变更')
+    expect(decision.reason ?? '').toContain('已变化')
     expect((decision.reason ?? '').length).toBeLessThanOrEqual(120)
     m.dispose()
   })
 
-  it('逃生门：同路径同回合前 2 次 deny、第 3 次放行并记 gaveUp；重读后放行（AT-2/3）', () => {
-    const { m, clock, git } = guardMachine()
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/a.ts' } }))
-    changeWorktree(git, 'bbb2222')
-    m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
-    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
+  it('判定表：hash 不同时 write 也 deny（v4.1 统一表）', () => {
+    const { m, content, abs, read } = fixture()
+    read('src/w.ts', 'h1')
+    content.set(abs('src/w.ts'), 'h2')
+    expect(m.guardEdit(S1, 'write', 'src/w.ts').kind).toBe('deny')
+    m.dispose()
+  })
+
+  it('逃生门：同路径同回合前 2 次 deny、第 3 次 allow + gaveUps；step/start 不清预算', () => {
+    const { m, clock, content, abs, read } = fixture()
+    read('src/a.ts', 'h1')
+    content.set(abs('src/a.ts'), 'h2')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
+    m.port.observe(event(S1, 'step/start', clock.now(), { turn: 1, step: 2 }))
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
     expect(m.port.snapshot(S1)?.guard.gaveUps).toBe(1)
-    // 重读后 stamp 更新到新 epoch → 放行
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/a.ts' } }))
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
+    expect(m.port.snapshot(S1)?.guard.denies).toBe(2)
     m.dispose()
   })
 
-  it('write 只 warn 不 deny；未读文件的 edit 不拦（本版偏差），只计 blindWrites', () => {
-    const { m, clock, git } = guardMachine()
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'edit', arguments: { path: 'src/never-read.ts' } }))
-    expect(m.port.snapshot(S1)?.blindWrites).toBe(1)
-    expect(m.guardEdit(S1, 'edit', 'src/never-read.ts')).toMatchObject({ kind: 'allow' })
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/w.ts' } }))
-    changeWorktree(git, 'ccc3333')
-    m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
+  it('判定表：守卫内部异常 → allow（fail-open，不计数）', () => {
+    const { m, content, read } = fixture()
+    read('src/boom.ts', 'h1')
+    content.failHash = true
+    expect(() => m.guardEdit(S1, 'edit', 'src/boom.ts')).not.toThrow()
+    expect(m.guardEdit(S1, 'edit', 'src/boom.ts').kind).toBe('allow')
+    expect(m.port.snapshot(S1)?.guard.denies).toBe(0)
+    m.dispose()
+  })
+
+  it('post-execute 成功刷新印记哈希（自己的写不误伤自己）；失败不刷新', () => {
+    const { m, content, abs, read } = fixture()
+    read('src/self.ts', 'h1')
+    content.set(abs('src/self.ts'), 'h2')
+    m.noteWriteResult(S1, 'edit', 'src/self.ts', true)
+    expect(m.port.readStamps(S1).find(stamp => stamp.path === 'src/self.ts')?.hash).toBe('h2')
+    expect(m.guardEdit(S1, 'edit', 'src/self.ts').kind).toBe('allow')
+    // 失败不刷新：内容再被改成 h1 时，印记仍是 h2 → deny
+    content.set(abs('src/self.ts'), 'h1')
+    m.noteWriteResult(S1, 'edit', 'src/self.ts', false)
+    expect(m.guardEdit(S1, 'edit', 'src/self.ts').kind).toBe('deny')
+    m.dispose()
+  })
+
+  it('writeIntent：post-execute 成功加入、turn/start 边界清空', () => {
+    const { m, clock } = fixture()
+    m.port.observe(event(S1, 'tool/result', clock.now(), { name: 'edit', arguments: { path: 'src/i.ts' }, ok: true }))
+    expect(m.port.snapshot(S1)?.writeIntent).toBe(1)
+    clock.advance(1_000)
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
-    expect(m.guardEdit(S1, 'write', 'src/w.ts').kind).toBe('warn')
-    expect(m.port.snapshot(S1)?.guard.writeWarnings).toBe(1)
+    expect(m.port.snapshot(S1)?.writeIntent).toBe(0)
     m.dispose()
   })
 
-  it('step/start 不清空回合 deny 预算（只有 turn/start 是边界）', () => {
-    const { m, clock, git } = guardMachine()
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/a.ts' } }))
-    changeWorktree(git, 'bbb2222')
-    m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
-    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
-    m.port.observe(event(S1, 'step/start', clock.now(), { turn: 2, step: 3 }))
-    // 若 step/start 被当成回合边界，第 3 次会再次 deny（denies=3）；正确语义是放行。
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
-    expect(m.port.snapshot(S1)?.guard.gaveUps).toBe(1)
+  it('非写工具 / 未知会话 / 空路径一律 allow', () => {
+    const { m } = fixture()
+    expect(m.guardEdit(S1, 'pwsh', 'a.ts').kind).toBe('allow')
+    expect(m.guardEdit('nope', 'edit', 'a.ts').kind).toBe('allow')
+    expect(m.guardEdit(S1, 'edit', '').kind).toBe('allow')
     m.dispose()
   })
 
-  it('wireEditGuard 接在 tools/pre-execute：deny 直接返回且不调用 next；allow 走 next', async () => {
-    const { m, clock, git } = guardMachine()
-    const registered: { event: string; fn: (exec: unknown, next: unknown) => Promise<unknown> }[] = []
+  it('wireEditGuard 同时注册 pre/post；deny 不调用 next；post 成功后刷新', async () => {
+    const { m, content, abs, read } = fixture()
+    const registered: { event: string; fn: (...args: unknown[]) => Promise<unknown> }[] = []
     const ctx = {
-      on: (event: string, fn: (exec: unknown, next: unknown) => Promise<unknown>) => {
+      on: (event: string, fn: (...args: unknown[]) => Promise<unknown>) => {
         registered.push({ event, fn })
         return () => {}
       },
     }
     const dispose = wireEditGuard({ ctx: ctx as never, machine: m })
-    expect(registered[0]?.event).toBe('tools/pre-execute')
-    m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path: 'src/a.ts' } }))
-    changeWorktree(git, 'bbb2222')
-    m.port.observe(event(S1, 'turn/end', clock.now(), { turn: 1, reason: 'completed' }))
-    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
+    expect(registered.map(entry => entry.event)).toEqual(['tools/pre-execute', 'tools/post-execute'])
+    read('src/a.ts', 'h1')
+    content.set(abs('src/a.ts'), 'h2')
     let nextCalls = 0
     const next = async (): Promise<unknown> => {
       nextCalls += 1
       return { kind: 'allow' }
     }
     const denied = await registered[0]?.fn({
-      name: 'edit',
-      arguments: { path: 'src/a.ts' },
-      agent: { session: { id: S1 } },
+      name: 'edit', arguments: { path: 'src/a.ts' }, agent: { session: { id: S1 } },
     }, next)
     expect(denied).toMatchObject({ kind: 'deny' })
     expect(nextCalls).toBe(0)
-    const allowed = await registered[0]?.fn({
-      name: 'edit',
-      arguments: { path: 'src/untouched.ts' },
-      agent: { session: { id: S1 } },
-    }, next)
-    expect(allowed).toEqual({ kind: 'allow' })
+    const post = await registered[1]?.fn({
+      name: 'edit', arguments: { path: 'src/a.ts' }, agent: { session: { id: S1 } },
+    }, { isError: false }, next)
+    expect(post).toEqual({ kind: 'allow' })
     expect(nextCalls).toBe(1)
+    expect(m.port.readStamps(S1).find(stamp => stamp.path === 'src/a.ts')?.hash).toBe('h2')
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
     dispose()
     m.dispose()
   })
+})
 
-  it('未知会话 / 空参数 / 非写工具一律放行且不抛', () => {
-    const { m } = guardMachine()
-    expect(m.guardEdit('nope', 'edit', 'a.ts').kind).toBe('allow')
-    expect(m.guardEdit(S1, 'pwsh', 'a.ts').kind).toBe('allow')
-    expect(m.guardEdit(S1, 'edit', '').kind).toBe('allow')
+describe('situation 快照（v4.1 §3.3：只读 / 同步 / 绝不抛 / ≤16 条）', () => {
+  function fixture(): {
+    m: SessionStateMachine
+    content: FakeContent
+    abs: (path: string) => string
+    read: (path: string, hash: string) => void
+  } {
+    const clock = new FakeClock()
+    const git = fakeGit({ head: 'aaa1111', status: '' })
+    const content = fakeContent()
+    const m = machine({ clock, git, cwd: 'C:/repo', content })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    const abs = (path: string): string => absPathOf('C:/repo', path) ?? path
+    const read = (path: string, hash: string): void => {
+      content.set(abs(path), hash)
+      m.port.observe(event(S1, 'tool/call', clock.now(), { name: 'read', arguments: { path } }))
+    }
+    return { m, content, abs, read }
+  }
+
+  it('结构化字段 + same/changed/unknown，entries 按 path 排序', () => {
+    const { m, content, abs, read } = fixture()
+    read('src/b.ts', 'hb')
+    read('src/a.ts', 'ha')
+    read('src/c.ts', 'hc')
+    content.set(abs('src/b.ts'), 'hb2')
+    content.remove(abs('src/c.ts'))
+    m.port.observe(event(S1, 'goal/change', 1_000_000, { id: 'g1', objective: '目标', phase: 'open' }))
+    m.port.observe(event(S1, 'todo/write', 1_000_000, {
+      todos: [{ id: 't1', status: 'pending' }, { id: 't2', status: 'completed' }],
+    }))
+    const situation = m.port.situation(S1)
+    expect(situation).toBeDefined()
+    expect(situation?.cwd).toBe('C:/repo')
+    expect(situation?.reads.count).toBe(3)
+    expect(situation?.reads.changed).toBe(1)
+    expect(situation?.reads.unknown).toBe(1)
+    expect(situation?.reads.entries).toEqual([
+      { path: 'src/a.ts', status: 'same', hash: 'ha' },
+      { path: 'src/b.ts', status: 'changed', hash: 'hb' },
+      { path: 'src/c.ts', status: 'unknown', hash: 'hc' },
+    ])
+    expect(situation?.goals).toEqual({ open: 1, total: 1 })
+    expect(situation?.todos).toEqual({ open: 1, total: 2 })
+    expect(situation?.sideEffects.blindWrites).toBe(0)
+    expect(situation?.epoch?.source).toBe('git')
     m.dispose()
+  })
+
+  it('entries 上限 16：20 条读取只返回 16 条，count 仍是 20', () => {
+    const { m, read } = fixture()
+    for (let index = 0; index < 20; index += 1) {
+      read(`src/f${String(index).padStart(2, '0')}.ts`, `h${index}`)
+    }
+    const situation = m.port.situation(S1)
+    expect(situation?.reads.count).toBe(20)
+    expect(situation?.reads.entries.length).toBe(MAX_SITUATION_ENTRIES)
+    const paths = situation?.reads.entries.map(entry => entry.path) ?? []
+    expect([...paths].sort()).toEqual(paths)
+    m.dispose()
+  })
+
+  it('绝不抛：contentHash 端口抛错时状态为 unknown，而不是异常冒泡', () => {
+    const { m, content, read } = fixture()
+    read('src/a.ts', 'h1')
+    content.failHash = true
+    expect(() => m.port.situation(S1)).not.toThrow()
+    expect(m.port.situation(S1)?.reads.entries[0]?.status).toBe('unknown')
+    m.dispose()
+  })
+
+  it('未知会话 / 注销后返回 undefined', () => {
+    const { m } = fixture()
+    expect(m.port.situation('missing')).toBeUndefined()
+    m.dispose()
+    expect(m.port.situation(S1)).toBeUndefined()
   })
 })
 

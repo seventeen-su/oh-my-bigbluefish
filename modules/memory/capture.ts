@@ -19,6 +19,18 @@
  *    活动写 `asserted_by=execution`（真的发生了这次调用），**不写助手文本**。
  * ③ **有界**：每会话偏好 ≤5、活动 ≤10；同会话按去重键幂等；会话状态表有上限。
  *
+ * ## v4.1 §3.5：生命周期（`tool/call` 只是尝试，`tool/result` 才是事实）
+ *
+ * v4.1 之前 `tool/call` 时就写"编辑文件：x"——**尝试过**被记成**完成过**。现在：
+ * - `tool/call` 只按 `callId` 建 pending（每会话 20 / 全局 512）；
+ * - `tool/result`：`ok===true` 写旧文本；`ok===false` 写 `未生效：…`（同一事实轴，
+ *   但明确未生效）；`ok===undefined` 不写并计 `unknown-result`；无匹配 pending 计 `no-pending`；
+ * - `turn/end` 丢弃未解决 pending 并计 `unconfirmed`（跨回合无法可靠配对）；
+ * - 没有 `callId` 时退回旧"调用时写"并计 `unconfirmed-call`（**明确记录的降级**）。
+ *
+ * 统计（`failed`/`unconfirmed`/`unknownResult`/`noPending`/`unconfirmedCall`/`pending`）
+ * 经模块健康面进入 `omb_status` 记忆段：没有成功就没有"完成过"，尝试与结果分开可见。
+ *
  * ## 与 `omb_remember` 的分工
  *
  * - `omb_remember`：模型主动、走准入闸门（用户原话核对/工件核验/执行台账）；
@@ -249,6 +261,18 @@ export interface CaptureStats {
   preferences: number
   activity: number
   outcomes: number
+  /** `ok=true` 的调用写过文本。 */
+  failed: number
+  /** 回合结束时仍未等到结果的 pending 数（丢弃）。 */
+  unconfirmed: number
+  /** 结果事件 `ok === undefined`（既不算成功也不算失败，不写）。 */
+  unknownResult: number
+  /** 带 callId 的结果找不到 pending（乱序/重放/超界丢弃）。 */
+  noPending: number
+  /** call 事件没有 callId → 退回旧"调用时写"并计数（明确记录的降级）。 */
+  unconfirmedCall: number
+  /** 当前挂起中的 pending 数（**瞬时量**，不是累计）。 */
+  pending: number
   skipped: Record<string, number>
 }
 
@@ -277,7 +301,13 @@ export interface CapturePorts extends CaptureFeatureSwitches {
   readonly projectRetryMs?: number
 }
 
-/** 单会话捕获状态。有界（见 `SESSION_STATE_MAX`）。 */
+/** 单会话捕获状态。有界（见 `SESSION_STATE_MAX` 与 pending 上限）。 */
+interface PendingActivity {
+  /** 调用侧分类结果（成功/失败共用同一段"旧文本"）。 */
+  readonly decision: { readonly text: string; readonly dedupeKey: string }
+  readonly at: number
+}
+
 interface SessionCaptureState {
   preferences: number
   activity: number
@@ -286,9 +316,17 @@ interface SessionCaptureState {
   activityKeys: Set<string>
   toolCalls: number
   tools: Map<string, number>
+  /** `tool/call` 建、`tool/result` 消；按 callId 配对（v4.1 生命周期）。 */
+  pending: Map<string, PendingActivity>
 }
 
 export const SESSION_STATE_MAX = 64
+/** pending 有界：每会话 20（R10 §6 轨迹预算；超出不再挂起，结果按 no-pending 计）。 */
+export const MAX_PENDING_PER_SESSION = 20
+/** pending 全局上限 512（多会话并发时的兜底）。 */
+export const MAX_PENDING_GLOBAL = 512
+/** 失败调用的写入前缀（"尝试过"被记成"完成过"的修复：同一行正文但明确未生效）。 */
+export const FAILED_PREFIX = '未生效：'
 
 function emptyState(): SessionCaptureState {
   return {
@@ -299,6 +337,7 @@ function emptyState(): SessionCaptureState {
     activityKeys: new Set(),
     toolCalls: 0,
     tools: new Map(),
+    pending: new Map(),
   }
 }
 
@@ -343,15 +382,34 @@ export function createCapture(ports: CapturePorts): Capture {
   const maxActivity = ports.maxActivity ?? DEFAULT_MAX_ACTIVITY
   const retryMs = ports.projectRetryMs ?? DEFAULT_PROJECT_RETRY_MS
   const states = new Map<string, SessionCaptureState>()
-  const stats: CaptureStats = { preferences: 0, activity: 0, outcomes: 0, skipped: {} }
+  const stats: CaptureStats = {
+    preferences: 0,
+    activity: 0,
+    outcomes: 0,
+    failed: 0,
+    unconfirmed: 0,
+    unknownResult: 0,
+    noPending: 0,
+    unconfirmedCall: 0,
+    pending: 0,
+    skipped: {},
+  }
+  /** pending 全局计数（stats.pending 每次读快照；不靠遍历会话求和）。 */
+  let globalPending = 0
 
   const stateOf = (sessionId: string): SessionCaptureState => {
     const existing = states.get(sessionId)
     if (existing !== undefined) return existing
     if (states.size >= SESSION_STATE_MAX) {
-      // 简单的插入序淘汰：捕获状态只服务"当前活跃会话"，越界即最旧
+      // 简单的插入序淘汰：捕获状态只服务"当前活跃会话"，越界即最旧。
+      // 淘汰时**必须归还该会话挂起的 pending 配额**：否则 globalPending 只增不减，
+      // 长跑进程会在 512 上限处永久拒绝新 pending（静默的全局捕获失效）。
       const oldest = states.keys().next().value
-      if (oldest !== undefined) states.delete(oldest)
+      if (oldest !== undefined) {
+        const evicted = states.get(oldest)
+        if (evicted !== undefined) globalPending = Math.max(0, globalPending - evicted.pending.size)
+        states.delete(oldest)
+      }
     }
     const created = emptyState()
     states.set(sessionId, created)
@@ -504,6 +562,48 @@ export function createCapture(ports: CapturePorts): Capture {
     }
   }
 
+  /** 写一条活动：成功 = 旧文本；失败 = `未生效：` + 旧文本（v4.1 §3.5）。 */
+  const writeActivity = async (input: {
+    readonly sessionId: string
+    readonly decision: { readonly text: string; readonly dedupeKey: string }
+    readonly at: number
+    readonly callId?: string
+    readonly failed?: boolean
+  }): Promise<boolean> => {
+    const state = stateOf(input.sessionId)
+    if (input.failed !== true && state.activityKeys.has(input.decision.dedupeKey)) {
+      skip('duplicate')
+      return false
+    }
+    if (state.activity >= maxActivity) {
+      skip('cap')
+      return false
+    }
+    const failed = input.failed === true
+    const sourceRef = `session:${input.sessionId}#call:${input.callId ?? input.at}`
+    const wrote = await write({
+      sessionId: input.sessionId,
+      scope: 'project',
+      kind: 'episodic',
+      text: failed ? `${FAILED_PREFIX}${input.decision.text}` : input.decision.text,
+      sourceRef,
+      assertedBy: 'execution',
+      // 失败与成功是两条不同的事实，去重键必须分开（否则同一命令先失败后成功会被吞一条）
+      dedupeKey: failed ? `fail:${input.decision.dedupeKey}` : input.decision.dedupeKey,
+    })
+    if (wrote) {
+      state.activity += 1
+      stats.activity += 1
+    }
+    return wrote
+  }
+
+  /**
+   * `tool/call`：**只挂 pending**（有 callId 时）。
+   *
+   * v4.1 §3.5：调用成功与否只有 `tool/result` 知道，call 时写就是把"尝试过"
+   * 记成"完成过"。无 callId 时退回旧行为并计 `unconfirmed-call`（明确记录的降级）。
+   */
   const captureActivity = async (payload: {
     sessionId: string
     tool: string
@@ -517,6 +617,12 @@ export function createCapture(ports: CapturePorts): Capture {
       skip(decision.reason)
       return
     }
+    if (payload.callId === undefined) {
+      stats.unconfirmedCall += 1
+      skip('unconfirmed-call')
+      await writeActivity({ sessionId: payload.sessionId, decision, at: payload.at })
+      return
+    }
     const state = stateOf(payload.sessionId)
     if (state.activityKeys.has(decision.dedupeKey)) {
       skip('duplicate')
@@ -526,20 +632,19 @@ export function createCapture(ports: CapturePorts): Capture {
       skip('cap')
       return
     }
-    const sourceRef = `session:${payload.sessionId}#call:${payload.callId ?? payload.at}`
-    const wrote = await write({
-      sessionId: payload.sessionId,
-      scope: 'project',
-      kind: 'episodic',
-      text: decision.text,
-      sourceRef,
-      assertedBy: 'execution',
-      dedupeKey: decision.dedupeKey,
-    })
-    if (wrote) {
-      state.activity += 1
-      stats.activity += 1
+    if (state.pending.has(payload.callId)) {
+      skip('pending-duplicate')
+      return
     }
+    if (state.pending.size >= MAX_PENDING_PER_SESSION || globalPending >= MAX_PENDING_GLOBAL) {
+      skip('pending-cap')
+      return
+    }
+    state.pending.set(payload.callId, {
+      decision: { text: decision.text, dedupeKey: decision.dedupeKey },
+      at: payload.at,
+    })
+    globalPending += 1
   }
 
   return {
@@ -561,15 +666,59 @@ export function createCapture(ports: CapturePorts): Capture {
       }
     },
     async onToolResult(payload) {
-      // 结果事件当前只用于"失败不记"：失败的调用不构成"项目活动已完成"。
-      // 成功判定在调用侧（tool/call）已经足够；这里保留订阅是为了将来按 ok 收窄。
-      if (payload.ok === false) {
+      try {
+        if (ports.enabledActivity === false) return
         const state = states.get(payload.sessionId)
-        if (state !== undefined) state.activityKeys.add(`failed:${payload.callId ?? payload.at}`)
+        const callId = payload.callId
+        // 旧路径（call 无 callId）已在调用时写过；结果侧没有可配对的 pending，
+        // 但那是已计数的降级，不重复计 no-pending。
+        if (callId === undefined) return
+        const pending = state?.pending.get(callId)
+        if (state === undefined || pending === undefined) {
+          // **只把"活动调用没配上 pending"算 no-pending**：读文件/状态面等本来就不
+          // 产生 pending，若也计入，这个数会被每次 read 撑大，变成"看起来一直在丢结果"。
+          // 结果事件带 tool+args（dsh 按 callId 从台账反查得到）时重新分类一次：
+          // 不是活动 → 静默忽略，这才与 call 侧"非活动不挂 pending"对称。
+          if (payload.tool !== undefined && payload.args !== undefined) {
+            if (!classifyToolActivity(payload.tool, payload.args).ok) return
+          }
+          stats.noPending += 1
+          skip('no-pending')
+          return
+        }
+        state.pending.delete(callId)
+        globalPending = Math.max(0, globalPending - 1)
+        // `ok === undefined` = 结果既没标成功也没标失败（宿主字段缺失/工具未声明）：
+        // 不写，但计数可见——"不知道"不能当成"成功"。
+        if (payload.ok === undefined) {
+          stats.unknownResult += 1
+          skip('unknown-result')
+          return
+        }
+        const failed = payload.ok === false
+        if (failed) stats.failed += 1
+        await writeActivity({
+          sessionId: payload.sessionId,
+          decision: pending.decision,
+          at: payload.at,
+          callId,
+          failed,
+        })
+      } catch (error) {
+        ports.logger?.warn(`OMB 自主捕获（结果）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
       }
     },
     async onTurnEnd(payload) {
       try {
+        // v4.1 生命周期：回合结束仍未等到结果的 pending 一律丢弃并计 unconfirmed。
+        // 跨回合结果本就不可靠配对；留在表里只会在下一回合再数一次。
+        const pendingState = states.get(payload.sessionId)
+        if (pendingState !== undefined && pendingState.pending.size > 0) {
+          const dropped = pendingState.pending.size
+          pendingState.pending.clear()
+          globalPending = Math.max(0, globalPending - dropped)
+          stats.unconfirmed += dropped
+        }
         if (ports.enabledOutcome === false) return
         const state = states.get(payload.sessionId)
         if (state === undefined) return
@@ -601,6 +750,12 @@ export function createCapture(ports: CapturePorts): Capture {
       preferences: stats.preferences,
       activity: stats.activity,
       outcomes: stats.outcomes,
+      failed: stats.failed,
+      unconfirmed: stats.unconfirmed,
+      unknownResult: stats.unknownResult,
+      noPending: stats.noPending,
+      unconfirmedCall: stats.unconfirmedCall,
+      pending: globalPending,
       skipped: { ...stats.skipped },
     }),
     warm(sessionId) {

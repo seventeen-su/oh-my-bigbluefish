@@ -43,7 +43,7 @@ import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats } from './capture.js'
 import { autoLinkRelated } from './link.js'
-import { createProjectTool, type ProjectProfilePort } from './project.js'
+import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
 import { AdaptiveFloorCalibrator } from './utility.js'
 import { asUtilityStore } from './store.js'
@@ -477,6 +477,13 @@ async function describeHealth(
     metrics['capture.preferences'] = runtime.capture.preferences
     metrics['capture.activity'] = runtime.capture.activity
     metrics['capture.outcomes'] = runtime.capture.outcomes
+    // v4.1 §3.5：生命周期读数（没有成功就没有"完成过"；尝试与结果分开计数）
+    metrics['capture.failed'] = runtime.capture.failed
+    metrics['capture.unconfirmed'] = runtime.capture.unconfirmed
+    metrics['capture.unknownResult'] = runtime.capture.unknownResult
+    metrics['capture.noPending'] = runtime.capture.noPending
+    metrics['capture.unconfirmedCall'] = runtime.capture.unconfirmedCall
+    metrics['capture.pending'] = runtime.capture.pending
     for (const [reason, count] of Object.entries(runtime.capture.skipped)) {
       if (count > 0) metrics[`capture.skipped.${reason}`] = count
     }
@@ -612,7 +619,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '4.0.0',
+    version: options.version ?? '4.1.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,
@@ -674,6 +681,25 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       const privacy = installPrivacy(kernel, config.privacy, { storagePort: resolveStoragePort() })
       privacyRef = privacy
 
+      /**
+       * 项目根解析（v4.1 §3.1/§3.6）：**唯一来源**是宿主 `SERVICES.projectRoot`。
+       *
+       * 记忆库与 `omb_project` 共用同一个闭包：两处各解析一次会出现"库按根、
+       * 画像按 cwd"的裂缝（正是 v4.1 要修的项目身份分裂）。
+       * 服务缺席/抛错/返回空串 → cwd 本身（非 git 目录的同一语义），绝不抛。
+       */
+      const projectRootOf = (cwd: string): string => {
+        try {
+          const port = kernel.service<{ resolve(cwd: string): string }>(SERVICES.projectRoot)
+          const root = port?.resolve?.(cwd)
+          if (typeof root === 'string' && root.length > 0) return root
+        } catch {
+          // 上游失败 → cwd（与 `dsh/project-root.ts` 的降级同一语义）
+        }
+        return cwd
+      }
+      const cwdSource = sessionCwdSource(kernel)
+
       const service = createStoresService({
         logger: kernel.logger,
         clock: kernel.clock,
@@ -687,7 +713,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         // `ungatedWrites` 双双点名，不是静默失效。
         privacy: () => kernel.service<PrivacyGatePort>(SERVICES.privacy),
         // 「会话 → cwd」不再由本模块存：唯一来源是内核登记处（见 sessionCwdSource 的说明）
-        ...sessionCwdSource(kernel),
+        ...cwdSource,
+        // v4.1 §3.6：项目身份 = 项目根（子目录会话与根会话共享同一个项目库）
+        projectRootOf,
       })
       // 同名重复注册 = 替换（ABI 契约，热插拔重载必然发生）；因此这里不 catch——
       // 若宿主实现真的抛，apply 抛出会由内核记为本模块 failed，语义正确。
@@ -1147,8 +1175,35 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             if (sessionId === undefined) return undefined
             const set = service.peek(sessionId)
             if (set === undefined) return undefined
-            return { cwd: set.projectScope ?? undefined, store: set.store('project') }
+            // 画像的 `cwd` 是**本次会话目录**（L0 的 `cwd 相对根` 靠它），不是项目根；
+            // 项目库/记忆仍按根统一（`set.projectScope` 已是根）。
+            const cwd = cwdSource.resolveSessionCwd(sessionId) ?? set.projectScope ?? undefined
+            return { cwd, store: set.store('project') }
           },
+          // v4.1 §3.4：状态机 situation（L2/L3/L5）；缺省=未接线，渲染里如实写
+          situation: sessionId => {
+            if (sessionId === undefined) return undefined
+            try {
+              const svc = kernel.service<{ situation?(id: string): SessionSituationView | undefined }>(
+                SERVICES.sessionState,
+              )
+              return svc?.situation?.(sessionId)
+            } catch {
+              return undefined
+            }
+          },
+          // v4.1 §5：隐私先于读取。服务缺席=可读；判定抛错=不可读（fail-closed）
+          privacyAllowsRead: sessionId => {
+            const gate = kernel.service<PrivacyGatePort>(SERVICES.privacy)
+            if (gate === undefined) return true
+            try {
+              return gate.decide(sessionId).allowRead
+            } catch {
+              return false
+            }
+          },
+          // v4.1 §3.1：项目根解析与记忆库共用同一闭包
+          projectRoot: projectRootOf,
           profile: () => {
             const port = kernel.service<ProjectProfilePort>(SERVICES.projectProfile)
             if (port === undefined) return undefined

@@ -1,5 +1,5 @@
 /**
- * 项目画像：给"工作区级记忆"一份**确定性、可复算**的项目理解。
+ * 项目画像：给"工作区级记忆"一份**确定性、可复算**的项目理解（v4.1 §3.2）。
  *
  * ## 为什么需要
  *
@@ -8,10 +8,18 @@
  * 项目画像把"这个仓库是什么、怎么跑、最近在做什么"固化成一段短文本，
  * 由 `omb_project` 按需读取——**不占常驻预算，不改变系统提示前缀**。
  *
+ * ## v4.1 的分层
+ *
+ * 画像构建在 **git 项目根**（由 `SERVICES.projectRoot` 解析）：同一个仓库从子
+ * 目录会话调用时，结构层与根会话**同源**，只有 `cwdRel` 不同（"我在哪"）。
+ * 文本 `text` 与结构化字段 `identity/structure/history/gates` **同一批读取渲染**
+ * ——读者不必怀疑"文本说的和结构说的是两回事"。
+ *
  * ## 边界
  *
  * - **只读**：不写仓库、不改 git、不执行项目脚本。
  * - **确定性**：同一份文件/git 状态产出同一段文本（顺序固定），便于缓存与 diff。
+ * - **有界**：源码目录扫描最多 `PROJECT_SCAN_MAX_FILES` 个文件，跳过依赖/生成物目录。
  * - **不在热路径**：`read()` 命中缓存直接返回；`refresh()` 才重扫。
  * - **绝不抛**：任何读失败都退化为"缺失该段"，而不是让工具调用失败。
  *
@@ -19,16 +27,86 @@
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, extname, join, relative, resolve, sep } from 'node:path'
 import type { Clock } from '../kernel/abi/index.js'
 
-/** 一段项目画像。`text` 已按固定顺序渲染，可直接交给模型。 */
+/** 画像身份层（L0）：项目名/版本 + git 身份。 */
+export interface ProjectProfileIdentity {
+  readonly name?: string
+  readonly version?: string
+  readonly branch?: string
+  readonly head?: string
+  readonly headAt?: number
+}
+
+/** 一个顶层目录及其（有界扫描到的）文件数。 */
+export interface ProjectProfileTopDir {
+  readonly name: string
+  readonly files: number
+}
+
+/** 一个源码目录的规模统计。 */
+export interface ProjectProfileSource {
+  readonly dir: string
+  readonly files: number
+  readonly lines: number
+  readonly tests: number
+}
+
+/** 一份仓库文档的标题。 */
+export interface ProjectProfileDoc {
+  readonly path: string
+  readonly title: string
+}
+
+/** 画像结构层（L1）：目录、源码规模、入口、文档。 */
+export interface ProjectProfileStructure {
+  readonly topDirs?: readonly ProjectProfileTopDir[]
+  readonly sources?: readonly ProjectProfileSource[]
+  readonly entries?: readonly string[]
+  readonly docs?: readonly ProjectProfileDoc[]
+}
+
+/** 一条提交（短 hash + 主题 + 作者时间）。 */
+export interface ProjectProfileCommit {
+  readonly hash: string
+  readonly subject: string
+  readonly at: number
+}
+
+/** 画像历史层：最近提交与未提交改动数。 */
+export interface ProjectProfileHistory {
+  readonly commits?: readonly ProjectProfileCommit[]
+  readonly dirty?: number
+}
+
+/** 一条构建/测试命令（来自 package.json scripts）。 */
+export interface ProjectProfileGate {
+  readonly name: string
+  readonly command: string
+}
+
+/**
+ * 一段项目画像。`text` 已按固定顺序渲染，可直接交给模型；
+ * 结构化字段与 `text` **同源**（同一批读取）。
+ */
 export interface ProjectProfile {
   readonly text: string
   readonly generatedAt: number
   /** git 短 HEAD；非 git 目录为 undefined。 */
   readonly gitHead?: string
+  /** git 项目根（非 git / 解析失败 = 规范化 cwd）。 */
+  readonly root?: string
+  /** 本次 cwd 相对 root 的路径（分隔符统一为 `/`；根目录为 `''`）。 */
+  readonly cwdRel?: string
+  readonly identity?: ProjectProfileIdentity
+  readonly structure?: ProjectProfileStructure
+  readonly history?: ProjectProfileHistory
+  readonly gates?: readonly ProjectProfileGate[]
 }
+
+/** 规格里的名字（`docs/v4.1-spacetime.md` §3.2）；与本文件的 `ProjectProfile` 同义。 */
+export type ProjectProfileView = ProjectProfile
 
 /** 供记忆模块调用的只读端口。 */
 export interface ProjectProfilePort {
@@ -40,19 +118,54 @@ export interface ProjectProfilePort {
 
 /** 默认缓存时长：10 分钟。项目结构不会每秒变化。 */
 export const PROJECT_PROFILE_TTL_MS = 10 * 60 * 1000
+/** 缓存上界：会话/工作区数量有限，上界防长跑进程无限增长。 */
+export const PROJECT_PROFILE_MAX_ENTRIES = 32
 /** 画像正文上限（避免把 README 全文搬进来）。 */
-const PROFILE_TEXT_MAX = 1400
+export const PROFILE_TEXT_MAX = 1400
+/** 源码目录扫描的文件上限（有界扫描，防大仓库拖垮工具调用）。 */
+export const PROJECT_SCAN_MAX_FILES = 2000
+/** 顶层目录展示上限。 */
+const TOP_DIR_MAX = 16
+/** 源码目录展示上限。 */
+const SOURCE_DIR_MAX = 8
+/** 入口文件展示上限。 */
+const ENTRY_MAX = 8
+/** 文档标题上限。 */
+const DOC_MAX = 8
+/** 单文件行数统计上限：超过就不读（仍计入文件数）。 */
+const LINE_COUNT_MAX_BYTES = 512 * 1024
 
 /** 构建配置。 */
 export interface ProjectProfileOptions {
   readonly clock: Clock
   readonly ttlMs?: number
+  /**
+   * 项目根解析（通常是 `SERVICES.projectRoot` 的端口）。
+   * 缺省 = `cwd` 本身；注入的实现**绝不抛**（本文件另有一层 try/catch）。
+   */
+  readonly rootOf?: (cwd: string) => string
+  /** 扫描文件上限；缺省 `PROJECT_SCAN_MAX_FILES`。 */
+  readonly maxFiles?: number
 }
 
 interface CacheEntry {
   readonly profile: ProjectProfile
   readonly expiresAt: number
 }
+
+/** 扫描时跳过的目录：依赖、版本库、生成物、缓存。 */
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', 'lib-gen', 'dist', 'build', 'coverage', '.omb',
+  '.next', '.turbo', 'out', 'target', '.venv', '__pycache__', '.pnpm-store',
+  '.cache', '.idea', '.vscode', '.mypy_cache', '.pytest_cache',
+])
+
+/** 视为"源码"的扩展名。 */
+const SOURCE_EXTENSIONS = new Set([
+  'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs',
+  'py', 'rs', 'go', 'java', 'kt', 'cs', 'c', 'h', 'cpp', 'hpp',
+  'swift', 'rb', 'php', 'sh', 'lua',
+])
 
 /** 安全执行一个只读命令；失败/超时/无输出返回 undefined。 */
 function runGit(cwd: string, args: readonly string[]): string | undefined {
@@ -81,9 +194,9 @@ function readJson(path: string): Record<string, unknown> | undefined {
 }
 
 /** 从 README 里取标题 + 第一段（最多 300 字符）。 */
-function readmeBrief(cwd: string): string | undefined {
+function readmeBrief(root: string): string | undefined {
   for (const name of ['README.zh.md', 'README.md', 'README.zh-CN.md', 'readme.md']) {
-    const path = join(cwd, name)
+    const path = join(root, name)
     if (!existsSync(path)) continue
     try {
       const text = readFileSync(path, 'utf8')
@@ -103,144 +216,435 @@ function readmeBrief(cwd: string): string | undefined {
   return undefined
 }
 
-/** 顶层条目（跳过生成物/依赖目录），固定排序。 */
-function topEntries(cwd: string): string[] {
-  const skip = new Set([
-    'node_modules', '.git', 'dist', 'build', 'lib-gen', 'coverage', '.pnpm-store',
-    '.next', '.turbo', 'out', 'target', '.venv', '__pycache__',
-  ])
+/** 相对路径统一成 `/` 分隔（确定性：同一仓库在 Windows/Posix 上同形）。 */
+function toPosixRelative(from: string, to: string): string {
   try {
-    return readdirSync(cwd)
-      .filter(name => !skip.has(name))
-      .filter(name => {
-        try {
-          return statSync(join(cwd, name)).isDirectory()
-        } catch {
-          return false
-        }
-      })
+    const rel = relative(from, to)
+    if (rel.length === 0) return ''
+    return rel.split(sep).join('/')
+  } catch {
+    return ''
+  }
+}
+
+/** 一条文件路径是否像测试文件。 */
+function looksLikeTest(relativePath: string): boolean {
+  const lower = relativePath.toLowerCase()
+  const base = lower.slice(lower.lastIndexOf('/') + 1)
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(base)) return true
+  if (/(^|\/)(tests?|__tests__)\//.test(lower)) return true
+  return /^test_/.test(base)
+}
+
+/** 数一个文件的行数（有界：只读小文件；失败 0）。 */
+function countLines(path: string): number {
+  try {
+    // 先看尺寸再读：超大文件（生成物/数据）连读都不读，避免一次画像拖垮工具调用。
+    if (statSync(path).size > LINE_COUNT_MAX_BYTES) return 0
+    const buffer = readFileSync(path)
+    if (buffer.length === 0) return 0
+    const text = buffer.toString('utf8')
+    let lines = 0
+    for (let i = 0; i < text.length; i += 1) {
+      if (text.charCodeAt(i) === 10) lines += 1
+    }
+    if (!text.endsWith('\n')) lines += 1
+    return lines
+  } catch {
+    return 0
+  }
+}
+
+/** 一个顶层目录下的源码统计累加器。 */
+interface SourceBucket {
+  files: number
+  lines: number
+  tests: number
+}
+
+interface ScanResult {
+  readonly topDirs: ProjectProfileTopDir[]
+  readonly sources: ProjectProfileSource[]
+  /** 是否因为文件上限而截断（状态面/文本不假装"这就是全部"）。 */
+  readonly truncated: boolean
+}
+
+/**
+ * 有界扫描：只读目录与文件尺寸，按固定顺序遍历，达到文件上限即停。
+ *
+ * 顺序 = 顶层目录字典序 → 目录内名称字典序 → 深度优先。预算耗尽时**停止**
+ * （而不是跳过某些目录），所以同一棵树在任意预算下都产出同一前缀。
+ */
+function scanTree(root: string, maxFiles: number): ScanResult {
+  const topDirs: ProjectProfileTopDir[] = []
+  const sourceBuckets = new Map<string, SourceBucket>()
+  let fileCount = 0
+  let budget = maxFiles
+  let truncated = false
+
+  let topNames: string[] = []
+  try {
+    topNames = readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !SKIP_DIRS.has(entry.name))
+      .map(entry => entry.name)
       .sort()
-      .slice(0, 16)
+  } catch {
+    return { topDirs: [], sources: [], truncated: false }
+  }
+
+  /** 记一个源码文件的规模（非源码扩展名直接跳过）。 */
+  const record = (topName: string, extension: string, absolutePath: string, relativePath: string): void => {
+    if (!SOURCE_EXTENSIONS.has(extension)) return
+    const bucket = sourceBuckets.get(topName) ?? { files: 0, lines: 0, tests: 0 }
+    bucket.files += 1
+    if (looksLikeTest(relativePath)) bucket.tests += 1
+    bucket.lines += countLines(absolutePath)
+    sourceBuckets.set(topName, bucket)
+  }
+
+  const walk = (topName: string, dir: string, prefix: string, depth: number): void => {
+    if (budget <= 0 || depth > 12) {
+      if (budget <= 0) truncated = true
+      return
+    }
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of sorted) {
+      if (budget <= 0) {
+        truncated = true
+        return
+      }
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue
+        walk(topName, join(dir, entry.name), `${prefix}${entry.name}/`, depth + 1)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const relativePath = `${prefix}${entry.name}`
+      const extension = extname(entry.name).replace(/^\./, '').toLowerCase()
+      const absolutePath = join(dir, entry.name)
+      fileCount += 1
+      budget -= 1
+      record(topName, extension, absolutePath, relativePath)
+    }
+  }
+
+  for (const topName of topNames) {
+    if (budget <= 0) {
+      truncated = true
+      break
+    }
+    const before = fileCount
+    walk(topName, join(root, topName), `${topName}/`, 1)
+    topDirs.push({ name: topName, files: fileCount - before })
+  }
+
+  const sources = [...sourceBuckets.entries()]
+    .map(([dir, bucket]) => ({ dir, files: bucket.files, lines: bucket.lines, tests: bucket.tests }))
+    .sort((a, b) => b.files - a.files || a.dir.localeCompare(b.dir))
+    .slice(0, SOURCE_DIR_MAX)
+
+  return {
+    topDirs: topDirs.slice(0, TOP_DIR_MAX),
+    sources,
+    truncated,
+  }
+}
+
+/** 入口文件候选（固定顺序；只保留存在的）。 */
+function entryCandidates(root: string, pkg: Record<string, unknown> | undefined): string[] {
+  const candidates = new Set<string>([
+    'package.json',
+    'tsconfig.json',
+    'README.md',
+    'README.zh.md',
+    'index.ts',
+    'index.js',
+    'main.ts',
+    'src/index.ts',
+    'src/main.ts',
+  ])
+  const main = pkg?.['main']
+  if (typeof main === 'string') candidates.add(main.replace(/^\.\//, ''))
+  const bin = pkg?.['bin']
+  if (typeof bin === 'string') candidates.add(bin.replace(/^\.\//, ''))
+  else if (typeof bin === 'object' && bin !== null) {
+    for (const value of Object.values(bin as Record<string, unknown>)) {
+      if (typeof value === 'string') candidates.add(value.replace(/^\.\//, ''))
+    }
+  }
+  const result: string[] = []
+  for (const relativePath of candidates) {
+    if (result.length >= ENTRY_MAX) break
+    if (relativePath.length === 0 || relativePath.includes('..')) continue
+    if (existsSync(join(root, relativePath))) result.push(relativePath.split(sep).join('/'))
+  }
+  return result
+}
+
+/** `docs/*.md` 的标题（最多 8 条）。 */
+function docTitles(root: string): ProjectProfileDoc[] {
+  const docsDir = join(root, 'docs')
+  try {
+    if (!statSync(docsDir).isDirectory()) return []
   } catch {
     return []
   }
+  let names: string[] = []
+  try {
+    names = readdirSync(docsDir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+      .map(entry => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+  const result: ProjectProfileDoc[] = []
+  for (const name of names.slice(0, DOC_MAX)) {
+    let title = basename(name, extname(name))
+    try {
+      const text = readFileSync(join(docsDir, name), 'utf8')
+      const heading = text.split(/\r?\n/).find(line => /^#\s+/.test(line))
+      if (heading !== undefined) title = heading.replace(/^#\s+/, '').trim()
+    } catch {
+      // 读不到就用文件名当标题
+    }
+    result.push({ path: `docs/${name}`, title })
+  }
+  return result
 }
 
-/** 语言/文件类型分布（优先 git index；非 git 目录退化为顶层统计）。 */
-function languageSummary(cwd: string): string | undefined {
-  let files: string[] = []
-  const listed = runGit(cwd, ['ls-files'])
-  if (listed !== undefined) {
-    files = listed.split(/\r?\n/).filter(Boolean)
-  } else {
-    try {
-      files = readdirSync(cwd).filter(name => {
-        try {
-          return statSync(join(cwd, name)).isFile()
-        } catch {
-          return false
-        }
-      })
-    } catch {
-      return undefined
+/** 解析 git 身份与历史（一条命令拿提交，另外两条拿分支/脏文件）。 */
+function readGit(root: string): {
+  branch?: string
+  head?: string
+  headAt?: number
+  commits?: readonly ProjectProfileCommit[]
+  dirty?: number
+} {
+  const branch = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  const log = runGit(root, ['log', '-5', '--pretty=format:%h%x09%s%x09%ct'])
+  const status = runGit(root, ['status', '--porcelain'])
+  const commits: ProjectProfileCommit[] = []
+  if (log !== undefined) {
+    for (const line of log.split(/\r?\n/)) {
+      const [hash, subject, at] = line.split('\t')
+      if (hash === undefined || subject === undefined) continue
+      const timestamp = Number(at)
+      commits.push({ hash, subject, at: Number.isFinite(timestamp) ? timestamp * 1000 : 0 })
     }
   }
-  const counts = new Map<string, number>()
-  for (const file of files) {
-    const extension = file.includes('.') ? file.slice(file.lastIndexOf('.') + 1).toLowerCase() : ''
-    if (extension.length === 0 || extension.length > 8) continue
-    counts.set(extension, (counts.get(extension) ?? 0) + 1)
+  const head = commits[0]?.hash
+  const headAt = commits[0]?.at === 0 ? undefined : commits[0]?.at
+  const dirty = status === undefined ? undefined : status.split(/\r?\n/).filter(Boolean).length
+  return {
+    ...(branch === undefined ? {} : { branch }),
+    ...(head === undefined ? {} : { head }),
+    ...(headAt === undefined ? {} : { headAt }),
+    ...(commits.length === 0 ? {} : { commits: commits.slice(0, 5) }),
+    ...(dirty === undefined ? {} : { dirty }),
   }
-  const top = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6)
-  if (top.length === 0) return undefined
-  return top.map(([extension, count]) => `${extension} ${count}`).join('、')
+}
+
+/** 从 package.json 取命令门（测试/构建/检查），固定顺序。 */
+function readGates(pkg: Record<string, unknown> | undefined): readonly ProjectProfileGate[] {
+  const scripts = typeof pkg?.['scripts'] === 'object' && pkg?.['scripts'] !== null
+    ? pkg['scripts'] as Record<string, unknown>
+    : {}
+  return Object.keys(scripts)
+    .sort()
+    .filter(key => /test|build|lint|typecheck|verify|check/i.test(key))
+    .slice(0, 8)
+    .map(key => ({ name: key, command: String(scripts[key]) }))
+}
+
+/** 把结构化字段渲染成固定顺序的短文本（与结构同源）。 */
+function renderText(input: {
+  root: string
+  cwdRel: string
+  identity: ProjectProfileIdentity
+  structure: ProjectProfileStructure
+  history: ProjectProfileHistory
+  gates: readonly ProjectProfileGate[]
+  description?: string
+  readme?: string
+  scanTruncated?: boolean
+  scanLimit?: number
+}): string {
+  const { root, cwdRel, identity, structure, history, gates } = input
+  const lines: string[] = []
+  const version = identity.version === undefined ? '' : ` v${identity.version}`
+  const description = input.description === undefined || input.description.length === 0
+    ? ''
+    : ` — ${input.description.slice(0, 120)}`
+  lines.push(`项目：${identity.name ?? basename(root)}${version}${description}`)
+  lines.push(`项目根：${root}（cwd 相对：${cwdRel.length === 0 ? '仓库根' : cwdRel}）`)
+
+  const stack: string[] = []
+  if (existsSync(join(root, 'package.json'))) stack.push('package.json')
+  if (existsSync(join(root, 'tsconfig.json'))) stack.push('TypeScript')
+  if (existsSync(join(root, 'pnpm-lock.yaml'))) stack.push('pnpm')
+  else if (existsSync(join(root, 'package-lock.json'))) stack.push('npm')
+  else if (existsSync(join(root, 'yarn.lock'))) stack.push('yarn')
+  if (stack.length > 0) lines.push(`栈：${stack.join('；')}`)
+
+  if (structure.topDirs !== undefined && structure.topDirs.length > 0) {
+    lines.push(`顶层目录：${structure.topDirs.map(dir => `${dir.name}(${dir.files})`).join('、')}`)
+  }
+  if (structure.sources !== undefined && structure.sources.length > 0) {
+    lines.push(
+      `源码：${structure.sources
+        .map(source => `${source.dir}（${source.files} 文件 / ${source.lines} 行 / ${source.tests} 测试）`)
+        .join('、')}`,
+    )
+  }
+  if (input.scanTruncated === true) {
+    const limit = input.scanLimit ?? PROJECT_SCAN_MAX_FILES
+    lines.push(`（结构扫描已达上限 ${limit} 文件：以上只是前 ${limit} 个文件内的统计）`)
+  }
+  if (structure.entries !== undefined && structure.entries.length > 0) {
+    lines.push(`入口：${structure.entries.join('、')}`)
+  }
+  if (structure.docs !== undefined && structure.docs.length > 0) {
+    lines.push(`文档：${structure.docs.map(doc => `${doc.path}「${doc.title}」`).join('、')}`)
+  }
+  if (gates.length > 0) {
+    lines.push(`命令：${gates.map(gate => `${gate.name}=${gate.command}`).join('；')}`)
+  }
+
+  const gitBits: string[] = []
+  if (identity.branch !== undefined) gitBits.push(`分支 ${identity.branch}`)
+  if (identity.head !== undefined) gitBits.push(`HEAD ${identity.head}`)
+  if (history.dirty !== undefined) gitBits.push(`未提交改动 ${history.dirty} 处`)
+  if (gitBits.length > 0) lines.push(`Git：${gitBits.join('；')}`)
+  if (history.commits !== undefined && history.commits.length > 0) {
+    lines.push(`最近提交：${history.commits.slice(0, 5).map(commit => `${commit.hash} ${commit.subject}`).join(' / ')}`)
+  }
+  if (input.readme !== undefined) lines.push(`README：${input.readme}`)
+
+  const body = lines.join('\n')
+  const footer = '\n（由 OMB 本地构建；如需最新请 refresh）'
+  if (body.length === 0) return ''
+  // 硬上限：含尾注一起 ≤ `PROFILE_TEXT_MAX`（规格 §3.2 的 1400 是**整段文本**的上限）。
+  if (body.length + footer.length <= PROFILE_TEXT_MAX) return body + footer
+  return body.slice(0, PROFILE_TEXT_MAX)
 }
 
 /** 构建一份画像。任何单段失败只丢该段。 */
-function buildProfile(cwd: string, now: number): ProjectProfile | undefined {
+function buildProfile(cwd: string, now: number, rootOf: (cwd: string) => string, maxFiles: number): ProjectProfile | undefined {
   try {
     if (!existsSync(cwd) || !statSync(cwd).isDirectory()) return undefined
   } catch {
     return undefined
   }
 
-  const pkg = readJson(join(cwd, 'package.json'))
-  const name = typeof pkg?.['name'] === 'string' ? pkg['name'] : basename(cwd)
+  // 项目根解析失败 = 用规范化 cwd（"没有项目根"不是"这里没有项目"）。
+  let root = cwd
+  try {
+    const resolved = rootOf(cwd)
+    if (typeof resolved === 'string' && resolved.length > 0) root = resolved
+  } catch {
+    root = cwd
+  }
+  try {
+    if (!existsSync(root) || !statSync(root).isDirectory()) root = cwd
+  } catch {
+    root = cwd
+  }
+  const cwdRel = toPosixRelative(root, cwd)
+
+  const pkg = readJson(join(root, 'package.json'))
+  const name = typeof pkg?.['name'] === 'string' ? pkg['name'] : basename(root)
   const version = typeof pkg?.['version'] === 'string' ? pkg['version'] : undefined
   const description = typeof pkg?.['description'] === 'string' ? pkg['description'] : undefined
-  const scripts = typeof pkg?.['scripts'] === 'object' && pkg['scripts'] !== null
-    ? pkg['scripts'] as Record<string, unknown>
-    : {}
-  const scriptNames = Object.keys(scripts).sort()
-  const gates = scriptNames
-    .filter(key => /test|build|lint|typecheck|verify|check/i.test(key))
-    .slice(0, 8)
-  const dependencies = typeof pkg?.['dependencies'] === 'object' && pkg['dependencies'] !== null
-    ? Object.keys(pkg['dependencies'] as Record<string, unknown>).length
-    : 0
-  const devDependencies = typeof pkg?.['devDependencies'] === 'object' && pkg['devDependencies'] !== null
-    ? Object.keys(pkg['devDependencies'] as Record<string, unknown>).length
-    : 0
 
-  const branch = runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])
-  const head = runGit(cwd, ['rev-parse', '--short', 'HEAD'])
-  const commits = runGit(cwd, ['log', '-5', '--pretty=format:%h %s'])
-  const dirty = runGit(cwd, ['status', '--porcelain'])
-  const languages = languageSummary(cwd)
-  const entries = topEntries(cwd)
-  const readme = readmeBrief(cwd)
+  const scan = scanTree(root, maxFiles)
+  const docs = docTitles(root)
+  const entries = entryCandidates(root, pkg)
+  const gates = readGates(pkg)
+  const git = readGit(root)
 
-  const lines: string[] = []
-  lines.push(`项目：${name}${version === undefined ? '' : ` v${version}`}${description === undefined ? '' : ` — ${description}`}`)
-  const stack: string[] = []
-  if (pkg !== undefined) stack.push(`package.json（依赖 ${dependencies} / 开发依赖 ${devDependencies}）`)
-  if (existsSync(join(cwd, 'tsconfig.json'))) stack.push('TypeScript')
-  if (existsSync(join(cwd, 'pnpm-lock.yaml'))) stack.push('pnpm')
-  else if (existsSync(join(cwd, 'package-lock.json'))) stack.push('npm')
-  else if (existsSync(join(cwd, 'yarn.lock'))) stack.push('yarn')
-  if (languages !== undefined) stack.push(languages)
-  if (stack.length > 0) lines.push(`栈：${stack.join('；')}`)
-  if (entries.length > 0) lines.push(`顶层目录：${entries.join('、')}`)
-  if (gates.length > 0) {
-    lines.push(`命令：${gates.map(key => `${key}=${String(scripts[key])}`).join('；')}`)
-  } else if (scriptNames.length > 0) {
-    lines.push(`命令（前 8 个）：${scriptNames.slice(0, 8).join('、')}`)
+  const identity: ProjectProfileIdentity = {
+    ...(name === undefined ? {} : { name }),
+    ...(version === undefined ? {} : { version }),
+    ...(git.branch === undefined ? {} : { branch: git.branch }),
+    ...(git.head === undefined ? {} : { head: git.head }),
+    ...(git.headAt === undefined ? {} : { headAt: git.headAt }),
   }
-  const gitBits: string[] = []
-  if (branch !== undefined) gitBits.push(`分支 ${branch}`)
-  if (head !== undefined) gitBits.push(`HEAD ${head}`)
-  if (dirty !== undefined) gitBits.push(`未提交改动 ${dirty.split(/\r?\n/).filter(Boolean).length} 处`)
-  if (commits !== undefined) gitBits.push(`最近提交：${commits.split(/\r?\n/).slice(0, 5).join(' / ')}`)
-  if (gitBits.length > 0) lines.push(`Git：${gitBits.join('；')}`)
-  if (readme !== undefined) lines.push(`README：${readme}`)
+  const structure: ProjectProfileStructure = {
+    ...(scan.topDirs.length === 0 ? {} : { topDirs: scan.topDirs }),
+    ...(scan.sources.length === 0 ? {} : { sources: scan.sources }),
+    ...(entries.length === 0 ? {} : { entries }),
+    ...(docs.length === 0 ? {} : { docs }),
+  }
+  const history: ProjectProfileHistory = {
+    ...(git.commits === undefined ? {} : { commits: git.commits }),
+    ...(git.dirty === undefined ? {} : { dirty: git.dirty }),
+  }
+  const readme = readmeBrief(root)
 
-  let text = lines.join('\n').slice(0, PROFILE_TEXT_MAX)
+  const text = renderText({
+    root,
+    cwdRel,
+    identity,
+    structure,
+    history,
+    gates,
+    ...(description === undefined ? {} : { description }),
+    ...(readme === undefined ? {} : { readme }),
+    ...(scan.truncated ? { scanTruncated: true, scanLimit: maxFiles } : {}),
+  })
   if (text.length === 0) return undefined
-  if (text.length < PROFILE_TEXT_MAX) text += '\n（由 OMB 本地构建；如需最新请 refresh）'
-  return { text, generatedAt: now, ...(head === undefined ? {} : { gitHead: head }) }
+
+  return {
+    text,
+    generatedAt: now,
+    ...(git.head === undefined ? {} : { gitHead: git.head }),
+    root,
+    cwdRel,
+    identity,
+    structure,
+    history,
+    gates,
+  }
+}
+
+/** 正整数上限；非法值退回默认。 */
+function positiveInt(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback
+  return Math.floor(value)
 }
 
 /**
  * 创建项目画像端口。
  *
- * @param options - 时钟与 TTL（测试可注入短 TTL/固定时钟）。
+ * @param options - 时钟、TTL、项目根解析器与扫描上限（测试可注入短 TTL/固定时钟）。
  * @returns 端口与幂等 disposer；dispose 只清缓存。
  */
 export function createProjectProfile(options: ProjectProfileOptions): {
   readonly port: ProjectProfilePort
   readonly dispose: () => void
 } {
-  const ttl = options.ttlMs ?? PROJECT_PROFILE_TTL_MS
+  const ttl = positiveInt(options.ttlMs, PROJECT_PROFILE_TTL_MS)
+  const maxFiles = positiveInt(options.maxFiles, PROJECT_SCAN_MAX_FILES)
+  const rootOf = options.rootOf ?? ((cwd: string) => resolve(cwd))
   const cache = new Map<string, CacheEntry>()
   let disposed = false
 
   /** 构建并写缓存（read 与 refresh 共用）。 */
   const buildCached = (cwd: string): ProjectProfile | undefined => {
     const now = options.clock.now()
-    const profile = buildProfile(cwd, now)
-    if (profile !== undefined) cache.set(cwd, { profile, expiresAt: now + ttl })
+    const profile = buildProfile(cwd, now, rootOf, maxFiles)
+    if (profile === undefined) return undefined
+    cache.delete(cwd)
+    cache.set(cwd, { profile, expiresAt: now + ttl })
     // 会话/工作区数量有限，但缓存仍设上界，防长跑进程无限增长。
-    while (cache.size > 32) {
+    while (cache.size > PROJECT_PROFILE_MAX_ENTRIES) {
       const oldest = cache.keys().next().value
       if (oldest === undefined) break
       cache.delete(oldest)

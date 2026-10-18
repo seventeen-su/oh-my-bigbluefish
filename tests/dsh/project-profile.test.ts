@@ -1,16 +1,18 @@
 /**
- * 项目画像端口的行为测试。
+ * 项目画像端口的行为测试（v4.1 §3.2）。
  *
- * 重点不是"文本好看"，而是三条契约：
- * ① 有 package.json/README/目录时能产出可用画像；
- * ② 缓存生效，`refresh()` 才能看到变化；
- * ③ 非目录/读失败/卸载后一律返回 undefined，**绝不抛**。
+ * 重点不是"文本好看"，而是四条契约：
+ * ① 有 package.json/README/目录时能产出可用画像，且文本与结构化层同源；
+ * ② 构建发生在**项目根**：子目录 cwd → root 一致、cwdRel 记录"我在哪"；
+ * ③ 缓存生效，`refresh()` 才能看到变化；确定性（同树同输出）；
+ * ④ 非目录/读失败/卸载后一律返回 undefined，**绝不抛**。
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createProjectProfile } from '../../dsh/project-profile.js'
+import { PROFILE_TEXT_MAX } from '../../dsh/project-profile.js'
 
 const dirs: string[] = []
 
@@ -29,6 +31,32 @@ function makeProject(): string {
   writeFileSync(join(dir, 'tsconfig.json'), '{}')
   writeFileSync(join(dir, 'pnpm-lock.yaml'), '')
   return dir
+}
+
+function makeRepo(): string {
+  const root = mkdtempSync(join(tmpdir(), 'omb-project-repo-'))
+  dirs.push(root)
+  writeFileSync(join(root, 'package.json'), JSON.stringify({
+    name: 'repo-demo',
+    version: '0.1.0',
+    description: 'a repo used by profile tests',
+    scripts: { build: 'tsc', test: 'vitest run', dev: 'vite' },
+    dependencies: { zod: '^4' },
+    devDependencies: { vitest: '^3' },
+  }))
+  writeFileSync(join(root, 'README.md'), '# Repo Demo\n\nA repo for the profile.\n')
+  writeFileSync(join(root, 'tsconfig.json'), '{}')
+  writeFileSync(join(root, 'pnpm-lock.yaml'), '')
+  mkdirSync(join(root, 'src', 'deep'), { recursive: true })
+  writeFileSync(join(root, 'src', 'index.ts'), 'export const a = 1\nexport const b = 2\n')
+  writeFileSync(join(root, 'src', 'deep', 'util.ts'), '// util\n')
+  mkdirSync(join(root, 'tests'), { recursive: true })
+  writeFileSync(join(root, 'tests', 'index.test.ts'), 'it("x", () => {})\n')
+  mkdirSync(join(root, 'docs'), { recursive: true })
+  writeFileSync(join(root, 'docs', 'guide.md'), '# Guide Title\n\nbody\n')
+  mkdirSync(join(root, 'sub', 'deep'), { recursive: true })
+  writeFileSync(join(root, 'sub', 'deep', 'note.md'), '# note\n')
+  return root
 }
 
 afterEach(() => {
@@ -89,5 +117,78 @@ describe('项目画像', () => {
     expect(port.read(join(dir, 'package.json'))).toBeUndefined()
     dispose()
     expect(port.read(dir)).toBeUndefined()
+  })
+
+  it('子目录 cwd：构建在项目根，cwdRel 记录"我在哪"，结构层与文本同源', () => {
+    const root = makeRepo()
+    const cwd = join(root, 'sub', 'deep')
+    const { port, dispose } = createProjectProfile({ clock: { now: () => 100 }, rootOf: () => root })
+    const view = port.read(cwd)
+    expect(view).toBeDefined()
+    expect(view?.root).toBe(resolve(root))
+    expect(view?.cwdRel).toBe('sub/deep')
+    expect(view?.identity?.name).toBe('repo-demo')
+    expect(view?.identity?.version).toBe('0.1.0')
+    expect(view?.gates?.map(gate => gate.name)).toEqual(['build', 'test'])
+
+    const src = view?.structure?.sources?.find(source => source.dir === 'src')
+    expect(src, 'src 目录必须被统计到').toBeDefined()
+    expect(src?.files).toBe(2)
+    expect(src?.lines).toBe(3)
+    expect(src?.tests).toBe(0)
+    const tests = view?.structure?.sources?.find(source => source.dir === 'tests')
+    expect(tests?.tests).toBe(1)
+
+    expect(view?.structure?.docs?.[0]?.path).toBe('docs/guide.md')
+    expect(view?.structure?.docs?.[0]?.title).toBe('Guide Title')
+    expect(view?.structure?.entries).toContain('package.json')
+    expect(view?.structure?.entries).toContain('src/index.ts')
+
+    expect(view?.text).toContain('cwd 相对：sub/deep')
+    expect(view?.text).toContain('源码：')
+    expect(view?.text).toContain('docs/guide.md「Guide Title」')
+    expect(view?.text.length ?? 0).toBeLessThanOrEqual(PROFILE_TEXT_MAX)
+    dispose()
+  })
+
+  it('从项目根调用：cwdRel 为空串，文本写"仓库根"', () => {
+    const root = makeRepo()
+    const { port, dispose } = createProjectProfile({ clock: { now: () => 1 }, rootOf: () => root })
+    const view = port.read(root)
+    expect(view?.root).toBe(resolve(root))
+    expect(view?.cwdRel).toBe('')
+    expect(view?.text).toContain('cwd 相对：仓库根')
+    dispose()
+  })
+
+  it('确定性：同一棵树两次重建产出同一份结构/身份/文本', async () => {
+    const root = makeRepo()
+    let now = 7
+    const { port, dispose } = createProjectProfile({ clock: { now: () => now }, rootOf: () => root })
+    const first = await port.refresh(root)
+    now = 9
+    const second = await port.refresh(root)
+    expect(first).toBeDefined()
+    expect(second).toBeDefined()
+    expect(JSON.stringify(second?.structure)).toBe(JSON.stringify(first?.structure))
+    expect(JSON.stringify(second?.identity)).toBe(JSON.stringify(first?.identity))
+    expect(JSON.stringify(second?.gates)).toBe(JSON.stringify(first?.gates))
+    expect(second?.text).toBe(first?.text)
+    expect(second?.generatedAt).toBe(9)
+    dispose()
+  })
+
+  it('有界扫描：达到文件上限时如实标注，不假装"这就是全部"', () => {
+    const root = makeRepo()
+    const { port, dispose } = createProjectProfile({
+      clock: { now: () => 1 },
+      rootOf: () => root,
+      maxFiles: 3,
+    })
+    const view = port.read(root)
+    expect(view).toBeDefined()
+    expect(view?.text).toContain('结构扫描已达上限 3 文件')
+    expect(view?.text.length ?? 0).toBeLessThanOrEqual(PROFILE_TEXT_MAX)
+    dispose()
   })
 })

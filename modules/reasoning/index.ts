@@ -56,7 +56,7 @@ import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
 /** 版本号在发版时由 Lead 统一抬；本模块不单独进位。 */
-export const MODULE_VERSION = '4.0.0'
+export const MODULE_VERSION = '4.1.0'
 
 /** 会话表上界（LRU）。超过就淘汰最久未活动的会话状态。 */
 export const MAX_TRACKED_SESSIONS = 128
