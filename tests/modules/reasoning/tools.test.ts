@@ -113,14 +113,14 @@ describe('omb_method', () => {
     bad.handle.dispose()
   })
 
-  it('描述与参数说明都写清"不传 topic 只给索引、不含正文"', () => {
+  it('描述与参数说明都写清"不传 topic 返回索引、传 topic 取正文"', () => {
     const { handle, ports } = makePorts()
     const tool = createMethodTool(ports)
-    expect(tool.description).toContain('只返回索引')
-    expect(tool.description).toContain('不含规则正文')
+    expect(tool.description).toContain('返回索引')
+    expect(tool.description).toContain('取正文')
     const schema = (tool.parameters as unknown as { jsonSchema: { properties: { topic: { description: string } } } })
       .jsonSchema
-    expect(schema.properties.topic.description).toContain('不含规则正文')
+    expect(schema.properties.topic.description).toContain('不传返回索引')
     handle.dispose()
   })
 })
@@ -296,7 +296,7 @@ describe('omb_verify：Verify 一环', () => {
     const { handle, ports } = makePorts()
     const description = createVerifyTool(ports).description
     expect(description).toContain('形式核对')
-    expect(description).toContain('不判断内容是否为真')
+    expect(description).toContain('不判内容真假')
     expect(description).toContain('failure')
     handle.dispose()
   })

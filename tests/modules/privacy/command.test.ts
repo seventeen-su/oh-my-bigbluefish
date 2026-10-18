@@ -7,8 +7,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { CommandResultLike, PrivacyCommandApi } from '../../../modules/memory/privacy/command.js'
 import {
+  PRIVACY_CLEAN_COMMAND_NAME,
   PRIVACY_COMMAND_NAME,
   PRIVACY_USAGE,
+  runPrivacyCleanCommand,
   runPrivacyCommand,
   sessionOfInvocation,
 } from '../../../modules/memory/privacy/command.js'
@@ -125,14 +127,14 @@ describe('命令语法', () => {
     const a = api()
     const result = runPrivacyCommand('sealed', noSession, a)
     expect(result.kind).toBe('error')
-    expect(result.text).toContain('拿不到本次命令所属的会话')
+    expect(result.text).toContain('读取本次命令所属的会话失败')
     expect(a.setMode).not.toHaveBeenCalled()
   })
 
   it('未知参数给用法', () => {
     const result = runPrivacyCommand('随便', withSession, api())
     expect(result.kind).toBe('error')
-    expect(result.text).toContain('不认识的参数')
+    expect(result.text).toContain('错误的参数')
     expect(result.text).toContain('/omb-privacy')
   })
 
@@ -148,6 +150,43 @@ describe('命令语法', () => {
       }) as unknown as PrivacyCommandApi['setMode'],
     })
     const result = runPrivacyCommand('sealed', withSession, a)
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('炸了')
+  })
+})
+
+describe('独立的清除命令 /omb-privacy-clean', () => {
+  it('命令名固定且带子参数（带参数才被认领）', () => {
+    expect(PRIVACY_CLEAN_COMMAND_NAME).toBe('omb-privacy-clean')
+  })
+
+  it('不带参数 = 清理当前会话的受限记录', () => {
+    const a = api()
+    expect(runPrivacyCleanCommand('', withSession, a)).toEqual({ kind: 'success', text: 'forget ok' })
+    expect(a.forget).toHaveBeenCalledWith('s1')
+  })
+
+  it('带参数 = 清理指定会话', () => {
+    const a = api()
+    expect(runPrivacyCleanCommand('sess-A', withSession, a)).toEqual({ kind: 'success', text: 'forget ok' })
+    expect(a.forget).toHaveBeenCalledWith('sess-A')
+  })
+
+  it('拿不到当前会话且没给 id → 拒绝并说明（不猜）', () => {
+    const a = api()
+    const result = runPrivacyCleanCommand('', noSession, a)
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('请提供会话 id')
+    expect(a.forget).not.toHaveBeenCalled()
+  })
+
+  it('api 抛异常 → 可读 error（不打断命令通道）', () => {
+    const a = api({
+      forget: (() => {
+        throw new Error('炸了')
+      }) as unknown as PrivacyCommandApi['forget'],
+    })
+    const result = runPrivacyCleanCommand('', withSession, a)
     expect(result.kind).toBe('error')
     expect(result.text).toContain('炸了')
   })

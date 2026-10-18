@@ -46,8 +46,8 @@ import type { ModuleRegistration, PromptContribution, StatusRegistry } from '../
 /** 迟到模块的常驻文案。字符数在断言里现算，避免测试自己钉一个会漂的数字。 */
 const LATE_RESIDENT = '迟到的模块也必须到达模型'
 
-/** 真机上推理模块的常驻提示实测占 104 字符（`modules/reasoning/methods.ts:152`）。 */
-const REASONING_CHARS = 104
+/** 真机上推理模块的常驻提示实测占 71 字符（`modules/reasoning/methods.ts` 的第一条变体）。 */
+const REASONING_CHARS = 71
 
 /**
  * 造一个只做一件事的模块登记项：provide 一个 `prompt:<name>` 贡献。

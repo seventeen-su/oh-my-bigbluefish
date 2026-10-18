@@ -42,7 +42,7 @@ const methodInput = z.object({
   topic: z
     .string()
     .describe(
-      '规则卡编号（如 R3）、话题（如 备选/失败/冲突）或 all；不传则返回索引（编号+标题+何时用），不含规则正文',
+      '规则卡编号（R3）、话题（备选/失败/冲突）或 all；不传返回索引（编号+标题+何时用）',
     )
     .optional(),
 })
@@ -50,20 +50,20 @@ const methodInput = z.object({
 const focusInput = z.object({
   depth: z
     .enum(FOCUS_DEPTH_VALUES, { error: `depth 必须是 ${FOCUS_DEPTHS.join(' / ')} 之一` })
-    .describe('推理深度档位：quick 直接回答 / standard 默认 / deep 更高验证预算'),
-  reason: z.string().describe('为什么调这一档（进审计与状态面，便于事后判断档位是否有用）').optional(),
+    .describe('档位：quick / standard / deep'),
+  reason: z.string().describe('调档原因（供审计）').optional(),
 })
 
 const verifyInput = z.object({
-  claim: z.string().describe('要核对的结论（一句话）。与 failure 至少给一个').optional(),
+  claim: z.string().describe('待核对结论；与 failure 至少一个').optional(),
   evidence: z
     .string()
-    .describe('支撑这条结论的来源：文件行号 / 命令输出 / 用户原话 / 工件路径')
+    .describe('来源：文件行号/命令输出/用户原话/工件路径')
     .optional(),
-  falsifier: z.string().describe('如果这条结论错了，会看到什么不一样').optional(),
+  falsifier: z.string().describe('结论错了会看到什么').optional(),
   failure: z
     .enum(FAILURE_CLASSES as unknown as [FailureClass, ...FailureClass[]])
-    .describe('给一次失败定性；给 unknown 时会用循环观察细化')
+    .describe('失败定性；unknown 用循环观察细化')
     .optional(),
 })
 
@@ -141,7 +141,7 @@ export function createMethodTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_method',
     description:
-      '按需拉取方法论规则卡 R1–R8。不传 topic 只返回索引（编号+标题+何时用），不含规则正文；要正文就传 topic（如 "R3"、"备选"、"失败"、"冲突"，或 "all" 取全部八张）。',
+      '拉取方法论卡 R1–R8。不传 topic 返回索引（编号+标题+何时用）；传 topic（R3 / 备选 / 失败 / 冲突 / all）取正文。',
     parameters: methodParams,
     execute(args: unknown): ToolOutcome {
       try {
@@ -187,7 +187,7 @@ export function createMethodTool(ports: ReasoningToolPorts): ToolDefinition {
 export function createFocusTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_focus',
-    description: `设定本会话的推理深度档位：${FOCUS_DEPTHS.join(' / ')}。quick=直接回答（简单确认/闲聊），standard=默认，deep=展开备选与可检验性。档位从下一轮起影响注入；上下文紧张时控制读数照给、规则卡只给索引（编号+标题+何时用），正文用 omb_method 取。reason 说明为什么调档（便于事后核对档位是否有用）。`,
+    description: `设定本会话推理深度：${FOCUS_DEPTHS.join(' / ')}。quick 直接答，standard 默认，deep 展开备选与可检验性。下一轮生效；上下文紧张时只给卡索引，正文用 omb_method，reason 记调档原因（供审计）。`,
     parameters: focusParams,
     execute(args: unknown): ToolOutcome {
       try {
@@ -227,8 +227,8 @@ export function createVerifyTool(ports: ReasoningToolPorts): ToolDefinition {
   return {
     name: 'omb_verify',
     description:
-      '验证一环。传 claim 核对一条结论：来源是否指得出来（文件行号/命令输出/用户原话/工件路径）、能否说出否证条件；传 failure 给一次失败定性（'
-      + `${FAILURE_CLASSES.join('/')}）并拿回该类处置与重试预算。只做形式核对，不判断内容是否为真。`,
+      '验证一环：claim 核对结论（来源可指、能否否证）；failure 给失败定性并返回处置与重试预算（'
+      + `${FAILURE_CLASSES.join('/')}）。只做形式核对，不判内容真假。`,
     parameters: verifyParams,
     execute(args: unknown): ToolOutcome {
       try {

@@ -401,12 +401,12 @@ interface ToolParameters extends ToolInputSchema {
 const RELATE_JSON_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
-    id: { type: 'string', description: '记忆 id（可从 omb_recall 的溯源行里拿到）' },
-    depth: { type: 'integer', enum: [1, 2], description: '跳数；默认 1，2 = 两跳' },
+    id: { type: 'string', description: '记忆 id（见 omb_recall 溯源行）' },
+    depth: { type: 'integer', enum: [1, 2], description: '跳数 1|2，默认 1' },
     types: {
       type: 'array',
       items: { type: 'string', enum: [...EDGE_TYPES] },
-      description: '要跟的边类型；省略 = 三种全要',
+      description: '边类型，省略=全部',
     },
   },
   required: ['id'],
@@ -430,10 +430,8 @@ export function createRelateTool(deps: RelateToolDeps): ToolDefinition {
   return {
     name: RELATE_TOOL,
     description:
-      '按需拉取与某条记忆**多跳相关**的其他记忆（类型化边：supersedes 时序更正 / ' +
-      'conflicts_with 未裁决矛盾 / derived_from 派生来源）。默认检索路径不含图扩展——' +
-      '只有当你确实需要"这条结论是被谁取代的""还有哪些观察与它冲突"时才调用。' +
-      '参数：{ id, depth?: 1|2, types?: ["supersedes","conflicts_with","derived_from"] }。',
+      '拉取某条记忆的多跳关联（supersedes 时序更正 / conflicts_with 未裁决矛盾 / derived_from 派生来源）。'
+      + '默认检索不含图扩展；需要"这条被谁取代/还有哪些冲突"时才用。',
     parameters,
     async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       const parsed = parseRelateArgs(args)

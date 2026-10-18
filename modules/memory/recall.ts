@@ -40,15 +40,15 @@ interface ToolParameters extends ToolInputSchema {
 const RECALL_JSON_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
-    query: { type: 'string', description: '要回忆什么（自然语言或关键词；中文可直接写）' },
-    limit: { type: 'integer', minimum: 1, maximum: 20, description: '最多返回几条，默认 5' },
-    scope: { type: 'string', enum: [...MEMORY_SCOPES], description: '偏好哪个库（仅影响排序与配额，不用于过滤）' },
+    query: { type: 'string', description: '要回忆什么（自然语言/关键词）' },
+    limit: { type: 'integer', minimum: 1, maximum: 20, description: '条数，默认 5' },
+    scope: { type: 'string', enum: [...MEMORY_SCOPES], description: '偏好库（仅影响排序/配额）' },
     kinds: {
       type: 'array',
       items: { type: 'string', enum: [...MEMORY_KINDS] },
-      description: '限定记忆类型；省略 = 不限',
+      description: '记忆类型，省略=不限',
     },
-    rerank: { type: 'boolean', description: '是否启用廉价重排（默认关闭）' },
+    rerank: { type: 'boolean', description: '启用廉价重排，默认关' },
   },
   required: ['query'],
   additionalProperties: false,
@@ -60,9 +60,9 @@ const FORGET_JSON_SCHEMA: Record<string, unknown> = {
     ids: {
       type: 'array',
       items: { type: 'string' },
-      description: '要**硬删除**的记忆 id（用户显式要求遗忘时才用；不可撤销）',
+      description: '要删除的记忆 id（不可撤销）',
     },
-    id: { type: 'string', description: '单条写法的便捷形式，等价于 ids: [id]' },
+    id: { type: 'string', description: '单条便捷写法，等价 ids:[id]' },
   },
   additionalProperties: false,
 }
@@ -323,13 +323,9 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       // ① 常驻预算总共 120 字符，推理那条已占 104，新增段要么截断它、要么抬高全体成本；
       // ② 工具描述与能力**同处一个清单**，模型在考虑用哪些工具时正好读到它；
       // ③ 常驻提示必须逐字节稳定（否则整个前缀缓存失效），做成"按需出现"反而更贵。
-      '当问题涉及"之前 / 上次 / 我们说过的 / 我的偏好 / 以前定过的方案"，' +
-      '或者当前任务看起来是过去某次工作的延续时，先查这里再回答——' +
-      '跨会话的既往结论只存在于此，不在你的上下文里。' +
-      '从记忆库召回与当前任务相关的既往结论/偏好/经验。**逐字返回**并附带溯源 ' +
-      '（sourceRef 与 observedAt），便于你判断证据新旧与来源。返回空结果也是正常结论 ' +
-      '（说明"不需要记忆"或确实没有相关记忆），不是错误。**已被推翻的条目不作为有效结论注入**；' +
-      '若本次存在这类候选，回执会列出它们的 id——那是历史痕迹，需要追溯时用 omb_relate。' +
+      '当问题涉及"之前/上次、讨论/做过的、我的（偏好）、纠错"，或当前任务可能为过去某次工作的延续时，先查这里的跨会话既往结论再回答。' +
+      '从记忆库召回相关的既往结论/偏好/经验，逐字返回并附溯源（sourceRef 与 observedAt），便于判断证据新旧。' +
+      '已被推翻的条目不作为有效结论注入；若存在这类候选，回执会列出 id——那是历史痕迹，追溯用 omb_relate。' +
       '需要多跳关联（这条结论被谁取代、还有哪些冲突）时也用 omb_relate。',
     parameters,
     async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
@@ -343,6 +339,13 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band), ports)
       // 记账在**结果已经成立之后**：它失败与否都不改变"检索到了什么"（也绝不抛）
       await markInjectedAsUsed(deps, resolved.stores, result)
+      if (result.items.length === 0) {
+        // 空结果也必须有可行动作：先说"没检索到"，再带上门控/降级原因与"不要编造"。
+        const parts = [`未检索到相关记忆（${result.note}）`]
+        if (result.degraded.length > 0) parts.push(`降级：${result.degraded.join('；')}`)
+        parts.push('不要编造内容')
+        return { kind: 'text', text: `${parts.join('；')}${unknownAttributionNote(call)}` }
+      }
       return { kind: 'text', text: renderRecall(result) + unknownAttributionNote(call) }
     },
   }
@@ -361,8 +364,7 @@ export function createForgetTool(deps: MemoryToolDeps): ToolDefinition {
   return {
     name: FORGET_TOOL,
     description:
-      '按 id **硬删除**记忆（不可撤销）。只在用户显式要求遗忘、或保留策略清理过期记录时使用；' +
-      '常规的"记忆衰减"由离线整合负责，不需要调用本工具。整库擦除请由用户直接操作库文件。',
+      '按 id 硬删除记忆（不可撤销）。仅用于用户显式要求遗忘或清理过期记录；记忆衰减由离线整合负责。整库擦除由用户直接操作库文件。',
     parameters,
     async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {
       const parsed = parseForgetArgs(args)

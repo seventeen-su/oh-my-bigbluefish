@@ -190,7 +190,7 @@ describe('注册面', () => {
 
       expect(() => booted.dispose()).not.toThrow()
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeUndefined()
-      expect(booted.commands.disposed()).toBe(1)
+      expect(booted.commands.disposed()).toBe(2)
     } finally {
       ws.cleanup()
     }
@@ -204,7 +204,7 @@ describe('注册面', () => {
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeDefined()
       // 命令面缺席**必须可读**：健康面写明未注册与原因，而不是静默少一条命令
       const health = await booted.registration.manifest.health()
-      expect(health.detail).toContain('命令面：omb-privacy **未注册**')
+      expect(health.detail).toContain('命令面：omb-privacy、omb-privacy-clean **未注册**')
       expect(health.detail).toContain('commands')
       expect(() => booted.dispose()).not.toThrow()
     } finally {
@@ -579,7 +579,7 @@ describe('健康面与状态面', () => {
       expect(health.detail).toContain('隐私闸门（/omb-privacy）')
       expect(health.detail).toContain('基线=normal（从未配置过）')
       expect(health.detail).toContain(path)
-      expect(health.detail).toContain('命令面：omb-privacy 已注册')
+      expect(health.detail).toContain('命令面：omb-privacy、omb-privacy-clean 已注册')
       expect(health.metrics?.['privacy.sessionsWithMode']).toBeTypeOf('number')
       booted.dispose()
     } finally {

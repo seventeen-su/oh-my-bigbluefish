@@ -428,30 +428,29 @@ interface ToolParameters extends ToolInputSchema {
 const rememberArgsSchema = z.object({
   text: z
     .string()
-    .describe('要逐字记住的原话/结论。不要转述、不要摘要——逐字原文比有损抽取更可靠。'),
+    .describe('逐字原文/结论；不要转述或摘要'),
   kind: z
     .enum(['episodic', 'semantic', 'procedural'])
-    .describe('episodic=情境记录；semantic=长期结论/偏好；procedural=做法与经验。决定落哪个库。'),
+    .describe('episodic=情境；semantic=结论/偏好；procedural=做法。决定落库。'),
   scope: z
     .enum(['user', 'project'])
     .optional()
-    .describe('显式覆盖落库位置。省略时按 kind 路由：semantic→用户库，episodic/procedural→项目库。'),
+    .describe('覆盖落库位置；省略按 kind 路由（semantic→用户库，其余→项目库）'),
   sourceRef: z
     .string()
     .optional()
-    .describe('来源引用（会话/轮次/文件/命令）。省略时用当前会话与回合号；没有来源就无法建立证据独立。'),
+    .describe('来源引用（会话/轮次/文件/命令）；省略用当前会话与回合号'),
   userAsserted: z
     .boolean()
     .optional()
-    .describe('仅当这句是用户自己明确说过的原话时置 true。不要为了写入而声称是用户说的。'),
+    .describe('仅当用户原话时 true'),
   supersedes: z
     .array(z.string().min(1))
     .max(MAX_SUPERSEDE_TARGETS)
     .optional()
     .describe(
-      `本条目**取代**的旧记忆 id 列表（最多 ${MAX_SUPERSEDE_TARGETS} 条；id 从 omb_recall / omb_relate 的溯源行里拿）。` +
-        '只在旧结论已被新证据或实测推翻时给：会把旧条目标为"已被本条取代"（validTo + supersededBy，非破坏性、' +
-        '历史仍可查）并建立 supersedes 边，使后续会话召回到它时能立刻看出它不再有效。不要用它表达"内容相近"。',
+      `本条目取代的旧记忆 id（最多 ${MAX_SUPERSEDE_TARGETS} 条；id 见 omb_recall/omb_relate 溯源行）。` +
+        '仅当旧结论已被新证据或实测推翻时给；会标旧条目为"已被取代"并建 supersedes 边（非破坏性、历史可查）。',
     ),
 })
 
@@ -911,9 +910,8 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
   return {
     name: REMEMBER_TOOL,
     description:
-      '把一条值得记住的内容写进记忆库（逐字原文 + 溯源）。只在满足准入时写入：' +
-      '用户明确说过的原话、可由具体工件（文件/命令/URL/提交）复现的事实、或被执行结果确认过的结论。' +
-      '模糊印象与推测会被拒绝（会给出原因）。写入是即时生效的，不需要额外确认。',
+      '将值得记住的内容写入记忆库（逐字原文+溯源）。仅在满足准入时写入：用户原话、可由工件（文件/命令/URL/提交）复现的事实、'
+      + '或执行结果确认的结论；模糊印象会被拒绝并给出原因。即时生效。',
     parameters,
 
     async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {

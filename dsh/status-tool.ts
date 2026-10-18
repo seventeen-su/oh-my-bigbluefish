@@ -383,13 +383,12 @@ export function buildStatusTool(handle: KernelHandle): ToolSpec {
   return {
     name: 'omb_status',
     description:
-      '查看 OMB 认知层的运行状态：各模块健康与降级原因、记忆库路径与就绪情况、'
-      + '当前上下文压力档位与缓存命中、推理深度档位、以及各组件自述。'
-      + '当某个功能表现异常、或需要确认哪个模块被关闭时使用。',
+      '检查 OMB 运行状态：模块健康与降级原因、记忆库路径与就绪、上下文压力与缓存、推理深度、各组件自述。'
+      + '功能异常或确认模块开关时用。',
     parameters: {
       type: 'object',
       properties: {
-        session: PARAM.optionalString('要查看的会话 id；缺省取当前活跃会话'),
+        session: PARAM.optionalString('会话 id，缺省当前活跃会话'),
       },
       additionalProperties: false,
     },

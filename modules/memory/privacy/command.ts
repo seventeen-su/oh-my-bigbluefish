@@ -68,7 +68,10 @@ export const PRIVACY_COMMAND_ID = 'omb-memory/privacy'
 export const PRIVACY_USAGE =
   '用法：/omb-privacy [status | normal | read-only | sealed | trust | forget <会话id> | clear]'
   + '（不带参数 = status；只影响当前会话，子代理继承；trust 只清除 fail-closed 兜底标记；'
-  + 'forget/clear 清除已结束会话留下的受限记录——它们不再掐住后续会话）'
+  + 'forget/clear 清除当前或指定会话残留的受限记录）'
+
+export const PRIVACY_CLEAN_COMMAND_NAME = 'omb-privacy-clean'
+export const PRIVACY_CLEAN_COMMAND_ID = 'omb-memory/privacy-clean'
 
 export interface InvocationSession {
   readonly sessionId: string | null
@@ -151,8 +154,7 @@ export function runPrivacyCommand(
         if (session.sessionId === null) {
           return {
             kind: 'error',
-            text: '拿不到本次命令所属的会话（宿主未提供 invocation.agent）：'
-              + '无法按会话设置隐私模式。请在新会话里重试，或用 /omb-privacy status 查看。',
+            text: '读取本次命令所属的会话失败：无法按会话设置隐私模式，请在新会话里重试，或用 /omb-privacy status 查看。',
           }
         }
         const mode = head === 'sealed' ? 'sealed' : head === 'normal' ? 'normal' : 'read-only'
@@ -168,7 +170,7 @@ export function runPrivacyCommand(
           return {
             kind: 'error',
             text: 'forget 需要指明会话：/omb-privacy forget <会话id>'
-              + '（哪些会话有显式设置见 /omb-privacy status）。',
+              + '（全部会话显式设置见 /omb-privacy status）。',
           }
         }
         return api.forget(target)
@@ -182,10 +184,37 @@ export function runPrivacyCommand(
         return { kind: 'success', text: PRIVACY_USAGE }
 
       default:
-        return { kind: 'error', text: `不认识的参数「${words[0] ?? ''}」。${PRIVACY_USAGE}` }
+        return { kind: 'error', text: `错误的参数「${words[0] ?? ''}」。${PRIVACY_USAGE}` }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     return { kind: 'error', text: `隐私命令执行失败：${message}` }
+  }
+}
+
+/**
+ * `/omb-privacy-clean`：清除**当前或指定会话**残留的受限记录。
+ *
+ * 与主命令分开的理由：这是"收拾自己设过的限制"的一次性动作，
+ * 和"切换档位"不是同一件事；拆开后主命令的说明只需讲档位。
+ * 绝不抛：任何输入都回到一条可读结果。
+ */
+export function runPrivacyCleanCommand(
+  rawInput: string,
+  session: InvocationSession,
+  api: PrivacyCommandApi,
+): CommandResultLike {
+  const target = rawInput.trim().split(/\s+/).filter(word => word.length > 0)[0]
+  try {
+    if (target === undefined) {
+      if (session.sessionId === null) {
+        return { kind: 'error', text: '读取当前会话失败：请提供会话 id。' }
+      }
+      return api.forget(session.sessionId)
+    }
+    return api.forget(target)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { kind: 'error', text: `清除受限记录失败：${message}` }
   }
 }

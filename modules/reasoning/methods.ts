@@ -165,14 +165,13 @@ export function residentHint(maxChars: number = RESIDENT_HINT_MAX): string {
 /**
  * 由长到短：能装下哪条用哪条，保证常驻提示永远在预算内。
  *
- * 四条都以 R1 的动作**逐字**开头（"先判断这个问题需要多少推理"）；
+ * 三条都以 R1 的动作**逐字**开头（"先判断这个问题需要多少推理"）；
  * 预算变小时先舍工具名、再舍后半句——动作本身留到最后（只有截断才可能丢）。
  * 三条常用工具（方法卡 / 档位 / 验证）只在预算够时点名：工具本身在工具面里可见，
  * 常驻提示的职责是"何时用"，不是"有哪些工具"。
  */
 const RESIDENT_HINT_VARIANTS: readonly string[] = [
-  '先判断这个问题需要多少推理：简单/闲聊/事实问答直接答，需推导或多方案再展开。规则卡 R1–R8 用 omb_method 取，深度档位用 omb_focus 设，结论核对与失败定性用 omb_verify。',
-  '先判断这个问题需要多少推理：简单直接答，需推导或多方案再展开。卡 omb_method，档位 omb_focus，验证 omb_verify。',
+  '先判断这个问题需要多少推理：简单直接答，复杂再展开。规则卡用 omb_method，档位用 omb_focus，验证用 omb_verify。',
   '先判断这个问题需要多少推理：简单直接答，复杂再展开；omb_method / omb_focus / omb_verify。',
   '先判断这个问题需要多少推理：简单直接答，复杂再展开。',
 ]

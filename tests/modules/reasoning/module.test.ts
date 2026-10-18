@@ -477,7 +477,7 @@ describe('回执 / 工具描述 / 渲染：紧张档说的是同一件事', () =
     expect(receipt).toContain('上下文紧张时读数照给')
     expect(receipt).toContain('索引')
     // 工具描述也这么说（模型是先看描述、后看回执的）
-    expect(focusTool?.description).toContain('上下文紧张时控制读数照给、规则卡只给索引')
+    expect(focusTool?.description).toContain('上下文紧张时只给卡索引')
 
     // 渲染侧：读数在、索引在、正文不在
     const tight = contributionOf(handle).context!({ sessionId: 'live', depth: 'deep', band: 'tight' })

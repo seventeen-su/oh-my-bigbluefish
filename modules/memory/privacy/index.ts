@@ -68,9 +68,12 @@ import type { PrivacyDoc } from './codec.js'
 import { createPrivacyDurable, resolvePrivacyPath, type StoragePortLike } from './durable.js'
 import type { CommandInvocationLike, CommandResultLike, PrivacyCommandApi } from './command.js'
 import {
+  PRIVACY_CLEAN_COMMAND_ID,
+  PRIVACY_CLEAN_COMMAND_NAME,
   PRIVACY_COMMAND_ID,
   PRIVACY_COMMAND_NAME,
   PRIVACY_USAGE,
+  runPrivacyCleanCommand,
   runPrivacyCommand,
   sessionOfInvocation,
 } from './command.js'
@@ -312,7 +315,7 @@ export function installPrivacy(
       : '基线=normal（从未配置过）'
     const detail =
       `${entries.length} 个会话有显式设置；${describeRestrictedCounts(counts)}；${baselineTitle}；${fileState}；`
-      + `命令面：${PRIVACY_COMMAND_NAME} ${commandState}；`
+      + `命令面：${PRIVACY_COMMAND_NAME}、${PRIVACY_CLEAN_COMMAND_NAME} ${commandState}；`
       + `拒绝计数：读 ${stats.readDenials}、写 ${stats.writeDenials}、`
       + `归属未知写 ${stats.unattributedWriteDenials}`
     return {
@@ -553,10 +556,7 @@ export function installPrivacy(
       const returned = commands.register({
         definitionId: PRIVACY_COMMAND_ID,
         name: PRIVACY_COMMAND_NAME,
-        description:
-          '隐私模式：read-only（可读不可写）/ sealed（不可读不可写）/ normal；'
-          + '按会话生效、子代理继承、重启不丢；'
-          + 'forget <会话id> / clear 清除已结束会话留下的受限记录。',
+        description: '设置当前对话记忆库隐私开关',
         /**
          * ⚠️ **声明 `input` 是"带参数的命令能用"的前提**——这一行是缺了它才出的 bug。
          *
@@ -603,6 +603,24 @@ export function installPrivacy(
         },
       })
       if (typeof returned === 'function') disposers.push(returned as () => void)
+      // 第二个命令：只做"清除当前或指定会话残留的受限记录"这一件事。
+      const returnedClean = commands.register({
+        definitionId: PRIVACY_CLEAN_COMMAND_ID,
+        name: PRIVACY_CLEAN_COMMAND_NAME,
+        description: '清除当前或指定会话残留的受限记录',
+        input: { hint: '[会话id]' },
+        handler: (invocation: CommandInvocationLike): CommandResultLike => {
+          const session = sessionOfInvocation(invocation)
+          const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
+          return runPrivacyCleanCommand(raw, session, api)
+        },
+      })
+      if (typeof returnedClean === 'function') disposers.push(returnedClean as () => void)
+      heartbeat('privacy-clean-command', {
+        name: PRIVACY_CLEAN_COMMAND_NAME,
+        registered: true,
+        returned: typeof returnedClean,
+      })
       /**
        * **命令注册结果必须留痕。**
        *

@@ -94,14 +94,14 @@
       config:
         id: omb
         name: 大肥鱼模式
-        description: OMB v3 通用认知增强（思维链质量 / 记忆 / 上下文优化）
+        description: 包含创造模式的所有能力，并使用OMB v3 通用认知增强。
         order: 10
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: >-
-                你是运行在「大肥鱼模式」（OMB v3 认知增强）下的智能体，基于 {{model}} 模型。
+                你是运行在「大肥鱼模式」下基于 {{model}} 的智能体。
               # **不要再加 `suffix: 你的工作目录是 {{cwd}}。`**
               #
               # 那句在 DSH 0.2.1-a2 上会让**整轮运行失败**：

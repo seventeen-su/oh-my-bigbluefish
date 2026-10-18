@@ -16,8 +16,8 @@ import { ARTIFACT_TOP_MAX, type ArtifactIndex } from './index.js'
 export const FILES_TOOL_NAME = 'omb_files'
 
 export const FILES_TOOL_DESCRIPTION =
-  '列出本会话索引到的制品（路径/类型/时间），不含内容。需要找文件时用；可选 query 按路径相关性筛选，' +
-  `最多返回 ${ARTIFACT_TOP_MAX} 条。要读内容请再用读取类工具打开对应路径。`
+  '列出本会话制品索引（路径/类型/时间，不含内容）；可用 query 按路径筛选，'
+  + `最多 ${ARTIFACT_TOP_MAX} 条。读内容用读取类工具。`
 
 export interface FilesToolInput {
   readonly query?: string
@@ -33,14 +33,14 @@ const FILES_PARAMETERS_ZOD = z.object({
   query: z
     .string()
     .optional()
-    .describe('路径关键词（文件名或路径片段）；不填则按最近排序'),
+    .describe('路径关键词（文件名/片段）；默认按最近排序'),
   limit: z
     .number()
     .int()
     .min(1)
     .max(ARTIFACT_TOP_MAX)
     .optional()
-    .describe(`返回条数，1~${ARTIFACT_TOP_MAX}，默认 ${ARTIFACT_TOP_MAX}`),
+    .describe(`条数 1~${ARTIFACT_TOP_MAX}，默认 ${ARTIFACT_TOP_MAX}`),
 })
 
 export interface FilesToolInputSchema extends ToolInputSchema {
