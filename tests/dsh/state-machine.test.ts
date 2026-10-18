@@ -13,11 +13,13 @@ import {
   SESSION_STATE_SERVICE,
   absPathOf,
   createSessionStateMachine,
+  extractShellWritePaths,
   formatGap,
   normalizePath,
   parsePorcelainV2Paths,
   pathOfArguments,
   renderNotice,
+  shellCommandOf,
   wireEditGuard,
   type ContentHashResult,
   type GitResult,
@@ -126,6 +128,7 @@ function machine(options: {
   git?: ReturnType<typeof fakeGit>
   cwd?: string
   content?: FakeContent
+  instruction?: (cwd: string) => string | null
   summaries?: (sessionId: string, seq: number) => WorkspaceChangesSummaryLike | undefined
   fs?: MemFs
   stateDir?: string
@@ -146,6 +149,7 @@ function machine(options: {
     ...(options.content === undefined
       ? {}
       : { contentHash: options.content.hashOf, fileExists: options.content.exists }),
+    ...(options.instruction === undefined ? {} : { instructionDigest: options.instruction }),
     config: {
       persist: options.persist === true,
       persistMinIntervalMs: 0,
@@ -228,6 +232,9 @@ describe('纯函数：Epoch 解析与通知行', () => {
       headTo: 'def5678901',
       branch: 'feature/very-long-branch-name-here',
       externalChanges: 7,
+      instructionsChanged: false,
+      shellWrites: 0,
+      shellUnknown: 0,
       interruptedAtTurn: 12,
       openGoals: 2,
       deepStale: true,
@@ -239,6 +246,25 @@ describe('纯函数：Epoch 解析与通知行', () => {
     expect(line).toContain('上次回合中断@12')
     expect(line).toContain('未闭合目标 2')
     expect(line.length).toBeLessThanOrEqual(120)
+    // v4.2：指令指纹与 shell 写是独立事实，字段顺序固定、同一事实同一字节串。
+    const v42 = renderNotice('e12345678', {
+      gapMs: undefined,
+      headFrom: null,
+      headTo: null,
+      branch: null,
+      externalChanges: 0,
+      instructionsChanged: true,
+      shellWrites: 2,
+      shellUnknown: 1,
+      interruptedAtTurn: null,
+      openGoals: 0,
+      deepStale: false,
+      degraded: false,
+    }, 120)
+    expect(v42).toContain('指令已变')
+    expect(v42).toContain('shell 写 2')
+    expect(v42).toContain('shell 未知写 1')
+    expect(v42.length).toBeLessThanOrEqual(120)
     expect(formatGap(7 * 60_000)).toBe('7m')
     expect(formatGap(2 * 3_600_000)).toBe('2h')
   })
@@ -793,6 +819,108 @@ describe('通知去重、确定性与未知会话安全', () => {
     expect(DEFAULT_SESSION_STATE_CONFIG.noticeMaxChars).toBe(120)
     expect(DEFAULT_SESSION_STATE_CONFIG.suppressTurns).toBe(2)
     expect(DEFAULT_SESSION_STATE_CONFIG.maxSessions).toBe(128)
+  })
+})
+
+describe('v4.2 留白收尾：指令指纹 / shell 写 / 跨会话 / 盲写策略', () => {
+  it('指令文件指纹从无到有、再到变化：只在真变化时给"指令已变"', () => {
+    const clock = new FakeClock()
+    const git = fakeGit({ head: 'abc1234', status: '' })
+    let digest: string | null = null
+    const m = machine({ clock, git, cwd: 'C:/repo', instruction: () => digest })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    expect(m.port.consumeNotice(S1)).toBeNull() // 第一次见到 null：只记录
+    digest = 'aaa111'
+    clock.advance(1000)
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
+    expect(m.port.consumeNotice(S1)).toBeNull() // 从无到有不算"变了"
+    digest = 'bbb222'
+    clock.advance(1000)
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 3 }))
+    expect(m.port.consumeNotice(S1)).toContain('指令已变')
+    m.dispose()
+  })
+
+  it('shell 命令写路径提取：重定向 / PowerShell 路径参数 / sed -i / git 未知写', () => {
+    expect(extractShellWritePaths('echo hi > out.txt').paths).toContain('out.txt')
+    expect(extractShellWritePaths('Set-Content -Path src/a.ts -Value x').paths).toContain('src/a.ts')
+    expect(extractShellWritePaths('Remove-Item -LiteralPath "dist/tmp.log"').paths).toContain('dist/tmp.log')
+    expect(extractShellWritePaths('sed -i "s/a/b/" src/x.ts').paths).toContain('src/x.ts')
+    expect(extractShellWritePaths('git apply patch.diff').unknown).toBe(true)
+    expect(extractShellWritePaths('ls -la').unknown).toBe(false)
+    expect(shellCommandOf({ arguments: JSON.stringify({ command: 'echo x' }) })).toBe('echo x')
+  })
+
+  it('读后 shell 写过且读取时无法核验内容 → deny（不是"未知就放行"）', () => {
+    const clock = new FakeClock()
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      contentHash: () => null,
+      fileExists: () => true,
+      instructionDigest: () => null,
+      config: { persist: false },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1, step: 1 }))
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'read',
+      arguments: JSON.stringify({ path: 'src/a.ts' }),
+    }))
+    clock.advance(1)
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'pwsh',
+      arguments: JSON.stringify({ command: 'Set-Content -Path src/a.ts -Value x' }),
+    }))
+    const decision = m.guardEdit(S1, 'edit', 'src/a.ts')
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason ?? '').toContain('shell')
+    expect(m.port.situation(S1)?.sideEffects.shellWrites).toBe(1)
+    m.dispose()
+  })
+
+  it('其他会话（子代理）写过本会话读过的文件 → 无法核验时 deny；situation 计数可见', () => {
+    const clock = new FakeClock()
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      contentHash: () => null,
+      fileExists: () => true,
+      instructionDigest: () => null,
+      config: { persist: false },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'read',
+      arguments: JSON.stringify({ path: 'src/a.ts' }),
+    }))
+    clock.advance(1)
+    m.port.observe(event('s2', 'turn/start', clock.now(), { turn: 1 }))
+    m.noteWriteResult('s2', 'edit', 'src/a.ts', true)
+    const decision = m.guardEdit(S1, 'edit', 'src/a.ts')
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason ?? '').toContain('其他会话')
+    expect(m.port.situation(S1)?.sideEffects.otherSessionWrites).toBe(1)
+    m.dispose()
+  })
+
+  it('盲写策略 deny：无印记且文件存在 → 前两次 deny，第 3 次按逃生门放行', () => {
+    const clock = new FakeClock()
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      fileExists: () => true,
+      contentHash: () => null,
+      instructionDigest: () => null,
+      config: { persist: false, blindWritePolicy: 'deny' },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
+    const snap = m.port.snapshot(S1)
+    expect(snap?.blindWrites).toBe(3)
+    expect(snap?.guard.gaveUps).toBe(1)
+    m.dispose()
   })
 })
 

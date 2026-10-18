@@ -435,12 +435,17 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     }
     const guard = state.guard
     const side = situation?.sideEffects
+    const shellBits = side === undefined
+      ? ''
+      : `${side.shellWrites > 0 ? `、shell 写 ${side.shellWrites}` : ''}`
+        + `${side.shellUnknown > 0 ? `、shell 未知写 ${side.shellUnknown}` : ''}`
+        + `${side.otherSessionWrites > 0 ? `、其他会话写 ${side.otherSessionWrites}` : ''}`
     lines.push(
       side === undefined
         ? `- 目标/待办：${state.openGoals} / ${state.openTodos}`
           + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次（旧版状态机：盲写/无法核验计数不可用）`
         : `- 目标/待办：${state.openGoals} / ${state.openTodos}`
-          + `；守卫 拒写 ${side.denies} 次、放弃 ${side.gaveUps} 次、盲写 ${side.blindWrites} 次、无法核验 ${side.unverifiable} 次`,
+          + `；守卫 拒写 ${side.denies} 次、放弃 ${side.gaveUps} 次、盲写 ${side.blindWrites} 次、无法核验 ${side.unverifiable} 次${shellBits}`,
     )
     if (state.persistence.error !== null) lines.push(`- 持久化：${state.persistence.error}`)
   }

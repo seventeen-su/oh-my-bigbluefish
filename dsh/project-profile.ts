@@ -51,6 +51,10 @@ export interface ProjectProfileSource {
   readonly files: number
   readonly lines: number
   readonly tests: number
+  /** v4.2：该目录下识别到的导出符号总数（正则，尽力而为；不是语言服务）。 */
+  readonly exports?: number
+  /** v4.2：出现频次最高的导出符号名（≤6 个，确定性排序）。 */
+  readonly symbols?: readonly string[]
 }
 
 /** 一份仓库文档的标题。 */
@@ -236,23 +240,59 @@ function looksLikeTest(relativePath: string): boolean {
   return /^test_/.test(base)
 }
 
-/** 数一个文件的行数（有界：只读小文件；失败 0）。 */
-function countLines(path: string): number {
+/** 数行数并抽取导出符号（有界：只读小文件；失败 0/空）。 */
+function analyzeSource(path: string): { readonly lines: number; readonly symbols: readonly string[] } {
   try {
     // 先看尺寸再读：超大文件（生成物/数据）连读都不读，避免一次画像拖垮工具调用。
-    if (statSync(path).size > LINE_COUNT_MAX_BYTES) return 0
+    if (statSync(path).size > LINE_COUNT_MAX_BYTES) return { lines: 0, symbols: [] }
     const buffer = readFileSync(path)
-    if (buffer.length === 0) return 0
+    if (buffer.length === 0) return { lines: 0, symbols: [] }
     const text = buffer.toString('utf8')
     let lines = 0
     for (let i = 0; i < text.length; i += 1) {
       if (text.charCodeAt(i) === 10) lines += 1
     }
     if (!text.endsWith('\n')) lines += 1
-    return lines
+    return { lines, symbols: extractSymbols(text, extname(path).toLowerCase()) }
   } catch {
-    return 0
+    return { lines: 0, symbols: [] }
   }
+}
+
+/**
+ * 抽取导出符号名（v4.2，确定性正则，**不是语言服务**）。
+ *
+ * 覆盖 TS/JS 的 `export function/class/const/interface/type/enum`、Python
+ * `def/class`、Go `func/type`、Rust `pub fn/struct/enum/trait/mod`。
+ * 名字按出现次数排序、同频按字母序；只用于"这个目录主要导出什么"的概览。
+ */
+export function extractSymbols(text: string, extension: string): readonly string[] {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const names: string[] = []
+  const add = (value: string | undefined): void => {
+    if (value === undefined) return
+    const clean = value.trim()
+    if (clean.length >= 2 && clean.length <= 48) names.push(clean)
+  }
+  if (extension === '.ts' || extension === '.tsx' || extension === '.mts' || extension === '.cts'
+    || extension === '.js' || extension === '.jsx' || extension === '.mjs' || extension === '.cjs') {
+    for (const match of text.matchAll(
+      /\bexport\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g,
+    )) add(match[1])
+  } else if (extension === '.py') {
+    for (const match of text.matchAll(/^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/gm)) add(match[1])
+  } else if (extension === '.go') {
+    for (const match of text.matchAll(/^(?:func\s+(?:\([^)]*\)\s*)?|type\s+)([A-Za-z_]\w*)/gm)) add(match[1])
+  } else if (extension === '.rs') {
+    for (const match of text.matchAll(/\bpub\s+(?:fn|struct|enum|trait|mod|const|static)\s+([A-Za-z_]\w*)/g)) add(match[1])
+  }
+  if (names.length === 0) return []
+  const counts = new Map<string, number>()
+  for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1)
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 6)
+    .map(([name]) => name)
 }
 
 /** 一个顶层目录下的源码统计累加器。 */
@@ -260,6 +300,8 @@ interface SourceBucket {
   files: number
   lines: number
   tests: number
+  exports: number
+  symbols: Map<string, number>
 }
 
 interface ScanResult {
@@ -292,13 +334,17 @@ function scanTree(root: string, maxFiles: number): ScanResult {
     return { topDirs: [], sources: [], truncated: false }
   }
 
-  /** 记一个源码文件的规模（非源码扩展名直接跳过）。 */
+  /** 记一个源码文件的规模与导出符号（非源码扩展名直接跳过）。 */
   const record = (topName: string, extension: string, absolutePath: string, relativePath: string): void => {
     if (!SOURCE_EXTENSIONS.has(extension)) return
-    const bucket = sourceBuckets.get(topName) ?? { files: 0, lines: 0, tests: 0 }
+    const bucket = sourceBuckets.get(topName)
+      ?? { files: 0, lines: 0, tests: 0, exports: 0, symbols: new Map<string, number>() }
     bucket.files += 1
     if (looksLikeTest(relativePath)) bucket.tests += 1
-    bucket.lines += countLines(absolutePath)
+    const analyzed = analyzeSource(absolutePath)
+    bucket.lines += analyzed.lines
+    bucket.exports += analyzed.symbols.length
+    for (const name of analyzed.symbols) bucket.symbols.set(name, (bucket.symbols.get(name) ?? 0) + 1)
     sourceBuckets.set(topName, bucket)
   }
 
@@ -345,7 +391,17 @@ function scanTree(root: string, maxFiles: number): ScanResult {
   }
 
   const sources = [...sourceBuckets.entries()]
-    .map(([dir, bucket]) => ({ dir, files: bucket.files, lines: bucket.lines, tests: bucket.tests }))
+    .map(([dir, bucket]) => ({
+      dir,
+      files: bucket.files,
+      lines: bucket.lines,
+      tests: bucket.tests,
+      exports: bucket.exports,
+      symbols: [...bucket.symbols.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 6)
+        .map(([name]) => name),
+    }))
     .sort((a, b) => b.files - a.files || a.dir.localeCompare(b.dir))
     .slice(0, SOURCE_DIR_MAX)
 
@@ -361,6 +417,8 @@ function entryCandidates(root: string, pkg: Record<string, unknown> | undefined)
   const candidates = new Set<string>([
     'package.json',
     'tsconfig.json',
+    'AGENTS.md',
+    'CLAUDE.md',
     'README.md',
     'README.zh.md',
     'index.ts',

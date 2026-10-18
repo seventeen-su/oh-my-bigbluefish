@@ -109,3 +109,15 @@
 | D5 | **`omb_project` 改为分层时空快照 L0–L5**（身份/结构/空间状态/时间/知识/意图），总长 ≤2,400 字符；新增 `sessionState.situation()` 供 L2/L3/L5 与状态面共用；缺项写"未接线/无会话归属/状态未知"，不写 0 | 四个组件缺同一套坐标；用户要"一次调用知道我在哪、什么变了、以前记过什么" | `tests/modules/memory/project-tool.test.ts`（六层顺序/缺服务降级/字符上限）；真机 `omb_project` 返回六层 | 符号级 repo-map、三方合并、shell 写追踪、子代理写集、`AGENTS.md` 指纹 → v4.2/不做（契约 §8） |
 
 **与 §3 的关系**：§3 的 L0–L3 分层不变；v4.1 是 L1 项目层与 L2 记忆层之间的**坐标/守卫**升级，不新增层、不新增工具。**与 §7 的关系**：§7 的不可逆项（删 `omb_verify`/`omb_method`/`omb_focus`、删 `omb-context`、技能化 8 卡、`AGENTS.md`）已在 v4.0 落地，v4.1 不重开。
+
+## 10. v4.2 决策（2026-10-19，版本 4.2.0 / g91）
+
+> 依据：`docs/v4.2-gap-closure.md`。v4.1 的五个明确留白逐条收尾；`dsh-path-guard` 不在本版范围。
+
+| # | 决策 | 为什么（证据） | 验收 | 明确不做 |
+| --- | --- | --- | --- | --- |
+| D6 | **指令文件指纹进 epoch**：`AGENTS.md`/`CLAUDE.md`（≤256KB）sha256 前 12 → `WorkspaceEpoch.instructions`；`turn/start` 真变化才提示"指令已变"；首次见到只记录 | v4.1 明确留白"AGENTS.md 指纹"；规则文件变了模型却不知道，等于继续按旧规则工作 | `tests/dsh/state-machine.test.ts` 指令指纹用例；状态行/`omb_project` L1 可见 | 不把指纹混进 `epoch.id`（宿主 tree 形状不变）；不做规则内容 diff |
+| D7 | **shell 写路径提取**：`shellTools` 可配置；`extractShellWritePaths` 覆盖重定向/-Path/sed -i/git checkout，提取不到标 `unknown`；shell 成功并入 `writeIntent` | v4.1 明确留白"shell 写文件追踪"；宿主 shell 是最大盲区 | `extractShellWritePaths` 单测 + "读后 shell 写过且 hash 不可用 → deny"；`situation.sideEffects.shellWrites/shellUnknown` | 不执行命令、不猜未列出的路径；`git apply`/构建脚本的未知写只计数 |
+| D8 | **跨会话/子代理写归因**：全局有界 `recentWrites`（cwd+absPath → 最近写入者/时刻）；`otherSessionWrites` 计入 situation；hash 不可用时保守 deny | v4.1 明确留白"子代理写集并入"；内容哈希能拦"内容变了"，但无法在**无法核验**时给归因 | 双会话单测（A 读、B 写 → A 的 edit deny 且理由含"其他会话"）；`omb_project` L2 显示 | 不做父/子会话拓扑推断；不做按路径精确归属的合并 |
+| D9 | **符号级 repo-map**：`extractSymbols`（TS/JS/Py/Go/Rust 导出名，频次排序 ≤6）+ `ProjectProfileSource.exports/symbols`；`omb_project` L1 只展示前两个有符号目录的短摘要 | 审查与用户都指出"画像不是深入项目理解"；完整语言服务成本高、收益未验证 | 临时仓库单测（`export const alpha/beta` → symbols）；`PROFILE_TEXT_MAX` 与扫描上限不变 | 完整导入图/调用图/类型解析（v4.3）；不新增常驻提示 |
+| D10 | **盲写策略可配置**：`blindWritePolicy: 'allow' \| 'deny'`（默认 allow）；deny 时无印记+文件存在 → deny，逃生门第 3 次放行 | v4.1 留白"缺读取戳是否硬拦"；shell 读不可见使默认硬拦有误伤风险，但需要更严的项目应有开关 | `tests/dsh/state-machine.test.ts` deny 两次→第 3 次 allow；`blindWrites` 两策略都计数 | 默认不改（避免误伤 shell 读）；不做按项目自动切换 |

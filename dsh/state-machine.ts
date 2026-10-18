@@ -92,10 +92,20 @@ export const MAX_DENIES_PER_PATH_PER_TURN = 2
 export const HASH_MAX_BYTES = 2 * 1024 * 1024
 /** `situation()` 读取印记明细上限（v4.1 §3.3）。 */
 export const MAX_SITUATION_ENTRIES = 16
+/** 指令文件（`AGENTS.md`/`CLAUDE.md`）指纹的读取上限。 */
+export const INSTRUCTION_MAX_BYTES = 256 * 1024
+/** 每会话记录 shell 写路径的上限（有界；超出淘汰最旧）。 */
+export const MAX_SHELL_WRITES = 32
+/** 跨会话最近写路径表上限。 */
+export const MAX_RECENT_WRITES = 256
 
 const SCHEMA_VERSION = 1
 const DEFAULT_READ_TOOLS: readonly string[] = ['read', 'read_file']
 const DEFAULT_WRITE_TOOLS: readonly string[] = ['edit', 'write', 'edit_file', 'write_file', 'multi_edit']
+/** shell 工具：v4.2 起从命令参数里**尽力**提取写路径（提取不到就记"未知写"）。 */
+const DEFAULT_SHELL_TOOLS: readonly string[] = ['pwsh', 'powershell', 'bash', 'shell', 'terminal', 'cmd']
+/** 指令文件：指纹进入 epoch，变化时在状态行提示"指令已变"。 */
+const DEFAULT_INSTRUCTION_FILES: readonly string[] = ['AGENTS.md', 'CLAUDE.md']
 const CLOSED_PHASES: readonly string[] = ['complete', 'completed', 'done', 'closed', 'cancelled', 'canceled']
 const INTERRUPT_REASONS: readonly string[] = ['aborted', 'error', 'interrupted', 'max-tokens', 'cancelled', 'canceled']
 
@@ -128,6 +138,12 @@ export interface WorkspaceEpoch {
   /** 宿主 tree id（`workspace/changes` 的 turn 起始/结束快照）。 */
   readonly treeBefore: string | null
   readonly treeAfter: string | null
+  /**
+   * 指令文件指纹（`AGENTS.md`/`CLAUDE.md` 的 sha256 前 12；v4.2）。
+   * `null` = 没有指令文件/读不到。它**不参与** `id`（宿主 tree id 形状不变），
+   * 只用于 `turn/start` 时判断"规则文件是否被改过"。
+   */
+  readonly instructions: string | null
 }
 
 /** 一条读取印记。`hash` 是读取当时的内容指纹（sha256 前 16）；守卫据此判断"读后被改"。 */
@@ -185,6 +201,12 @@ export interface SessionSituation {
     readonly denies: number
     readonly gaveUps: number
     readonly unverifiable: number
+    /** v4.2：提取到路径的 shell 写次数（会话内累计）。 */
+    readonly shellWrites: number
+    /** v4.2：可能写文件但提取不到路径的 shell 次数（显式未知）。 */
+    readonly shellUnknown: number
+    /** v4.2：其他会话写过的、本会话读过且写时间晚于读取的路径数（子代理/并发会话）。 */
+    readonly otherSessionWrites: number
   }
 }
 
@@ -219,11 +241,10 @@ export interface SessionStateSnapshot {
     readonly source: 'host' | 'git' | 'none'
     readonly treeBefore: string | null
     readonly treeAfter: string | null
-    /**
-     * 尚未报告的外部改动数（v4.1 L2 用；`record.unreportedExternal` 的只读投影）。
-     * 这是"还没进过通知的事实"，不是历史累计——通知消费后会归零。
-     */
+    /** 尚未报告的外部改动数（v4.1 L2 用；通知消费后会归零，不是历史累计）。 */
     readonly externalChanges?: number
+    /** 指令文件指纹（v4.2）；null = 没有/读不到。 */
+    readonly instructions?: string | null
   } | null
   readonly openGoals: number
   readonly openTodos: number
@@ -330,6 +351,16 @@ export interface SessionStateConfig {
   readonly maxDeniesPerPathPerTurn: number
   readonly readTools: readonly string[]
   readonly writeTools: readonly string[]
+  /** shell 工具名（v4.2：从命令里提取写路径；提取不到记 `shellUnknown`）。 */
+  readonly shellTools: readonly string[]
+  /** 指令文件（相对 cwd）；指纹变化时状态行提示"指令已变"。 */
+  readonly instructionFiles: readonly string[]
+  /**
+   * 缺读取印记且目标已存在时的策略（v4.2）：
+   * - `allow`（默认）：放行 + `blindWrites`（读可能发生在 shell 里，硬拦会误伤）；
+   * - `deny`：拒绝一次，计 `denies`，逃生门仍生效（同路径同回合第 3 次放行）。
+   */
+  readonly blindWritePolicy: 'allow' | 'deny'
   /** 是否落盘（R10 §6.4）；默认开启，测试可关。 */
   readonly persist: boolean
   /** 落盘节流：回合边界每几十秒一次，避免每步写文件。 */
@@ -350,6 +381,9 @@ export const DEFAULT_SESSION_STATE_CONFIG: SessionStateConfig = {
   maxDeniesPerPathPerTurn: MAX_DENIES_PER_PATH_PER_TURN,
   readTools: DEFAULT_READ_TOOLS,
   writeTools: DEFAULT_WRITE_TOOLS,
+  shellTools: DEFAULT_SHELL_TOOLS,
+  instructionFiles: DEFAULT_INSTRUCTION_FILES,
+  blindWritePolicy: 'allow',
   persist: true,
   persistMinIntervalMs: 30_000,
 }
@@ -371,6 +405,11 @@ export interface SessionStateOptions {
   readonly contentHash?: ContentHashPort
   /** 目标是否存在（无印记时区分"新建"与"盲写"）；缺省 node:fs.existsSync。 */
   readonly fileExists?: (absPath: string) => boolean
+  /**
+   * 指令文件指纹（v4.2）；缺省读 cwd 下 `instructionFiles` 并 sha256 前 12。
+   * 测试注入以避免造真实文件。
+   */
+  readonly instructionDigest?: (cwd: string) => string | null
   readonly config?: Partial<SessionStateConfig>
 }
 
@@ -406,6 +445,20 @@ interface SessionRecord {
   blindWrites: number
   staleWrites: number
   unverifiable: number
+  /** v4.2：从 shell 命令里提取到的写路径 → 发生时刻（有界 `MAX_SHELL_WRITES`）。 */
+  shellWrites: Map<string, number>
+  /** v4.2：本回合 shell 写路径（等 post-execute 成功后才并入 `writeIntent`）。 */
+  shellIntentPending: Set<string>
+  /** v4.2：可能写但提取不到路径的 shell 次数（"未知写"，不是 0）。 */
+  shellUnknown: number
+  /** 尚未进通知的 shell 写次数。 */
+  unreportedShell: number
+  /** 尚未进通知的 shell 未知写次数。 */
+  unreportedShellUnknown: number
+  /** 上次看到的指令文件指纹（v4.2；`null` = 尚无）。 */
+  instructions: string | null
+  /** 指令文件在两次回合之间变化（待通知）。 */
+  unreportedInstructions: boolean
   denyCounts: Map<string, number>
   denies: number
   gaveUps: number
@@ -425,6 +478,8 @@ export interface SessionStateMachine {
   guardEdit(sessionId: string, toolName: string, path: string): EditGuardDecision
   /** v4.1 §4：`tools/post-execute` 成功（isError===false）后刷新印记哈希 + 记 writeIntent。 */
   noteWriteResult(sessionId: string, toolName: string, path: string, ok: boolean): void
+  /** v4.2：shell 工具 post-execute（成功时把提取到的 shell 写路径并入 writeIntent）。 */
+  noteShellResult(sessionId: string, toolName: string, ok: boolean): void
   dispose(): void
 }
 
@@ -495,6 +550,29 @@ export function pathOfArguments(data: unknown): string | undefined {
   return undefined
 }
 
+/** 从 shell 工具参数里取命令串（`command`/`cmd`/`script`；参数可能是未解析 JSON）。 */
+export function shellCommandOf(data: unknown): string {
+  const record = asRecord(data)
+  if (record === undefined) return ''
+  const raw = record['arguments']
+  let args: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      args = JSON.parse(raw)
+    } catch {
+      return raw
+    }
+  }
+  if (typeof args === 'string') return args
+  const argsRecord = asRecord(args)
+  if (argsRecord === undefined) return ''
+  for (const key of ['command', 'cmd', 'script', 'input', 'code']) {
+    const value = argsRecord[key]
+    if (typeof value === 'string' && value.trim().length > 0) return value
+  }
+  return ''
+}
+
 /** 从 `git status --porcelain=v2 -z` 输出解析路径清单。解析失败返回空，不猜。 */
 export function parsePorcelainV2Paths(stdout: string): readonly string[] {
   const tokens = stdout.split('\u0000')
@@ -538,6 +616,7 @@ function emptyEpoch(at: number, reason: string): WorkspaceEpoch {
     source: 'none',
     treeBefore: null,
     treeAfter: null,
+    instructions: null,
   }
 }
 
@@ -586,6 +665,96 @@ const defaultFileExists = (absPath: string): boolean => {
   }
 }
 
+/**
+ * 缺省指令文件指纹：读 cwd 下 `instructionFiles`，对"文件名 + 内容"做 sha256 前 12。
+ * 单文件 ≤256KB；不存在/超限/读失败跳过；一个都读不到 → null（"没有指令文件"，不是空串）。
+ */
+function defaultInstructionDigest(files: readonly string[]): (cwd: string) => string | null {
+  return cwd => {
+    try {
+      const parts: string[] = []
+      for (const name of files) {
+        try {
+          const file = join(cwd, name)
+          const stat = statSync(file)
+          if (!stat.isFile() || stat.size > INSTRUCTION_MAX_BYTES) continue
+          const hash = createHash('sha256').update(readFileSync(file)).digest('hex')
+          parts.push(`${name}:${hash}`)
+        } catch {
+          // 单个文件缺失/不可读：继续
+        }
+      }
+      return parts.length === 0 ? null : sha256Short(parts.join('|'), 12)
+    } catch {
+      return null
+    }
+  }
+}
+
+/** shell 命令里"看起来会写文件"的模式（用于判断"提取不到路径的未知写"）。 */
+const SHELL_MUTATION_PATTERN =
+  /(?:\b(?:git\s+(?:apply|checkout|restore|clean)|(?:pnpm|npm|yarn)\s+(?:install|add|remove|up)|make|cmake|cargo\s+build|python\s+setup|sed\s+-i|tee|rm|del|Remove-Item|Move-Item|Copy-Item|Rename-Item|Set-Content|Add-Content|Out-File|New-Item|truncate|chmod|chown)\b|>>?)/i
+
+export interface ShellWriteExtraction {
+  /** 从命令里提取到的写路径（原样字符串，未 resolve；去重、稳定排序）。 */
+  readonly paths: readonly string[]
+  /** 命令像写操作但没提取到任何明确路径（显式"未知写"）。 */
+  readonly unknown: boolean
+}
+
+function cleanShellPath(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  let value = raw.trim()
+  if (value.length === 0) return undefined
+  value = value.replace(/^["']|["']$/g, '')
+  value = value.replace(/[;,)]+$/, '')
+  value = value.replace(/^\.\//, '')
+  if (value.length === 0) return undefined
+  if (/^(?:-|\d+>|&|\||;)/.test(value)) return undefined
+  if (/^(?:\/dev\/null|NUL|\$null|nul)$/i.test(value)) return undefined
+  if (/^[a-z]+:\/\//i.test(value)) return undefined
+  return value
+}
+
+/**
+ * 从 shell 命令串里**尽力**提取写路径（v4.2，确定性正则，不执行命令）。
+ *
+ * 覆盖：重定向（`>`/`>>`）、PowerShell 路径参数（`-Path/-LiteralPath/-Destination/-FilePath`）、
+ * 常见 cmdlet 的首个位置参数、`sed -i` 的最后一个参数、`git checkout/restore` 的路径。
+ * 提取不到但命令带写特征 → `unknown: true`；调用方据此显式计"未知写"，**不猜**。
+ */
+export function extractShellWritePaths(command: string): ShellWriteExtraction {
+  const text = typeof command === 'string' ? command : ''
+  if (text.length === 0) return { paths: [], unknown: false }
+  const found = new Set<string>()
+  const push = (value: string | undefined): void => {
+    const clean = cleanShellPath(value)
+    if (clean !== undefined) found.add(clean)
+  }
+  // 重定向：`> file` / `>> file`（排除 fd 复制 `2>&1` 与 `>>>`）
+  for (const match of text.matchAll(/(?:^|[^>\d])>{1,2}\s*("[^"]+"|'[^']+'|[^\s;&|)]+)/g)) {
+    push(match[1])
+  }
+  // PowerShell 显式路径参数
+  for (const match of text.matchAll(/-(?:Path|LiteralPath|Destination|FilePath)\s+("[^"]+"|'[^']+'|[^\s;)]+)/gi)) {
+    push(match[1])
+  }
+  // 常见 cmdlet 的首个位置参数（值以 - 开头的开关跳过）
+  for (const match of text.matchAll(/\b(?:Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Copy-Item|Move-Item|Rename-Item)\s+(?:-Force\s+)?("[^"]+"|'[^']+'|[^\s;)-]+)/gi)) {
+    push(match[1])
+  }
+  // sed -i 的最后一个参数
+  for (const match of text.matchAll(/\bsed\s+-i[^\s]*\s+(?:[^;|]+\s+)?("[^"]+"|'[^']+'|[^\s;|)]+)\s*(?:$|[;|])/gim)) {
+    push(match[1])
+  }
+  // git checkout -- path / git restore path
+  for (const match of text.matchAll(/\bgit\s+(?:checkout|restore)\b[^;&|]*?(?:--\s+)?("[^"]+"|'[^']+'|[\w./\\-]+)\s*(?:$|[;&|])/gim)) {
+    push(match[1])
+  }
+  const paths = [...found].sort()
+  return { paths, unknown: paths.length === 0 && SHELL_MUTATION_PATTERN.test(text) }
+}
+
 function tierOf(gapMs: number | undefined, config: SessionStateConfig): IdleTier {
   if (gapMs === undefined) return 'fresh'
   if (gapMs >= config.deepStaleAfterMs) return 'deep-stale'
@@ -612,6 +781,12 @@ interface NoticeFacts {
   readonly headTo: string | null
   readonly branch: string | null
   readonly externalChanges: number
+  /** v4.2：指令文件（AGENTS.md/CLAUDE.md）在两次回合之间变化。 */
+  readonly instructionsChanged: boolean
+  /** v4.2：本回合提取到路径的 shell 写次数。 */
+  readonly shellWrites: number
+  /** v4.2：可能写但提取不到路径的 shell 次数。 */
+  readonly shellUnknown: number
   readonly interruptedAtTurn: number | null
   readonly openGoals: number
   readonly deepStale: boolean
@@ -630,6 +805,9 @@ export function renderNotice(epochLabel: string, facts: NoticeFacts, maxChars: n
   }
   if (facts.branch !== null) parts.push(`分支 ${facts.branch.slice(0, 24)}`)
   if (facts.externalChanges > 0) parts.push(`外部改动 ${facts.externalChanges}`)
+  if (facts.instructionsChanged) parts.push('指令已变')
+  if (facts.shellWrites > 0) parts.push(`shell 写 ${facts.shellWrites}`)
+  if (facts.shellUnknown > 0) parts.push(`shell 未知写 ${facts.shellUnknown}`)
   if (facts.interruptedAtTurn !== null) parts.push(`上次回合中断@${facts.interruptedAtTurn}`)
   if (facts.openGoals > 0) parts.push(`未闭合目标 ${facts.openGoals}`)
   if (facts.deepStale) parts.push('结论可能过期')
@@ -654,8 +832,17 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
   const fs = options.fs ?? defaultFs
   const contentHash = options.contentHash ?? defaultContentHash
   const fileExists = options.fileExists ?? defaultFileExists
+  const instructionDigest = options.instructionDigest ?? defaultInstructionDigest(config.instructionFiles)
   const sessions = new Map<string, SessionRecord>()
   const epochCache = new Map<string, { readonly epoch: WorkspaceEpoch; readonly at: number }>()
+  /**
+   * v4.2 跨会话写表：`<cwd>\0<absPath>` → 最近写入者与时刻。
+   *
+   * 子代理与并发会话写同一工作区时，内容哈希已经能拦住"读后被改"的编辑；
+   * 这张表补的是**归因可见性**（谁写的、本会话读过的文件里有多少被其他会话改过），
+   * 以及"hash 未知时"的保守拒绝依据。有界，绝不无限增长。
+   */
+  const recentWrites = new Map<string, { readonly sessionId: string; readonly at: number }>()
   let disposed = false
 
   const warn = (where: string, error: unknown): void => {
@@ -680,6 +867,18 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     } catch (error) {
       warn('contentHash', error)
       return { ok: false }
+    }
+  }
+
+  /** 登记一次工作区写入（跨会话归因用）。 */
+  const noteRecentWrite = (sessionId: string, absPath: string, at: number): void => {
+    const key = `${safeCwd(sessionId) ?? ''}\u0000${absPath}`
+    recentWrites.delete(key)
+    recentWrites.set(key, { sessionId, at })
+    while (recentWrites.size > MAX_RECENT_WRITES) {
+      const oldest = recentWrites.keys().next().value
+      if (oldest === undefined) break
+      recentWrites.delete(oldest)
     }
   }
 
@@ -753,7 +952,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
           source: epoch['source'] === 'host' ? 'host' : 'git',
           treeBefore: nonEmpty(epoch['treeBefore']) ?? null,
           treeAfter: nonEmpty(epoch['treeAfter']) ?? null,
+          instructions: nonEmpty(epoch['instructions']) ?? null,
         }
+        record.instructions = record.epoch.instructions
         record.treeAfter = record.epoch.treeAfter
         record.hostTreeSeen = record.epoch.source === 'host'
       }
@@ -875,6 +1076,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         source: 'git',
         treeBefore: null,
         treeAfter: null,
+        instructions: instructionDigest(path),
       }
       epochCache.set(path, { epoch, at })
       while (epochCache.size > MAX_EPOCH_CACHE) {
@@ -893,6 +1095,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
   const epochFromSummary = (
     summary: WorkspaceChangesSummaryLike,
     at: number,
+    instructions: string | null,
   ): WorkspaceEpoch | null => {
     const snapshot = summary.snapshot
     if (snapshot === undefined) return null
@@ -915,6 +1118,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       source: 'host',
       treeBefore: before,
       treeAfter: after,
+      instructions,
     }
   }
 
@@ -955,6 +1159,13 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       blindWrites: 0,
       staleWrites: 0,
       unverifiable: 0,
+      shellWrites: new Map(),
+      shellIntentPending: new Set(),
+      shellUnknown: 0,
+      unreportedShell: 0,
+      unreportedShellUnknown: 0,
+      instructions: null,
+      unreportedInstructions: false,
       denyCounts: new Map(),
       denies: 0,
       gaveUps: 0,
@@ -1020,8 +1231,15 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
   const applyWorkspaceSummary = (sessionId: string, record: SessionRecord, seq: number | undefined, at: number): void => {
     const summary = summaryOf(sessionId, seq)
     if (summary === undefined) return
-    const epoch = epochFromSummary(summary, at)
+    const cwd = safeCwd(sessionId)
+    const instructions = cwd === undefined ? null : instructionDigest(cwd)
+    const epoch = epochFromSummary(summary, at, instructions)
     if (epoch === null) return
+    // v4.2：指令文件指纹变化单独作为"规则已变"事实（不混进外部改动数）。
+    if (record.instructions !== null && instructions !== null && record.instructions !== instructions) {
+      record.unreportedInstructions = true
+    }
+    if (instructions !== null) record.instructions = instructions
     const previousAfter = record.epoch?.source === 'host' ? record.epoch.treeAfter : record.treeAfter
     const before = epoch.treeBefore
     // 外部改动：上一回合结束的 tree ≠ 本回合开始的 tree（回合之间被改），
@@ -1035,7 +1253,6 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     record.hostTreeSeen = true
     record.degraded = false
     record.treeAfter = epoch.treeAfter
-    const cwd = safeCwd(sessionId)
     if (cwd !== undefined) persistWorkspace(cwd, epoch, at)
   }
 
@@ -1055,6 +1272,14 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     const before = record.epoch
     if (!record.hostTreeSeen) refreshEpoch(sessionId, record, at)
     const current = record.epoch
+    // v4.2：指令文件指纹变化（首次见到只记录，不报"变了"）。
+    const currentInstructions = current?.instructions ?? null
+    if (record.instructions === null) {
+      record.instructions = currentInstructions
+    } else if (currentInstructions !== null && currentInstructions !== record.instructions) {
+      record.instructions = currentInstructions
+      record.unreportedInstructions = true
+    }
     const headChanged = before !== null && current !== null && before.source === 'git' && current.source === 'git'
       && before.head !== null && current.head !== null && before.head !== current.head
     const branchChanged = before !== null && current !== null && before.source === 'git' && current.source === 'git'
@@ -1069,7 +1294,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     const openGoals = openGoalCount(record)
     const external = record.unreportedExternal
     const interruptedAt = record.interruptedAtTurn
-    const hasChange = tier !== 'fresh' || headChanged || branchChanged || external > 0 || interruptedAt !== null
+    const hasChange = tier !== 'fresh' || headChanged || branchChanged || external > 0
+      || interruptedAt !== null || record.unreportedInstructions
+      || record.unreportedShell > 0 || record.unreportedShellUnknown > 0
     const deep = tier === 'deep-stale'
 
     if (hasChange) {
@@ -1081,6 +1308,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         headTo: headChanged ? current?.head ?? null : null,
         branch: branchChanged ? current?.branch ?? null : null,
         externalChanges: external,
+        instructionsChanged: record.unreportedInstructions,
+        shellWrites: record.unreportedShell,
+        shellUnknown: record.unreportedShellUnknown,
         interruptedAtTurn: interruptedAt,
         openGoals,
         deepStale: deep,
@@ -1095,6 +1325,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       }
       // 已报告的事实不再触发下一次通知；新的变化会重新累积。
       record.unreportedExternal = 0
+      record.unreportedInstructions = false
+      record.unreportedShell = 0
+      record.unreportedShellUnknown = 0
       record.interruptedAtTurn = null
       persistSession(sessionId, record, at)
     } else {
@@ -1107,6 +1340,30 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     const dataRecord = asRecord(data)
     const name = nonEmpty(dataRecord?.['name'])?.toLowerCase()
     if (name === undefined) return
+    // v4.2：shell 写可见性。先于 path 检查——shell 参数里通常没有 path 字段。
+    if (config.shellTools.includes(name)) {
+      const extraction = extractShellWritePaths(shellCommandOf(dataRecord))
+      const cwd = safeCwd(sessionId)
+      for (const raw of extraction.paths) {
+        const absPath = absPathOf(cwd, raw)
+        const key = absPath ?? raw
+        record.shellWrites.delete(key)
+        record.shellWrites.set(key, at)
+        while (record.shellWrites.size > MAX_SHELL_WRITES) {
+          const oldest = record.shellWrites.keys().next().value
+          if (oldest === undefined) break
+          record.shellWrites.delete(oldest)
+        }
+        record.shellIntentPending.add(key)
+        if (absPath !== undefined) noteRecentWrite(sessionId, absPath, at)
+      }
+      record.unreportedShell += extraction.paths.length
+      if (extraction.unknown) {
+        record.shellUnknown += 1
+        record.unreportedShellUnknown += 1
+      }
+      return
+    }
     const path = pathOfArguments(dataRecord)
     if (path === undefined) return
     const absPath = absPathOf(safeCwd(sessionId), path)
@@ -1212,13 +1469,35 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     return undefined
   }
 
+  /** 读取之后是否有本会话的 shell 写（v4.2）。 */
+  const shellWroteAfter = (record: SessionRecord, absPath: string | undefined, since: number): boolean => {
+    if (absPath === undefined) return false
+    const at = record.shellWrites.get(absPath)
+    return at !== undefined && at > since
+  }
+
+  /** 读取之后是否有其他会话（子代理/并发会话）写过同一路径（v4.2）。 */
+  const otherSessionWroteAfter = (
+    sessionId: string,
+    absPath: string | undefined,
+    since: number,
+  ): boolean => {
+    if (absPath === undefined) return false
+    const key = `${safeCwd(sessionId) ?? ''}\u0000${absPath}`
+    const entry = recentWrites.get(key)
+    return entry !== undefined && entry.sessionId !== sessionId && entry.at > since
+  }
+
   /**
    * v4.1 §4 统一判定表（edit+write）：**内容哈希**，不是全局 epoch。
+   *
+   * v4.2 增补：盲写策略（`blindWritePolicy`）、shell 写后未重读、其他会话写后未重读。
    *
    * | 情况 | 判定 | 记账 |
    * |---|---|---|
    * | 无印记，目标不存在 | allow | — |
-   * | 无印记，目标存在 | allow | blindWrites++ |
+   * | 无印记，目标存在 | allow + blindWrites++（策略 deny 时 deny） | blindWrites |
+   * | 印记 hash=null 且读后 shell/他人写过 | deny | denies |
    * | 印记 hash=null | allow | unverifiable++ |
    * | 当前读不到/超限 | allow | unverifiable++ |
    * | hash 相同 | allow | — |
@@ -1238,14 +1517,35 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       const denyKey = absPath ?? normalized
       const stamp = findStamp(record, absPath, normalized)
 
-      // ① 无印记：新建 allow；覆盖既有文件 allow 但计 blindWrites（未保护）。
+      /** 统一 deny 记账（逃生门：同路径同回合第 3 次放行）。 */
+      const denyWith = (reason: string): EditGuardDecision => {
+        const denied = record.denyCounts.get(denyKey) ?? 0
+        if (denied >= config.maxDeniesPerPathPerTurn) {
+          record.gaveUps += 1
+          return { kind: 'allow', reason: null }
+        }
+        record.denyCounts.set(denyKey, denied + 1)
+        record.denies += 1
+        return { kind: 'deny', reason: reason.length > 120 ? reason.slice(0, 120) : reason }
+      }
+
+      // ① 无印记：新建 allow；覆盖既有文件按盲写策略（默认 allow + blindWrites）。
       if (stamp === undefined) {
         if (absPath === undefined || !fileExists(absPath)) return { kind: 'allow', reason: null }
         record.blindWrites += 1
+        if (config.blindWritePolicy === 'deny') {
+          return denyWith('该文件已存在但本会话没有可核验的读取印记；先读取再修改（盲写策略 deny）。')
+        }
         return { kind: 'allow', reason: null }
       }
-      // ② 读取时就没有哈希（目录/超限/读失败）→ 无法核验，不拦。
+      // ② 读取时就没有哈希（目录/超限/读失败）：若有 shell/其他会话在其后写过，主动 deny。
       if (stamp.hash === null) {
+        if (shellWroteAfter(record, absPath, stamp.at)) {
+          return denyWith('该文件在读取后被本会话的 shell 写入过，且读取时无法核验内容；请重读后再编辑。')
+        }
+        if (otherSessionWroteAfter(sessionId, absPath, stamp.at)) {
+          return denyWith('该文件在读取后被其他会话（含子代理）写入，且读取时无法核验内容；请重读后再编辑。')
+        }
         record.unverifiable += 1
         return { kind: 'allow', reason: null }
       }
@@ -1253,25 +1553,22 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         record.unverifiable += 1
         return { kind: 'allow', reason: null }
       }
-      // ③ 当前内容读不到/超限 → 无法核验，不拦；端口自身抛错 → fail-open（不计数）。
+      // ③ 当前内容读不到/超限 → 无法核验；有 shell/他人写则 deny，否则放行并计数。
       const current = readCurrentHash(absPath)
       if (!current.ok) return { kind: 'allow', reason: null }
       if (current.value === null) {
+        if (shellWroteAfter(record, absPath, stamp.at)) {
+          return denyWith('该文件在读取后被本会话的 shell 写入过，且当前无法核验内容；请重读后再编辑。')
+        }
         record.unverifiable += 1
         return { kind: 'allow', reason: null }
       }
       // ④ 哈希相同 → 读后未变，放行。
       if (current.value.hash === stamp.hash) return { kind: 'allow', reason: null }
       // ⑤ 哈希不同（读后被改）→ deny；同路径同回合第 3 次放行并计 gaveUps。
-      const denied = record.denyCounts.get(denyKey) ?? 0
-      if (denied >= config.maxDeniesPerPathPerTurn) {
-        record.gaveUps += 1
-        return { kind: 'allow', reason: null }
-      }
-      record.denyCounts.set(denyKey, denied + 1)
-      record.denies += 1
-      const reason = `文件内容在本会话读取后已变化（${stamp.hash.slice(0, 8)}→${current.value.hash.slice(0, 8)}），编辑未执行；重读后可再编辑。`
-      return { kind: 'deny', reason: reason.length > 120 ? reason.slice(0, 120) : reason }
+      return denyWith(
+        `文件内容在本会话读取后已变化（${stamp.hash.slice(0, 8)}→${current.value.hash.slice(0, 8)}），编辑未执行；重读后可再编辑。`,
+      )
     } catch (error) {
       warn('guardEdit', error)
       return { kind: 'allow', reason: null }
@@ -1300,6 +1597,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       }
       const absPath = absPathOf(safeCwd(sessionId), normalized)
       if (absPath === undefined) return
+      noteRecentWrite(sessionId, absPath, clock.now())
       const stamp = findStamp(record, absPath, normalized)
       if (stamp === undefined) return
       const current = readCurrentHash(absPath)
@@ -1312,6 +1610,34 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       })
     } catch (error) {
       warn('noteWriteResult', error)
+    }
+  }
+
+  /**
+   * v4.2：shell 工具 post-execute。成功时把本回合提取到的 shell 写路径并入
+   * `writeIntent`（归因"这台会话确实写过"）；失败不清空（写可能部分生效，
+   * 下一次回合边界会清空）。
+   */
+  const noteShellResult = (sessionId: string, toolName: string, ok: boolean): void => {
+    if (disposed) return
+    try {
+      const name = toolName.toLowerCase()
+      if (!config.shellTools.includes(name)) return
+      const record = sessions.get(nonEmpty(sessionId) ?? '')
+      if (record === undefined) return
+      if (ok) {
+        for (const path of record.shellIntentPending) {
+          record.writeIntent.add(path)
+          while (record.writeIntent.size > MAX_WRITE_INTENT) {
+            const oldest = record.writeIntent.values().next().value
+            if (oldest === undefined) break
+            record.writeIntent.delete(oldest)
+          }
+        }
+      }
+      record.shellIntentPending.clear()
+    } catch (error) {
+      warn('noteShellResult', error)
     }
   }
 
@@ -1329,6 +1655,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         treeBefore: record.epoch.treeBefore,
         treeAfter: record.epoch.treeAfter,
         externalChanges: record.unreportedExternal,
+        instructions: record.epoch.instructions,
       }
 
   const port: SessionStateService = {
@@ -1502,6 +1829,11 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
           }
           return { path: stamp.path, status, hash: stamp.hash }
         })
+        const otherSessionWrites = stamps.reduce((count, stamp) => {
+          const key = `${safeCwd(sessionId) ?? ''}\u0000${stamp.absPath}`
+          const entry = recentWrites.get(key)
+          return entry !== undefined && entry.sessionId !== sessionId && entry.at > stamp.at ? count + 1 : count
+        }, 0)
         return {
           sessionId,
           cwd: safeCwd(sessionId) ?? null,
@@ -1529,6 +1861,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
             denies: record.denies,
             gaveUps: record.gaveUps,
             unverifiable: record.unverifiable,
+            shellWrites: record.shellWrites.size,
+            shellUnknown: record.shellUnknown,
+            otherSessionWrites,
           },
         }
       } catch (error) {
@@ -1542,10 +1877,12 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     port,
     guardEdit,
     noteWriteResult,
+    noteShellResult,
     dispose(): void {
       disposed = true
       sessions.clear()
       epochCache.clear()
+      recentWrites.clear()
     },
   }
 }
@@ -1611,8 +1948,10 @@ export function wireEditGuard(options: {
           (execRecord?.['agent'] as { session?: { id?: unknown } } | undefined)?.session?.id,
         )
         const path = pathOfArguments(execRecord)
-        if (ok && toolName !== undefined && sessionId !== undefined && path !== undefined) {
-          machine.noteWriteResult(sessionId, toolName, path, true)
+        if (toolName !== undefined && sessionId !== undefined) {
+          if (path !== undefined) machine.noteWriteResult(sessionId, toolName, path, ok)
+          // shell 没有 path 参数：按命令里提取到的路径归因；失败也会清空本回合 pending。
+          machine.noteShellResult(sessionId, toolName, ok)
         }
       } catch (error) {
         log(`OMB 状态机：写后刷新异常（已隔离）——${errorText(error)}`)

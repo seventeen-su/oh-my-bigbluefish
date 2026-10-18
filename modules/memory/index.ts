@@ -619,7 +619,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '4.1.0',
+    version: options.version ?? '4.2.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,

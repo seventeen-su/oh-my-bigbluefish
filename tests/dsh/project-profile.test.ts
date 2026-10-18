@@ -47,8 +47,9 @@ function makeRepo(): string {
   writeFileSync(join(root, 'README.md'), '# Repo Demo\n\nA repo for the profile.\n')
   writeFileSync(join(root, 'tsconfig.json'), '{}')
   writeFileSync(join(root, 'pnpm-lock.yaml'), '')
+  writeFileSync(join(root, 'AGENTS.md'), '# Agent rules\n\nbe careful\n')
   mkdirSync(join(root, 'src', 'deep'), { recursive: true })
-  writeFileSync(join(root, 'src', 'index.ts'), 'export const a = 1\nexport const b = 2\n')
+  writeFileSync(join(root, 'src', 'index.ts'), 'export const alpha = 1\nexport const beta = 2\n')
   writeFileSync(join(root, 'src', 'deep', 'util.ts'), '// util\n')
   mkdirSync(join(root, 'tests'), { recursive: true })
   writeFileSync(join(root, 'tests', 'index.test.ts'), 'it("x", () => {})\n')
@@ -136,12 +137,17 @@ describe('项目画像', () => {
     expect(src?.files).toBe(2)
     expect(src?.lines).toBe(3)
     expect(src?.tests).toBe(0)
+    // v4.2 符号层：从 `export const a/b` 识别出代表符号（正则，不是语言服务）。
+    expect(src?.symbols).toContain('alpha')
+    expect(src?.symbols).toContain('beta')
+    expect(src?.exports).toBeGreaterThanOrEqual(2)
     const tests = view?.structure?.sources?.find(source => source.dir === 'tests')
     expect(tests?.tests).toBe(1)
 
     expect(view?.structure?.docs?.[0]?.path).toBe('docs/guide.md')
     expect(view?.structure?.docs?.[0]?.title).toBe('Guide Title')
     expect(view?.structure?.entries).toContain('package.json')
+    expect(view?.structure?.entries).toContain('AGENTS.md')
     expect(view?.structure?.entries).toContain('src/index.ts')
 
     expect(view?.text).toContain('cwd 相对：sub/deep')

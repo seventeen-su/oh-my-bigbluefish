@@ -111,3 +111,43 @@
 3. shell 写文件、子代理写集、`AGENTS.md` 指纹、符号级 repo-map：契约 §8 明确不做/留 v4.2。
 4. `dsh-path-guard` 的 `selfProtection` 仍为 `false`（用户设置）。
 5. **已修（v4.1 收尾）**：`situation().sideEffects.writeWarnings` 无递增点、状态面恒显 0——已从 `situation` 删除该字段，状态面回退行不再显示恒 0 的 write 警告；`SessionStateSnapshot.guard.writeWarnings` 仅作旧快照兼容保留（见审查回应 §3.1 C1）。
+
+---
+
+# OMB v4.2 交付记录（2026-10-19 凌晨）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.2.0**（根包 + 7 个组件 + 模块清单） |
+| 基线 | `79feb7e`（v4.1.0 / g90）→ 本版提交（`git log` 最新） |
+| 构建 | **g91**；`generation: 91`、`outDir: lib-gen/g91`、`builtAt: 2026-10-18T16:23:32Z` |
+| 契约/决策 | `docs/v4.2-gap-closure.md`、`docs/v4-decision.md` §10 |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **107 files / 1335 passed | 1 skipped**；`build` 成功（g91）；`check-resolution` **7/7** |
+| 真机验收 | **待重启 `dsh web` 后核对**（本进程仍加载旧代；部署副本同步后应为 4.2.0 / g91）。重启后核对：`omb_status` 构建 91/91、状态行含「指令已变 / shell 写 / 其他会话写」、`omb_project` L1 含「符号 …」 |
+
+## 收掉的五个留白
+
+1. **指令文件指纹**：`AGENTS.md`/`CLAUDE.md` 变化 → 状态行「指令已变」（首次见到不误报）。
+2. **shell 写可见性**：重定向/`-Path`/`sed -i`/`git checkout` 路径提取；提取不到显式计 `shellUnknown`；
+   读取时 hash 不可用且读后被 shell 写 → deny。
+3. **跨会话/子代理写**：`recentWrites` + `otherSessionWrites`；hash 不可用时保守 deny 并写明"其他会话"。
+4. **符号级 repo-map**：画像 `sources[].symbols/exports`（正则、有界）；`omb_project` L1 摘要展示。
+5. **盲写策略**：新增 `blindWritePolicy`（默认 allow；deny 时逃生门仍生效）。
+
+## 文件
+
+- `dsh/state-machine.ts`：指令指纹、shell 提取/写表、`recentWrites`、盲写策略、通知字段、situation 计数。
+- `dsh/project-profile.ts`：`extractSymbols`/`analyzeSource`、`sources[].symbols/exports`、`AGENTS.md`/`CLAUDE.md` 入口。
+- `modules/memory/project.ts`：L1 符号摘要、L2 shell/其他会话写展示。
+- `dsh/status-tool.ts`：守卫行追加 shell/其他会话写计数。
+- `pnpm-lock.yaml`：删除 `@omb/context` 残留 importer。
+- 测试：`tests/dsh/state-machine.test.ts`（+5 用例）、`tests/dsh/project-profile.test.ts`（符号/入口）。
+- 版本：8 个 `package.json`、6 个模块常量、`KERNEL_SELF`、注册测试。
+
+## 仍未做
+
+- 完整导入图/调用图与语言服务级符号解析（v4.3）。
+- shell 未知写的路径级归因；`git apply`/构建脚本的写集。
+- 三方合并/自动补丁；`dsh-path-guard` 的 `selfProtection`（用户设置，本版不动）。

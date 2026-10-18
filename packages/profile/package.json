@@ -1,15 +1,15 @@
 {
   "name": "@omb/profile",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — explicit preferences and profile entries; conflicts are surfaced, never auto-resolved.",
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g90/index.js",
+  "main": "./lib-gen/g91/index.js",
   "exports": {
-    ".": "./lib-gen/g90/index.js",
+    ".": "./lib-gen/g91/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"

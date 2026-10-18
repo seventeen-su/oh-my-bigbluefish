@@ -11,9 +11,6 @@ importers:
       '@omb/artifact':
         specifier: workspace:*
         version: link:packages/artifact
-      '@omb/context':
-        specifier: workspace:*
-        version: link:packages/context
       '@omb/kernel':
         specifier: workspace:*
         version: link:packages/kernel

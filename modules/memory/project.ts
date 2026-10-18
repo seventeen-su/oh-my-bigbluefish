@@ -82,6 +82,9 @@ export interface ProjectProfileSource {
   readonly files: number
   readonly lines: number
   readonly tests: number
+  /** v4.2：导出符号总数与代表符号（来自画像的正则扫描，不是语言服务）。 */
+  readonly exports?: number
+  readonly symbols?: readonly string[]
 }
 
 export interface ProjectProfileDoc {
@@ -168,6 +171,10 @@ export interface SessionSituationView {
     readonly gaveUps?: number
     readonly writeWarnings?: number
     readonly unverifiable?: number
+    /** v4.2：shell 写路径数 / shell 未知写次数 / 其他会话写过的已读路径数。 */
+    readonly shellWrites?: number
+    readonly shellUnknown?: number
+    readonly otherSessionWrites?: number
   }
 }
 
@@ -363,6 +370,15 @@ function renderStructure(view: ProjectProfileView | undefined, missingReason: st
         .map(source => `${source.dir}(${source.files} 文件/${source.lines} 行/${source.tests} 测试)`)
         .join('、')}`,
     )
+    // v4.2 符号层：只给"每个目录主要导出什么"的短摘要，不做完整 repo-map。
+    const withSymbols = structure.sources.filter(source => (source.symbols?.length ?? 0) > 0).slice(0, 2)
+    if (withSymbols.length > 0) {
+      parts.push(
+        `符号 ${withSymbols
+          .map(source => `${source.dir}:${(source.symbols ?? []).slice(0, 4).join('/')}`)
+          .join('；')}`,
+      )
+    }
   }
   if (structure?.entries !== undefined && structure.entries.length > 0) {
     parts.push(`入口 ${structure.entries.slice(0, 4).join('、')}`)
@@ -414,6 +430,13 @@ function renderSpace(situation: SessionSituationView | undefined): string {
       `守卫 拒写 ${finiteNumber(sideEffects.denies) ?? 0}/放弃 ${finiteNumber(sideEffects.gaveUps) ?? 0}` +
         `/盲写 ${finiteNumber(sideEffects.blindWrites) ?? 0}/无法核验 ${finiteNumber(sideEffects.unverifiable) ?? 0}`,
     )
+    const shellWrites = finiteNumber(sideEffects.shellWrites) ?? 0
+    const shellUnknown = finiteNumber(sideEffects.shellUnknown) ?? 0
+    const otherWrites = finiteNumber(sideEffects.otherSessionWrites) ?? 0
+    if (shellWrites > 0 || shellUnknown > 0) {
+      parts.push(`shell 写 ${shellWrites}/未知 ${shellUnknown}`)
+    }
+    if (otherWrites > 0) parts.push(`其他会话写 ${otherWrites}`)
   }
   return joinParts(parts)
 }
