@@ -1,8 +1,9 @@
 /**
  * 桌面通知桥：**探测外部服务，探测不到就全部静默降级**。
  *
- * **协议对齐 `dsh-desktop-notify` 2.0.0，对外 API 基线 `1.0.0`**
- * （`NOTIFY_API_VERSION`，见其 README「给其它插件调用」与 `src/api.ts`）。
+ * **协议对齐 `dsh-desktop-notify` 2.x（本机 profile 实际安装 `2.1.0-led.1`），
+ * 本桥只声明对外 API 基线 `1.0.0`**（`NOTIFY_API_VERSION`；2.1.0-led.1 实测为
+ * `1.1.0-led.1`，主版本仍为 1，因此基线声明仍被接受，见其 `src/api.ts` 与 README）。
  *
  * | 方法 | 门控 | 返回 |
  * | --- | --- | --- |
@@ -11,7 +12,7 @@
  * | `notify(payload)` | **与 `push` 完全同一个 `deliver()`** | 明细 `{ ok, queued, silenced, reason, apiVersion, unsupportedVersion }` |
  *
  * ⚠️ 本文件旧注释把 `notify` 写成"同上（`pushAlways`）但返回明细"——**那是错的**。
- * 读 2.0.0 的 `src/api.ts:192-207` 可见：`push` 与 `notify` 是同一个 `deliver()`，
+ * 读 2.x 的 `src/api.ts` 的 `deliver()`（2.1.0-led.1 实测 `:185-210`）可见：`push` 与 `notify` 是同一个 `deliver()`，
  * `pushAlways` 才是不走门控的那一个。所以**改用 `notify` 不改变门控语义**，
  * 只是把"没发出去"从裸 `false` 变成一个可读原因——这正是本仓库"降级必须可读"要的。
  *
@@ -66,7 +67,10 @@ export const DEFAULT_NOTIFY_SESSION = 'default'
 export type NotifyUrgency = 'low' | 'normal' | 'critical'
 
 /**
- * 本桥声明的对外 API 版本（对方 2.0.0 的 `NOTIFY_API_VERSION`）。
+ * 本桥声明的对外 API 版本（对方的 `NOTIFY_API_VERSION`）。
+ *
+ * 2.1.0-led.1 实测 `NOTIFY_API_VERSION = '1.1.0-led.1'`：主版本仍是 1，协议规定
+ * "更高的主版本不会中断推送、只在结果里回带 `unsupportedVersion: true`"，所以声明基线不会触发它。
  *
  * 为什么声明：协议规定"更高的主版本不会中断推送，但结果里会回带
  * `unsupportedVersion: true`"。不声明就永远观测不到这件事——
@@ -78,7 +82,7 @@ export const NOTIFY_API_BASELINE = '1.0.0'
 /**
  * 挑选发送方法：**优先 `notify`**。
  *
- * `push` 与 `notify` 在 2.0.0 里是同一个 `deliver()`（门控行为完全相同），
+ * `push` 与 `notify` 在 2.x 里是同一个 `deliver()`（门控行为完全相同；2.1.0-led.1 实测 `api.ts:185-230`），
  * 区别只在返回：`push` 给 boolean，`notify` 给 `{ ok, queued, silenced, reason, … }`。
  * 既然门控一样，选能说出原因的那个——这也让"设置页关掉了对外 API"这类
  * 拒绝从裸 `false` 变成 `reason: 'api-disabled'`。
@@ -113,7 +117,7 @@ function outcomeOf(value: unknown): NotifyOutcomeLike | undefined {
   return candidate
 }
 
-/** 点击通知后做什么。四态与 `dsh-desktop-notify` 2.0.0 的 `ClickTarget` 一致。 */
+/** 点击通知后做什么。四态与 `dsh-desktop-notify` 2.x 的 `ClickTarget` 一致（2.1.0-led.1 实测 `src/protocol.ts:18-22`）。 */
 export type NotifyClick =
   | { readonly type: 'none' }
   | { readonly type: 'session'; readonly sessionId?: string }
@@ -130,7 +134,7 @@ export interface NotifyPayload {
   readonly urgency?: NotifyUrgency
   /** 传了就按会话门控；不传则始终推送。 */
   readonly sessionId?: string | readonly string[]
-  /** 点击后的行为（2.0.0 四态）。 */
+  /** 点击后的行为（2.x 四态）。 */
   readonly click?: NotifyClick
   /**
    * `click` 之前的旧写法，等价于 `click: { type: 'url', url }`。
@@ -260,7 +264,7 @@ export class NotifyBridge {
    * @param kind 节流与去重用的类型键（不给人看）。
    * @param title **必填**——对方对空标题一律拒绝。
    * @param message 正文（可选）。
-   * @param click 点击通知后的行为（2.0.0 四态）；不给则点了不跳转。
+   * @param click 点击通知后的行为（2.x 四态）；不给则点了不跳转。
    * @returns 是否**真的发出**（false = 未安装/节流/去重/超上限/对方拒绝，全部静默）
    *
    * **绝不抛异常**：没有任何失败路径能把错误带给调用方。

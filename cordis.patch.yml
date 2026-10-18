@@ -123,8 +123,17 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
           # 工具面逐行抄自 DSH 自带的**创造模式**预设
           # （`packages/bundle/web-app/presets/cordis.patch.yml`）。
+          #
+          # **0.2.1-rc.2 对齐（2026-10-18）**：相对 0.2.0-rc.2，创造模式新增了
+          # `time-context` / `tool-schedule` / `tool-plugin-market` 三行，删除了
+          # `tool-subagent-codex` / `tool-subagent-claude-code` / `tool-ralph` 三行与
+          # `backgroundMode` 字段（后者在 rc.2 已是运行时概念、不再是 config 键——
+          #  schemastery 的 `strict` 默认为 false，未知键会被**静默合并**，永不生效）。
+          # 本列表已逐行跟上；护栏是 `tests/dsh/preset-composition.test.ts`。
           #
           # **为什么抄创造模式而不是标准模式**：创造模式才是全的那一份——
           # standard 少了 `tool-cordis`、少了 `skill-filesystem` 的 customSkillDirs、
@@ -140,6 +149,7 @@
           # **去掉的项（相对创造模式）**：
           # ① `tool-cordis`（Cordis 源码导航）——那是给"改 DSH 自身"用的，
           #    与 OMB 的日常认知任务无关，且它有 `cordis_inspect_*` 一族工具面。
+          #    这是**唯一**有意的差异；其余行必须与创造模式一致（含上面的 3 行新增）。
           #
           # **恢复的项**：② `compaction` 组（compaction-basic / command-compact /
           #    tool-result-pruner）。原先整组去掉的理由是"OMB 是拉取式 + 软压力档位，
@@ -161,6 +171,8 @@
               sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
           - id: command-goal
             name: '@deepseek-ai/dsh-command-goal'
           - id: tool-goal
@@ -175,7 +187,7 @@
                 name: '@deepseek-ai/dsh-plan-mode'
                 config:
                   section: |
-                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
 
                     Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
 
@@ -234,41 +246,17 @@
                   provider: spawn
                   toolName: subagent
                   modelSelectionSettings: true
-                  backgroundMode: continuable
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
-              - id: tool-subagent-codex
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: codex
-                  toolName: subagent_codex
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
-              - id: tool-subagent-claude-code
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: claude-code
-                  toolName: subagent_claude_code
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 config:
                   provider: spawn
               - id: tool-workflow
                 name: '@deepseek-ai/dsh-tool-workflow'
-              - id: tool-ralph
-                name: '@deepseek-ai/dsh-tool-ralph'
-                disabled: true
-                config:
-                  subagentProvider: spawn
-                  maxRounds: 64
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
           - id: tool-todo
@@ -291,4 +279,7 @@
             name: '@deepseek-ai/dsh-tool-present'
           - id: tool-plugin-manager
             name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: !!js "!ctx.get('profileContext')"

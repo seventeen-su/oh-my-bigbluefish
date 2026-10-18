@@ -4,6 +4,16 @@
 > `packages/{core/tools,core/session,core/system-prompt,core/agent,preset/agent-preset,llm/token-meter,interaction/commands,bundle/base}/package.json` 逐一实测同为 `0.2.0-rc.2`）
 > Cordis：`@deepseek-ai/cordis` **`4.0.4`**（`<dsh-checkout>\vendor\cordis\package.json`）
 > 本档只记录**读过源码/实测过**的事实；每条断言带 `文件:行号`。不确定的写在 §7。
+>
+> ⚠️ **2026-10-18 已针对 DSH `0.2.1-rc.2` 复核，本档部分结论被推翻**，以
+> [`docs/dsh-0.2.1-rc.2-compatibility.md`](./dsh-0.2.1-rc.2-compatibility.md) 为准。最要紧两处：
+>
+> 1. §2.2 的"`^0.2.0-rc.2` **不接受** `0.2.1-rc.1`"只在 semver **默认口径**下成立。
+>    DSH 的兼容门用 `semver.satisfies(..., { includePrerelease: true })`
+>    （`packages/boot/app-boot/src/plugin-compatibility.ts:52`），实际接受任何 `0.2.x` 预发布。
+>    现在版本契约已收敛为一条 `engines.dsh`（存在时 DSH 只用它、忽略全部 peer，同文件 `:57-61`）。
+> 2. §3.2 提到的"注册按名字 Map、重名静默覆盖"**不成立**：同层重名**抛错**
+>    （`packages/core/scope/src/store.ts:45`），只有跨作用域才是有意遮蔽。
 
 ---
 

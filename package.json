@@ -2,6 +2,9 @@
   "name": "@omb/plugin",
   "version": "3.6.0",
   "private": true,
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <=0.2.1-rc.2"
+  },
   "type": "module",
   "icon": "./icon.svg",
   "description": "OMB v3 通用认知增强：思维链质量 / 记忆库 / 上下文优化三个组件，共 8 个可单独开关的插件行。不限于编程，生活与闲聊同样适用。",
@@ -45,9 +48,11 @@
     "@deepseek-ai/dsh-persona": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-plan-mode": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-plugin-manager": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-plugin-market": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-session": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-skill-filesystem": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-time-context": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-token-meter": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-ask-user": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-bash": "^0.2.0-rc.2",
@@ -58,6 +63,7 @@
     "@deepseek-ai/dsh-tool-present": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-pwsh": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-ralph": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-schedule": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-skill": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-subagent": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tool-subagent-control": "^0.2.0-rc.2",
@@ -95,7 +101,13 @@
     "@deepseek-ai/dsh-plugin-manager": {
       "optional": true
     },
+    "@deepseek-ai/dsh-plugin-market": {
+      "optional": true
+    },
     "@deepseek-ai/dsh-skill-filesystem": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-time-context": {
       "optional": true
     },
     "@deepseek-ai/dsh-tool-ask-user": {
@@ -123,6 +135,9 @@
       "optional": true
     },
     "@deepseek-ai/dsh-tool-ralph": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-schedule": {
       "optional": true
     },
     "@deepseek-ai/dsh-tool-skill": {
