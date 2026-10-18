@@ -8,8 +8,12 @@ import {
   DEFAULT_LOOP_THRESHOLDS,
   DEFAULT_WINDOW_SIZE,
   LOOP_HINT_MAX,
+  LOOP_HYSTERESIS_STEPS,
+  NO_ANNOUNCE,
   NO_PROGRESS_KINDS,
+  type EvidenceObservation,
   type TurnFingerprint,
+  announceLoop,
   appendFingerprint,
   detectLoop,
   isNoProgressSignal,
@@ -294,5 +298,89 @@ describe('无进展信号集合（注入侧与观察侧共用的唯一真源）'
     expect(isNoProgressSignal(undefined)).toBe(false)
     expect(isNoProgressSignal({} as never)).toBe(false)
     expect(isNoProgressSignal({ kind: 'bogus' } as never)).toBe(false)
+  })
+})
+
+/**
+ * Wave 1 / R3：callId 精确配对、surface 代际分区、注入迟滞。
+ *
+ * 这三条对应调研报告里的两个真实缺陷：
+ * ① v3.6 用"上一条缺证据就补"归并——DSH 每步 1.27 次工具调用，并发调用时
+ *    call 事件先成批出现、result 才陆续到达，证据会挂到错误动作上；
+ * ② 压缩/替换后如果沿用旧窗口，压缩前的"重复/无进展"会算到压缩后的头上。
+ */
+describe('R3：callId 配对 + 代际分区 + 注入迟滞', () => {
+  const obs = (
+    actionHash: string,
+    evidenceHash: string,
+    callId: string,
+    generation = 0,
+  ): EvidenceObservation & { generation: number } => ({ actionHash, evidenceHash, callId, at: 0, generation })
+
+  it('并发调用：两个 call 先到、两个 result 乱序到达 → 按 callId 各自配对', () => {
+    let window = noteObservation([], obs('call-A', '', 'c1'), DEFAULT_WINDOW_SIZE, 0)
+    window = noteObservation(window, obs('call-B', '', 'c2'), DEFAULT_WINDOW_SIZE, 0)
+    window = noteObservation(window, obs('', 'res-B', 'c2'), DEFAULT_WINDOW_SIZE, 0)
+    window = noteObservation(window, obs('', 'res-A', 'c1'), DEFAULT_WINDOW_SIZE, 0)
+    expect(window.map(entry => [entry.actionHash, entry.evidenceHash, entry.callId])).toEqual([
+      ['call-A', 'res-A', 'c1'],
+      ['call-B', 'res-B', 'c2'],
+    ])
+  })
+
+  it('没有对应 call 的 result 单独成步（不污染上一条动作）', () => {
+    let window = noteObservation([], obs('call-A', '', 'c1'), DEFAULT_WINDOW_SIZE, 0)
+    window = noteObservation(window, obs('', 'orphan-evidence', 'c9'), DEFAULT_WINDOW_SIZE, 0)
+    expect(window).toHaveLength(2)
+    expect(window[0]?.evidenceHash).toBe('')
+    expect(window[1]?.evidenceHash).toBe('orphan-evidence')
+  })
+
+  it('旧接线（没有 callId）仍走兜底归并：上一条缺证据就补', () => {
+    let window = noteObservation([], { actionHash: 'read:a.ts', evidenceHash: '', at: 1 })
+    window = noteObservation(window, { actionHash: 'result:a', evidenceHash: 'h1', at: 2 })
+    expect(window).toHaveLength(1)
+    expect(window[0]).toMatchObject({ actionHash: 'read:a.ts', evidenceHash: 'h1' })
+  })
+
+  it('surface 代际变化：旧代际指纹整段丢弃', () => {
+    let window: readonly TurnFingerprint[] = []
+    for (const action of ['a', 'b', 'c']) {
+      window = noteObservation(window, obs(action, 'same', ''), DEFAULT_WINDOW_SIZE, 0)
+    }
+    expect(window).toHaveLength(3)
+    window = noteObservation(window, obs('d', 'new', '', 1), DEFAULT_WINDOW_SIZE, 1)
+    expect(window).toHaveLength(1)
+    expect(window[0]).toMatchObject({ actionHash: 'd', evidenceHash: 'new', generation: 1 })
+  })
+
+  it('迟滞：同信号冷却期内不重复；kind 变化立刻放行；信号解除后复发可立刻报', () => {
+    const signal = (kind: 'stalled' | 'no-new-evidence') => ({ kind, detail: 'd', hint: 'h' })
+    const first = announceLoop(NO_ANNOUNCE, signal('stalled'), 1)
+    expect(first.inject).toBe(true)
+    expect(first.state).toEqual({ kind: 'stalled', step: 1 })
+
+    const cooling = announceLoop(first.state, signal('stalled'), 2)
+    expect(cooling.inject).toBe(false)
+    expect(cooling.state).toEqual(first.state)
+
+    const afterCooldown = announceLoop(first.state, signal('stalled'), 1 + LOOP_HYSTERESIS_STEPS)
+    expect(afterCooldown.inject).toBe(true)
+
+    // 信号变化：立刻放行（新的诊断更具体/更不同）
+    expect(announceLoop(first.state, signal('no-new-evidence'), 2).inject).toBe(true)
+
+    // 信号解除：状态归零；同一信号复发可立刻报
+    const cleared = announceLoop(first.state, null, 2)
+    expect(cleared.inject).toBe(false)
+    expect(cleared.state.kind).toBeNull()
+    expect(announceLoop(cleared.state, signal('stalled'), 3).inject).toBe(true)
+  })
+
+  it('迟滞是纯函数、非法 step 不抛', () => {
+    const signal = { kind: 'stalled' as const, detail: 'd', hint: 'h' }
+    expect(announceLoop(NO_ANNOUNCE, signal, Number.NaN).inject).toBe(true)
+    expect(announceLoop(undefined, null, 1).inject).toBe(false)
+    expect(announceLoop(undefined, null, 1).state).toEqual(NO_ANNOUNCE)
   })
 })

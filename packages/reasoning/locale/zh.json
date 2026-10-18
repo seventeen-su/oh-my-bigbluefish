@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "思维链质量",
-    "description": "提供核心方法论与思维链质量改进"
+    "description": "过程卡迁到 skills（omb-r1…r8）；只在检测到循环/无进展时注入一行"
   }
 }

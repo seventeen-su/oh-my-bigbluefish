@@ -138,8 +138,8 @@ describe.skipIf(!built)('构建产物加载冒烟（换代产物）', () => {
 
     // 工具面：内核自带 + 各模块声明的（缺宿主端口时模块会降级，但工具应注册）
     expect(registered.tools).toContain('omb_status')
-    // 提示注入：一个 order 200 的 omb:cognitive 段
-    expect(registered.contexts).toContainEqual({ name: 'omb:cognitive', order: 200 })
+    // 提示注入：一个 order 190 的 omb:cognitive 段（避开宿主 HARNESS_SOURCE:200）
+    expect(registered.contexts).toContainEqual({ name: 'omb:cognitive', order: 190 })
 
     expect(() => dispose()).not.toThrow()
     expect(() => dispose()).not.toThrow() // 幂等

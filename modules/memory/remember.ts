@@ -12,8 +12,15 @@
  *
  * 归属（`assertedBy`）与准入依据（`AdmissionGround`）是**两个问题**，别混：
  * - 准入依据 = "这条值不值得写"（用户陈述 / 可由工件复现 / 执行结果确认）
- * - `assertedBy` = "谁在断言"（`user` 需要核对到用户真的这么说过；本次写入没有真的执行过，
- *   因此**永不**写 `execution`——那是需要真实执行轨迹才能claim的来源等级）
+ * - `assertedBy` = "谁在断言"（`user` 需要核对到用户真的这么说过；`execution` 需要
+ *   `SessionWitnessPort.hasExecution` 命中真实调用记录——**不再**认 `sourceRef` 前缀自证，
+ *   那条路径实测产出的是模型自己的会话回顾体）
+ *
+ * 3.7（W1-M4）新增两条模块侧护栏：
+ * - **回顾体护栏**：>240 字符 + ≥3 个不同路径 + 总结词（本会话/回顾/完成/总结）→
+ *   强制 `episodic` + 项目库；只有调用方**同时显式**给 `kind:'semantic'` 与
+ *   `scope:'user'` 才允许进用户库（"写错"比"少写"更难回收）。
+ * - **弃权分档**：每种弃权带 `category`，供健康面按原因计数（旧实现只有一句自由文本）。
  *
  * 回执要能**当场自证**两件事（缺一个都会让调用方只能事后反证）：
  * ① 存下的**逐字原文**（截断必注明）——"我存了什么"当场可见
@@ -33,6 +40,8 @@ import type {
 } from '../../kernel/abi/index.js'
 import { MEMORY_KINDS, MEMORY_SCOPES, RESERVED_SOURCE_PREFIX, SCOPE_BY_KIND } from '../../kernel/abi/index.js'
 import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
+import { hasSecret } from './secrets.js'
+import type { SessionWitnessPort } from './witness.js'
 
 /** 工具名 = `MODULE_CATALOG` 里 `omb-memory` 的 tools 之一（目录是唯一契约）。 */
 export const REMEMBER_TOOL = 'omb_remember'
@@ -130,10 +139,48 @@ export interface AdmissionInput {
    * 拿它当依据等于让工具给自己发合格证——那个假阳性修过一次，不要再打开。
    */
   readonly sourceRefExplicit?: boolean
+  /**
+   * **真实执行台账命中**（3.7-M4）。
+   *
+   * 由调用方从 `SessionWitnessPort.hasExecution(sessionId, sourceRef)` 取来：
+   * `true` = 本会话真的执行过与 `sourceRef` 对应的调用。
+   *
+   * 旧实现只看 `sourceRef` 是否以 `execution:` 开头——那是模型可以自己写的字符串，
+   * 等于自签合格证。实测项目库 3/3 条就是这么进来的**会话回顾体**。
+   * `undefined`/`false` 一律不算依据（fail closed）。
+   */
+  readonly executionConfirmed?: boolean
 }
 
 /** 工件类别。只有**可核验**的类别才可能成为准入依据。 */
 export type ArtifactKind = 'path' | 'command' | 'url' | 'hash' | 'version' | 'line'
+
+/**
+ * 弃权原因分档（3.7-M4）。
+ *
+ * 为什么必须分类：旧实现只给一句自由文本，健康面只能数"弃权总数"——
+ * 而"没有依据"（可能是噪声，也可能是没带工件的真结论）与"来源缺失"（接线/归属问题）
+ * 的修法完全不同。分类让它们各自变成可读的读数。
+ */
+export type AbstentionCategory =
+  /** 正文为空。 */
+  | 'empty'
+  /** 正文不含任何文字或数字（纯标点/符号）。 */
+  | 'no-content'
+  /** 短于最小长度。 */
+  | 'too-short'
+  /** 长于单条上限。 */
+  | 'too-long'
+  /** 没有来源引用（投毒防御的必要条件）。 */
+  | 'missing-source'
+  /** 来源前缀保留给单文档状态（画像一类）。 */
+  | 'reserved-source'
+  /** 自称用户陈述但核对不到原话。 */
+  | 'user-claim-unverified'
+  /** 正文含凭据形态（3.7 Wave 2：与自主捕获共用 `./secrets.js` 的同一张模式表）。 */
+  | 'secret'
+  /** 看不出任何准入依据。 */
+  | 'no-ground'
 
 export type AdmissionDecision =
   | {
@@ -144,7 +191,7 @@ export type AdmissionDecision =
       /** 写入回执里要显示的准入依据。 */
       readonly reason: string
     }
-  | { readonly ok: false; readonly reason: string }
+  | { readonly ok: false; readonly reason: string; readonly category: AbstentionCategory }
 
 /**
  * "可由具体工件复现"的可核对标记。命中即说明这条挂在某个具体东西上，不是模糊印象。
@@ -235,8 +282,51 @@ const ARTIFACT_MARKERS: readonly {
   },
 ]
 
-/** "被执行结果确认"的显式来源标注（`sourceRef` 前缀）。 */
-const EXECUTION_SOURCE_PREFIXES: readonly string[] = ['execution:', 'command:', 'test:', 'run:', 'observed:']
+/**
+ * 回顾体护栏（3.7-M4）。
+ *
+ * ## 为什么需要它
+ *
+ * 实测：用户库 16 条里 12 条是 `asserted_by=model` 的**会话回顾/自检记录**
+ * （"本会话完成了…"、"自检标记…"），项目库 3/3 条是 `execution:` 回顾体。
+ * 它们能进库是因为正文里顺手提到了几个**真实存在的**文件路径——工件核验通过，
+ * 但核验通过的是"提到了这个工件"，不是"这条陈述是项目知识"。
+ *
+ * ## 判据（三个条件同时成立，宁可漏判不可错杀）
+ *
+ * ① 长度 > `RECAP_MIN_CHARS`（240）：短结论才是记忆该有的形状；
+ * ② 正文里出现 ≥ `RECAP_MIN_PATHS`（3）个**不同**路径/文件名；
+ * ③ 出现总结词（本会话/本轮/回顾/完成/总结）。
+ *
+ * 命中后**不弃权**（它仍可能是有价值的经验），而是**改路由**：
+ * 强制 `episodic` + 项目库；只有调用方同时显式给 `kind:'semantic'` 与
+ * `scope:'user'` 才允许进用户库（"写错"比"少写"难回收——用户库是跨项目的）。
+ */
+export const RECAP_MIN_CHARS = 240
+export const RECAP_MIN_PATHS = 3
+const RECAP_MARKERS: readonly string[] = ['本会话', '本轮', '回顾', '完成', '总结']
+const RECAP_PATH_PATTERNS: readonly RegExp[] = [
+  // Windows 绝对路径
+  /[A-Za-z]:\\[^\s"'`）)，,。；;]+/g,
+  // 相对路径（至少两级）
+  /(?:\.{0,2}\/)[\w.@-]+(?:\/[\w.@-]+)+/g,
+  // 裸文件名（与 ARTIFACT_MARKERS 的扩展名表同源）
+  /\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|yml|yaml|toml|ini|py|go|rs|java|kt|sql|sh|ps1|css|html|txt|csv)\b/g,
+]
+
+/** 这条文本像不像"会话回顾体"（纯函数，**不做 I/O**）。 */
+export function looksLikeRecap(text: string): boolean {
+  if (typeof text !== 'string' || text.length <= RECAP_MIN_CHARS) return false
+  const paths = new Set<string>()
+  for (const pattern of RECAP_PATH_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      const value = match[0]
+      if (value.length > 0) paths.add(value)
+    }
+  }
+  if (paths.size < RECAP_MIN_PATHS) return false
+  return RECAP_MARKERS.some(marker => text.includes(marker))
+}
 
 /** 保留来源前缀（画像一类的单文档状态）——不该经本工具写入。 */
 function isReservedSource(sourceRef: string): boolean {
@@ -271,37 +361,53 @@ function hasReadableContent(text: string): boolean {
 /**
  * 准入启发式（**纯函数**，规划 §5.6）：写，当且仅当
  * ① 用户显式陈述（且能在会话用户消息里核对到，或明确记为"自报未核对"）
- * ② 可由具体工件复现（路径/命令/URL/哈希/版本号）
- * ③ 被执行结果确认（`sourceRef` 带 `execution:` 一类前缀）
- * 否则**弃权**并给出可读原因。
+ * ② 可由具体工件复现（路径/命令/URL/哈希/版本号，可核验类别要真的核验通过）
+ * ③ 被执行结果确认（**本会话真实执行台账命中**，由调用方给 `executionConfirmed`）
+ * 否则**弃权**并给出可读原因 + 可计数的 `category`。
  */
 export function decideAdmission(input: AdmissionInput): AdmissionDecision {
   const text = typeof input.text === 'string' ? input.text : ''
   const trimmed = text.trim()
 
-  if (trimmed.length === 0) return { ok: false, reason: '内容为空：没有可写入的陈述' }
+  if (trimmed.length === 0) return { ok: false, reason: '内容为空：没有可写入的陈述', category: 'empty' }
   if (!hasReadableContent(trimmed)) {
-    return { ok: false, reason: '内容不含任何文字或数字：无法成为一条可检索、可核对的记忆' }
+    return { ok: false, reason: '内容不含任何文字或数字：无法成为一条可检索、可核对的记忆', category: 'no-content' }
   }
   if (trimmed.length < MIN_TEXT_CHARS) {
-    return { ok: false, reason: `内容过短（${trimmed.length} < ${MIN_TEXT_CHARS} 字符）：太短的内容无法成为可核对的事实` }
+    return {
+      ok: false,
+      reason: `内容过短（${trimmed.length} < ${MIN_TEXT_CHARS} 字符）：太短的内容无法成为可核对的事实`,
+      category: 'too-short',
+    }
   }
   if (trimmed.length > MAX_TEXT_CHARS) {
     return {
       ok: false,
       reason: `内容过长（${trimmed.length} > ${MAX_TEXT_CHARS} 字符）：逐字原文适合短陈述；长内容请落到制品索引，避免一条巨块污染召回`,
+      category: 'too-long',
     }
   }
   if (typeof input.sourceRef !== 'string' || input.sourceRef.length === 0) {
     return {
       ok: false,
       reason: '缺少来源引用（source_ref 非空是投毒防御与证据独立的必要条件，§5.2）',
+      category: 'missing-source',
     }
   }
   if (isReservedSource(input.sourceRef)) {
     return {
       ok: false,
       reason: `来源前缀 ${RESERVED_SOURCE_PREFIX} 保留给"单文档结构化状态"（画像一类）：它不是经验痕迹，请由对应模块写入`,
+      category: 'reserved-source',
+    }
+  }
+  // 凭据形态一律拒：记忆库是**明文 SQLite**，"先存后删"不构成保护
+  // （WAL/备份/历史读都可能留痕）。自主捕获走同一张模式表（`capture.ts`）。
+  if (hasSecret(trimmed) || hasSecret(input.sourceRef)) {
+    return {
+      ok: false,
+      reason: '正文或来源含凭据形态（密钥/令牌/私钥/明文口令）：记忆库不存凭据，请改用环境变量或密钥管理',
+      category: 'secret',
     }
   }
 
@@ -319,16 +425,20 @@ export function decideAdmission(input: AdmissionInput): AdmissionDecision {
     }
   }
 
-  // ③ 被执行结果确认（按 `sourceRef` 的显式标注）
-  const source = input.sourceRef.toLowerCase()
-  if (EXECUTION_SOURCE_PREFIXES.some(prefix => source.startsWith(prefix))) {
+  // ③ 被执行结果确认（**真实台账命中**，3.7-M4）
+  //
+  // 旧实现按 `sourceRef` 前缀（`execution:` / `test:` …）判——那是模型自己写的字符串，
+  // 等于自签合格证。现在只认 `SessionWitnessPort.hasExecution` 的结论：
+  // 调用方把命中的布尔值放进 `executionConfirmed`，纯函数不做 I/O。
+  if (input.executionConfirmed === true) {
     return {
       ok: true,
       ground: 'execution-confirmed',
-      // 断言来源保守记为 model：本次写入并没有真的执行过任何东西（写 execution 会是假溯源）
-      assertedBy: 'model',
+      // 这次**真的**有执行轨迹（见 `SessionWitnessPort.hasExecution`），
+      // 因此写 `execution` 是如实溯源，而不是旧实现里那个保守的 `model`。
+      assertedBy: 'execution',
       verification: 'not-user',
-      reason: `可由执行结果确认（来源标注 ${input.sourceRef.split(':')[0]}）`,
+      reason: '可由执行结果确认（本会话真实执行台账命中，见 sourceRef）',
     }
   }
 
@@ -402,6 +512,7 @@ export function decideAdmission(input: AdmissionInput): AdmissionDecision {
   if (input.claimedUserAssertion) {
     return {
       ok: false,
+      category: 'user-claim-unverified',
       reason:
         '自称用户陈述但无法在会话的用户消息里核对到原话，且看不出可由具体工件复现或被执行结果确认——' +
         '弃权（自报不能用来取得 user 来源等级，§5.8 的等级差是结构性的）',
@@ -410,6 +521,7 @@ export function decideAdmission(input: AdmissionInput): AdmissionDecision {
 
   return {
     ok: false,
+    category: 'no-ground',
     reason:
       '没有准入依据：既不是用户显式陈述，也看不出可由具体工件复现或被执行结果确认——' +
       '弃权并记录（§5.6 要求精度优先于召回，宁可漏记也不要写入模糊印象）',
@@ -530,6 +642,19 @@ export interface RememberOutcome {
   readonly contentHash?: string
   /** 本次声明了 `supersedes` 时：逐条标注结果。 */
   readonly supersede?: SupersedeReport
+  /**
+   * 回顾体护栏改变了路由（3.7-M4）。
+   *
+   * 回执必须说清"你写的是 semantic/user，实际落的是 episodic/project"——
+   * 静默改路由比拒绝更坏：调用方会以为用户库里有了这条偏好。
+   */
+  readonly routing?: {
+    readonly reason: string
+    readonly requestedKind: MemoryKind
+    readonly requestedScope: MemoryScope
+    readonly kind: MemoryKind
+    readonly scope: MemoryScope
+  }
 }
 
 export interface MemoryWriteDeps {
@@ -553,8 +678,31 @@ export interface MemoryWriteDeps {
   readonly clock: Clock
   /** 某会话的回合号；用于默认 `sourceRef`（拿不到就退化成 `session:<id>`）。 */
   readonly currentTurn?: (sessionId?: string) => number | undefined
-  /** 会话里最近一条用户消息（宿主能力可得时提供；缺省即"自报未核对"）。 */
+  /**
+   * 会话里最近一条用户消息（宿主能力可得时提供；缺省即"自报未核对"）。
+   *
+   * 3.7-M4 起优先用 `witness()` 的 `lastUserMessage`（按会话取）；
+   * 本字段保留给只有单会话读数的旧装配/测试。
+   */
   readonly lastUserMessage?: () => string | undefined
+  /**
+   * **会话见证**（3.7-M4）：`userAsserted` 核对与 `execution-confirmed` 的唯一来源。
+   *
+   * 生产里由 `modules/memory/index.ts` 惰性解析内核服务
+   * `SessionWitnessPort`（服务名 `omb:session-witness`，见 `./witness.js`）；
+   * 拿不到（单测、旧装配、宿主未接线）→ 退化为旧行为：
+   * - 用户陈述只能记成 `claimed-unverified`；
+   * - 执行依据一律不成立（比"自签合格证"更安全的方向）。
+   */
+  readonly witness?: () => SessionWitnessPort | undefined
+  /**
+   * 写入成功后的附加索引（3.7 Wave 2：图自动连边）。
+   *
+   * 在 `put` 成功之后、回执之前调用；**失败不影响"已写入"**（由调用方隔离）。
+   */
+  readonly onStored?: (store: MemoryStore, record: MemoryRecord) => Promise<void>
+  /** 可读日志口（附加索引失败时留声；缺省不日志）。 */
+  readonly logger?: { warn(message: string): void }
   /** 某会话的项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
   readonly currentProject?: (sessionId?: string) => string | undefined
   /**
@@ -582,7 +730,12 @@ export interface MemoryWriteDeps {
     readonly kind: MemoryKind
   }) => void
   /** 每一次弃权（准入拒绝）都要记录：弃权率是审计漏记的唯一手段。 */
-  readonly onAbstained?: (info: { readonly reason: string; readonly text: string }) => void
+  readonly onAbstained?: (info: {
+    readonly reason: string
+    readonly text: string
+    /** 弃权分档（3.7-M4）；健康面按它计数。 */
+    readonly category: AbstentionCategory
+  }) => void
 }
 
 function messageOf(error: unknown): string {
@@ -700,6 +853,14 @@ export function renderRemember(outcome: RememberOutcome): string {
   ]
   if (outcome.verification === 'claimed-unverified') {
     lines.push('注意：断言来源按"用户陈述"记录，但本进程拿不到用户消息原文，未能核对。')
+  }
+  if (outcome.routing !== undefined) {
+    // 护栏改了路由就必须在回执里说清：调用方按 semantic/user 写的，实际进了 episodic/project。
+    lines.push(`⚠ 路由已调整：${outcome.routing.reason}`)
+    lines.push(
+      `   请求 ${outcome.routing.requestedKind}/${outcome.routing.requestedScope}` +
+        ` → 实际 ${outcome.routing.kind}/${outcome.routing.scope}`,
+    )
   }
   if (outcome.text !== undefined) lines.push(...echoLines(outcome.text, outcome.contentHash))
   if (outcome.supersede !== undefined) lines.push(...renderSupersede(outcome.supersede))
@@ -929,13 +1090,38 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
          */
         const sessionId = call?.attribution === 'session' ? call.sessionId : undefined
 
-        const scope: MemoryScope = input.scope ?? SCOPE_BY_KIND[input.kind]
+        /**
+         * **见证服务**（3.7-M4）：每次执行惰性解析，拿不到就退化为旧行为。
+         *
+         * 只解析一次：`lastUserMessage` 与 `hasExecution` 必须看**同一时刻**的见证，
+         * 否则两次调用之间刚好来了新消息，会让"核对"与"执行确认"互相矛盾。
+         */
+        let witness: SessionWitnessPort | undefined
+        try {
+          witness = deps.witness?.()
+        } catch {
+          witness = undefined
+        }
+
+        const requestedScope: MemoryScope = input.scope ?? SCOPE_BY_KIND[input.kind]
         const sourceRef = input.sourceRef ?? defaultSourceRef(sessionId, deps.currentTurn?.(sessionId))
+        // 用户消息：见证优先（按会话取），旧字段兜底（单会话装配/测试）
+        const userMessage = (sessionId === undefined ? undefined : witness?.lastUserMessage(sessionId)) ?? deps.lastUserMessage?.()
+        // 执行确认：只有真实台账命中才算（sourceRef 是"要确认的那条轨迹"）
+        let executionConfirmed = false
+        if (sessionId !== undefined && sourceRef !== undefined && witness !== undefined) {
+          try {
+            executionConfirmed = witness.hasExecution(sessionId, sourceRef) === true
+          } catch {
+            executionConfirmed = false
+          }
+        }
         const decision = decideAdmission({
           text: input.text,
           sourceRef: sourceRef ?? '',
           claimedUserAssertion: input.userAsserted === true,
-          ...(deps.lastUserMessage?.() === undefined ? {} : { userMessage: deps.lastUserMessage?.() }),
+          ...(userMessage === undefined ? {} : { userMessage }),
+          ...(executionConfirmed ? { executionConfirmed: true } : {}),
           // 核验基准目录用**本次调用的会话**（判据本身不变，只是把会话传进去）
           ...(deps.verifyArtifact === undefined
             ? {}
@@ -949,12 +1135,35 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
 
         if (!decision.ok) {
           try {
-            deps.onAbstained?.({ reason: decision.reason, text: input.text })
+            deps.onAbstained?.({ reason: decision.reason, text: input.text, category: decision.category })
           } catch {
             // 记账失败不得改变"没写入"这个结论
           }
           return { kind: 'text', text: renderRemember({ written: false, reason: decision.reason }) }
         }
+
+        /**
+         * **回顾体护栏**（3.7-M4）：命中则不写进用户库。
+         *
+         * 只在调用方**没有同时显式**给 `kind:'semantic'` + `scope:'user'` 时改路由：
+         * 两个都写出来是一次"我知道我在做什么"的显式声明，护栏不再覆盖它。
+         */
+        const recap = looksLikeRecap(input.text)
+        const explicitUserSemantic = input.kind === 'semantic' && input.scope === 'user'
+        const routing = recap && !explicitUserSemantic
+          ? {
+              reason:
+                `回顾体护栏：正文 ${input.text.length} 字符（>${RECAP_MIN_CHARS}）、`
+                + '含 ≥3 个不同路径且出现总结词——按经验（episodic）落项目库，不进跨项目用户库。'
+                + '若这确是用户级结论，请显式同时给 kind:"semantic" 与 scope:"user"。',
+              requestedKind: input.kind,
+              requestedScope,
+              kind: 'episodic' as MemoryKind,
+              scope: 'project' as MemoryScope,
+            }
+          : undefined
+        const kind: MemoryKind = routing?.kind ?? input.kind
+        const scope: MemoryScope = routing?.scope ?? requestedScope
 
         if (sourceRef === undefined) {
           // 防御性守卫：空来源已在准入里被拒（"缺少来源引用"），正常到不了这里。
@@ -983,7 +1192,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         const record: MemoryRecord = {
           id: newMemoryId(deps.clock, contentHash),
           scope,
-          kind: input.kind,
+          kind,
           text: input.text,
           contentHash,
           sourceRef,
@@ -1006,6 +1215,12 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         } catch {
           // 事件通道失败不改变"已写入"这个事实
         }
+        // 自动连边（3.7 Wave 2）：附加索引，失败不影响写入结果
+        try {
+          await deps.onStored?.(store, record)
+        } catch (error) {
+          deps.logger?.warn?.(`OMB：自动连边失败（已隔离）——${messageOf(error)}`)
+        }
 
         // 推翻标注在 put 成功**之后**做：标注一个不存在的取代者是没有意义的。
         // 标不出来也不影响"新条目已写入"，但结果必须原样进回执（见 renderSupersede）。
@@ -1026,6 +1241,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
             reason: decision.reason,
             text: record.text,
             contentHash: record.contentHash,
+            ...(routing === undefined ? {} : { routing }),
             ...(supersede === undefined ? {} : { supersede }),
           }),
         }

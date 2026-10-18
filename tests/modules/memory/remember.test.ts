@@ -218,13 +218,26 @@ describe('准入启发式（纯函数，§5.6）', () => {
     expect(decision.ok, '自动生成的来源不该让模糊内容通过').toBe(false)
   })
 
-  it('执行结果确认（来源标注）→ 准入；但**绝不**写 assertedBy=execution（本次没有真的执行过）', () => {
-    const decision = decideAdmission({
+  it('执行结果确认：**只认真实台账**——旧 `execution:` 前缀不再算依据（3.7-M4）', () => {
+    // 旧实现按 sourceRef 前缀判：模型写 `sourceRef: "execution:…"` 就能自签合格证。
+    // 实测项目库 3/3 行正是这种回顾体。现在前缀本身**不再**构成依据。
+    const prefixOnly = decideAdmission({
       ...base,
       sourceRef: 'execution:pnpm test',
       text: '这条结论已由测试结果确认。',
     })
-    expect(decision).toMatchObject({ ok: true, ground: 'execution-confirmed', assertedBy: 'model' })
+    expect(prefixOnly.ok, 'sourceRef 前缀不能自证执行').toBe(false)
+    expect(prefixOnly.ok === false && prefixOnly.category).toBe('no-ground')
+
+    // 真实台账命中（由调用方从 SessionWitnessPort.hasExecution 取来）才准入，
+    // 且这次可以如实写 assertedBy=execution。
+    const confirmed = decideAdmission({
+      ...base,
+      sourceRef: 'execution:pnpm test',
+      text: '这条结论已由测试结果确认。',
+      executionConfirmed: true,
+    })
+    expect(confirmed).toMatchObject({ ok: true, ground: 'execution-confirmed', assertedBy: 'execution' })
   })
 
   it('模糊印象 → 弃权，并给出可读原因（不是静默丢弃）', () => {

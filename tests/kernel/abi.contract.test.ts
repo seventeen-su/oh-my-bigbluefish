@@ -129,7 +129,7 @@ describe('内核 ABI 契约', () => {
     expect(abi.MEMORY_KINDS).toEqual(['episodic', 'semantic', 'procedural'])
     expect(abi.MEMORY_SCOPES).toEqual(['user', 'project'])
     expect(abi.ASSERTED_BY).toEqual(['user', 'execution', 'model'])
-    expect(abi.EDGE_TYPES).toEqual(['supersedes', 'conflicts_with', 'derived_from'])
+    expect(abi.EDGE_TYPES).toEqual(['supersedes', 'conflicts_with', 'derived_from', 'related'])
     expect(abi.FOCUS_DEPTHS).toEqual(['quick', 'standard', 'deep'])
   })
 

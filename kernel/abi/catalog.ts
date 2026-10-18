@@ -46,7 +46,6 @@ export const MODULE_IDS = [
   'omb-memory-vector',
   'omb-profile',
   'omb-reasoning',
-  'omb-context',
   'omb-artifact',
   'omb-notify',
 ] as const
@@ -99,7 +98,7 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
       'memory.recall.multiquery',
       'privacy.modes',
     ],
-    tools: ['omb_recall', 'omb_forget', 'omb_relate', 'omb_remember'],
+    tools: ['omb_recall', 'omb_forget', 'omb_relate', 'omb_remember', 'omb_project'],
   },
   {
     id: 'omb-memory-vector',
@@ -121,21 +120,13 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     id: 'omb-reasoning',
     enabledByDefault: true,
     requires: ['omb-kernel'],
-    capabilities: ['reasoning.methods', 'reasoning.depth', 'reasoning.loop-detect'],
-    // `omb_verify` 是**已经实现并注册**的第三个工具（`modules/reasoning/tools.ts:228`、
-    // `verify.ts`），此前目录里漏登记了它：而 `tests/modules/reasoning/module.test.ts`
-    // 的断言方向是"目录声明 ⊆ 实际注册"，**漏登记永远不会变红**——这正是
-    // "看起来权威、实际不驱动"的那类漂移。补登记后，`tests/dsh/assembly.smoke.test.ts`
-    // 的"目录声明的每个工具都必须真有 tools:<id> 服务"重新覆盖它。
-    // ⚠️ 反向断言（实际注册 ⊆ 目录声明）由 Lead 在两条流合并后统一补——
-    // 那才是这次漏登记的方向，别以为本行改完就永久免疫了。
-    tools: ['omb_method', 'omb_focus', 'omb_verify'],
-  },
-  {
-    id: 'omb-context',
-    enabledByDefault: true,
-    requires: ['omb-kernel'],
-    capabilities: ['context.pressure', 'context.admission', 'context.metrics'],
+    // v4（docs/v4-decision.md §3 L3 / §4）：工具面清空。
+    // - 8 张方法卡迁到 DSH skills（`skills/omb-r1…r8/SKILL.md`）；
+    // - `omb_verify` 删除（外部核验器替代），验证台账/验证段同删；
+    // - `omb_method` / `omb_focus` 删除，`reasoning:methods` 服务不再 provide；
+    //   档位 → `reasoningEffort` 由 `/omb-depth` + `dsh/reasoning-effort.ts` 负责。
+    // 模块只剩：一句常驻提示 + 事件驱动的循环提示/出口段 + `reasoning:loop` 读数。
+    capabilities: ['reasoning.loop-detect'],
     tools: [],
   },
   {
@@ -256,10 +247,6 @@ export const SERVICES = {
   reasoningLoop: 'reasoning:loop',
   /** 方法卡目录（`{ cardsFor(depth) }`）。 */
   reasoningMethods: 'reasoning:methods',
-  /** `ContextPressure` 读数 + 档位行为。 */
-  contextPressure: 'context:pressure',
-  /** 拉取计数与缓存命中率的账本（供状态面）。 */
-  contextMetrics: 'context:metrics',
   /** `StatusRegistry`：由微内核自己 provide，各模块 `register` 贡献段落。 */
   statusContributor: 'status:contributor',
   /**
@@ -334,6 +321,35 @@ export const SERVICES = {
    * （`apply` 里那条与 `collectToolSpecs` 那条）就都能拿到同一份答案。
    */
   pressureReading: 'omb:pressure-reading',
+  /**
+   * **会话见证端口**（`SessionWitnessPort`，形状由 `dsh/session.ts` 定义并 provide）。
+   *
+   * 为什么需要：模块只能经内核拿宿主事实（`modules/*` 禁止 import 宿主包），
+   * 而下面三件事实只有 `dsh/` 的会话事件订阅能看到：
+   * - 最近一条用户消息原文（写入准入核对"用户原话"用；此前是死代码）；
+   * - 本会话真实发生过的工具调用台账（`execution:` 依据必须在台账里命中，
+   *   否则那只是模型自己写的一个字符串前缀）；
+   * - 压缩代际与最近一次压缩读数（循环窗口分区、状态面账单）。
+   *
+   * 取不到 = 该模块按"没有见证"降级（不得把"没看到"当成"没有发生"）。
+   */
+  sessionWitness: 'omb:session-witness',
+  /**
+   * **项目画像端口**（`ProjectProfilePort`，由 `dsh/project-profile.ts` provide）。
+   *
+   * 工作区级记忆要"形成对项目的深入理解"，但不能每会话重新读一遍仓库：
+   * 这里提供一份**确定性、可复算**的项目画像（栈、命令、目录、README 要点、
+   * git 头与近期提交），由 `omb_project` 工具按需读取。构建发生在 `dsh/`
+   * （只有它允许碰文件系统/子进程），模块层只读结果。
+   */
+  projectProfile: 'omb:project-profile',
+  /**
+   * **档位 → 真实推理预算的留痕**（`EffortControlPort`，由 `dsh/reasoning-effort.ts` provide）。
+   *
+   * 用户命令 `/omb-depth` 写档位；本服务让状态面报"这条请求头到底改成了什么、
+   * 有没有因 provider 不支持而没生效"——不猜、不承诺。
+   */
+  effortControl: 'omb:effort-control',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]
@@ -372,7 +388,7 @@ export const RESERVED_SOURCE_PREFIX = 'omb-doc:'
  * 状态面贡献登记处。
  *
  * **为什么是登记处而不是单值服务**：单值服务表一个名字只能装一个实现，
- * 而 `omb-reasoning` 与 `omb-context` 等多个模块都要向 `omb_status` 贡献段落。
+ * 而 `omb-reasoning`、`omb-artifact` 等多个模块都要向 `omb_status` 贡献段落。
  * 让它们互相覆盖（后注册者胜）会**静默丢掉**前面的段落；让它们各自用
  * `status:contributor:<id>` 又需要在 `dsh/` 侧逐个探测、且新增模块要改 dsh。
  * 登记处一次注册、天然支持 N 个、dsh 侧一段代码遍历。

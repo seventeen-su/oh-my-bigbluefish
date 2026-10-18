@@ -824,7 +824,7 @@ describe('MemoryStore：stats 与类型守卫', () => {
     const { store, ws } = fixtureOf('project')
     await putAll(store, [makeRecord({ scope: 'project', id: 'p1' }), makeRecord({ scope: 'project', id: 'p2' })])
     const stats = await store.stats()
-    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 2, vectors: null })
+    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 3, vectors: null })
     ws.cleanup()
   })
 
@@ -851,11 +851,10 @@ describe('MemoryStore：stats 与类型守卫', () => {
     ws.cleanup()
   })
 
-  it('打开时就完成迁移：migrated 记录 0 → 最新（含 v2 的 embedding.content_hash）', async () => {
+  it('打开时就完成迁移：migrated 记录 0 → 最新（含 v2 的 embedding.content_hash、v3 的 edge.related）', async () => {
     const { store, ws } = fixtureOf()
-    // 0 → 2：v1 建表 + v2 加列。断言用**结构实际版本**（2），不用 ABI 的 SCHEMA_VERSION——
-    // 那个常量此刻仍写着 1（`kernel/**` 由另一个 agent 在改），而库结构确实已经是 v2。
-    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 2 })
+    // 0 → 3：v1 建表 + v2 加列 + v3 重建 edge 表（CHECK 增加 related）。
+    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 3 })
     ws.cleanup()
   })
 })

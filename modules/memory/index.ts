@@ -13,6 +13,7 @@ import { z } from 'zod'
 import type {
   Embedder,
   Kernel,
+  MemoryRecord,
   MemoryScope,
   MemoryStore,
   ModuleHealth,
@@ -40,14 +41,40 @@ import { createStoresService, asMemoryStore, asRecordScanner, type MemoryStoresS
 import { planConsolidation } from './consolidate.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
-import type { ArtifactKind } from './remember.js'
+import { createCapture, type Capture, type CaptureStats } from './capture.js'
+import { autoLinkRelated } from './link.js'
+import { createProjectTool, type ProjectProfilePort } from './project.js'
+import type { AbstentionCategory, ArtifactKind } from './remember.js'
 import { createRememberTool } from './remember.js'
 import { artifactVerificationDegradeReason, verifyArtifactExists } from './artifacts.js'
 import type { RetrievalChannel } from './retrieve.js'
+import { readSessionWitness } from './witness.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
 export const MODULE_ID = 'omb-memory'
+
+/**
+ * 常驻提示（3.7-M1）。
+ *
+ * 为什么是这一句、为什么这么短：
+ * - 模型此前**完全不知道记忆库存在**（常驻提示只点名推理类工具），`omb_recall`
+ *   的使用率只有 27/391 会话；而修这条不需要第二个常驻段——推理模块换短变体后
+ *   （71 字符）余量足够放下这一句；
+ * - 常驻预算 120 字符是**所有模块合计**（`kernel/abi/host.ts:110-122`），
+ *   所以这句必须 ≤24 字符且**逐字节稳定**（进静态前缀，跨轮不变才能保缓存）；
+ * - 只点"何时用"，不承诺返回什么（与 `omb_recall` 描述同一分工）。
+ */
+export const MEMORY_RESIDENT_HINT = '跨会话结论用 omb_recall 查'
+
+/**
+ * 提示贡献的服务名。
+ *
+ * 集成层按 `prompt:` 前缀自动发现（`dsh/session.ts` 的 `collectPromptContributions`），
+ * 模块不需要改宿主代码。名字与 `SERVICES` 目录里的条目不强制绑定：
+ * 服务名本身就是契约（`prompt:<模块 id>`）。
+ */
+export const PROMPT_SERVICE = 'prompt:omb-memory'
 
 /**
  * 宿主存储端口（`StorageHostPort`）的服务名。
@@ -64,6 +91,31 @@ const rawConfigSchema = z.object({
   consolidationEveryTurns: z.number().int().min(1).default(32),
   /** 向量编码线程数（ONNX 路径用；纯 JS 路径忽略）。 */
   embeddingThreads: z.number().int().min(1).default(2),
+  /**
+   * 常驻提示开关（3.7-M1 的回滚开关）。
+   *
+   * `false` 时 apply 不注册 `prompt:omb-memory`，回到"模型只能从工具描述知道记忆库"的旧行为。
+   */
+  residentHint: z.boolean().default(true),
+  /**
+   * 召回缺省详细度（3.7-M2 的回滚开关）。
+   *
+   * `snippet`（默认）单次 ≤1,600 字符；`full` 是旧行为（逐字全文，单次可达 ~3,877 字符）。
+   * 单个调用仍可用 `detail` 参数覆盖本缺省。
+   */
+  recallDetail: z.enum(['snippet', 'full']).default('snippet'),
+  /** 自主捕获：用户偏好/决定（3.7 Wave 2；默认开，回滚可关）。 */
+  autoCapturePreferences: z.boolean().default(true),
+  /** 自主捕获：项目活动（命令/改文件；默认开）。 */
+  autoCaptureActivity: z.boolean().default(true),
+  /** 自主捕获：会话结局兜底（≥3 次调用且一条活动都没捕获时写 1 条；默认开）。 */
+  autoCaptureOutcome: z.boolean().default(true),
+  /** 新记忆自动连 `related` 边（默认开）。 */
+  autoLinkRelated: z.boolean().default(true),
+  /** 召回时 1-hop 关联扩展（默认开；回滚可关）。 */
+  relatedExpansion: z.boolean().default(true),
+  /** 项目库写入未就绪时的重试等待（毫秒；冷启动竞态，默认 250，0=不重试）。 */
+  coldStartRetryMs: z.number().int().min(0).max(2000).default(250),
   /**
    * **隐私闸门**（3.6 从独立的 `omb-privacy` 行并入本行）。
    *
@@ -89,6 +141,14 @@ export type MemoryConfig = z.infer<typeof rawConfigSchema>
 export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   consolidationEveryTurns: 32,
   embeddingThreads: 2,
+  residentHint: true,
+  recallDetail: 'snippet',
+  autoCapturePreferences: true,
+  autoCaptureActivity: true,
+  autoCaptureOutcome: true,
+  autoLinkRelated: true,
+  relatedExpansion: true,
+  coldStartRetryMs: 250,
   privacy: PRIVACY_DEFAULT_CONFIG,
 }
 
@@ -153,6 +213,13 @@ export interface MemoryWriteLedger {
   abstentions: number
   /** 最近一次弃权的原因（截断后进 detail，完整原因在日志里）。 */
   lastAbstention: string
+  /**
+   * 按原因分档的弃权计数（3.7-M4）。
+   *
+   * 旧账本只有总数：`no-ground`（可能是没带工件的真结论）与 `missing-source`
+   * （接线/归属问题）的修法完全不同，混在一个数字里就无法据此决策。
+   */
+  abstentionsByCategory: Partial<Record<AbstentionCategory, number>>
 }
 
 /**
@@ -195,6 +262,27 @@ export interface ConsolidationLedger {
 
 /** 单次整合扫描的条数上界：让每次运行的代价与库大小无关（见 `listRecentRecords`）。 */
 export const CONSOLIDATION_SCAN_LIMIT = 500
+
+/**
+ * 项目画像工具的运行读数（3.7 Wave 2）。
+ *
+ * `degraded` = 服务缺席/读取失败次数：**"没接线"与"画像为空"必须能分开**，
+ * 否则状态面会把"宿主没实现"显示成"这个项目没有画像"。
+ */
+export interface ProjectToolLedger {
+  reads: number
+  refreshes: number
+  degraded: number
+  lastError: string
+}
+
+/** 冷启动读数（P4 验收：项目库未就绪失败要能被量化）。 */
+export interface ColdStartLedger {
+  /** 项目库首次解析失败、触发 250ms 重试的次数。 */
+  retries: number
+  /** 重试后仍未就绪（随后返回可读失败，**不回落用户库**）。 */
+  failures: number
+}
 
 /**
  * 跑一轮离线整合（M3）：**离线、无 LLM、非破坏性**。
@@ -300,6 +388,12 @@ async function describeHealth(
   usage: MemoryUsageLedger | undefined,
   consolidation: ConsolidationLedger | undefined,
   privacyReadings: (() => ModuleHealth) | undefined,
+  runtime?: {
+    readonly capture?: CaptureStats
+    readonly project?: ProjectToolLedger
+    readonly coldStart?: ColdStartLedger
+    readonly relatedExpanded?: number
+  },
 ): Promise<ModuleHealth> {
   const status = service.status()
   const snapshot = service.snapshot()
@@ -338,8 +432,41 @@ async function describeHealth(
   if (ledger !== undefined) {
     metrics['writes'] = ledger.writes
     metrics['abstentions'] = ledger.abstentions
+    // 分档弃权：`abstentions.no-ground` 等。**没有条目的原因不出现**（0 与未发生同形，
+    // 这里宁可少一个键，也不要印一个"这条原因被关了"的假 0）。
+    for (const [category, count] of Object.entries(ledger.abstentionsByCategory)) {
+      if (typeof count === 'number' && count > 0) metrics[`abstentions.${category}`] = count
+    }
   }
   if (usage !== undefined && usage.failures > 0) metrics['usageFailures'] = usage.failures
+
+  /**
+   * 3.7 Wave 2 运行读数（W4 验收用；全部来自本模块自己的台账，不是"被观测对象自报"）：
+   * - 自主捕获按类计数 + 跳过原因（P1：为什么没写）；
+   * - 项目画像读取/重建/降级（"未接线"必须可见）；
+   * - 冷启动重试与失败（P4：283 次失败要能降到 <10）；
+   * - 1-hop 关联扩展累计（P2：扩展真的被用到）。
+   */
+  if (runtime?.capture !== undefined) {
+    metrics['capture.preferences'] = runtime.capture.preferences
+    metrics['capture.activity'] = runtime.capture.activity
+    metrics['capture.outcomes'] = runtime.capture.outcomes
+    for (const [reason, count] of Object.entries(runtime.capture.skipped)) {
+      if (count > 0) metrics[`capture.skipped.${reason}`] = count
+    }
+  }
+  if (runtime?.project !== undefined) {
+    metrics['project.reads'] = runtime.project.reads
+    metrics['project.refreshes'] = runtime.project.refreshes
+    metrics['project.degraded'] = runtime.project.degraded
+  }
+  if (runtime?.coldStart !== undefined) {
+    metrics['coldStart.retries'] = runtime.coldStart.retries
+    metrics['coldStart.failures'] = runtime.coldStart.failures
+  }
+  if (runtime?.relatedExpanded !== undefined && runtime.relatedExpanded > 0) {
+    metrics['recall.relatedExpanded'] = runtime.relatedExpanded
+  }
 
   /**
    * **隐私读数（3.6 并入）**。
@@ -434,6 +561,11 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   let consolidationRef: ConsolidationLedger | undefined
   /** 隐私闸门的装配产物（3.6 并入；见 `./privacy/index.js`）。 */
   let privacyRef: PrivacyInstallation | undefined
+  /** 3.7 Wave 2 运行读数（惰性读：热插拔会换实例）。 */
+  let captureRef: (() => CaptureStats) | undefined
+  let projectLedgerRef: ProjectToolLedger | undefined
+  let coldStartRef: ColdStartLedger | undefined
+  let relatedExpandedRef = 0
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
@@ -454,6 +586,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           consolidationRef,
           // 惰性读（不是取一次存下来）：热插拔时新实例的 install 产物必须立刻被读到
           privacyRef === undefined ? undefined : () => privacyRef!.health(),
+          {
+            ...(captureRef === undefined ? {} : { capture: captureRef() }),
+            ...(projectLedgerRef === undefined ? {} : { project: projectLedgerRef }),
+            ...(coldStartRef === undefined ? {} : { coldStart: coldStartRef }),
+            relatedExpanded: relatedExpandedRef,
+          },
         )
       } catch (error) {
         // health() 自身绝不抛：状态面拿不到原因比拿到"检查失败"更糟
@@ -585,7 +723,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
        * 写入账本。**弃权必须可审计**（§5.6）：弃权率是发现"该记的没记"的唯一手段。
        * 通过 health 的 metrics 与 detail 暴露给状态面。
        */
-      const ledger: MemoryWriteLedger = { writes: 0, abstentions: 0, lastAbstention: '' }
+      const ledger: MemoryWriteLedger = {
+        writes: 0,
+        abstentions: 0,
+        lastAbstention: '',
+        abstentionsByCategory: {},
+      }
       ledgerRef = ledger
       /** 使用计数账本（见 `MemoryUsageLedger`）：写不成也要可见。 */
       const usageLedger: MemoryUsageLedger = { failures: 0, lastFailure: '' }
@@ -601,6 +744,113 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         const set = sessionId === undefined ? undefined : service.peek(sessionId)
         return (set ?? service.snapshot().user)?.stores
       }
+
+      // ── 3.7 Wave 2：冷启动重试、自主捕获、项目画像、自动连边 ─────────────
+      const projectToolLedger: ProjectToolLedger = { reads: 0, refreshes: 0, degraded: 0, lastError: '' }
+      projectLedgerRef = projectToolLedger
+      const coldStart: ColdStartLedger = { retries: 0, failures: 0 }
+      coldStartRef = coldStart
+
+      const waitMs = async (ms: number): Promise<void> => {
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, ms)
+          if (typeof (timer as { unref?: () => void }).unref === 'function') {
+            ;(timer as { unref: () => void }).unref()
+          }
+        })
+      }
+
+      /**
+       * **写入解析**（P4 冷启动）：项目库未就绪 → 等 `coldStartRetryMs` 再取一次。
+       *
+       * 为什么必须在此处重试：宿主 `turn/start` 才预热项目库，而自主捕获/工具调用
+       * 可能更早发生；实测 283 次"项目库尚未就绪"写入失败大多是这个竞态。
+       * **绝不回落用户库**：项目作用域写进用户库会污染跨项目面（位置即权威）。
+       */
+      const resolveWriteStore = async (
+        scope: MemoryScope,
+        sessionId?: string,
+      ): Promise<MemoryStore | undefined> => {
+        if (sessionId === undefined) {
+          return scope === 'user' ? service.snapshot().user?.store('user') : undefined
+        }
+        const first = (await service.forSession(sessionId)) ?? service.snapshot().user
+        const direct = first?.store(scope)
+        if (direct !== undefined || scope !== 'project' || config.coldStartRetryMs <= 0) {
+          if (direct === undefined && scope === 'project') {
+            coldStart.failures += 1
+            kernel.logger.warn(`OMB：项目库写入未就绪（会话 ${sessionId}）——不回落用户库`)
+          }
+          return direct
+        }
+        coldStart.retries += 1
+        await waitMs(config.coldStartRetryMs)
+        const second = (service.peek(sessionId) ?? (await service.forSession(sessionId))) ?? service.snapshot().user
+        const retried = second?.store('project')
+        if (retried === undefined) {
+          coldStart.failures += 1
+          kernel.logger.warn(`OMB：项目库重试仍未就绪（会话 ${sessionId}，等了 ${config.coldStartRetryMs}ms）`)
+        }
+        return retried
+      }
+
+      /** 隐私写许可（自主捕获必须过闸；库访问边界还会再拦一次）。 */
+      const writeAllowed = (sessionId: string): boolean => {
+        try {
+          const gate = kernel.service<{ decide(id: string): { allowWrite: boolean } }>(SERVICES.privacy)
+          return gate?.decide(sessionId).allowWrite ?? true
+        } catch {
+          return false
+        }
+      }
+
+      /** 写入后的图自动连边（3.7 Wave 2 §4）：失败只留声，不影响写入。 */
+      const linkOnStored = async (store: MemoryStore, record: MemoryRecord): Promise<void> => {
+        if (!config.autoLinkRelated) return
+        const outcome = await autoLinkRelated(store, record, {
+          now: kernel.clock.now(),
+          projectName: record.project,
+        })
+        if (outcome.linked.length > 0) {
+          kernel.logger.debug(
+            `OMB：自动连边 ${outcome.linked.length} 条（${record.scope}/${record.kind}，` +
+              `共享键示例：${outcome.linked[0]?.shared.slice(0, 2).join('、') ?? ''}）`,
+          )
+        }
+      }
+
+      const capture: Capture = createCapture({
+        clock: kernel.clock,
+        resolveStore: resolveWriteStore,
+        currentProject: sessionId => service.peek(sessionId)?.projectScope ?? undefined,
+        privacyAllowsWrite: writeAllowed,
+        onMemoryWritten: payload => {
+          ledger.writes += 1
+          kernel.emit('memory/written', payload)
+        },
+        onMemoryStored: linkOnStored,
+        logger: kernel.logger,
+        enabledPreferences: config.autoCapturePreferences,
+        enabledActivity: config.autoCaptureActivity,
+        enabledOutcome: config.autoCaptureOutcome,
+        projectRetryMs: config.coldStartRetryMs,
+      })
+      captureRef = () => capture.stats()
+      const offCaptureMessage = kernel.on('user/message/observed', payload => {
+        void capture.onUserMessage(payload)
+      })
+      const offCaptureCall = kernel.on('tool/call/observed', payload => {
+        void capture.onToolCall(payload)
+      })
+      const offCaptureResult = kernel.on('tool/result/observed', payload => {
+        void capture.onToolResult(payload)
+      })
+      const offCaptureOutcome = kernel.on('turn/end', payload => {
+        void capture.onTurnEnd({ sessionId: payload.sessionId, turn: payload.turn })
+      })
+      const offCaptureWarm = kernel.on('turn/start', payload => {
+        capture.warm(payload.sessionId)
+      })
 
       const tools: readonly ToolDefinition[] = [
         ...createMemoryTools({
@@ -624,6 +874,13 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           // 压力是**按会话**的读数：没有会话就不施压（不拿别人的读数塑形本次检索）
           pressureBand: sessionId =>
             sessionId === undefined ? undefined : kernel.pressure(sessionId).band,
+          // 召回缺省详细度（3.7-M2）：配置开关，个体调用仍可用 detail 覆盖
+          defaultDetail: config.recallDetail,
+          // 1-hop `related` 扩展（3.7 Wave 2，默认开）
+          expandRelated: config.relatedExpansion,
+          onRetrieved: result => {
+            relatedExpandedRef += result.stats.relatedExpanded
+          },
           // 使用计数写不成：计数 + 原因进健康面（记账失败不改变召回结果，但绝不静默）
           onUsageFailure: info => {
             usageLedger.failures += 1
@@ -634,14 +891,11 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         createRelateTool({ resolveStores }),
         // ── 写入路径（规划 §5.6 在线部分）：不写，两个库永远是空的 ──────────────
         createRememberTool({
-          // 写入可**等库打开**（读路径不行，它有延迟预算）：项目库尚未预热也能落库
-          resolveStore: async (scope: MemoryScope, sessionId?: string) => {
-            const set =
-              sessionId === undefined
-                ? service.snapshot().user
-                : (await service.forSession(sessionId)) ?? service.snapshot().user
-            return set?.store(scope)
-          },
+          // 写入可**等库打开**（读路径不行，它有延迟预算）：项目库尚未预热也能落库。
+          // 3.7 Wave 2：项目库未就绪时**重试一次**（冷启动竞态），仍不行则返回可读失败，
+          // **绝不**回落用户库（见 `resolveWriteStore`）。
+          resolveStore: async (scope: MemoryScope, sessionId?: string) =>
+            await resolveWriteStore(scope, sessionId),
           clock: kernel.clock,
           // 回合号按会话取（查不到就是 undefined：`sourceRef` 会退化成 `session:<id>`）
           currentTurn: sessionId =>
@@ -699,16 +953,77 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             ledger.writes += 1
             kernel.emit('memory/written', payload)
           },
+          /**
+           * **会话见证**（3.7-M4）：惰性读内核服务，拿不到就退化为旧行为。
+           *
+           * 服务由 Lead 在 `dsh/session.ts` 侧实现并 provide（`user/message` 缓存 +
+           * `tool/call` 台账）。每次执行再解析：热插拔换实例后立刻生效。
+           */
+          witness: () => readSessionWitness(name => kernel.service(name)),
+          // 3.7 Wave 2：写入成功后自动连 `related` 边（仅附加索引，失败不影响写入）
+          onStored: linkOnStored,
+          logger: kernel.logger,
           onAbstained: info => {
             ledger.abstentions += 1
             ledger.lastAbstention = info.reason
+            // 按原因分档计数：健康面据此区分"该记的没记"与"接线/归属问题"
+            ledger.abstentionsByCategory[info.category] =
+              (ledger.abstentionsByCategory[info.category] ?? 0) + 1
             // 完整原因进日志（detail 里只放截断版，避免状态面被长文本淹没）
-            kernel.logger.info(`OMB：记忆写入弃权——${info.reason}`)
+            kernel.logger.info(`OMB：记忆写入弃权（${info.category}）——${info.reason}`)
+          },
+        }),
+        // ── 项目画像入口（3.7 Wave 2 §3）：任务开始时先读，画像服务可缺席 ──────────
+        createProjectTool({
+          clock: kernel.clock,
+          resolveProject: sessionId => {
+            if (sessionId === undefined) return undefined
+            const set = service.peek(sessionId)
+            if (set === undefined) return undefined
+            return { cwd: set.projectScope ?? undefined, store: set.store('project') }
+          },
+          profile: () => {
+            const port = kernel.service<ProjectProfilePort>(SERVICES.projectProfile)
+            if (port === undefined) return undefined
+            return {
+              read: cwd => {
+                projectToolLedger.reads += 1
+                try {
+                  const view = port.read(cwd)
+                  if (view === undefined) projectToolLedger.degraded += 1
+                  return view
+                } catch (error) {
+                  projectToolLedger.degraded += 1
+                  projectToolLedger.lastError = messageOf(error)
+                  throw error
+                }
+              },
+              refresh: async cwd => {
+                projectToolLedger.refreshes += 1
+                try {
+                  const view = await port.refresh(cwd)
+                  if (view === undefined) projectToolLedger.degraded += 1
+                  return view
+                } catch (error) {
+                  projectToolLedger.degraded += 1
+                  projectToolLedger.lastError = messageOf(error)
+                  throw error
+                }
+              },
+            }
           },
         }),
       ]
       const offTools = kernel.provide(toolsServiceFor(MODULE_ID), tools)
-
+      /**
+       * **常驻提示**（3.7-M1）：`prompt:omb-memory` 由集成层按前缀自动发现。
+       *
+       * 不在 apply 里写任何时间/计数：它进静态前缀，逐字节稳定是硬要求。
+       * 配置 `residentHint:false` 时不注册（回滚开关），行为回到 3.6。
+       */
+      const offPrompt = config.residentHint
+        ? kernel.provide(PROMPT_SERVICE, { id: MODULE_ID, resident: MEMORY_RESIDENT_HINT })
+        : () => {}
       // 打开是异步的，但注册已经全部完成——这里只填内部状态（H-2）。
       // `start()` 内部吞掉一切异常，`.catch` 只是防止未来的改动引入 unhandled rejection。
       //
@@ -746,6 +1061,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         // H-1：dispose 绝不抛异常。任何一步失败都只记日志。
         for (const [label, close] of [
           ['工具服务', offTools],
+          ['常驻提示', offPrompt],
+          ['捕获·用户消息订阅', offCaptureMessage],
+          ['捕获·工具调用订阅', offCaptureCall],
+          ['捕获·工具结果订阅', offCaptureResult],
+          ['捕获·回合结局订阅', offCaptureOutcome],
+          ['捕获·回合预热订阅', offCaptureWarm],
           ['回合订阅', offTurn],
           ['回合结束订阅', offTurnEnd],
           // 隐私闸门：注销服务、命令、状态段与血缘订阅。

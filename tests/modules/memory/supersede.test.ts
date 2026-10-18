@@ -47,6 +47,13 @@ function fixture(): SupersedeFixture {
       scope === 'user' ? store : undefined,
     clock,
     currentTurn: () => 1,
+    // 3.7-M4：`execution:` 前缀不再自证；本文件的选择是给一个**真实台账替身**
+    // （凡 `execution:` 引用都算本会话执行过——正是 dsh 侧将提供的行为）。
+    witness: () => ({
+      lastUserMessage: () => undefined,
+      hasExecution: (_session, reference) => reference.startsWith('execution:'),
+      surfaceGeneration: () => 1,
+    }),
     onWritten: () => {},
     onAbstained: () => {},
   }
@@ -220,6 +227,7 @@ describe('被推翻的结论：后续会话看得见', () => {
           score: 1,
           channels: ['lexical'],
           ranks: [{ channel: 'lexical', scope: 'user', rank: 1 }],
+          signals: {},
         },
       ],
       gate: { retrieve: true, reason: 'ok', detail: '门控通过' },
@@ -237,6 +245,9 @@ describe('被推翻的结论：后续会话看得见', () => {
         perStore: [{ scope: 'user', candidates: 1, selected: 1 }],
         rrfK: 60,
         reranked: false,
+        lexicalFloor: 0,
+        lexicalFloorDropped: 0,
+        relatedExpanded: 0,
       },
       now: 3,
       note: '已查询 1 个库、1 个通道，注入 1 条（逐字 + 溯源）',

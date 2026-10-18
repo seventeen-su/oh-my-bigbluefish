@@ -1,8 +1,23 @@
 /**
- * 循环与空转检测（规划 §4.5）——本组件**唯一带状态**的机制的外部形式：
- * 状态（滚动指纹窗口）由 `index.ts` 维护，**判定在这里是纯函数**。
+ * 循环与空转检测（规划 §4.5；Wave 1 / R3 重写归并层）。
  *
+ * 状态（滚动指纹窗口）由 `index.ts` 维护，**判定在这里是纯函数**。
  * 为什么必须由外部提供：模型自己看不见"我已经绕了三圈"。
+ *
+ * ## Wave 1 改了什么（v3.7 §2.3 / R3）
+ *
+ * v3.6 的归并假设"一次工具调用 = 一条 call 事件 + 紧跟着一条 result 事件"，
+ * 用"上一条缺证据就补"来配对。真实接线里 DSH 每步平均 **1.27 次**工具调用
+ * （49,440 / 39,081），同一批并发调用的 call 事件会先成批出现、result 才陆续到达：
+ * 按"上一条缺证据"归并会把 A 的证据挂到 B 上，制造假的重复/无进展。
+ *
+ * 现在：
+ * ① **callId 精确配对**：`tool/call` 与 `tools/result` 都带 `callId`（dsh 传出），
+ *    证据只补到同 id 且还缺证据的那一条；
+ * ② **surface 代际分区**：压缩/替换后 surface 代际 +1，旧代际的指纹整段丢弃
+ *    （压缩后的循环判断不得沿用压缩前的窗口）；
+ * ③ **注入迟滞**：同一信号 N 步内不重复注入（`announceLoop`），避免每轮重复刷同一句；
+ * ④ 旧接线（没有 callId）仍走兜底归并：上一条缺证据就补——但不是主路径。
  *
  * 四类信号**领域中立**——指纹只有"做了什么"（动作哈希）与"知道了什么"
  * （证据哈希），因此"编程里重复同一条命令"、"生活建议里重复同一套说辞"、
@@ -25,6 +40,30 @@ export interface TurnFingerprint {
   readonly actionHash: string
   readonly evidenceHash: string
   readonly at: number
+  /**
+   * 同一步的调用 id（`tool/call.callId` / `tools/result` 对应的 callId）。
+   * 缺省 `''` = 旧接线（没有 callId），归并走兜底路径。
+   */
+  readonly callId?: string
+  /** surface 代际；缺省 0。压缩/替换后由 dsh 递增。 */
+  readonly generation?: number
+  /** 工具名（dsh 提供；只用于审计与提示文案，不参与判定）。 */
+  readonly tool?: string
+}
+
+/**
+ * 一次证据观察（`evidence/observed` 的模块内形状）。
+ *
+ * 与内核 ABI 的差别：`callId` / `generation` 是 Wave 1 由 `dsh/` 传出的**可选**
+ * 运行期字段（ABI 本轮不改；Wave 2 再评估是否入 ABI）。缺省时退化为旧行为。
+ */
+export interface EvidenceObservation {
+  readonly actionHash: string
+  readonly evidenceHash: string
+  readonly at: number
+  readonly callId?: string
+  /** 工具名（`tool/call` / result 侧由调用台账反查）。缺省 = 未知。 */
+  readonly tool?: string
 }
 
 export interface LoopThresholds {
@@ -40,7 +79,7 @@ export interface LoopThresholds {
 
 /**
  * 缺省阈值。它们是**可调参数而不是标定过的真理**：
- * 自调离线进行（§4.4），运行时只记账。
+ * 自调离线进行（§4.4），运行时只记账。Wave 2 用日志标注再标定。
  */
 export const DEFAULT_LOOP_THRESHOLDS: LoopThresholds = {
   flatEvidenceTurns: 3,
@@ -52,18 +91,17 @@ export const DEFAULT_LOOP_THRESHOLDS: LoopThresholds = {
 /** 提示字符上限：`hint` 是注入给模型的一句话，必须短。 */
 export const LOOP_HINT_MAX = 80
 
+/** 同一种信号在多少步内不重复注入（迟滞；Wave 1 / R3）。 */
+export const LOOP_HYSTERESIS_STEPS = 5
+
 /**
  * "无进展"信号：这两类说的是同一件事——**做了动作但没有新增证据**。
  *
  * 单列一个集合，是因为它有两个消费者，而它们必须判同一件事：
- * ① 注入侧的"合法出口"段（`control.ts` 的 `renderExitOptions`）——
+ * ① 注入侧的"合法出口"段（`hints.ts` 的 `renderExitOptions`）——
  *    无进展时才需要把出口写出来；
- * ② 观察侧的状态面信号（`gaming.ts` 的 `observeGaming`）。
+ * ② 状态面的会话行（直接复用同一个信号与 detail）。
  * 两处各写一份 kind 列表，就会出现"注入说这套、状态面说那套"的漂移。
- *
- * `repeat-action` / `oscillation` **不在此列**：它们各自的 `hint` 已经点明了一个
- * 具体出口（"别原样再来一次" / "需要第三个选项或先向用户确认"），
- * 属于"这一步做错了"，不属于"整体没有进展"。
  */
 export const NO_PROGRESS_KINDS: readonly LoopKind[] = ['stalled', 'no-new-evidence']
 
@@ -84,47 +122,131 @@ export function appendFingerprint(
   max: number = DEFAULT_WINDOW_SIZE,
 ): readonly TurnFingerprint[] {
   const limit = limitOf(max)
-  const next = [...window, normalize(fingerprint)]
-  return next.length > limit ? next.slice(next.length - limit) : next
+  const next = [...(Array.isArray(window) ? window : []), normalize(fingerprint)]
+  return cap(next, limit)
 }
 
 /**
  * 把一次"证据观察"并入滚动窗口——**一步 = 一个动作 + 它产生的证据**。
  *
- * 集成层对一次工具调用会发**两条** `evidence/observed`（`dsh/session.ts`）：
- * ① `tool/call`：动作指纹，`evidenceHash` 为空（"发生了这个动作，证据还没到"）
- * ② `tools/result`：证据指纹（动作哈希是结果指纹，不是动作本身）
+ * 配对规则（按优先级）：
+ * 1. **callId 精确配对**：证据哈希非空且带 callId → 找同 callId、还缺证据的那条，
+ *    就地补上（并发调用的结果乱序到达也能对上）；
+ * 2. **旧接线兜底**：证据不带 callId，且上一条正缺证据 → 就地补上；
+ * 3. 其余情况追加新指纹（没有对应动作的结果也单独成步，例如用户消息）。
  *
- * 因此这里做归并，而不是无脑追加：
- * - 证据哈希非空、且上一条正缺证据 → **就地补上证据**（同一个步骤，不新增）
- * - 证据哈希为空 → 新动作开始，追加一条待补证据的指纹
- * - 其余 → 追加新指纹
+ * `generation` 变化（压缩/替换后 dsh 递增）时，**旧代际的指纹整段丢弃**：
+ * 压缩后的循环判断不得沿用压缩前的窗口。
  *
- * 不做这一步归并，"连续两次同动作"与"连续 k 轮无新证据"在真实接线里
- * 会永远对不上号：调用与其结果会把窗口交替填满。
+ * 空事件（动作与证据都空）不入账。
  */
 export function noteObservation(
   window: readonly TurnFingerprint[],
-  observation: TurnFingerprint,
+  observation: EvidenceObservation | TurnFingerprint,
   max: number = DEFAULT_WINDOW_SIZE,
+  generation: number = 0,
 ): readonly TurnFingerprint[] {
   const limit = limitOf(max)
-  const next = normalize(observation)
-  const last = window[window.length - 1]
+  const gen = generationOf(generation)
+  const sameGeneration = (Array.isArray(window) ? window : [])
+    .filter(isFingerprint)
+    .map(normalize)
+    .filter(entry => entry.generation === gen)
+  const next = normalize({ ...observation, generation: gen })
 
-  if (next.evidenceHash !== '' && last !== undefined && last.evidenceHash === '') {
-    const merged = [...window.slice(0, -1), { ...last, evidenceHash: next.evidenceHash, at: next.at }]
-    return merged.length > limit ? merged.slice(merged.length - limit) : merged
+  if (next.actionHash === '' && next.evidenceHash === '') return cap(sameGeneration, limit)
+
+  if (next.evidenceHash !== '') {
+    const pending = pendingCallIndex(sameGeneration, next.callId ?? '')
+    if (pending >= 0) {
+      const merged = [...sameGeneration]
+      const target = merged[pending] as TurnFingerprint
+      merged[pending] = {
+        ...target,
+        evidenceHash: next.evidenceHash,
+        at: next.at,
+        ...(target.tool !== undefined && target.tool !== '' ? {} : next.tool === undefined ? {} : { tool: next.tool }),
+      }
+      return cap(merged, limit)
+    }
+    if ((next.callId ?? '') === '') {
+      const last = sameGeneration[sameGeneration.length - 1]
+      if (last !== undefined && last.evidenceHash === '') {
+        const merged = [...sameGeneration]
+        merged[merged.length - 1] = {
+          ...last,
+          evidenceHash: next.evidenceHash,
+          at: next.at,
+          ...(last.tool !== undefined && last.tool !== '' ? {} : next.tool === undefined ? {} : { tool: next.tool }),
+        }
+        return cap(merged, limit)
+      }
+    }
   }
-  if (next.actionHash === '' && next.evidenceHash === '') {
-    // 空事件不入账：它既不表示动作，也不表示新证据
-    return window.length > limit ? window.slice(window.length - limit) : [...window]
+  return cap([...sameGeneration, next], limit)
+}
+
+/** 注入迟滞状态：上一次注入过什么、在第几步。 */
+export interface LoopAnnounceState {
+  readonly kind: LoopKind | null
+  readonly step: number
+}
+
+/** 空状态（**每会话**一份；`kind=null` 表示"没有注入过"）。 */
+export const NO_ANNOUNCE: LoopAnnounceState = Object.freeze({ kind: null, step: 0 })
+
+export interface LoopAnnouncement {
+  readonly inject: boolean
+  readonly state: LoopAnnounceState
+}
+
+/**
+ * 迟滞判定：同一信号在 `gap` 步内不重复注入；信号变化或窗口到期才放行。
+ *
+ * 为什么需要它：v3.6 在信号持续期间**每一轮**都注入同一句提示（实测 553 个快照 /
+ * 82 个会话），既占上下文又降低信噪比。迟滞是"发现时立刻说一次，之后冷却"。
+ *
+ * 纯函数；`step` 非法时按 0 处理。
+ */
+export function announceLoop(
+  previous: LoopAnnounceState | null | undefined,
+  signal: LoopSignal | null | undefined,
+  step: number,
+  gap: number = LOOP_HYSTERESIS_STEPS,
+): LoopAnnouncement {
+  const base = normalizeAnnounce(previous)
+  const at = Number.isFinite(step) ? Math.floor(step) : 0
+  if (signal === null || signal === undefined) {
+    return { inject: false, state: base.kind === null ? base : { kind: null, step: at } }
   }
-  return appendFingerprint(window, next, limit)
+  if (base.kind !== signal.kind) {
+    return { inject: true, state: { kind: signal.kind, step: at } }
+  }
+  const elapsed = at - base.step
+  const cooldown = Number.isFinite(gap) ? Math.max(1, Math.floor(gap)) : LOOP_HYSTERESIS_STEPS
+  if (elapsed >= cooldown) return { inject: true, state: { kind: signal.kind, step: at } }
+  return { inject: false, state: base }
+}
+
+function pendingCallIndex(window: readonly TurnFingerprint[], callId: string): number {
+  if (callId === '') return -1
+  for (let index = window.length - 1; index >= 0; index -= 1) {
+    const entry = window[index]
+    if (entry !== undefined && entry.callId === callId && entry.evidenceHash === '') return index
+  }
+  return -1
+}
+
+function cap(window: readonly TurnFingerprint[], limit: number): readonly TurnFingerprint[] {
+  return window.length > limit ? window.slice(window.length - limit) : window
 }
 
 function limitOf(max: number): number {
   return Number.isFinite(max) ? Math.max(1, Math.floor(max)) : DEFAULT_WINDOW_SIZE
+}
+
+function generationOf(generation: unknown): number {
+  return typeof generation === 'number' && Number.isFinite(generation) ? Math.max(0, Math.floor(generation)) : 0
 }
 
 /**
@@ -138,7 +260,7 @@ export function detectLoop(
   thresholds: Partial<LoopThresholds> = {},
 ): LoopSignal | null {
   const t = { ...DEFAULT_LOOP_THRESHOLDS, ...clean(thresholds) }
-  const window = recent.filter(isFingerprint).map(normalize)
+  const window = (Array.isArray(recent) ? recent : []).filter(isFingerprint).map(normalize)
   if (window.length === 0) return null
 
   const repeat = detectRepeatAction(window)
@@ -164,10 +286,12 @@ function detectRepeatAction(window: readonly TurnFingerprint[]): LoopSignal | nu
   const prev = window[window.length - 2]
   if (last === undefined || prev === undefined) return null
   if (last.actionHash === '' || last.actionHash !== prev.actionHash) return null
+  const tool = last.tool === undefined || last.tool === '' ? '' : shortTool(last.tool)
+  const toolText = tool === '' ? '' : `（${tool}）`
   return {
     kind: 'repeat-action',
-    detail: `连续两步的动作与参数完全相同（动作指纹 ${short(last.actionHash)}）`,
-    hint: '这一步刚做过，别原样再来一次；换参数或换个做法。',
+    detail: `连续两步的动作与参数完全相同${toolText}（动作指纹 ${short(last.actionHash)}）`,
+    hint: `这一步刚做过${toolText}，别原样再来一次；换参数或换个做法。`,
   }
 }
 
@@ -250,12 +374,26 @@ function short(hash: string): string {
   return hash.length <= 8 ? hash : hash.slice(0, 8)
 }
 
+/** 工具名在提示里最多占 16 字符（hint 总上限 80）。 */
+function shortTool(tool: string): string {
+  return tool.length <= 16 ? tool : `${tool.slice(0, 15)}…`
+}
+
 function normalize(fingerprint: TurnFingerprint): TurnFingerprint {
   return {
-    actionHash: String(fingerprint.actionHash ?? ''),
-    evidenceHash: String(fingerprint.evidenceHash ?? ''),
-    at: Number.isFinite(fingerprint.at) ? fingerprint.at : 0,
+    actionHash: String(fingerprint?.actionHash ?? ''),
+    evidenceHash: String(fingerprint?.evidenceHash ?? ''),
+    at: Number.isFinite(fingerprint?.at) ? fingerprint.at : 0,
+    callId: typeof fingerprint?.callId === 'string' ? fingerprint.callId : '',
+    generation: generationOf(fingerprint?.generation),
+    tool: typeof fingerprint?.tool === 'string' ? fingerprint.tool : '',
   }
+}
+
+function normalizeAnnounce(state: LoopAnnounceState | null | undefined): LoopAnnounceState {
+  if (state === null || state === undefined) return NO_ANNOUNCE
+  const kind = typeof state.kind === 'string' ? state.kind : null
+  return { kind: kind as LoopKind | null, step: Number.isFinite(state.step) ? Math.floor(state.step) : 0 }
 }
 
 function isFingerprint(value: unknown): value is TurnFingerprint {

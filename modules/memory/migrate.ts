@@ -178,7 +178,7 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
 /**
  * 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。
  *
- * **当前最高版本 2，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 2）一致。**
+ * **当前最高版本 3，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 3）一致。**
  * 这条一致性是**有自检的**：`migrate()` 在缺省步骤表下会比对"表最高版本 vs `SCHEMA_VERSION`"，
  * 不一致就抛"契约漂移"。而打开库的一方（`store.ts` 的 `openMemoryStore`）**不传步骤表**，
  * 正是为了让这条自检继续跑——所以**不许**再靠"显式传表"绕过它：
@@ -191,6 +191,7 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
 export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 1, name: 'initial-schema', up: applySchemaV1 },
   { version: 2, name: 'embedding-content-hash', up: applySchemaV2 },
+  { version: 3, name: 'edge-related', up: applySchemaV3 },
 ]
 
 
@@ -334,5 +335,41 @@ function applySchemaV2(db: SqliteLike): void {
   db.exec(`
     -- NULL = 未知（迁移前写入的历史行），不是"内容未变"
     ALTER TABLE embedding ADD COLUMN content_hash TEXT;
+  `)
+}
+
+/**
+ * v3：`edge.type` 的 CHECK 增加 `'related'`（**自动关联**，3.7 Wave 2）。
+ *
+ * ## 为什么必须重建表
+ *
+ * SQLite **不能** `ALTER TABLE ... DROP/ALTER CONSTRAINT`：v1 建的
+ * `edge` 表上写死了 `CHECK (type IN ('supersedes','conflicts_with','derived_from'))`，
+ * 不重建的话插入 `related` 会直接被约束拒绝——那正是"迁移做了但功能不可用"的形态。
+ *
+ * ## 为什么这次不是"纯加法"
+ *
+ * 结构约束变了（枚举多一值），只能"复制 → 丢弃 → 改名 → 重建索引"。代价有界：
+ * `edge` 是 WITHOUT ROWID 的小表（实测全库 1 条边），复制在事务里完成；
+ * **数据不丢**（同库同表名，迁移后用一条 SELECT 就能验证行数）。
+ * 迁移失败由 `migrate()` 的既有事务回滚兜住（半迁移比重试更危险，见文件头）。
+ */
+function applySchemaV3(db: SqliteLike): void {
+  db.exec(`
+    CREATE TABLE edge_v3 (
+      from_id    TEXT    NOT NULL,
+      to_id      TEXT    NOT NULL,
+      type       TEXT    NOT NULL CHECK (type IN ('supersedes', 'conflicts_with', 'derived_from', 'related')),
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (from_id, to_id, type)
+    ) STRICT, WITHOUT ROWID;
+
+    INSERT INTO edge_v3 (from_id, to_id, type, created_at)
+      SELECT from_id, to_id, type, created_at FROM edge;
+
+    DROP TABLE edge;
+    ALTER TABLE edge_v3 RENAME TO edge;
+
+    CREATE INDEX edge_to_type ON edge(to_id, type);
   `)
 }

@@ -664,6 +664,7 @@ describe('不变量：模型不能自己解除限制', () => {
        */
       expect(tools?.map(tool => tool.name).sort()).toEqual([
         'omb_forget',
+        'omb_project',
         'omb_recall',
         'omb_relate',
         'omb_remember',

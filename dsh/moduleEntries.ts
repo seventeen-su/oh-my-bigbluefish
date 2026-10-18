@@ -19,7 +19,6 @@ import * as memory from '../modules/memory/index.js'
 import * as memoryVector from '../modules/memory/vector.js'
 import * as profile from '../modules/profile/index.js'
 import * as reasoning from '../modules/reasoning/index.js'
-import * as context from '../modules/context/index.js'
 import * as artifact from '../modules/artifact/module.js'
 import * as notify from '../modules/notify/index.js'
 
@@ -39,7 +38,6 @@ export const MODULE_ENTRIES: ReadonlyMap<string, unknown> = new Map<string, unkn
   ['modules/memory/vector', memoryVector],
   ['modules/profile/index', profile],
   ['modules/reasoning/index', reasoning],
-  ['modules/context/index', context],
   ['modules/artifact/module', artifact],
   ['modules/notify/index', notify],
 ])

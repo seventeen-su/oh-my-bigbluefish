@@ -44,10 +44,14 @@ export interface SystemPromptLike {
 /**
  * 注入顺序。
  *
- * 宿主自己的 `CONTEXT_ORDERS` 是 110/115/120（sandbox/approval/subagent）。
- * 我们用 200 段，落在宿主的内置段之后、保证不插队——插队会改变宿主的提示结构。
+ * 宿主自己的 `CONTEXT_ORDERS` 是 110/115/120/125/200/210
+ * （`packages/core/system-prompt/src/index.ts:170-179`），其中 **200 是宿主的
+ * `HARNESS_SOURCE`**。OMB 原先也用 200：两段同序时先后由注册顺序决定，
+ * 既不是我们想要的"落在宿主之后"，也让"顺序"变成了一个未定义行为。
+ * 改用 190（晚于宿主内置段 110–125、早于 `HARNESS_SOURCE:200` 与
+ * `WEB_SURFACE:210`）——位置固定，且不插队宿主的固定段。
  */
-export const CONTEXT_ORDER = 200
+export const CONTEXT_ORDER = 190
 
 /** 从可能的事件载荷里稳取字符串字段（宿主事件形状跨版本可能变）。 */
 function pickString(source: unknown, ...keys: readonly string[]): string | undefined {
@@ -56,6 +60,28 @@ function pickString(source: unknown, ...keys: readonly string[]): string | undef
   for (const key of keys) {
     const value = record[key]
     if (typeof value === 'string' && value.length > 0) return value
+  }
+  return undefined
+}
+
+/** 从可能的事件载荷里稳取数字字段。 */
+function pickNumber(source: unknown, ...keys: readonly string[]): number | undefined {
+  if (typeof source !== 'object' || source === null) return undefined
+  const record = source as Record<string, unknown>
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+/** 从可能的事件载荷里稳取布尔字段。 */
+function pickBoolean(source: unknown, ...keys: readonly string[]): boolean | undefined {
+  if (typeof source !== 'object' || source === null) return undefined
+  const record = source as Record<string, unknown>
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'boolean') return value
   }
   return undefined
 }
@@ -692,6 +718,57 @@ function sessionIdOf(ctx: unknown): string {
 }
 
 /**
+ * 会话见证端口：只保存 `dsh/` **直接看到**的宿主事实，不推断。
+ *
+ * 形状由使用方（记忆/推理模块）结构化声明；这里 export 是为了让集成层与
+ * 状态面共用同一份定义，而不是各写一份"看起来差不多"的接口。
+ */
+export interface SessionWitnessPort {
+  /** 本会话最近一条用户消息的文本（已去空行；从未观测到则 undefined）。 */
+  lastUserMessage(sessionId: string): string | undefined
+  /** 本会话是否真的发生过与 `reference` 匹配的工具调用。 */
+  hasExecution(sessionId: string, reference: string): boolean
+  /** 本会话的 surface 代际（每成功压缩一次 +1）。 */
+  surfaceGeneration(sessionId: string): number
+  /** 本会话压缩读数（只读；无压缩时 count=0、其余为 null）。 */
+  compactionStats(sessionId: string): {
+    readonly count: number
+    readonly lastAt: number | null
+    readonly lastShadowedTokens: number | null
+    readonly lastSummaryChars: number | null
+  }
+}
+
+/** 见证表的上界：按会话 LRU，防止长跑进程无限增长。 */
+const WITNESS_SESSIONS_MAX = 128
+/** 每个会话保留的执行台账条数（只用于"这条命令真的跑过吗"）。 */
+const WITNESS_EXECUTIONS_MAX = 100
+/** 单条用户消息的保留上限（只用于核对"用户原话"，不用于回放）。 */
+const WITNESS_TEXT_MAX = 4000
+
+/** 归一化：空白折叠 + 小写，避免格式差异造成假阴性。 */
+function normalizeWitnessText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/** 从 `user/message` 载荷里抽文本块（形状跨版本可能变，全部防御式读取）。 */
+function userMessageTextOf(data: unknown): string {
+  const record = typeof data === 'object' && data !== null ? data as Record<string, unknown> : {}
+  const content = Array.isArray(record['content'])
+    ? record['content']
+    : Array.isArray((record['message'] as { content?: unknown } | undefined)?.content)
+      ? (record['message'] as { content: unknown[] }).content
+      : []
+  const parts: string[] = []
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
+    const text = (block as { text?: unknown }).text
+    if (typeof text === 'string' && text.length > 0) parts.push(text)
+  }
+  return parts.join('\n').slice(0, WITNESS_TEXT_MAX)
+}
+
+/**
  * 订阅宿主会话事件并转成内核事件。
  *
  * 只订阅**三个**宿主事件面（与规划一致，不扩张观察面）：
@@ -730,6 +807,90 @@ export function wireSessionEvents(options: {
     kernel.service<{ remember(session: string, cwd?: string): void }>(SERVICES.activeSession)
 
   const offs: (() => void)[] = []
+
+  /**
+   * 见证表：按会话键控，整体有上界（LRU 128）。
+   *
+   * **只装 `dsh/` 亲自看到的事实**：最近一条用户消息、执行过的工具调用、
+   * 压缩代际与读数。不做推断、不跨会话合并、不落盘——它回答的是
+   * "本进程里这个会话发生过什么"，不是"这个会话历史上发生过什么"。
+   */
+  const witnessOrder: string[] = []
+  const witnessLastUser = new Map<string, string>()
+  const witnessExecutions = new Map<string, { tool: string; args: string; callId: string; at: number }[]>()
+  const witnessGenerations = new Map<string, number>()
+  const witnessCompactions = new Map<string, {
+    count: number
+    lastAt: number | null
+    lastShadowedTokens: number | null
+    lastSummaryChars: number | null
+  }>()
+
+  const touchWitness = (sessionId: string): void => {
+    const index = witnessOrder.indexOf(sessionId)
+    if (index >= 0) witnessOrder.splice(index, 1)
+    witnessOrder.push(sessionId)
+    while (witnessOrder.length > WITNESS_SESSIONS_MAX) {
+      const evicted = witnessOrder.shift()
+      if (evicted === undefined) continue
+      witnessLastUser.delete(evicted)
+      witnessExecutions.delete(evicted)
+      witnessGenerations.delete(evicted)
+      witnessCompactions.delete(evicted)
+    }
+  }
+
+  const noteExecution = (sessionId: string, tool: string, args: string, callId: string): void => {
+    touchWitness(sessionId)
+    const list = witnessExecutions.get(sessionId) ?? []
+    list.push({ tool, args, callId, at: kernel.clock.now() })
+    while (list.length > WITNESS_EXECUTIONS_MAX) list.shift()
+    witnessExecutions.set(sessionId, list)
+  }
+
+  const executionOfCall = (
+    sessionId: string,
+    callId: string,
+  ): { tool: string; args: string; callId: string; at: number } | undefined => {
+    const list = witnessExecutions.get(sessionId)
+    if (list === undefined) return undefined
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const entry = list[i]
+      if (entry !== undefined && entry.callId === callId) return entry
+    }
+    return undefined
+  }
+
+  const witness: SessionWitnessPort = {
+    lastUserMessage: sessionId => witnessLastUser.get(sessionId),
+    hasExecution: (sessionId, reference) => {
+      const needle = normalizeWitnessText(reference)
+      if (needle.length < 6) return false
+      const list = witnessExecutions.get(sessionId)
+      if (list === undefined) return false
+      return list.some(entry => {
+        const haystack = normalizeWitnessText(`${entry.tool} ${entry.args}`)
+        if (haystack.includes(needle)) return true
+        // 反向：模型可能把命令原文抄进 sourceRef 又追加了解释。
+        return needle.includes(haystack) && haystack.length >= 8
+      })
+    },
+    surfaceGeneration: sessionId => witnessGenerations.get(sessionId) ?? 0,
+    compactionStats: sessionId => witnessCompactions.get(sessionId) ?? {
+      count: 0,
+      lastAt: null,
+      lastShadowedTokens: null,
+      lastSummaryChars: null,
+    },
+  }
+
+  try {
+    offs.push(kernel.provide<SessionWitnessPort>(SERVICES.sessionWitness, witness))
+  } catch (error) {
+    // 见证端口装不上只影响"可核验"类能力，不影响会话本身；必须留声。
+    kernel.logger.warn(`OMB：会话见证端口注册失败——${String(error)}`)
+  }
+
   const safeOn = (event: string, fn: (...args: never[]) => void): void => {
     try {
       const returned = ctx.on?.(event, fn)
@@ -784,6 +945,53 @@ export function wireSessionEvents(options: {
     })
     const data = (event as { data?: unknown } | undefined)?.data
     switch (type) {
+      /**
+       * 用户消息：写入准入核对"用户原话"的**唯一**事实来源。
+       *
+       * 以前 `lastUserMessage` 依赖从未注入，于是 10 次「用户自称原话」
+       * 全部只能记成 `claimed-unverified`——最强证据等级实际等于自报。
+       * 现在由 dsh/ 在事件到达时缓存，模块经 `omb:session-witness` 读取。
+       */
+      case 'user/message': {
+        const text = userMessageTextOf(data)
+        if (text.length > 0) {
+          touchWitness(sessionId)
+          witnessLastUser.set(sessionId, text)
+          kernel.emit('user/message/observed', {
+            sessionId,
+            text,
+            at: kernel.clock.now(),
+            ...(pickNumber(event, 'seq') === undefined ? {} : { seq: pickNumber(event, 'seq') as number }),
+          })
+        }
+        return
+      }
+      /**
+       * 压缩成功：surface 被替换，跨代的循环窗口/证据不再可比。
+       * 只记代际与读数，不参与会话历史改写。
+       */
+      case 'compaction/summary': {
+        const record = typeof data === 'object' && data !== null ? data as Record<string, unknown> : {}
+        touchWitness(sessionId)
+        witnessGenerations.set(sessionId, (witnessGenerations.get(sessionId) ?? 0) + 1)
+        const shadowed = record['shadowedTokenCount']
+        const summary = record['summary']
+        const current = witnessCompactions.get(sessionId) ?? {
+          count: 0,
+          lastAt: null,
+          lastShadowedTokens: null,
+          lastSummaryChars: null,
+        }
+        witnessCompactions.set(sessionId, {
+          count: current.count + 1,
+          lastAt: kernel.clock.now(),
+          lastShadowedTokens: typeof shadowed === 'number' && Number.isFinite(shadowed)
+            ? shadowed
+            : current.lastShadowedTokens,
+          lastSummaryChars: typeof summary === 'string' ? summary.length : current.lastSummaryChars,
+        })
+        return
+      }
       // **DSH 的会话事件里没有 `turn/start` / `turn/end`** —— 这是本次实测纠正的
       // 一个错误假设：实际边界是 `step/start` / `step/end`
       // （`packages/core/session/src/known-event-types.ts`，心跳日志实测到
@@ -824,14 +1032,31 @@ export function wireSessionEvents(options: {
         return
       }
       case 'tool/call': {
-        // 动作指纹：工具名 + 参数摘要。用于循环检测（同一动作重复即信号）
+        // 动作指纹：工具名 + 参数摘要。用于循环检测（同一动作重复即信号）。
+        // `arguments` 在宿主里是**未解析的 JSON 字符串**（`core/session/src/types.ts:362`），
+        // 这里按原样保留：解析再序列化会改变字面量，指纹就不再是"同一动作"。
         const name = pickString(data, 'name') ?? 'unknown'
-        const argsText = JSON.stringify((data as { arguments?: unknown })?.arguments ?? null)
+        const rawArgs = (data as { arguments?: unknown })?.arguments
+        const argsText = typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs ?? null)
+        const callId = pickString(data, 'callId') ?? ''
+        if (callId.length > 0) noteExecution(sessionId, name, argsText, callId)
+        else touchWitness(sessionId)
+        const at = kernel.clock.now()
         kernel.emit('evidence/observed', {
           sessionId,
           actionHash: fingerprint('call', name, argsText),
           evidenceHash: '',
-          at: kernel.clock.now(),
+          at,
+          ...(callId.length === 0 ? {} : { callId }),
+          tool: name,
+          generation: witnessGenerations.get(sessionId) ?? 0,
+        })
+        kernel.emit('tool/call/observed', {
+          sessionId,
+          tool: name,
+          args: argsText,
+          at,
+          ...(callId.length === 0 ? {} : { callId }),
         })
         return
       }
@@ -848,26 +1073,32 @@ export function wireSessionEvents(options: {
     if (sessionId.length === 0) return
     const callId = pickString(exec, 'callId')
     const text = extractText(result)
+    const entry = callId === undefined ? undefined : executionOfCall(sessionId, callId)
+    const tool = pickString(exec, 'name') ?? pickString(exec, 'toolName') ?? entry?.tool
+    const ok = pickBoolean(result, 'isError', 'error') === undefined
+      ? (pickBoolean((result as { message?: unknown } | undefined)?.message, 'isError') === undefined
+        ? undefined
+        : !pickBoolean((result as { message?: unknown } | undefined)?.message, 'isError'))
+      : !pickBoolean(result, 'isError', 'error')
+    const at = kernel.clock.now()
     kernel.emit('evidence/observed', {
       sessionId,
       actionHash: fingerprint('result', callId ?? ''),
       evidenceHash: fingerprint('evidence', text.slice(0, 512)),
-      at: kernel.clock.now(),
+      at,
+      ...(callId === undefined ? {} : { callId }),
+      ...(tool === undefined ? {} : { tool }),
+      generation: witnessGenerations.get(sessionId) ?? 0,
     })
-
-    // 拉取计数：**这是"拉取式设计"唯一的有效性证据**。
-    // 不接线的话台账永远是 0，而杀死判据（"拉取次数/轮次长期趋近 0 → 删除该视图"）
-    // 会把五个视图全部误判为待删除——把一条测量缺失变成一次错误决策。
-    const toolName = pickString(exec, 'name') ?? pickString(exec, 'toolName') ?? ''
-    if (toolName.length > 0) {
-      try {
-        kernel
-          .service<{ recordPull?(tool: string, session: string): void }>(SERVICES.contextMetrics)
-          ?.recordPull?.(toolName, sessionId)
-      } catch {
-        // 计量失败不得影响会话
-      }
-    }
+    kernel.emit('tool/result/observed', {
+      sessionId,
+      text: text.slice(0, 4000),
+      at,
+      ...(tool === undefined ? {} : { tool }),
+      ...(entry === undefined ? {} : { args: entry.args }),
+      ...(callId === undefined ? {} : { callId }),
+      ...(ok === undefined ? {} : { ok }),
+    })
 
     try {
       onToolResult?.({ sessionId, text, callId })

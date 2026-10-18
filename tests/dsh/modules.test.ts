@@ -26,7 +26,6 @@ import { loadModulesSync, isModuleEntry, pickRegistrations, ambiguousIds, regist
 import { MODULE_IDS } from '../../kernel/abi/index.js'
 import { COMPONENT_DISPLAY, componentDirOf, displayFor } from '../../kernel/display.js'
 import * as artifactEntry from '../../packages/artifact/index.js'
-import * as contextEntry from '../../packages/context/index.js'
 import * as kernelEntry from '../../packages/kernel/index.js'
 import * as memoryEntry from '../../packages/memory/index.js'
 import * as memoryVectorEntry from '../../packages/memory-vector/index.js'
@@ -49,7 +48,6 @@ const COMPONENT_ENTRIES: Readonly<Record<string, unknown>> = {
   'memory-vector': memoryVectorEntry,
   profile: profileEntry,
   reasoning: reasoningEntry,
-  context: contextEntry,
   artifact: artifactEntry,
   notify: notifyEntry,
 }
@@ -187,7 +185,7 @@ describe('模块入口清单与 YAML 一致', () => {
   })
 
   it('没有两行指向同一个组件包（否则同一模块被激活两次）', () => {
-    // 实测过这个症状：状态面出现两条 `omb-context` 段落、计数器各自独立。
+    // 实测过这个症状：状态面出现两条同一模块的段落、计数器各自独立（旧 `omb-context` 双挂载）。
     const names = moduleRows().map(([, name]) => name)
     expect(new Set(names).size).toBe(names.length)
   })

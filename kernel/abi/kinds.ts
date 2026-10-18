@@ -29,10 +29,15 @@ export type AssertedBy = 'user' | 'execution' | 'model'
 
 export const ASSERTED_BY: readonly AssertedBy[] = ['user', 'execution', 'model']
 
-/** 边的类型。三种，布尔事实，**没有权重**（未归一化的权重是量纲不可比错误）。 */
-export type EdgeType = 'supersedes' | 'conflicts_with' | 'derived_from'
+/**
+ * 边的类型。四种，布尔事实，**没有权重**（未归一化的权重是量纲不可比错误）。
+ *
+ * `related` 是 v3.7 新增的**自动关联**（实体/路径/命令重合），与三条
+ * "裁决边"分开：它只表示"这两条记忆相关"，不代表时序替代或事实冲突。
+ */
+export type EdgeType = 'supersedes' | 'conflicts_with' | 'derived_from' | 'related'
 
-export const EDGE_TYPES: readonly EdgeType[] = ['supersedes', 'conflicts_with', 'derived_from']
+export const EDGE_TYPES: readonly EdgeType[] = ['supersedes', 'conflicts_with', 'derived_from', 'related']
 
 /** 思维链的推理深度档位，由模型自己设定（见规划 §4.4）。 */
 export type FocusDepth = 'quick' | 'standard' | 'deep'

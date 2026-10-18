@@ -144,7 +144,7 @@ describe('② 扇出绝不短路：窄库的平庸命中不能遮蔽宽库更好
 })
 
 describe('③ 融合只消费排名：禁止跨通道分数算术', () => {
-  it('rankHits 完全无视通道原始分', () => {
+  it('rankHits 的排名无视通道原始分（原始分只随行保存为展示信号，不参与融合）', () => {
     const a = rankHits([
       { id: 'x', score: 1e9, channel: 'lexical' },
       { id: 'y', score: -5, channel: 'lexical' },
@@ -153,11 +153,14 @@ describe('③ 融合只消费排名：禁止跨通道分数算术', () => {
       { id: 'x', score: 0.0001, channel: 'lexical' },
       { id: 'y', score: 0.0002, channel: 'lexical' },
     ])
-    expect(a).toEqual(b)
-    expect(a).toEqual([
+    // 排名相同（顺序由输入顺序决定，与分数无关）
+    expect(a.map(hit => ({ id: hit.id, rank: hit.rank }))).toEqual(b.map(hit => ({ id: hit.id, rank: hit.rank })))
+    expect(a.map(hit => ({ id: hit.id, rank: hit.rank }))).toEqual([
       { id: 'x', rank: 1 },
       { id: 'y', rank: 2 },
     ])
+    // 3.7 Wave 2：原始分保留下来只作"相关度信号"展示，融合仍只吃排名
+    expect(a.map(hit => hit.score)).toEqual([1e9, -5])
   })
 
   it('原始分极高但排名更差者，输给两通道都靠前者（旧实现会把它加出来）', () => {
@@ -203,8 +206,8 @@ describe('③ 融合只消费排名：禁止跨通道分数算术', () => {
     expect(b?.score).toBeCloseTo(1 / 62 + 1 / 61, 12)
     expect(a?.score).toBeCloseTo(1 / 61, 12)
     expect(b?.ranks).toEqual([
-      { channel: 'lexical', scope: 'user', rank: 2 },
-      { channel: 'vector', scope: 'user', rank: 1 },
+      { channel: 'lexical', scope: 'user', rank: 2, rawScore: 0.5 },
+      { channel: 'vector', scope: 'user', rank: 1, rawScore: -12 },
     ])
     expect([...result.stats.channelsUsed].sort()).toEqual(['lexical', 'vector'])
   })

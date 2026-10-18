@@ -142,7 +142,7 @@ describe('parseRelateArgs：参数校验零抛异常', () => {
   it('合法参数补默认值', () => {
     expect(parseRelateArgs({ id: 'x' })).toEqual({
       ok: true,
-      value: { id: 'x', depth: 1, types: ['supersedes', 'conflicts_with', 'derived_from'] },
+      value: { id: 'x', depth: 1, types: ['supersedes', 'conflicts_with', 'derived_from', 'related'] },
     })
     expect(parseRelateArgs({ id: ' x ', depth: 2, types: ['conflicts_with'] })).toEqual({
       ok: true,

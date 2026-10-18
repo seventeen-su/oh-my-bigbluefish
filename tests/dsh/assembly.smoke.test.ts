@@ -28,7 +28,7 @@ import { collectPromptContributions } from '../../dsh/session.js'
  * 装配冒烟：复现**真实路径**——宿主 ctx → `ctx.get('omb:kernel')` → 模块 apply。
  *
  * **不走内核自己启动模块那条路**：那样会与宿主启动重复（实测状态面出现两条
- * `omb-context` 段落、计数器各自独立）。模块生命周期归宿主，依赖顺序由
+ * 同一模块的段落、计数器各自独立）。模块生命周期归宿主，依赖顺序由
  * `cordis.patch.yml` 的行级 `inject: ['omb:kernel']` 保证。
  *
  * 这条测试的由来：模块入口曾因拿到宿主 ctx（而非内核）而**静默空转**——
@@ -194,9 +194,10 @@ describe('装配冒烟：真实清单 + 真实内核', () => {
     const specs = collectToolSpecs(handle)
     const names = specs.map(s => s.name)
     expect(names).toContain('omb_status')
-    // 至少覆盖记忆与思维链两组工具——否则说明工具服务名拼错了
+    // 至少覆盖记忆与项目两组工具——否则说明工具服务名拼错了
+    // （v4：reasoning 三工具已删除，方法卡迁到 skills）
     expect(names).toContain('omb_recall')
-    expect(names).toContain('omb_method')
+    expect(names).toContain('omb_project')
     // 工具名唯一（重名会被宿主 tools.register 拒绝，而拒绝会让整批失败）
     expect(new Set(names).size).toBe(names.length)
   })

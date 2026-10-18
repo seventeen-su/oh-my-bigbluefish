@@ -32,6 +32,30 @@ export const FORGET_TOOL = 'omb_forget'
 /** 一次 `omb_forget` 允许的 id 上限（隐私擦除应当分批、可审计）。 */
 export const MAX_FORGET_IDS = 500
 
+/**
+ * 召回输出的详细度（3.7-M2）。
+ *
+ * - `snippet`（**默认**）：每条正文 ≤ `SNIPPET_CHARS_PER_ITEM`，整次输出按
+ *   `SNIPPET_TOTAL_CHARS` 分配预算——实测旧行为（全文）单次 3,877 字符 ≈2.4–3.2K token；
+ * - `full`：逐字全文（旧行为，保留一个版本供显式要求与回归对照）。
+ */
+export type RecallDetail = 'snippet' | 'full'
+
+/** 检索门控模式（3.7-M2）：`always` 绕过 pressure-tight 软门控。 */
+export type RecallMode = 'auto' | 'always'
+
+/** snippet 模式：每条正文上限（字符）。 */
+export const SNIPPET_CHARS_PER_ITEM = 240
+/**
+ * snippet 模式：整次输出的正文预算（字符，不含 note 与逐条 header）。
+ *
+ * 取 1,500 而不是 1,600：工具回执可能追加"归属未知"说明（~90 字符），
+ * 留出余量后**整次工具输出**仍 ≤1,600（W1 验收口径）。
+ */
+export const SNIPPET_TOTAL_CHARS = 1500
+/** 分配后每条正文的下限：再紧也留一句可读的片段，不返回空条目。 */
+export const SNIPPET_MIN_CHARS = 60
+
 /** 参数 schema：`parse` + 给模型看的 `jsonSchema`（模型看不到我们的校验器）。 */
 interface ToolParameters extends ToolInputSchema {
   readonly jsonSchema: Record<string, unknown>
@@ -49,6 +73,16 @@ const RECALL_JSON_SCHEMA: Record<string, unknown> = {
       description: '记忆类型，省略=不限',
     },
     rerank: { type: 'boolean', description: '启用廉价重排，默认关' },
+    detail: {
+      type: 'string',
+      enum: ['snippet', 'full'],
+      description: '输出详细度：snippet（默认，每条≤240字符）/ full（逐字全文）',
+    },
+    mode: {
+      type: 'string',
+      enum: ['auto', 'always'],
+      description: 'auto（默认）：压力紧时跳过检索；always：即使压力紧也强制检索',
+    },
   },
   required: ['query'],
   additionalProperties: false,
@@ -73,6 +107,8 @@ export interface RecallArgs {
   readonly scope?: MemoryScope
   readonly kinds?: readonly MemoryKind[]
   readonly rerank?: boolean
+  readonly detail?: RecallDetail
+  readonly mode?: RecallMode
 }
 
 export interface ForgetArgs {
@@ -86,13 +122,29 @@ export type ArgsResult<T> =
 /** `omb_recall` 参数校验。**不抛**。 */
 export function parseRecallArgs(input: unknown): ArgsResult<RecallArgs> {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-    return { ok: false, error: '参数必须是对象：{ query, limit?, scope?, kinds?, rerank? }' }
+    return { ok: false, error: '参数必须是对象：{ query, limit?, scope?, kinds?, rerank?, detail?, mode? }' }
   }
-  const raw = input as { query?: unknown; limit?: unknown; scope?: unknown; kinds?: unknown; rerank?: unknown }
+  const raw = input as {
+    query?: unknown
+    limit?: unknown
+    scope?: unknown
+    kinds?: unknown
+    rerank?: unknown
+    detail?: unknown
+    mode?: unknown
+  }
   if (typeof raw.query !== 'string' || raw.query.trim().length === 0) {
     return { ok: false, error: 'query 必须是非空字符串' }
   }
-  const value: { query: string; limit?: number; scope?: MemoryScope; kinds?: readonly MemoryKind[]; rerank?: boolean } = {
+  const value: {
+    query: string
+    limit?: number
+    scope?: MemoryScope
+    kinds?: readonly MemoryKind[]
+    rerank?: boolean
+    detail?: RecallDetail
+    mode?: RecallMode
+  } = {
     query: raw.query,
   }
   if (raw.limit !== undefined) {
@@ -123,6 +175,18 @@ export function parseRecallArgs(input: unknown): ArgsResult<RecallArgs> {
   if (raw.rerank !== undefined) {
     if (typeof raw.rerank !== 'boolean') return { ok: false, error: 'rerank 必须是布尔值' }
     value.rerank = raw.rerank
+  }
+  if (raw.detail !== undefined) {
+    if (raw.detail !== 'snippet' && raw.detail !== 'full') {
+      return { ok: false, error: 'detail 只能是 snippet / full' }
+    }
+    value.detail = raw.detail
+  }
+  if (raw.mode !== undefined) {
+    if (raw.mode !== 'auto' && raw.mode !== 'always') {
+      return { ok: false, error: 'mode 只能是 auto / always' }
+    }
+    value.mode = raw.mode
   }
   return { ok: true, value }
 }
@@ -191,6 +255,21 @@ export interface MemoryToolDeps {
    * 否则"这条记忆被用过几次"永远是个没有来源的数字（M5 的静默失效正是这么来的）。
    */
   readonly onUsageFailure?: (info: { readonly reason: string; readonly ids: readonly string[] }) => void
+  /**
+   * 缺省输出详细度（3.7-M2，来自模块配置 `recallDetail`）。
+   *
+   * 缺省 `snippet`：单次召回 3,877 → ≤1,600 字符的验收目标由它承担。
+   * `full` 只保留给显式参数与回归对照。
+   */
+  readonly defaultDetail?: RecallDetail
+  /**
+   * 1-hop `related` 扩展开关（3.7 Wave 2，来自模块配置 `relatedExpansion`）。
+   *
+   * 缺省关闭：单测/旧装配保持"只返回直接命中"；生产由模块配置默认打开。
+   */
+  readonly expandRelated?: boolean
+  /** 检索完成后的只读观测口（3.7 Wave 2：累计 `relatedExpanded` 等读数）。绝不改变结果。 */
+  readonly onRetrieved?: (result: RetrieveResult) => void
 }
 
 export interface ForgetOutcome {
@@ -336,17 +415,34 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       if (!resolved.ok) return { kind: 'error', text: `${RECALL_TOOL} 不可用：${resolved.error}` }
       const ports = resolvePorts(deps)
       const band = readPressureBand(deps, sessionId)
-      const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band), ports)
+      const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band, deps.expandRelated === true), ports)
+      try {
+        deps.onRetrieved?.(result)
+      } catch {
+        // 观测口失败不得改变召回结果
+      }
       // 记账在**结果已经成立之后**：它失败与否都不改变"检索到了什么"（也绝不抛）
       await markInjectedAsUsed(deps, resolved.stores, result)
       if (result.items.length === 0) {
-        // 空结果也必须有可行动作：先说"没检索到"，再带上门控/降级原因与"不要编造"。
-        const parts = [`未检索到相关记忆（${result.note}）`]
+        // **"跳过"与"没有"必须分开说**（3.7-M2）：旧文案把 pressure-tight 门控也写成
+        // "未检索到相关记忆 / 没有可注入的记忆"——模型会据此回答"记忆里没有这件事"，
+        // 而真相是"库根本没被查"。两者的行动含义相反。
+        const parts: string[] = []
+        if (!result.gate.retrieve) {
+          parts.push(`本次未检索（门控：${result.gate.reason}）——${result.gate.detail}`)
+          parts.push('这不是"没有相关记忆"：记忆库没有被查询')
+          if (result.gate.reason === 'pressure-tight') {
+            parts.push('需要时用 mode:"always" 强制检索')
+          }
+        } else {
+          parts.push(`未检索到相关记忆（${result.note}）`)
+        }
         if (result.degraded.length > 0) parts.push(`降级：${result.degraded.join('；')}`)
         parts.push('不要编造内容')
         return { kind: 'text', text: `${parts.join('；')}${unknownAttributionNote(call)}` }
       }
-      return { kind: 'text', text: renderRecall(result) + unknownAttributionNote(call) }
+      const detail = parsed.value.detail ?? deps.defaultDetail ?? 'snippet'
+      return { kind: 'text', text: renderRecall(result, detail) + unknownAttributionNote(call) }
     },
   }
 }
@@ -386,35 +482,90 @@ export function createMemoryTools(deps: MemoryToolDeps): readonly ToolDefinition
 /** `ToolFactory` 契约：由 `dsh/` 在正确作用域调用。 */
 export const memoryToolFactory: ToolFactory<MemoryToolDeps> = { create: createMemoryTools }
 
-/** 召回结果的可读渲染：逐字文本 + 溯源 + 审计位。 */
-export function renderRecall(result: RetrieveResult): string {
+/**
+ * 召回结果的可读渲染：逐字文本 + 溯源 + 审计位。
+ *
+ * `detail` 默认 `full`（保持既有调用方/测试行为不变）；**工具执行体**按模块配置
+ * 传 `snippet`（3.7-M2 的默认）。snippet 只截正文，header（id/作用域/时间/通道/来源）
+ * 一律保留——"这条从哪来、凭什么排第一"不能因为省 token 而丢。
+ */
+export function renderRecall(result: RetrieveResult, detail: RecallDetail = 'full'): string {
   const lines: string[] = [`记忆召回（${RECALL_TOOL}）：${result.note}`]
-  for (const item of result.items) {
-    const channels = item.ranks.map(r => `${r.channel}#${r.rank}`).join('+')
-    lines.push(
-      `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · observedAt=${formatTime(item.observedAt)}` +
-        ` · score=${item.score.toFixed(4)} · 通道 ${channels} · sourceRef=${item.sourceRef}` +
-        validityMark(item.supersededBy, item.validTo),
-    )
-    lines.push(`  ${item.text}`)
-  }
+  const headers = result.items.map(itemHeader)
+  const tails: string[] = []
   if (result.items.length === 0) {
-    lines.push('（没有可注入的记忆：请基于当前上下文作答，不要编造记忆内容。）')
+    tails.push('（没有可注入的记忆：请基于当前上下文作答，不要编造记忆内容。）')
+  } else if (detail === 'snippet') {
+    tails.push(
+      `（snippet 模式：每条正文 ≤${SNIPPET_CHARS_PER_ITEM} 字符、整次预算 ${SNIPPET_TOTAL_CHARS} 字符；` +
+        '逐字全文用 detail:"full"。）',
+    )
   } else {
-    lines.push('（以上为逐字原文；需要多跳关联时用 omb_relate。）')
+    tails.push('（以上为逐字原文；需要多跳关联时用 omb_relate。）')
   }
   // "被取代"不能只体现在计数上：给出 id，后续会话才能追到那条历史痕迹。
   if (result.stats.supersededSkipped > 0) {
     const ids = result.stats.supersededSkippedIds
     const listed = ids.length === 0 ? '（id 列表已达上限，未列出）' : ids.join('、')
     const more = result.stats.supersededSkipped > ids.length ? ` 等 ${result.stats.supersededSkipped} 条` : ''
-    lines.push(
+    tails.push(
       `⚠️ 另有 ${result.stats.supersededSkipped} 条相关记忆**已被推翻**、未作为有效结论注入：${listed}${more}。` +
         '这是历史痕迹（"曾经相信过什么"），不是当前结论；要核对用 omb_relate <id> depth=1 types=["supersedes"]。',
     )
   }
-  if (result.degraded.length > 0) lines.push(`降级：${result.degraded.join('；')}`)
+  if (result.degraded.length > 0) tails.push(`降级：${result.degraded.join('；')}`)
+
+  if (detail === 'full') {
+    for (let index = 0; index < result.items.length; index += 1) {
+      lines.push(headers[index] ?? '')
+      lines.push(`  ${result.items[index]?.text ?? ''}`)
+    }
+    lines.push(...tails)
+    return lines.join('\n')
+  }
+
+  // snippet：先扣掉 header/note/尾部，再把剩余预算平均分给正文（每条 ≤240）。
+  // 这样"整次 ≤ SNIPPET_TOTAL_CHARS"与"每条 ≤ SNIPPET_CHARS_PER_ITEM"同时成立；
+  // 极端情况（limit=20、header 很长）允许低于预算下限时超总预算，但不会超单条上限。
+  const fixed =
+    (lines[0]?.length ?? 0) +
+    1 +
+    tails.reduce((sum, line) => sum + line.length + 1, 0) +
+    headers.reduce((sum, header) => sum + header.length + 3, 0)
+  const count = result.items.length
+  const available = Math.max(0, SNIPPET_TOTAL_CHARS - fixed)
+  const perItem = count === 0
+    ? 0
+    : Math.min(SNIPPET_CHARS_PER_ITEM, Math.max(SNIPPET_MIN_CHARS, Math.floor(available / count)))
+  for (let index = 0; index < count; index += 1) {
+    const text = result.items[index]?.text ?? ''
+    const snippet = text.length <= perItem ? text : `${text.slice(0, Math.max(0, perItem - 1))}…`
+    lines.push(headers[index] ?? '')
+    lines.push(`  ${snippet}`)
+  }
+  lines.push(...tails)
   return lines.join('\n')
+}
+
+/** 单条 header：id/作用域/类型/时间/相关度信号/通道/来源 + 有效性标注。 */
+function itemHeader(item: RetrieveResult['items'][number]): string {
+  const channels = item.ranks.map(r => `${r.channel}#${r.rank}`).join('+')
+  /**
+   * 3.7 Wave 2 / 审计 P3：`score` 是 RRF 融合分，**只有 1/(k+rank) 的两种取值**
+   * （1 通道 0.0164 / 2 通道 0.0328）。把它写成 `score=` 会被模型读成"相关度"。
+   * 这里改成：`融合分`（明确标注仅排序）+ `信号`（通道原始分：词法 -bm25 / 向量余弦）。
+   */
+  const signals: string[] = []
+  if (item.signals.lexical !== undefined) signals.push(`词法 ${item.signals.lexical.toFixed(2)}`)
+  if (item.signals.vector !== undefined) signals.push(`向量 ${item.signals.vector.toFixed(2)}`)
+  if (item.channels.includes('graph')) signals.push('1-hop 关联（弱）')
+  const signalText = signals.length === 0 ? '信号 未测' : `信号 ${signals.join(' / ')}`
+  return (
+    `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · observedAt=${formatTime(item.observedAt)}` +
+    ` · 融合分 ${item.score.toFixed(4)}（仅排序，不是相关度） · ${signalText} · 通道 ${channels}` +
+    ` · sourceRef=${item.sourceRef}` +
+    validityMark(item.supersededBy, item.validTo)
+  )
 }
 
 /**
@@ -494,14 +645,21 @@ function resolveStores(
 }
 
 /** 工具参数 → 检索请求（工具面用 `query`，检索面用 `text`；这里是唯一的映射点）。 */
-function toRetrieveQuery(args: RecallArgs, band: PressureBand | undefined): RetrieveQuery {
+function toRetrieveQuery(
+  args: RecallArgs,
+  band: PressureBand | undefined,
+  expandRelated: boolean,
+): RetrieveQuery {
   return {
     text: args.query,
     ...(args.limit !== undefined ? { limit: args.limit } : {}),
     ...(args.scope !== undefined ? { scope: args.scope } : {}),
     ...(args.kinds !== undefined ? { kinds: args.kinds } : {}),
     ...(args.rerank !== undefined ? { rerank: args.rerank } : {}),
+    // `auto` 不写字面量：门控默认行为就是 auto；`always` 是唯一需要穿透的档位。
+    ...(args.mode === 'always' ? { mode: 'always' as const } : {}),
     ...(band !== undefined ? { pressureBand: band } : {}),
+    ...(expandRelated ? { expandRelated: true } : {}),
   }
 }
 

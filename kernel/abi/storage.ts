@@ -136,10 +136,14 @@ export const STORES_SERVICE = 'stores'
  *   发现不了**正文被改写而嵌入器没换**——那种情况下旧向量会一直参与检索，
  *   且不报错，症状是"检索结果莫名其妙"。历史行 `content_hash` 为 NULL 表示
  *   **未知**，按"需要重建"处理（不许当成"内容未变"，那是静默的错误方向）。
+ * - v3：`edge` 表重建，`type` CHECK 增加 `'related'`（记忆网络的普通关联边）。
+ *   为什么必须重建：SQLite 不能 ALTER CHECK；行数有界、事务内 `INSERT SELECT`
+ *   后 `DROP/RENAME`。`related` 是**自动连边**（实体重合），不是用户裁决，
+ *   因此与 `supersedes`/`conflicts_with` 的时序/冲突语义分开。
  *
  * **这个常量与迁移表的最高版本必须一致**：`migrate()` 在缺省步骤表下会做这条
  * 自检，不一致就抛"契约漂移"。本轮曾经因为表到了 v2 而常量还是 1，
  * 只能靠 `openMemoryStore` 显式传步骤表绕过——那等于把自检关掉，
- * 现在已收口（常量抬到 2、显式参数撤掉）。
+ * 现在已收口（常量抬到 3、显式参数撤掉）。
  */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3

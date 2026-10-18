@@ -43,7 +43,7 @@ const REASONING_CHARS = 104
 /** 两个模块各自写满：104 + 1（分隔符）+ 104 = 209 > 120，第二个必然被截。 */
 const OVER: readonly PromptContribution[] = [
   { id: 'omb-reasoning', resident: 'x'.repeat(REASONING_CHARS) },
-  { id: 'omb-context', resident: 'y'.repeat(REASONING_CHARS) },
+  { id: 'probe-module', resident: 'y'.repeat(REASONING_CHARS) },
 ]
 
 /** 造一个只做一件事的模块登记项：provide 一个 `prompt:<id>` 贡献。 */
@@ -94,12 +94,12 @@ describe('residentHintReport：超预算必须成为可读事实', () => {
     // 逐项账目：谁给了多少、实际进去多少
     expect(report.entries).toEqual([
       { id: 'omb-reasoning', chars: REASONING_CHARS, kept: REASONING_CHARS, truncated: false },
-      { id: 'omb-context', chars: REASONING_CHARS, kept: 15, truncated: true },
+      { id: 'probe-module', chars: REASONING_CHARS, kept: 15, truncated: true },
     ])
-    expect(report.clipped.map(e => e.id)).toEqual(['omb-context'])
+    expect(report.clipped.map(e => e.id)).toEqual(['probe-module'])
 
     // **报告必须可读**：含被截的模块名与字符数（89 = 104 - 15）
-    expect(report.report).toContain('omb-context')
+    expect(report.report).toContain('probe-module')
     expect(report.report).toContain('89/104')
     expect(report.report).toContain('209')
     expect(report.report).toContain('120')
@@ -142,7 +142,7 @@ describe('residentHintReport：超预算必须成为可读事实', () => {
     const a = residentHintReport(OVER)
     const b = residentHintReport([
       { id: 'omb-reasoning', resident: 'x'.repeat(REASONING_CHARS) },
-      { id: 'omb-context', resident: 'y'.repeat(REASONING_CHARS) },
+      { id: 'probe-module', resident: 'y'.repeat(REASONING_CHARS) },
     ])
     expect(JSON.stringify(a)).toBe(JSON.stringify(b))
     // 报告里不得混入时钟/计数一类会跨轮变化的东西
@@ -231,7 +231,7 @@ describe('wirePromptInjection：超限留声，但不让插件加载失败', () 
     expect(sp.calls).toHaveLength(1)
     // ② 留声：可读报告进了日志
     const logged = warn.mock.calls.map(call => String(call[0])).join('\n')
-    expect(logged).toContain('omb-context')
+    expect(logged).toContain('probe-module')
     expect(logged).toContain('89/104')
     expect(() => dispose()).not.toThrow()
   })
@@ -244,7 +244,7 @@ describe('wirePromptInjection：超限留声，但不让插件加载失败', () 
 
     expect(h.statusNames()).toContain(RESIDENT_BUDGET_STATUS_NAME)
     const text = h.status().join('\n')
-    expect(text).toContain('omb-context')
+    expect(text).toContain('probe-module')
     expect(text).toContain('89/104')
     expect(text).toContain('超限')
 
@@ -357,7 +357,7 @@ describe('wirePromptInjection：超限留声，但不让插件加载失败', () 
     h.status(); h.status()
 
     expect(over()).toHaveLength(1)
-    expect(String(over()[0]?.[0])).toContain('omb-context')
+    expect(String(over()[0]?.[0])).toContain('probe-module')
     dispose()
   })
 

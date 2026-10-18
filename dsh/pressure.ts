@@ -9,19 +9,26 @@
  * 一次都不会触发，而模块健康面、工具面、状态面**全部正常**——
  * 每一层单独看都对，只是中间少了一根线。
  *
- * ## 宿主侧的真源
+ * ## 宿主侧的真源（**stateOf 返回宿主 state，不是 wire view**）
  *
- * `packages/llm/token-meter/src/projection.ts:68-76` 注册了三个会话投影：
+ * `packages/llm/token-meter/src/projection.ts` 注册了三个会话投影。它们各有
+ * **宿主 state** 与 **client wire view** 两层形状，而 `stateOf` 返回的是前者
+ * （`packages/session/session-projection/src/index.ts:313-328`）：
  *
- * - `contextPressure`：`pressureTokens`（最近一次请求的真实 prompt 大小）、
- *   `projectedTokens`（下一次请求的预估，会上报 usage 而对 compaction 一无所知）、
- *   `contextWindow`（该路由最新一次被声明的窗口容量）
- * - `tokenUsage`：累计缓存读 / 写 token
- * - `contextBreakdown`：system / tools / messages 的**启发式**构成
+ * - `contextPressure` host state：`{contextWindow?, pressureTokens?,
+ *   surfaceTokens, sampledSurfaceTokens?, claim?}`。`projectedTokens` 只在
+ *   wire view 里由 `pressureTokens + surfaceTokens − sampledSurfaceTokens` 算出
+ *   （`usage-projection.ts:210-216`）——本文件必须自己按这条公式算。
+ * - `tokenUsage` host state：`{totals, last}`；`cacheReadTokens/cacheWriteTokens`
+ *   在 `totals` 里（wire view 才是扁平 totals）。
+ * - `contextBreakdown` host state：`{systems, surfaceTokens, breakdown:{...}}`；
+ *   `systemTokens/toolsTokens/messageTokens` 在嵌套的 `breakdown` 里。
  *
- * 三者都经 `ctx.sessionProjections.stateOf(session, key)` 读取
- * （`packages/session/session-projection/src/index.ts:319`），而 `stateOf` 要的是
- * **Session 对象**、不是 sessionId —— 本模块负责那个映射。
+ * 读错这一层不会报错，只会**静默地永远读到 0 / undefined**——本文件的测试替身
+ * 曾经也照着 wire view 写，于是整条链路在测试里全绿、在真机上从未生效。
+ *
+ * 三者都经 `ctx.sessionProjections.stateOf(session, key)` 读取，而 `stateOf`
+ * 要的是 **Session 对象**、不是 sessionId —— 本模块负责那个映射。
  *
  * ## 映射怎么来
  *
@@ -229,10 +236,20 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
         unmetered += 1
         return undefined
       }
-      // **优先 projectedTokens**：它是"下一次请求的 prompt 会花多少"，随 compaction
-      // 立即变化；pressureTokens 只跟着 provider 上报走，compaction 之后仍是旧值
-      // （projection.ts:37-45）。用了旧值，压完上下文压力档位不会回落。
-      const total = firstFinite(pressure['projectedTokens'], pressure['pressureTokens'])
+      // **下一次请求的压力**：`stateOf` 返回的是**宿主 state**（不是 client
+      // wire view）——host state 里没有 `projectedTokens`，只有
+      // `{pressureTokens, surfaceTokens, sampledSurfaceTokens}`。
+      // 因此这里自己算 view 的同一条公式（`usage-projection.ts` 的 wire.view）：
+      //   projected = pressureTokens + surfaceTokens − sampledSurfaceTokens
+      // 它随 compaction 立即下降（surface 被遮蔽），而 pressureTokens 只跟 provider
+      // 上报走、压缩后仍是旧值。`projectedTokens` 仍保留为兼容旧替身/旧宿主的退路。
+      const pressureTokens = finite(pressure['pressureTokens'])
+      const surfaceTokens = finite(pressure['surfaceTokens'])
+      const sampledSurfaceTokens = finite(pressure['sampledSurfaceTokens'])
+      const legacyProjected = finite(pressure['projectedTokens'])
+      const total = pressureTokens !== undefined && surfaceTokens !== undefined && sampledSurfaceTokens !== undefined
+        ? Math.max(0, Math.round(pressureTokens + surfaceTokens - sampledSurfaceTokens))
+        : firstFinite(legacyProjected, pressureTokens)
       if (total === undefined) {
         lastReason = '宿主尚未上报过一次 provider usage（投影里还没有压力读数）'
         unmetered += 1
@@ -242,7 +259,12 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
       const window = finite(pressure['contextWindow'])
       const usableWindow = window !== undefined && window > 0 ? window : undefined
       const usage = projectionOf(registry, session, KEY_USAGE)
-      const breakdown = projectionOf(registry, session, KEY_BREAKDOWN)
+      // `tokenUsage` 的宿主 state 是 `{totals,last}`；client view 才是扁平 totals。
+      // 读错一层就会永远得到 0（这正是本次修复前的实测症状）。
+      const usageTotals = asRecord(usage?.['totals']) ?? usage
+      const breakdownRoot = projectionOf(registry, session, KEY_BREAKDOWN)
+      // `contextBreakdown` 的宿主 state 是 `{systems,surfaceTokens,breakdown:{...}}`。
+      const breakdown = asRecord(breakdownRoot?.['breakdown']) ?? breakdownRoot
 
       measured += 1
       lastReason = usableWindow === undefined
@@ -257,8 +279,8 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
         // （kernel/index.ts:420），阈值只有内核那一份，此处不重复实现。
         // tests/kernel/kernel.test.ts:214 钉住了这条契约。
         band: 'relaxed',
-        cacheReadTokens: finite(usage?.['cacheReadTokens']) ?? 0,
-        cacheWriteTokens: finite(usage?.['cacheWriteTokens']) ?? 0,
+        cacheReadTokens: finite(usageTotals?.['cacheReadTokens']) ?? 0,
+        cacheWriteTokens: finite(usageTotals?.['cacheWriteTokens']) ?? 0,
         nodes: nodesOf(breakdown),
       }
     } catch (error) {

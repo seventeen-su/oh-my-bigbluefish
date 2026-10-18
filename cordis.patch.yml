@@ -69,15 +69,6 @@
       config:
         defaultDepth: standard
 
-    # ── 上下文优化 ───────────────────────────────────────────────
-    - id: omb-context
-      name: '@omb/context'
-      inject: ['omb:kernel']
-      config:
-        # 软压力档位，**不是每回合 token 上限**；阈值从测量标定
-        pressureBands: [0.3, 0.6]
-        candidateConsiderLimit: 12
-
     # ── 制品索引 / 通知桥 ────────────────────────────────────────
     - id: omb-artifact
       name: '@omb/artifact'
@@ -208,10 +199,8 @@
           #   · tool-result-pruner 纯确定性：工具结果超过 8192 字符就保留
           #                        head 4096 + tail 1024，原文仍可经 shadowed node 追回；
           #   · command-compact   只由人打 `/compact` 触发，无自主行为。
-          # 为什么与 OMB 的上下文优化不冲突：OMB **只读** tokenMeter、**从不改会话历史**
-          # （`modules/context/index.ts:249` 读压力；拉取台账只累计 pulls/turns），
-          # 且在 fillRatio 0.6 就转"读数 + 索引"（规则卡正文改按需用 omb_method 拉取），
-          # 早于压缩的 ~0.8 阈值——互补而非互斥。
+          # OMB 不再持有上下文组件（v4）：下面三行是**宿主自己的**上下文管理，
+          # OMB 只读 tokenMeter 投影用于状态面，从不改会话历史，因此不冲突。
           # 详情：`docs/dsh-compatibility.md` §4。
           - id: compaction
             name: cordis:group
@@ -273,6 +262,9 @@
             config:
               customSkillDirs:
                 - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+                # OMB 自己的过程卡（v4：8 张方法卡从 `omb_method` 工具迁到 skills）。
+                # 目录随插件包发布；skill 正文只在模型调用 `skill` 时读取，不占常驻预算。
+                - !!js process.getBuiltinModule('node:path').join(baseUrl, 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: present

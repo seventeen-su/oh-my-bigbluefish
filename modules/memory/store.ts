@@ -55,6 +55,7 @@ import {
   SchemaVersionAheadError,
 } from './migrate.js'
 import type { OverturnedHit, OverturnedProbe, OverturnedQuery } from './overturned.js'
+import { SHORT_ENTRY_CHARS, SHORT_ENTRY_GUARD_CHARS } from './retrieve.js'
 import { ftsMatchExpr, tokenizeForFts } from './text.js'
 
 /** 写锁等待上限：1000ms。**快速失败**，不做无限等待（规划 R8）。 */
@@ -1082,10 +1083,14 @@ class SqliteStore implements SqliteMemoryStore {
   }
 
   /**
-   * 词法检索（FTS5 + BM25）。
+   * 词法检索（FTS5 + BM25 + **短结论优先的长度惩罚**，3.7-M3）。
    *
    * - 查询串用**与写入侧相同的分词器**处理后构造 MATCH 表达式（规划 §8.3）
-   * - `score` 为 `-bm25()`：**越大越相关**；同一通道内降序即排名。跨通道禁止算术语义（融合只按排名）
+   * - `score` = `-bm25()` × 长度偏好系数：
+   *   `(SHORT+GUARD) / (SHORT+GUARD + max(0, LENGTH(text) − SHORT))`
+   *   （≤300 字符不加权、700 字符 ≈×0.50、1100 字符 ≈×0.36；参数与标定见 `retrieve.ts`）。
+   *   为什么需要：中文 bigram + OR 下，长回顾靠"命中的 bigram 多"系统性占首位（M7 实测），
+   *   而结论/偏好应是短句。这只是**偏好**——真正相关且长的条目仍可靠更高的 bm25 留在前面。
    * - 默认**排除失效记忆**：`valid_to` 或 `superseded_by` 非空的行不注入（精度优先，规划 §5.1）。
    *   `get`/`getMany` 仍会返回它们——"我当时相信什么"必须可回答
    */
@@ -1113,8 +1118,13 @@ class SqliteStore implements SqliteMemoryStore {
     }
     params.push(limit)
 
+    // 长度偏好系数：N/(N + max(0, LENGTH(text) − SHORT))，N = SHORT + GUARD。
+    // 全部是模块内常量（非用户输入），直接内联进 SQL 以保持语句可缓存性。
+    const preferenceNumerator = SHORT_ENTRY_CHARS + SHORT_ENTRY_GUARD_CHARS
     const rows = this.#all(
-      `SELECT m.id AS id, -bm25(memory_fts) AS score
+      `SELECT m.id AS id,
+              (-bm25(memory_fts)) * ${preferenceNumerator}.0
+                / (${preferenceNumerator}.0 + MAX(0, LENGTH(m.text) - ${SHORT_ENTRY_CHARS})) AS score
          FROM memory_fts
          JOIN memory m ON m.rowid = memory_fts.rowid
         WHERE memory_fts MATCH ?

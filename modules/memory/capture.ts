@@ -1,0 +1,619 @@
+/**
+ * 自主记忆捕获（3.7 Wave 2，task-17）。
+ *
+ * ## 为什么需要它
+ *
+ * W1 之后记忆库仍然**只靠模型主动调 `omb_remember`**：391 会话里只有 29 个用过，
+ * 大量"用户明确说过的偏好/决定"和"这个项目实际做了什么"留在原始会话里，
+ * 下次会话从零开始——这正是用户说的"不自动、不理解项目、每次冷启动"。
+ *
+ * 本模块订阅 `dsh/` 已观测到的**三个事实事件**（不读宿主、不读模型输出）：
+ * - `user/message/observed`：用户原话（偏好/决定的唯一可信来源）；
+ * - `tool/call/observed` / `tool/result/observed`：项目活动（命令/改文件）。
+ *
+ * ## 三条硬规则
+ *
+ * ① **零 LLM、零抽取**：全是确定性的正则/长度/去重规则，同一输入永远同一结论
+ *    （模型可以复核、测试可以断言；不用小模型"总结"，避免又造回顾体）。
+ * ② **只写观测到的事实**：偏好写 `asserted_by=user`（原文包含用户陈述），
+ *    活动写 `asserted_by=execution`（真的发生了这次调用），**不写助手文本**。
+ * ③ **有界**：每会话偏好 ≤5、活动 ≤10；同会话按去重键幂等；会话状态表有上限。
+ *
+ * ## 与 `omb_remember` 的分工
+ *
+ * - `omb_remember`：模型主动、走准入闸门（用户原话核对/工件核验/执行台账）；
+ * - 本模块：**事件驱动**，不经过 `decideAdmission`（它的输入是观测事实，不是模型自述），
+ *   但同样受隐私闸门约束、同样拒绝密钥模式。
+ */
+import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../../kernel/abi/index.js'
+import { contentHashOf, newMemoryId } from './remember.js'
+import { hasSecret } from './secrets.js'
+
+export { hasSecret } from './secrets.js'
+
+/** 用户偏好/决定标记（任一命中即候选；宁可漏收，不可把闲聊写进用户库）。 */
+export const PREFERENCE_MARKERS: readonly string[] = [
+  '记住',
+  '以后',
+  '下次',
+  '我喜欢',
+  '我习惯',
+  '不要',
+  '必须',
+  '决定',
+  '采用',
+  '方案',
+  '约定',
+]
+
+/** 项目活动命令标记（大小写不敏感）。 */
+export const ACTIVITY_COMMAND_PATTERN = /\b(?:test|build|verify|git\s+commit|pnpm|npm|pytest|tsc)\b/i
+
+/** 视为"改文件"的工具名（宿主工具名可能带前缀，按子串匹配）。 */
+export const EDIT_TOOL_MARKERS: readonly string[] = ['edit', 'write', 'str_replace', 'str-replace']
+
+/** 偏好文本长度域（太短无法成为可核对陈述；太长是回顾体）。 */
+export const PREF_MIN_CHARS = 8
+export const PREF_MAX_CHARS = 500
+
+/** 每会话捕获上限（有界；见任务书）。 */
+export const DEFAULT_MAX_PREFERENCES = 5
+export const DEFAULT_MAX_ACTIVITY = 10
+
+/** 项目库未就绪时的重试（冷启动）。 */
+export const DEFAULT_PROJECT_RETRY_MS = 250
+
+/**
+ * 密钥/凭据模式识别（与准入共用；3.7 Wave 2 起抽到 `./secrets.js`）。
+ *
+ * 自主写入不经 `omb_remember` 的准入，必须在写之前自己拒。
+ */
+
+/** 疑问句：以问号结尾或典型疑问开头（"以后要不要…"这种带有决定标记的仍算偏好，见 classify）。 */
+export function isQuestion(text: string): boolean {
+  const trimmed = text.trim()
+  if (/[?？]\s*$/.test(trimmed)) return true
+  return /^(?:什么|怎么|为什么|为何|是否|能否|能不能|可不可以|是不是|要不要|哪个|哪些|多少|何时|几时|请问)/.test(
+    trimmed,
+  )
+}
+
+/** 命令/代码块：命令行、斜杠命令、代码围栏或典型代码片段一律不收。 */
+export function isCommandOrCode(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return false
+  if (trimmed.startsWith('/') || trimmed.startsWith('$') || trimmed.startsWith('>')) return true
+  if (trimmed.includes('```')) return true
+  if (/\b(?:function|class|interface)\s+\w+\s*[({]/.test(trimmed)) return true
+  if (/\bimport\s+[^\n]+\s+from\s+['"]/.test(trimmed)) return true
+  // 多行且以分号/花括号结尾的行占比高 → 代码粘贴
+  const lines = trimmed.split('\n').filter(line => line.trim().length > 0)
+  if (lines.length >= 3) {
+    const codeLike = lines.filter(line => /[;{}]\s*$/.test(line.trim())).length
+    if (codeLike / lines.length >= 0.5) return true
+  }
+  return false
+}
+
+/** 偏好候选的分类结果：`ok` 时给出要写入的正文（去首尾空白）。 */
+export type PreferenceDecision =
+  | { readonly ok: true; readonly text: string }
+  | { readonly ok: false; readonly reason: string }
+
+/**
+ * 判断一条用户消息是否值得作为**跨会话偏好/决定**写入。
+ *
+ * 判据顺序固定（确定性）：长度 → 疑问/命令/代码 → 标记 → 密钥。
+ */
+export function classifyUserMessage(text: string): PreferenceDecision {
+  const trimmed = typeof text === 'string' ? text.trim() : ''
+  if (trimmed.length === 0) return { ok: false, reason: 'empty' }
+  if (trimmed.length < PREF_MIN_CHARS) return { ok: false, reason: 'too-short' }
+  if (trimmed.length > PREF_MAX_CHARS) return { ok: false, reason: 'too-long' }
+  if (isQuestion(trimmed)) return { ok: false, reason: 'question' }
+  if (isCommandOrCode(trimmed)) return { ok: false, reason: 'command-or-code' }
+  if (!PREFERENCE_MARKERS.some(marker => trimmed.includes(marker))) return { ok: false, reason: 'no-marker' }
+  if (hasSecret(trimmed)) return { ok: false, reason: 'secret' }
+  return { ok: true, text: trimmed }
+}
+
+/** 工具调用 → 项目活动的分类结果。 */
+export type ActivityDecision =
+  | { readonly ok: true; readonly text: string; readonly dedupeKey: string }
+  | { readonly ok: false; readonly reason: string }
+
+function toolNameMatches(tool: string, marker: string): boolean {
+  return tool.toLowerCase().includes(marker)
+}
+
+/** 从参数串里抽路径（防御式：参数可能是 JSON、命令行或裸路径）。 */
+export function extractPaths(raw: string): readonly string[] {
+  if (typeof raw !== 'string' || raw.length === 0) return []
+  const found = new Set<string>()
+  for (const match of raw.matchAll(/[A-Za-z]:\\[^\s"'`）)，,。；;]+/g)) found.add(match[0])
+  for (const match of raw.matchAll(/(?:\.{1,2}\/)[\w.@/-]+/g)) found.add(match[0])
+  for (const match of raw.matchAll(/(?:^|[\s"':=])((?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})/g)) {
+    const value = match[1]
+    if (value !== undefined && value.length > 2) found.add(value)
+  }
+  return [...found].sort()
+}
+
+/** 从命令串/参数串里抽命令摘要（最多两个 token，避免写进整段参数）。 */
+export function extractCommand(raw: string): string | undefined {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const match = raw.match(
+    /(?:^|["'\s])((?:pnpm|npm|yarn|npx|node|pytest|tsc|git|make|docker|vitest|go|cargo)\b[^"'`\n]{0,80})/i,
+  )
+  if (match?.[1] === undefined) return undefined
+  return match[1].trim().slice(0, 120)
+}
+
+/**
+ * 判断一次工具调用是否构成"项目活动"，并给出可写入的**事实陈述**。
+ *
+ * - 改文件类工具 → `编辑文件：<path>`（抽不到路径就跳过，不写空泛记录）；
+ * - 命令类（命中 `ACTIVITY_COMMAND_PATTERN`）→ `执行命令：<cmd>`；
+ * - 其它 → 跳过（读操作不记，避免把"看过"写成"做过"）。
+ */
+export function classifyToolActivity(tool: string, args: string): ActivityDecision {
+  const toolText = typeof tool === 'string' ? tool : ''
+  const argText = typeof args === 'string' ? args : ''
+  if (toolText.length === 0) return { ok: false, reason: 'no-tool' }
+  if (hasSecret(argText) || hasSecret(toolText)) return { ok: false, reason: 'secret' }
+
+  if (EDIT_TOOL_MARKERS.some(marker => toolNameMatches(toolText, marker))) {
+    const paths = extractPaths(argText)
+    if (paths.length === 0) return { ok: false, reason: 'no-path' }
+    const shown = paths.slice(0, 3).join('、')
+    return { ok: true, text: `编辑文件：${shown}`, dedupeKey: `edit:${paths.join('|')}` }
+  }
+
+  const command = extractCommand(argText)
+  const haystack = `${toolText} ${argText}`
+  if (!ACTIVITY_COMMAND_PATTERN.test(haystack)) return { ok: false, reason: 'not-activity' }
+  if (command === undefined) {
+    const trimmed = argText.trim().slice(0, 120)
+    if (trimmed.length === 0) return { ok: false, reason: 'no-command' }
+    return { ok: true, text: `执行命令：${trimmed}`, dedupeKey: `cmd:${trimmed}` }
+  }
+  return { ok: true, text: `执行命令：${command}`, dedupeKey: `cmd:${command}` }
+}
+
+/** 会话结局（turn/end）：只在"有活动但一条都没捕获"时兜一条，避免刷屏。 */
+export function classifySessionOutcome(input: {
+  readonly toolCalls: number
+  readonly capturedActivity: number
+  readonly topTools: readonly string[]
+}): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: string } {
+  if (input.toolCalls < 3) return { ok: false, reason: 'too-few-calls' }
+  if (input.capturedActivity > 0) return { ok: false, reason: 'already-captured' }
+  const tools = input.topTools.slice(0, 3).join('、')
+  return { ok: true, text: `会话活动：${input.toolCalls} 次工具调用（${tools}）` }
+}
+
+/**
+ * 实体键（图自动连边用）。
+ *
+ * 四类：路径 / 命令 / 包名（反引号内标识符）/ 项目名（cwd basename）。
+ * **至少 2 个共用键才连边**——单个键重合（如都提到 `README.md`）不构成"同一主题"。
+ */
+export function extractEntityKeys(text: string, projectName?: string | null): readonly string[] {
+  const raw = typeof text === 'string' ? text : ''
+  const keys = new Set<string>()
+  if (raw.length === 0) return []
+  for (const match of raw.matchAll(/[A-Za-z]:\\[^\s"'`）)，,。；;]+/g)) {
+    keys.add(`path:${match[0].replace(/\\/g, '/').toLowerCase()}`)
+  }
+  for (const match of raw.matchAll(/(?:\.{1,2}\/)[\w.@/-]+/g)) {
+    keys.add(`path:${match[0].replace(/^\.\//, '').toLowerCase()}`)
+  }
+  // 裸相对路径（至少两级）：`modules/memory/store.ts` —— 代码讨论里最常见的形态
+  for (const match of raw.matchAll(/(?:^|[\s"'(:：，,])((?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})/g)) {
+    const value = match[1]
+    if (value !== undefined) keys.add(`path:${value.toLowerCase()}`)
+  }
+  for (const match of raw.matchAll(/\b([\w.@-]+\.[A-Za-z0-9]{1,8})\b/g)) {
+    keys.add(`path:${match[1]?.toLowerCase() ?? ''}`)
+  }
+  for (const match of raw.matchAll(
+    /\b((?:pnpm|npm|yarn|npx|node|pytest|tsc|git|make|docker|vitest|go|cargo)\s+[a-z][\w:-]{0,24})/gi,
+  )) {
+    keys.add(`cmd:${(match[1] ?? '').toLowerCase().replace(/\s+/g, ' ')}`)
+  }
+  for (const match of raw.matchAll(/`([^`\n]{2,40})`/g)) {
+    const value = match[1]?.trim().toLowerCase()
+    if (value !== undefined && value.length >= 2) keys.add(`token:${value}`)
+  }
+  if (typeof projectName === 'string' && projectName.length > 0) {
+    const name = projectName.split(/[\\/]/).filter(Boolean).pop() ?? projectName
+    if (name.length >= 2 && raw.toLowerCase().includes(name.toLowerCase())) {
+      keys.add(`project:${name.toLowerCase()}`)
+    }
+  }
+  // **去重"裸文件名"**：完整路径 `path:modules/memory/store.ts` 已包含 `path:store.ts`
+  // 的语义，二者同时计数会让"只共享一个文件"被算成 2 个键（自动连边因此过度触发）。
+  // 只保留完整路径键。
+  const pathKeys = [...keys].filter(key => key.startsWith('path:'))
+  for (const key of pathKeys) {
+    const base = key.split('/').pop() ?? ''
+    const bare = `path:${base}`
+    if (bare !== key && key.includes('/') && keys.has(bare)) keys.delete(bare)
+  }
+  keys.delete('path:')
+  return [...keys].sort()
+}
+
+/** 捕获统计（健康面用；按类分开，避免"捕获 0 条"一个数字掩盖具体原因）。 */
+export interface CaptureStats {
+  preferences: number
+  activity: number
+  outcomes: number
+  skipped: Record<string, number>
+}
+
+export interface CapturePorts extends CaptureFeatureSwitches {
+  readonly clock: Clock
+  /** 解析库。**项目作用域必须返回项目库**；拿不到就报告，绝不回落用户库。 */
+  readonly resolveStore: (scope: MemoryScope, sessionId: string) => Promise<MemoryStore | undefined>
+  /** 该会话的项目身份（规范化 cwd）；用于 `project` 字段与实体键。 */
+  readonly currentProject?: (sessionId: string) => string | undefined
+  /** 隐私闸门（写许可）。缺省视为允许（模块装配层一定给；单测可省）。 */
+  readonly privacyAllowsWrite?: (sessionId: string) => boolean
+  /** 写入成功回调（触发向量落盘与统计）。 */
+  readonly onMemoryWritten?: (payload: {
+    readonly id: string
+    readonly scope: MemoryScope
+    readonly kind: MemoryKind
+  }) => void
+  /** 写入成功后的图自动连边（3.7 Wave 2；缺省不连）。 */
+  readonly onMemoryStored?: (store: MemoryStore, record: MemoryRecord) => Promise<void>
+  readonly logger?: { warn(message: string): void; info?(message: string): void }
+  /** 每会话偏好上限（默认 5）。 */
+  readonly maxPreferences?: number
+  /** 每会话活动上限（默认 10）。 */
+  readonly maxActivity?: number
+  /** 项目库未就绪时的重试等待（默认 250ms；0 = 不重试）。 */
+  readonly projectRetryMs?: number
+}
+
+/** 单会话捕获状态。有界（见 `SESSION_STATE_MAX`）。 */
+interface SessionCaptureState {
+  preferences: number
+  activity: number
+  outcomes: number
+  hashes: Set<string>
+  activityKeys: Set<string>
+  toolCalls: number
+  tools: Map<string, number>
+}
+
+export const SESSION_STATE_MAX = 64
+
+function emptyState(): SessionCaptureState {
+  return {
+    preferences: 0,
+    activity: 0,
+    outcomes: 0,
+    hashes: new Set(),
+    activityKeys: new Set(),
+    toolCalls: 0,
+    tools: new Map(),
+  }
+}
+
+export interface Capture {
+  readonly onUserMessage: (payload: {
+    readonly sessionId: string
+    readonly text: string
+    readonly at: number
+    readonly seq?: number
+  }) => Promise<void>
+  readonly onToolCall: (payload: {
+    readonly sessionId: string
+    readonly tool: string
+    readonly args: string
+    readonly at: number
+    readonly callId?: string
+  }) => Promise<void>
+  readonly onToolResult: (payload: {
+    readonly sessionId: string
+    readonly tool?: string
+    readonly args?: string
+    readonly callId?: string
+    readonly ok?: boolean
+    readonly text: string
+    readonly at: number
+  }) => Promise<void>
+  readonly onTurnEnd: (payload: { readonly sessionId: string; readonly turn: number }) => Promise<void>
+  readonly stats: () => CaptureStats
+  /** 预热会话状态（turn/start）：不清空已捕获的计数——同一会话跨回合。 */
+  readonly warm: (sessionId: string) => void
+}
+
+/**
+ * 造一个捕获器。
+ *
+ * 所有方法**绝不抛**：事件订阅侧是 fire-and-forget，抛出去会变成未处理的 rejection。
+ * 写失败只记日志与 skipped 计数（`store-error`），不重试（重试会放大写风暴；
+ * 冷启动重试只发生在"库尚未打开"这一条上，且只有一次）。
+ */
+export function createCapture(ports: CapturePorts): Capture {
+  const maxPreferences = ports.maxPreferences ?? DEFAULT_MAX_PREFERENCES
+  const maxActivity = ports.maxActivity ?? DEFAULT_MAX_ACTIVITY
+  const retryMs = ports.projectRetryMs ?? DEFAULT_PROJECT_RETRY_MS
+  const states = new Map<string, SessionCaptureState>()
+  const stats: CaptureStats = { preferences: 0, activity: 0, outcomes: 0, skipped: {} }
+
+  const stateOf = (sessionId: string): SessionCaptureState => {
+    const existing = states.get(sessionId)
+    if (existing !== undefined) return existing
+    if (states.size >= SESSION_STATE_MAX) {
+      // 简单的插入序淘汰：捕获状态只服务"当前活跃会话"，越界即最旧
+      const oldest = states.keys().next().value
+      if (oldest !== undefined) states.delete(oldest)
+    }
+    const created = emptyState()
+    states.set(sessionId, created)
+    return created
+  }
+
+  const skip = (reason: string): void => {
+    stats.skipped[reason] = (stats.skipped[reason] ?? 0) + 1
+  }
+
+  const writable = (sessionId: string): boolean => {
+    try {
+      return ports.privacyAllowsWrite?.(sessionId) ?? true
+    } catch {
+      return false
+    }
+  }
+
+  /** 项目库未就绪 → 等一次再取（冷启动竞态）；用户库不重试。 */
+  const resolveStoreOnce = async (scope: MemoryScope, sessionId: string): Promise<MemoryStore | undefined> => {
+    const first = await ports.resolveStore(scope, sessionId)
+    if (first !== undefined || scope !== 'project' || retryMs <= 0) return first
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, retryMs)
+      // 不阻止进程退出（测试/宿主关闭时不被 250ms 挂住）
+      if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref()
+    })
+    return await ports.resolveStore(scope, sessionId)
+  }
+
+  /**
+   * 内容去重：内存集合（快）+ 库内同内容（跨进程）。
+   *
+   * 库内检查用「正文前 60 字符的词法命中 + content_hash 比对」：不引入新端口，
+   * 也只对"同一段文字"生效（近义改写不拦——那是离线整合的活）。
+   */
+  const alreadyStored = async (store: MemoryStore, text: string): Promise<boolean> => {
+    const hash = contentHashOf(text)
+    try {
+      const probe = text.slice(0, 60)
+      const hits = await store.searchLexical({ text: probe, scope: store.scope, limit: 5 })
+      if (hits.length === 0) return false
+      const records = await store.getMany(hits.map(hit => hit.id))
+      return records.some(record => record.contentHash === hash)
+    } catch {
+      return false
+    }
+  }
+
+  const write = async (input: {
+    readonly sessionId: string
+    readonly scope: MemoryScope
+    readonly kind: MemoryKind
+    readonly text: string
+    readonly sourceRef: string
+    readonly assertedBy: 'user' | 'execution' | 'model'
+    readonly dedupeKey: string
+  }): Promise<boolean> => {
+    const state = stateOf(input.sessionId)
+    const hash = contentHashOf(input.text)
+    if (state.hashes.has(hash)) {
+      skip('duplicate')
+      return false
+    }
+    if (!writable(input.sessionId)) {
+      skip('privacy')
+      return false
+    }
+    const store = await resolveStoreOnce(input.scope, input.sessionId)
+    if (store === undefined) {
+      skip(input.scope === 'project' ? 'no-project-store' : 'no-user-store')
+      return false
+    }
+    if (await alreadyStored(store, input.text)) {
+      state.hashes.add(hash)
+      skip('duplicate')
+      return false
+    }
+    const now = ports.clock.now()
+    const record: MemoryRecord = {
+      id: newMemoryId(ports.clock, hash),
+      scope: input.scope,
+      kind: input.kind,
+      text: input.text,
+      contentHash: hash,
+      sourceRef: input.sourceRef,
+      assertedBy: input.assertedBy,
+      observedAt: now,
+      validTo: null,
+      supersededBy: null,
+      lastUsedAt: now,
+      useCount: 0,
+      project: ports.currentProject?.(input.sessionId) ?? null,
+    }
+    try {
+      await store.put(record)
+    } catch (error) {
+      // 隐私闸门在库访问边界也会拒一次；按可读原因归类，不静默
+      const message = error instanceof Error ? error.message : String(error)
+      skip(/隐私|禁止写入|privacy|sealed|read-only/i.test(message) ? 'privacy' : 'store-error')
+      ports.logger?.warn(`OMB 自主捕获：写入失败（${input.scope}/${input.kind}）——${message.slice(0, 120)}`)
+      return false
+    }
+    state.hashes.add(hash)
+    state.activityKeys.add(input.dedupeKey)
+    try {
+      ports.onMemoryWritten?.({ id: record.id, scope: record.scope, kind: record.kind })
+    } catch {
+      // 事件通道失败不改变"已写入"
+    }
+    try {
+      await ports.onMemoryStored?.(store, record)
+    } catch (error) {
+      // 图连边失败不影响"已写入"这个事实（它只是附加索引）
+      ports.logger?.warn(`OMB 自主捕获：自动连边失败（已隔离）——${error instanceof Error ? error.message : String(error)}`)
+    }
+    return true
+  }
+
+  const capturePreference = async (payload: {
+    sessionId: string
+    text: string
+    at: number
+    seq?: number
+  }): Promise<void> => {
+    if (ports.enabledPreferences === false) return
+    const decision = classifyUserMessage(payload.text)
+    if (!decision.ok) {
+      skip(decision.reason)
+      return
+    }
+    const state = stateOf(payload.sessionId)
+    if (state.preferences >= maxPreferences) {
+      skip('cap')
+      return
+    }
+    const sourceRef = `session:${payload.sessionId}#${payload.seq ?? payload.at}`
+    const wrote = await write({
+      sessionId: payload.sessionId,
+      scope: 'user',
+      kind: 'semantic',
+      text: decision.text,
+      sourceRef,
+      assertedBy: 'user',
+      dedupeKey: `pref:${sourceRef}`,
+    })
+    if (wrote) {
+      state.preferences += 1
+      stats.preferences += 1
+    }
+  }
+
+  const captureActivity = async (payload: {
+    sessionId: string
+    tool: string
+    args: string
+    at: number
+    callId?: string
+  }): Promise<void> => {
+    if (ports.enabledActivity === false) return
+    const decision = classifyToolActivity(payload.tool, payload.args)
+    if (!decision.ok) {
+      skip(decision.reason)
+      return
+    }
+    const state = stateOf(payload.sessionId)
+    if (state.activityKeys.has(decision.dedupeKey)) {
+      skip('duplicate')
+      return
+    }
+    if (state.activity >= maxActivity) {
+      skip('cap')
+      return
+    }
+    const sourceRef = `session:${payload.sessionId}#call:${payload.callId ?? payload.at}`
+    const wrote = await write({
+      sessionId: payload.sessionId,
+      scope: 'project',
+      kind: 'episodic',
+      text: decision.text,
+      sourceRef,
+      assertedBy: 'execution',
+      dedupeKey: decision.dedupeKey,
+    })
+    if (wrote) {
+      state.activity += 1
+      stats.activity += 1
+    }
+  }
+
+  return {
+    async onUserMessage(payload) {
+      try {
+        await capturePreference(payload)
+      } catch (error) {
+        ports.logger?.warn(`OMB 自主捕获（偏好）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
+    async onToolCall(payload) {
+      try {
+        const state = stateOf(payload.sessionId)
+        state.toolCalls += 1
+        state.tools.set(payload.tool, (state.tools.get(payload.tool) ?? 0) + 1)
+        await captureActivity(payload)
+      } catch (error) {
+        ports.logger?.warn(`OMB 自主捕获（活动）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
+    async onToolResult(payload) {
+      // 结果事件当前只用于"失败不记"：失败的调用不构成"项目活动已完成"。
+      // 成功判定在调用侧（tool/call）已经足够；这里保留订阅是为了将来按 ok 收窄。
+      if (payload.ok === false) {
+        const state = states.get(payload.sessionId)
+        if (state !== undefined) state.activityKeys.add(`failed:${payload.callId ?? payload.at}`)
+      }
+    },
+    async onTurnEnd(payload) {
+      try {
+        if (ports.enabledOutcome === false) return
+        const state = states.get(payload.sessionId)
+        if (state === undefined) return
+        if (state.outcomes >= 1) return
+        const decision = classifySessionOutcome({
+          toolCalls: state.toolCalls,
+          capturedActivity: state.activity,
+          topTools: [...state.tools.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([tool]) => tool),
+        })
+        if (!decision.ok) return
+        const wrote = await write({
+          sessionId: payload.sessionId,
+          scope: 'project',
+          kind: 'episodic',
+          text: decision.text,
+          sourceRef: `session:${payload.sessionId}#outcome:${payload.turn}`,
+          assertedBy: 'model',
+          dedupeKey: `outcome:${payload.turn}`,
+        })
+        if (wrote) {
+          state.outcomes += 1
+          stats.outcomes += 1
+        }
+      } catch (error) {
+        ports.logger?.warn(`OMB 自主捕获（结局）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
+    stats: () => ({
+      preferences: stats.preferences,
+      activity: stats.activity,
+      outcomes: stats.outcomes,
+      skipped: { ...stats.skipped },
+    }),
+    warm(sessionId) {
+      stateOf(sessionId)
+    },
+  }
+}
+
+/**
+ * 捕获端口里的**开关**（由模块配置映射；放在 ports 上是为了让单测能关）。
+ */
+export interface CaptureFeatureSwitches {
+  readonly enabledPreferences: boolean
+  readonly enabledActivity: boolean
+  readonly enabledOutcome: boolean
+}

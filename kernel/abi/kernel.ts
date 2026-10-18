@@ -33,6 +33,52 @@ export interface ModuleEvents {
     readonly actionHash: string
     readonly evidenceHash: string
     readonly at: number
+    /**
+     * 宿主的工具调用 id（`tool/call.callId` / `tool/result.message.toolCallId`）。
+     *
+     * 为什么加：循环检测原先靠"上一条缺证据就补下一条"把 call 与 result 配对，
+     * 而 DSH 每步平均 1.27 次工具调用、并行调用时顺序不保证——配对会被打乱，
+     * 精度从未被测过。带上宿主自己的 callId 后，配对准确定为事实而非启发式。
+     */
+    readonly callId?: string
+    /** 工具名（仅 tool/call 提供；result 侧由调用台账按 callId 反查）。 */
+    readonly tool?: string
+    /**
+     * 本会话的 surface 代际（成功压缩次数）。压缩会替换会话表面，
+     * 跨代的循环窗口/证据不再可比——消费方应按代际分区。
+     */
+    readonly generation?: number
+  }
+  /**
+   * 观察到一条用户消息（原文）。
+   *
+   * 为什么由 `dsh/` 发出而不是让记忆模块自己订阅宿主：模块层不允许接触宿主
+   * Context（只认内核 ABI），而"自主记忆"必须看到模型不会主动转述的原文。
+   * `seq` 是宿主事件序号，用于 `sourceRef=session:<id>#<seq>` 的精确溯源。
+   */
+  'user/message/observed': {
+    readonly sessionId: string
+    readonly text: string
+    readonly at: number
+    readonly seq?: number
+  }
+  /** 观察到一次工具调用（名称 + 原始参数串）。 */
+  'tool/call/observed': {
+    readonly sessionId: string
+    readonly tool: string
+    readonly args: string
+    readonly at: number
+    readonly callId?: string
+  }
+  /** 观察到一次工具结果（成功/失败 + 文本；供自主记录项目活动）。 */
+  'tool/result/observed': {
+    readonly sessionId: string
+    readonly tool?: string
+    readonly args?: string
+    readonly callId?: string
+    readonly ok?: boolean
+    readonly text: string
+    readonly at: number
   }
   /** 记忆被写入（供画像、审计、回响检测订阅）。 */
   'memory/written': { readonly id: string; readonly scope: string; readonly kind: string }

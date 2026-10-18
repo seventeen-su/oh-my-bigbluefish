@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Chain-of-thought quality",
-    "description": "Core methodology and chain-of-thought quality."
+    "description": "Process cards live in skills (omb-r1…r8); injects only on loop/no-progress signals."
   }
 }

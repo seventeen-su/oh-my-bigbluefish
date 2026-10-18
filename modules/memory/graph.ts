@@ -36,11 +36,12 @@ export const DEFAULT_MAX_NODES = 20
 /** 默认边上限。 */
 export const DEFAULT_MAX_EDGES = 60
 
-/** 边的三种类型的语义（写进工具的 `why`，让模型知道它拿到的是什么）。 */
+/** 边的四种类型的语义（写进工具的 `why`，让模型知道它拿到的是什么）。 */
 export const EDGE_LEGEND: Readonly<Record<EdgeType, string>> = {
   supersedes: '时序更正：指向的记录已被新证据取代（非破坏性，历史仍可回答）',
   conflicts_with: '未裁决的矛盾：两条都保留，不由系统静默选一个',
   derived_from: '派生来源：这条结论是从哪条观察/工件推出来的',
+  related: '自动关联：两条记忆共享 ≥2 个实体键（路径/命令/包名/项目名），是**弱关联**（不是因果、不是取代）',
 }
 
 export interface RelateRequest {
@@ -77,7 +78,7 @@ export function parseRelateArgs(input: unknown): RelateArgsResult {
       return { ok: false, error: 'types 必须是数组，例如 ["supersedes","conflicts_with"]' }
     }
     if (raw.types.length === 0) {
-      return { ok: false, error: 'types 不能是空数组；省略即三种边全要' }
+      return { ok: false, error: 'types 不能是空数组；省略即全部边类型' }
     }
     const picked: EdgeType[] = []
     for (const value of raw.types) {

@@ -2,8 +2,17 @@
  * 度量桥测试。
  *
  * 这一层的存在理由就是"`band` 恒为 relaxed 时没人会发现"，所以每个用例都同时断言
- * **读数**与**原因**：只断言"返回 undefined"会放过"四种成因混成一种"的退化，
- * 而那正是这条线当初断掉却全绿的原因。
+ * **读数**与**原因**：只断言"返回 undefined"会放过"四种成因混成一种"的退化。
+ *
+ * ## v3.7：投影替身必须按**宿主 state** 写，不能按 client wire view 写
+ *
+ * `ctx.sessionProjections.stateOf()` 返回 host state：
+ * - `contextPressure`：`{pressureTokens, surfaceTokens, sampledSurfaceTokens, contextWindow}`
+ *   （`projectedTokens` 只在 wire view 里，由前三个算出来）
+ * - `tokenUsage`：`{totals:{...}, last}`
+ * - `contextBreakdown`：`{systems, surfaceTokens, breakdown:{...}}`
+ *
+ * 旧测试替身照着 wire view 扁平写，于是"读错一层"在测试里永远绿、在真机上永远 0。
  */
 import { describe, expect, it } from 'vitest'
 import { createPressureBridge } from '../../dsh/pressure.js'
@@ -35,15 +44,30 @@ function registry(states: Record<string, unknown>, options: { throwing?: readonl
 
 const SESSION = { id: 's1', header: { cwd: 'D:/p' } }
 
-/** 完整读数：projectedTokens + 窗口 + 缓存 + 构成。 */
+/** 一个可算出 projectedTokens = 1000 + 2000 − 1500 = 1500 的宿主 state。 */
 const FULL = {
-  contextPressure: { pressureTokens: 1000, projectedTokens: 1500, contextWindow: 5000 },
-  tokenUsage: { cacheReadTokens: 400, cacheWriteTokens: 100 },
-  contextBreakdown: { systemTokens: 300, toolsTokens: 200, messageTokens: 900 },
+  contextPressure: { pressureTokens: 1000, surfaceTokens: 2000, sampledSurfaceTokens: 1500, contextWindow: 5000 },
+  tokenUsage: {
+    totals: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 400, cacheWriteTokens: 100 },
+    last: null,
+  },
+  contextBreakdown: {
+    systems: [],
+    surfaceTokens: 1400,
+    breakdown: { systemTokens: 300, toolsTokens: 200, messageTokens: 900 },
+  },
 }
 
+/** 紧凑构造：projected = pressureTokens（surface 与采样相等）。 */
+const cp = (total: number, contextWindow?: number): Record<string, unknown> => ({
+  pressureTokens: total,
+  surfaceTokens: total,
+  sampledSurfaceTokens: total,
+  ...contextWindow === undefined ? {} : { contextWindow },
+})
+
 describe('度量桥：读数', () => {
-  it('完整投影 → fillRatio = projectedTokens / contextWindow，缓存与构成一并带上', () => {
+  it('宿主 state → projected = pressureTokens + surfaceTokens − sampledSurfaceTokens；缓存取 totals；构成取嵌套 breakdown', () => {
     const bridge = createPressureBridge({ ctx: fakeCtx({ sessionProjections: registry(FULL) }) })
     bridge.remember('s1', SESSION)
     const reading = bridge.measure('s1')
@@ -57,7 +81,21 @@ describe('度量桥：读数', () => {
     expect(reading?.nodes.every(n => n.name.includes('估算'))).toBe(true)
   })
 
-  it('优先 projectedTokens：compaction 之后 pressureTokens 仍是旧值，用旧值档位不会回落', () => {
+  it('compaction 之后：pressureTokens 仍是旧值，但 surface 已被遮蔽 → projected 立刻下降', () => {
+    const bridge = createPressureBridge({
+      ctx: fakeCtx({
+        sessionProjections: registry({
+          // 压缩前最后一次 usage：4900；surface 被遮蔽到 500；采样点是压缩前
+          contextPressure: { pressureTokens: 4900, surfaceTokens: 500, sampledSurfaceTokens: 4900, contextWindow: 5000 },
+        }),
+      }),
+    })
+    bridge.remember('s1', SESSION)
+    expect(bridge.measure('s1')?.totalTokens).toBe(500)
+    expect(bridge.measure('s1')?.fillRatio).toBeCloseTo(0.1, 6)
+  })
+
+  it('旧替身/旧宿主的 wire view（projectedTokens）仍可作退路', () => {
     const bridge = createPressureBridge({
       ctx: fakeCtx({
         sessionProjections: registry({
@@ -67,10 +105,9 @@ describe('度量桥：读数', () => {
     })
     bridge.remember('s1', SESSION)
     expect(bridge.measure('s1')?.totalTokens).toBe(500)
-    expect(bridge.measure('s1')?.fillRatio).toBeCloseTo(0.1, 6)
   })
 
-  it('没有 projectedTokens 时退回 pressureTokens（不该因为缺一个字段就整条失效）', () => {
+  it('既没有 host state 三件套、也没有 projectedTokens 时退回 pressureTokens', () => {
     const bridge = createPressureBridge({
       ctx: fakeCtx({ sessionProjections: registry({ contextPressure: { pressureTokens: 2000, contextWindow: 4000 } }) }),
     })
@@ -79,9 +116,21 @@ describe('度量桥：读数', () => {
     expect(bridge.measure('s1')?.fillRatio).toBeCloseTo(0.5, 6)
   })
 
+  it('surface 小于采样点（异常负增量）→ 夹到 0，不给负数', () => {
+    const bridge = createPressureBridge({
+      ctx: fakeCtx({
+        sessionProjections: registry({
+          contextPressure: { pressureTokens: 100, surfaceTokens: 0, sampledSurfaceTokens: 500, contextWindow: 1000 },
+        }),
+      }),
+    })
+    bridge.remember('s1', SESSION)
+    expect(bridge.measure('s1')?.totalTokens).toBe(0)
+  })
+
   it('宿主没声明窗口 → 有总量但比例是 null，且原因是"没声明窗口"而不是别的', () => {
     const bridge = createPressureBridge({
-      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: { projectedTokens: 1234 } }) }),
+      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: cp(1234) }) }),
     })
     bridge.remember('s1', SESSION)
     const reading = bridge.measure('s1')
@@ -92,7 +141,7 @@ describe('度量桥：读数', () => {
 
   it('比例可以超过 1：溢出是真实发生过的事，夹到 1 等于粉饰', () => {
     const bridge = createPressureBridge({
-      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: { projectedTokens: 9000, contextWindow: 6000 } }) }),
+      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: cp(9000, 6000) }) }),
     })
     bridge.remember('s1', SESSION)
     expect(bridge.measure('s1')?.fillRatio).toBeCloseTo(1.5, 6)
@@ -100,7 +149,16 @@ describe('度量桥：读数', () => {
 
   it('NaN / Infinity 一律当"没有"，不冒充 0 也不冒充大数', () => {
     const bridge = createPressureBridge({
-      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: { projectedTokens: Number.NaN, pressureTokens: Number.POSITIVE_INFINITY } }) }),
+      ctx: fakeCtx({
+        sessionProjections: registry({
+          contextPressure: {
+            projectedTokens: Number.NaN,
+            pressureTokens: Number.POSITIVE_INFINITY,
+            surfaceTokens: Number.POSITIVE_INFINITY,
+            sampledSurfaceTokens: Number.POSITIVE_INFINITY,
+          },
+        }),
+      }),
     })
     bridge.remember('s1', SESSION)
     expect(bridge.measure('s1')).toBeUndefined()
@@ -109,13 +167,27 @@ describe('度量桥：读数', () => {
 
   it('缺 tokenUsage / contextBreakdown 不影响主读数，缓存记 0、节点为空', () => {
     const bridge = createPressureBridge({
-      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: { projectedTokens: 10, contextWindow: 100 } }) }),
+      ctx: fakeCtx({ sessionProjections: registry({ contextPressure: cp(10, 100) }) }),
     })
     bridge.remember('s1', SESSION)
     const reading = bridge.measure('s1')
     expect(reading?.cacheReadTokens).toBe(0)
     expect(reading?.cacheWriteTokens).toBe(0)
     expect(reading?.nodes).toEqual([])
+  })
+
+  it('tokenUsage 是老式扁平形状时仍可读（向后兼容，不是主路径）', () => {
+    const bridge = createPressureBridge({
+      ctx: fakeCtx({
+        sessionProjections: registry({
+          contextPressure: cp(10, 100),
+          tokenUsage: { cacheReadTokens: 7, cacheWriteTokens: 3 },
+        }),
+      }),
+    })
+    bridge.remember('s1', SESSION)
+    expect(bridge.measure('s1')?.cacheReadTokens).toBe(7)
+    expect(bridge.measure('s1')?.cacheWriteTokens).toBe(3)
   })
 })
 
@@ -221,12 +293,9 @@ describe('度量桥接到内核：档位真的被驱动', () => {
   }
 
   it('低占用 → relaxed；中占用 → moderate；高占用 → tight（阈值来自内核那一份）', () => {
-    expect(kernelWith({ contextPressure: { projectedTokens: 100, contextWindow: 1000 } }).handle.kernel.pressure('s1').band)
-      .toBe('relaxed')
-    expect(kernelWith({ contextPressure: { projectedTokens: 400, contextWindow: 1000 } }).handle.kernel.pressure('s1').band)
-      .toBe('moderate')
-    expect(kernelWith({ contextPressure: { projectedTokens: 800, contextWindow: 1000 } }).handle.kernel.pressure('s1').band)
-      .toBe('tight')
+    expect(kernelWith({ contextPressure: cp(100, 1000) }).handle.kernel.pressure('s1').band).toBe('relaxed')
+    expect(kernelWith({ contextPressure: cp(400, 1000) }).handle.kernel.pressure('s1').band).toBe('moderate')
+    expect(kernelWith({ contextPressure: cp(800, 1000) }).handle.kernel.pressure('s1').band).toBe('tight')
   })
 
   it('量不到时回落到 UNKNOWN_PRESSURE，而不是把 0 当成"上下文是空的"', () => {

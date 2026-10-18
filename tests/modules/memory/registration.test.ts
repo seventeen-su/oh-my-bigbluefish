@@ -159,9 +159,18 @@ describe('omb-memory 配置', () => {
     expect(memoryConfigSchema.parse(null)).toEqual(MEMORY_CONFIG_DEFAULTS)
     expect(memoryConfigSchema.parse({})).toEqual(MEMORY_CONFIG_DEFAULTS)
     // 3.6：隐私闸门并入记忆库，配置多了一个 `privacy` 子块（原 `omb-privacy` 行的 config 块）
+    // 3.7：新增两个**回滚开关**（`residentHint`/`recallDetail`），缺省即新行为
     expect(MEMORY_CONFIG_DEFAULTS).toEqual({
       consolidationEveryTurns: 32,
       embeddingThreads: 2,
+      residentHint: true,
+      recallDetail: 'snippet',
+      autoCapturePreferences: true,
+      autoCaptureActivity: true,
+      autoCaptureOutcome: true,
+      autoLinkRelated: true,
+      relatedExpansion: true,
+      coldStartRetryMs: 250,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -170,13 +179,36 @@ describe('omb-memory 配置', () => {
     expect(memoryConfigSchema.parse({ consolidationEveryTurns: 8 })).toEqual({
       consolidationEveryTurns: 8,
       embeddingThreads: 2,
+      residentHint: true,
+      recallDetail: 'snippet',
+      autoCapturePreferences: true,
+      autoCaptureActivity: true,
+      autoCaptureOutcome: true,
+      autoLinkRelated: true,
+      relatedExpansion: true,
+      coldStartRetryMs: 250,
       privacy: { failClosedMode: 'sealed', path: null },
     })
     expect(memoryConfigSchema.parse({ embeddingThreads: 4 })).toEqual({
       consolidationEveryTurns: 32,
       embeddingThreads: 4,
+      residentHint: true,
+      recallDetail: 'snippet',
+      autoCapturePreferences: true,
+      autoCaptureActivity: true,
+      autoCaptureOutcome: true,
+      autoLinkRelated: true,
+      relatedExpansion: true,
+      coldStartRetryMs: 250,
       privacy: { failClosedMode: 'sealed', path: null },
     })
+  })
+
+  it('3.7 回滚开关：residentHint 关掉即回到"无提示"；recallDetail 可切回 full', () => {
+    expect(memoryConfigSchema.parse({ residentHint: false }).residentHint).toBe(false)
+    expect(memoryConfigSchema.parse({ recallDetail: 'full' }).recallDetail).toBe('full')
+    expect(() => memoryConfigSchema.parse({ recallDetail: 'verbose' })).toThrow()
+    expect(() => memoryConfigSchema.parse({ residentHint: 'yes' })).toThrow()
   })
 
   it('非法配置被拒（路径可读）', () => {
@@ -195,6 +227,14 @@ describe('omb-memory 配置', () => {
     expect(readMemoryConfig(kernel)).toEqual({
       consolidationEveryTurns: 32,
       embeddingThreads: 4,
+      residentHint: true,
+      recallDetail: 'snippet',
+      autoCapturePreferences: true,
+      autoCaptureActivity: true,
+      autoCaptureOutcome: true,
+      autoLinkRelated: true,
+      relatedExpansion: true,
+      coldStartRetryMs: 250,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -304,7 +344,7 @@ describe('omb-memory 与真实内核', () => {
     // 库路径/项目库数/schema/迁移由**唯一报数处**给出：存储服务自己的 status()
     const storeStatus = service?.status()
     expect(storeStatus?.detail).toContain('knowledge.db')
-    expect(storeStatus?.detail).toContain('迁移 v0→v2')
+    expect(storeStatus?.detail).toContain('迁移 v0→v3')
     expect(storeStatus?.openProjects).toEqual([projectIdentity(ws.dir)])
     expect(storeStatus?.maxOpenProjects).toBe(16)
     expect(storeStatus?.detail).not.toMatch(/已打开项目库|会话→cwd/)
@@ -314,7 +354,7 @@ describe('omb-memory 与真实内核', () => {
     expect(health.metrics?.['openProjects']).toBe(1)
     // 结构实际版本 = 步骤表最高版本（2）；ABI 的 `SCHEMA_VERSION` 此刻仍是 1（kernel/** 由另一个
     // agent 在改，本轮不许碰），所以这里断言的是**库的**版本，不是那个常量。
-    expect(health.metrics?.['schemaVersion']).toBe(2)
+    expect(health.metrics?.['schemaVersion']).toBe(3)
 
     // 关闭后库确实关了：旧句柄报错而不是继续读写
     handle.dispose()
@@ -365,7 +405,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     return handle.kernel.service<readonly ToolDefinition[]>(toolsServiceFor('omb-memory'))
   }
 
-  it('apply 内同步提供三个工具（recall/forget/relate），与目录声明一致', () => {
+  it('apply 内同步提供五个工具（recall/forget/relate/remember/project），与目录声明一致', () => {
     const ws = tempWorkspace()
     const handle = createKernel({ logger: capturingLogger(), clock: fixedClock() })
     const registration = createMemoryRegistration({ storageHost: testPort(ws.dir) })
@@ -374,6 +414,7 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     const tools = toolsOf(handle)
     expect(tools?.map(tool => tool.name).sort()).toEqual([
       'omb_forget',
+      'omb_project',
       'omb_recall',
       'omb_relate',
       'omb_remember',
@@ -542,9 +583,15 @@ describe('omb-memory 工具面（tools:omb-memory）', () => {
     handle.start([kernelRow, registration])
 
     const tools = toolsOf(handle)
-    expect(tools).toHaveLength(4)
+    expect(tools).toHaveLength(5)
     for (const tool of tools ?? []) {
       const outcome = await tool.execute({ query: '任意', id: '任意', ids: ['任意'] }, sessionCall('s1'))
+      // 3.7 Wave 2：`omb_project` 是只读降级工具（画像服务缺席时仍返回 text）——
+      // 所以 H-3 的判据是"绝不抛 + 给出可读结果"，不是"每个工具都必须 error"。
+      if (tool.name === 'omb_project') {
+        expect(outcome.kind).toBe('text')
+        continue
+      }
       expect(outcome.kind).toBe('error')
     }
 

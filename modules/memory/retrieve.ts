@@ -33,6 +33,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
 import { asOverturnedProbe, type OverturnedHit } from './overturned.js'
+import { RELATED_EDGE } from './link.js'
 
 /** RRF 常数 k 的惯例默认值。⚠️ 这是惯例，不是最优值——规划 §5.4 明确标注，故暴露为配置项。 */
 export const DEFAULT_RRF_K = 60
@@ -53,6 +54,57 @@ export const RERANK_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000
  * 只有 id 列表会被截到这么多条（给 id 是为了让后续会话能追到那条历史痕迹）。
  */
 export const MAX_REPORTED_SUPERSEDED = 5
+
+/**
+ * 词法通道的**后置分数下限**（3.7-M3）。
+ *
+ * ## 为什么需要它
+ *
+ * 中文按 bigram、用 OR 连接（`text.ts:67-90`）——任何共享两个字的记录都进候选，
+ * 而词法通道**没有下限**（下限此前只给了向量通道）。实测 43 次有命中的召回里，
+ * 首条命中 32/43 集中在 9 条记录上（"今天感觉还不错…"7 次），主题错配过半。
+ *
+ * ## 阈值怎么来的（不拍脑袋）
+ *
+ * 用 52 条**真实历史召回查询**（会话日志 `tool/call.arguments.query`）对当前 10 个库
+ * 只读重放，取每条查询 top-10 命中的 `-bm25` 分数（539 条命中）：
+ * - 全部命中：p25=0.72、p50=1.39、p75=2.17、p90=3.41；
+ * - 每条查询的 top-1：p10/p25≈2.22、p50=3.30。
+ *
+ * 取 **0.5**：保留 77.7% 的命中、且 **98% 的查询仍保住它的 top-1**——
+ * 掉的是"只沾到一个高频 bigram"的低分噪声，不是相关命中。
+ * 库变大后该值应按同一方法重标（口径：真实查询 + top-10 分数分布）。
+ *
+ * 设为 `0` 可关闭（回归对照用）。
+ */
+export const DEFAULT_LEXICAL_SCORE_FLOOR = 0.5
+
+/**
+ * 相对下限系数：`threshold = min(topScore × 本系数, 绝对下限)`。
+ *
+ * 为什么不能只用绝对下限：小库（1–3 条）的 FTS5 bm25 绝对值只有 ~1e-6，
+ * 绝对下限 0.5 会把**唯一命中**也过滤掉（实测：新装用户写第一条后就再也搜不到）。
+ * 取 `min(相对, 绝对)` 后：小库自动按"与 top 同量级"放行，大库退回标定的 0.5。
+ */
+export const LEXICAL_FLOOR_RELATIVE = 0.5
+
+/**
+ * 短结论优先的长度惩罚参数（3.7-M3，实现在 `store.searchLexical` 的 SQL 里）。
+ *
+ * 分数乘以 `(SHORT + GUARD) / (SHORT + GUARD + max(0, LENGTH(text) - SHORT))`：
+ * ≤300 字符不加权；700 字符 ≈ ×0.50；1100 字符 ≈ ×0.36。
+ *
+ * 依据：实测用户库 avg 484 字符、项目库 avg 706 字符，而"结论/偏好"应是
+ * 几十到两百字符的短句；长回顾靠"提到的 bigram 多"系统性占据首位（M7）。
+ * 这只是**偏好**（不是硬阈值）：真正相关且长的条目仍能靠更高的 bm25 留在前面。
+ */
+export const SHORT_ENTRY_CHARS = 300
+export const SHORT_ENTRY_GUARD_CHARS = 100
+
+/** 1-hop 关联扩展：从 top 3 出发、最多补 3 条、分数打 5 折（弱于任何直接命中）。 */
+export const RELATED_PARENTS = 3
+export const RELATED_LIMIT = 3
+export const RELATED_PENALTY = 0.5
 
 const ASSERTED_WEIGHT: Readonly<Record<AssertedBy, number>> = { user: 1, execution: 0.7, model: 0.3 }
 
@@ -121,6 +173,19 @@ export interface RetrieveQuery {
   readonly pressureBand?: PressureBand
   /** tight 压力下是否跳过检索（默认 true）；`mode: 'always'` 时忽略。 */
   readonly skipOnTightPressure?: boolean
+  /**
+   * 词法通道的**后置分数下限**（3.7-M3，默认 `DEFAULT_LEXICAL_SCORE_FLOOR`）。
+   *
+   * 只作用于 `lexical` 通道；向量通道的余弦下限由通道自身标定。
+   * 显式给 `0` = 关闭过滤（回归对照）。单位是 `-bm25`（越大越相关）。
+   */
+  readonly lexicalFloor?: number
+  /**
+   * 1-hop 关联扩展（3.7 Wave 2）：从 top 3 命中沿 `related` 边扩展，
+   * 最多补 `RELATED_LIMIT` 条，分数 = 父条目 × `RELATED_PENALTY`（**弱于任何直接命中**）。
+   * 缺省关闭（回归对照）；生产由 `omb_recall` 按配置打开。
+   */
+  readonly expandRelated?: boolean
 }
 
 export type GateReason = 'ok' | 'empty-query' | 'explicit-never' | 'no-stores' | 'no-kinds' | 'pressure-tight'
@@ -132,10 +197,11 @@ export interface GateDecision {
   readonly detail: string
 }
 
-/** 通道内的一位（rank 从 1 起）。 */
+/** 通道内的一位（rank 从 1 起）。`score` 是该通道的**原始分**（仅用于展示相关度信号，不参与融合）。 */
 export interface RankedHit {
   readonly id: string
   readonly rank: number
+  readonly score?: number
 }
 
 /** 某一库某一通道的排名表。顺序即相关度降序（**原始分不参与跨通道计算**）。 */
@@ -149,6 +215,8 @@ export interface ChannelMatch {
   readonly channel: ChannelName
   readonly scope: MemoryScope
   readonly rank: number
+  /** 该通道命中的原始分（词法 = 长度偏好后的 `-bm25`；向量 = 余弦）。**不参与融合**。 */
+  readonly rawScore?: number
 }
 
 export interface FusedCandidate {
@@ -174,8 +242,19 @@ export interface RetrievedItem {
   readonly project: string | null
   readonly validTo: number | null
   readonly supersededBy: string | null
-  /** RRF 分（同 `FusedCandidate.score`）。 */
+  /** RRF 分（同 `FusedCandidate.score`）。**只用于排序**，不是相关度——展示时不得标成 score。 */
   readonly score: number
+  /**
+   * 各通道的**原始相关度信号**（3.7 Wave 2，审计 P3）。
+   *
+   * 为什么必须单独给：RRF 分只有 `1/(k+rank)` 两种取值（1 通道 vs 2 通道），
+   * 拿它当"相关度"展示等于告诉模型"这条有多相关"而实际只说"它由几个通道命中"。
+   * 信号是**可解释的原始量**：词法 `-bm25`（越大越相关）、向量余弦（0~1）。
+   */
+  readonly signals: {
+    readonly lexical?: number
+    readonly vector?: number
+  }
   readonly channels: readonly ChannelName[]
   readonly ranks: readonly ChannelMatch[]
 }
@@ -218,6 +297,12 @@ export interface RetrieveStats {
   }[]
   readonly rrfK: number
   readonly reranked: boolean
+  /** 本次生效的词法分数下限（0 = 未过滤）。 */
+  readonly lexicalFloor: number
+  /** 因低于词法下限而被丢掉的命中数（不是"没查到"，是"查到了但不达标"）。 */
+  readonly lexicalFloorDropped: number
+  /** 本次通过 1-hop `related` 扩展补进来的条目数（P2 验收读数）。 */
+  readonly relatedExpanded: number
 }
 
 export interface RetrieveResult {
@@ -336,14 +421,14 @@ function pad(value: number, width: number): string {
   return String(value).padStart(width, '0')
 }
 
-/** 去重（保留首次出现）并赋 1 起的排名。通道原始分在此被**丢弃**。 */
+/** 去重（保留首次出现）并赋 1 起的排名。通道原始分**只保留在 `score` 字段**，不参与融合。 */
 export function rankHits(hits: readonly ScoredHit[]): readonly RankedHit[] {
   const seen = new Set<string>()
   const out: RankedHit[] = []
   for (const hit of hits) {
     if (seen.has(hit.id)) continue
     seen.add(hit.id)
-    out.push({ id: hit.id, rank: out.length + 1 })
+    out.push({ id: hit.id, rank: out.length + 1, score: hit.score })
   }
   return out
 }
@@ -371,7 +456,12 @@ export function fuseByRank(rankings: readonly ChannelRanking[], k: number): read
         acc.set(hit.id, entry)
       }
       entry.score += 1 / (effectiveK + hit.rank)
-      entry.matches.push({ channel: ranking.channel, scope: ranking.scope, rank: hit.rank })
+      entry.matches.push({
+        channel: ranking.channel,
+        scope: ranking.scope,
+        rank: hit.rank,
+        ...(hit.score !== undefined ? { rawScore: hit.score } : {}),
+      })
     }
   }
   const out: FusedCandidate[] = []
@@ -547,6 +637,11 @@ export async function retrieve(
   const poolLimit = normalizePositive(query.poolLimit, maxCandidates)
   const ordered = orderStores(stores)
   const channels = ports.channels ?? []
+  /** 词法下限：缺省用标定常量；显式 0/非法值 = 关闭（回归对照）。 */
+  const lexicalFloor = query.lexicalFloor === undefined
+    ? DEFAULT_LEXICAL_SCORE_FLOOR
+    : (Number.isFinite(query.lexicalFloor) && query.lexicalFloor > 0 ? query.lexicalFloor : 0)
+  let lexicalFloorDropped = 0
 
   // 查询向量只算一次；算不出就退化为纯词法（诚实降级，不抛）。
   const channelsUsable = channels.length > 0
@@ -578,7 +673,14 @@ export async function retrieve(
         `库 ${tagged.scope} 词法通道失败`,
       )
       if (lexical !== null && lexical.length > 0) {
-        rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(lexical) })
+        // 3.7-M3：低于下限的命中**不进排名**——但计数要可见（"查到了但不达标"
+        // 与"根本没查到"在诊断上是两件事）。
+        // 阈值取 `min(top × LEXICAL_FLOOR_RELATIVE, 绝对下限)`：小库不误杀（见常量注释）。
+        const kept = lexicalFloor > 0 ? filterByScoreFloor(lexical, lexicalFloor) : lexical
+        lexicalFloorDropped += lexical.length - kept.length
+        if (kept.length > 0) {
+          rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(kept) })
+        }
       }
       for (const channel of channels) {
         const hits = await safeSearch(
@@ -668,7 +770,13 @@ export async function retrieve(
   const selected = new Set(selection.map(s => s.id))
   const chosen = reranked.filter(h => selected.has(h.candidate.id))
 
-  const items = chosen.map((h, rank) => toItem(h, rank))
+  const baseItems = chosen.map((h, rank) => toItem(h, rank))
+  // 3.7 Wave 2 / P2：1-hop `related` 扩展。只在显式请求时发生（生产由 recall 打开），
+  // 扩展条目**弱于任何直接命中**（分数 × RELATED_PENALTY），因此不会挤掉主结果。
+  const expansion = query.expandRelated === true && chosen.length > 0
+    ? await expandRelatedItems(ordered, chosen, degraded)
+    : { items: [] as RetrievedItem[], expanded: 0 }
+  const items = [...baseItems, ...expansion.items.map((item, index) => ({ ...item, rank: baseItems.length + index }))]
   return {
     items,
     gate,
@@ -690,6 +798,9 @@ export async function retrieve(
       })),
       rrfK: k,
       reranked: rerankRequested,
+      lexicalFloor,
+      lexicalFloorDropped,
+      relatedExpanded: expansion.expanded,
     },
     now: now ?? null,
     note: buildNote(ordered.length, rankings.length, items.length, supersededSkipped),
@@ -697,6 +808,22 @@ export async function retrieve(
 }
 
 // ---------- 内部工具 ----------
+
+/**
+ * 词法下限过滤：`score >= min(top × RELATIVE, 绝对下限)`。
+ *
+ * 纯函数、确定性；`top` 是**本库本通道**的最高分（不跨库比较——不同库的 bm25 量纲
+ * 本来就不可比，融合只按排名）。
+ */
+function filterByScoreFloor(
+  hits: readonly ScoredHit[],
+  absoluteFloor: number,
+): readonly ScoredHit[] {
+  let top = 0
+  for (const hit of hits) if (Number.isFinite(hit.score) && hit.score > top) top = hit.score
+  const threshold = Math.min(top * LEXICAL_FLOOR_RELATIVE, absoluteFloor)
+  return hits.filter(hit => Number.isFinite(hit.score) && hit.score >= threshold)
+}
 
 interface StoreSearch {
   readonly tagged: TaggedStore
@@ -722,6 +849,9 @@ function emptyStats(k: number): RetrieveStats {
     perStore: [],
     rrfK: k,
     reranked: false,
+    lexicalFloor: DEFAULT_LEXICAL_SCORE_FLOOR,
+    lexicalFloorDropped: 0,
+    relatedExpanded: 0,
   }
 }
 
@@ -818,7 +948,17 @@ async function probeOverturned(
   return hits
 }
 
-function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {  const { candidate, record } = hydrated
+function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
+  const { candidate, record } = hydrated
+  const signals: { lexical?: number; vector?: number } = {}
+  for (const match of candidate.matches) {
+    if (match.rawScore === undefined) continue
+    if (match.channel === 'lexical') {
+      signals.lexical = Math.max(signals.lexical ?? Number.NEGATIVE_INFINITY, match.rawScore)
+    } else if (match.channel === 'vector') {
+      signals.vector = Math.max(signals.vector ?? Number.NEGATIVE_INFINITY, match.rawScore)
+    }
+  }
   return {
     rank,
     id: record.id,
@@ -834,6 +974,7 @@ function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {  con
     score: candidate.score,
     channels: candidate.channels,
     ranks: candidate.matches,
+    signals,
   }
 }
 
@@ -849,9 +990,75 @@ function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {  con
     .map(entry => entry.store)
 }
 
-/** 每作用域一次批量水合；单库失败只降级不抛。 */
-async function hydrate(
+/**
+ * 1-hop `related` 扩展（3.7 Wave 2 / P2）。
+ *
+ * 从 top 3 命中出发，沿自动连边看"同一批文件/同一条命令"的邻居：
+ * - 只补**直接命中之外**的条目，最多 `RELATED_LIMIT` 条；
+ * - 分数 = 父条目 RRF × `RELATED_PENALTY`（弱于任何直接命中，排序不会倒挂）；
+ * - 排除已失效/保留来源；单库失败只记降级、不抛。
+ */
+async function expandRelatedItems(
   ordered: readonly TaggedStore[],
+  chosen: readonly HydratedCandidate[],
+  degraded: string[],
+): Promise<{ items: RetrievedItem[]; expanded: number }> {
+  const parents = chosen.slice(0, RELATED_PARENTS)
+  const picked = new Set(chosen.map(entry => entry.candidate.id))
+  const items: RetrievedItem[] = []
+  for (const parent of parents) {
+    if (items.length >= RELATED_LIMIT) break
+    const tagged = ordered.find(store => store.scope === primaryScope(parent.candidate))
+    if (tagged === undefined) continue
+    let walk
+    try {
+      walk = await tagged.store.walkGraph({
+        fromId: parent.candidate.id,
+        depth: 1,
+        types: [RELATED_EDGE],
+      })
+    } catch (error) {
+      degraded.push(`库 ${tagged.scope} 的 1-hop 关联扩展失败（已隔离）：${messageOf(error)}`)
+      continue
+    }
+    const ids = [...new Set(walk.edges.flatMap(edge => [edge.fromId, edge.toId]))].filter(id => !picked.has(id))
+    if (ids.length === 0) continue
+    let records: readonly MemoryRecord[]
+    try {
+      records = await tagged.store.getMany(ids.slice(0, RELATED_LIMIT * 3))
+    } catch {
+      continue
+    }
+    for (const record of records) {
+      if (items.length >= RELATED_LIMIT) break
+      if (picked.has(record.id)) continue
+      if (record.validTo !== null || record.supersededBy !== null) continue
+      if (isReservedSource(record.sourceRef)) continue
+      picked.add(record.id)
+      items.push({
+        rank: 0,
+        id: record.id,
+        text: record.text,
+        sourceRef: record.sourceRef,
+        observedAt: record.observedAt,
+        scope: record.scope,
+        kind: record.kind,
+        assertedBy: record.assertedBy,
+        project: record.project,
+        validTo: record.validTo,
+        supersededBy: record.supersededBy,
+        score: parent.candidate.score * RELATED_PENALTY,
+        channels: ['graph'],
+        ranks: [{ channel: 'graph', scope: record.scope, rank: 1 }],
+        signals: {},
+      })
+    }
+  }
+  return { items, expanded: items.length }
+}
+
+/** 每作用域一次批量水合；单库失败只降级不抛。 */
+async function hydrate(  ordered: readonly TaggedStore[],
   candidates: readonly FusedCandidate[],
   degraded: string[],
 ): Promise<readonly HydratedCandidate[]> {

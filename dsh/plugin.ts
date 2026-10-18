@@ -48,6 +48,9 @@ import {
 import type { SessionWiringOptions } from './session.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { createPressureBridge } from './pressure.js'
+import { createProjectProfile } from './project-profile.js'
+import { registerDepthCommand } from './depth-command.js'
+import { wireReasoningEffort } from './reasoning-effort.js'
 import { wireArtifactIndex } from './hooks.js'
 import { buildStatusTool } from './status-tool.js'
 import { loadModulesSync } from './modules.js'
@@ -137,6 +140,14 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     })
   } catch (error) {
     logger.warn(`OMB：压力读数说明注册失败——${String(error)}（状态面将只说"未测量"，不说是哪种）`)
+  }
+  // ── 项目画像：工作区级理解的唯一构建点 ────────────────────────────────
+  // 只在 `omb_project` 调用时构建/读缓存；不参与每轮提示，不改变缓存前缀。
+  const projectProfile = createProjectProfile({ clock })
+  try {
+    handle.kernel.provide(SERVICES.projectProfile, projectProfile.port)
+  } catch (error) {
+    logger.warn(`OMB：项目画像服务注册失败——${String(error)}（omb_project 将只给记忆、无画像）`)
   }
   try {
     handle.kernel.provide(STORAGE_HOST_SERVICE, storageHost.port)
@@ -304,6 +315,15 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   //    会话 → cwd 由这里写进内核登记处（唯一存放处）；不再另存一份。
   const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, onHostSession: pressure.remember })
   /**
+   * 用户命令 + 真实 effort 映射。
+   *
+   * 两者必须一起装：命令只写内核 focus 表，映射器在根 `agent/request` 瀑布上
+   * 把显式档位落到请求头；**同步注册顺序决定映射器在外层**（晚注册会被
+   * agent 作用域的 model-selection 覆盖，症状是"设了 quick 但请求头仍是 max"）。
+   */
+  const disposeDepth = registerDepthCommand({ ctx, kernel: handle.kernel, logger })
+  const disposeEffort = wireReasoningEffort({ ctx, kernel: handle.kernel })
+  /**
    * 制品索引的**生产者**。
    *
    * 这条接线曾经不存在（`dsh/hooks.ts` 只是个被注释提及的文件名）：
@@ -346,6 +366,9 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     disposed = true
     const steps: readonly (() => void)[] = [
       disposeEvents,
+      disposeEffort,
+      disposeDepth,
+      () => projectProfile.dispose(),
       disposeArtifactIndex,
       disposeToolResync,
       disposePrompt,

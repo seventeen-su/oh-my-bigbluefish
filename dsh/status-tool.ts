@@ -18,6 +18,8 @@ import type {
   StoresService,
 } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
+import type { SessionWitnessPort } from './session.js'
+import type { EffortControlPort } from './reasoning-effort.js'
 import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
@@ -312,15 +314,36 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     lines.push(`- 压力档位：${pressure.band}${unmeasured ? '（**按宽松档处理**：没有度量，故不施压）' : ''}`)
     lines.push(`- 窗口占用：${ratio}${why === undefined ? '' : ` —— ${why}`}`)
     lines.push(`- 总 token：${pressure.totalTokens}${unmeasured ? '（未测量，不是 0）' : ''}`)
+    const cacheTotal = pressure.cacheReadTokens + pressure.cacheWriteTokens
     lines.push(
       `- 缓存：读 ${pressure.cacheReadTokens} / 写 ${pressure.cacheWriteTokens}`
-      + `${pressure.cacheReadTokens === 0 && pressure.cacheWriteTokens === 0 ? '（未测量，不是 0）' : ''}`,
+      + `${cacheTotal === 0
+        ? '（未测量，不是 0）'
+        : `（命中率 ${(pressure.cacheReadTokens / cacheTotal * 100).toFixed(1)}%）`}`,
     )
+    // 压缩账单：状态面此前完全看不到"上下文为什么突然变短"。
+    // 数据来自 dsh/ 亲眼看过的 `compaction/summary` 事件，不推断、不补算。
+    const witness = kernel.service<SessionWitnessPort>(SERVICES.sessionWitness)
+    const compaction = witness?.compactionStats(activeSession)
+    if (compaction !== undefined && compaction.count > 0) {
+      const masked = compaction.lastShadowedTokens === null ? '未知' : `${compaction.lastShadowedTokens}`
+      const summaryChars = compaction.lastSummaryChars === null ? '未知' : `${compaction.lastSummaryChars} 字符`
+      lines.push(`- 压缩：本会话 ${compaction.count} 次；最近遮蔽 ${masked} token、摘要 ${summaryChars}`)
+    }
     if (pressure.nodes.length > 0) {
       const top = [...pressure.nodes].sort((a, b) => b.tokens - a.tokens).slice(0, 5)
       lines.push(`- 最贵的 ${top.length} 块：${top.map(n => `${n.name}(${n.tokens})`).join('、')}`)
     }
-    lines.push(`- 推理深度档位：${kernel.focus(activeSession)}`, '')
+    lines.push(`- 推理深度档位：${kernel.focus(activeSession)}（用户命令 /omb-depth 设置）`)
+    const effort = kernel.service<EffortControlPort>(SERVICES.effortControl)?.last(activeSession)
+    if (effort !== undefined) {
+      lines.push(
+        effort.effort === null
+          ? `- 真实推理预算：未改写（${effort.reason ?? '未生效'}；档位 ${effort.depth}）`
+          : `- 真实推理预算：reasoningEffort=${effort.effort}（档位 ${effort.depth}；已落请求头）`,
+      )
+    }
+    lines.push('')
     // 兜底会话必须**自报口径**：它给出的读数不属于"这次是谁在问"，
     // 不标注就会让一个精确数字冒充当前事实（硬不变量：没有静默失效）。
     if (sessionFallback) {
