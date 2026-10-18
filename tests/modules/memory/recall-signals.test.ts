@@ -53,6 +53,7 @@ function resultOf(items: readonly RetrieveResult['items'][number][]): RetrieveRe
       rrfK: 60,
       reranked: false,
       lexicalFloor: 0.5,
+      lexicalFloorMode: 'fixed',
       lexicalFloorDropped: 0,
       relatedExpanded: 0,
     },
@@ -100,7 +101,7 @@ describe('召回相关度信号（3.7 Wave 2 / P3）', () => {
       name: 'vector' as const,
       search: () => Promise.resolve([{ id: 'a', score: 0.71, channel: 'vector' as const }]),
     }
-    const result = await retrieve([tagged(store)], { text: '端口', limit: 2 }, { clock: CLOCK, channels: [vector] })
+    const result = await retrieve([tagged(store)], { text: '端口', limit: 2, lexicalFloor: 0 }, { clock: CLOCK, channels: [vector] })
     const a = result.items.find(entry => entry.id === 'a')
     const b = result.items.find(entry => entry.id === 'b')
     expect(a?.signals.lexical).toBe(3.4)

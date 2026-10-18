@@ -178,7 +178,7 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
 /**
  * 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。
  *
- * **当前最高版本 3，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 3）一致。**
+ * **当前最高版本 4，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 4）一致。**
  * 这条一致性是**有自检的**：`migrate()` 在缺省步骤表下会比对"表最高版本 vs `SCHEMA_VERSION`"，
  * 不一致就抛"契约漂移"。而打开库的一方（`store.ts` 的 `openMemoryStore`）**不传步骤表**，
  * 正是为了让这条自检继续跑——所以**不许**再靠"显式传表"绕过它：
@@ -192,6 +192,7 @@ export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 1, name: 'initial-schema', up: applySchemaV1 },
   { version: 2, name: 'embedding-content-hash', up: applySchemaV2 },
   { version: 3, name: 'edge-related', up: applySchemaV3 },
+  { version: 4, name: 'utility-and-feedback', up: applySchemaV4 },
 ]
 
 
@@ -371,5 +372,62 @@ function applySchemaV3(db: SqliteLike): void {
     ALTER TABLE edge_v3 RENAME TO edge;
 
     CREATE INDEX edge_to_type ON edge(to_id, type);
+  `)
+}
+
+/**
+ * v4：**效用账本 + 显式反馈审计 + 自适应阈值状态**（3.7 Wave 2 / R9 C1+C3）。
+ *
+ * ## 为什么是"纯加法、不碰 memory 表"
+ *
+ * 真值（`valid_to`/`superseded_by`）与效用是**两个正交轴**（R9 §3 C3-4：
+ * "禁止用 valid_to 表达低效用"）。归档动作需要"这是反馈归档、可复活"的**来源**，
+ * 所以 `archive_reason` 放在**新表**里，旧行默认"没有账本 = 从未曝光"，
+ * 不破坏任何既有读取路径；也不需要重建/回填 `memory` 表。
+ *
+ * ## 三张表
+ *
+ * - `memory_utility`：每条记忆的计数（曝光/使用/显式反馈）+ 待确认的 `wrong` +
+ *   可逆归档来源。读取路径（`getMany`）一次性 JOIN 它即可算 utility，零额外查询。
+ * - `memory_feedback`：只增不改的审计日志（"谁在什么时候按了什么"），
+ *   撤销靠"再按一次 useful/revive"或直接改库，不靠删除日志。
+ * - `memory_meta`：自适应下限 q / 精度 EWMA 的持久状态（跨重启确定，
+ *   不把阈值变成"这次进程恰好学到的值"）。
+ */
+function applySchemaV4(db: SqliteLike): void {
+  db.exec(`
+    CREATE TABLE memory_utility (
+      memory_id            TEXT    PRIMARY KEY,
+      exposed              INTEGER NOT NULL DEFAULT 0 CHECK (exposed >= 0),
+      used                 INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0),
+      useful               INTEGER NOT NULL DEFAULT 0 CHECK (useful >= 0),
+      wrong                INTEGER NOT NULL DEFAULT 0 CHECK (wrong >= 0),
+      stale                INTEGER NOT NULL DEFAULT 0 CHECK (stale >= 0),
+      noise                INTEGER NOT NULL DEFAULT 0 CHECK (noise >= 0),
+      last_at              INTEGER,
+      pending_wrong_at     INTEGER,
+      pending_wrong_session TEXT,
+      archived_at          INTEGER,
+      archive_reason       TEXT
+    ) STRICT;
+
+    CREATE TABLE memory_feedback (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      memory_id TEXT    NOT NULL,
+      action    TEXT    NOT NULL CHECK (action IN ('useful', 'wrong', 'stale', 'noise', 'revive', 'archive')),
+      session_id TEXT,
+      at        INTEGER NOT NULL,
+      detail    TEXT
+    ) STRICT;
+
+    CREATE INDEX memory_feedback_memory ON memory_feedback(memory_id, at);
+
+    CREATE TABLE memory_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    ) STRICT;
+
+    INSERT INTO memory_meta (key, value) VALUES ('lexical.floor.q', '0.5');
+    INSERT INTO memory_meta (key, value) VALUES ('lexical.floor.precision', '');
   `)
 }

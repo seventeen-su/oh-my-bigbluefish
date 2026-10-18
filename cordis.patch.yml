@@ -264,7 +264,10 @@
                 - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
                 # OMB 自己的过程卡（v4：8 张方法卡从 `omb_method` 工具迁到 skills）。
                 # 目录随插件包发布；skill 正文只在模型调用 `skill` 时读取，不占常驻预算。
-                - !!js process.getBuiltinModule('node:path').join(baseUrl, 'skills')
+                # 用 createRequire(baseUrl) 解析包根，而不是 join(baseUrl)：宿主
+                # ctx.baseUrl 是 file URL（`pathToFileURL(dir).href + '/'`，见
+                # app-boot/src/index.ts:1222），直接 join 会得到 `file:/...` 形状。
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@omb/plugin/package.json')), 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: present

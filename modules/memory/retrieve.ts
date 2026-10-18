@@ -34,6 +34,11 @@ import type {
 import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
 import { asOverturnedProbe, type OverturnedHit } from './overturned.js'
 import { RELATED_EDGE } from './link.js'
+import {
+  LEXICAL_QUANTILE_INITIAL,
+  lexicalFloorFor,
+  type LexicalFloorMode,
+} from './utility.js'
 
 /** RRF 常数 k 的惯例默认值。⚠️ 这是惯例，不是最优值——规划 §5.4 明确标注，故暴露为配置项。 */
 export const DEFAULT_RRF_K = 60
@@ -85,6 +90,10 @@ export const DEFAULT_LEXICAL_SCORE_FLOOR = 0.5
  * 为什么不能只用绝对下限：小库（1–3 条）的 FTS5 bm25 绝对值只有 ~1e-6，
  * 绝对下限 0.5 会把**唯一命中**也过滤掉（实测：新装用户写第一条后就再也搜不到）。
  * 取 `min(相对, 绝对)` 后：小库自动按"与 top 同量级"放行，大库退回标定的 0.5。
+ *
+ * **3.7 Wave 2（R9 C3）起不再是唯一规则**：默认走 `relative` 模式
+ * （`max(top×0.35, Q_q(候选))` 再绝对夹紧，见 `./utility.js` 的 `lexicalFloorFor`）；
+ * 本常量只在 `fixed` 回滚模式与"小库保护"分支里保留。
  */
 export const LEXICAL_FLOOR_RELATIVE = 0.5
 
@@ -177,9 +186,14 @@ export interface RetrieveQuery {
    * 词法通道的**后置分数下限**（3.7-M3，默认 `DEFAULT_LEXICAL_SCORE_FLOOR`）。
    *
    * 只作用于 `lexical` 通道；向量通道的余弦下限由通道自身标定。
-   * 显式给 `0` = 关闭过滤（回归对照）。单位是 `-bm25`（越大越相关）。
+   * 显式给 `0` = 关闭过滤（回归对照）；给正数 = `fixed` 模式覆盖。
+   * 单位是 `-bm25`（越大越相关）。
    */
   readonly lexicalFloor?: number
+  /** 下限模式（3.7 Wave 2 / R9 C3）：`relative`（默认）/ `fixed`（回滚）。 */
+  readonly lexicalFloorMode?: LexicalFloorMode
+  /** 相对模式下 `Q_q(候选)` 的分位 q（默认 0.5，来自校准器；[0.3,0.8] 夹紧）。 */
+  readonly lexicalFloorQuantile?: number
   /**
    * 1-hop 关联扩展（3.7 Wave 2）：从 top 3 命中沿 `related` 边扩展，
    * 最多补 `RELATED_LIMIT` 条，分数 = 父条目 × `RELATED_PENALTY`（**弱于任何直接命中**）。
@@ -297,8 +311,10 @@ export interface RetrieveStats {
   }[]
   readonly rrfK: number
   readonly reranked: boolean
-  /** 本次生效的词法分数下限（0 = 未过滤）。 */
+  /** 本次生效的词法分数下限（多库时取各库阈值的平均；0 = 未过滤）。 */
   readonly lexicalFloor: number
+  /** 本次实际使用的下限模式（`off` = 显式关闭）。 */
+  readonly lexicalFloorMode: 'relative' | 'fixed' | 'off'
   /** 因低于词法下限而被丢掉的命中数（不是"没查到"，是"查到了但不达标"）。 */
   readonly lexicalFloorDropped: number
   /** 本次通过 1-hop `related` 扩展补进来的条目数（P2 验收读数）。 */
@@ -570,8 +586,17 @@ export function rerankPrior(input: RerankInput, options: RerankOptions): number 
   const halfLife = normalizeHalfLife(options.halfLifeMs)
   const age = Math.max(0, options.now - input.record.observedAt)
   const recency = Math.pow(0.5, age / halfLife)
+  /**
+   * 3.7 Wave 2（R9 C1）：usage 用 **P(used|exposed) 的 Beta 后验**（带经验贝叶斯收缩），
+   * 由 `store.getMany` 挂在记录上的非枚举 `utility` 属性提供；拿不到（旧库/假库/
+   * 账本读失败）就退回旧的 `useCount/(1+useCount)`——**降级可见**，不是静默换公式。
+   */
+  const attached = (input.record as MemoryRecord & { readonly utility?: unknown }).utility
+  const utility = typeof attached === 'number' && Number.isFinite(attached)
+    ? Math.min(1, Math.max(0, attached))
+    : undefined
   const useCount = Math.max(0, input.record.useCount)
-  const usage = useCount / (1 + useCount)
+  const usage = utility ?? useCount / (1 + useCount)
   const asserted = ASSERTED_WEIGHT[input.record.assertedBy]
   const fusion = 1 / (1 + Math.max(0, options.position))
   return (
@@ -637,11 +662,19 @@ export async function retrieve(
   const poolLimit = normalizePositive(query.poolLimit, maxCandidates)
   const ordered = orderStores(stores)
   const channels = ports.channels ?? []
-  /** 词法下限：缺省用标定常量；显式 0/非法值 = 关闭（回归对照）。 */
-  const lexicalFloor = query.lexicalFloor === undefined
-    ? DEFAULT_LEXICAL_SCORE_FLOOR
-    : (Number.isFinite(query.lexicalFloor) && query.lexicalFloor > 0 ? query.lexicalFloor : 0)
+  /** 词法下限配置（3.7 Wave 2 / R9 C3）：显式 lexicalFloor 优先（fixed 覆盖/0=关）。 */
+  const floorDisabled = query.lexicalFloor !== undefined && !(query.lexicalFloor > 0)
+  const floorMode: LexicalFloorMode = query.lexicalFloor !== undefined && query.lexicalFloor > 0
+    ? 'fixed'
+    : (query.lexicalFloorMode ?? 'relative')
+  const fixedFloor = query.lexicalFloor !== undefined && query.lexicalFloor > 0
+    ? query.lexicalFloor
+    : DEFAULT_LEXICAL_SCORE_FLOOR
+  const floorQuantile = query.lexicalFloorQuantile ?? LEXICAL_QUANTILE_INITIAL
   let lexicalFloorDropped = 0
+  let thresholdSum = 0
+  let thresholdCount = 0
+  let relativeUsed = false
 
   // 查询向量只算一次；算不出就退化为纯词法（诚实降级，不抛）。
   const channelsUsable = channels.length > 0
@@ -673,13 +706,18 @@ export async function retrieve(
         `库 ${tagged.scope} 词法通道失败`,
       )
       if (lexical !== null && lexical.length > 0) {
-        // 3.7-M3：低于下限的命中**不进排名**——但计数要可见（"查到了但不达标"
-        // 与"根本没查到"在诊断上是两件事）。
-        // 阈值取 `min(top × LEXICAL_FLOOR_RELATIVE, 绝对下限)`：小库不误杀（见常量注释）。
-        const kept = lexicalFloor > 0 ? filterByScoreFloor(lexical, lexicalFloor) : lexical
-        lexicalFloorDropped += lexical.length - kept.length
-        if (kept.length > 0) {
-          rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(kept) })
+        // 3.7-M3 + R9 C3：低于下限的命中**不进排名**——但计数要可见（"查到了但不达标"
+        // 与"根本没查到"在诊断上是两件事）。阈值由 `lexicalFloorFor` 统一计算
+        // （相对分位 + 小库保护 + fixed 回滚），本层只负责过滤与累计读数。
+        const decision = floorDisabled
+          ? { kept: lexical, threshold: 0, mode: 'off' as const }
+          : applyFloatFloor(lexical, { mode: floorMode, fixedFloor, quantile: floorQuantile })
+        lexicalFloorDropped += lexical.length - decision.kept.length
+        if (decision.mode === 'relative') relativeUsed = true
+        thresholdSum += decision.threshold
+        thresholdCount += 1
+        if (decision.kept.length > 0) {
+          rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(decision.kept) })
         }
       }
       for (const channel of channels) {
@@ -798,7 +836,8 @@ export async function retrieve(
       })),
       rrfK: k,
       reranked: rerankRequested,
-      lexicalFloor,
+      lexicalFloor: thresholdCount > 0 ? thresholdSum / thresholdCount : (floorDisabled ? 0 : fixedFloor),
+      lexicalFloorMode: floorDisabled ? 'off' : (relativeUsed ? 'relative' : 'fixed'),
       lexicalFloorDropped,
       relatedExpanded: expansion.expanded,
     },
@@ -810,19 +849,23 @@ export async function retrieve(
 // ---------- 内部工具 ----------
 
 /**
- * 词法下限过滤：`score >= min(top × RELATIVE, 绝对下限)`。
+ * 词法下限过滤（3.7 Wave 2 / R9 C3）：阈值算法在 `utility.ts` 的 `lexicalFloorFor`
+ * （相对分位 `max(top×0.35, Q_q)` + 绝对夹紧 + 小库保护），这里只做过滤与读数返回。
  *
  * 纯函数、确定性；`top` 是**本库本通道**的最高分（不跨库比较——不同库的 bm25 量纲
  * 本来就不可比，融合只按排名）。
  */
-function filterByScoreFloor(
+function applyFloatFloor(
   hits: readonly ScoredHit[],
-  absoluteFloor: number,
-): readonly ScoredHit[] {
-  let top = 0
-  for (const hit of hits) if (Number.isFinite(hit.score) && hit.score > top) top = hit.score
-  const threshold = Math.min(top * LEXICAL_FLOOR_RELATIVE, absoluteFloor)
-  return hits.filter(hit => Number.isFinite(hit.score) && hit.score >= threshold)
+  options: { readonly mode: LexicalFloorMode; readonly fixedFloor: number; readonly quantile: number },
+): { readonly kept: readonly ScoredHit[]; readonly threshold: number; readonly mode: LexicalFloorMode } {
+  const scores = hits.map(hit => hit.score).filter(score => Number.isFinite(score))
+  const decision = lexicalFloorFor({ scores, ...options })
+  return {
+    kept: hits.filter(hit => Number.isFinite(hit.score) && hit.score >= decision.threshold),
+    threshold: decision.threshold,
+    mode: decision.mode,
+  }
 }
 
 interface StoreSearch {
@@ -850,6 +893,7 @@ function emptyStats(k: number): RetrieveStats {
     rrfK: k,
     reranked: false,
     lexicalFloor: DEFAULT_LEXICAL_SCORE_FLOOR,
+    lexicalFloorMode: 'fixed',
     lexicalFloorDropped: 0,
     relatedExpanded: 0,
   }

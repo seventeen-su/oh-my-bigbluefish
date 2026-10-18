@@ -824,7 +824,7 @@ describe('MemoryStore：stats 与类型守卫', () => {
     const { store, ws } = fixtureOf('project')
     await putAll(store, [makeRecord({ scope: 'project', id: 'p1' }), makeRecord({ scope: 'project', id: 'p2' })])
     const stats = await store.stats()
-    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 3, vectors: null })
+    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 4, vectors: null })
     ws.cleanup()
   })
 
@@ -854,7 +854,7 @@ describe('MemoryStore：stats 与类型守卫', () => {
   it('打开时就完成迁移：migrated 记录 0 → 最新（含 v2 的 embedding.content_hash、v3 的 edge.related）', async () => {
     const { store, ws } = fixtureOf()
     // 0 → 3：v1 建表 + v2 加列 + v3 重建 edge 表（CHECK 增加 related）。
-    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 3 })
+    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 4 })
     ws.cleanup()
   })
 })

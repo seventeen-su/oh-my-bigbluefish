@@ -46,6 +46,12 @@ import {
   wireSessionEvents,
 } from './session.js'
 import type { SessionWiringOptions } from './session.js'
+import {
+  SESSION_STATE_SERVICE,
+  createSessionStateMachine,
+  wireEditGuard,
+  type WorkspaceChangesLike,
+} from './state-machine.js'
 import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { createPressureBridge } from './pressure.js'
 import { createProjectProfile } from './project-profile.js'
@@ -148,6 +154,27 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     handle.kernel.provide(SERVICES.projectProfile, projectProfile.port)
   } catch (error) {
     logger.warn(`OMB：项目画像服务注册失败——${String(error)}（omb_project 将只给记忆、无画像）`)
+  }
+  // ── 会话状态机（R10）：共享状态服务 + edit 守卫 ─────────────────────────
+  //
+  // 宿主 `workspace-changes` 已在本 profile 运行（520 事件 / 27 会话）：状态机的
+  // epoch 优先读 `workspaceChanges.summary()` 的 turn 起止 git tree id（零 subprocess），
+  // 拿不到时才回退自算 git。服务名在 Lead 接入 `SERVICES.sessionState` 前由
+  // `dsh/state-machine.ts` 的常量提供（避免两处各写一个字符串）。
+  const sessionState = createSessionStateMachine({
+    clock,
+    logger,
+    // cwd 的唯一来源：内核 `ActiveSessionTable`（`dsh/session.ts` 观测会话事件时写入）。
+    cwdOf: sessionId =>
+      handle.kernel.service<{ cwd(session: string): string | null }>(SERVICES.activeSession)
+        ?.cwd(sessionId) ?? undefined,
+    // 每次现取：宿主服务可能晚于插件就绪，也可能中途被开关（与通知服务同一条口径）。
+    workspaceChanges: () => readService<WorkspaceChangesLike>(ctx, 'workspaceChanges'),
+  })
+  try {
+    handle.kernel.provide(SESSION_STATE_SERVICE, sessionState.port)
+  } catch (error) {
+    logger.warn(`OMB：会话状态服务注册失败——${String(error)}（状态行与 edit 守卫将不生效）`)
   }
   try {
     handle.kernel.provide(STORAGE_HOST_SERVICE, storageHost.port)
@@ -299,7 +326,13 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   handle.kernel.report({ state: 'ok', detail: `微内核已就绪（产物代数 ${generationFromUrl(import.meta.url) ?? '未知'}）` })
 
   // ── 3) 提示注入（同步注册）────────────────────────────────────────────
-  const disposePrompt = wirePromptInjection(promptWiringOptions({ handle, ctx, clock }))
+  const disposePrompt = wirePromptInjection(promptWiringOptions({
+    handle,
+    ctx,
+    clock,
+    // 状态行唯一消费者：走运行时上下文尾部快照；取走即清空（R10 §9.2）。
+    stateNotice: sessionId => sessionState.port.consumeNotice(sessionId),
+  }))
 
   // 回合边界再重放一次工具注册。
   //
@@ -313,7 +346,17 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
 
   // ── 5) 会话事件（只观察，不接管 Loop）─────────────────────────────────
   //    会话 → cwd 由这里写进内核登记处（唯一存放处）；不再另存一份。
-  const disposeEvents = wireSessionEvents({ ctx, kernel: handle.kernel, onHostSession: pressure.remember })
+  const disposeEvents = wireSessionEvents({
+    ctx,
+    kernel: handle.kernel,
+    onHostSession: pressure.remember,
+    // 所有原始会话事件在 bridge 内部转交状态机（turn/start、workspace/changes、
+    // goal/change、todo/write…）；状态机自己决定消费哪些，不在这里重复事件词表。
+    onSessionEvent: event => sessionState.port.observe(event),
+  })
+  // edit 守卫：`tools/pre-execute` 上只 deny edit（读后 epoch 变了），write 只警告；
+  // 同路径每回合最多 2 次 deny，第 3 次放行；守卫自身异常一律放行（R10 §6.5）。
+  const disposeGuard = wireEditGuard({ ctx, machine: sessionState, logger })
   /**
    * 用户命令 + 真实 effort 映射。
    *
@@ -365,7 +408,9 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     if (disposed) return
     disposed = true
     const steps: readonly (() => void)[] = [
+      disposeGuard,
       disposeEvents,
+      () => sessionState.dispose(),
       disposeEffort,
       disposeDepth,
       () => projectProfile.dispose(),
@@ -459,8 +504,10 @@ export function promptWiringOptions(input: {
   readonly handle: KernelHandle
   readonly ctx: HostContextLike
   readonly clock: { now(): number }
+  /** 状态机通知行消费者；缺省 = 不注入状态行（测试/诊断路径）。 */
+  readonly stateNotice?: (sessionId: string) => string | null
 }): SessionWiringOptions {
-  const { handle, ctx, clock } = input
+  const { handle, ctx, clock, stateNotice } = input
   return {
     kernel: handle.kernel,
     // **提供者，不是一次性收集的数组**：每次要文本时重新扫服务表，
@@ -469,6 +516,7 @@ export function promptWiringOptions(input: {
     contributions: () => collectPromptContributions(handle.kernel),
     systemPrompt: readSystemPrompt(ctx),
     clock,
+    ...(stateNotice === undefined ? {} : { stateNotice }),
   }
 }
 

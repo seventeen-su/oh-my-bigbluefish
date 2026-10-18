@@ -20,6 +20,7 @@ import type {
 import { SERVICES } from '../kernel/abi/index.js'
 import type { SessionWitnessPort } from './session.js'
 import type { EffortControlPort } from './reasoning-effort.js'
+import type { SessionStateService } from './state-machine.js'
 import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
@@ -353,6 +354,34 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
         '',
       )
     }
+  }
+
+  // ── 会话状态（状态机；只报可核对的事实）──────────────────────────────
+  const machine = kernel.service<SessionStateService>(SERVICES.sessionState)
+  const state = machine?.snapshot(activeSession)
+  lines.push('## 会话状态', '')
+  if (state === undefined) {
+    lines.push('（状态机未接线：无法报告 epoch/空闲/外部改动——这不是"工作区没变"）', '')
+  } else {
+    const epoch = state.epoch
+    lines.push(
+      `- 状态：${state.state}（tier ${state.tier}${state.flags.degraded ? '；降级' : ''}`
+      + `${state.flags.interrupted ? '；有中断' : ''}${state.flags.unresolved ? '；有未闭合' : ''}）`
+      + `；空闲 ${state.idleMs === null ? '未测量' : `${Math.round(state.idleMs / 1000)}s`}`,
+    )
+    if (epoch !== null) {
+      lines.push(
+        `- 工作区：${epoch.head ?? '无 git'} @ ${epoch.branch ?? '?'}`
+        + `；脏文件 ${epoch.dirtyCount}；epoch ${epoch.id}（来源 ${epoch.source}）`,
+      )
+    }
+    const guard = state.guard
+    lines.push(
+      `- 目标/待办：${state.openGoals} / ${state.openTodos}`
+      + `；守卫 deny ${guard.denies} 次、放行 ${guard.gaveUps} 次、write 警告 ${guard.writeWarnings} 次`,
+    )
+    if (state.persistence.error !== null) lines.push(`- 持久化：${state.persistence.error}`)
+    lines.push('')
   }
 
   // ── 预算 ──────────────────────────────────────────────────────────────

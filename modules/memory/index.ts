@@ -44,6 +44,9 @@ import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats } from './capture.js'
 import { autoLinkRelated } from './link.js'
 import { createProjectTool, type ProjectProfilePort } from './project.js'
+import { createUsageTracker, installFeedback } from './feedback.js'
+import { AdaptiveFloorCalibrator } from './utility.js'
+import { asUtilityStore } from './store.js'
 import type { AbstentionCategory, ArtifactKind } from './remember.js'
 import { createRememberTool } from './remember.js'
 import { artifactVerificationDegradeReason, verifyArtifactExists } from './artifacts.js'
@@ -116,6 +119,12 @@ const rawConfigSchema = z.object({
   relatedExpansion: z.boolean().default(true),
   /** 项目库写入未就绪时的重试等待（毫秒；冷启动竞态，默认 250，0=不重试）。 */
   coldStartRetryMs: z.number().int().min(0).max(2000).default(250),
+  /** 词法下限模式（3.7 Wave 2 / R9 C3）：`relative`（默认）/ `fixed`（旧 0.5 回滚）。 */
+  lexicalFloorMode: z.enum(['relative', 'fixed']).default('relative'),
+  /** 自适应下限的目标精度（EWMA 工作点；[0.3,0.9]，默认 0.6）。 */
+  lexicalFloorTargetPrecision: z.number().min(0.3).max(0.9).default(0.6),
+  /** `/omb-feedback` 命令开关（默认开；关掉只影响显式反馈，隐式效用照常）。 */
+  feedbackCommand: z.boolean().default(true),
   /**
    * **隐私闸门**（3.6 从独立的 `omb-privacy` 行并入本行）。
    *
@@ -149,6 +158,9 @@ export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   autoLinkRelated: true,
   relatedExpansion: true,
   coldStartRetryMs: 250,
+  lexicalFloorMode: 'relative',
+  lexicalFloorTargetPrecision: 0.6,
+  feedbackCommand: true,
   privacy: PRIVACY_DEFAULT_CONFIG,
 }
 
@@ -284,6 +296,18 @@ export interface ColdStartLedger {
   failures: number
 }
 
+/** `/omb-feedback` 的运行读数（R9 C2：反馈动作按类计数）。 */
+export interface FeedbackLedger {
+  commands: number
+  useful: number
+  wrongPending: number
+  wrongConfirmed: number
+  archived: number
+  revived: number
+  refused: number
+  lastChange: string
+}
+
 /**
  * 跑一轮离线整合（M3）：**离线、无 LLM、非破坏性**。
  *
@@ -393,6 +417,8 @@ async function describeHealth(
     readonly project?: ProjectToolLedger
     readonly coldStart?: ColdStartLedger
     readonly relatedExpanded?: number
+    readonly feedback?: FeedbackLedger
+    readonly floor?: { readonly q: number; readonly recalls: number; readonly precision: number | null; readonly mode: string }
   },
 ): Promise<ModuleHealth> {
   const status = service.status()
@@ -466,6 +492,21 @@ async function describeHealth(
   }
   if (runtime?.relatedExpanded !== undefined && runtime.relatedExpanded > 0) {
     metrics['recall.relatedExpanded'] = runtime.relatedExpanded
+  }
+  if (runtime?.feedback !== undefined) {
+    metrics['feedback.commands'] = runtime.feedback.commands
+    if (runtime.feedback.useful > 0) metrics['feedback.useful'] = runtime.feedback.useful
+    if (runtime.feedback.wrongPending > 0) metrics['feedback.wrongPending'] = runtime.feedback.wrongPending
+    if (runtime.feedback.wrongConfirmed > 0) metrics['feedback.wrongConfirmed'] = runtime.feedback.wrongConfirmed
+    if (runtime.feedback.archived > 0) metrics['feedback.archived'] = runtime.feedback.archived
+    if (runtime.feedback.revived > 0) metrics['feedback.revived'] = runtime.feedback.revived
+    if (runtime.feedback.refused > 0) metrics['feedback.refused'] = runtime.feedback.refused
+  }
+  if (runtime?.floor !== undefined) {
+    metrics['lexical.floor.q'] = Number(runtime.floor.q.toFixed(3))
+    metrics['lexical.floor.recalls'] = runtime.floor.recalls
+    metrics[runtime.floor.mode === 'relative' ? 'lexical.floor.relative' : 'lexical.floor.fixed'] = 1
+    if (runtime.floor.precision !== null) metrics['lexical.floor.precision'] = Number(runtime.floor.precision.toFixed(3))
   }
 
   /**
@@ -566,6 +607,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   let projectLedgerRef: ProjectToolLedger | undefined
   let coldStartRef: ColdStartLedger | undefined
   let relatedExpandedRef = 0
+  let feedbackLedgerRef: FeedbackLedger | undefined
+  let floorRef: { q: number; recalls: number; precision: number | null; mode: string } | undefined
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
@@ -591,6 +634,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             ...(projectLedgerRef === undefined ? {} : { project: projectLedgerRef }),
             ...(coldStartRef === undefined ? {} : { coldStart: coldStartRef }),
             relatedExpanded: relatedExpandedRef,
+            ...(feedbackLedgerRef === undefined ? {} : { feedback: feedbackLedgerRef }),
+            ...(floorRef === undefined ? {} : { floor: floorRef }),
           },
         )
       } catch (error) {
@@ -836,11 +881,121 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         projectRetryMs: config.coldStartRetryMs,
       })
       captureRef = () => capture.stats()
+
+      // ── 3.7 Wave 2（R9 C1/C2/C3）：隐式效用、显式反馈、自适应下限 ──────────
+      const usageTracker = createUsageTracker()
+      const feedbackLedger: FeedbackLedger = {
+        commands: 0, useful: 0, wrongPending: 0, wrongConfirmed: 0, archived: 0, revived: 0, refused: 0, lastChange: '',
+      }
+      feedbackLedgerRef = feedbackLedger
+      let calibrator = new AdaptiveFloorCalibrator({}, config.lexicalFloorTargetPrecision)
+      const floorState = {
+        q: calibrator.q,
+        recalls: 0,
+        precision: null as number | null,
+        mode: config.lexicalFloorMode,
+      }
+      floorRef = floorState
+      let floorLoaded = false
+      let lastTotals = { exposed: 0, used: 0 }
+
+      const userUtility = (): ReturnType<typeof asUtilityStore> => {
+        const store = service.snapshot().user?.store('user')
+        return store === undefined ? undefined : asUtilityStore(store)
+      }
+      /** 从 `memory_meta` 恢复 q（跨重启确定；读不出就用初值，不假装学过了）。 */
+      const loadFloorState = async (): Promise<void> => {
+        if (floorLoaded) return
+        floorLoaded = true
+        try {
+          const api = userUtility()
+          if (api === undefined) return
+          const saved = await api.utilityMeta('lexical.floor.q')
+          const parsed = saved === undefined ? Number.NaN : Number(saved)
+          if (Number.isFinite(parsed)) {
+            calibrator = new AdaptiveFloorCalibrator({ q: parsed }, config.lexicalFloorTargetPrecision)
+            floorState.q = calibrator.q
+          }
+          const totals = await api.utilityTotals()
+          lastTotals = { exposed: totals.exposed, used: totals.used }
+        } catch {
+          // 读不出 = 用初值（状态面会显示 recalls/q，不显示"已学习"）
+        }
+      }
+      /**
+       * 每次召回后尝试一次校准：每 20 次用"本窗口 used/exposed"更新 q（步长 ≤0.05）。
+       * 失败一律隔离（校准是旁路，不得影响召回）。
+       */
+      const calibrateAfterRecall = async (): Promise<void> => {
+        try {
+          await loadFloorState()
+          floorState.recalls += 1
+          let deltaExposed = 0
+          let deltaUsed = 0
+          const api = userUtility()
+          if (api !== undefined) {
+            const totals = await api.utilityTotals()
+            deltaExposed = Math.max(0, totals.exposed - lastTotals.exposed)
+            deltaUsed = Math.max(0, totals.used - lastTotals.used)
+            lastTotals = { exposed: totals.exposed, used: totals.used }
+          }
+          const updated = calibrator.observe({ exposures: deltaExposed, used: deltaUsed })
+          const state = calibrator.state()
+          floorState.q = state.q
+          floorState.precision = state.precision
+          if (updated && api !== undefined) {
+            await api.setUtilityMeta('lexical.floor.q', String(state.q))
+            await api.setUtilityMeta('lexical.floor.precision', state.precision === null ? '' : String(state.precision))
+          }
+        } catch (error) {
+          kernel.logger.warn(`OMB：自适应下限校准失败（已隔离）——${messageOf(error)}`)
+        }
+      }
+      /** `used_tool`：工具调用与最近曝光记忆共享实体键 → 隐式使用 +1。 */
+      const recordUsedFromToolCall = async (payload: {
+        readonly sessionId: string
+        readonly tool: string
+        readonly args: string
+        readonly at: number
+      }): Promise<void> => {
+        try {
+          const ids = usageTracker.matchToolCall(payload.sessionId, payload.tool, payload.args)
+          if (ids.length === 0) return
+          for (const tagged of resolveStores(payload.sessionId) ?? []) {
+            const api = asUtilityStore(tagged.store)
+            if (api !== undefined) await api.recordUsed(ids, payload.at)
+          }
+        } catch (error) {
+          kernel.logger.warn(`OMB：隐式使用记账失败（已隔离）——${messageOf(error)}`)
+        }
+      }
+      const feedback = config.feedbackCommand
+        ? installFeedback(kernel, {
+            clock: kernel.clock,
+            resolveStores: sessionId => resolveStores(sessionId),
+            privacy: () => kernel.service(SERVICES.privacy),
+            logger: kernel.logger,
+            onFeedback: info => {
+              feedbackLedger.commands += 1
+              feedbackLedger.lastChange = `${info.action}→${info.change}`
+              if (info.change === 'useful' || info.change === 'revive') feedbackLedger.useful += 1
+              if (info.change === 'wrong-pending') feedbackLedger.wrongPending += 1
+              if (info.change === 'wrong-confirmed') feedbackLedger.wrongConfirmed += 1
+              if (info.change === 'stale-archived') feedbackLedger.archived += 1
+              if (info.change === 'revive') feedbackLedger.revived += 1
+            },
+          })
+        : {
+            commandState: () => '未启用（config.feedbackCommand=false）',
+            dispose: (): void => {},
+          }
+
       const offCaptureMessage = kernel.on('user/message/observed', payload => {
         void capture.onUserMessage(payload)
       })
       const offCaptureCall = kernel.on('tool/call/observed', payload => {
         void capture.onToolCall(payload)
+        void recordUsedFromToolCall(payload)
       })
       const offCaptureResult = kernel.on('tool/result/observed', payload => {
         void capture.onToolResult(payload)
@@ -878,8 +1033,20 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           defaultDetail: config.recallDetail,
           // 1-hop `related` 扩展（3.7 Wave 2，默认开）
           expandRelated: config.relatedExpansion,
-          onRetrieved: result => {
+          // 自适应词法下限（R9 C3）：q 由校准器在线更新；fixed 模式走旧 0.5
+          lexicalFloorMode: config.lexicalFloorMode,
+          lexicalFloorQuantile: () => floorState.q,
+          onRetrieved: (result, sessionId) => {
             relatedExpandedRef += result.stats.relatedExpanded
+            // 曝光登记（隐式效用的分母；`markUsed` 已写 exposed，这里登记实体键供 used_tool 匹配）
+            if (result.items.length > 0 && sessionId !== undefined) {
+              usageTracker.noteExposure(
+                sessionId,
+                result.items.map(item => ({ id: item.id, text: item.text })),
+                kernel.clock.now(),
+              )
+            }
+            void calibrateAfterRecall()
           },
           // 使用计数写不成：计数 + 原因进健康面（记账失败不改变召回结果，但绝不静默）
           onUsageFailure: info => {
@@ -1063,6 +1230,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           ['工具服务', offTools],
           ['常驻提示', offPrompt],
           ['捕获·用户消息订阅', offCaptureMessage],
+          ['反馈命令', () => feedback.dispose()],
           ['捕获·工具调用订阅', offCaptureCall],
           ['捕获·工具结果订阅', offCaptureResult],
           ['捕获·回合结局订阅', offCaptureOutcome],

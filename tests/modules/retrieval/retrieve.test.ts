@@ -198,7 +198,7 @@ describe('③ 融合只消费排名：禁止跨通道分数算术', () => {
     }
     const result = await retrieve(
       [tagged(store)],
-      { text: 'alpha', limit: 2 },
+      { text: 'alpha', limit: 2, lexicalFloor: 0 },
       { clock: CLOCK, channels: [vector] },
     )
     const b = result.items.find(i => i.id === 'b')

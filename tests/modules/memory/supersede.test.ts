@@ -246,6 +246,7 @@ describe('被推翻的结论：后续会话看得见', () => {
         rrfK: 60,
         reranked: false,
         lexicalFloor: 0,
+        lexicalFloorMode: 'fixed',
         lexicalFloorDropped: 0,
         relatedExpanded: 0,
       },

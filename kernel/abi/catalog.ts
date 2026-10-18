@@ -350,6 +350,14 @@ export const SERVICES = {
    * 有没有因 provider 不支持而没生效"——不猜、不承诺。
    */
   effortControl: 'omb:effort-control',
+  /**
+   * **会话/工作区状态机**（`SessionStateService`，由 `dsh/state-machine.ts` provide）。
+   *
+   * 状态面与模块共用的唯一「世界身份 + 时间」来源：workspace epoch、空闲分级、
+   * 外部改动、读取戳、目标/待办计数、edit 守卫读数。
+   * 模型面只有 `consumeNotice()` 在真实变化时返回的一行（≤120 字符）。
+   */
+  sessionState: 'omb:session-state',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]

@@ -368,6 +368,11 @@ export interface SessionWiringOptions {
   readonly contributions: PromptContributionSource
   readonly systemPrompt: SystemPromptLike | undefined
   readonly clock: { now(): number }
+  /**
+   * 状态机通知行的**唯一消费者**（R10 §9.2：走运行时上下文尾部快照）。
+   * 返回 null = 当前没有新事实 → 不注入任何字节。
+   */
+  readonly stateNotice?: (sessionId: string) => string | null
 }
 
 /**
@@ -591,7 +596,7 @@ function createResidentBudgetAnnouncer(kernel: Kernel): (report: ResidentHintRep
  * @returns 幂等 disposer；**绝不抛异常**（H-1）。
  */
 export function wirePromptInjection(options: SessionWiringOptions): () => void {
-  const { kernel, contributions, systemPrompt, clock } = options
+  const { kernel, contributions, systemPrompt, clock, stateNotice } = options
 
   /** 留声器自带内容去重：惰性账目每轮都算，同一份超限只 warn 一次（否则就是刷屏）。 */
   const announceBudget = createResidentBudgetAnnouncer(kernel)
@@ -674,7 +679,12 @@ export function wirePromptInjection(options: SessionWiringOptions): () => void {
         // 「本快照取代此前的运行时上下文快照」，所以完整自包含比精简更重要。
         const { report, current } = snapshotNow()
         const dynamic = renderContext(current, input)
-        return [report.text, dynamic].filter(p => p.length > 0).join('\n\n')
+        // 状态行（R10 §9）：只在真变化时存在；与常驻提示/易变段一起走尾部快照，
+        // **绝不进系统提示**。取走即清空，因此一次渲染最多注入一条。
+        const notice = consumeStateNotice(stateNotice, sessionId)
+        return [report.text, dynamic, notice]
+          .filter((part): part is string => typeof part === 'string' && part.length > 0)
+          .join('\n\n')
       },
     })
     wiring.injected = true
@@ -715,6 +725,20 @@ function sessionIdOf(ctx: unknown): string {
   const fromSession = pickString(session, 'id')
   if (fromSession !== undefined) return fromSession
   return pickString(ctx, 'scope') ?? ''
+}
+
+/** 状态行消费：**绝不抛**（提示渲染失败不得打断会话装配）。 */
+function consumeStateNotice(
+  source: ((sessionId: string) => string | null) | undefined,
+  sessionId: string,
+): string | null {
+  if (source === undefined) return null
+  try {
+    const line = source(sessionId)
+    return typeof line === 'string' && line.length > 0 ? line : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -790,8 +814,22 @@ export function wireSessionEvents(options: {
    * 是兜底而非常路）。
    */
   readonly onHostSession?: (sessionId: string, session: unknown) => void
+  /**
+   * 原始宿主会话事件的**唯一交接点**（状态机 `omb:session-state` 的输入，R10 §6.2）。
+   *
+   * 为什么在 `switch` 之前送出：`turn/start` / `turn/end` / `workspace/changes` /
+   * `goal/change` / `todo/write` 这些类型 OMB 其他部分**不消费**，只 feed 给状态机；
+   * 让状态机自己决定信什么，而不是在这里把事件词汇再抄一遍（两处词表必然漂移）。
+   * 回调自身绝不允许抛：状态机失败不得打断会话事件桥。
+   */
+  readonly onSessionEvent?: (event: {
+    readonly sessionId: string
+    readonly type: string
+    readonly data: unknown
+    readonly seq?: number
+  }) => void
 }): () => void {
-  const { ctx, kernel, onToolResult, onHostSession } = options
+  const { ctx, kernel, onToolResult, onHostSession, onSessionEvent } = options
   /** 见过的会话事件类型 → 次数（诊断用）。 */
   const sawEventTypes = new Map<string, number>()
   if (typeof ctx.on !== 'function') {
@@ -944,6 +982,25 @@ export function wireSessionEvents(options: {
       seen: Object.fromEntries(sawEventTypes),
     })
     const data = (event as { data?: unknown } | undefined)?.data
+    /**
+     * 状态机输入：所有会话事件在 `switch` 之前原样转交。
+     * 顺序刻意在 `data` 之后：状态机需要 payload 与 seq；`switch` 只消费它自己那几类。
+     */
+    if (onSessionEvent !== undefined) {
+      try {
+        const seq = pickNumber(event, 'seq')
+        onSessionEvent({
+          sessionId,
+          type,
+          data,
+          ...(seq === undefined ? {} : { seq }),
+        })
+      } catch (error) {
+        kernel.logger.warn(
+          `OMB：状态机事件交接失败（已隔离）——${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
     switch (type) {
       /**
        * 用户消息：写入准入核对"用户原话"的**唯一**事实来源。

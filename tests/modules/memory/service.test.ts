@@ -65,7 +65,7 @@ describe('StoresService：双库与 cwd 身份', () => {
     expect(set?.store('project')).not.toBe(set?.store('user'))
     expect(set?.migrated.map(entry => entry.scope).sort()).toEqual(['project', 'user'])
     // 0 → 3：v1 建表 + v2 加 content_hash + v3 重建 edge 表加入 related（旧库原地升级）
-    expect(set?.migrated.every(entry => entry.from === 0 && entry.to === 3)).toBe(true)
+    expect(set?.migrated.every(entry => entry.from === 0 && entry.to === 4)).toBe(true)
 
     // 路径遵循规划 §5.3 的布局
     expect(port.opened).toEqual([port.userDbPath, projectDbPathFor(ws.dir)])

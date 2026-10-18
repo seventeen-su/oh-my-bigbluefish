@@ -140,10 +140,13 @@ export const STORES_SERVICE = 'stores'
  *   为什么必须重建：SQLite 不能 ALTER CHECK；行数有界、事务内 `INSERT SELECT`
  *   后 `DROP/RENAME`。`related` 是**自动连边**（实体重合），不是用户裁决，
  *   因此与 `supersedes`/`conflicts_with` 的时序/冲突语义分开。
+ * - v4：**纯加法**。`memory_utility`（曝光/使用/反馈的效用账本 + wrong 二次确认
+ *   待定态 + 可逆归档来源）、`memory_feedback`（只增审计日志）、`memory_meta`
+ *   （自适应下限的 q 与目标精度 EWMA）。不改 `memory` 表：归档复用 `valid_to`。
  *
  * **这个常量与迁移表的最高版本必须一致**：`migrate()` 在缺省步骤表下会做这条
  * 自检，不一致就抛"契约漂移"。本轮曾经因为表到了 v2 而常量还是 1，
  * 只能靠 `openMemoryStore` 显式传步骤表绕过——那等于把自检关掉，
- * 现在已收口（常量抬到 3、显式参数撤掉）。
+ * 现在已收口（常量抬到 4、显式参数撤掉）。
  */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4

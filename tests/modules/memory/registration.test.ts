@@ -171,6 +171,9 @@ describe('omb-memory 配置', () => {
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
+      lexicalFloorMode: 'relative',
+      lexicalFloorTargetPrecision: 0.6,
+      feedbackCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -187,6 +190,9 @@ describe('omb-memory 配置', () => {
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
+      lexicalFloorMode: 'relative',
+      lexicalFloorTargetPrecision: 0.6,
+      feedbackCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
     expect(memoryConfigSchema.parse({ embeddingThreads: 4 })).toEqual({
@@ -200,6 +206,9 @@ describe('omb-memory 配置', () => {
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
+      lexicalFloorMode: 'relative',
+      lexicalFloorTargetPrecision: 0.6,
+      feedbackCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -235,6 +244,9 @@ describe('omb-memory 配置', () => {
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
+      lexicalFloorMode: 'relative',
+      lexicalFloorTargetPrecision: 0.6,
+      feedbackCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -344,7 +356,7 @@ describe('omb-memory 与真实内核', () => {
     // 库路径/项目库数/schema/迁移由**唯一报数处**给出：存储服务自己的 status()
     const storeStatus = service?.status()
     expect(storeStatus?.detail).toContain('knowledge.db')
-    expect(storeStatus?.detail).toContain('迁移 v0→v3')
+    expect(storeStatus?.detail).toContain('迁移 v0→v4')
     expect(storeStatus?.openProjects).toEqual([projectIdentity(ws.dir)])
     expect(storeStatus?.maxOpenProjects).toBe(16)
     expect(storeStatus?.detail).not.toMatch(/已打开项目库|会话→cwd/)
@@ -354,7 +366,7 @@ describe('omb-memory 与真实内核', () => {
     expect(health.metrics?.['openProjects']).toBe(1)
     // 结构实际版本 = 步骤表最高版本（2）；ABI 的 `SCHEMA_VERSION` 此刻仍是 1（kernel/** 由另一个
     // agent 在改，本轮不许碰），所以这里断言的是**库的**版本，不是那个常量。
-    expect(health.metrics?.['schemaVersion']).toBe(3)
+    expect(health.metrics?.['schemaVersion']).toBe(4)
 
     // 关闭后库确实关了：旧句柄报错而不是继续读写
     handle.dispose()

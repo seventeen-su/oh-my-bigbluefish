@@ -268,8 +268,16 @@ export interface MemoryToolDeps {
    * 缺省关闭：单测/旧装配保持"只返回直接命中"；生产由模块配置默认打开。
    */
   readonly expandRelated?: boolean
-  /** 检索完成后的只读观测口（3.7 Wave 2：累计 `relatedExpanded` 等读数）。绝不改变结果。 */
-  readonly onRetrieved?: (result: RetrieveResult) => void
+  /**
+   * 自适应词法下限（3.7 Wave 2 / R9 C3，来自模块配置与校准器）。
+   *
+   * - `mode`：`relative`（默认，`max(top×0.35, Q_q)`）/ `fixed`（旧 0.5 回滚）；
+   * - `quantile`：惰性读取校准器当前 q（每轮可能被在线校准改动；缺省 0.5）。
+   */
+  readonly lexicalFloorMode?: 'relative' | 'fixed'
+  readonly lexicalFloorQuantile?: () => number
+  /** 检索完成后的只读观测口（3.7 Wave 2：曝光/扩展读数）。绝不改变结果。 */
+  readonly onRetrieved?: (result: RetrieveResult, sessionId?: string) => void
 }
 
 export interface ForgetOutcome {
@@ -415,9 +423,9 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       if (!resolved.ok) return { kind: 'error', text: `${RECALL_TOOL} 不可用：${resolved.error}` }
       const ports = resolvePorts(deps)
       const band = readPressureBand(deps, sessionId)
-      const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band, deps.expandRelated === true), ports)
+      const result = await retrieve(resolved.stores, toRetrieveQuery(parsed.value, band, deps), ports)
       try {
-        deps.onRetrieved?.(result)
+        deps.onRetrieved?.(result, sessionId)
       } catch {
         // 观测口失败不得改变召回结果
       }
@@ -648,7 +656,7 @@ function resolveStores(
 function toRetrieveQuery(
   args: RecallArgs,
   band: PressureBand | undefined,
-  expandRelated: boolean,
+  deps: MemoryToolDeps,
 ): RetrieveQuery {
   return {
     text: args.query,
@@ -659,7 +667,17 @@ function toRetrieveQuery(
     // `auto` 不写字面量：门控默认行为就是 auto；`always` 是唯一需要穿透的档位。
     ...(args.mode === 'always' ? { mode: 'always' as const } : {}),
     ...(band !== undefined ? { pressureBand: band } : {}),
-    ...(expandRelated ? { expandRelated: true } : {}),
+    ...(deps.expandRelated === true ? { expandRelated: true } : {}),
+    ...(deps.lexicalFloorMode !== undefined ? { lexicalFloorMode: deps.lexicalFloorMode } : {}),
+    ...(() => {
+      if (deps.lexicalFloorQuantile === undefined) return {}
+      try {
+        const quantile = deps.lexicalFloorQuantile()
+        return Number.isFinite(quantile) ? { lexicalFloorQuantile: quantile } : {}
+      } catch {
+        return {}
+      }
+    })(),
   }
 }
 

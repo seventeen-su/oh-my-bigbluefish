@@ -8,7 +8,6 @@
 import { describe, expect, it } from 'vitest'
 import type { MemoryRecord } from '../../../kernel/abi/index.js'
 import {
-  DEFAULT_LEXICAL_SCORE_FLOOR,
   retrieve,
 } from '../../../modules/memory/retrieve.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
@@ -36,7 +35,8 @@ describe('retrieve：词法分数下限（3.7-M3）', () => {
     })
     const result = await retrieve([tagged(store)], { text: '端口 回顾', limit: 5 }, { clock: CLOCK })
     expect(result.items.map(item => item.id)).toEqual(['relevant'])
-    expect(result.stats.lexicalFloor).toBe(DEFAULT_LEXICAL_SCORE_FLOOR)
+    expect(result.stats.lexicalFloorMode).toBe('relative')
+    expect(result.stats.lexicalFloor).toBeCloseTo(0.7, 12) // Q_0.5([0.2,1.2]) = 0.7
     expect(result.stats.lexicalFloorDropped).toBe(1)
   })
 

@@ -41,6 +41,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import { ASSERTED_BY, EDGE_TYPES, MEMORY_KINDS } from '../../kernel/abi/index.js'
 import { blobToVector, cosineSimilarity, vectorToBlob } from './embed.js'
+import { EMPTY_UTILITY_COUNTERS, estimateUtility, type UtilityCounters } from './utility.js'
 import {
   DATA_DIR_NAME,
   MEMORY_DIR_NAME,
@@ -60,6 +61,9 @@ import { ftsMatchExpr, tokenizeForFts } from './text.js'
 
 /** 写锁等待上限：1000ms。**快速失败**，不做无限等待（规划 R8）。 */
 export const WRITE_BUSY_TIMEOUT_MS = 1000
+
+/** 反馈动作里"最近被使用过"的判据：7 天内被用过则 `stale` 只记信号、不归档。 */
+export const STALE_RECENT_MS = 7 * 24 * 60 * 60 * 1000
 
 /** 单条 SQL 的最大绑定参数个数（SQLite 默认上限 32766，取保守值以便确定性分块）。 */
 export const MAX_SQL_VARS = 500
@@ -243,11 +247,92 @@ export interface VectorStoreApi {
 }
 
 /**
+ * 显式反馈动作（3.7 Wave 2 / R9 C2；审计日志的枚举）。
+ *
+ * `revive` / `archive` 是**内部动作**（命令的 `useful` 会自动触发 `revive`），
+ * 仍写审计行以便"谁在什么时候复活了哪条"可查。
+ */
+export type FeedbackAction = 'useful' | 'wrong' | 'stale' | 'noise' | 'revive' | 'archive'
+
+/** 一条记忆的效用账本（`memory_utility` 行；缺省行 = 从未曝光）。 */
+export interface UtilityCountersRow extends UtilityCounters {
+  readonly memoryId: string
+  readonly lastAt: number | null
+  readonly pendingWrongAt: number | null
+  readonly pendingWrongSession: string | null
+  readonly archivedAt: number | null
+  readonly archiveReason: string | null
+}
+
+/** `recordFeedback` 的结果类别（回执与测试按它断言语义）。 */
+export type FeedbackChange =
+  | 'useful'
+  | 'wrong-pending'
+  | 'wrong-confirmed'
+  | 'stale-archived'
+  | 'stale-recorded'
+  | 'noise'
+  | 'revive'
+  | 'not-found'
+
+export interface FeedbackResult {
+  readonly change: FeedbackChange
+  readonly counters: UtilityCountersRow
+  /** 这次动作是否让条目从"可注入"变成"归档"（valid_to 写入）。 */
+  readonly archived: boolean
+  /** 这次动作是否让条目从归档回到有效（valid_to 清除）。 */
+  readonly revived: boolean
+  /** 待二次确认的 wrong 仍挂着（第一次 wrong）。 */
+  readonly pending: boolean
+}
+
+/**
+ * **效用账本面**（结构探测，不进 ABI；与 `UsageApi` 同一条模式）。
+ *
+ * 为什么需要：`use_count` 只有"曝光"一个数，`utility = P(used|exposed)` 需要分母与
+ * 使用事件；显式反馈需要可逆归档与审计。把这些放进 `memory_utility` / `memory_feedback`，
+ * 读取路径（`getMany`）一次性 JOIN 即可，**不需要 ABI 变更**。
+ */
+export interface UtilityStoreApi {
+  /** 读计数（缺失的 id 不返回行；调用方按"从未曝光"处理）。 */
+  utilityStats(ids: readonly string[]): Promise<readonly UtilityCountersRow[]>
+  /** 全库曝光/使用的合计（自适应下限的精度 EWMA 用）。 */
+  utilityTotals(): Promise<{ readonly exposed: number; readonly used: number }>
+  /** 曝光 +1（`markUsed` 内部已自动调用；此方法供"只曝光未使用"的调用方显式记）。 */
+  recordExposure(ids: readonly string[], at: number): Promise<number>
+  /** 隐式使用 +1（实体键命中；见 `feedback.ts` 的 `used_tool` 匹配）。 */
+  recordUsed(ids: readonly string[], at: number): Promise<number>
+  /** 显式反馈（`/omb-feedback` 命令调用）。会按动作更新计数与（可逆）归档状态。 */
+  recordFeedback(input: {
+    readonly memoryId: string
+    readonly action: FeedbackAction
+    readonly sessionId: string | null
+    readonly at: number
+    readonly detail?: string
+  }): Promise<FeedbackResult>
+  /** 读审计日志（倒序；`limit` 有界）。 */
+  feedbackLog(memoryId: string, limit?: number): Promise<readonly {
+    readonly action: FeedbackAction
+    readonly sessionId: string | null
+    readonly at: number
+    readonly detail: string | null
+  }[]>
+  /** 自适应阈值的持久状态（`memory_meta`）。 */
+  utilityMeta(key: string): Promise<string | undefined>
+  setUtilityMeta(key: string, value: string): Promise<void>
+}
+
+/** 从端口句柄取效用账本面；不是本实现返回 undefined（调用方退回旧 `useCount` 公式）。 */
+export function asUtilityStore(store: MemoryStore): UtilityStoreApi | undefined {
+  return store instanceof SqliteStore ? store : undefined
+}
+
+/**
  * 具体实现类型。除端口外还暴露状态面需要的诊断字段，以及两个**结构面**能力
  * （`UsageApi` 的使用计数、`RecordScanApi` 的整合扫描）——它们不进 ABI，
  * 由 `asUsageStore` / `asRecordScanner` 按能力探测（模式同 `asVectorStore`）。
  */
-export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe, UsageApi, RecordScanApi {
+export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe, UsageApi, RecordScanApi, UtilityStoreApi {
   /** 库文件路径（`:memory:` 时为该字面量）。 */
   readonly dbPath: string
   /** 打开时的迁移结果；未迁移时为 `{from: n, to: n}`。 */
@@ -304,6 +389,18 @@ export function asRecordScanner(store: MemoryStore): RecordScanApi | undefined {
 
 const RECORD_COLUMNS = `id, scope, kind, text, content_hash, source_ref, asserted_by,
   observed_at, valid_to, superseded_by, last_used_at, use_count, project`
+
+/**
+ * 读取路径随行带出的**效用账本列**（3.7 Wave 2 / R9 C1）。
+ *
+ * 为什么 JOIN 而不是第二次查询：`getMany` 有一条硬要求"批量而不是 N+1"
+ * （旧实现每 id 一次 SELECT 是明确缺陷）；再补一条 utility 查询虽然仍是一次，
+ * 但会把"每库一次"变成"每库两次"。LEFT JOIN 让读取仍是一条 SQL，
+ * 缺失账本行（从未曝光）自然得到 NULL → utility 用基率。
+ */
+const UTILITY_COLUMNS = `u.exposed AS utility_exposed, u.used AS utility_used,
+  u.useful AS utility_useful, u.wrong AS utility_wrong, u.stale AS utility_stale, u.noise AS utility_noise,
+  u.archived_at AS utility_archived_at, u.archive_reason AS utility_archive_reason`
 
 const INSERT_RECORD_SQL = `
 INSERT INTO memory (
@@ -534,6 +631,66 @@ function toEdge(row: unknown): Edge {
     type: enumOf(r['type'], EDGE_TYPES, 'type'),
     createdAt: integerOf(r['created_at'], 'created_at'),
   }
+}
+
+/** 没账本行时的计数（"从未曝光"→ utility 应等于基率，不是 0）。 */
+function emptyUtilityRow(memoryId: string): UtilityCountersRow {
+  return {
+    memoryId,
+    ...EMPTY_UTILITY_COUNTERS,
+    lastAt: null,
+    pendingWrongAt: null,
+    pendingWrongSession: null,
+    archivedAt: null,
+    archiveReason: null,
+  }
+}
+
+function toUtilityRow(row: unknown): UtilityCountersRow {
+  const r = asRow(row, '效用账本行')
+  const count = (field: string): number => {
+    const value = r[field]
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0
+  }
+  return {
+    memoryId: textOf(r['memory_id'], 'memory_id'),
+    exposed: count('exposed'),
+    used: count('used'),
+    useful: count('useful'),
+    wrong: count('wrong'),
+    stale: count('stale'),
+    noise: count('noise'),
+    lastAt: nullableIntegerOf(r['last_at'], 'last_at'),
+    pendingWrongAt: nullableIntegerOf(r['pending_wrong_at'], 'pending_wrong_at'),
+    pendingWrongSession: nullableTextOf(r['pending_wrong_session'], 'pending_wrong_session'),
+    archivedAt: nullableIntegerOf(r['archived_at'], 'archived_at'),
+    archiveReason: nullableTextOf(r['archive_reason'], 'archive_reason'),
+  }
+}
+
+/**
+ * 从"记忆 + LEFT JOIN 效用行"里挂 utility（**非枚举**：不改变 `MemoryRecord` 的
+ * 可观察形状，`toEqual`/JSON 序列化都看不到；检索侧按结构读 `record.utility`）。
+ */
+function attachUtilityFromRow(record: MemoryRecord, row: unknown): void {
+  const r = asRow(row, '记忆+效用行')
+  const count = (field: string): number => {
+    const value = r[field]
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0
+  }
+  const counters: UtilityCounters = {
+    exposed: count('utility_exposed'),
+    used: count('utility_used'),
+    useful: count('utility_useful'),
+    wrong: count('utility_wrong'),
+    stale: count('utility_stale'),
+    noise: count('utility_noise'),
+  }
+  Object.defineProperty(record, 'utility', {
+    value: estimateUtility(counters),
+    enumerable: false,
+    configurable: true,
+  })
 }
 
 function chunkArray<T>(items: readonly T[], size: number): readonly (readonly T[])[] {
@@ -874,7 +1031,258 @@ class SqliteStore implements SqliteMemoryStore {
           [at, ...chunk],
         )
       }
+      // 3.7 Wave 2（R9 C1）：**曝光**同时进效用账本。
+      // `use_count` 保留（ABI 语义不变、旧消费者仍在读），utility 用它当分母。
+      try {
+        this.#bumpUtility(unique, 'exposed', at)
+      } catch {
+        // 账本写失败不改变"召回已发生"这个事实（读取侧会退化为空计数 = 基率）
+      }
       return updated
+    })
+  }
+
+  // ── 效用账本（3.7 Wave 2 / R9 C1+C2；结构面，不进 ABI）──────────────────
+
+  /** 读一批账本行（缺失的 id 不返回；调用方按"从未曝光"处理）。 */
+  #utilityRows(ids: readonly string[]): readonly UtilityCountersRow[] {
+    const unique = [...new Set(ids)].filter(id => typeof id === 'string' && id.length > 0)
+    const rows: UtilityCountersRow[] = []
+    for (const chunk of chunkArray(unique, MAX_SQL_VARS)) {
+      const placeholders = chunk.map(() => '?').join(', ')
+      for (const row of this.#all(
+        `SELECT memory_id, exposed, used, useful, wrong, stale, noise, last_at,
+                pending_wrong_at, pending_wrong_session, archived_at, archive_reason
+           FROM memory_utility WHERE memory_id IN (${placeholders})`,
+        chunk,
+      )) {
+        rows.push(toUtilityRow(row))
+      }
+    }
+    return rows
+  }
+
+  #utilityRow(id: string): UtilityCountersRow {
+    return this.#utilityRows([id])[0] ?? emptyUtilityRow(id)
+  }
+
+  /** 计数 +1（字段来自闭合联合，SQL 拼接安全）。**只为已存在的记忆建账本行**。 */
+  #bumpUtility(ids: readonly string[], field: 'exposed' | 'used', at: number): number {
+    let touched = 0
+    for (const id of ids) {
+      // 孤儿 id（已被 forget / 来自另一个库）不建账本行：否则效用表会积累无主行。
+      const exists = this.#get('SELECT 1 AS present FROM memory WHERE id = ?', [id])
+      if (exists === undefined) continue
+      touched += this.#run(
+        `INSERT INTO memory_utility (memory_id, ${field}, last_at) VALUES (?, 1, ?)
+           ON CONFLICT(memory_id) DO UPDATE SET ${field} = ${field} + 1, last_at = excluded.last_at`,
+        [id, at],
+      )
+    }
+    return touched
+  }
+
+  async utilityStats(ids: readonly string[]): Promise<readonly UtilityCountersRow[]> {
+    this.#assertUsable()
+    return this.#utilityRows(ids)
+  }
+
+  async utilityTotals(): Promise<{ readonly exposed: number; readonly used: number }> {
+    this.#assertUsable()
+    const row = this.#get('SELECT COALESCE(SUM(exposed), 0) AS exposed, COALESCE(SUM(used), 0) AS used FROM memory_utility') ?? {}
+    return {
+      exposed: typeof row['exposed'] === 'number' ? row['exposed'] : 0,
+      used: typeof row['used'] === 'number' ? row['used'] : 0,
+    }
+  }
+
+  async recordExposure(ids: readonly string[], at: number): Promise<number> {
+    this.#assertUsable()
+    const unique = [...new Set(ids)].filter(id => typeof id === 'string' && id.length > 0)
+    if (unique.length === 0) return 0
+    return await this.#enqueue(() => {
+      this.#assertOpen()
+      return this.#bumpUtility(unique, 'exposed', at)
+    })
+  }
+
+  async recordUsed(ids: readonly string[], at: number): Promise<number> {
+    this.#assertUsable()
+    const unique = [...new Set(ids)].filter(id => typeof id === 'string' && id.length > 0)
+    if (unique.length === 0) return 0
+    return await this.#enqueue(() => {
+      this.#assertOpen()
+      return this.#bumpUtility(unique, 'used', at)
+    })
+  }
+
+  async recordFeedback(input: {
+    readonly memoryId: string
+    readonly action: FeedbackAction
+    readonly sessionId: string | null
+    readonly at: number
+    readonly detail?: string
+  }): Promise<FeedbackResult> {
+    this.#assertUsable()
+    return await this.#enqueue(() => {
+      this.#assertOpen()
+      const memory = this.#get('SELECT use_count, last_used_at, valid_to, superseded_by FROM memory WHERE id = ?', [
+        input.memoryId,
+      ])
+      if (memory === undefined) {
+        return { change: 'not-found' as const, counters: emptyUtilityRow(input.memoryId), archived: false, revived: false, pending: false }
+      }
+      const at = input.at
+      this.#run('INSERT OR IGNORE INTO memory_utility (memory_id) VALUES (?)', [input.memoryId])
+      const before = this.#utilityRow(input.memoryId)
+      let change: FeedbackChange
+      let archived = false
+      let revived = false
+      let action: FeedbackAction = input.action
+      const log = (detail?: string, logAction: FeedbackAction = action): void => {
+        this.#run(
+          'INSERT INTO memory_feedback (memory_id, action, session_id, at, detail) VALUES (?, ?, ?, ?, ?)',
+          [input.memoryId, logAction, input.sessionId, at, detail ?? input.detail ?? null],
+        )
+      }
+
+      switch (input.action) {
+        case 'useful': {
+          this.#run(
+            'UPDATE memory_utility SET useful = useful + 1, last_at = ?, pending_wrong_at = NULL, pending_wrong_session = NULL WHERE memory_id = ?',
+            [at, input.memoryId],
+          )
+          // 1 次正反馈即可复活"反馈归档"的条目（R9 C2 迟滞：降级需 2 次，复活只需 1 次）。
+          const isFeedbackArchive = before.archivedAt !== null && (before.archiveReason ?? '').startsWith('feedback:')
+          const supersededBy = memory['superseded_by']
+          if (isFeedbackArchive && supersededBy === null) {
+            this.#run('UPDATE memory SET valid_to = NULL WHERE id = ? AND superseded_by IS NULL', [input.memoryId])
+            this.#run('UPDATE memory_utility SET archived_at = NULL, archive_reason = NULL WHERE memory_id = ?', [input.memoryId])
+            revived = true
+            action = 'revive'
+            log('useful → 复活归档条目', 'revive')
+            change = 'revive'
+          } else {
+            log()
+            change = 'useful'
+          }
+          break
+        }
+        case 'wrong': {
+          const pendingSession = before.pendingWrongSession
+          const confirmed = before.pendingWrongAt !== null && pendingSession !== null && pendingSession !== input.sessionId
+          this.#run('UPDATE memory_utility SET wrong = wrong + 1, last_at = ? WHERE memory_id = ?', [at, input.memoryId])
+          if (confirmed) {
+            this.#run('UPDATE memory_utility SET pending_wrong_at = NULL, pending_wrong_session = NULL WHERE memory_id = ?', [input.memoryId])
+            const validNow = memory['valid_to'] === null && memory['superseded_by'] === null
+            if (validNow) {
+              this.#run('UPDATE memory SET valid_to = ? WHERE id = ? AND valid_to IS NULL AND superseded_by IS NULL', [at, input.memoryId])
+              this.#run(
+                'UPDATE memory_utility SET archived_at = ?, archive_reason = ? WHERE memory_id = ?',
+                [at, 'feedback:wrong', input.memoryId],
+              )
+              archived = true
+            }
+            log(`第二次独立确认（首个确认会话 ${pendingSession}）→ 可逆 supersede`)
+            change = 'wrong-confirmed'
+          } else {
+            this.#run(
+              'UPDATE memory_utility SET pending_wrong_at = ?, pending_wrong_session = ? WHERE memory_id = ?',
+              [at, input.sessionId, input.memoryId],
+            )
+            log('第一次 wrong：只挂待确认，不动真值')
+            change = 'wrong-pending'
+          }
+          break
+        }
+        case 'stale': {
+          this.#run('UPDATE memory_utility SET stale = stale + 1, last_at = ? WHERE memory_id = ?', [at, input.memoryId])
+          const useCount = typeof memory['use_count'] === 'number' ? memory['use_count'] : 0
+          const lastUsedAt = typeof memory['last_used_at'] === 'number' ? memory['last_used_at'] : 0
+          const recentlyUsed = useCount > 0 && lastUsedAt >= at - STALE_RECENT_MS
+          const validNow = memory['valid_to'] === null && memory['superseded_by'] === null
+          if (!recentlyUsed && validNow) {
+            this.#run('UPDATE memory SET valid_to = ? WHERE id = ? AND valid_to IS NULL AND superseded_by IS NULL', [at, input.memoryId])
+            this.#run(
+              'UPDATE memory_utility SET archived_at = ?, archive_reason = ? WHERE memory_id = ?',
+              [at, 'feedback:stale', input.memoryId],
+            )
+            archived = true
+            action = 'archive'
+            log('最近未使用 → 可逆归档（valid_to；不删行）', 'archive')
+            change = 'stale-archived'
+          } else {
+            log(recentlyUsed ? '最近被使用过：只记负信号，不归档' : '已被取代/失效：只记负信号')
+            change = 'stale-recorded'
+          }
+          break
+        }
+        case 'noise': {
+          this.#run('UPDATE memory_utility SET noise = noise + 1, last_at = ? WHERE memory_id = ?', [at, input.memoryId])
+          log()
+          change = 'noise'
+          break
+        }
+        case 'revive':
+        case 'archive': {
+          const isFeedbackArchive = before.archivedAt !== null && (before.archiveReason ?? '').startsWith('feedback:')
+          if (input.action === 'revive' && isFeedbackArchive && memory['superseded_by'] === null) {
+            this.#run('UPDATE memory SET valid_to = NULL WHERE id = ? AND superseded_by IS NULL', [input.memoryId])
+            this.#run('UPDATE memory_utility SET archived_at = NULL, archive_reason = NULL WHERE memory_id = ?', [input.memoryId])
+            revived = true
+            log('显式 revive')
+            change = 'revive'
+          } else {
+            log('revive 不可用（不是反馈归档，或已被其它记忆取代）')
+            change = 'revive'
+          }
+          break
+        }
+      }
+      if (input.detail !== undefined) {
+        // 明细只在分支未自带 detail 时补写一条；分支内已带原因的日志行不重复
+        if (action === input.action) log(input.detail)
+      }
+      return { change, counters: this.#utilityRow(input.memoryId), archived, revived, pending: change === 'wrong-pending' }
+    })
+  }
+
+  async feedbackLog(
+    memoryId: string,
+    limit = 10,
+  ): Promise<readonly { action: FeedbackAction; sessionId: string | null; at: number; detail: string | null }[]> {
+    this.#assertUsable()
+    const bounded = Number.isFinite(limit) ? Math.max(0, Math.min(100, Math.floor(limit))) : 0
+    if (bounded === 0) return []
+    const rows = this.#all(
+      'SELECT action, session_id, at, detail FROM memory_feedback WHERE memory_id = ? ORDER BY at DESC, id DESC LIMIT ?',
+      [memoryId, bounded],
+    )
+    return rows.map(row => {
+      const r = asRow(row, '反馈日志')
+      return {
+        action: textOf(r['action'], 'action') as FeedbackAction,
+        sessionId: nullableTextOf(r['session_id'], 'session_id'),
+        at: integerOf(r['at'], 'at'),
+        detail: nullableTextOf(r['detail'], 'detail'),
+      }
+    })
+  }
+
+  async utilityMeta(key: string): Promise<string | undefined> {
+    this.#assertUsable()
+    const row = this.#get('SELECT value FROM memory_meta WHERE key = ?', [key])
+    return row === undefined ? undefined : textOf(row['value'], 'value')
+  }
+
+  async setUtilityMeta(key: string, value: string): Promise<void> {
+    this.#assertUsable()
+    await this.#enqueue(() => {
+      this.#assertOpen()
+      this.#run(
+        'INSERT INTO memory_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        [key, value],
+      )
     })
   }
 
@@ -1033,8 +1441,14 @@ class SqliteStore implements SqliteMemoryStore {
 
   async get(id: string): Promise<MemoryRecord | undefined> {
     this.#assertUsable()
-    const row = this.#get(`SELECT ${RECORD_COLUMNS} FROM memory WHERE id = ?`, [id])
-    return row === undefined ? undefined : toRecord(row)
+    const row = this.#get(
+      `SELECT ${RECORD_COLUMNS}, ${UTILITY_COLUMNS} FROM memory m LEFT JOIN memory_utility u ON u.memory_id = m.id WHERE m.id = ?`,
+      [id],
+    )
+    if (row === undefined) return undefined
+    const record = toRecord(row)
+    attachUtilityFromRow(record, row)
+    return record
   }
 
   /**
@@ -1048,8 +1462,14 @@ class SqliteStore implements SqliteMemoryStore {
     const found = new Map<string, MemoryRecord>()
     for (const chunk of chunkArray(unique, MAX_SQL_VARS)) {
       const placeholders = chunk.map(() => '?').join(', ')
-      for (const row of this.#all(`SELECT ${RECORD_COLUMNS} FROM memory WHERE id IN (${placeholders})`, chunk)) {
+      for (const row of this.#all(
+        `SELECT ${RECORD_COLUMNS}, ${UTILITY_COLUMNS}
+           FROM memory m LEFT JOIN memory_utility u ON u.memory_id = m.id
+          WHERE m.id IN (${placeholders})`,
+        chunk,
+      )) {
         const record = toRecord(row)
+        attachUtilityFromRow(record, row)
         found.set(record.id, record)
       }
     }
