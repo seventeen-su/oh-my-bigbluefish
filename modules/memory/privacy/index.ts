@@ -383,7 +383,7 @@ export function installPrivacy(
     if (counts !== null && counts.history > counts.active) {
       lines.push(
         ' 已结束会话的记录不再掐住新会话；要清掉它们：'
-        + '/omb-privacy clear（全部已结束的）或 /omb-privacy forget <会话id>（单条）。',
+        + '/omb-privacy-clean clear（全部已结束的）或 /omb-privacy-clean <会话id>（单条）。',
       )
     }
     lines.push(
@@ -586,7 +586,7 @@ export function installPrivacy(
          *
          * `hint` 会在输入框里作为占位提示显示，也顺便告诉用户参数怎么给。
          */
-        input: { hint: '[status | normal | read-only | sealed | trust | forget <会话id> | clear]' },
+        input: { hint: '[status | normal | read-only | sealed | trust]' },
         handler: (invocation: CommandInvocationLike): CommandResultLike => {
           // 用户手打的命令：先把血缘登记下来（子代理的父链），再执行。
           const session = sessionOfInvocation(invocation)
@@ -607,8 +607,8 @@ export function installPrivacy(
       const returnedClean = commands.register({
         definitionId: PRIVACY_CLEAN_COMMAND_ID,
         name: PRIVACY_CLEAN_COMMAND_NAME,
-        description: '清除当前或指定会话残留的受限记录',
-        input: { hint: '[会话id]' },
+        description: '清除当前/指定会话或全部已结束会话的受限记录',
+        input: { hint: '[会话id | clear]（缺省=当前会话）' },
         handler: (invocation: CommandInvocationLike): CommandResultLike => {
           const session = sessionOfInvocation(invocation)
           const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
@@ -705,7 +705,7 @@ export function installPrivacy(
             ? '状态文件不可用（**未持久化**）'
             : `状态文件 ${durablePath}${durableError === null ? '（正常）' : `（降级：${durableError}）`}`,
           '当前会话的模式：用 /omb-privacy status 查看（状态面拿不到"这次是谁在问"）',
-          '清理已结束会话的记录：/omb-privacy clear 或 /omb-privacy forget <会话id>',
+          '清理受限记录：/omb-privacy-clean（当前会话）、/omb-privacy-clean <会话id> 或 /omb-privacy-clean clear（全部已结束）',
         ].join('；')
       } catch (error) {
         return `隐私状态渲染失败：${messageOf(error)}`

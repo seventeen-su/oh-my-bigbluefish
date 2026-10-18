@@ -98,29 +98,23 @@ describe('命令语法', () => {
     expect(a.trust).toHaveBeenCalledTimes(1)
   })
 
-  it('forget 把会话 id 透传给 api；不带 id 时给可读用法（不猜是哪个会话）', () => {
-    const withId = api()
-    expect(runPrivacyCommand('forget sess-A', withSession, withId)).toEqual({ kind: 'success', text: 'forget ok' })
-    expect(withId.forget).toHaveBeenCalledWith('sess-A')
-    expect(withId.clearInactive).not.toHaveBeenCalled()
-
-    const noId = api()
-    const result = runPrivacyCommand('forget', withSession, noId)
-    expect(result.kind).toBe('error')
-    expect(result.text).toContain('forget <会话id>')
-    expect(noId.forget).not.toHaveBeenCalled()
-  })
-
-  it('clear 走"清全部已结束会话"的通道', () => {
+  it('主命令不再承载 forget/clear（已拆到 /omb-privacy-clean）', () => {
     const a = api()
-    expect(runPrivacyCommand('clear', withSession, a)).toEqual({ kind: 'success', text: 'clear ok' })
-    expect(a.clearInactive).toHaveBeenCalledTimes(1)
+    for (const legacy of ['forget sess-A', 'clear']) {
+      const result = runPrivacyCommand(legacy, withSession, a)
+      expect(result.kind).toBe('error')
+      expect(result.text).toContain('错误的参数')
+    }
+    expect(a.forget).not.toHaveBeenCalled()
+    expect(a.clearInactive).not.toHaveBeenCalled()
   })
 
-  it('用法文本点名 forget / clear（用户要在输入框里看得到出口）', () => {
-    expect(PRIVACY_USAGE).toContain('forget')
-    expect(PRIVACY_USAGE).toContain('clear')
-    expect(runPrivacyCommand('help', withSession, api()).text).toContain('forget <会话id>')
+  it('用法文本只讲档位，并指向独立清除命令', () => {
+    expect(PRIVACY_USAGE).toContain('normal')
+    expect(PRIVACY_USAGE).toContain('sealed')
+    expect(PRIVACY_USAGE).toContain('/omb-privacy-clean')
+    expect(PRIVACY_USAGE).not.toContain('forget')
+    expect(PRIVACY_USAGE).not.toContain('clear')
   })
 
   it('拿不到会话 → 拒绝执行并说明原因（不猜是哪个会话）', () => {
@@ -170,6 +164,13 @@ describe('独立的清除命令 /omb-privacy-clean', () => {
     const a = api()
     expect(runPrivacyCleanCommand('sess-A', withSession, a)).toEqual({ kind: 'success', text: 'forget ok' })
     expect(a.forget).toHaveBeenCalledWith('sess-A')
+  })
+
+  it('clear = 清理全部已结束会话（批量出口留在这里，不在主命令）', () => {
+    const a = api()
+    expect(runPrivacyCleanCommand('clear', withSession, a)).toEqual({ kind: 'success', text: 'clear ok' })
+    expect(a.clearInactive).toHaveBeenCalledTimes(1)
+    expect(a.forget).not.toHaveBeenCalled()
   })
 
   it('拿不到当前会话且没给 id → 拒绝并说明（不猜）', () => {

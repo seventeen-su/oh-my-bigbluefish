@@ -66,12 +66,16 @@ export const PRIVACY_COMMAND_NAME = 'omb-privacy'
 export const PRIVACY_COMMAND_ID = 'omb-memory/privacy'
 
 export const PRIVACY_USAGE =
-  '用法：/omb-privacy [status | normal | read-only | sealed | trust | forget <会话id> | clear]'
+  '用法：/omb-privacy [status | normal | read-only | sealed | trust]'
   + '（不带参数 = status；只影响当前会话，子代理继承；trust 只清除 fail-closed 兜底标记；'
-  + 'forget/clear 清除当前或指定会话残留的受限记录）'
+  + '清理受限记录用 /omb-privacy-clean）'
 
 export const PRIVACY_CLEAN_COMMAND_NAME = 'omb-privacy-clean'
 export const PRIVACY_CLEAN_COMMAND_ID = 'omb-memory/privacy-clean'
+
+export const PRIVACY_CLEAN_USAGE =
+  '用法：/omb-privacy-clean [会话id | clear]'
+  + '（缺省 = 当前会话；clear = 清除全部已结束会话的记录；活跃会话不动）'
 
 export interface InvocationSession {
   readonly sessionId: string | null
@@ -164,21 +168,6 @@ export function runPrivacyCommand(
       case 'trust':
         return api.trust()
 
-      case 'forget': {
-        const target = words[1]
-        if (target === undefined) {
-          return {
-            kind: 'error',
-            text: 'forget 需要指明会话：/omb-privacy forget <会话id>'
-              + '（全部会话显式设置见 /omb-privacy status）。',
-          }
-        }
-        return api.forget(target)
-      }
-
-      case 'clear':
-        return api.clearInactive()
-
       case 'help':
       case '?':
         return { kind: 'success', text: PRIVACY_USAGE }
@@ -204,14 +193,17 @@ export function runPrivacyCleanCommand(
   session: InvocationSession,
   api: PrivacyCommandApi,
 ): CommandResultLike {
-  const target = rawInput.trim().split(/\s+/).filter(word => word.length > 0)[0]
+  const words = rawInput.trim().split(/\s+/).filter(word => word.length > 0)
+  const target = words[0]
   try {
+    // 不带参数 = **当前会话**（用户最常见的用途）；不再要求用户先查 id。
     if (target === undefined) {
       if (session.sessionId === null) {
-        return { kind: 'error', text: '读取当前会话失败：请提供会话 id。' }
+        return { kind: 'error', text: `读取当前会话失败：请提供会话 id。${PRIVACY_CLEAN_USAGE}` }
       }
       return api.forget(session.sessionId)
     }
+    if (target.toLowerCase() === 'clear') return api.clearInactive()
     return api.forget(target)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

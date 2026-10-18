@@ -233,11 +233,15 @@ describe('并入验收：删掉 omb-privacy 行之后，制品写入仍受闸门
       service?.record('src/plan.md', undefined, 's1')
       expect(service?.topFor('plan', 3, 's1')).toHaveLength(1)
 
-      // ② 命令仍在（名字没变；注册从记忆库的 apply 走），forget / clear 也在 hint 里
+      // ② 命令仍在（名字没变；注册从记忆库的 apply 走）。
+      // v4：forget/clear 已拆到 /omb-privacy-clean，主命令 hint 只讲档位。
       const command = definitions.find(item => item.name === 'omb-privacy')
       expect(command, '命令没注册——并入之后用户就没有改档位的入口了').toBeDefined()
-      expect(command?.input?.hint).toContain('forget')
-      expect(command?.input?.hint).toContain('clear')
+      expect(command?.input?.hint).not.toContain('forget')
+      expect(command?.input?.hint).not.toContain('clear')
+      const clean = definitions.find(item => item.name === 'omb-privacy-clean')
+      expect(clean, '独立清除命令必须注册').toBeDefined()
+      expect(clean?.input?.hint).toContain('会话id')
 
       // ③ 真命令改档位 → 制品的写与读立刻被拒（闸门没丢）
       const sealed = await command?.handler({ rawInput: 'sealed', agent: { id: 's1' } })
@@ -246,8 +250,8 @@ describe('并入验收：删掉 omb-privacy 行之后，制品写入仍受闸门
       expect(() => service?.topFor('plan', 3, 's1')).toThrow(/sealed/)
       expect(() => service?.list('s1')).toThrow(/sealed/)
 
-      // ④ 逃生口仍在：forget 之后该会话回到基线，写入恢复
-      const forgotten = await command?.handler({ rawInput: 'forget s1', agent: { id: 's1' } })
+      // ④ 逃生口仍在：独立清除命令把该会话清回基线，写入恢复
+      const forgotten = await clean?.handler({ rawInput: 's1', agent: { id: 's1' } })
       expect(forgotten?.kind).toBe('success')
       expect(service?.record('src/new.md', undefined, 's1')).toBeDefined()
 

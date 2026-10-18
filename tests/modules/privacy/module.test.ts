@@ -123,9 +123,10 @@ async function runCommand(
   commands: FakeCommands,
   rawInput: string,
   agent?: unknown,
+  name = 'omb-privacy',
 ): Promise<CommandResultLike> {
-  const definition = commands.definitions.find(item => item.name === 'omb-privacy')
-  if (definition === undefined) throw new Error('命令未注册')
+  const definition = commands.definitions.find(item => item.name === name)
+  if (definition === undefined) throw new Error(`命令未注册：${name}`)
   return await definition.handler({ rawInput, agent: agent ?? { id: 's1' } })
 }
 
@@ -373,7 +374,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
       await runCommand(booted.commands, 'sealed', { id: 'A' })
       expect(gateOf(booted)?.decide('A')).toMatchObject({ allowWrite: false })
 
-      const result = await runCommand(booted.commands, 'forget A')
+      const result = await runCommand(booted.commands, 'A', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('A')
       expect(gateOf(booted)?.decide('A')).toMatchObject({ allowRead: true, allowWrite: true })
@@ -393,7 +394,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const ws = tempWorkspace('omb-privacy-forget-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      const result = await runCommand(booted.commands, 'forget 查无此会话')
+      const result = await runCommand(booted.commands, '查无此会话', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('没有显式隐私设置')
       booted.dispose()
@@ -412,7 +413,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
 
       const second = boot({ path })
       await runCommand(second.commands, 'read-only', { id: 'live' }) // 本进程内活跃
-      const result = await runCommand(second.commands, 'clear')
+      const result = await runCommand(second.commands, 'clear', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('已清除 1 个已结束会话')
 
@@ -441,7 +442,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
       expect(text).toContain('old=sealed（已结束）')
       expect(text).toContain('live=sealed（活跃）')
       // 出口本身也要在状态面里点得到名，否则用户不知道有这条命令
-      expect(text).toContain('/omb-privacy clear')
+      expect(text).toContain('/omb-privacy-clean')
 
       const registry = second.kernel.service<StatusRegistry>(SERVICES.statusContributor)
       const rendered = registry?.list().find(c => c.name === '隐私')?.render() ?? ''
