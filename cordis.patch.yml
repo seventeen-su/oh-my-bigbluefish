@@ -262,10 +262,11 @@
                 - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
                 # OMB 自己的过程卡（v4：8 张方法卡从 `omb_method` 工具迁到 skills）。
                 # 目录随插件包发布；skill 正文只在模型调用 `skill` 时读取，不占常驻预算。
-                # 宿主 ctx.baseUrl 是 file URL（`pathToFileURL(dir).href + '/'`，
-                # 见 app-boot/src/index.ts:1222），不能直接 join；这里兼容
-                # file URL 与普通路径两种形态（IIFE 是单个表达式，符合 !!js 的约束）。
-                - !!js "(function(){var u=process.getBuiltinModule('node:url');var p=process.getBuiltinModule('node:path');var b=String(baseUrl);return p.join(b.indexOf('file:')===0?u.fileURLToPath(b):b,'skills');})()"
+                # 不能 join(baseUrl,'skills')：baseUrl 是**当前补丁层**的目录
+                # （file URL），对 bundle 层而言可能是 profile 根而不是插件根。
+                # 用 createRequire(baseUrl) 解析出 @omb/plugin 的 package.json，
+                # 再从它的目录取 skills——对两种 baseUrl 都成立（实测）。
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@omb/plugin/package.json')), 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: present
