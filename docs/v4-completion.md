@@ -6,13 +6,15 @@
 | --- | --- |
 | 研究报告 | `docs/research/2026-10-18-*.md` 共 **12 份**（记忆/推理/上下文/DSH 能力、学术前沿、生态、DSH 组合、上下文重构、结构审计、产品审计、记忆反馈、状态机） |
 | 裁决/架构 | `docs/v4-decision.md`、`docs/v4-architecture.md`、`AGENTS.md`、`README.md` |
-| 代码 | 提交 `ce2816e` → `d81bdd9` → `4cebf8e` → `ca353bf` → `81bdc43` → `2039f3b` |
-| 构建 | **g87**（7 个组件包） |
+| 版本 | **4.0.0**（根包 + 7 个组件 + 模块清单） |
+| 代码 | 提交 `ce2816e` → `d81bdd9` → `4cebf8e` → `ca353bf` → `81bdc43` → `2039f3b` → `778e911` → `299a4ae` → `86bb176` |
+| 构建 | **g88**（7 个组件包） |
 | 门禁 | tsc 0、eslint 0、vitest **1287 passed | 1 skipped**、`scripts/build.mjs` 成功、`check-resolution` 7/7 |
 | TS 7.1.0-dev canary | `tsc --noEmit` **0 类型错误**（不进门禁） |
-| C: 副本 | `@omb/plugin` = `2039f3b`，组件 g87，git status clean，7 个组件 import OK |
+| C: 副本 | `@omb/plugin` = `86bb176`，版本 **4.0.0**，组件 g88，git status clean，7 个组件 import OK |
+| 云端 | `origin/main` = `86bb176`（已推送） |
 
-## 真机验收（宿主重启到 g87 后）
+## 真机验收（宿主重启到 g87 后；4.0.0/g88 已发布，需再重启加载版本号）
 
 `omb_status` 实测：
 
