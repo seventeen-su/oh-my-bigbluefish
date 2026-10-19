@@ -1,6 +1,6 @@
 {
   "name": "@omb/plugin",
-  "version": "4.3.0",
+  "version": "4.5.0",
   "private": true,
   "engines": {
     "dsh": ">=0.2.0-rc.2 <=0.2.1-rc.2"
@@ -21,8 +21,10 @@
     "lint": "eslint .",
     "build": "node scripts/build.mjs",
     "check-resolution": "node scripts/check-resolution.mjs",
+    "version:check": "node scripts/version.mjs",
+    "version:sync": "node scripts/version.mjs --write",
     "fetch-embedding-model": "node scripts/fetch-embedding-model.mjs",
-    "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm check-resolution"
+    "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm check-resolution && pnpm version:check"
   },
   "dependencies": {
     "@omb/artifact": "workspace:*",
@@ -181,4 +183,3 @@
     "locale"
   ]
 }
-

@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../../kernel/version.js'
 /**
  * `omb-notify` 模块注册入口：外部通知服务的探测桥。
  *
@@ -17,7 +18,7 @@ import { toHostPlugin } from '../../kernel/hostEntry.js'
 export const NOTIFY_MODULE_ID = 'omb-notify'
 /** 服务名取 ABI 契约里的 `SERVICES.notify`（不是本地约定）。 */
 export const NOTIFY_SERVICE = SERVICES.notify
-export const NOTIFY_VERSION = '4.3.0'
+export const NOTIFY_VERSION = OMB_VERSION
 
 /**
  * 宿主服务名。`dsh/` 侧把 `ctx.get('desktopNotify')` 注册进内核服务表后，

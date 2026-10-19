@@ -1,0 +1,254 @@
+{
+  "major": 4,
+  "description": "OMB 版本号 = major.累计功能数.累计小功能数。每次新增/完成一个功能或小功能，先改本文件，再运行 node scripts/version.mjs --write。",
+  "features": [
+    {
+      "id": "memory-autonomy",
+      "name": "记忆自主化",
+      "since": "4.0",
+      "subfeatures": [
+        "偏好/决定自动捕获",
+        "项目活动捕获",
+        "会话结果捕获",
+        "去重与每会话上限"
+      ]
+    },
+    {
+      "id": "project-profile",
+      "name": "项目画像与入口",
+      "since": "4.0",
+      "subfeatures": [
+        "确定性项目画像",
+        "omb_project 入口",
+        "缓存与显式刷新",
+        "项目记忆 top3"
+      ]
+    },
+    {
+      "id": "memory-graph",
+      "name": "记忆事件图",
+      "since": "4.0",
+      "subfeatures": [
+        "related 边类型",
+        "写入后自动连边",
+        "召回 1-hop 扩展"
+      ]
+    },
+    {
+      "id": "reasoning-skills",
+      "name": "推理技能化",
+      "since": "4.0",
+      "subfeatures": [
+        "omb-r1…r8 过程卡",
+        "48 字符常驻提示",
+        "循环/无进展提示",
+        "/omb-depth effort 映射"
+      ]
+    },
+    {
+      "id": "context-zero",
+      "name": "上下文归零",
+      "since": "4.0",
+      "subfeatures": [
+        "删除 omb-context 组件",
+        "状态面保留压力行",
+        "不逐回合注入上下文"
+      ]
+    },
+    {
+      "id": "write-guard",
+      "name": "资源级写守卫",
+      "since": "4.1",
+      "subfeatures": [
+        "读取时内容哈希",
+        "edit+write 统一判定",
+        "post-execute 自刷新印记",
+        "writeIntent 按回合清空"
+      ]
+    },
+    {
+      "id": "capture-lifecycle",
+      "name": "捕获 pending→result 生命周期",
+      "since": "4.1",
+      "subfeatures": [
+        "tool/result 才写",
+        "失败写未生效",
+        "未知/未配对显式计数",
+        "无 callId 降级"
+      ]
+    },
+    {
+      "id": "project-root",
+      "name": "项目根统一身份",
+      "since": "4.1",
+      "subfeatures": [
+        "git root 解析",
+        "项目库/画像按根",
+        "子目录会话共享项目库",
+        "失败退化为 cwd"
+      ]
+    },
+    {
+      "id": "spacetime-snapshot",
+      "name": "L0–L5 时空快照",
+      "since": "4.1",
+      "subfeatures": [
+        "六层固定顺序",
+        "sessionState.situation()",
+        "≤2400 字符确定性",
+        "缺项显式标注"
+      ]
+    },
+    {
+      "id": "project-privacy",
+      "name": "omb_project 隐私门控",
+      "since": "4.1",
+      "subfeatures": [
+        "sealed 全拒",
+        "read-only 允许读",
+        "无归属只给画像",
+        "隐私测试"
+      ]
+    },
+    {
+      "id": "instruction-fingerprint",
+      "name": "指令文件指纹",
+      "since": "4.2",
+      "subfeatures": [
+        "AGENTS/CLAUDE 指纹",
+        "指纹进 epoch",
+        "指令已变提示",
+        "首次见到不误报"
+      ]
+    },
+    {
+      "id": "shell-write-visibility",
+      "name": "shell 写可见性",
+      "since": "4.2",
+      "subfeatures": [
+        "写路径正则提取",
+        "未知写显式计数",
+        "读后 shell 写 → deny",
+        "成功写入并入 writeIntent"
+      ]
+    },
+    {
+      "id": "cross-session-writes",
+      "name": "跨会话/子代理写",
+      "since": "4.2",
+      "subfeatures": [
+        "recentWrites 有界表",
+        "otherSessionWrites 计数",
+        "无法核验时保守拒绝"
+      ]
+    },
+    {
+      "id": "symbol-map",
+      "name": "符号级 repo-map",
+      "since": "4.2",
+      "subfeatures": [
+        "extractSymbols 正则",
+        "sources.symbols/exports",
+        "L1 短摘要展示"
+      ]
+    },
+    {
+      "id": "blind-policy",
+      "name": "盲写策略",
+      "since": "4.2",
+      "subfeatures": [
+        "allow/deny 可配置",
+        "逃生门第 3 次放行",
+        "两种策略都计数"
+      ]
+    },
+    {
+      "id": "bounded-turn-map",
+      "name": "回合表有界",
+      "since": "4.3",
+      "subfeatures": [
+        "MAX_TRACKED_TURNS=256",
+        "LRU 刷新"
+      ]
+    },
+    {
+      "id": "bounded-project-failures",
+      "name": "项目失败表有界",
+      "since": "4.3",
+      "subfeatures": [
+        "上限 32 条",
+        "错误文本截断",
+        "状态只显示前 5 条"
+      ]
+    },
+    {
+      "id": "bounded-caches",
+      "name": "同类缓存有界",
+      "since": "4.3",
+      "subfeatures": [
+        "artifact 索引 16",
+        "reasoning explicit/capabilities 上限"
+      ]
+    },
+    {
+      "id": "process-memory",
+      "name": "进程内存诊断",
+      "since": "4.3",
+      "subfeatures": [
+        "omb_status ## 进程 段",
+        "非法读数写未测量"
+      ]
+    },
+    {
+      "id": "import-graph-dir",
+      "name": "跨目录导入图",
+      "since": "4.3",
+      "subfeatures": [
+        "相对导入提取",
+        "仓库内解析",
+        "目录级边 ≤12"
+      ]
+    },
+    {
+      "id": "import-graph-alias-call",
+      "name": "别名与近似调用图",
+      "since": "4.4",
+      "subfeatures": [
+        "tsconfig 路径别名解析",
+        "文件级导入边",
+        "近似调用边（符号被调用）"
+      ]
+    },
+    {
+      "id": "shell-inferred-writes",
+      "name": "shell 未知写推断",
+      "since": "4.4",
+      "subfeatures": [
+        "命令前后 git status 基线",
+        "差分推断写集",
+        "推断写触发守卫/通知"
+      ]
+    },
+    {
+      "id": "conflict-package",
+      "name": "冲突材料包",
+      "since": "4.4",
+      "subfeatures": [
+        "读取时 base 正文缓存",
+        "拒绝时写 base/current 材料",
+        "最多保留 20 份"
+      ]
+    },
+    {
+      "id": "oom-forensics",
+      "name": "OOM 取证",
+      "since": "4.4",
+      "subfeatures": [
+        "内存增长证据链",
+        "heap snapshot 启动脚本",
+        "归属结论（OMB 事件驱动表排除）"
+      ]
+    }
+  ],
+  "version": "4.5.0"
+}

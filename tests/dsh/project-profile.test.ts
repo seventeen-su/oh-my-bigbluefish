@@ -202,3 +202,44 @@ describe('项目画像', () => {
     dispose()
   })
 })
+
+/** v4.4：带 tsconfig 路径别名的仓库（src/app.ts 通过 `@lib/*` 导入并调用）。 */
+function makeAliasRepo(): string {
+  const root = mkdtempSync(join(tmpdir(), 'omb-project-alias-'))
+  dirs.push(root)
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'alias-demo', version: '0.1.0' }))
+  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: { baseUrl: '.', paths: { '@lib/*': ['lib/*'] } },
+  }))
+  mkdirSync(join(root, 'src'), { recursive: true })
+  mkdirSync(join(root, 'lib'), { recursive: true })
+  writeFileSync(join(root, 'lib', 'helper.ts'), 'export function helper(): number { return 1 }\n')
+  writeFileSync(
+    join(root, 'src', 'app.ts'),
+    "import { helper } from '@lib/helper'\nexport const value = helper()\n",
+  )
+  return root
+}
+
+describe('v4.4 导入图升级', () => {
+  it('tsconfig 别名解析：目录边 + 文件边 + 近似调用边', () => {
+    const root = makeAliasRepo()
+    const { port, dispose } = createProjectProfile({ clock: { now: () => 1 }, rootOf: () => root })
+    const view = port.read(root)
+    expect(view).toBeDefined()
+    expect(view?.structure?.aliases?.[0]).toContain('@lib/*')
+    expect(view?.structure?.imports).toContainEqual({ from: 'src', to: 'lib', count: 1 })
+    expect(view?.structure?.fileImports).toContainEqual({
+      from: 'src/app.ts',
+      to: 'lib/helper.ts',
+      count: 1,
+    })
+    expect(view?.structure?.calls).toContainEqual({
+      caller: 'src/app.ts',
+      callee: 'lib/helper.ts',
+      symbol: 'helper',
+      count: 1,
+    })
+    dispose()
+  })
+})

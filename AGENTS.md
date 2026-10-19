@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -62,18 +62,25 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.3（当前，4.3.0 / g92）** = **有界化 + 导入图**：`turnBySession`/`projectFailures`/artifact 缓存/
-  reasoning 会话表全部有界；`omb_status` 新增 `## 进程`（rss/heapUsed/heapTotal/external/uptime，OOM 趋势可见）；
-  画像新增 `structure.imports`（跨顶层目录相对导入边，≤12）并在 `omb_project` L1 展示。
-  契约：`docs/v4.3-bounded-and-imports.md`；v4.2 契约见 `docs/v4.2-gap-closure.md`。
+- **v4.4（当前，计算版本 4.5.0 / g94）** = **版本号实测计算 + 剩余项收尾**：
+  版本号改为 `major.累计功能数.累计小功能数`（`version-manifest.json` + `scripts/version.mjs`，
+  禁止手写 4.x）；导入图支持 tsconfig `paths` 别名、文件级边与近似调用边；
+  shell 未知写用命令前后 `git status` 差分推断；守卫拒绝时写 base/current 冲突材料包；
+  OOM 取证脚本 `scripts/heap-snapshot.ps1` 与证据结论。
+  契约：`docs/v4.4-versioning-alias-and-oom.md`。
+- v4.3 = **有界化 + 导入图**：`turnBySession`/`projectFailures`/artifact 缓存/reasoning 会话表有界；
+  `omb_status` 新增 `## 进程`；画像 `structure.imports`（跨顶层目录相对导入边）。
+  契约：`docs/v4.3-bounded-and-imports.md`。
 - v4.2 = **写可见性收尾**：指令文件指纹（`AGENTS.md`/`CLAUDE.md` →"指令已变"）、shell 写路径提取
   （提取不到记未知）、跨会话/子代理写归因（`recentWrites` + `otherSessionWrites`）、符号级 repo-map、
   盲写策略可配置（默认 `allow`，`deny` 时逃生门仍生效）。
 - v4.1 = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
   自主捕获 = `tool/call` → `tool/result` 生命周期；`omb_project` = L0–L5 分层时空快照（≤2,400 字符，隐私先于读取）。
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。
-- 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 / §11 v4.3 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
+- 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 / §11 v4.3 / §12 v4.4 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
 - 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
-- v4.3 仍未做（不要在文档里假装已做）：完整调用图/类型图与路径别名解析（v4.4）、shell 未知写的
-  路径级归因、三方合并/自动补丁、OOM 根因定位（宿主侧 heap snapshot）、`dsh-path-guard` 的
+- **版本纪律（v4.4）**：新增/完成功能或小功能 → 改 `version-manifest.json` → `node scripts/version.mjs --write`；
+  门禁用 `node scripts/version.mjs`（漂移退出码 1）。不要把版本号手写回 4.x。
+- v4.4 仍未做（不要在文档里假装已做）：完整类型图/类型解析与包导出映射、真正三方自动合并
+  （当前只出冲突材料）、OOM 根因最终定位（依赖宿主 heap snapshot，脚本已备）、`dsh-path-guard` 的
   `selfProtection`（用户设置）。

@@ -475,6 +475,7 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
       ? ''
       : `${side.shellWrites > 0 ? `、shell 写 ${side.shellWrites}` : ''}`
         + `${side.shellUnknown > 0 ? `、shell 未知写 ${side.shellUnknown}` : ''}`
+        + `${side.shellInferred > 0 ? `、shell 推断写 ${side.shellInferred}` : ''}`
         + `${side.otherSessionWrites > 0 ? `、其他会话写 ${side.otherSessionWrites}` : ''}`
     lines.push(
       side === undefined

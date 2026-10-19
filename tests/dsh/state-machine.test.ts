@@ -235,6 +235,7 @@ describe('纯函数：Epoch 解析与通知行', () => {
       instructionsChanged: false,
       shellWrites: 0,
       shellUnknown: 0,
+      shellInferred: 0,
       interruptedAtTurn: 12,
       openGoals: 2,
       deepStale: true,
@@ -256,6 +257,7 @@ describe('纯函数：Epoch 解析与通知行', () => {
       instructionsChanged: true,
       shellWrites: 2,
       shellUnknown: 1,
+      shellInferred: 3,
       interruptedAtTurn: null,
       openGoals: 0,
       deepStale: false,
@@ -920,6 +922,82 @@ describe('v4.2 留白收尾：指令指纹 / shell 写 / 跨会话 / 盲写策�
     const snap = m.port.snapshot(S1)
     expect(snap?.blindWrites).toBe(3)
     expect(snap?.guard.gaveUps).toBe(1)
+    m.dispose()
+  })
+})
+
+describe('v4.4：shell 未知写推断与冲突材料', () => {
+  it('未知写 shell 成功后按 git status 差分推断写集，并可拒绝后续编辑', () => {
+    const clock = new FakeClock()
+    const state = { status: '' }
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      git: (_cwd, args) => {
+        const joined = args.join(' ')
+        if (joined.startsWith('status --porcelain=v2')) return { ok: true, stdout: state.status }
+        if (joined.startsWith('rev-parse')) return { ok: true, stdout: 'abc1234\n' }
+        return { ok: false, stdout: '' }
+      },
+      contentHash: () => null,
+      fileExists: () => true,
+      instructionDigest: () => null,
+      config: { persist: false },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'read',
+      arguments: JSON.stringify({ path: 'src/x.ts' }),
+    }))
+    clock.advance(1)
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'pwsh',
+      arguments: JSON.stringify({ command: 'git apply patch.diff' }),
+    }))
+    // 基线为空；命令执行后出现新脏文件
+    state.status = '? src/x.ts\u0000'
+    clock.advance(1)
+    m.noteShellResult(S1, 'pwsh', true)
+
+    expect(m.port.situation(S1)?.sideEffects.shellInferred).toBe(1)
+    const decision = m.guardEdit(S1, 'edit', 'src/x.ts')
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason ?? '').toContain('shell')
+    m.dispose()
+  })
+
+  it('读后被改且已有 base 正文 → 写冲突材料（base/current），拒绝理由指向材料', () => {
+    const clock = new FakeClock()
+    let text = 'v1'
+    let hash = 'h1'
+    const writes: { base: string | null; current: string | null; path: string }[] = []
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      contentHash: () => ({ hash, size: text.length }),
+      fileExists: () => true,
+      contentOf: () => text,
+      instructionDigest: () => null,
+      writeConflict: input => {
+        writes.push({ base: input.base, current: input.current, path: input.path })
+        return '.omb/conflicts/demo.md'
+      },
+      config: { persist: false },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    m.port.observe(event(S1, 'tool/call', clock.now(), {
+      name: 'read',
+      arguments: JSON.stringify({ path: 'src/a.ts' }),
+    }))
+    text = 'v2'
+    hash = 'h2'
+    clock.advance(1)
+    const decision = m.guardEdit(S1, 'edit', 'src/a.ts')
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason ?? '').toContain('冲突材料')
+    expect(writes).toHaveLength(1)
+    expect(writes[0]?.base).toBe('v1')
+    expect(writes[0]?.current).toBe('v2')
     m.dispose()
   })
 })

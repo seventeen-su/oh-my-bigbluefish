@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../../kernel/version.js'
 /**
  * 向量通道模块入口（`omb-memory-vector`）。
  *
@@ -1882,7 +1883,7 @@ export function createVectorModule(deps: VectorModuleDeps = {}): VectorModuleIns
 
   const manifest: VectorManifest = {
     id: VECTOR_MODULE_ID,
-    version: '4.3.0',
+    version: OMB_VERSION,
     // 依赖 `omb-memory`：关掉记忆库，向量通道没有意义。依赖从目录派生（唯一真源）。
     requires: derivedRequires(VECTOR_MODULE_ID),
     capabilities: derivedCapabilities(VECTOR_MODULE_ID),

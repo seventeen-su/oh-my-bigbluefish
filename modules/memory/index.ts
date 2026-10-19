@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../../kernel/version.js'
 /**
  * `omb-memory` 模块注册入口。
  *
@@ -646,7 +647,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '4.3.0',
+    version: options.version ?? OMB_VERSION,
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,

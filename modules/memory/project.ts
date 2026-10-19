@@ -99,12 +99,33 @@ export interface ProjectProfileImport {
   readonly count: number
 }
 
+/** v4.4：文件级导入边。 */
+export interface ProjectProfileFileImport {
+  readonly from: string
+  readonly to: string
+  readonly count: number
+}
+
+/** v4.4：近似调用边（A 调用 B 的导出符号 `symbol`）。 */
+export interface ProjectProfileCall {
+  readonly caller: string
+  readonly callee: string
+  readonly symbol: string
+  readonly count: number
+}
+
 export interface ProjectProfileStructure {
   readonly topDirs?: readonly ProjectProfileTopDir[]
   readonly sources?: readonly ProjectProfileSource[]
   readonly entries?: readonly string[]
   readonly docs?: readonly ProjectProfileDoc[]
   readonly imports?: readonly ProjectProfileImport[]
+  /** v4.4：文件级导入边（最多 12 条）。 */
+  readonly fileImports?: readonly ProjectProfileFileImport[]
+  /** v4.4：近似调用边（最多 12 条；正则近似，不是类型系统）。 */
+  readonly calls?: readonly ProjectProfileCall[]
+  /** v4.4：tsconfig 路径别名（展示用）。 */
+  readonly aliases?: readonly string[]
 }
 
 export interface ProjectProfileCommit {
@@ -183,6 +204,8 @@ export interface SessionSituationView {
     readonly shellWrites?: number
     readonly shellUnknown?: number
     readonly otherSessionWrites?: number
+    /** v4.4：shell 未知写经 git status 差分推断出的写次数。 */
+    readonly shellInferred?: number
   }
 }
 
@@ -267,6 +290,12 @@ function boolOf(value: unknown): boolean | undefined {
 
 function joinParts(parts: readonly string[]): string {
   return parts.filter(part => part.length > 0).join(' · ')
+}
+
+/** 文件路径压成末两段（`dsh/project-profile.ts`），避免 L1 被长路径撑爆。 */
+function shortFile(path: string): string {
+  const parts = path.split('/').filter(part => part.length > 0)
+  return parts.slice(-2).join('/')
 }
 
 /** 层内容：标题固定，正文可压缩。 */
@@ -397,6 +426,26 @@ function renderStructure(view: ProjectProfileView | undefined, missingReason: st
         .join('、')}`,
     )
   }
+  // v4.4 别名/文件级依赖/近似调用（正则近似，明确不是类型系统）。
+  if (structure?.aliases !== undefined && structure.aliases.length > 0) {
+    parts.push(`别名 ${structure.aliases.slice(0, 2).join('；')}`)
+  }
+  if (structure?.fileImports !== undefined && structure.fileImports.length > 0) {
+    parts.push(
+      `文件依赖 ${structure.fileImports
+        .slice(0, 3)
+        .map(edge => `${shortFile(edge.from)}→${shortFile(edge.to)}(${edge.count})`)
+        .join('、')}`,
+    )
+  }
+  if (structure?.calls !== undefined && structure.calls.length > 0) {
+    parts.push(
+      `调用 ${structure.calls
+        .slice(0, 3)
+        .map(call => `${shortFile(call.caller)}→${shortFile(call.callee)}:${call.symbol}`)
+        .join('、')}`,
+    )
+  }
   if (structure?.entries !== undefined && structure.entries.length > 0) {
     parts.push(`入口 ${structure.entries.slice(0, 4).join('、')}`)
   }
@@ -449,10 +498,12 @@ function renderSpace(situation: SessionSituationView | undefined): string {
     )
     const shellWrites = finiteNumber(sideEffects.shellWrites) ?? 0
     const shellUnknown = finiteNumber(sideEffects.shellUnknown) ?? 0
+    const shellInferred = finiteNumber(sideEffects.shellInferred) ?? 0
     const otherWrites = finiteNumber(sideEffects.otherSessionWrites) ?? 0
     if (shellWrites > 0 || shellUnknown > 0) {
       parts.push(`shell 写 ${shellWrites}/未知 ${shellUnknown}`)
     }
+    if (shellInferred > 0) parts.push(`shell 推断写 ${shellInferred}`)
     if (otherWrites > 0) parts.push(`其他会话写 ${otherWrites}`)
   }
   return joinParts(parts)

@@ -193,3 +193,41 @@
 - 完整调用图/类型图、路径别名与包导出映射（v4.4）。
 - shell 未知写路径级归因、三方合并。
 - OOM 根因（宿主侧快照）。
+
+---
+
+# OMB v4.4 交付记录（2026-10-19）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.5.0**（`24 功能 / 79 小功能`，由 `version-manifest.json` 计算） |
+| 构建 | **g94**；`generation: 94`、`outDir: lib-gen/g94`、`builtAt: 2026-10-19T15:35:27Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **109 files / 1342 passed | 1 skipped**；`build` 成功（g94）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 93/93、计算版本 4.5.0、`## 进程` 段；`omb_project` L1 含 `别名/文件依赖/调用` |
+
+## 本版内容
+
+1. **版本号实测计算**：`version-manifest.json` + `scripts/version.mjs`；所有包/模块常量/注册测试
+   从 `kernel/version.ts` 的 `OMB_VERSION` 读取，不再手写 4.x。
+2. **导入图升级**：tsconfig `paths`/`baseUrl` 别名；`structure.fileImports`（文件级边）与
+   `structure.calls`（近似调用边）；`omb_project` L1 展示。
+3. **shell 未知写推断**：命令前后 `git status` 基线差分 → `shellInferred`，参与守卫与状态行。
+4. **冲突材料包**：读取时缓存 base；拒绝时写 `.omb/conflicts/*.md`（base/current + 事实说明）。
+5. **OOM 取证**：`scripts/heap-snapshot.ps1` + 证据链文档。
+
+## 文件
+
+- `version-manifest.json`、`scripts/version.mjs`、`kernel/version.ts`（生成）
+- `dsh/project-profile.ts`（别名/文件边/调用边）、`dsh/state-machine.ts`（shell 推断 + 冲突材料）
+- `dsh/status-tool.ts`（shell 推断写计数）
+- `scripts/heap-snapshot.ps1`
+- 测试：`tests/dsh/state-machine.test.ts`（+2）、`tests/dsh/project-profile.test.ts`（别名用例）
+- 版本：8 个 `package.json` 由脚本写入；模块常量统一引用 `OMB_VERSION`
+
+## 仍未做
+
+- 完整类型图/类型解析与包导出映射（v4.5）。
+- 真正三方自动合并（当前只出材料）。
+- OOM 根因最终定位（依赖宿主 heap snapshot；脚本已备）。

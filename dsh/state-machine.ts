@@ -205,6 +205,8 @@ export interface SessionSituation {
     readonly shellWrites: number
     /** v4.2：可能写文件但提取不到路径的 shell 次数（显式未知）。 */
     readonly shellUnknown: number
+    /** v4.4：由 git status 差分推断出的 shell 写次数（近似归因）。 */
+    readonly shellInferred: number
     /** v4.2：其他会话写过的、本会话读过且写时间晚于读取的路径数（子代理/并发会话）。 */
     readonly otherSessionWrites: number
   }
@@ -361,6 +363,11 @@ export interface SessionStateConfig {
    * - `deny`：拒绝一次，计 `denies`，逃生门仍生效（同路径同回合第 3 次放行）。
    */
   readonly blindWritePolicy: 'allow' | 'deny'
+  /**
+   * v4.4：shell 命令提取不到写路径（`unknown`）时，用命令前后 `git status` 差分
+   * **推断**写集。默认开启；代价是每次未知写 shell 调两次 git（仅此类命令）。
+   */
+  readonly shellInferUnknown: boolean
   /** 是否落盘（R10 §6.4）；默认开启，测试可关。 */
   readonly persist: boolean
   /** 落盘节流：回合边界每几十秒一次，避免每步写文件。 */
@@ -384,6 +391,7 @@ export const DEFAULT_SESSION_STATE_CONFIG: SessionStateConfig = {
   shellTools: DEFAULT_SHELL_TOOLS,
   instructionFiles: DEFAULT_INSTRUCTION_FILES,
   blindWritePolicy: 'allow',
+  shellInferUnknown: true,
   persist: true,
   persistMinIntervalMs: 30_000,
 }
@@ -410,6 +418,19 @@ export interface SessionStateOptions {
    * 测试注入以避免造真实文件。
    */
   readonly instructionDigest?: (cwd: string) => string | null
+  /** v4.4：读取文件正文（冲突包用；默认读真实文件，单文件 ≤64KB）。 */
+  readonly contentOf?: (absPath: string) => string | null
+  /**
+   * v4.4：写冲突材料（默认写 `<cwd>/.omb/conflicts/*.md` 并返回相对路径）。
+   * 测试可注入以避免落盘。
+   */
+  readonly writeConflict?: (input: {
+    readonly cwd: string
+    readonly path: string
+    readonly reason: string
+    readonly base: string | null
+    readonly current: string | null
+  }) => string | undefined
   readonly config?: Partial<SessionStateConfig>
 }
 
@@ -455,10 +476,18 @@ interface SessionRecord {
   unreportedShell: number
   /** 尚未进通知的 shell 未知写次数。 */
   unreportedShellUnknown: number
+  /** v4.4：未知写 shell 调用前的脏文件基线（完成后与再次 status 差分）。 */
+  shellBaseline: Set<string> | null
+  /** v4.4：由 git status 差分推断出的 shell 写次数（近似归因）。 */
+  shellInferred: number
+  /** 尚未进通知的推断写次数。 */
+  unreportedShellInferred: number
   /** 上次看到的指令文件指纹（v4.2；`null` = 尚无）。 */
   instructions: string | null
   /** 指令文件在两次回合之间变化（待通知）。 */
   unreportedInstructions: boolean
+  /** v4.4：读取时保存的正文（冲突包 base；每会话最多 4 条 × 64KB）。 */
+  readBases: Map<string, string>
   denyCounts: Map<string, number>
   denies: number
   gaveUps: number
@@ -665,6 +694,71 @@ const defaultFileExists = (absPath: string): boolean => {
   }
 }
 
+/** v4.4：冲突包读取的正文上限（只给可核验材料，不复制整个大文件）。 */
+const CONFLICT_TEXT_MAX_BYTES = 64 * 1024
+/** 冲突材料保留上限。 */
+const CONFLICT_FILE_MAX = 20
+
+const defaultContentOf = (absPath: string): string | null => {
+  try {
+    const stat = statSync(absPath)
+    if (!stat.isFile() || stat.size > CONFLICT_TEXT_MAX_BYTES) return null
+    return readFileSync(absPath, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+/** v4.4：写冲突材料（base/current 两段原文 + 事实说明；不自动合并）。 */
+const defaultWriteConflict = (input: {
+  readonly cwd: string
+  readonly path: string
+  readonly reason: string
+  readonly base: string | null
+  readonly current: string | null
+}): string | undefined => {
+  try {
+    const dir = join(input.cwd, '.omb', 'conflicts')
+    mkdirSync(dir, { recursive: true })
+    const name = `${Date.now()}-${sha256Short(input.path, 8)}.md`
+    const fence = (label: string, text: string | null): string =>
+      text === null ? `## ${label}\n（未保存/不可读：无法给出 base 文本）\n` : `## ${label}\n\`\`\`text\n${text}\n\`\`\`\n`
+    const content = [
+      '# OMB 编辑冲突材料',
+      '',
+      `- 文件：${input.path}`,
+      `- 原因：${input.reason}`,
+      `- 生成：${new Date().toISOString()}`,
+      '',
+      fence('读取时（base）', input.base),
+      fence('当前（current）', input.current),
+      '这是**事实材料，不是自动合并结果**：OMB 没有覆盖文件，也没有生成补丁。',
+      '处理：重新读取当前内容后决定编辑；如需三方合并，请用 git/编辑器手工裁决。',
+      '',
+    ].join('\n')
+    writeFileSync(join(dir, name), content, 'utf8')
+    // 有界：只保留最近 20 份
+    try {
+      const files = readdirSync(dir)
+        .filter(file => file.endsWith('.md'))
+        .map(file => ({ file, mtime: statSync(join(dir, file)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime)
+      for (const old of files.slice(CONFLICT_FILE_MAX)) {
+        try {
+          unlinkSync(join(dir, old.file))
+        } catch {
+          // 清理失败不影响本次材料
+        }
+      }
+    } catch {
+      // 同上
+    }
+    return `.omb/conflicts/${name}`
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 缺省指令文件指纹：读 cwd 下 `instructionFiles`，对"文件名 + 内容"做 sha256 前 12。
  * 单文件 ≤256KB；不存在/超限/读失败跳过；一个都读不到 → null（"没有指令文件"，不是空串）。
@@ -787,6 +881,8 @@ interface NoticeFacts {
   readonly shellWrites: number
   /** v4.2：可能写但提取不到路径的 shell 次数。 */
   readonly shellUnknown: number
+  /** v4.4：由 git status 差分推断出的 shell 写次数（近似归因）。 */
+  readonly shellInferred: number
   readonly interruptedAtTurn: number | null
   readonly openGoals: number
   readonly deepStale: boolean
@@ -808,6 +904,7 @@ export function renderNotice(epochLabel: string, facts: NoticeFacts, maxChars: n
   if (facts.instructionsChanged) parts.push('指令已变')
   if (facts.shellWrites > 0) parts.push(`shell 写 ${facts.shellWrites}`)
   if (facts.shellUnknown > 0) parts.push(`shell 未知写 ${facts.shellUnknown}`)
+  if (facts.shellInferred > 0) parts.push(`shell 推断写 ${facts.shellInferred}`)
   if (facts.interruptedAtTurn !== null) parts.push(`上次回合中断@${facts.interruptedAtTurn}`)
   if (facts.openGoals > 0) parts.push(`未闭合目标 ${facts.openGoals}`)
   if (facts.deepStale) parts.push('结论可能过期')
@@ -833,6 +930,8 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
   const contentHash = options.contentHash ?? defaultContentHash
   const fileExists = options.fileExists ?? defaultFileExists
   const instructionDigest = options.instructionDigest ?? defaultInstructionDigest(config.instructionFiles)
+  const contentOf = options.contentOf ?? defaultContentOf
+  const writeConflict = options.writeConflict ?? defaultWriteConflict
   const sessions = new Map<string, SessionRecord>()
   const epochCache = new Map<string, { readonly epoch: WorkspaceEpoch; readonly at: number }>()
   /**
@@ -1152,6 +1251,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       turnStartSeen: false,
       treeAfter: null,
       readStamps: new Map(),
+      readBases: new Map(),
       writeStamps: new Map(),
       writeIntent: new Set(),
       goals: new Map(),
@@ -1164,6 +1264,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       shellUnknown: 0,
       unreportedShell: 0,
       unreportedShellUnknown: 0,
+      shellBaseline: null,
+      shellInferred: 0,
+      unreportedShellInferred: 0,
       instructions: null,
       unreportedInstructions: false,
       denyCounts: new Map(),
@@ -1297,6 +1400,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     const hasChange = tier !== 'fresh' || headChanged || branchChanged || external > 0
       || interruptedAt !== null || record.unreportedInstructions
       || record.unreportedShell > 0 || record.unreportedShellUnknown > 0
+      || record.unreportedShellInferred > 0
     const deep = tier === 'deep-stale'
 
     if (hasChange) {
@@ -1311,6 +1415,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         instructionsChanged: record.unreportedInstructions,
         shellWrites: record.unreportedShell,
         shellUnknown: record.unreportedShellUnknown,
+        shellInferred: record.unreportedShellInferred,
         interruptedAtTurn: interruptedAt,
         openGoals,
         deepStale: deep,
@@ -1328,6 +1433,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       record.unreportedInstructions = false
       record.unreportedShell = 0
       record.unreportedShellUnknown = 0
+      record.unreportedShellInferred = 0
       record.interruptedAtTurn = null
       persistSession(sessionId, record, at)
     } else {
@@ -1361,6 +1467,10 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       if (extraction.unknown) {
         record.shellUnknown += 1
         record.unreportedShellUnknown += 1
+        // v4.4：未知写命令执行前记录脏文件基线，完成后差分为"推断写"。
+        if (config.shellInferUnknown && cwd !== undefined) {
+          record.shellBaseline = dirtyPathsOf(cwd) ?? null
+        }
       }
       return
     }
@@ -1381,6 +1491,11 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         hash: current.ok ? current.value?.hash ?? null : null,
         size: current.ok ? current.value?.size ?? null : null,
       }, config.maxStamps)
+      // v4.4：保存读取时正文（最多 4 条），供守卫拒绝时生成冲突材料。
+      if (absPath !== undefined) {
+        const text = contentOf(absPath)
+        if (typeof text === 'string') putBounded(record.readBases, key, text, 4)
+      }
       return
     }
     if (!config.writeTools.includes(name)) return
@@ -1469,6 +1584,18 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     return undefined
   }
 
+  /** v4.4：`git status --porcelain=v2 -z` 的脏路径集合；git 不可用返回 undefined。 */
+  const dirtyPathsOf = (cwd: string): Set<string> | undefined => {
+    try {
+      const result = git(cwd, ['status', '--porcelain=v2', '-z', '--untracked-files=normal'])
+      if (!result.ok) return undefined
+      return new Set(parsePorcelainV2Paths(result.stdout))
+    } catch (error) {
+      warn('dirtyPaths', error)
+      return undefined
+    }
+  }
+
   /** 读取之后是否有本会话的 shell 写（v4.2）。 */
   const shellWroteAfter = (record: SessionRecord, absPath: string | undefined, since: number): boolean => {
     if (absPath === undefined) return false
@@ -1529,6 +1656,18 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         return { kind: 'deny', reason: reason.length > 120 ? reason.slice(0, 120) : reason }
       }
 
+      /**
+       * v4.4：写冲突材料（base/current 原文 + 事实说明），返回相对路径。
+       * 没有 cwd / 没有 base 文本 / 写失败 → undefined（拒绝本身照常）。
+       */
+      const conflictFor = (stampForBase: ReadStamp | undefined, reason: string): string | undefined => {
+        const cwd = safeCwd(sessionId)
+        if (cwd === undefined || absPath === undefined) return undefined
+        const base = record.readBases.get(absPath) ?? record.readBases.get(normalized) ?? null
+        const current = contentOf(absPath)
+        return writeConflict({ cwd, path: normalized, reason, base, current })
+      }
+
       // ① 无印记：新建 allow；覆盖既有文件按盲写策略（默认 allow + blindWrites）。
       if (stamp === undefined) {
         if (absPath === undefined || !fileExists(absPath)) return { kind: 'allow', reason: null }
@@ -1541,10 +1680,14 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       // ② 读取时就没有哈希（目录/超限/读失败）：若有 shell/其他会话在其后写过，主动 deny。
       if (stamp.hash === null) {
         if (shellWroteAfter(record, absPath, stamp.at)) {
-          return denyWith('该文件在读取后被本会话的 shell 写入过，且读取时无法核验内容；请重读后再编辑。')
+          const base = '读后 shell 写过，读取时无法核验内容；编辑未执行。'
+          const conflict = conflictFor(stamp, base)
+          return denyWith(conflict === undefined ? `${base}请重读后再编辑。` : `${base}冲突材料 ${conflict}`)
         }
         if (otherSessionWroteAfter(sessionId, absPath, stamp.at)) {
-          return denyWith('该文件在读取后被其他会话（含子代理）写入，且读取时无法核验内容；请重读后再编辑。')
+          const base = '读后被其他会话（含子代理）写过，无法核验内容；编辑未执行。'
+          const conflict = conflictFor(stamp, base)
+          return denyWith(conflict === undefined ? `${base}请重读后再编辑。` : `${base}冲突材料 ${conflict}`)
         }
         record.unverifiable += 1
         return { kind: 'allow', reason: null }
@@ -1558,7 +1701,9 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       if (!current.ok) return { kind: 'allow', reason: null }
       if (current.value === null) {
         if (shellWroteAfter(record, absPath, stamp.at)) {
-          return denyWith('该文件在读取后被本会话的 shell 写入过，且当前无法核验内容；请重读后再编辑。')
+          const base = '读后 shell 写过，当前无法核验内容；编辑未执行。'
+          const conflict = conflictFor(stamp, base)
+          return denyWith(conflict === undefined ? `${base}请重读后再编辑。` : `${base}冲突材料 ${conflict}`)
         }
         record.unverifiable += 1
         return { kind: 'allow', reason: null }
@@ -1566,9 +1711,13 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       // ④ 哈希相同 → 读后未变，放行。
       if (current.value.hash === stamp.hash) return { kind: 'allow', reason: null }
       // ⑤ 哈希不同（读后被改）→ deny；同路径同回合第 3 次放行并计 gaveUps。
-      return denyWith(
-        `文件内容在本会话读取后已变化（${stamp.hash.slice(0, 8)}→${current.value.hash.slice(0, 8)}），编辑未执行；重读后可再编辑。`,
-      )
+      {
+        const base = `读后内容已变化（${stamp.hash.slice(0, 8)}→${current.value.hash.slice(0, 8)}），编辑未执行。`
+        const conflict = conflictFor(stamp, base)
+        return denyWith(
+          conflict === undefined ? `${base}重读后可再编辑。` : `${base}冲突材料 ${conflict}；重读后可再编辑。`,
+        )
+      }
     } catch (error) {
       warn('guardEdit', error)
       return { kind: 'allow', reason: null }
@@ -1634,7 +1783,32 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
             record.writeIntent.delete(oldest)
           }
         }
+        // v4.4：未知写 shell 成功 → 用命令前后 git status 差分推断写集（近似归因）。
+        const cwd = safeCwd(sessionId)
+        if (record.shellBaseline !== null && cwd !== undefined) {
+          const after = dirtyPathsOf(cwd)
+          if (after !== undefined) {
+            const at = clock.now()
+            for (const path of after) {
+              if (record.shellBaseline.has(path)) continue
+              const absPath = absPathOf(cwd, path)
+              const key = absPath ?? path
+              record.shellWrites.delete(key)
+              record.shellWrites.set(key, at)
+              while (record.shellWrites.size > MAX_SHELL_WRITES) {
+                const oldest = record.shellWrites.keys().next().value
+                if (oldest === undefined) break
+                record.shellWrites.delete(oldest)
+              }
+              if (absPath !== undefined) noteRecentWrite(sessionId, absPath, at)
+              record.shellInferred += 1
+              record.unreportedShellInferred += 1
+              record.shellIntentPending.add(key)
+            }
+          }
+        }
       }
+      record.shellBaseline = null
       record.shellIntentPending.clear()
     } catch (error) {
       warn('noteShellResult', error)
@@ -1863,6 +2037,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
             unverifiable: record.unverifiable,
             shellWrites: record.shellWrites.size,
             shellUnknown: record.shellUnknown,
+            shellInferred: record.shellInferred,
             otherSessionWrites,
           },
         }

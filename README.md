@@ -1,17 +1,22 @@
-# Oh-My-BigBlueFish (OMB v4.3)
+# Oh-My-BigBlueFish (OMB v4.4 · 4.5.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
 不是编程专用——生活、情感陪伴、闲聊、一次性提问同样适用。v4 把它们组织成**一个可拼装、
 但设计为一起使用的共享层**；v4.1 给四个组件加**同一套时空坐标**（项目身份 = git 根、资源级内容哈希、
 `omb_project` 的 L0–L5 分层快照）；v4.2 把写可见性补到 shell、其他会话/子代理与规则文件；
-v4.3 把内存增长点有界化、给 `omb_status` 加进程内存读数，并补上跨模块导入图。详见
+v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改为按**功能数/小功能数实际计算**，
+并购入路径别名/文件级依赖/近似调用图、shell 推断写与冲突材料包。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
-[`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md) 与
-[`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md)。
+[`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
+[`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md) 与
+[`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)。
 
-## v4.3 结构（2026-10）
+> 版本规则：`major.累计功能数.累计小功能数`。单一真源 `version-manifest.json`，
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.0**。
+
+## v4.4 结构（2026-10）
 
 | 层 | 做什么 | 模型面成本 |
 | --- | --- | --- |
@@ -20,6 +25,11 @@ v4.3 把内存增长点有界化、给 `omb_status` 加进程内存读数，并�
 | **状态层** | `omb:session-state`：工作区 epoch（含 `AGENTS.md`/`CLAUDE.md` 指纹）、空闲分级、外部改动、读取戳（**内容哈希**）、shell 写路径、跨会话写、目标/待办；**edit+write 写守卫**（读后被外部改/shell 写/其他会话写 → 拒绝一次，重读后可再编辑）；仅在真实变化时注入一行 ≤120 字符 | 正常 0 字节 |
 | **过程层** | 8 张过程卡迁到 `skills/omb-r1…r8`，模型按需加载；循环/无进展才注入一行 | 技能目录会话级 |
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
+
+v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
+（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.0）、**导入图支持 tsconfig 别名 +
+文件级边 + 近似调用边**、**shell 未知写按 git status 差分推断**、**守卫拒绝时写 base/current
+冲突材料包**、**OOM 取证脚本与证据结论**。
 
 v4.3 的关键变化（与 v4.2 的差别）：**无界增长点全部有界**（`turnBySession` 256 / `projectFailures` 32 /
 artifact 索引 16 / reasoning 会话表 128）、**`## 进程` 内存读数**（OOM 趋势可见）、

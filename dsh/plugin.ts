@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../kernel/version.js'
 /**
  * Cordis 插件入口 —— `@omb/kernel` 组件包（`packages/kernel/index.ts`）re-export 本文件，
  * `cordis.patch.yml` 的 `omb-kernel` 行加载的就是它。
@@ -88,7 +89,7 @@ export const inject = ['commands']
 export const KERNEL_SELF: ModuleRegistration<unknown> = {
   manifest: {
     id: 'omb-kernel',
-    version: '4.3.0',
+    version: OMB_VERSION,
     requires: [],
     capabilities: ['kernel.services', 'kernel.events', 'kernel.health', 'kernel.metrics'],
     configSchema: { parse: (input: unknown) => input ?? {} },

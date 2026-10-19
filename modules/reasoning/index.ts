@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../../kernel/version.js'
 /**
  * `omb-reasoning` 模块注册入口（v4：**技能化 + 只留事件驱动提示**）。
  *
@@ -56,7 +57,7 @@ import { heartbeat, toHostPlugin } from '../../kernel/hostEntry.js'
 
 export const MODULE_ID = 'omb-reasoning'
 /** 版本号在发版时由 Lead 统一抬；本模块不单独进位。 */
-export const MODULE_VERSION = '4.3.0'
+export const MODULE_VERSION = OMB_VERSION
 
 /** 会话表上界（LRU）。超过就淘汰最久未活动的会话状态。 */
 export const MAX_TRACKED_SESSIONS = 128

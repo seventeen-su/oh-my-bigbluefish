@@ -1,3 +1,4 @@
+import { OMB_VERSION } from '../../../kernel/version.js'
 /**
  * 注册入口测试：清单契约、配置缺省值、`stores` 服务与 disposer 的 H-1 保证。
  *
@@ -144,7 +145,7 @@ describe('omb-memory 清单', () => {
     expect(registration.manifest.requires).toEqual(['omb-kernel'])
     expect(entry?.tools).toEqual(expect.arrayContaining(['omb_recall', 'omb_forget']))
     expect(entry?.capabilities).toEqual(expect.arrayContaining(['memory.write', 'memory.recall']))
-    expect(registration.manifest.version).toBe('4.3.0')
+    expect(registration.manifest.version).toBe(OMB_VERSION)
   })
 
   it('服务名契约为 stores（与 ABI 的 SERVICES 一致）', () => {
