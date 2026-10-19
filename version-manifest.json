@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.8.0 = 候选确认命令与跨路径写入去重。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.8.1 = 候选确认的撤销与审计（4.8.0 功能的收尾修复，不是独立功能）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -17,7 +17,8 @@
         "控制器写入查回验证",
         "控制器旧结论查找与任务 TTL",
         "候选确认命令",
-        "跨写入路径同内容去重"
+        "跨写入路径同内容去重",
+        "确认撤销与审计"
       ]
     },
     {
@@ -258,5 +259,5 @@
       ]
     }
   ],
-  "version": "4.8.0"
+  "version": "4.8.1"
 }

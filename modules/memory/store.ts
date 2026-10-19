@@ -340,12 +340,47 @@ export function asUtilityStore(store: MemoryStore): UtilityStoreApi | undefined 
   return store instanceof SqliteStore ? store : undefined
 }
 
+/** 确认/撤销动作（`/omb-confirm` 的审计轴）。 */
+export type ConfirmAction = 'confirm' | 'undo'
+
+/** 一条确认审计（只增日志；当前状态 = 倒序第一条）。 */
+export interface ConfirmAuditEntry {
+  readonly action: ConfirmAction
+  readonly sessionId: string | null
+  readonly at: number
+}
+
+/**
+ * **确认审计面**（结构探测，不进 ABI；与 `UsageApi` / `UtilityStoreApi` 同一条模式）。
+ *
+ * 为什么需要落盘：确认把 `asserted_by` 从 `model` 改成 `user`；撤销必须能区分
+ * "经 `/omb-confirm` 确认的候选"与"用户显式 remember 的条目"——两者都是 `user`，
+ * 没有审计就分不清，撤销会误伤后者。探测不到审计面时，撤销一律拒绝（fail-closed），
+ * 不按"看起来像候选"去猜。
+ */
+export interface ConfirmStoreApi {
+  /** 追加一条确认/撤销审计（只增不改）。 */
+  recordConfirm(input: {
+    readonly memoryId: string
+    readonly action: ConfirmAction
+    readonly sessionId: string | null
+    readonly at: number
+  }): Promise<void>
+  /** 读审计（倒序、有界）。当前状态 = 第一条的 action。 */
+  confirmLog(memoryId: string, limit?: number): Promise<readonly ConfirmAuditEntry[]>
+}
+
+/** 从端口句柄取确认审计面；不是本实现返回 undefined（调用方 fail-closed）。 */
+export function asConfirmStore(store: MemoryStore): ConfirmStoreApi | undefined {
+  return store instanceof SqliteStore ? store : undefined
+}
+
 /**
  * 具体实现类型。除端口外还暴露状态面需要的诊断字段，以及两个**结构面**能力
  * （`UsageApi` 的使用计数、`RecordScanApi` 的整合扫描）——它们不进 ABI，
  * 由 `asUsageStore` / `asRecordScanner` 按能力探测（模式同 `asVectorStore`）。
  */
-export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe, UsageApi, RecordScanApi, UtilityStoreApi {
+export interface SqliteMemoryStore extends MemoryStore, VectorStoreApi, OverturnedProbe, UsageApi, RecordScanApi, UtilityStoreApi, ConfirmStoreApi {
   /** 库文件路径（`:memory:` 时为该字面量）。 */
   readonly dbPath: string
   /** 打开时的迁移结果；未迁移时为 `{from: n, to: n}`。 */
@@ -1296,6 +1331,40 @@ class SqliteStore implements SqliteMemoryStore {
         'INSERT INTO memory_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
         [key, value],
       )
+    })
+  }
+
+  async recordConfirm(input: {
+    readonly memoryId: string
+    readonly action: ConfirmAction
+    readonly sessionId: string | null
+    readonly at: number
+  }): Promise<void> {
+    this.#assertUsable()
+    await this.#enqueue(() => {
+      this.#assertOpen()
+      this.#run(
+        'INSERT INTO memory_confirm (memory_id, action, session_id, at) VALUES (?, ?, ?, ?)',
+        [input.memoryId, input.action, input.sessionId, input.at],
+      )
+    })
+  }
+
+  async confirmLog(memoryId: string, limit = 10): Promise<readonly ConfirmAuditEntry[]> {
+    this.#assertUsable()
+    const bounded = Number.isFinite(limit) ? Math.max(0, Math.min(100, Math.floor(limit))) : 0
+    if (bounded === 0) return []
+    const rows = this.#all(
+      'SELECT action, session_id, at FROM memory_confirm WHERE memory_id = ? ORDER BY at DESC, id DESC LIMIT ?',
+      [memoryId, bounded],
+    )
+    return rows.map(row => {
+      const r = asRow(row, '确认日志')
+      return {
+        action: textOf(r['action'], 'action') as ConfirmAction,
+        sessionId: nullableTextOf(r['session_id'], 'session_id'),
+        at: integerOf(r['at'], 'at'),
+      }
     })
   }
 

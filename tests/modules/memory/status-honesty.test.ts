@@ -63,14 +63,14 @@ describe('存储服务的自述：不再出现第二份会话→cwd / 已打开�
     const port = testPort(ws.dir)
     const first = createStoresService({ logger: capturingLogger(), clock: fixedClock(), resolvePort: () => port })
     await first.forProject(ws.dir) // 首次打开：v0→v3（v1 建表 + v2 加 embedding.content_hash + v3 edge.related），真的迁移了
-    expect(first.status().detail).toContain('迁移 v0→v4')
+    expect(first.status().detail).toContain('迁移 v0→v5')
     await first.close()
 
     // 第二次打开：库已是最新，没有任何迁移发生 —— 这里绝不能写 v0→v0
     const second = createStoresService({ logger: capturingLogger(), clock: fixedClock(), resolvePort: () => port })
     await second.forProject(ws.dir)
     const detail = second.status().detail
-    expect(detail).toContain('本次打开未迁移：schema v4')
+    expect(detail).toContain('本次打开未迁移：schema v5')
     expect(detail).not.toContain('迁移 v0→v0')
     await second.close()
     ws.cleanup()
@@ -217,14 +217,24 @@ describe('事件控制器状态面：dry-run 与执行不能混说（v4.7.0）',
   })
 })
 
-describe('候选确认状态面：没按过命令就不写（v4.8.0）', () => {
-  const ledger: ConfirmLedger = { commands: 2, listed: 1, promoted: 1, refused: 0, lastChange: 'promoted' }
+describe('候选确认状态面：没按过命令就不写（v4.8.0 / v4.8.1）', () => {
+  const ledger: ConfirmLedger = { commands: 2, listed: 1, logged: 0, promoted: 1, undone: 0, refused: 0, lastChange: 'promoted' }
 
   it('按过命令才报；确认与列出分开计数', () => {
     const note = confirmHealthNote(ledger)
     expect(note).toContain('候选确认：已确认 1 条')
     expect(note).toContain('命令 2 次')
     expect(note).toContain('列出 1 次')
+  })
+
+  it('审计查询次数 >0 才写"查询 N 次"', () => {
+    expect(confirmHealthNote(ledger)).not.toContain('查询')
+    expect(confirmHealthNote({ ...ledger, logged: 3 })).toContain('查询 3 次')
+  })
+
+  it('撤销次数 >0 才写"撤销 N 条"', () => {
+    expect(confirmHealthNote(ledger)).not.toContain('撤销')
+    expect(confirmHealthNote({ ...ledger, undone: 2 })).toContain('撤销 2 条')
   })
 
   it('拒绝次数为 0 时不印"拒绝 0 次"（0 与未发生不同形）', () => {

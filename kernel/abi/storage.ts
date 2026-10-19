@@ -143,10 +143,14 @@ export const STORES_SERVICE = 'stores'
  * - v4：**纯加法**。`memory_utility`（曝光/使用/反馈的效用账本 + wrong 二次确认
  *   待定态 + 可逆归档来源）、`memory_feedback`（只增审计日志）、`memory_meta`
  *   （自适应下限的 q 与目标精度 EWMA）。不改 `memory` 表：归档复用 `valid_to`。
+ * - v5：**纯加法**。`memory_confirm`（候选确认/撤销的只增审计日志）。
+ *   为什么必须落盘：确认改变的是**证据等级**（`assertedBy`），撤销只能由
+ *   "确实经 `/omb-confirm` 确认过"这一事实决定；没有审计就无法区分
+ *   "用户确认的候选"与"用户显式记住的条目"，撤销会误伤后者。
  *
  * **这个常量与迁移表的最高版本必须一致**：`migrate()` 在缺省步骤表下会做这条
  * 自检，不一致就抛"契约漂移"。本轮曾经因为表到了 v2 而常量还是 1，
  * 只能靠 `openMemoryStore` 显式传步骤表绕过——那等于把自检关掉，
- * 现在已收口（常量抬到 4、显式参数撤掉）。
+ * 现在已收口（常量抬到 5、显式参数撤掉）。
  */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5

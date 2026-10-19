@@ -26,7 +26,7 @@ describe('v3：edge.related（3.7 Wave 2）', () => {
     const outcome = migrate(db)
     expect(outcome.from).toBe(2)
     expect(outcome.to).toBe(latestVersion(SCHEMA_MIGRATIONS))
-    expect(userVersion(db)).toBe(4)
+    expect(userVersion(db)).toBe(latestVersion(SCHEMA_MIGRATIONS))
     expect(columnNames(db, 'edge')).toEqual(['from_id', 'to_id', 'type', 'created_at'])
 
     const rows = db.prepare('SELECT from_id, to_id, type FROM edge').all()

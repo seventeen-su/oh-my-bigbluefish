@@ -351,14 +351,18 @@ export interface FeedbackLedger {
   lastChange: string
 }
 
-/** `/omb-confirm` 的运行读数（v4.8.0：候选确认只由用户触发）。 */
+/** `/omb-confirm` 的运行读数（v4.8.0 起；v4.8.1 加撤销与审计查询）。 */
 export interface ConfirmLedger {
   commands: number
   /** 列出候选的次数（只读命令）。 */
   listed: number
+  /** 查询确认审计的次数（只读命令）。 */
+  logged: number
   /** 真正把候选改成"已确认"的条数。 */
   promoted: number
-  /** 拒绝次数（不是候选/隐私/写回失败）。 */
+  /** 撤销确认的条数（批量按实际撤销条数计）。 */
+  undone: number
+  /** 拒绝次数（不是候选/隐私/写回失败/审计缺失）。 */
   refused: number
   lastChange: string
 }
@@ -499,8 +503,11 @@ export function controllerHealthNote(stats: ControllerStats | undefined): string
  */
 export function confirmHealthNote(confirm: ConfirmLedger | undefined): string {
   if (confirm === undefined || confirm.commands === 0) return ''
-  return `；候选确认：已确认 ${confirm.promoted} 条（命令 ${confirm.commands} 次`
+  return `；候选确认：已确认 ${confirm.promoted} 条`
+    + (confirm.undone > 0 ? `（撤销 ${confirm.undone} 条）` : '')
+    + `（命令 ${confirm.commands} 次`
     + `，列出 ${confirm.listed} 次`
+    + (confirm.logged > 0 ? `，查询 ${confirm.logged} 次` : '')
     + (confirm.refused > 0 ? `，拒绝 ${confirm.refused} 次` : '')
     + '）'
 }
@@ -631,7 +638,9 @@ async function describeHealth(
   if (runtime?.confirm !== undefined) {
     metrics['confirm.commands'] = runtime.confirm.commands
     metrics['confirm.listed'] = runtime.confirm.listed
+    metrics['confirm.logged'] = runtime.confirm.logged
     metrics['confirm.promoted'] = runtime.confirm.promoted
+    if (runtime.confirm.undone > 0) metrics['confirm.undone'] = runtime.confirm.undone
     if (runtime.confirm.refused > 0) metrics['confirm.refused'] = runtime.confirm.refused
   }
   if (runtime?.floor !== undefined) {
@@ -1075,7 +1084,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       }
       feedbackLedgerRef = feedbackLedger
       const confirmLedger: ConfirmLedger = {
-        commands: 0, listed: 0, promoted: 0, refused: 0, lastChange: '',
+        commands: 0, listed: 0, logged: 0, promoted: 0, undone: 0, refused: 0, lastChange: '',
       }
       confirmLedgerRef = confirmLedger
       let calibrator = new AdaptiveFloorCalibrator({}, config.lexicalFloorTargetPrecision)
@@ -1194,10 +1203,13 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             logger: kernel.logger,
             onConfirm: info => {
               confirmLedger.commands += 1
+              const count = info.count ?? 1
               if (info.action === 'list') confirmLedger.listed += 1
-              else if (info.changed) confirmLedger.promoted += 1
+              else if (info.action === 'log') confirmLedger.logged += 1
+              else if (info.changed && info.action === 'promote') confirmLedger.promoted += count
+              else if (info.changed) confirmLedger.undone += count
               else confirmLedger.refused += 1
-              confirmLedger.lastChange = info.changed ? 'promoted' : info.reason.slice(0, 80)
+              confirmLedger.lastChange = info.changed ? `${info.action}×${count}` : info.reason.slice(0, 80)
             },
           })
         : {

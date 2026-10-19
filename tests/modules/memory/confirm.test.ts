@@ -12,7 +12,9 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { Kernel, MemoryRecord, TaggedStore } from '../../../kernel/abi/index.js'
 import {
+  CANDIDATE_STALE_DAYS,
   CONFIRM_USAGE,
+  MAX_BATCH_UNDO,
   installConfirm,
   isConfirmableCandidate,
   listCandidates,
@@ -21,6 +23,7 @@ import {
   renderCandidateList,
   renderConfirmResult,
   runConfirmCommand,
+  undoConfirmedRecord,
   type ConfirmDeps,
 } from '../../../modules/memory/confirm.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
@@ -31,7 +34,7 @@ interface ConfirmFixture {
   readonly project: SqliteMemoryStore
   readonly stores: readonly TaggedStore[]
   readonly deps: ConfirmDeps
-  readonly events: { action: string; changed: boolean; reason: string; sessionId: string | null }[]
+  readonly events: { action: string; changed: boolean; reason: string; sessionId: string | null; count?: number }[]
   close(): Promise<void>
 }
 
@@ -81,13 +84,28 @@ async function putRecord(store: SqliteMemoryStore, record: MemoryRecord): Promis
 }
 
 describe('确认命令：解析（纯函数）', () => {
-  it('不带参数 = 列表；一个 id = 确认；多余参数拒绝', () => {
-    expect(parseConfirmArgs('')).toEqual({ ok: true, request: { kind: 'list' } })
-    expect(parseConfirmArgs('   ')).toEqual({ ok: true, request: { kind: 'list' } })
+  it('list/log/确认/批量撤销/上限/非法参数', () => {
+    expect(parseConfirmArgs('')).toEqual({ ok: true, request: { kind: 'list', offset: 0 } })
+    expect(parseConfirmArgs('   ')).toEqual({ ok: true, request: { kind: 'list', offset: 0 } })
+    expect(parseConfirmArgs('list')).toEqual({ ok: true, request: { kind: 'list', offset: 0 } })
+    expect(parseConfirmArgs('list 5')).toEqual({ ok: true, request: { kind: 'list', offset: 5 } })
     expect(parseConfirmArgs('mem_abc')).toEqual({ ok: true, request: { kind: 'promote', id: 'mem_abc' } })
-    const bad = parseConfirmArgs('mem_abc extra')
-    expect(bad.ok).toBe(false)
-    expect(bad.ok === false && bad.error).toContain('多余的参数')
+    expect(parseConfirmArgs('log mem_abc')).toEqual({ ok: true, request: { kind: 'log', id: 'mem_abc' } })
+    expect(parseConfirmArgs('undo mem_abc')).toEqual({ ok: true, request: { kind: 'undo', ids: ['mem_abc'] } })
+    expect(parseConfirmArgs('undo a b c')).toEqual({ ok: true, request: { kind: 'undo', ids: ['a', 'b', 'c'] } })
+
+    const extra = parseConfirmArgs('mem_abc extra')
+    expect(extra.ok).toBe(false)
+    expect(extra.ok === false && extra.error).toContain('多余的参数')
+    expect(parseConfirmArgs('undo').ok).toBe(false)
+    expect(parseConfirmArgs('log').ok).toBe(false)
+    const badOffset = parseConfirmArgs('list -1')
+    expect(badOffset.ok).toBe(false)
+    expect(badOffset.ok === false && badOffset.error).toContain('offset')
+    expect(parseConfirmArgs('list abc').ok).toBe(false)
+    const tooMany = parseConfirmArgs(`undo ${Array.from({ length: MAX_BATCH_UNDO + 1 }, (_, i) => `id${i}`).join(' ')}`)
+    expect(tooMany.ok).toBe(false)
+    expect(tooMany.ok === false && tooMany.error).toContain(`最多撤 ${MAX_BATCH_UNDO} 条`)
     expect(CONFIRM_USAGE).toContain('/omb-confirm')
   })
 })
@@ -133,12 +151,27 @@ describe('确认变换：只改证据归属', () => {
 
   it('列表/确认回执都明确说"只改归属"', () => {
     const record = makeRecord({ id: 'mem_x', text: '回答要简洁', assertedBy: 'model' })
-    const list = renderCandidateList([{ record }])
+    const list = renderCandidateList({ items: [{ record }], total: 1 })
     expect(list).toContain('mem_x')
     expect(list).toContain('/omb-confirm')
     const confirmed = renderConfirmResult({ record: { ...record, assertedBy: 'user' } })
     expect(confirmed).toContain('阶段：候选 → 已确认')
     expect(confirmed).toContain('正文、来源、id、observedAt 均未改')
+    expect(confirmed).toContain('/omb-confirm undo mem_x')
+  })
+
+  it('撤销变换：只接受已确认的活跃语义条目', () => {
+    const record = makeRecord({ id: 'mem_x', kind: 'semantic', assertedBy: 'user' })
+    const undone = undoConfirmedRecord(record)
+    expect(undone.ok).toBe(true)
+    if (!undone.ok) return
+    expect(undone.record).toEqual({ ...record, assertedBy: 'model' })
+    expect(record.assertedBy).toBe('user') // 纯函数
+
+    expect(undoConfirmedRecord(makeRecord({ assertedBy: 'model' })).ok).toBe(false)
+    expect(undoConfirmedRecord(makeRecord({ kind: 'episodic', assertedBy: 'user' })).ok).toBe(false)
+    expect(undoConfirmedRecord(makeRecord({ assertedBy: 'user', validTo: 1 })).ok).toBe(false)
+    expect(undoConfirmedRecord(makeRecord({ assertedBy: 'user', supersededBy: 'm2' })).ok).toBe(false)
   })
 })
 
@@ -150,14 +183,40 @@ describe('确认命令：真实 SQLite', () => {
     await putRecord(f.user, makeRecord({ id: 'mem_event', text: '今天发生了什么', kind: 'episodic', assertedBy: 'execution' }))
     await putRecord(f.user, makeRecord({ id: 'mem_stale', text: '已失效的候选', assertedBy: 'model', validTo: 1 }))
 
-    const items = await listCandidates(f.stores, 5)
-    expect(items.map(item => item.record.id)).toEqual(['mem_cand'])
+    const scan = await listCandidates(f.stores, 5)
+    expect(scan.items.map(item => item.record.id)).toEqual(['mem_cand'])
+    expect(scan.total).toBe(1)
     const result = await runConfirmCommand('', 's1', f.deps)
     expect(result.kind).toBe('success')
     expect(result.text).toContain('mem_cand')
     expect(result.text).not.toContain('mem_user')
     expect(result.text).not.toContain('mem_event')
     expect(f.events[0]).toMatchObject({ action: 'list', changed: false })
+    await f.close()
+  })
+
+  it('列表分页：offset 跳过前 N 条，回执写明总数与"还有多少条"', async () => {
+    const f = fixture()
+    for (let index = 0; index < 7; index += 1) {
+      await putRecord(f.user, makeRecord({
+        id: `mem_c${index}`,
+        text: `候选结论 ${index}`,
+        assertedBy: 'model',
+        observedAt: 1_000 + index,
+      }))
+    }
+    const first = await listCandidates(f.stores, 5, 0)
+    expect(first.total).toBe(7)
+    expect(first.items).toHaveLength(5)
+    const page = await listCandidates(f.stores, 5, 5)
+    expect(page.items).toHaveLength(2)
+
+    const result = await runConfirmCommand('list 5', 's1', f.deps)
+    expect(result.kind).toBe('success')
+    expect(result.text).toContain('显示第 6–7 条')
+    expect(result.text).not.toContain('还有')
+    const page0 = await runConfirmCommand('', 's1', f.deps)
+    expect(page0.text).toContain('还有 2 条未显示')
     await f.close()
   })
 
@@ -247,6 +306,93 @@ describe('确认命令：真实 SQLite', () => {
     expect(result.text).toContain('记忆服务未就绪')
     await f.close()
   })
+
+  it('撤销：经确认的条目可撤销（写审计），撤销后再撤被拒', async () => {
+    const f = fixture()
+    await putRecord(f.user, makeRecord({ id: 'mem_cand', text: '回答要简洁', assertedBy: 'model' }))
+
+    const promoted = await runConfirmCommand('mem_cand', 's1', f.deps)
+    expect(promoted.kind).toBe('success')
+    expect(promoted.text).toContain('撤销：/omb-confirm undo mem_cand')
+
+    const undone = await runConfirmCommand('undo mem_cand', 's1', f.deps)
+    expect(undone.kind).toBe('success')
+    expect(undone.text).toContain('已撤销确认')
+    expect((await f.user.get('mem_cand'))?.assertedBy).toBe('model')
+
+    // 审计只增：undo 在前、confirm 在后
+    const log = await f.user.confirmLog('mem_cand', 5)
+    expect(log.map(entry => entry.action)).toEqual(['undo', 'confirm'])
+    expect(log[0]?.sessionId).toBe('s1')
+
+    const again = await runConfirmCommand('undo mem_cand', 's1', f.deps)
+    expect(again.kind).toBe('error')
+    expect((await f.user.get('mem_cand'))?.assertedBy).toBe('model')
+    await f.close()
+  })
+
+  it('撤销拒绝用户显式写入的条目（没有确认审计，避免误伤原话）', async () => {
+    const f = fixture()
+    await putRecord(f.user, makeRecord({ id: 'mem_user', text: '用户原话', assertedBy: 'user' }))
+    const result = await runConfirmCommand('undo mem_user', 's1', f.deps)
+    expect(result.kind).toBe('error')
+    expect(result.text).toContain('没有找到该条的 /omb-confirm 确认记录')
+    expect((await f.user.get('mem_user'))?.assertedBy).toBe('user')
+    await f.close()
+  })
+
+  it('批量撤销：逐条执行、部分失败也逐条报告', async () => {
+    const f = fixture()
+    await putRecord(f.user, makeRecord({ id: 'mem_c1', text: '候选一', assertedBy: 'model' }))
+    await putRecord(f.user, makeRecord({ id: 'mem_c2', text: '候选二', assertedBy: 'model' }))
+    await runConfirmCommand('mem_c1', 's1', f.deps)
+    await runConfirmCommand('mem_c2', 's1', f.deps)
+
+    const result = await runConfirmCommand('undo mem_c1 mem_missing mem_c2', 's1', f.deps)
+    expect(result.kind).toBe('success')
+    expect(result.text).toContain('成功 2 / 共 3 条')
+    expect(result.text).toContain('未知 id：mem_missing')
+    expect((await f.user.get('mem_c1'))?.assertedBy).toBe('model')
+    expect((await f.user.get('mem_c2'))?.assertedBy).toBe('model')
+    expect(f.events.at(-1)).toMatchObject({ action: 'undo', changed: true, count: 2 })
+    await f.close()
+  })
+
+  it('审计查询：列出 confirm/undo 与当前状态', async () => {
+    const f = fixture()
+    await putRecord(f.user, makeRecord({ id: 'mem_cand', text: '回答要简洁', assertedBy: 'model' }))
+    await runConfirmCommand('mem_cand', 's1', f.deps)
+
+    const confirmedLog = await runConfirmCommand('log mem_cand', 's1', f.deps)
+    expect(confirmedLog.kind).toBe('success')
+    expect(confirmedLog.text).toContain('确认审计')
+    expect(confirmedLog.text).toContain('confirm')
+    expect(confirmedLog.text).toContain('当前状态：已确认（经本命令）')
+    expect(f.events.at(-1)).toMatchObject({ action: 'log', changed: false })
+
+    await runConfirmCommand('undo mem_cand', 's1', f.deps)
+    const undoneLog = await runConfirmCommand('log mem_cand', 's1', f.deps)
+    expect(undoneLog.text).toContain('undo')
+    expect(undoneLog.text).toContain('当前状态：候选（已撤销）')
+    await f.close()
+  })
+
+  it('候选列表显示年龄；超过 30 天给 stale 建议', async () => {
+    const f = fixture()
+    const now = 1_700_000_000_000
+    await putRecord(f.user, makeRecord({
+      id: 'mem_old',
+      text: '很旧的候选结论',
+      assertedBy: 'model',
+      observedAt: now - (CANDIDATE_STALE_DAYS + 1) * 24 * 60 * 60 * 1000,
+    }))
+    const result = await runConfirmCommand('', 's1', f.deps)
+    expect(result.kind).toBe('success')
+    expect(result.text).toContain(`已存在 ${CANDIDATE_STALE_DAYS + 1} 天`)
+    expect(result.text).toContain('stale')
+    await f.close()
+  })
+
 })
 
 describe('确认命令：装配', () => {

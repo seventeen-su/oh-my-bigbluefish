@@ -441,3 +441,43 @@
 - 确认不可撤销（没有"退回候选"命令）；
 - 候选列表有界（最近 50 条/库、最多显示 5 条），更早的候选从 `omb_recall` 回执拿 id 确认；
 - 去重只认精确同内容，不做向量近似与跨作用域去重。
+
+---
+
+# OMB v4.8.1 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.8.1**（`24 功能 / 88 小功能`；x3 修复位：4.8.0 候选确认功能的收尾，不是独立功能） |
+| 构建 | 中间版本不单独构建/部署；随下一个功能版本一起构建（代数以最终版本为准） |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | 不适用（中间版本）；撤销/审计随下一次重启一起核对 |
+
+## 本版内容（4.8.0 功能的收尾）
+
+1. **存储 schema v5**：只增审计表 `memory_confirm`（confirm/undo），v4→v5 纯加法；
+   `SCHEMA_VERSION` 抬到 5，漂移自检继续生效；结构能力 `asConfirmStore`，
+   探测不到时撤销 fail-closed。
+2. **`/omb-confirm undo <id>...`**：只在"审计最后一次动作是 confirm + 条目仍活跃"时执行，
+   只改 `assertedBy`（user→model），写回后查回验证；批量撤销 ≤10 条、逐条报告。
+3. **`/omb-confirm log <id>`**：列出确认/撤销审计与当前状态（只读）。
+4. **列表分页与年龄**：`list [offset]`，回执写明总数与"还有 N 条未显示"；
+   候选超过 30 天未确认时给出 stale 建议。
+5. 健康面新增 `confirm.undone/logged`，文案只在按过命令后出现。
+
+详见 `docs/v4.8.1-confirm-undo-and-audit.md`。
+
+## 文件
+
+- 新增：`docs/v4.8.1-confirm-undo-and-audit.md`
+- 修改：`kernel/abi/storage.ts`（SCHEMA_VERSION 5）、`modules/memory/migrate.ts`、
+  `modules/memory/store.ts`（确认审计面）、`modules/memory/confirm.ts`、
+  `modules/memory/index.ts`、`tests/modules/memory/*`、版本文件
+
+## 仍未做
+
+- 没有自动晋升/自动撤销（确认与撤销都是用户命令）；
+- 撤销只逐条或 ≤10 条批量，没有"全库撤销"；
+- 写入冲突提示不在本版（独立能力，见下一个功能版本）。

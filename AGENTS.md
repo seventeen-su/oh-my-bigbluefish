@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.8.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.8.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,14 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.8.0（当前） = 候选确认与跨路径写入去重**：
+- **v4.8.1（当前） = 候选确认的撤销与审计（4.8.0 功能的收尾，x3 修复位）**：
+  存储 schema **v5** 增加只增审计表 `memory_confirm`（confirm/undo），v4→v5 纯加法，
+  `SCHEMA_VERSION=5`；`asConfirmStore` 探测不到时撤销 fail-closed。
+  `/omb-confirm undo <id>...`（≤10 条，逐条报告）只在"审计最后一次动作是 confirm +
+  条目仍活跃"时执行；`/omb-confirm log <id>` 查审计；`list [offset]` 分页并显示
+  候选年龄/stale 建议。健康面 `confirm.undone/logged`，文案只在按过命令后出现。
+  契约：`docs/v4.8.1-confirm-undo-and-audit.md`。
+- **v4.8.0** = 候选确认与跨路径写入去重：
   `/omb-confirm [id]` 是**用户**确认候选的斜杠命令（不新增模型工具）：不带参数列出
   候选（每库最近 50 条里筛、最多显示 5 条），带 id 把 `assertedBy` 从 `model` 改为
   `user`（正文/id/来源/时间一字不改），写回后查回验证；sealed 不读、read-only 不写。

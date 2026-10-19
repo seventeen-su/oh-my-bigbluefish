@@ -178,7 +178,7 @@ function syncMetaSchemaVersion(db: SqliteLike, version: number): void {
 /**
  * 正式迁移步骤表。新增版本时在此追加，并把 `SCHEMA_VERSION` 同步到最高版本。
  *
- * **当前最高版本 4，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 4）一致。**
+ * **当前最高版本 5，与 `kernel/abi/storage.ts` 的 `SCHEMA_VERSION`（也是 5）一致。**
  * 这条一致性是**有自检的**：`migrate()` 在缺省步骤表下会比对"表最高版本 vs `SCHEMA_VERSION`"，
  * 不一致就抛"契约漂移"。而打开库的一方（`store.ts` 的 `openMemoryStore`）**不传步骤表**，
  * 正是为了让这条自检继续跑——所以**不许**再靠"显式传表"绕过它：
@@ -193,6 +193,7 @@ export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 2, name: 'embedding-content-hash', up: applySchemaV2 },
   { version: 3, name: 'edge-related', up: applySchemaV3 },
   { version: 4, name: 'utility-and-feedback', up: applySchemaV4 },
+  { version: 5, name: 'confirm-audit', up: applySchemaV5 },
 ]
 
 
@@ -429,5 +430,29 @@ function applySchemaV4(db: SqliteLike): void {
 
     INSERT INTO memory_meta (key, value) VALUES ('lexical.floor.q', '0.5');
     INSERT INTO memory_meta (key, value) VALUES ('lexical.floor.precision', '');
+  `)
+}
+
+/**
+ * v5：**纯加法**。候选确认/撤销的只增审计日志（`/omb-confirm`）。
+ *
+ * 为什么必须落盘：确认把 `asserted_by` 从 `model` 改成 `user`，撤销必须能判断
+ * "这条 user 是不是经 `/omb-confirm` 确认来的"——用户显式 `omb_remember` 的条目
+ * 也是 `user`，没有审计就分不清，撤销会误伤真正由用户陈述的记忆。
+ *
+ * 只增不改：撤销不删 `confirm` 行，而是再写一条 `undo` 行。
+ * 当前状态由**最后一次动作**决定（`confirmLog` 倒序读第一条）。
+ */
+function applySchemaV5(db: SqliteLike): void {
+  db.exec(`
+    CREATE TABLE memory_confirm (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      memory_id TEXT    NOT NULL,
+      action    TEXT    NOT NULL CHECK (action IN ('confirm', 'undo')),
+      session_id TEXT,
+      at        INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX memory_confirm_memory ON memory_confirm(memory_id, at);
   `)
 }

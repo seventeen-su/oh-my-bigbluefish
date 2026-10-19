@@ -1,52 +1,67 @@
 /**
- * `/omb-confirm`：候选记忆的**用户**确认入口（v4.8.0）。
+ * `/omb-confirm`：候选记忆的**用户**确认入口与撤销入口（v4.8.0 起；v4.9.0 加撤销/审计/分页）。
  *
  * ## 为什么必须存在
  *
  * `lifecycle.ts` 的规则是"写入时是什么证据，就停在对应的阶段；想升级只能由用户
  * 显式确认"。控制器自动写入的非显式长期偏好停在**候选**（`semantic + assertedBy:model`），
- * 但此前没有任何确认入口——候选只能靠"再显式说一遍"覆盖，库里因此长期堆着
- * 永远不会升级的条目。这不是"没有自动晋升"（那是对的），而是**缺了手动晋升**。
+ * 需要用户确认才能变成"已确认"。确认改变的是证据等级，只有**用户**有权做，
+ * 所以这里只注册斜杠命令，模型工具面一个字都不加（与 `/omb-privacy`、`/omb-feedback` 同原则）。
  *
- * ## 为什么是命令而不是工具
+ * ## 为什么要能撤销
  *
- * 确认改变的是"证据等级"，只有**用户**有权把"系统推断"升格为"用户确认"。
- * 做成模型工具等于让模型自证（与 `/omb-privacy`、`/omb-feedback` 同一条原则），
- * 所以这里只注册斜杠命令，模型工具面一个字都不加。
+ * 用户会改主意。但撤销不能靠"看起来像候选"去猜——用户显式 `omb_remember` 的条目也是
+ * `assertedBy:user`，误撤会把用户真正说过的话降级。因此 v5 增加只增审计表
+ * `memory_confirm`：**只有最后一次动作是 `confirm` 的条目才允许 undo**。
+ * 没有审计面 / 没有确认记录 → 一律拒绝（fail-closed）。
  *
- * ## 语义（只做一件事）
+ * ## 语法
  *
- * - 不带参数：列出当前会话可见库里的候选（最近 50 条里筛，最多显示 5 条）；
- * - `/omb-confirm <id>`：把该条 `assertedBy` 从 `model` 改为 `user`；
- * - **正文、id、contentHash、sourceRef、observedAt 一律不改**；不是删除/重写，是
- *   证据归属变更。确认后生命周期由"候选"变为"已确认"（或"经验"，procedural 时）。
- * - 只接受真正的候选：事件条目、已失效、已被取代、已是 `user` 的一律拒绝并说明。
+ * ```text
+ * /omb-confirm                列出候选（每库最近 50 条里筛，最多显示 5 条）
+ * /omb-confirm list [offset]  同上，从第 offset 条开始显示（分页）
+ * /omb-confirm <记忆id>        确认为"已确认"
+ * /omb-confirm undo <记忆id>   撤销一次经本命令做的确认
+ * ```
  *
- * 隐私：sealed 不读；read-only 与归属未知不写（与 `/omb-feedback` 同一闸门）。
+ * ## 语义（只改证据归属）
+ *
+ * - 确认：`assertedBy` 从 `model` 改为 `user`；正文/id/来源/时间/计数一律不改；
+ * - 撤销：`assertedBy` 从 `user` 改为 `model`；同样不改其它字段；
+ * - 两个动作都追加审计行，写回后**查回验证**；
+ * - 只接受真正的候选（事件、已失效、已被取代、已是 user 的一律拒绝并说明）。
+ *
+ * 隐私：sealed 不读；read-only 与归属未知不写。
  */
 import type { Kernel, MemoryRecord, TaggedStore } from '../../kernel/abi/index.js'
 import type { CommandInvocationLike, CommandResultLike } from './privacy/command.js'
 import { sessionOfInvocation } from './privacy/command.js'
-import { asRecordScanner } from './store.js'
+import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { stageLabel, stageOfMemory } from './lifecycle.js'
 import { isoUtc } from './retrieve.js'
 
 export const CONFIRM_COMMAND_NAME = 'omb-confirm'
 export const CONFIRM_COMMAND_ID = 'omb-memory/confirm'
 
-export const CONFIRM_USAGE =
-  '用法：/omb-confirm [记忆id]'
-  + '（不带参数 = 列出候选；带 id = 确认该候选为"已确认"。'
-  + '确认只改证据归属，不改正文与来源；模型没有这个入口）'
-
-/** 列表最多显示几条候选。 */
+/** 列表默认最多显示几条候选。 */
 export const CONFIRM_LIST_LIMIT = 5
 /** 每库扫描最近多少条记录（有界：确认列表不该按库大小付代价）。 */
 export const CONFIRM_SCAN_LIMIT = 50
+/** 单次批量撤销的条数上限（爆炸半径限制；逐条报告）。 */
+export const MAX_BATCH_UNDO = 10
+/** 候选超过多少天未确认时，列表里给出 stale 建议（只是建议，不自动处理）。 */
+export const CANDIDATE_STALE_DAYS = 30
+
+export const CONFIRM_USAGE =
+  '用法：/omb-confirm [list [offset] | log <记忆id> | <记忆id> | undo <记忆id>...]'
+  + '（不带参数 = 列出候选；带 id = 确认为"已确认"；log = 看确认审计；'
+  + `undo 支持一次撤 ${MAX_BATCH_UNDO} 条以内。确认/撤销只改证据归属，不改正文与来源；模型没有这个入口）`
 
 export type ConfirmRequest =
-  | { readonly kind: 'list' }
+  | { readonly kind: 'list'; readonly offset: number }
   | { readonly kind: 'promote'; readonly id: string }
+  | { readonly kind: 'undo'; readonly ids: readonly string[] }
+  | { readonly kind: 'log'; readonly id: string }
 
 export type ConfirmParseResult =
   | { readonly ok: true; readonly request: ConfirmRequest }
@@ -55,11 +70,37 @@ export type ConfirmParseResult =
 /** 解析命令参数。**不抛**；纯函数。 */
 export function parseConfirmArgs(raw: string): ConfirmParseResult {
   const tokens = (typeof raw === 'string' ? raw : '').trim().split(/\s+/).filter(token => token.length > 0)
-  if (tokens.length === 0) return { ok: true, request: { kind: 'list' } }
+  if (tokens.length === 0) return { ok: true, request: { kind: 'list', offset: 0 } }
+
+  const head = tokens[0] as string
+  if (head === 'list') {
+    if (tokens.length === 1) return { ok: true, request: { kind: 'list', offset: 0 } }
+    if (tokens.length > 2) return { ok: false, error: `多余的参数：${tokens.slice(2).join(' ')}。${CONFIRM_USAGE}` }
+    const rawOffset = tokens[1] as string
+    const offset = Number(rawOffset)
+    if (!Number.isInteger(offset) || offset < 0) {
+      return { ok: false, error: `offset 必须是非负整数：${JSON.stringify(rawOffset)}。${CONFIRM_USAGE}` }
+    }
+    return { ok: true, request: { kind: 'list', offset } }
+  }
+  if (head === 'undo') {
+    if (tokens.length === 1) return { ok: false, error: `undo 需要记忆 id。${CONFIRM_USAGE}` }
+    const ids = tokens.slice(1)
+    if (ids.length > MAX_BATCH_UNDO) {
+      return { ok: false, error: `一次最多撤 ${MAX_BATCH_UNDO} 条（收到 ${ids.length} 条）：请分批。${CONFIRM_USAGE}` }
+    }
+    if (ids.some(id => id.length === 0)) return { ok: false, error: `undo 的 id 不能为空。${CONFIRM_USAGE}` }
+    return { ok: true, request: { kind: 'undo', ids } }
+  }
+  if (head === 'log') {
+    if (tokens.length === 1) return { ok: false, error: `log 需要记忆 id。${CONFIRM_USAGE}` }
+    if (tokens.length > 2) return { ok: false, error: `多余的参数：${tokens.slice(2).join(' ')}。${CONFIRM_USAGE}` }
+    return { ok: true, request: { kind: 'log', id: tokens[1] as string } }
+  }
   if (tokens.length > 1) {
     return { ok: false, error: `多余的参数：${tokens.slice(1).join(' ')}。${CONFIRM_USAGE}` }
   }
-  return { ok: true, request: { kind: 'promote', id: tokens[0] as string } }
+  return { ok: true, request: { kind: 'promote', id: head } }
 }
 
 /**
@@ -95,22 +136,50 @@ export function promoteCandidateRecord(record: MemoryRecord): PromoteDecision {
   return { ok: true, record: { ...record, assertedBy: 'user' } }
 }
 
+export type UndoDecision =
+  | { readonly ok: true; readonly record: MemoryRecord }
+  | { readonly ok: false; readonly reason: string }
+
+/**
+ * 已确认 → 候选的**纯变换**（撤销）。
+ *
+ * 调用方必须**先**证明审计日志的最后一次动作是 `confirm`——本函数只做形态检查：
+ * 记录当前必须是 `user` 且仍活跃。没有审计证明就撤销会误伤用户显式写入的条目。
+ */
+export function undoConfirmedRecord(record: MemoryRecord): UndoDecision {
+  if (record.kind === 'episodic') return { ok: false, reason: '事件条目没有"撤销确认"语义' }
+  if (record.validTo !== null) return { ok: false, reason: '该条目已失效：撤销确认不会改变它的可注入状态' }
+  if (record.supersededBy !== null) return { ok: false, reason: '该条目已被取代：撤销确认不会让它重新生效' }
+  if (record.assertedBy !== 'user') {
+    return { ok: false, reason: `该条目的证据归属是 ${record.assertedBy}，不是"已确认"，没有可撤销的确认` }
+  }
+  return { ok: true, record: { ...record, assertedBy: 'model' } }
+}
+
 /** 一条候选（列表项）。 */
 export interface ConfirmListItem {
   readonly record: MemoryRecord
+}
+
+/** 候选扫描结果（有界：每库最近 `CONFIRM_SCAN_LIMIT` 条里筛）。 */
+export interface CandidateScan {
+  readonly items: readonly ConfirmListItem[]
+  /** 扫描范围内候选**总数**（不是全库总数）。 */
+  readonly total: number
 }
 
 /**
  * 扫描各库的最近记录，筛出候选（未失效、未被取代、semantic/procedural + model）。
  *
  * 只扫 `CONFIRM_SCAN_LIMIT` 条/库：确认列表是人工操作，不值得按库大小付代价；
- * 更早的候选可以用 `/omb-confirm <id>` 直接确认（id 从 recall 回执里拿）。
+ * `total` 是扫描范围内的候选数（回执里如实写"最近 N 条里"）。
  */
 export async function listCandidates(
   stores: readonly TaggedStore[],
   limit: number,
-): Promise<readonly ConfirmListItem[]> {
-  const items: ConfirmListItem[] = []
+  offset = 0,
+): Promise<CandidateScan> {
+  const candidates: ConfirmListItem[] = []
   const seen = new Set<string>()
   for (const tagged of stores) {
     const scanner = asRecordScanner(tagged.store)
@@ -125,12 +194,12 @@ export async function listCandidates(
       if (seen.has(record.id)) continue
       if (!isConfirmableCandidate(record)) continue
       seen.add(record.id)
-      items.push({ record })
+      candidates.push({ record })
     }
   }
-  return items
-    .sort((a, b) => b.record.observedAt - a.record.observedAt)
-    .slice(0, limit)
+  const sorted = candidates.sort((a, b) => b.record.observedAt - a.record.observedAt)
+  const start = Math.max(0, offset)
+  return { items: sorted.slice(start, start + Math.max(0, limit)), total: sorted.length }
 }
 
 function excerpt(text: string, max = 100): string {
@@ -138,32 +207,86 @@ function excerpt(text: string, max = 100): string {
   return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed
 }
 
-/** 候选列表回执（纯函数）。 */
-export function renderCandidateList(items: readonly ConfirmListItem[]): string {
-  if (items.length === 0) {
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/** 候选列表回执（纯函数；给了 `now` 才显示年龄与 stale 建议）。 */
+export function renderCandidateList(scan: CandidateScan, offset = 0, now?: number): string {
+  if (scan.total === 0) {
     return '没有待确认的候选记忆（当前可见库的最近记录里没有 semantic/procedural + model 的活跃条目）。'
   }
-  const lines = [`待确认候选 ${items.length} 条（最多显示 ${CONFIRM_LIST_LIMIT} 条）：`]
-  for (const { record } of items) {
+  const start = Math.max(0, offset) + 1
+  const end = Math.max(0, offset) + scan.items.length
+  const lines = [`待确认候选：最近记录里共 ${scan.total} 条，显示第 ${start}–${end} 条。`]
+  for (const { record } of scan.items) {
     const stage = stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy })
+    const ageDays = now === undefined ? null : Math.max(0, Math.floor((now - record.observedAt) / DAY_MS))
+    const ageText = ageDays === null ? '' : ` · 已存在 ${ageDays} 天`
+    const stale = ageDays !== null && ageDays >= CANDIDATE_STALE_DAYS
+      ? `（超过 ${CANDIDATE_STALE_DAYS} 天未确认：确认它，或用 /omb-feedback ${record.id} stale 归档）`
+      : ''
     lines.push(
       `- ${record.id} · ${record.scope}/${record.kind} · 阶段 ${stageLabel(stage)}`
-      + ` · observedAt=${isoUtc(record.observedAt)} · ${excerpt(record.text)}`,
+      + ` · observedAt=${isoUtc(record.observedAt)}${ageText}${stale} · ${excerpt(record.text)}`,
     )
+  }
+  if (end < scan.total) {
+    lines.push(`还有 ${scan.total - end} 条未显示：/omb-confirm list ${end}`)
   }
   lines.push('确认：/omb-confirm <记忆id>（确认后阶段变为"已确认"，正文与来源不变）')
   return lines.join('\n')
 }
 
+/** 确认审计回执（纯函数）：逐条列出动作、时间、会话与当前状态。 */
+export function renderAuditLog(
+  record: MemoryRecord,
+  entries: readonly ConfirmAuditEntry[],
+  lastAction: ConfirmAuditEntry | undefined,
+): string {
+  const stage = stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy })
+  const lines = [`记忆 ${record.id}（${record.scope}/${record.kind} · 阶段 ${stageLabel(stage)}）`]
+  if (entries.length === 0) {
+    lines.push('确认审计：无记录（这条不是经 /omb-confirm 确认的）。')
+  } else {
+    lines.push('确认审计（倒序，只增不改）：')
+    for (const entry of entries) {
+      lines.push(`- ${isoUtc(entry.at)} · ${entry.action}${entry.sessionId === null ? '' : `（会话 ${entry.sessionId}）`}`)
+    }
+    lines.push(
+      lastAction === undefined
+        ? '当前状态：未知（审计读取出错）'
+        : `当前状态：${lastAction.action === 'confirm' ? '已确认（经本命令）' : '候选（已撤销）'}`,
+    )
+  }
+  lines.push(`撤销：/omb-confirm undo ${record.id}`)
+  return lines.join('\n')
+}
+
 /** 确认回执（纯函数）。 */
-export function renderConfirmResult(input: { readonly record: MemoryRecord }): string {
+export function renderConfirmResult(input: {
+  readonly record: MemoryRecord
+  /** 审计写入失败时的可读原因（确认已生效，但撤销入口会失效）。 */
+  readonly auditWarning?: string
+}): string {
   const { record } = input
   const stage = stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy })
-  return [
+  const lines = [
     `已确认：id=${record.id}（${record.scope}/${record.kind}）`,
     `阶段：候选 → ${stageLabel(stage)}；证据归属 model → user（正文、来源、id、observedAt 均未改）。`,
     `原文：${excerpt(record.text, 240)}`,
-  ].join('\n')
+    `撤销：/omb-confirm undo ${record.id}`,
+  ]
+  if (input.auditWarning !== undefined) lines.push(`⚠ 审计写入失败：${input.auditWarning}（确认已生效，但本条无法撤销）`)
+  return lines.join('\n')
+}
+
+/** 撤销回执（纯函数）。 */
+export function renderUndoResult(input: { readonly record: MemoryRecord; readonly lastConfirmedAt: number | null }): string {
+  const lines = [
+    `已撤销确认：id=${input.record.id}（${input.record.scope}/${input.record.kind}）`,
+    '阶段：已确认 → 候选；证据归属 user → model（正文、来源、id、observedAt 均未改）。',
+  ]
+  if (input.lastConfirmedAt !== null) lines.push(`本次撤销对应 ${isoUtc(input.lastConfirmedAt)} 的确认；撤销也写了审计行。`)
+  return lines.join('\n')
 }
 
 /** 命令执行依赖（由 `modules/memory/index.ts` 装配）。 */
@@ -177,9 +300,11 @@ export interface ConfirmDeps {
   readonly logger?: { info(message: string): void; warn(message: string): void }
   /** 观测口（健康面按动作计数；绝不改变命令结果）。 */
   readonly onConfirm?: (info: {
-    readonly action: 'list' | 'promote'
+    readonly action: 'list' | 'log' | 'promote' | 'undo'
     readonly changed: boolean
     readonly reason: string
+    /** 本动作实际影响的条数（批量撤销 > 1；其它动作缺省 1）。 */
+    readonly count?: number
     readonly sessionId: string | null
   }) => void
 }
@@ -221,8 +346,20 @@ async function findRecord(
   return undefined
 }
 
+/** 读最后一次确认动作（没有审计面 → null = 无法证明，fail-closed）。 */
+async function readLastAction(store: TaggedStore, id: string): Promise<ConfirmAuditEntry | null | undefined> {
+  const api = asConfirmStore(store.store)
+  if (api === undefined) return undefined
+  try {
+    const log = await api.confirmLog(id, 1)
+    return log[0] ?? null
+  } catch {
+    return undefined
+  }
+}
+
 /**
- * 执行一次确认命令（解析 → 隐私 → 定位 → 变换 → 写回 → 查回验证 → 回执）。
+ * 执行一次确认命令（解析 → 隐私 → 定位 → 变换 → 写回 → 查回验证 → 审计 → 回执）。
  *
  * 绝不抛；任何失败都返回可读错误。
  */
@@ -248,10 +385,10 @@ export async function runConfirmCommand(
     if (!decision.allowRead) {
       return { kind: 'error', text: '当前会话处于 sealed（禁读禁写）隐私模式：确认命令不读取记忆库，也不改动任何条目。' }
     }
-    if (parsed.request.kind === 'promote' && !decision.allowWrite) {
+    if (parsed.request.kind !== 'list' && !decision.allowWrite) {
       return {
         kind: 'error',
-        text: '当前会话处于 read-only/未知归属：确认会改库，已拒绝（确认不能放宽隐私）。用 /omb-privacy normal 解除写限制后再试。',
+        text: '当前会话处于 read-only/未知归属：确认/撤销会改库，已拒绝（确认不能放宽隐私）。用 /omb-privacy normal 解除写限制后再试。',
       }
     }
 
@@ -261,61 +398,226 @@ export async function runConfirmCommand(
     }
 
     if (parsed.request.kind === 'list') {
-      const items = await listCandidates(stores, CONFIRM_LIST_LIMIT)
+      const scan = await listCandidates(stores, CONFIRM_LIST_LIMIT, parsed.request.offset)
       try {
-        deps.onConfirm?.({ action: 'list', changed: false, reason: `listed=${items.length}`, sessionId })
+        deps.onConfirm?.({ action: 'list', changed: false, reason: `listed=${scan.items.length}/${scan.total}`, sessionId })
       } catch {
         // 观测口失败不影响命令结果
       }
-      return { kind: 'success', text: renderCandidateList(items) }
+      return { kind: 'success', text: renderCandidateList(scan, parsed.request.offset, deps.clock.now()) }
+    }
+
+    if (parsed.request.kind === 'log') {
+      const found = await findRecord(stores, parsed.request.id)
+      if (found === undefined) {
+        return { kind: 'error', text: `未知 id：${parsed.request.id}。用户库/项目库都没有这条记忆（不会按"最近一条"猜）。` }
+      }
+      const api = asConfirmStore(found.store.store)
+      if (api === undefined) {
+        return { kind: 'error', text: '未查询：该库没有确认审计面（旧实现），无法列出审计。' }
+      }
+      let entries: readonly ConfirmAuditEntry[] = []
+      let last: ConfirmAuditEntry | undefined
+      let readError: string | undefined
+      try {
+        entries = await api.confirmLog(found.record.id, 20)
+        last = entries[0]
+      } catch (error) {
+        readError = messageOf(error)
+      }
+      try {
+        deps.onConfirm?.({ action: 'log', changed: false, reason: entries.length === 0 ? 'empty' : `entries=${entries.length}`, sessionId })
+      } catch {
+        // 观测口失败不影响命令结果
+      }
+      if (readError !== undefined) {
+        return { kind: 'error', text: `审计读取失败（已隔离，未改动任何数据）：${readError}` }
+      }
+      return { kind: 'success', text: renderAuditLog(found.record, entries, last) }
+    }
+
+    const at = deps.clock.now()
+    if (parsed.request.kind === 'undo') {
+      return await runUndoBatch(parsed.request.ids, stores, sessionId, at, deps)
     }
 
     const found = await findRecord(stores, parsed.request.id)
     if (found === undefined) {
       return { kind: 'error', text: `未知 id：${parsed.request.id}。用户库/项目库都没有这条记忆（不会按"最近一条"猜）。` }
     }
-    const promoted = promoteCandidateRecord(found.record)
-    if (!promoted.ok) {
-      try {
-        deps.onConfirm?.({ action: 'promote', changed: false, reason: promoted.reason, sessionId })
-      } catch {
-        // 观测口失败不影响命令结果
-      }
-      return { kind: 'error', text: `未确认：${promoted.reason}。${CONFIRM_USAGE}` }
-    }
-
-    try {
-      await found.store.store.put(promoted.record)
-    } catch (error) {
-      deps.logger?.warn(`OMB 确认：写回失败（${parsed.request.id}）——${messageOf(error)}`)
-      return { kind: 'error', text: `确认写入失败（已隔离，未改动任何数据）：${messageOf(error)}` }
-    }
-
-    // ② 查回验证：确认是"改库"动作，必须证明它真的落库了。
-    let stored: MemoryRecord | undefined
-    try {
-      stored = (await found.store.store.getMany([promoted.record.id]))[0]
-    } catch {
-      stored = undefined
-    }
-    if (stored === undefined || stored.assertedBy !== 'user' || stored.contentHash !== promoted.record.contentHash) {
-      return {
-        kind: 'error',
-        text: `确认写入后查回失败（id=${promoted.record.id}）：结论未变更可信度，请重试或检查库状态。`,
-      }
-    }
-
-    try {
-      deps.onConfirm?.({ action: 'promote', changed: true, reason: 'confirmed', sessionId })
-    } catch {
-      // 观测口失败不影响命令结果
-    }
-    deps.logger?.info(`OMB 确认：${sessionId ?? '未知会话'} ${promoted.record.id} 候选 → 已确认`)
-    return { kind: 'success', text: renderConfirmResult({ record: stored }) }
+    return await runPromote(found, parsed.request.id, sessionId, at, deps)
   } catch (error) {
     deps.logger?.warn(`OMB 确认命令失败（已隔离）：${messageOf(error)}`)
     return { kind: 'error', text: `确认命令执行失败（已隔离，未改动任何数据）：${messageOf(error)}` }
   }
+}
+
+async function runPromote(
+  found: { readonly store: TaggedStore; readonly record: MemoryRecord },
+  id: string,
+  sessionId: string | null,
+  at: number,
+  deps: ConfirmDeps,
+): Promise<CommandResultLike> {
+  const promoted = promoteCandidateRecord(found.record)
+  if (!promoted.ok) {
+    try {
+      deps.onConfirm?.({ action: 'promote', changed: false, reason: promoted.reason, sessionId })
+    } catch {
+      // 观测口失败不影响命令结果
+    }
+    const hint = found.record.assertedBy === 'user'
+      ? `（若这是经本命令确认的条目，用 /omb-confirm undo ${id} 撤销。）`
+      : ''
+    return { kind: 'error', text: `未确认：${promoted.reason}${hint}。${CONFIRM_USAGE}` }
+  }
+
+  try {
+    await found.store.store.put(promoted.record)
+  } catch (error) {
+    deps.logger?.warn(`OMB 确认：写回失败（${id}）——${messageOf(error)}`)
+    return { kind: 'error', text: `确认写入失败（已隔离，未改动任何数据）：${messageOf(error)}` }
+  }
+
+  // ② 查回验证：确认是"改库"动作，必须证明它真的落库了。
+  let stored: MemoryRecord | undefined
+  try {
+    stored = (await found.store.store.getMany([promoted.record.id]))[0]
+  } catch {
+    stored = undefined
+  }
+  if (stored === undefined || stored.assertedBy !== 'user' || stored.contentHash !== promoted.record.contentHash) {
+    return {
+      kind: 'error',
+      text: `确认写入后查回失败（id=${promoted.record.id}）：结论未变更可信度，请重试或检查库状态。`,
+    }
+  }
+
+  // ③ 审计（确认已生效；审计失败不能让回执说"没确认"，必须如实说"无法撤销"）。
+  let auditWarning: string | undefined
+  try {
+    const api = asConfirmStore(found.store.store)
+    if (api === undefined) auditWarning = '该库没有确认审计面（旧实现），本条无法撤销'
+    else await api.recordConfirm({ memoryId: stored.id, action: 'confirm', sessionId, at })
+  } catch (error) {
+    auditWarning = messageOf(error)
+  }
+
+  try {
+    deps.onConfirm?.({ action: 'promote', changed: true, reason: 'confirmed', sessionId })
+  } catch {
+    // 观测口失败不影响命令结果
+  }
+  deps.logger?.info(`OMB 确认：${sessionId ?? '未知会话'} ${stored.id} 候选 → 已确认`)
+  return {
+    kind: 'success',
+    text: renderConfirmResult({
+      record: stored,
+      ...(auditWarning === undefined ? {} : { auditWarning }),
+    }),
+  }
+}
+
+/**
+ * 撤销一条（内部；不触发观测口，批量与单条由调用方汇总）。
+ * 返回 `ok` 与已经渲染好的回执行（失败时是可读原因）。
+ */
+async function runUndo(
+  found: { readonly store: TaggedStore; readonly record: MemoryRecord },
+  id: string,
+  sessionId: string | null,
+  at: number,
+  deps: ConfirmDeps,
+): Promise<{ readonly ok: boolean; readonly text: string }> {
+  const undone = undoConfirmedRecord(found.record)
+  if (!undone.ok) return { ok: false, text: `未撤销：${undone.reason}。` }
+
+  const last = await readLastAction(found.store, id)
+  if (last === undefined) {
+    return { ok: false, text: '未撤销：该库没有确认审计面（旧实现），无法证明这条是经 /omb-confirm 确认的。' }
+  }
+  if (last === null || last.action !== 'confirm') {
+    return {
+      ok: false,
+      text: '未撤销：没有找到该条的 /omb-confirm 确认记录。它可能是用户显式 omb_remember 写入的——撤销会误伤用户原话，已拒绝。',
+    }
+  }
+
+  try {
+    await found.store.store.put(undone.record)
+  } catch (error) {
+    deps.logger?.warn(`OMB 确认：撤销写回失败（${id}）——${messageOf(error)}`)
+    return { ok: false, text: `撤销写入失败（已隔离，未改动任何数据）：${messageOf(error)}` }
+  }
+
+  let stored: MemoryRecord | undefined
+  try {
+    stored = (await found.store.store.getMany([id]))[0]
+  } catch {
+    stored = undefined
+  }
+  if (stored === undefined || stored.assertedBy !== 'model' || stored.contentHash !== undone.record.contentHash) {
+    return { ok: false, text: `撤销写入后查回失败（id=${id}）：结论未变更，请重试或检查库状态。` }
+  }
+
+  let auditWarning: string | undefined
+  try {
+    const api = asConfirmStore(found.store.store)
+    if (api === undefined) auditWarning = '该库没有确认审计面（旧实现）'
+    else await api.recordConfirm({ memoryId: stored.id, action: 'undo', sessionId, at })
+  } catch (error) {
+    auditWarning = messageOf(error)
+  }
+
+  deps.logger?.info(`OMB 确认：${sessionId ?? '未知会话'} ${stored.id} 已确认 → 候选（撤销）`)
+  const text = renderUndoResult({ record: stored, lastConfirmedAt: last.at })
+  return {
+    ok: true,
+    text: auditWarning === undefined ? text : `${text}\n⚠ 撤销审计写入失败：${auditWarning}`,
+  }
+}
+
+/** 批量撤销：逐条执行、逐条报告；一条失败不影响其它条。 */
+async function runUndoBatch(
+  ids: readonly string[],
+  stores: readonly TaggedStore[],
+  sessionId: string | null,
+  at: number,
+  deps: ConfirmDeps,
+): Promise<CommandResultLike> {
+  const results: { readonly id: string; readonly ok: boolean; readonly text: string }[] = []
+  for (const id of ids) {
+    const found = await findRecord(stores, id)
+    if (found === undefined) {
+      results.push({ id, ok: false, text: `未知 id：${id}（用户库/项目库都没有这条记忆）` })
+      continue
+    }
+    try {
+      const result = await runUndo(found, id, sessionId, at, deps)
+      results.push({ id, ok: result.ok, text: result.text })
+    } catch (error) {
+      results.push({ id, ok: false, text: `撤销失败（已隔离）：${messageOf(error)}` })
+    }
+  }
+  const okCount = results.filter(result => result.ok).length
+  try {
+    deps.onConfirm?.({
+      action: 'undo',
+      changed: okCount > 0,
+      count: okCount,
+      reason: `undone=${okCount}/${ids.length}`,
+      sessionId,
+    })
+  } catch {
+    // 观测口失败不影响命令结果
+  }
+  const lines = [`批量撤销：成功 ${okCount} / 共 ${ids.length} 条。`]
+  for (const result of results) {
+    // 单条回执可能多行；批量里压成一行，用 `：` 连接第一行与其余要点
+    const compact = result.text.split('\n').filter(line => line.trim().length > 0).join(' ｜ ')
+    lines.push(`- ${result.ok ? '✅' : '❌'} ${result.id}：${compact}`)
+  }
+  return { kind: okCount > 0 ? 'success' : 'error', text: lines.join('\n') }
 }
 
 /**
@@ -333,8 +635,8 @@ export function installConfirm(kernel: Kernel, deps: ConfirmDeps): ConfirmInstal
       const returned = commands.register({
         definitionId: CONFIRM_COMMAND_ID,
         name: CONFIRM_COMMAND_NAME,
-        description: '把候选记忆确认为已确认（用户显式动作；只改证据归属，不改正文与来源）',
-        input: { hint: '[记忆id]（不带参数 = 列出候选）' },
+        description: '确认候选记忆（可撤销；用户显式动作，只改证据归属，不改正文与来源）',
+        input: { hint: '[list [offset] | log 记忆id | 记忆id | undo 记忆id...]' },
         handler: (invocation: CommandInvocationLike): Promise<CommandResultLike> => {
           const session = sessionOfInvocation(invocation)
           const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
@@ -358,7 +660,6 @@ export function installConfirm(kernel: Kernel, deps: ConfirmDeps): ConfirmInstal
           // 幂等、不抛
         }
       }
-      // 清空后重复 dispose 不会再次调用宿主的注销函数（"幂等"要真的幂等）
       disposers.length = 0
     },
   }
