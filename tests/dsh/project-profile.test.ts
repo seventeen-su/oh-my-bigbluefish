@@ -49,8 +49,10 @@ function makeRepo(): string {
   writeFileSync(join(root, 'pnpm-lock.yaml'), '')
   writeFileSync(join(root, 'AGENTS.md'), '# Agent rules\n\nbe careful\n')
   mkdirSync(join(root, 'src', 'deep'), { recursive: true })
-  writeFileSync(join(root, 'src', 'index.ts'), 'export const alpha = 1\nexport const beta = 2\n')
+  writeFileSync(join(root, 'src', 'index.ts'), "import { helper } from '../lib/helper'\nexport const alpha = 1\nexport const beta = 2\n")
   writeFileSync(join(root, 'src', 'deep', 'util.ts'), '// util\n')
+  mkdirSync(join(root, 'lib'), { recursive: true })
+  writeFileSync(join(root, 'lib', 'helper.ts'), 'export function helper(): void {}\n')
   mkdirSync(join(root, 'tests'), { recursive: true })
   writeFileSync(join(root, 'tests', 'index.test.ts'), 'it("x", () => {})\n')
   mkdirSync(join(root, 'docs'), { recursive: true })
@@ -135,12 +137,14 @@ describe('项目画像', () => {
     const src = view?.structure?.sources?.find(source => source.dir === 'src')
     expect(src, 'src 目录必须被统计到').toBeDefined()
     expect(src?.files).toBe(2)
-    expect(src?.lines).toBe(3)
+    expect(src?.lines).toBe(4)
     expect(src?.tests).toBe(0)
     // v4.2 符号层：从 `export const a/b` 识别出代表符号（正则，不是语言服务）。
     expect(src?.symbols).toContain('alpha')
     expect(src?.symbols).toContain('beta')
     expect(src?.exports).toBeGreaterThanOrEqual(2)
+    // v4.3 依赖层：src/index.ts 的 `../lib/helper` 解析为仓库内文件 → 跨目录边。
+    expect(view?.structure?.imports).toEqual([{ from: 'src', to: 'lib', count: 1 }])
     const tests = view?.structure?.sources?.find(source => source.dir === 'tests')
     expect(tests?.tests).toBe(1)
 

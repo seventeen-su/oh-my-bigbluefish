@@ -74,6 +74,19 @@ export const MAX_WALK_DEPTH = 3
 /** 项目库连接缓存上限；超限按 LRU 淘汰并关库（防止长跑进程里句柄无限增长）。 */
 export const MAX_OPEN_PROJECTS = 16
 
+/**
+ * 项目库打开失败记录上限（v4.3）。
+ *
+ * 失败记录用于状态面诊断；不设上限时，持续遇到不同路径的失败会让键、错误文本
+ * 与 `status().detail` 一起增长（ChatGPT 审查指出的第二个无界增长点）。
+ * 32 条足够定位问题，超出按插入序淘汰最旧；错误文本也截断到 200 字符。
+ */
+export const MAX_PROJECT_FAILURES = 32
+/** 单条失败原因的最大字符数（防止一个超长异常把状态文本撑大）。 */
+export const MAX_PROJECT_FAILURE_TEXT = 200
+/** 状态面最多展示多少条失败明细（其余只报总数）。 */
+export const MAX_PROJECT_FAILURE_LINES = 5
+
 const NOOP = (): void => {}
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2503,8 +2516,18 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
   }
 
   function recordProjectFailure(key: string, reason: string): void {
-    projectFailures.set(key, reason)
-    logger.warn(`OMB 记忆库：${reason}`)
+    const text = reason.length > MAX_PROJECT_FAILURE_TEXT
+      ? `${reason.slice(0, MAX_PROJECT_FAILURE_TEXT - 1)}…`
+      : reason
+    // 先删后插：同一项目再次失败时刷新 LRU 次序，避免被旧位置误淘汰。
+    projectFailures.delete(key)
+    projectFailures.set(key, text)
+    while (projectFailures.size > MAX_PROJECT_FAILURES) {
+      const oldest = projectFailures.keys().next().value
+      if (oldest === undefined) break
+      projectFailures.delete(oldest)
+    }
+    logger.warn(`OMB 记忆库：${text}`)
   }
 
   function taggedStore(store: SqliteMemoryStore): TaggedStore {
@@ -2815,10 +2838,13 @@ export function createStoresService(options: StoresServiceOptions): MemoryStores
         parts.push(`用户库=${resolvedPort?.userDbPath ?? userPath}${migrationText(userSet.migrated[0])}`)
       }
       if (projectFailures.size > 0) {
+        const shown = [...projectFailures]
+          .slice(0, MAX_PROJECT_FAILURE_LINES)
+          .map(([key, reason]) => `${key}（${reason}）`)
         parts.push(
-          `项目库失败 ${projectFailures.size} 个：${[...projectFailures]
-            .map(([key, reason]) => `${key}（${reason}）`)
-            .join('；')}`,
+          `项目库失败 ${projectFailures.size} 个`
+          + `${projectFailures.size > shown.length ? `（只显示前 ${shown.length} 条）` : ''}：`
+          + shown.join('；'),
         )
       }
       if (unexpectedFailure !== undefined) parts.push(`意外失败：${unexpectedFailure}`)

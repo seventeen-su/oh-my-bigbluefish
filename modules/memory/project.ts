@@ -92,11 +92,19 @@ export interface ProjectProfileDoc {
   readonly title: string
 }
 
+/** v4.3：跨顶层目录的相对导入边。 */
+export interface ProjectProfileImport {
+  readonly from: string
+  readonly to: string
+  readonly count: number
+}
+
 export interface ProjectProfileStructure {
   readonly topDirs?: readonly ProjectProfileTopDir[]
   readonly sources?: readonly ProjectProfileSource[]
   readonly entries?: readonly string[]
   readonly docs?: readonly ProjectProfileDoc[]
+  readonly imports?: readonly ProjectProfileImport[]
 }
 
 export interface ProjectProfileCommit {
@@ -379,6 +387,15 @@ function renderStructure(view: ProjectProfileView | undefined, missingReason: st
           .join('；')}`,
       )
     }
+  }
+  // v4.3 依赖层：跨顶层目录的相对导入边（不是完整调用图）。
+  if (structure?.imports !== undefined && structure.imports.length > 0) {
+    parts.push(
+      `依赖 ${structure.imports
+        .slice(0, 4)
+        .map(edge => `${edge.from}→${edge.to}(${edge.count})`)
+        .join('、')}`,
+    )
   }
   if (structure?.entries !== undefined && structure.entries.length > 0) {
     parts.push(`入口 ${structure.entries.slice(0, 4).join('、')}`)

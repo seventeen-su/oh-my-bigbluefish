@@ -64,7 +64,26 @@ interface IndexCache {
 }
 
 const caches = new Map<string, IndexCache>()
+/**
+ * cwd → 索引缓存上限（v4.3）。
+ *
+ * 每个缓存项持有一份 `git ls-files` 结果（一个仓库可能上千条路径），
+ * 不设上限时，长跑进程里见过的每个工作目录都会永久留一份——这是审查之后
+ * 主动排查发现的第三个有界化缺口。16 与项目库连接上限同量级。
+ */
+const MAX_INDEX_CACHES = 16
 let verificationCount = 0
+
+/** 有界写入：同一 cwd 刷新 LRU 次序，超出淘汰最旧。 */
+function rememberIndex(cwd: string, entry: IndexCache): void {
+  caches.delete(cwd)
+  caches.set(cwd, entry)
+  while (caches.size > MAX_INDEX_CACHES) {
+    const oldest = caches.keys().next().value
+    if (oldest === undefined) break
+    caches.delete(oldest)
+  }
+}
 
 /**
  * 最近一次核验为什么"核验不了"（`null` = 最近一次拿到了可用索引）。
@@ -118,18 +137,18 @@ function indexOf(cwd: string, tick: number): ReadonlySet<string> | undefined {
   } catch (error) {
     // 不是 git 仓库 / git 不在 / 超时：一律"核验不了"，**但记住这个结论与原因**
     const reason = unavailableReasonOf(error)
-    caches.set(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
+    rememberIndex(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
     lastUnavailableReason = reason
     return undefined
   }
   if (files.size === 0) {
     // 空索引（仓库里没有受管文件，或输出为空）：同样核验不了 —— 也缓存
     const reason = 'git 索引为空（该目录下没有受管文件）'
-    caches.set(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
+    rememberIndex(cwd, { files: EMPTY_INDEX, at: tick, unavailable: reason })
     lastUnavailableReason = reason
     return undefined
   }
-  caches.set(cwd, { files, at: tick, unavailable: null })
+  rememberIndex(cwd, { files, at: tick, unavailable: null })
   lastUnavailableReason = null
   return files
 }

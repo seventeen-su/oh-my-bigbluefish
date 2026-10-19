@@ -209,6 +209,40 @@ export function renderBuildSection(
   return lines
 }
 
+/**
+ * 进程内存读数（v4.3）：把 OOM 从"崩溃后才知道"变成"状态面可见"。
+ *
+ * 为什么放在 `omb_status`：这是唯一的模型可见诊断入口，也是人工排查的第一站；
+ * 宿主堆增长到 4GB 才 OOM 的现场，事后只剩崩溃栈。这里每次渲染给出 rss/heap
+ * 与 uptime，至少能在崩溃前看到趋势。
+ */
+export interface ProcessMemorySnapshot {
+  readonly rss: number
+  readonly heapUsed: number
+  readonly heapTotal: number
+  readonly external: number
+}
+
+function mb(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '未测量'
+  return `${(bytes / 1024 / 1024).toFixed(0)} MB`
+}
+
+/** 渲染 `## 进程` 段（纯函数，便于测试）。 */
+export function renderProcessSection(snapshot: ProcessMemorySnapshot, uptimeSec: number): readonly string[] {
+  const uptime = Number.isFinite(uptimeSec) && uptimeSec >= 0
+    ? uptimeSec >= 3600
+      ? `${Math.floor(uptimeSec / 3600)}h${Math.floor((uptimeSec % 3600) / 60)}m`
+      : `${Math.floor(uptimeSec / 60)}m`
+    : '未知'
+  return [
+    '## 进程',
+    `- Node ${process.version}：rss ${mb(snapshot.rss)} / heapUsed ${mb(snapshot.heapUsed)}`
+    + ` / heapTotal ${mb(snapshot.heapTotal)} / external ${mb(snapshot.external)}（uptime ${uptime}）`,
+    '',
+  ]
+}
+
 /** 组装 `omb_status` 的输出文本。纯组装，无副作用，便于测试。 */
 export function renderStatus(options: StatusToolOptions, sessionId?: string): string {
   const { handle } = options
@@ -274,6 +308,8 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   // （实测：真机报第 77 代，磁盘早已是 g79，而 g77 的产物目录已被构建删掉）。
   const generation = generationFromUrl(import.meta.url)
   lines.push('## 构建', '', ...renderBuildSection(generation, diskGeneration()), '')
+  // v4.3：OOM 诊断入口——进程内存与 uptime（趋势比崩溃栈更有用）。
+  lines.push(...renderProcessSection(process.memoryUsage(), process.uptime()))
 
   // ── 模块健康 ──────────────────────────────────────────────────────────
   //

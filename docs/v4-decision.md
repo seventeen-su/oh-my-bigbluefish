@@ -121,3 +121,16 @@
 | D8 | **跨会话/子代理写归因**：全局有界 `recentWrites`（cwd+absPath → 最近写入者/时刻）；`otherSessionWrites` 计入 situation；hash 不可用时保守 deny | v4.1 明确留白"子代理写集并入"；内容哈希能拦"内容变了"，但无法在**无法核验**时给归因 | 双会话单测（A 读、B 写 → A 的 edit deny 且理由含"其他会话"）；`omb_project` L2 显示 | 不做父/子会话拓扑推断；不做按路径精确归属的合并 |
 | D9 | **符号级 repo-map**：`extractSymbols`（TS/JS/Py/Go/Rust 导出名，频次排序 ≤6）+ `ProjectProfileSource.exports/symbols`；`omb_project` L1 只展示前两个有符号目录的短摘要 | 审查与用户都指出"画像不是深入项目理解"；完整语言服务成本高、收益未验证 | 临时仓库单测（`export const alpha/beta` → symbols）；`PROFILE_TEXT_MAX` 与扫描上限不变 | 完整导入图/调用图/类型解析（v4.3）；不新增常驻提示 |
 | D10 | **盲写策略可配置**：`blindWritePolicy: 'allow' \| 'deny'`（默认 allow）；deny 时无印记+文件存在 → deny，逃生门第 3 次放行 | v4.1 留白"缺读取戳是否硬拦"；shell 读不可见使默认硬拦有误伤风险，但需要更严的项目应有开关 | `tests/dsh/state-machine.test.ts` deny 两次→第 3 次 allow；`blindWrites` 两策略都计数 | 默认不改（避免误伤 shell 读）；不做按项目自动切换 |
+
+## 11. v4.3 决策（2026-10-19，版本 4.3.0 / g92）
+
+> 依据：`docs/v4.3-bounded-and-imports.md`。审查指出的两个无界增长点确认并修复；
+> v4.2 未完成的"完整导入图"落地为**跨顶层目录相对导入图**；新增进程内存读数。
+
+| # | 决策 | 为什么（证据） | 验收 | 明确不做 |
+| --- | --- | --- | --- | --- |
+| D11 | **`turnBySession` 有界**：`MAX_TRACKED_TURNS=256` + 先删后插 LRU | 审查属实：`turn/start` 只 set、无删除/上限 | `rememberTurn` 单测（上限/刷新次序） | 不把回合号持久化（进程内派生数据） |
+| D12 | **`projectFailures` 有界**：32 条、单条 200 字符、状态只显示前 5 条 | 审查属实：失败记录只增不减，`status().detail` 全量拼接 | `bounded-growth.test.ts`（32 条/截断/只显示 5 条/用户库仍可用） | 不隐藏总数（超过 5 条只省略明细，不省略计数） |
+| D13 | **同类缓存有界**：artifact 索引 16、reasoning `explicit` 128、`capabilities` 64 | 审查后主动排查：artifact 缓存每项可含上千文件路径且无上限 | 代码级上限 + 类型门禁 | 不改缓存命中语义（只淘汰最旧） |
+| D14 | **进程内存进 `omb_status`**：`## 进程` 段（rss/heapUsed/heapTotal/external/uptime） | OOM 现场只有崩溃栈；状态面是唯一模型可见诊断入口 | `status-process.test.ts`（格式/非法值"未测量"） | 不做自动重启/自愈；只报事实 |
+| D15 | **跨顶层目录相对导入图**：`extractRelativeImports` + `resolveImportTarget` + `structure.imports`（≤12 边）；`omb_project` L1 显示前 4 条 | v4.2 明确留白"完整导入图"；只做确定性、无语言服务依赖的部分 | `project-profile.test.ts`（`src → lib` 边、确定性不变） | 完整调用图/类型图、路径别名（`@/…`）、包导出映射（v4.4） |

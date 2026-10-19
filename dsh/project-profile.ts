@@ -27,7 +27,7 @@
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { basename, extname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import type { Clock } from '../kernel/abi/index.js'
 
 /** 画像身份层（L0）：项目名/版本 + git 身份。 */
@@ -63,12 +63,21 @@ export interface ProjectProfileDoc {
   readonly title: string
 }
 
-/** 画像结构层（L1）：目录、源码规模、入口、文档。 */
+/** v4.3：一条跨顶层目录的相对导入边（from → to，含出现次数）。 */
+export interface ProjectProfileImport {
+  readonly from: string
+  readonly to: string
+  readonly count: number
+}
+
+/** 画像结构层（L1）：目录、源码规模、入口、文档、跨模块依赖。 */
 export interface ProjectProfileStructure {
   readonly topDirs?: readonly ProjectProfileTopDir[]
   readonly sources?: readonly ProjectProfileSource[]
   readonly entries?: readonly string[]
   readonly docs?: readonly ProjectProfileDoc[]
+  /** v4.3：相对导入构成的有向边（只统计仓库内、跨顶层目录；不是完整调用图）。 */
+  readonly imports?: readonly ProjectProfileImport[]
 }
 
 /** 一条提交（短 hash + 主题 + 作者时间）。 */
@@ -240,23 +249,52 @@ function looksLikeTest(relativePath: string): boolean {
   return /^test_/.test(base)
 }
 
-/** 数行数并抽取导出符号（有界：只读小文件；失败 0/空）。 */
-function analyzeSource(path: string): { readonly lines: number; readonly symbols: readonly string[] } {
+/** 数行数、抽取导出符号与相对导入（有界：只读小文件；失败 0/空）。 */
+function analyzeSource(path: string): {
+  readonly lines: number
+  readonly symbols: readonly string[]
+  readonly imports: readonly string[]
+} {
   try {
     // 先看尺寸再读：超大文件（生成物/数据）连读都不读，避免一次画像拖垮工具调用。
-    if (statSync(path).size > LINE_COUNT_MAX_BYTES) return { lines: 0, symbols: [] }
+    if (statSync(path).size > LINE_COUNT_MAX_BYTES) return { lines: 0, symbols: [], imports: [] }
     const buffer = readFileSync(path)
-    if (buffer.length === 0) return { lines: 0, symbols: [] }
+    if (buffer.length === 0) return { lines: 0, symbols: [], imports: [] }
     const text = buffer.toString('utf8')
     let lines = 0
     for (let i = 0; i < text.length; i += 1) {
       if (text.charCodeAt(i) === 10) lines += 1
     }
     if (!text.endsWith('\n')) lines += 1
-    return { lines, symbols: extractSymbols(text, extname(path).toLowerCase()) }
+    const extension = extname(path).toLowerCase()
+    return { lines, symbols: extractSymbols(text, extension), imports: extractRelativeImports(text, extension) }
   } catch {
-    return { lines: 0, symbols: [] }
+    return { lines: 0, symbols: [], imports: [] }
   }
+}
+
+/**
+ * 抽取**相对导入**的说明符（v4.3，确定性正则）。
+ *
+ * 只收 `./`/`../` 开头（仓库内边）；外部包与路径别名（`@/…`）不猜。
+ * TS/JS：`import … from '…'`、`export … from '…'`、`require('…')`、动态 `import('…')`。
+ * Python：`from .x import …`。Go/Rust 的模块路径不是文件相对路径，跳过。
+ */
+export function extractRelativeImports(text: string, extension: string): readonly string[] {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const found = new Set<string>()
+  const add = (value: string | undefined): void => {
+    if (value === undefined) return
+    const clean = value.trim()
+    if (clean.startsWith('./') || clean.startsWith('../')) found.add(clean)
+  }
+  if (extension === '.ts' || extension === '.tsx' || extension === '.mts' || extension === '.cts'
+    || extension === '.js' || extension === '.jsx' || extension === '.mjs' || extension === '.cjs') {
+    for (const match of text.matchAll(/(?:from|require\s*\(|import\s*\()\s*['"]([^'"]+)['"]/g)) add(match[1])
+  } else if (extension === '.py') {
+    for (const match of text.matchAll(/^\s*from\s+(\.+[\w.]*)\s+import\b/gm)) add(match[1])
+  }
+  return [...found].sort()
 }
 
 /**
@@ -307,8 +345,40 @@ interface SourceBucket {
 interface ScanResult {
   readonly topDirs: ProjectProfileTopDir[]
   readonly sources: ProjectProfileSource[]
+  /** v4.3：跨顶层目录的相对导入边（最多 `IMPORT_EDGE_MAX` 条）。 */
+  readonly imports: ProjectProfileImport[]
   /** 是否因为文件上限而截断（状态面/文本不假装"这就是全部"）。 */
   readonly truncated: boolean
+}
+
+/** v4.3：导入边展示上限（够看"模块怎么依赖"，不追求完整图）。 */
+const IMPORT_EDGE_MAX = 12
+
+/**
+ * 把一个相对导入说明符解析成仓库内文件（v4.3，确定性候选序列）。
+ *
+ * 依次尝试：原路径（带扩展名时）、常见扩展名、`index.<ext>`；只有**仓库内**
+ * 且真实存在的文件才算边。解析不到就跳过——不猜路径别名、不执行打包器规则。
+ */
+function resolveImportTarget(root: string, fromFile: string, specifier: string): string | undefined {
+  if (!specifier.startsWith('.')) return undefined
+  const base = resolve(dirname(fromFile), specifier)
+  const extensions = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs']
+  const candidates: string[] = []
+  if (extname(base).length > 0) candidates.push(base)
+  for (const extension of extensions) candidates.push(`${base}${extension}`)
+  for (const extension of extensions) candidates.push(join(base, `index${extension}`))
+  for (const candidate of candidates) {
+    try {
+      if (!statSync(candidate).isFile()) continue
+      const rel = relative(root, candidate)
+      if (rel.length === 0 || rel.startsWith('..') || resolve(root, rel) !== resolve(candidate)) continue
+      return rel.split(sep).join('/')
+    } catch {
+      // 候选不存在：继续
+    }
+  }
+  return undefined
 }
 
 /**
@@ -320,6 +390,7 @@ interface ScanResult {
 function scanTree(root: string, maxFiles: number): ScanResult {
   const topDirs: ProjectProfileTopDir[] = []
   const sourceBuckets = new Map<string, SourceBucket>()
+  const importEdges = new Map<string, number>()
   let fileCount = 0
   let budget = maxFiles
   let truncated = false
@@ -331,7 +402,7 @@ function scanTree(root: string, maxFiles: number): ScanResult {
       .map(entry => entry.name)
       .sort()
   } catch {
-    return { topDirs: [], sources: [], truncated: false }
+    return { topDirs: [], sources: [], imports: [], truncated: false }
   }
 
   /** 记一个源码文件的规模与导出符号（非源码扩展名直接跳过）。 */
@@ -345,6 +416,15 @@ function scanTree(root: string, maxFiles: number): ScanResult {
     bucket.lines += analyzed.lines
     bucket.exports += analyzed.symbols.length
     for (const name of analyzed.symbols) bucket.symbols.set(name, (bucket.symbols.get(name) ?? 0) + 1)
+    // v4.3：相对导入 → 仓库内目标文件的顶层目录边（跨目录才记；去重按边累计）。
+    for (const specifier of analyzed.imports) {
+      const target = resolveImportTarget(root, absolutePath, specifier)
+      if (target === undefined) continue
+      const to = target.split('/')[0]
+      if (to === undefined || to.length === 0 || to === topName) continue
+      const key = `${topName}\u0000${to}`
+      importEdges.set(key, (importEdges.get(key) ?? 0) + 1)
+    }
     sourceBuckets.set(topName, bucket)
   }
 
@@ -405,9 +485,18 @@ function scanTree(root: string, maxFiles: number): ScanResult {
     .sort((a, b) => b.files - a.files || a.dir.localeCompare(b.dir))
     .slice(0, SOURCE_DIR_MAX)
 
+  const imports = [...importEdges.entries()]
+    .map(([key, count]) => {
+      const split = key.indexOf('\u0000')
+      return { from: key.slice(0, split), to: key.slice(split + 1), count }
+    })
+    .sort((a, b) => b.count - a.count || a.from.localeCompare(b.from) || a.to.localeCompare(b.to))
+    .slice(0, IMPORT_EDGE_MAX)
+
   return {
     topDirs: topDirs.slice(0, TOP_DIR_MAX),
     sources,
+    imports,
     truncated,
   }
 }
@@ -639,6 +728,7 @@ function buildProfile(cwd: string, now: number, rootOf: (cwd: string) => string,
     ...(scan.sources.length === 0 ? {} : { sources: scan.sources }),
     ...(entries.length === 0 ? {} : { entries }),
     ...(docs.length === 0 ? {} : { docs }),
+    ...(scan.imports.length === 0 ? {} : { imports: scan.imports }),
   }
   const history: ProjectProfileHistory = {
     ...(git.commits === undefined ? {} : { commits: git.commits }),

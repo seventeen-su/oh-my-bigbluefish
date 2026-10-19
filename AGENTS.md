@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.2**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -62,16 +62,18 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.2（当前，4.2.0 / g91）** = **写可见性收尾**：在 v4.1 之上加指令文件指纹（`AGENTS.md`/`CLAUDE.md`
-  变化 → 状态行"指令已变"）、shell 写路径提取（`>`/`-Path`/`sed -i`/`git checkout`，提取不到记未知）、
-  跨会话/子代理写归因（`recentWrites` + `otherSessionWrites`）、符号级 repo-map（`ProjectProfileSource.symbols`，
-  正则、非语言服务）、盲写策略可配置（默认 `allow`，`deny` 时逃生门仍生效）。
-  契约：`docs/v4.2-gap-closure.md`；v4.1 契约与审查回应见 `docs/v4.1-spacetime.md`、
-  `docs/research/2026-10-18-v4-review-response.md`。
+- **v4.3（当前，4.3.0 / g92）** = **有界化 + 导入图**：`turnBySession`/`projectFailures`/artifact 缓存/
+  reasoning 会话表全部有界；`omb_status` 新增 `## 进程`（rss/heapUsed/heapTotal/external/uptime，OOM 趋势可见）；
+  画像新增 `structure.imports`（跨顶层目录相对导入边，≤12）并在 `omb_project` L1 展示。
+  契约：`docs/v4.3-bounded-and-imports.md`；v4.2 契约见 `docs/v4.2-gap-closure.md`。
+- v4.2 = **写可见性收尾**：指令文件指纹（`AGENTS.md`/`CLAUDE.md` →"指令已变"）、shell 写路径提取
+  （提取不到记未知）、跨会话/子代理写归因（`recentWrites` + `otherSessionWrites`）、符号级 repo-map、
+  盲写策略可配置（默认 `allow`，`deny` 时逃生门仍生效）。
 - v4.1 = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
   自主捕获 = `tool/call` → `tool/result` 生命周期；`omb_project` = L0–L5 分层时空快照（≤2,400 字符，隐私先于读取）。
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。
-- 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
+- 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 / §11 v4.3 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
 - 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
-- v4.2 仍未做（不要在文档里假装已做）：完整导入图/调用图与语言服务级符号解析、shell 未知写的路径级归因、
-  三方合并/自动补丁、`dsh-path-guard` 的 `selfProtection`（用户设置）。
+- v4.3 仍未做（不要在文档里假装已做）：完整调用图/类型图与路径别名解析（v4.4）、shell 未知写的
+  路径级归因、三方合并/自动补丁、OOM 根因定位（宿主侧 heap snapshot）、`dsh-path-guard` 的
+  `selfProtection`（用户设置）。

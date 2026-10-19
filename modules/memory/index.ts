@@ -58,6 +58,33 @@ import { toHostPlugin } from '../../kernel/hostEntry.js'
 export const MODULE_ID = 'omb-memory'
 
 /**
+ * 「会话 → 当前回合号」表的上限（v4.3）。
+ *
+ * 这张表只用于 `sourceRef` 里写回合号；不设上限时，长跑进程见过的每个会话
+ * 都会永久留一条（ChatGPT 审查指出的无界增长点之一）。256 足够覆盖活跃会话，
+ * 超出按插入序淘汰最旧；同一会话再次 set 会先删后插，近似 LRU。
+ */
+export const MAX_TRACKED_TURNS = 256
+
+/** 有界地记录一个会话的回合号（导出便于单测；生产只此一处调用）。 */
+export function rememberTurn(
+  map: Map<string, number>,
+  sessionId: string,
+  turn: number,
+  max = MAX_TRACKED_TURNS,
+): void {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return
+  if (!Number.isFinite(turn)) return
+  map.delete(sessionId)
+  map.set(sessionId, turn)
+  while (map.size > max) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
+}
+
+/**
  * 常驻提示（3.7-M1）。
  *
  * 为什么是这一句、为什么这么短：
@@ -619,7 +646,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
   const manifest: ModuleManifest<MemoryConfig> = {
     id: MODULE_ID,
-    version: options.version ?? '4.2.0',
+    version: options.version ?? '4.3.0',
     requires: REQUIRES,
     capabilities: CAPABILITIES,
     configSchema: memoryConfigSchema,
@@ -736,7 +763,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 它是**按会话**键控的表，不是一个"最近回合"变量。
       const turnBySession = new Map<string, number>()
       const offTurn = kernel.on('turn/start', payload => {
-        turnBySession.set(payload.sessionId, payload.turn)
+        rememberTurn(turnBySession, payload.sessionId, payload.turn)
         // 预热该会话的项目库：打开是异步的，工具执行体只能同步取库（`peek`）。
         // 失败由服务记入状态面（`status().detail`），这里吞掉是刻意的。
         void service.forSession(payload.sessionId)

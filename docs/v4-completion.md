@@ -151,3 +151,45 @@
 - 完整导入图/调用图与语言服务级符号解析（v4.3）。
 - shell 未知写的路径级归因；`git apply`/构建脚本的写集。
 - 三方合并/自动补丁；`dsh-path-guard` 的 `selfProtection`（用户设置，本版不动）。
+
+---
+
+# OMB v4.3 交付记录（2026-10-19）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.3.0**（根包 + 7 个组件 + 模块清单） |
+| 构建 | **g92**；`generation: 92`、`outDir: lib-gen/g92`、`builtAt: 2026-10-19T15:23:19Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **109 files / 1339 passed | 1 skipped**；`build` 成功（g92）；`check-resolution` **7/7** |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 92/92 + `## 进程` 段；`omb_project` L1 含「依赖 …」 |
+
+## 本版内容
+
+1. **审查指出的两个无界增长点**：`turnBySession` 256 条 LRU；`projectFailures` 32 条 +
+   文本截断 + 状态只显示前 5 条（计数仍全量）。
+2. **同类缓存有界**：artifact 索引 16、reasoning `explicit` 128、`capabilities` 64。
+3. **进程内存读数**：`omb_status` 新增 `## 进程`（rss/heapUsed/heapTotal/external/uptime）。
+4. **跨模块导入图**：画像 `structure.imports`（≤12 条边）+ `omb_project` L1 展示；
+   正则、相对路径、仓库内解析，不是完整调用图。
+5. **关于 OOM**：两个增长点属实但不是主因（条目小、事件驱动；空闲仍增长）。
+   根因仍需宿主 heap snapshot；`## 进程` 段用于观察趋势。
+
+## 文件
+
+- `modules/memory/index.ts`（`rememberTurn`/`MAX_TRACKED_TURNS`）
+- `modules/memory/store.ts`（失败记录上限/截断/状态只显示 5 条）
+- `modules/memory/artifacts.ts`（索引缓存 16）
+- `dsh/reasoning-effort.ts`（explicit/capabilities 上限）
+- `dsh/project-profile.ts`（`extractRelativeImports`/`resolveImportTarget`/`structure.imports`）
+- `modules/memory/project.ts`（L1 依赖展示）
+- `dsh/status-tool.ts`（`## 进程`）
+- 测试：`tests/modules/memory/bounded-growth.test.ts`、`tests/dsh/status-process.test.ts`、
+  `tests/dsh/project-profile.test.ts`（导入边）
+
+## 仍未做
+
+- 完整调用图/类型图、路径别名与包导出映射（v4.4）。
+- shell 未知写路径级归因、三方合并。
+- OOM 根因（宿主侧快照）。

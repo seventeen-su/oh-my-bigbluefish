@@ -75,13 +75,37 @@ export function wireReasoningEffort(options: {
   const explicit = new Map<string, FocusDepth>()
   const applied = new Map<string, EffortApplication>()
   const capabilities = new Map<string, readonly string[] | null>()
+  /**
+   * 会话表有界（v4.3）：`explicit` 每会话一条、`capabilities` 每 provider/model 一条。
+   * 不设上限时，长跑进程见过的每个会话都会永久留一条——与 `turnBySession` 同类。
+   */
+  const MAX_EXPLICIT_SESSIONS = 128
+  const MAX_CAPABILITY_ENTRIES = 64
+  const rememberExplicit = (sessionId: string, depth: FocusDepth): void => {
+    explicit.delete(sessionId)
+    explicit.set(sessionId, depth)
+    while (explicit.size > MAX_EXPLICIT_SESSIONS) {
+      const oldest = explicit.keys().next().value
+      if (oldest === undefined) break
+      explicit.delete(oldest)
+    }
+  }
+  const rememberCapability = (key: string, value: readonly string[] | null): void => {
+    capabilities.delete(key)
+    capabilities.set(key, value)
+    while (capabilities.size > MAX_CAPABILITY_ENTRIES) {
+      const oldest = capabilities.keys().next().value
+      if (oldest === undefined) break
+      capabilities.delete(oldest)
+    }
+  }
   const llm = readService<LlmLike>(ctx, 'llm')
   let disposed = false
 
   const offFocus = kernel.on('focus/changed', payload => {
     if (disposed) return
     if (payload.depth === 'standard') explicit.delete(payload.sessionId)
-    else explicit.set(payload.sessionId, payload.depth)
+    else rememberExplicit(payload.sessionId, payload.depth)
   })
 
   const record = (sessionId: string, entry: EffortApplication): void => {
@@ -97,17 +121,17 @@ export function wireReasoningEffort(options: {
     const key = `${provider}\u0000${model}`
     if (capabilities.has(key)) return capabilities.get(key) ?? null
     if (llm === undefined) {
-      capabilities.set(key, null)
+      rememberCapability(key, null)
       return null
     }
     try {
       const info = await llm.resolveModelInfo(provider, model)
       const efforts = info.reasoning?.efforts.map(effort => effort.id) ?? []
       const value = efforts.length === 0 ? null : efforts
-      capabilities.set(key, value)
+      rememberCapability(key, value)
       return value
     } catch {
-      capabilities.set(key, null)
+      rememberCapability(key, null)
       return null
     }
   }
