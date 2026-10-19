@@ -169,6 +169,7 @@ describe('omb-memory 配置', () => {
       autoCapturePreferences: true,
       autoCaptureActivity: true,
       autoCaptureOutcome: true,
+      memoryController: 'execute',
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
@@ -188,6 +189,7 @@ describe('omb-memory 配置', () => {
       autoCapturePreferences: true,
       autoCaptureActivity: true,
       autoCaptureOutcome: true,
+      memoryController: 'execute',
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
@@ -204,6 +206,7 @@ describe('omb-memory 配置', () => {
       autoCapturePreferences: true,
       autoCaptureActivity: true,
       autoCaptureOutcome: true,
+      memoryController: 'execute',
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,
@@ -219,6 +222,13 @@ describe('omb-memory 配置', () => {
     expect(memoryConfigSchema.parse({ recallDetail: 'full' }).recallDetail).toBe('full')
     expect(() => memoryConfigSchema.parse({ recallDetail: 'verbose' })).toThrow()
     expect(() => memoryConfigSchema.parse({ residentHint: 'yes' })).toThrow()
+  })
+
+  it('v4.7.0 控制器模式：execute（缺省）/ dry-run / off，其它值被拒', () => {
+    expect(memoryConfigSchema.parse({}).memoryController).toBe('execute')
+    expect(memoryConfigSchema.parse({ memoryController: 'dry-run' }).memoryController).toBe('dry-run')
+    expect(memoryConfigSchema.parse({ memoryController: 'off' }).memoryController).toBe('off')
+    expect(() => memoryConfigSchema.parse({ memoryController: 'on' })).toThrow()
   })
 
   it('非法配置被拒（路径可读）', () => {
@@ -242,6 +252,7 @@ describe('omb-memory 配置', () => {
       autoCapturePreferences: true,
       autoCaptureActivity: true,
       autoCaptureOutcome: true,
+      memoryController: 'execute',
       autoLinkRelated: true,
       relatedExpansion: true,
       coldStartRetryMs: 250,

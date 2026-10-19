@@ -352,3 +352,49 @@
   `tests/dsh/project-evidence.test.ts`、`tests/modules/memory/capture.test.ts`、
   `tests/modules/memory/proactive.test.ts`
 - 版本：`version-manifest.json`（4.6.1 / 82 小功能）
+
+---
+
+# OMB v4.7.0 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.7.0**（`24 功能 / 85 小功能`；x2 功能更新，决策与执行在同一功能内完成） |
+| 构建 | **g108**；`generation: 108`、`outDir: lib-gen/g108`、`builtAt: 2026-10-19T18:37:11Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **116 files / 1414 passed | 1 skipped**；`build` 成功（g108）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 108/108、版本 4.7.0；记忆行显示 `事件控制器（执行）` 及 `写入/查回` 计数；`memoryController: dry-run`/`off` 可回滚 |
+
+## 本版内容（决策 + 执行）
+
+1. `modules/memory/controller.ts` 纯 reducer：user-message / tool-result / turn-end /
+   memory-written → persist / lookup / request-model / track-task / expire-task；
+   任务 TTL 在事件到达时清算，回合结束清空剩余任务。
+2. 安全闸门：临时约束永不 persist、显式记住优先、纠正不自动写、工具结果不产生动作、
+   同文本去重、候选/任务有界；疑问/命令/代码/偏好标记判据抽到
+   `modules/memory/message-filter.ts`，捕获与控制器共用一份。
+3. `capture.ts` 在 `execute` 模式执行动作：persist 走既有隐私/去重/冷启动写入并
+   查回验证（id + contentHash）、lookup 走词法检索给旧 id 与 supersedes 用法、
+   request-model 只注入一行；显式记住 `assertedBy=user`（已确认、不受上限），
+   非显式推断 `assertedBy=model`（候选）。
+4. execute 且自动捕获开启时抑制 proactive 提示，避免模型重复 `omb_remember`；
+   `memoryController` 三档（execute/dry-run/off）；健康面 `controllerHealthNote()`
+   区分执行与 dry-run，决策计数与执行计数分开。
+
+详见 `docs/v4.7.0-memory-controller.md`。
+
+## 文件
+
+- 新增：`modules/memory/controller.ts`、`modules/memory/message-filter.ts`、
+  `tests/modules/memory/controller.test.ts`、`docs/v4.7.0-memory-controller.md`
+- 修改：`modules/memory/capture.ts`、`modules/memory/index.ts`、
+  `tests/modules/memory/{capture,registration,status-honesty}.test.ts`、版本文件
+
+## 仍未做（本版结束时）
+
+- 不自动 supersedes（旧 id 交给模型核对）；
+- 任务约束不跨会话/进程持久化；
+- lookup 只走词法，不做向量/语义；
+- 候选晋升命令仍未实现；
+- 模型主动 `omb_remember` 与控制器写入之间仍无正文唯一约束（靠提示抑制降低重复概率）。

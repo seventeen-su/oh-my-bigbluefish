@@ -11,7 +11,7 @@
  * ⑥ 隐私闸门：写许可为假时一条都不写。
  */
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { MemoryRecord, MemoryScope, MemoryStore } from '../../../kernel/abi/index.js'
 import {
   classifySessionOutcome,
@@ -25,7 +25,10 @@ import {
   isQuestion,
   MAX_PENDING_GLOBAL,
   MAX_PENDING_PER_SESSION,
+  type ControllerLookup,
+  type ControllerMode,
 } from '../../../modules/memory/capture.js'
+import { stageOfMemory } from '../../../modules/memory/lifecycle.js'
 import { asRecordScanner, openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { fixedClock, tempWorkspace, testPort, type TempWorkspace } from './helpers.js'
 
@@ -43,7 +46,13 @@ interface CaptureFixture {
   close(): Promise<void>
 }
 
-function captureFixture(options: { readonly withProject?: boolean; readonly privacyAllows?: boolean; readonly retryMs?: number } = {}): CaptureFixture {
+function captureFixture(options: {
+  readonly withProject?: boolean
+  readonly privacyAllows?: boolean
+  readonly retryMs?: number
+  readonly controllerMode?: ControllerMode
+  readonly lookupEntries?: ControllerLookup
+} = {}): CaptureFixture {
   const ws: TempWorkspace = tempWorkspace('omb-capture-')
   const clock = fixedClock()
   const port = testPort(ws.dir)
@@ -75,6 +84,8 @@ function captureFixture(options: { readonly withProject?: boolean; readonly priv
     enabledPreferences: true,
     enabledActivity: true,
     enabledOutcome: true,
+    controllerMode: options.controllerMode ?? 'execute',
+    ...(options.lookupEntries === undefined ? {} : { lookupEntries: options.lookupEntries }),
     projectRetryMs: options.retryMs ?? 0,
   })
   return {
@@ -145,7 +156,7 @@ describe('规则（纯函数）', () => {
 })
 
 describe('事件落地（真实 SQLite）', () => {
-  it('用户消息 → 用户库 semantic/user，逐字 + sourceRef=session:<id>#<seq>', async () => {
+  it('非显式长期偏好 → 用户库 semantic/**候选**（assertedBy=model，不冒充已确认）', async () => {
     const f = captureFixture()
     await f.capture.onUserMessage({ sessionId: 's1', text: '以后回答请简洁一点，不要分点。', at: 1000, seq: 42 })
     const rows = await rowsOf(f.user)
@@ -154,27 +165,48 @@ describe('事件落地（真实 SQLite）', () => {
       scope: 'user',
       kind: 'semantic',
       text: '以后回答请简洁一点，不要分点。',
-      assertedBy: 'user',
-      sourceRef: 'session:s1#42',
+      // v4.7.0：控制器执行非显式写入 → 候选阶段（生命周期"候选"）
+      assertedBy: 'model',
+      sourceRef: 'session:s1#controller:1000',
       project: '/work/demo',
     })
+    expect(stageOfMemory({ kind: 'semantic', assertedBy: 'model' })).toBe('candidate')
     expect(f.written).toHaveLength(1)
-    expect(f.capture.stats().preferences).toBe(1)
+    const stats = f.capture.stats()
+    expect(stats.preferences).toBe(1)
+    expect(stats.controller.persisted).toBe(1)
+    expect(stats.controller.verified).toBe(1)
+    expect(stats.controller.verifyFailed).toBe(0)
     await f.close()
   })
 
-  it('同一条消息重复投递只写一次；每会话偏好上限 5', async () => {
+  it('显式“记住” → 用户库 semantic/**已确认**（assertedBy=user）', async () => {
+    const f = captureFixture()
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后回答不要分点，保持简短。', at: 5 })
+    const rows = await rowsOf(f.user)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ assertedBy: 'user', sourceRef: 'session:s1#controller:5' })
+    expect(stageOfMemory({ kind: 'semantic', assertedBy: 'user' })).toBe('confirmed')
+    expect(f.capture.stats().controller.persisted).toBe(1)
+    await f.close()
+  })
+
+  it('同一条消息重复投递只写一次；每会话偏好上限 5（显式记住不受上限约束）', async () => {
     const f = captureFixture()
     await f.capture.onUserMessage({ sessionId: 's1', text: '以后回答请简洁一点，不要分点。', at: 1, seq: 1 })
     await f.capture.onUserMessage({ sessionId: 's1', text: '以后回答请简洁一点，不要分点。', at: 2, seq: 2 })
     expect(await rowsOf(f.user)).toHaveLength(1)
 
     for (let index = 0; index < 8; index += 1) {
-      await f.capture.onUserMessage({ sessionId: 's1', text: `约定 ${index}：以后都用中文回答。`, at: 10 + index, seq: 10 + index })
+      await f.capture.onUserMessage({ sessionId: 's1', text: `以后回答 ${index}：请简洁一点，不要分点。`, at: 10 + index, seq: 10 + index })
     }
     const rows = await rowsOf(f.user)
     expect(rows).toHaveLength(5) // 1 + 4（达到上限后不再写）
     expect(f.capture.stats().skipped.cap).toBeGreaterThan(0)
+    // 显式记住是用户命令：不受每会话自动捕获上限约束
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后回答不要分点，保持简短。', at: 100 })
+    expect(await rowsOf(f.user)).toHaveLength(6)
+    expect(f.capture.stats().controller.persisted).toBe(6)
     await f.close()
   })
 
@@ -430,18 +462,164 @@ describe('生命周期（v4.1 §3.5）', () => {
     await f.close()
   })
 
-  it('主动性提示：命中用户信号时给一行，普通消息/回合结束清空', async () => {
-    const f = captureFixture()
+  it('主动性提示（dry-run）：命中用户信号时给一行，普通消息/回合结束清空', async () => {
+    const f = captureFixture({ controllerMode: 'dry-run' })
     await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后都用 pnpm。', at: 1 })
     expect(f.capture.nudge('s1')).toContain('omb_remember')
-    // 下一条普通消息覆盖（不继续念叨上一条）
     await f.capture.onUserMessage({ sessionId: 's1', text: '好的，继续。', at: 2 })
     expect(f.capture.nudge('s1')).toBeUndefined()
-    // 再命中后，回合结束清空
     await f.capture.onUserMessage({ sessionId: 's1', text: '之前说的方案不对，改成 B。', at: 3 })
     expect(f.capture.nudge('s1')).toContain('supersedes')
     await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
     expect(f.capture.nudge('s1')).toBeUndefined()
+    await f.close()
+  })
+
+  it('控制器 dry-run：记录决策但不改变写入路径（旧路径仍 assertedBy=user）', async () => {
+    const f = captureFixture({ controllerMode: 'dry-run' })
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后都用 pnpm。', at: 1 })
+    const stats = f.capture.stats()
+    expect(stats.controller.mode).toBe('dry-run')
+    expect(stats.controller.events).toBe(1)
+    expect(stats.controller.persist).toBe(1)
+    expect(stats.controller.persisted).toBe(0)
+    const rows = await rowsOf(f.user)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.assertedBy).toBe('user')
+    await f.capture.onUserMessage({ sessionId: 's1', text: '这次不要联网，先离线测试。', at: 2 })
+    expect(f.capture.stats().controller.trackTask).toBe(1)
+    await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
+    expect(f.capture.stats().controller.expireTask).toBe(1)
+    await f.close()
+  })
+
+  it('控制器 off：完全不接入，回到 v4.6 写入路径', async () => {
+    const f = captureFixture({ controllerMode: 'off' })
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后都用 pnpm。', at: 1 })
+    const stats = f.capture.stats()
+    expect(stats.controller.mode).toBe('off')
+    expect(stats.controller.events).toBe(0)
+    expect((await rowsOf(f.user))[0]?.assertedBy).toBe('user')
+    await f.close()
+  })
+})
+
+describe('控制器执行（v4.7.0，execute）', () => {
+  it('临时任务约束：只跟踪不写库；易变槽可见；回合结束过期', async () => {
+    const f = captureFixture()
+    await f.capture.onUserMessage({ sessionId: 's1', text: '这次不要联网，先离线测试。', at: 1 })
+    expect(await rowsOf(f.user)).toHaveLength(0)
+    const stats = f.capture.stats()
+    expect(stats.controller.trackTask).toBe(1)
+    expect(stats.controller.tasksActive).toBe(1)
+    // 执行模式不再注入"别写成长期记忆"的散文提示，改为把任务约束本身留在易变槽
+    const nudge = f.capture.nudge('s1')
+    expect(nudge).toContain('当前任务约束')
+    expect(nudge).toContain('回合结束失效')
+    await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
+    expect(f.capture.stats().controller.expireTask).toBe(1)
+    expect(f.capture.stats().controller.tasksActive).toBe(0)
+    expect(f.capture.nudge('s1')).toBeUndefined()
+    await f.close()
+  })
+
+  it('任务 TTL 到期：下一次事件先清算（不依赖回合结束）', async () => {
+    const f = captureFixture()
+    // CONTROLLER_TASK_TTL_MS = 2h：10h 后再来一条消息
+    await f.capture.onUserMessage({ sessionId: 's1', text: '这次不要联网，先离线测试。', at: 1 })
+    expect(f.capture.stats().controller.tasksActive).toBe(1)
+    await f.capture.onUserMessage({ sessionId: 's1', text: '好的，继续。', at: 10 * 60 * 60 * 1000 })
+    const stats = f.capture.stats()
+    expect(stats.controller.expireTask).toBe(1)
+    expect(stats.controller.tasksActive).toBe(0)
+    expect(f.capture.nudge('s1')).toBeUndefined()
+    await f.close()
+  })
+
+  it('纠错：lookup 命中旧条目 → 注入旧 id 与 supersedes 用法；不自动写', async () => {
+    const calls: string[] = []
+    const f = captureFixture({
+      lookupEntries: async input => {
+        calls.push(input.text)
+        expect(input.limit).toBe(3)
+        return [{
+          id: 'mem_old_1',
+          text: '方案：先用 SQLite。',
+          scope: 'project',
+          kind: 'semantic',
+          observedAt: 1,
+          supersededBy: null,
+        }]
+      },
+    })
+    await f.capture.onUserMessage({ sessionId: 's1', text: '之前说的方案不对，改成先用 Postgres。', at: 1 })
+    expect(calls).toHaveLength(1)
+    const stats = f.capture.stats()
+    expect(stats.controller.lookup).toBe(1)
+    expect(stats.controller.lookupHits).toBe(1)
+    const nudge = f.capture.nudge('s1')
+    expect(nudge).toContain('mem_old_1')
+    expect(nudge).toContain('supersedes')
+    expect(await rowsOf(f.user)).toHaveLength(0)
+    await f.close()
+  })
+
+  it('纠错：lookup 未命中 → 注入"先 omb_recall 再写"，不自动写', async () => {
+    const f = captureFixture({ lookupEntries: async () => [] })
+    await f.capture.onUserMessage({ sessionId: 's1', text: '之前说的方案不对，改成先用 Postgres。', at: 1 })
+    expect(f.capture.stats().controller.lookupHits).toBe(0)
+    expect(f.capture.nudge('s1')).toContain('未找到')
+    expect(await rowsOf(f.user)).toHaveLength(0)
+    expect(await rowsOf(f.project)).toHaveLength(0)
+    await f.close()
+  })
+
+  it('默认 lookup 走词法检索：同主题旧条目能被找回', async () => {
+    const f = captureFixture()
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：存储层采用 SQLite。', at: 1 })
+    const old = await rowsOf(f.project)
+    expect(old).toHaveLength(1)
+    await f.capture.onUserMessage({ sessionId: 's1', text: '之前说的 SQLite 方案不对，改成用 Postgres。', at: 2 })
+    const nudge = f.capture.nudge('s1')
+    expect(nudge).toContain(old[0]?.id ?? 'missing-id')
+    expect(f.capture.stats().controller.lookupHits).toBe(1)
+    await f.close()
+  })
+
+  it('显式记住临时约束 → 只注入"限定边界"，不写', async () => {
+    const f = captureFixture()
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：这次不要联网。', at: 1 })
+    const stats = f.capture.stats()
+    expect(stats.controller.requestModel).toBe(1)
+    expect(stats.controller.requestInjections).toBe(1)
+    expect(f.capture.nudge('s1')).toContain('临时约束')
+    expect(await rowsOf(f.user)).toHaveLength(0)
+    expect(await rowsOf(f.project)).toHaveLength(0)
+    await f.close()
+  })
+
+  it('写入后查回失败 → 计 verifyFailed 并注入"不要重复写"', async () => {
+    const f = captureFixture()
+    const spy = vi.spyOn(f.user, 'getMany').mockResolvedValue([])
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后回答不要分点。', at: 1 })
+    const stats = f.capture.stats()
+    expect(stats.controller.persisted).toBe(1)
+    expect(stats.controller.verified).toBe(0)
+    expect(stats.controller.verifyFailed).toBe(1)
+    expect(f.capture.nudge('s1')).toContain('查回失败')
+    spy.mockRestore()
+    await f.close()
+  })
+
+  it('执行模式写路径仍受隐私闸门约束', async () => {
+    const f = captureFixture({ privacyAllows: false })
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后回答不要分点。', at: 1 })
+    const stats = f.capture.stats()
+    expect(stats.controller.persist).toBe(1)
+    expect(stats.controller.persisted).toBe(0)
+    expect(stats.controller.persistSkipped).toBe(1)
+    expect(stats.skipped.privacy).toBeGreaterThan(0)
+    expect(await rowsOf(f.user)).toHaveLength(0)
     await f.close()
   })
 })

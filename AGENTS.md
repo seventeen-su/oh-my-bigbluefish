@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.6.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.7.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,19 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.6.1（当前） = 审查修复**：项目证据改为解析 shell 结果里的 `[exit code: N]`
+- **v4.7.0（当前） = 事件驱动记忆控制器（决策 + 执行）**：`modules/memory/controller.ts`
+  纯 reducer（user-message/tool-result/turn-end/memory-written → persist/lookup/
+  request-model/track-task/expire-task），TTL 在事件到达时清算、回合结束清空剩余任务。
+  `memoryController` 三档（`execute` 缺省 / `dry-run` / `off`）：execute 下
+  `capture.ts` 执行动作——persist 走既有隐私/去重/冷启动写入并**查回验证**
+  （id + contentHash），显式记住写 `assertedBy=user`（已确认、不受每会话上限），
+  非显式推断写 `assertedBy=model`（候选）；lookup 走词法检索找旧条目并注入
+  `supersedes` 用法（不自动 supersedes）；request-model 只注入一行。临时/任务约束
+  永不 persist，只在会话内跟踪、易变槽可见。疑问/命令/代码/偏好标记判据抽到
+  `modules/memory/message-filter.ts`，捕获与控制器共用一份。execute 且自动捕获开启时
+  **抑制 proactive 提示**（避免模型重复 `omb_remember`）；健康面 `controllerHealthNote()`
+  区分 dry-run 与执行，决策计数与执行计数分开。契约：`docs/v4.7.0-memory-controller.md`。
+- **v4.6.1** = 审查修复：项目证据改为解析 shell 结果里的 `[exit code: N]`
   （工具 `isError` 不再当命令成功；无标记=unknown），旧 v1 落盘 `ok` 降为 unknown；
   记忆意图分流（临时/任务约束不自动写长期；`modules/memory/intent.ts`）；
   `verifiedFix` 改名 `recoveredFromFailure`（仅"失败后再次成功"，连续成功不重复标记）；

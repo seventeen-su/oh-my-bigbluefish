@@ -42,7 +42,7 @@ import { createStoresService, asMemoryStore, asRecordScanner, type MemoryStoresS
 import { planConsolidation } from './consolidate.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
-import { createCapture, type Capture, type CaptureStats } from './capture.js'
+import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
 import { autoLinkRelated } from './link.js'
 import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
@@ -143,6 +143,14 @@ const rawConfigSchema = z.object({
   autoCaptureActivity: z.boolean().default(true),
   /** 自主捕获：会话结局兜底（≥3 次调用且一条活动都没捕获时写 1 条；默认开）。 */
   autoCaptureOutcome: z.boolean().default(true),
+  /**
+   * 事件驱动记忆控制器的运行模式（v4.7.0）。
+   *
+   * - `execute`（默认）：控制器执行 persist/lookup/request-model；
+   * - `dry-run`：只计数、不改写入路径（v4.7.0 阶段 1 的回滚档）；
+   * - `off`：不接入控制器（回到 v4.6 的主动提示 + 捕获路径）。
+   */
+  memoryController: z.enum(['off', 'dry-run', 'execute']).default('execute'),
   /** 新记忆自动连 `related` 边（默认开）。 */
   autoLinkRelated: z.boolean().default(true),
   /** 召回时 1-hop 关联扩展（默认开；回滚可关）。 */
@@ -185,6 +193,7 @@ export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   autoCapturePreferences: true,
   autoCaptureActivity: true,
   autoCaptureOutcome: true,
+  memoryController: 'execute',
   autoLinkRelated: true,
   relatedExpansion: true,
   coldStartRetryMs: 250,
@@ -436,6 +445,36 @@ async function runConsolidationOnce(
  * 「存储」段（唯一报数处）。`metrics` 仍带实时统计——它给健康面消费者用，
  * **不进 `omb_status` 文本**，因此不会制造第二个可见数字。
  */
+/**
+ * 事件控制器的状态面文案（v4.7.0）。
+ *
+ * 诚实性要求（导出以便单测直接钉住这句话）：
+ * - `execute` 必须同时报"决策数"与"执行结果"（写入/查回/失败/拒绝）；
+ * - `dry-run` 必须明说只决策、不写，**不得**出现"写入"字样；
+ * - `off` 明说已关闭，不冒充"0 次"；
+ * - 没有事件时写"本进程尚无事件"，不写"正常"。
+ */
+export function controllerHealthNote(stats: ControllerStats | undefined): string {
+  if (stats === undefined) return ''
+  if (stats.mode === 'off') return '；事件控制器：已关闭（memoryController=off）'
+  if (stats.events === 0) {
+    return `；事件控制器（${stats.mode === 'execute' ? '执行' : 'dry-run'}）：本进程尚无事件`
+  }
+  if (stats.mode === 'execute') {
+    return `；事件控制器（执行）：${stats.events} 事件 → persist ${stats.persist}`
+      + `（写入 ${stats.persisted}/查回 ${stats.verified}`
+      + `/验证失败 ${stats.verifyFailed}/写路径拒绝 ${stats.persistSkipped}）`
+      + `/lookup ${stats.lookup}（命中 ${stats.lookupHits}）`
+      + `/request ${stats.requestModel}（注入 ${stats.requestInjections}）`
+      + `/track ${stats.trackTask}/expire ${stats.expireTask}`
+      + `；当前任务约束 ${stats.tasksActive} 条（回合结束失效）`
+  }
+  return `；事件控制器 dry-run：${stats.events} 事件 → persist ${stats.persist}`
+    + `/lookup ${stats.lookup}/request ${stats.requestModel}`
+    + `/track ${stats.trackTask}/expire ${stats.expireTask}`
+    + '（dry-run：只决策、不改写入路径）'
+}
+
 async function describeHealth(
   service: MemoryStoresService,
   ledger: MemoryWriteLedger | undefined,
@@ -516,6 +555,21 @@ async function describeHealth(
     metrics['capture.noPending'] = runtime.capture.noPending
     metrics['capture.unconfirmedCall'] = runtime.capture.unconfirmedCall
     metrics['capture.unknownCorrelation'] = runtime.capture.unknownCorrelation
+    // v4.7.0 阶段 1：事件驱动控制器的决策计数
+    metrics['capture.controller.events'] = runtime.capture.controller.events
+    metrics['capture.controller.persist'] = runtime.capture.controller.persist
+    metrics['capture.controller.lookup'] = runtime.capture.controller.lookup
+    metrics['capture.controller.requestModel'] = runtime.capture.controller.requestModel
+    metrics['capture.controller.trackTask'] = runtime.capture.controller.trackTask
+    metrics['capture.controller.expireTask'] = runtime.capture.controller.expireTask
+    // v4.7.0：执行读数与决策计数**分开**——"控制器决定写"不等于"真的写进去了"。
+    metrics['capture.controller.persisted'] = runtime.capture.controller.persisted
+    metrics['capture.controller.verified'] = runtime.capture.controller.verified
+    metrics['capture.controller.verifyFailed'] = runtime.capture.controller.verifyFailed
+    metrics['capture.controller.persistSkipped'] = runtime.capture.controller.persistSkipped
+    metrics['capture.controller.lookupHits'] = runtime.capture.controller.lookupHits
+    metrics['capture.controller.requestInjections'] = runtime.capture.controller.requestInjections
+    metrics['capture.controller.tasksActive'] = runtime.capture.controller.tasksActive
     metrics['capture.pending'] = runtime.capture.pending
     for (const [reason, count] of Object.entries(runtime.capture.skipped)) {
       if (count > 0) metrics[`capture.skipped.${reason}`] = count
@@ -631,7 +685,10 @@ async function describeHealth(
         : `；有效命中 ${runtime.usage.used}/${runtime.usage.exposed}`
           + `（${(runtime.usage.used / runtime.usage.exposed * 100).toFixed(1)}%；`
           + 'used_tool 实体键匹配，不是检索次数）'
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${consolidationNote}${privacyNote}`
+  // v4.7.0：事件控制器的模式与执行结果必须在状态面可见，否则"接入了但没人知道"。
+  // `execute` 与 `dry-run` 的文案必须不同：只改了计数却写"已执行"就是伪报。
+  const controllerNote = controllerHealthNote(runtime?.capture?.controller)
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${consolidationNote}${privacyNote}`
 
   // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
   // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。
@@ -963,6 +1020,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         enabledPreferences: config.autoCapturePreferences,
         enabledActivity: config.autoCaptureActivity,
         enabledOutcome: config.autoCaptureOutcome,
+        controllerMode: config.memoryController,
         projectRetryMs: config.coldStartRetryMs,
       })
       captureRef = () => capture.stats()

@@ -14,7 +14,8 @@
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import type { MemoryStore, ModuleRegistration, ScoredHit, TaggedStore } from '../../../kernel/abi/index.js'
-import { createMemoryRegistration } from '../../../modules/memory/index.js'
+import { createMemoryRegistration, controllerHealthNote } from '../../../modules/memory/index.js'
+import type { ControllerStats } from '../../../modules/memory/capture.js'
 import type { MemoryStoresService } from '../../../modules/memory/store.js'
 import { createStoresService, openMemoryStore } from '../../../modules/memory/store.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
@@ -169,6 +170,49 @@ describe('向量状态面：没检索过就不能说"正常"', () => {  /** 最�
     dispose()
     expect(module.state().searches).toBe(0)
     expect(module.state().channelErrors).toBe(0)
+  })
+})
+
+describe('事件控制器状态面：dry-run 与执行不能混说（v4.7.0）', () => {
+  const base: ControllerStats = {
+    mode: 'execute',
+    events: 3,
+    persist: 2,
+    lookup: 1,
+    requestModel: 1,
+    trackTask: 1,
+    expireTask: 1,
+    persisted: 1,
+    verified: 1,
+    verifyFailed: 0,
+    persistSkipped: 1,
+    lookupHits: 1,
+    requestInjections: 2,
+    tasksActive: 0,
+  }
+
+  it('execute：决策数与执行结果分开报（写入 ≠ 决定写）', () => {
+    const note = controllerHealthNote(base)
+    expect(note).toContain('事件控制器（执行）')
+    expect(note).toContain('persist 2')
+    expect(note).toContain('写入 1')
+    expect(note).toContain('查回 1')
+    expect(note).toContain('写路径拒绝 1')
+    expect(note).toContain('命中 1')
+  })
+
+  it('dry-run：明说只决策、不改写入路径，且不报任何写入/查回计数', () => {
+    const note = controllerHealthNote({ ...base, mode: 'dry-run' })
+    expect(note).toContain('dry-run')
+    expect(note).toContain('只决策')
+    expect(note).not.toMatch(/写入 \d/)
+    expect(note).not.toContain('查回')
+  })
+
+  it('off / 无事件 / 未接线：不冒充正常读数为 0', () => {
+    expect(controllerHealthNote({ ...base, mode: 'off' })).toContain('已关闭')
+    expect(controllerHealthNote({ ...base, events: 0 })).toContain('尚无事件')
+    expect(controllerHealthNote(undefined)).toBe('')
   })
 })
 

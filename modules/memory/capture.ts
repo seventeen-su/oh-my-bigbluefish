@@ -46,23 +46,22 @@ import { contentHashOf, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
 import { detectProactiveCue } from './proactive.js'
 import { classifyMemoryIntent, isDurableIntent } from './intent.js'
+import { isCommandOrCode, isQuestion, PREFERENCE_MARKERS } from './message-filter.js'
+import {
+  clearControllerCandidate,
+  EMPTY_CONTROLLER_STATE,
+  reduceMemoryEvent,
+  type ControllerAction,
+  type ControllerCandidate,
+  type ControllerEvent,
+  type ControllerSessionState,
+} from './controller.js'
 
 export { hasSecret } from './secrets.js'
 
-/** 用户偏好/决定标记（任一命中即候选；宁可漏收，不可把闲聊写进用户库）。 */
-export const PREFERENCE_MARKERS: readonly string[] = [
-  '记住',
-  '以后',
-  '下次',
-  '我喜欢',
-  '我习惯',
-  '不要',
-  '必须',
-  '决定',
-  '采用',
-  '方案',
-  '约定',
-]
+// 形态判据与控制器共用同一份（v4.7.0）：两套判据漂移会导致"控制器决定写、
+// 写入路径认为该跳过"的分裂。这里保留 re-export，旧导入路径仍然可用。
+export { PREFERENCE_MARKERS, hasPreferenceMarker, isCommandOrCode, isQuestion } from './message-filter.js'
 
 /** 项目活动命令标记（大小写不敏感）。 */
 export const ACTIVITY_COMMAND_PATTERN = /\b(?:test|build|verify|git\s+commit|pnpm|npm|pytest|tsc)\b/i
@@ -86,32 +85,6 @@ export const DEFAULT_PROJECT_RETRY_MS = 250
  *
  * 自主写入不经 `omb_remember` 的准入，必须在写之前自己拒。
  */
-
-/** 疑问句：以问号结尾或典型疑问开头（"以后要不要…"这种带有决定标记的仍算偏好，见 classify）。 */
-export function isQuestion(text: string): boolean {
-  const trimmed = text.trim()
-  if (/[?？]\s*$/.test(trimmed)) return true
-  return /^(?:什么|怎么|为什么|为何|是否|能否|能不能|可不可以|是不是|要不要|哪个|哪些|多少|何时|几时|请问)/.test(
-    trimmed,
-  )
-}
-
-/** 命令/代码块：命令行、斜杠命令、代码围栏或典型代码片段一律不收。 */
-export function isCommandOrCode(text: string): boolean {
-  const trimmed = text.trim()
-  if (trimmed.length === 0) return false
-  if (trimmed.startsWith('/') || trimmed.startsWith('$') || trimmed.startsWith('>')) return true
-  if (trimmed.includes('```')) return true
-  if (/\b(?:function|class|interface)\s+\w+\s*[({]/.test(trimmed)) return true
-  if (/\bimport\s+[^\n]+\s+from\s+['"]/.test(trimmed)) return true
-  // 多行且以分号/花括号结尾的行占比高 → 代码粘贴
-  const lines = trimmed.split('\n').filter(line => line.trim().length > 0)
-  if (lines.length >= 3) {
-    const codeLike = lines.filter(line => /[;{}]\s*$/.test(line.trim())).length
-    if (codeLike / lines.length >= 0.5) return true
-  }
-  return false
-}
 
 /** 偏好候选的分类结果：`ok` 时给出要写入的正文（去首尾空白）。 */
 export type PreferenceDecision =
@@ -266,6 +239,54 @@ export function extractEntityKeys(text: string, projectName?: string | null): re
   return [...keys].sort()
 }
 
+/** 事件驱动记忆控制器的运行模式（v4.7.0）。 */
+export type ControllerMode = 'off' | 'dry-run' | 'execute'
+
+/** 缺省执行（用户要求"自主管理记忆"；`dry-run`/`off` 是回滚开关）。 */
+export const DEFAULT_CONTROLLER_MODE: ControllerMode = 'execute'
+
+/** 一条旧条目（lookup 动作的检索结果；只含展示与 supersedes 所需的字段）。 */
+export interface ControllerLookupHit {
+  readonly id: string
+  readonly text: string
+  readonly scope: MemoryScope
+  readonly kind: MemoryKind
+  readonly observedAt: number
+  readonly supersededBy: string | null
+}
+
+/** lookup 端口：控制器只做**词法**检索（热路径不调嵌入模型）。 */
+export type ControllerLookup = (input: {
+  readonly sessionId: string
+  readonly text: string
+  readonly limit: number
+}) => Promise<readonly ControllerLookupHit[]>
+
+/** 事件驱动记忆控制器（v4.7.0：决策 + 执行）的计数。 */
+export interface ControllerStats {
+  /** 运行模式（状态面据此区分"只决策"与"已执行"）。 */
+  mode: ControllerMode
+  events: number
+  persist: number
+  lookup: number
+  requestModel: number
+  trackTask: number
+  expireTask: number
+  /** execute：persist 动作真正写入成功数。 */
+  persisted: number
+  /** execute：写入后查回验证通过 / 失败。 */
+  verified: number
+  verifyFailed: number
+  /** execute：写路径拒绝（去重/隐私/库未就绪/上限/写入异常）。 */
+  persistSkipped: number
+  /** execute：lookup 命中旧条目的次数。 */
+  lookupHits: number
+  /** execute：注入到易变上下文槽的控制器提示次数。 */
+  requestInjections: number
+  /** 当前活跃任务约束（瞬时量；按 `expiresAt` 过滤）。 */
+  tasksActive: number
+}
+
 /** 捕获统计（健康面用；按类分开，避免"捕获 0 条"一个数字掩盖具体原因）。 */
 export interface CaptureStats {
   preferences: number
@@ -285,6 +306,8 @@ export interface CaptureStats {
   unknownCorrelation: number
   /** 当前挂起中的 pending 数（**瞬时量**，不是累计）。 */
   pending: number
+  /** 事件驱动记忆控制器的决策与执行计数（v4.7.0：默认执行，可回滚 dry-run）。 */
+  controller: ControllerStats
   skipped: Record<string, number>
 }
 
@@ -311,6 +334,15 @@ export interface CapturePorts extends CaptureFeatureSwitches {
   readonly maxActivity?: number
   /** 项目库未就绪时的重试等待（默认 250ms；0 = 不重试）。 */
   readonly projectRetryMs?: number
+  /**
+   * 事件控制器模式（v4.7.0）。缺省 `execute`：
+   * - `execute`：执行 persist/lookup/request-model，写入走既有隐私/去重/生命周期；
+   * - `dry-run`：只计数，不改写入路径（v4.7.0 阶段 1 行为，回滚用）；
+   * - `off`：完全不接入控制器（连事件都不计）。
+   */
+  readonly controllerMode?: ControllerMode
+  /** lookup 端口（缺省用 `resolveStore` + `searchLexical`；测试可注入）。 */
+  readonly lookupEntries?: ControllerLookup
 }
 
 /** 单会话捕获状态。有界（见 `SESSION_STATE_MAX` 与 pending 上限）。 */
@@ -330,6 +362,8 @@ interface SessionCaptureState {
   tools: Map<string, number>
   /** `tool/call` 建、`tool/result` 消；按 callId 配对（v4.1 生命周期）。 */
   pending: Map<string, PendingActivity>
+  /** 事件驱动记忆控制器状态（v4.7.0 execute：动作会被执行；dry-run/off 见 `controllerMode`）。 */
+  controller: ControllerSessionState
 }
 
 export const SESSION_STATE_MAX = 64
@@ -350,6 +384,7 @@ function emptyState(): SessionCaptureState {
     toolCalls: 0,
     tools: new Map(),
     pending: new Map(),
+    controller: EMPTY_CONTROLLER_STATE,
   }
 }
 
@@ -397,6 +432,8 @@ export function createCapture(ports: CapturePorts): Capture {
   const maxPreferences = ports.maxPreferences ?? DEFAULT_MAX_PREFERENCES
   const maxActivity = ports.maxActivity ?? DEFAULT_MAX_ACTIVITY
   const retryMs = ports.projectRetryMs ?? DEFAULT_PROJECT_RETRY_MS
+  /** 控制器模式：off/dry-run/execute（缺省 execute，见 `DEFAULT_CONTROLLER_MODE`）。 */
+  const controllerMode: ControllerMode = ports.controllerMode ?? DEFAULT_CONTROLLER_MODE
   const states = new Map<string, SessionCaptureState>()
   const stats: CaptureStats = {
     preferences: 0,
@@ -409,6 +446,22 @@ export function createCapture(ports: CapturePorts): Capture {
     unconfirmedCall: 0,
     unknownCorrelation: 0,
     pending: 0,
+    controller: {
+      mode: controllerMode,
+      events: 0,
+      persist: 0,
+      lookup: 0,
+      requestModel: 0,
+      trackTask: 0,
+      expireTask: 0,
+      persisted: 0,
+      verified: 0,
+      verifyFailed: 0,
+      persistSkipped: 0,
+      lookupHits: 0,
+      requestInjections: 0,
+      tasksActive: 0,
+    },
     skipped: {},
   }
   /** pending 全局计数（stats.pending 每次读快照；不靠遍历会话求和）。 */
@@ -432,6 +485,31 @@ export function createCapture(ports: CapturePorts): Capture {
     }
     nudges.delete(sessionId)
     nudges.set(sessionId, text)
+  }
+
+  /**
+   * 事件驱动记忆控制器（v4.7.0）。
+   *
+   * - `off`：不推进、不计数（完全回滚）；
+   * - `dry-run`：只推进状态并累计决策计数，不改写入路径（v4.7.0 阶段 1）；
+   * - `execute`：推进状态后由 `executeControllerActions` 真正执行。
+   *
+   * 计数的是**决策**，执行结果另有 `persisted/verified/verifyFailed/...`，
+   * 状态面可以分别回答"控制器想做什么"和"实际做成了什么"。
+   */
+  const observeController = (state: SessionCaptureState, event: ControllerEvent): readonly ControllerAction[] => {
+    if (controllerMode === 'off') return []
+    const reduced = reduceMemoryEvent(state.controller, event)
+    state.controller = reduced.state
+    stats.controller.events += 1
+    for (const action of reduced.actions) {
+      if (action.type === 'persist') stats.controller.persist += 1
+      else if (action.type === 'lookup') stats.controller.lookup += 1
+      else if (action.type === 'request-model') stats.controller.requestModel += 1
+      else if (action.type === 'track-task') stats.controller.trackTask += 1
+      else if (action.type === 'expire-task') stats.controller.expireTask += 1
+    }
+    return reduced.actions
   }
 
   const stateOf = (sessionId: string): SessionCaptureState => {
@@ -496,6 +574,16 @@ export function createCapture(ports: CapturePorts): Capture {
     }
   }
 
+  /**
+   * 写入结果。
+   *
+   * 返回**原因**而不只是 boolean：控制器的 `persist` 动作要把"写路径拒绝"计入
+   * `persistSkipped` 并在状态面可解释（去重/隐私/库未就绪/写入异常不是同一件事）。
+   */
+  type WriteOutcome =
+    | { readonly ok: true; readonly record: MemoryRecord; readonly store: MemoryStore }
+    | { readonly ok: false; readonly reason: string }
+
   const write = async (input: {
     readonly sessionId: string
     readonly scope: MemoryScope
@@ -504,26 +592,27 @@ export function createCapture(ports: CapturePorts): Capture {
     readonly sourceRef: string
     readonly assertedBy: 'user' | 'execution' | 'model'
     readonly dedupeKey: string
-  }): Promise<boolean> => {
+  }): Promise<WriteOutcome> => {
     const state = stateOf(input.sessionId)
     const hash = contentHashOf(input.text)
     if (state.hashes.has(hash)) {
       skip('duplicate')
-      return false
+      return { ok: false, reason: 'duplicate' }
     }
     if (!writable(input.sessionId)) {
       skip('privacy')
-      return false
+      return { ok: false, reason: 'privacy' }
     }
     const store = await resolveStoreOnce(input.scope, input.sessionId)
     if (store === undefined) {
-      skip(input.scope === 'project' ? 'no-project-store' : 'no-user-store')
-      return false
+      const reason = input.scope === 'project' ? 'no-project-store' : 'no-user-store'
+      skip(reason)
+      return { ok: false, reason }
     }
     if (await alreadyStored(store, input.text)) {
       state.hashes.add(hash)
       skip('duplicate')
-      return false
+      return { ok: false, reason: 'duplicate' }
     }
     const now = ports.clock.now()
     const record: MemoryRecord = {
@@ -546,9 +635,10 @@ export function createCapture(ports: CapturePorts): Capture {
     } catch (error) {
       // 隐私闸门在库访问边界也会拒一次；按可读原因归类，不静默
       const message = error instanceof Error ? error.message : String(error)
-      skip(/隐私|禁止写入|privacy|sealed|read-only/i.test(message) ? 'privacy' : 'store-error')
+      const reason = /隐私|禁止写入|privacy|sealed|read-only/i.test(message) ? 'privacy' : 'store-error'
+      skip(reason)
       ports.logger?.warn(`OMB 自主捕获：写入失败（${input.scope}/${input.kind}）——${message.slice(0, 120)}`)
-      return false
+      return { ok: false, reason }
     }
     state.hashes.add(hash)
     state.activityKeys.add(input.dedupeKey)
@@ -563,7 +653,212 @@ export function createCapture(ports: CapturePorts): Capture {
       // 图连边失败不影响"已写入"这个事实（它只是附加索引）
       ports.logger?.warn(`OMB 自主捕获：自动连边失败（已隔离）——${error instanceof Error ? error.message : String(error)}`)
     }
-    return true
+    return { ok: true, record, store }
+  }
+
+  /** 写入后查回验证：id 存在且内容哈希一致才算"真的写进去了"。 */
+  const verifyStored = async (outcome: Extract<WriteOutcome, { ok: true }>): Promise<boolean> => {
+    try {
+      const rows = await outcome.store.getMany([outcome.record.id])
+      return rows.some(row => row.id === outcome.record.id && row.contentHash === outcome.record.contentHash)
+    } catch {
+      return false
+    }
+  }
+
+  // ── 控制器执行层（v4.7.0）─────────────────────────────────────────────────
+
+  /** 控制器提示走主动提示的同一易变槽（回合结束由 `clearNudge` 清掉）。 */
+  const controllerHint = (sessionId: string, text: string): void => {
+    const trimmed = text.replace(/\s+/g, ' ').trim()
+    if (trimmed.length === 0) return
+    setNudge(sessionId, trimmed.slice(0, 180))
+    stats.controller.requestInjections += 1
+  }
+
+  /**
+   * lookup 的检索探针：整句 + 按标点切开的片段。
+   *
+   * 中文 FTS 是 bigram 通道，整句太长时命中面反而窄；拆成短语再查更稳。
+   * **只查词法**：控制器在用户消息热路径上，不调用嵌入模型。
+   */
+  const lexicalProbes = (text: string): readonly string[] => {
+    const compact = text.replace(/\s+/g, ' ').trim()
+    if (compact.length === 0) return []
+    const segments = compact
+      .split(/[，。；;,.!！?？、:：\n]/u)
+      .map(segment => segment.trim())
+      .filter(segment => segment.length >= 2)
+    return [...new Set([compact.slice(0, 60), ...segments.map(segment => segment.slice(0, 40))])].slice(0, 4)
+  }
+
+  /** 默认 lookup：跨项目库/用户库做词法检索，最多 `limit` 条（未失效优先）。 */
+  const lookupOldEntries = async (
+    sessionId: string,
+    text: string,
+    limit: number,
+  ): Promise<readonly ControllerLookupHit[]> => {
+    if (ports.lookupEntries !== undefined) {
+      try {
+        return await ports.lookupEntries({ sessionId, text, limit })
+      } catch {
+        return []
+      }
+    }
+    const probes = lexicalProbes(text)
+    const seen = new Set<string>()
+    const hits: ControllerLookupHit[] = []
+    for (const scope of ['project', 'user'] as const) {
+      if (hits.length >= limit) break
+      const store = await resolveStoreOnce(scope, sessionId)
+      if (store === undefined) continue
+      for (const probe of probes) {
+        if (hits.length >= limit) break
+        try {
+          const found = await store.searchLexical({ text: probe, scope: store.scope, limit: 2 })
+          if (found.length === 0) continue
+          const records = await store.getMany(found.map(hit => hit.id))
+          for (const record of records) {
+            if (seen.has(record.id)) continue
+            seen.add(record.id)
+            hits.push({
+              id: record.id,
+              text: record.text,
+              scope: record.scope,
+              kind: record.kind,
+              observedAt: record.observedAt,
+              supersededBy: record.supersededBy,
+            })
+          }
+        } catch {
+          // 单个探针失败不影响其它探针（查询语法问题不该让 lookup 整条失效）
+        }
+      }
+    }
+    return [...hits]
+      .sort((a, b) => (a.supersededBy === null ? 0 : 1) - (b.supersededBy === null ? 0 : 1))
+      .slice(0, limit)
+  }
+
+  /**
+   * 执行 persist：走既有写入路径（隐私/去重/冷启动重试），写入后查回验证。
+   *
+   * 证据语义（v4.7.0）：
+   * - `persisted` = store.put 成功；`verified` = 查回 id 与 contentHash 一致；
+   * - 写路径拒绝（隐私/去重/上限/库未就绪）计 `persistSkipped`，原因另在 skipped 里；
+   * - 显式"记住"是用户命令，**不受每会话上限约束**；推断出的候选才受上限约束。
+   */
+  const executePersist = async (
+    sessionId: string,
+    candidate: ControllerCandidate,
+    explicit: boolean,
+    at: number,
+  ): Promise<void> => {
+    if (ports.enabledPreferences === false) {
+      skip('controller-disabled')
+      stats.controller.persistSkipped += 1
+      return
+    }
+    const state = stateOf(sessionId)
+    if (!explicit && state.preferences >= maxPreferences) {
+      skip('cap')
+      stats.controller.persistSkipped += 1
+      return
+    }
+    const outcome = await write({
+      sessionId,
+      scope: candidate.scope,
+      kind: candidate.kind,
+      text: candidate.text,
+      sourceRef: `session:${sessionId}#controller:${at}`,
+      // 显式记住：正文是用户原话，assertedBy=user → 生命周期"已确认"；
+      // 推断出的长期偏好：assertedBy=model → 生命周期"候选"，不冒充已确认。
+      assertedBy: explicit ? 'user' : 'model',
+      dedupeKey: `controller:${candidate.id}`,
+    })
+    if (!outcome.ok) {
+      stats.controller.persistSkipped += 1
+      return
+    }
+    stats.controller.persisted += 1
+    state.preferences += 1
+    stats.preferences += 1
+    // 真实写入已覆盖该候选：从控制器状态里清掉，避免同一文本反复产生 persist 动作。
+    state.controller = clearControllerCandidate(state.controller, candidate.text)
+    if (await verifyStored(outcome)) {
+      stats.controller.verified += 1
+      return
+    }
+    stats.controller.verifyFailed += 1
+    controllerHint(sessionId, `写入后查回失败（${candidate.scope}）：不要重复写，先用 omb_recall 核对。`)
+    ports.logger?.warn(
+      `OMB 事件控制器：persist 查回验证失败（${candidate.scope}/${candidate.kind}，id=${outcome.record.id}）`,
+    )
+  }
+
+  /**
+   * 执行 lookup：找到旧条目 → 注入"旧 id + supersedes 用法"。
+   *
+   * **不自动 supersedes**：控制器无法确定新陈述是否真的完整替代旧条目；
+   * 旧 id 与用法交给模型，由模型核对后写（契约：`docs/v4.7.0-memory-controller.md`）。
+   */
+  const executeLookup = async (
+    sessionId: string,
+    action: Extract<ControllerAction, { type: 'lookup' }>,
+  ): Promise<void> => {
+    const hits = await lookupOldEntries(sessionId, action.query, 3)
+    if (hits.length === 0) {
+      controllerHint(sessionId, '未找到被纠正的旧条目：先 omb_recall 再写新结论，不要直接覆盖。')
+      return
+    }
+    stats.controller.lookupHits += 1
+    const top = hits[0]
+    if (top === undefined) return
+    const more = hits.length > 1 ? `（另有 ${hits.length - 1} 条候选）` : ''
+    const stale = top.supersededBy === null ? '' : '（已被取代）'
+    controllerHint(
+      sessionId,
+      `检测到纠正：旧条目 id=${top.id}${stale}${more}；核对后用 omb_remember(supersedes=["${top.id}"]) 写入新结论。`,
+    )
+  }
+
+  /** 执行控制器动作（execute 模式）；任何单步失败只留声，不影响其它动作。 */
+  const executeControllerActions = async (
+    sessionId: string,
+    actions: readonly ControllerAction[],
+    at: number,
+  ): Promise<void> => {
+    // request-model 先执行：它是"必须让模型决定"的通用提示，随后具体动作
+    // （lookup 找到的旧 id / persist 查回失败）可以用更精确的提示覆盖它。
+    // 正确顺序不能反：否则通用提示会把"旧 id=…"盖掉，模型还是不知道要 supersede 谁。
+    for (const action of actions) {
+      if (action.type !== 'request-model') continue
+      controllerHint(sessionId, action.hint)
+    }
+    for (const action of actions) {
+      try {
+        if (action.type === 'persist') {
+          await executePersist(sessionId, action.candidate, action.explicit, at)
+        } else if (action.type === 'lookup') {
+          await executeLookup(sessionId, action)
+        }
+        // request-model 已在上一步执行；track-task / expire-task 只改控制器状态（reducer 已完成）。
+      } catch (error) {
+        ports.logger?.warn(
+          `OMB 事件控制器：执行 ${action.type} 失败（已隔离）——${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+  }
+
+  /**
+   * 控制器没有产生 persist 时，仍要保留"为什么没写"的可读原因。
+   *
+   * 用捕获路径的同一个 `classifyUserMessage`（形态/标记/意图判据一致），只计数不写。
+   */
+  const notePreferenceRejection = (text: string): void => {
+    const decision = classifyUserMessage(text)
+    if (!decision.ok) skip(decision.reason)
   }
 
   const capturePreference = async (payload: {
@@ -584,7 +879,7 @@ export function createCapture(ports: CapturePorts): Capture {
       return
     }
     const sourceRef = `session:${payload.sessionId}#${payload.seq ?? payload.at}`
-    const wrote = await write({
+    const outcome = await write({
       sessionId: payload.sessionId,
       scope: 'user',
       kind: 'semantic',
@@ -593,7 +888,7 @@ export function createCapture(ports: CapturePorts): Capture {
       assertedBy: 'user',
       dedupeKey: `pref:${sourceRef}`,
     })
-    if (wrote) {
+    if (outcome.ok) {
       state.preferences += 1
       stats.preferences += 1
     }
@@ -619,7 +914,7 @@ export function createCapture(ports: CapturePorts): Capture {
     }
     const failed = input.failed === true
     const sourceRef = `session:${input.sessionId}#call:${input.correlation ?? input.at}`
-    const wrote = await write({
+    const outcome = await write({
       sessionId: input.sessionId,
       scope: 'project',
       kind: 'episodic',
@@ -629,11 +924,11 @@ export function createCapture(ports: CapturePorts): Capture {
       // 失败与成功是两条不同的事实，去重键必须分开（否则同一命令先失败后成功会被吞一条）
       dedupeKey: failed ? `fail:${input.decision.dedupeKey}` : input.decision.dedupeKey,
     })
-    if (wrote) {
+    if (outcome.ok) {
       state.activity += 1
       stats.activity += 1
     }
-    return wrote
+    return outcome.ok
   }
 
   /**
@@ -714,11 +1009,36 @@ export function createCapture(ports: CapturePorts): Capture {
   return {
     async onUserMessage(payload) {
       // 主动性提示与自动捕获解耦：即使偏好捕获被关闭/失败，提示仍按用户消息更新。
-      const cue = detectProactiveCue(payload.text)
-      if (cue === null) clearNudge(payload.sessionId)
-      else setNudge(payload.sessionId, cue.text)
+      //
+      // execute 模式（v4.7.0）：控制器**自己执行** persist/lookup/任务跟踪，此时再提示
+      // "立即调用 omb_remember" 只会让模型把同一条内容写第二遍（库里没有正文唯一约束）。
+      // 所以执行模式下 proactive 提示让位给控制器；只有自动捕获被关掉时才保留提示，
+      // 因为那时控制器不会写、模型仍需要知道该主动记。
+      const suppressCue = controllerMode === 'execute' && ports.enabledPreferences !== false
+      if (suppressCue) {
+        clearNudge(payload.sessionId)
+      } else {
+        const cue = detectProactiveCue(payload.text)
+        if (cue === null) clearNudge(payload.sessionId)
+        else setNudge(payload.sessionId, cue.text)
+      }
+
+      const actions = observeController(stateOf(payload.sessionId), {
+        type: 'user-message',
+        text: payload.text,
+        at: payload.at,
+      })
+
       try {
-        await capturePreference(payload)
+        if (controllerMode === 'execute') {
+          // 阶段 2：控制器是用户消息的唯一决策点；persist 由 `executePersist` 写入。
+          await executeControllerActions(payload.sessionId, actions, payload.at)
+          // 没有 persist 决策时仍保留"为什么没写"的原因（secret/question/... 计数）。
+          if (!actions.some(action => action.type === 'persist')) notePreferenceRejection(payload.text)
+        } else {
+          // off / dry-run：保持旧写入路径（dry-run 只多一份决策计数）。
+          await capturePreference(payload)
+        }
       } catch (error) {
         ports.logger?.warn(`OMB 自主捕获（偏好）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
       }
@@ -737,6 +1057,14 @@ export function createCapture(ports: CapturePorts): Capture {
       try {
         if (ports.enabledActivity === false) return
         const state = states.get(payload.sessionId)
+        if (state !== undefined) {
+          observeController(state, {
+            type: 'tool-result',
+            tool: payload.tool ?? 'unknown',
+            text: payload.text,
+            at: payload.at,
+          })
+        }
         const key = correlationKey(payload)
         // 结果事件连"是哪条调用"都无法确定：保持 unknown，不写。
         // 若结果本身可判定为非活动（读/状态面），静默忽略，避免把每次 read 撑成"未知"。
@@ -791,6 +1119,11 @@ export function createCapture(ports: CapturePorts): Capture {
       try {
         // 主动性提示只服务当前回合；回合结束即清，避免下一轮还在念叨上一轮的话。
         clearNudge(payload.sessionId)
+        // 控制器在回合边界过期任务约束（动作由 reducer 产生，这里只推进状态）。
+        observeController(stateOf(payload.sessionId), {
+          type: 'turn-end',
+          at: ports.clock.now(),
+        })
         // v4.1 生命周期：回合结束仍未等到结果的 pending 一律丢弃并计 unconfirmed。
         // 跨回合结果本就不可靠配对；留在表里只会在下一回合再数一次。
         const pendingState = states.get(payload.sessionId)
@@ -810,7 +1143,7 @@ export function createCapture(ports: CapturePorts): Capture {
           topTools: [...state.tools.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([tool]) => tool),
         })
         if (!decision.ok) return
-        const wrote = await write({
+        const outcome = await write({
           sessionId: payload.sessionId,
           scope: 'project',
           kind: 'episodic',
@@ -819,7 +1152,7 @@ export function createCapture(ports: CapturePorts): Capture {
           assertedBy: 'model',
           dedupeKey: `outcome:${payload.turn}`,
         })
-        if (wrote) {
+        if (outcome.ok) {
           state.outcomes += 1
           stats.outcomes += 1
         }
@@ -827,20 +1160,48 @@ export function createCapture(ports: CapturePorts): Capture {
         ports.logger?.warn(`OMB 自主捕获（结局）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
       }
     },
-    stats: () => ({
-      preferences: stats.preferences,
-      activity: stats.activity,
-      outcomes: stats.outcomes,
-      failed: stats.failed,
-      unconfirmed: stats.unconfirmed,
-      unknownResult: stats.unknownResult,
-      noPending: stats.noPending,
-      unconfirmedCall: stats.unconfirmedCall,
-      unknownCorrelation: stats.unknownCorrelation,
-      pending: globalPending,
-      skipped: { ...stats.skipped },
-    }),
-    nudge: (sessionId: string) => nudges.get(sessionId),
+    stats: () => {
+      // 活跃任务约束：TTL 只能在**事件到达时**判定（reducer 无时钟、无定时器）。
+      // 因此这里按该会话最后一次事件时间比较，而不是另取一个墙钟：
+      // 两个时钟域混用会让状态面与 reducer 的到期判断打架。
+      let tasksActive = 0
+      for (const state of states.values()) {
+        const now = state.controller.lastEventAt ?? 0
+        for (const task of state.controller.tasks) {
+          if (task.expiresAt > now) tasksActive += 1
+        }
+      }
+      return {
+        preferences: stats.preferences,
+        activity: stats.activity,
+        outcomes: stats.outcomes,
+        failed: stats.failed,
+        unconfirmed: stats.unconfirmed,
+        unknownResult: stats.unknownResult,
+        noPending: stats.noPending,
+        unconfirmedCall: stats.unconfirmedCall,
+        unknownCorrelation: stats.unknownCorrelation,
+        pending: globalPending,
+        controller: { ...stats.controller, tasksActive },
+        skipped: { ...stats.skipped },
+      }
+    },
+    nudge: (sessionId: string) => {
+      const existing = nudges.get(sessionId)
+      if (existing !== undefined) return existing
+      // execute 模式：没有主动提示时，把活跃任务约束留在易变槽里（回合结束/TTL 自动消失）。
+      // 这正是"临时约束不是长期记忆"的可见形态：只在任务存活期内提示，不写库。
+      if (controllerMode !== 'execute') return undefined
+      const state = states.get(sessionId)
+      if (state === undefined) return undefined
+      // 与 reducer 同一个时间域：最后一次事件时间（TTL 在事件到达时判定）。
+      const now = state.controller.lastEventAt ?? 0
+      const active = state.controller.tasks.filter(task => task.expiresAt > now)
+      const first = active[0]
+      if (first === undefined) return undefined
+      const text = first.text.replace(/\s+/g, ' ').trim().slice(0, 80)
+      return `当前任务约束（回合结束失效）：${text}${active.length > 1 ? ` 等 ${active.length} 条` : ''}`
+    },
     clearNudge,
     warm(sessionId) {
       stateOf(sessionId)
