@@ -242,4 +242,41 @@ describe('v4.4 导入图升级', () => {
     })
     dispose()
   })
+
+  it('workspace 包导出映射：裸包名 → 包入口文件（v4.9.4）', () => {
+    const root = mkdtempSync(join(tmpdir(), 'omb-project-pkg-'))
+    dirs.push(root)
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'pkg-demo', version: '0.1.0' }))
+    mkdirSync(join(root, 'app', 'src'), { recursive: true })
+    mkdirSync(join(root, 'packages', 'core', 'src'), { recursive: true })
+    writeFileSync(join(root, 'packages', 'core', 'package.json'), JSON.stringify({
+      name: '@demo/core',
+      version: '1.0.0',
+      main: 'src/index.ts',
+    }))
+    writeFileSync(
+      join(root, 'packages', 'core', 'src', 'index.ts'),
+      'export function coreHelper(): number { return 1 }\n',
+    )
+    writeFileSync(
+      join(root, 'app', 'src', 'app.ts'),
+      "import { coreHelper } from '@demo/core'\nexport const value = coreHelper()\n",
+    )
+
+    const { port, dispose } = createProjectProfile({ clock: { now: () => 1 }, rootOf: () => root })
+    const view = port.read(root)
+    expect(view?.structure?.fileImports).toContainEqual({
+      from: 'app/src/app.ts',
+      to: 'packages/core/src/index.ts',
+      count: 1,
+    })
+    expect(view?.structure?.calls).toContainEqual({
+      caller: 'app/src/app.ts',
+      callee: 'packages/core/src/index.ts',
+      symbol: 'coreHelper',
+      count: 1,
+    })
+    expect(view?.structure?.imports).toContainEqual({ from: 'app', to: 'packages', count: 1 })
+    dispose()
+  })
 })

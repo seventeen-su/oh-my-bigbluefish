@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.3（当前） = 项目证据到文件映射（x3）**：`extractEvidencePaths` 从命令里
+- **v4.9.4（当前） = 项目画像包导出映射 + 剩余项收口（x3）**：`readPackageEntryMap`
+  读 workspace `packages/*/package.json` 的 `main`/`types`/`exports`，裸包名 →
+  仓库内入口文件（相对路径/别名之后第三级解析），文件边/目录边/近似调用边都适用。
+  剩余项收口见 `docs/v4-remaining-closure.md`：类型图/三方合并为设计不变量，
+  OOM 根因为宿主快照外部依赖，`dsh-path-guard selfProtection` 是用户设置。
+- **v4.9.3** = 项目证据到文件映射（x3）：`extractEvidencePaths` 从命令里
   抽带扩展名的文件路径（URL/目录/符号不记，单条 ≤5），证据落盘升 v3（v2 旧文件照读）；
   `omb_project` L1 在证据后显示"→ 文件"（最多 2 个，更多写"等 N 个"）。
   契约：`docs/v4.9.3-evidence-file-mapping.md`。
@@ -149,6 +154,6 @@ node scripts/check-resolution.mjs
 - 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
 - **版本纪律（v4.4）**：新增功能 → x2+1，单个修复 → x3+1；改 `version-manifest.json` 的 `version` 字段 → `node scripts/version.mjs --write`；
   门禁用 `node scripts/version.mjs`（漂移退出码 1）。不要把版本号手写回 4.x。
-- v4.4 仍未做（不要在文档里假装已做）：完整类型图/类型解析与包导出映射、真正三方自动合并
-  （当前只出冲突材料）、OOM 根因最终定位（依赖宿主 heap snapshot，脚本已备）、`dsh-path-guard` 的
-  `selfProtection`（用户设置）。
+- v4.4 遗留项已收口：完整类型图/类型解析（设计边界）、三方自动合并（设计不变量）、
+  OOM 根因（宿主快照外部依赖）、`dsh-path-guard` 的 `selfProtection`（用户设置）——
+  逐条证据与性质见 `docs/v4-remaining-closure.md`；包导出映射已在 v4.9.4 实现。

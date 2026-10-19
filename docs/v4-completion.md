@@ -625,3 +625,40 @@
 - 不解析符号（函数/类级映射需要类型解析）；
 - 路径只表示"命令提到过"，不核验文件存在、也不声称测试覆盖范围；
 - 命令里没写文件（如 `pnpm test` 跑全量）时没有映射，不猜。
+
+---
+
+# OMB v4.9.4 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.4**（`24 功能 / 93 小功能`；x3 修复位：项目画像细化 + 剩余项收口） |
+| 构建 | **g115**；`generation: 115`、`outDir: lib-gen/g115` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 115/115、版本 4.9.4；`omb_project` 导入边包含跨 workspace 包名的文件边/调用边 |
+
+## 本版内容
+
+1. **包导出映射**：`readPackageEntryMap` 读 `packages/*/package.json` 的
+   `main`/`types`/`typings`/`exports`；`resolveImportTarget` 在相对路径、tsconfig 别名之后
+   按裸包名解析到仓库内入口文件（支持子路径），文件边/目录边/近似调用边都适用。
+2. **剩余项收口**：`docs/v4-remaining-closure.md` 逐条给出处置与证据——
+   类型图/三方合并 = 设计不变量，OOM 根因 = 宿主快照外部依赖，
+   `dsh-path-guard selfProtection` = 用户设置；并列出已做项与能力边界。
+3. AGENTS/README 的"仍未做"改为"已收口"，不再有可执行但无人做的条目。
+
+详见 `docs/v4.9.4-import-graph-package-exports.md` 与 `docs/v4-remaining-closure.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.4-import-graph-package-exports.md`、`docs/v4-remaining-closure.md`
+- 修改：`dsh/project-profile.ts`、`tests/dsh/project-profile.test.ts`、
+  `AGENTS.md`、`README.md`、版本文件
+
+## 仍未做（能力边界，不是遗漏）
+
+- 完整类型图/类型解析：需要 TS program，成本与画像预算冲突（见收口文档 §2.3）；
+- 语义冲突提示依赖嵌入器与已编码向量；证据映射只到文件、不解析符号；
+- precision@k 是使用归因口径，不是标注集评测。

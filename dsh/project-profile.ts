@@ -487,16 +487,74 @@ function readAliasConfig(root: string): AliasConfig {
 }
 
 /**
- * 把一个导入说明符解析成仓库内文件（v4.4：相对路径 + tsconfig 别名 + baseUrl）。
+ * 包导出映射（v4.9.4）：workspace 内包名 → 包目录 + 入口候选文件。
+ *
+ * 为什么不跑 TypeScript 类型解析：那需要加载编译器、按项目规模付出秒级代价，
+ * 而这里要回答的只是"这个裸包名指向仓库里的哪个文件"——`package.json` 的
+ * `main`/`types`/`exports` 已经给出答案。包导出映射是静态、廉价、可解释的；
+ * 完整类型图仍不在本仓库能力内（见文档边界）。
+ */
+interface PackageEntry {
+  readonly dir: string
+  readonly entries: readonly string[]
+}
+
+function readPackageEntryMap(root: string): ReadonlyMap<string, PackageEntry> {
+  const map = new Map<string, PackageEntry>()
+  const packagesRoot = join(root, 'packages')
+  const dirs: string[] = []
+  try {
+    for (const entry of readdirSync(packagesRoot, { withFileTypes: true })) {
+      if (entry.isDirectory() && !SKIP_DIRS.has(entry.name)) dirs.push(join('packages', entry.name))
+    }
+  } catch {
+    // 没有 packages/ 目录：只尝试根包
+  }
+  dirs.sort()
+  for (const dir of dirs.slice(0, 32)) {
+    const manifest = readJson(join(root, dir, 'package.json'))
+    if (manifest === undefined) continue
+    const name = manifest['name']
+    if (typeof name !== 'string' || name.length === 0) continue
+    const entries: string[] = []
+    const pushEntry = (value: unknown): void => {
+      if (typeof value === 'string' && value.length > 0) entries.push(value.replace(/^\.\//, ''))
+    }
+    pushEntry(manifest['main'])
+    pushEntry(manifest['types'])
+    pushEntry(manifest['typings'])
+    const exportsRaw = manifest['exports']
+    if (typeof exportsRaw === 'string') pushEntry(exportsRaw)
+    else if (typeof exportsRaw === 'object' && exportsRaw !== null) {
+      const dot = (exportsRaw as Record<string, unknown>)['.']
+      if (typeof dot === 'string') pushEntry(dot)
+      else if (typeof dot === 'object' && dot !== null) {
+        pushEntry((dot as Record<string, unknown>)['import'])
+        pushEntry((dot as Record<string, unknown>)['require'])
+        pushEntry((dot as Record<string, unknown>)['types'])
+      }
+    }
+    for (const fallback of ['index.ts', 'index.js', 'src/index.ts', 'src/index.js']) entries.push(fallback)
+    map.set(name, { dir, entries: [...new Set(entries)] })
+  }
+  return map
+}
+
+/**
+ * 把一个导入说明符解析成仓库内文件（v4.4：相对路径 + tsconfig 别名 + baseUrl；
+ * v4.9.4：workspace 包导出映射）。
  *
  * 依次尝试：原路径（带扩展名时）、常见扩展名、`index.<ext>`；只有**仓库内**
- * 且真实存在的文件才算边。解析不到就跳过——不执行打包器插件、不猜包导出映射。
+ * 且真实存在的文件才算边。裸包名先按 tsconfig/baseUrl 解析，仍找不到时按
+ * workspace `package.json` 的 `main`/`types`/`exports` 映射到包入口。
+ * 解析不到就跳过——不执行打包器插件、不猜第三方依赖的磁盘位置。
  */
 function resolveImportTarget(
   root: string,
   fromFile: string,
   specifier: string,
   alias: AliasConfig,
+  packages: ReadonlyMap<string, PackageEntry>,
 ): string | undefined {
   const bases: string[] = []
   if (specifier.startsWith('.')) {
@@ -513,6 +571,26 @@ function resolveImportTarget(
     }
     if (bases.length === 0) bases.push(resolve(alias.baseUrl, specifier))
   }
+  const resolved = resolveCandidates(root, bases)
+  if (resolved !== undefined) return resolved
+
+  // v4.9.4：workspace 包名（`@scope/name` 或 `name`，可带子路径）
+  if (specifier.startsWith('.') || specifier.startsWith('/')) return undefined
+  const segments = specifier.split('/')
+  const nameLength = specifier.startsWith('@') ? 2 : 1
+  if (segments.length < nameLength) return undefined
+  const name = segments.slice(0, nameLength).join('/')
+  const subpath = segments.slice(nameLength).join('/')
+  const entry = packages.get(name)
+  if (entry === undefined) return undefined
+  const packageBases: string[] = []
+  if (subpath.length > 0) packageBases.push(join(root, entry.dir, subpath))
+  for (const candidate of entry.entries) packageBases.push(join(root, entry.dir, candidate))
+  return resolveCandidates(root, packageBases)
+}
+
+/** 候选基名 → 仓库内相对文件（带扩展名/index 尝试；越界与不存在一律跳过）。 */
+function resolveCandidates(root: string, bases: readonly string[]): string | undefined {
   const extensions = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs']
   const candidates: string[] = []
   for (const base of bases) {
@@ -632,9 +710,11 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
   }
 
   // v4.4：扫描完成后再解析边（此时 `fileExports` 已覆盖全部被扫文件）。
+  // v4.9.4：同时带上 workspace 包导出映射（裸包名 → 包入口文件）。
+  const packages = readPackageEntryMap(root)
   for (const file of scanned) {
     for (const specifier of file.imports) {
-      const target = resolveImportTarget(root, file.absolutePath, specifier, alias)
+      const target = resolveImportTarget(root, file.absolutePath, specifier, alias, packages)
       if (target === undefined || target === file.relativePath) continue
       putEdge(fileEdges, file.relativePath, target)
       const to = target.split('/')[0]
@@ -642,7 +722,7 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
       putEdge(importEdges, file.topName, to)
     }
     for (const call of file.importCalls) {
-      const target = resolveImportTarget(root, file.absolutePath, call.specifier, alias)
+      const target = resolveImportTarget(root, file.absolutePath, call.specifier, alias, packages)
       if (target === undefined || !(fileExports.get(target)?.has(call.name) ?? false)) continue
       const key = `${file.relativePath}\u0000${target}\u0000${call.name}`
       callEdges.set(key, (callEdges.get(key) ?? 0) + 1)
