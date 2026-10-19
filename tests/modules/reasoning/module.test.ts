@@ -98,7 +98,7 @@ describe('目录与服务面：工具面清空、methods 服务消失', () => {
     const { handle } = start()
     expect(handle.statusNames()).toContain('思维链质量（omb-reasoning）')
     const detail = handle.health()[MODULE_ID]?.detail ?? ''
-    expect(detail).toContain('skills omb-r1…r8')
+    expect(detail).toContain('skills（omb-depth 等）')
     expect(detail).toContain(`常驻提示 ${RESIDENT_HINT.length}/${RESIDENT_HINT_MAX_CHARS} 字符`)
     // v4 删除的面不许再出现在健康行
     for (const banned of ['规则卡 8 张', '验证', '推理预算映射', '尚未核对过结论']) {
@@ -144,8 +144,7 @@ describe('常驻提示：一句入口（≤80）', () => {
     expect(resident).toBe(RESIDENT_HINT)
     expect(resident.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX_CHARS)
     expect(resident.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX)
-    expect(resident).toContain('omb-r1')
-    expect(resident).toContain('omb-r8')
+    expect(resident).toContain('omb-depth')
     expect(resident).toContain('skills')
     for (const banned of ['omb_method', 'omb_focus', 'omb_verify']) {
       expect(resident.includes(banned), `常驻提示仍提到 ${banned}`).toBe(false)

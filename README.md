@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.9.4)
+# Oh-My-BigBlueFish (OMB v4.9.5)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -18,7 +18,8 @@ v4.9.1 是它的语义通道收尾（x3）：有嵌入器时补充没有共享�
 v4.9.2 补上**检索命中排名读数**（使用命中时的 @1/@3/@5 分布）；
 v4.9.3 给项目证据加**文件映射**（命令里提到的文件随证据落盘并在 L1 显示）；
 v4.9.4 补上**workspace 包导出映射**并完成**剩余项收口**（类型图/三方合并为设计不变量、
-OOM 为外部依赖、selfProtection 为用户设置）。详见
+OOM 为外部依赖、selfProtection 为用户设置）；
+v4.9.5 精简四个用户命令的简介、把 8 张过程卡标成**用户不可见**（不再出现在 `/` 菜单）。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -33,11 +34,12 @@ OOM 为外部依赖、selfProtection 为用户设置）。详见
 [`docs/v4.9.0-conflict-hints.md`](docs/v4.9.0-conflict-hints.md)、
 [`docs/v4.9.2-retrieval-precision.md`](docs/v4.9.2-retrieval-precision.md)、
 [`docs/v4.9.3-evidence-file-mapping.md`](docs/v4.9.3-evidence-file-mapping.md)、
-[`docs/v4.9.4-import-graph-package-exports.md`](docs/v4.9.4-import-graph-package-exports.md) 与
+[`docs/v4.9.4-import-graph-package-exports.md`](docs/v4.9.4-import-graph-package-exports.md)、
+[`docs/v4.9.5-naming-cleanup.md`](docs/v4.9.5-naming-cleanup.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 92 小功能 → 4.9.3**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 93 小功能 → 4.9.5**。
 
 ## v4.4 结构（2026-10）
 
@@ -46,7 +48,7 @@ OOM 为外部依赖、selfProtection 为用户设置）。详见
 | **记忆库（核心）** | 双库长期记忆、逐字召回、**自主捕获**（偏好/决定 + 项目活动 + 会话结果，确定性零 LLM；v4.1 起按 `tool/result` 生命周期写，失败写"未生效"）、多跳关联 + 自动连边、反馈效用（`/omb-feedback`）、隐私闸门（`/omb-privacy`）；v4.3 起会话/失败/索引缓存全部有界 | 只有工具描述；召回按需 |
 | **项目层** | `omb_project` 读 **L0–L5 分层时空快照**（身份/结构/空间状态/时间/知识/意图，≤2,400 字符）：git 根身份、画像（含符号与跨模块导入摘要）、读取印记与外部改动、回合/空闲、项目记忆 top 3、开放目标；仓库根 `AGENTS.md` 由宿主自动加载 | 按需；不占常驻 |
 | **状态层** | `omb:session-state`：工作区 epoch（含 `AGENTS.md`/`CLAUDE.md` 指纹）、空闲分级、外部改动、读取戳（**内容哈希**）、shell 写路径、跨会话写、目标/待办；**edit+write 写守卫**（读后被外部改 → 拒绝；覆盖既有文件且无读取印记默认也拒绝，v4.5.3），连续拒绝后须重读才放行；仅在真实变化时注入一行 ≤120 字符 | 正常 0 字节 |
-| **过程层** | 8 张过程卡迁到 `skills/omb-r1…r8`，模型按需加载；循环/无进展才注入一行 | 技能目录会话级 |
+| **过程层** | 8 张过程卡在 `skills/omb-*`（`user-invocable: false`，不出现在用户命令菜单），模型按需加载；循环/无进展才注入一行 | 技能目录会话级 |
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
 
 v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
@@ -71,7 +73,7 @@ v4.1 的关键变化（与 v4.0 的差别）：**项目身份 = git root**（子
 
 - **不再有逐回合压力/摘要注入**：宿主 `systemPrompt.context()` 是尾部快照，不是系统提示段；
   任何逐回合变化只会污染注意力。正常状态注入 0 字节。
-- **规则卡不是工具**：8 张过程卡是 `skills/` 文件，由模型按需加载；`omb_method` 已删除。
+- **规则卡不是工具**：8 张过程卡是 `skills/` 文件，由模型按需加载；`omb_method` 已删除；它们标了 `user-invocable: false`，不会出现在 `/` 命令菜单。
 - **记忆逐字返回**：不做有损抽取。逐字原文 + 溯源（`sourceRef` + 时间）比摘要更可靠。
 - **写入有准入**：用户原话/真实执行台账/工件核验才写；自主捕获只写可观测事实，密钥模式拒写。
 - **冲突只呈现**：发现两个来源矛盾时不替你选择，把两条都摆出来。

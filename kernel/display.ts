@@ -98,8 +98,8 @@ export const COMPONENT_DISPLAY: readonly ComponentDisplay[] = [
     packageName: '@omb/reasoning',
     zh: '思维链质量',
     en: 'Chain-of-thought quality',
-    zhDescription: '过程卡迁到 skills（omb-r1…r8）；只在检测到循环/无进展时注入一行',
-    enDescription: 'Process cards live in skills (omb-r1…r8); injects only on loop/no-progress signals.',
+    zhDescription: '过程卡在 skills（omb-depth 等，不对用户暴露）；只在检测到循环/无进展时注入一行',
+    enDescription: 'Process cards live in skills (omb-depth etc.); injects only on loop/no-progress signals.',
     kind: 'module',
   },
   {

@@ -121,7 +121,7 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
     enabledByDefault: true,
     requires: ['omb-kernel'],
     // v4（docs/v4-decision.md §3 L3 / §4）：工具面清空。
-    // - 8 张方法卡迁到 DSH skills（`skills/omb-r1…r8/SKILL.md`）；
+    // - 8 张过程卡迁到 DSH skills（`skills/omb-depth` 等，`user-invocable: false`）；
     // - `omb_verify` 删除（外部核验器替代），验证台账/验证段同删；
     // - `omb_method` / `omb_focus` 删除，`reasoning:methods` 服务不再 provide；
     //   档位 → `reasoningEffort` 由 `/omb-depth` + `dsh/reasoning-effort.ts` 负责。

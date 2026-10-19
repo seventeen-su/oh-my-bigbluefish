@@ -1,9 +1,10 @@
 /**
  * 常驻提示（v4 技能化后只剩这一句）。
  *
- * 8 张方法卡已迁到 DSH skills：`skills/omb-r1/SKILL.md` … `skills/omb-r8/SKILL.md`。
+ * 8 张过程卡已迁到 DSH skills（`skills/omb-depth/SKILL.md` 等，用户不可见的模型技能），
  * 模型通过会话技能目录（name + description）发现它们，用 `skill` 工具按需加载正文；
- * 用户也可以用 `/omb-rN` 显式加载。本文件不再持有卡片正文/索引/话题匹配。
+ * 它们**不是用户指令**：每张卡的 frontmatter 都带 `user-invocable: false`，
+ * 否则会被 DSH 的斜杠菜单列成 `/omb-*` 噪音。
  *
  * 硬约束（v4 / docs/v4-decision.md §3 L3）：
  * - **≤80 字符**（模块自身上限；宿主的共享常驻预算是 120 字符，
@@ -23,9 +24,9 @@ export const RESIDENT_HINT_MAX_CHARS = 80
  * 逐字节稳定的常驻提示。
  *
  * 它做三件事：① 承载 R1 的判断动作；② 说明"简单直接答、复杂再展开"；
- * ③ 指向 skills（omb-r1…r8）——这是模型发现过程卡目录的入口。
+ * ③ 指向 skills（omb-depth 等 8 张）——这是模型发现过程卡目录的入口。
  */
-export const RESIDENT_HINT = '先判断需要多少推理：简单直接答，复杂再展开；过程卡见 skills：omb-r1…omb-r8。'
+export const RESIDENT_HINT = '先判断需要多少推理：简单直接答，复杂再展开；过程卡见 skills：omb-depth 等。'
 
 /**
  * 按预算取常驻提示：装得下就用整句，装不下才截断（截断保留省略号，

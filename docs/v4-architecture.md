@@ -22,7 +22,7 @@ v4.1 在此之上加**一套共享坐标**：项目身份（git root）、资源
 | **会话见证** | `omb:session-witness` | `dsh/session.ts` | 记忆写入准入 | 最近用户原话、真实执行台账、压缩代际 |
 | **项目画像** | `omb:project-profile` | `dsh/project-profile.ts` | `omb_project`、记忆 | 栈/命令/目录/README/git 头；v4.1 在**项目根**构建，附 `root/cwdRel/identity/structure/history/gates` 结构化字段（文本 ≤1400 字符） |
 | **记忆与反馈** | `stores` + `memory_utility`/`memory_feedback` | `omb-memory` | recall/relate/project/status | 逐字结论、边、效用账本、可逆归档、审计；v4.1 按项目根取库（`projectRootOf`） |
-| **过程库** | `skills/omb-r*` + `reasoning:loop` | `skills/` + `omb-reasoning` | 模型（按需） | 8 张过程卡按需加载；循环/无进展只在真信号时注入一行 |
+| **过程库** | `skills/omb-*` + `reasoning:loop` | `skills/` + `omb-reasoning` | 模型（按需） | 8 张过程卡按需加载（`user-invocable: false`，不对用户暴露）；循环/无进展只在真信号时注入一行 |
 
 只有 `dsh/` 能接触宿主；模块之间不互相 import，只认这些结构化契约（ESLint 强制）。
 

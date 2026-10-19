@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Chain-of-thought quality",
-    "description": "Process cards live in skills (omb-r1…r8); injects only on loop/no-progress signals."
+    "description": "Process cards live in skills (omb-depth etc.); injects only on loop/no-progress signals."
   }
 }

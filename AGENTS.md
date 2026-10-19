@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.5**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.4（当前） = 项目画像包导出映射 + 剩余项收口（x3）**：`readPackageEntryMap`
+- **v4.9.5（当前） = 命令简介精简与过程卡隐藏（x3）**：四个用户命令的简介改短、
+  去括号、说人话（只改 `description`，不动命令名与用法）；8 张过程卡 frontmatter 加
+  `user-invocable: false`（模型技能，不再出现在用户斜杠菜单），并改名为
+  `omb-depth/goal/options/testable/cite/failure/honesty/conflict`。
+  契约：`docs/v4.9.5-naming-cleanup.md`。
+- **v4.9.4** = 项目画像包导出映射 + 剩余项收口（x3）：`readPackageEntryMap`
   读 workspace `packages/*/package.json` 的 `main`/`types`/`exports`，裸包名 →
   仓库内入口文件（相对路径/别名之后第三级解析），文件边/目录边/近似调用边都适用。
   剩余项收口见 `docs/v4-remaining-closure.md`：类型图/三方合并为设计不变量，

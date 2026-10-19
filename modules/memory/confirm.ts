@@ -672,7 +672,7 @@ export function installConfirm(kernel: Kernel, deps: ConfirmDeps): ConfirmInstal
       const returned = commands.register({
         definitionId: CONFIRM_COMMAND_ID,
         name: CONFIRM_COMMAND_NAME,
-        description: '确认候选记忆（可撤销；用户显式动作，只改证据归属，不改正文与来源）',
+        description: '确认候选记忆，可撤销',
         input: { hint: '[list [offset] | log 记忆id | 记忆id | undo 记忆id...]' },
         handler: (invocation: CommandInvocationLike): Promise<CommandResultLike> => {
           const session = sessionOfInvocation(invocation)

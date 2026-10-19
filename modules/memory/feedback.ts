@@ -278,7 +278,7 @@ export function installFeedback(kernel: Kernel, deps: FeedbackDeps): FeedbackIns
       const returned = commands.register({
         definitionId: FEEDBACK_COMMAND_ID,
         name: FEEDBACK_COMMAND_NAME,
-        description: '对记忆条目给一次显式反馈（useful / wrong / stale / noise；不新增模型工具）',
+        description: '标记记忆是否有用、过时或不对',
         input: { hint: '<记忆id> [useful | wrong | stale | noise | revive]' },
         handler: (invocation: CommandInvocationLike): Promise<CommandResultLike> => {
           const session = sessionOfInvocation(invocation)

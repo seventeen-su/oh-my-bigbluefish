@@ -7,7 +7,7 @@ import { OMB_VERSION } from '../../kernel/version.js'
  * - **`omb_verify`**（工具 + `verify.ts` + 验证台账 + 验证段）——外部核验器
  *   （tsc/eslint/vitest/git diff）替代，不做内在自验证；
  * - **`omb_method` / `omb_focus`** 两个工具与 `reasoning:methods` 服务——
- *   8 张方法卡迁到 DSH skills（`skills/omb-r1…r8/SKILL.md`），档位/effort 由
+ *   8 张过程卡迁到 DSH skills（`skills/omb-depth/SKILL.md` 等，`user-invocable: false`），档位/effort 由
  *   `dsh/depth-command.ts` + `dsh/reasoning-effort.ts`（用户命令 `/omb-depth`）负责；
  * - 控制读数、自动注入卡、紧档索引、逐回合压力塑形、失败处置表、糊弄观察面。
  *
@@ -206,7 +206,7 @@ function describeLastRender(
 export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
   let lastHealth: ModuleHealth = {
     state: 'ok',
-    detail: `未启动；常驻提示上限 ${RESIDENT_HINT_MAX_CHARS} 字符，过程卡在 skills omb-r1…r8`,
+    detail: `未启动；常驻提示上限 ${RESIDENT_HINT_MAX_CHARS} 字符，过程卡在 skills（omb-depth 等）`,
   }
 
   const manifest: ModuleManifest<ReasoningConfig> = {
@@ -260,7 +260,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
       let withSignal = 0
       for (const state of sessions.values()) if (state.lastSignal !== null) withSignal += 1
       const parts = [
-        `过程卡 skills omb-r1…r8`,
+        `过程卡 skills（omb-depth 等）`,
         `常驻提示 ${hint.length}/${RESIDENT_HINT_MAX_CHARS} 字符`,
         `跟踪会话 ${sessions.size}`,
         withSignal > 0 ? `循环信号 ${withSignal} 个` : '无循环信号',
@@ -493,7 +493,7 @@ export function createReasoningModule(): ModuleRegistration<ReasoningConfig> {
       }
       disposers.length = 0
       sessions.clear()
-      lastHealth = { state: 'ok', detail: `模块已卸载；过程卡仍在 skills omb-r1…r8` }
+      lastHealth = { state: 'ok', detail: `模块已卸载；过程卡仍在 skills（omb-depth 等）` }
     }
   }
 

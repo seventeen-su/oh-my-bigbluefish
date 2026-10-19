@@ -4,7 +4,7 @@
  * 判据：
  * ① ≤80 字符（模块自身上限；宿主的共享预算是 120，要留余量给其它模块）；
  * ② 逐字节稳定、按预算只缩不涨；
- * ③ 自己承载 R1 的动作，并点名 skills omb-r1…r8（模型据此发现过程卡目录）；
+ * ③ 自己承载 R1 的动作，并点名 skills（omb-depth 等 8 张，用户不可见的过程卡）；
  * ④ 不再提到已删除的工具（omb_method/omb_focus/omb_verify）。
  */
 import { describe, expect, it } from 'vitest'
@@ -23,12 +23,11 @@ describe('常驻提示：一句入口', () => {
     expect(RESIDENT_HINT.length).toBeLessThanOrEqual(RESIDENT_HINT_MAX)
   })
 
-  it('承载 R1 的动作，并点名 skills omb-r1…r8', () => {
+  it('承载 R1 的动作，并点名 skills（omb-depth 等）', () => {
     expect(RESIDENT_HINT).toContain('先判断需要多少推理')
     expect(RESIDENT_HINT).toContain('简单直接答')
     expect(RESIDENT_HINT).toContain('skills')
-    expect(RESIDENT_HINT).toContain('omb-r1')
-    expect(RESIDENT_HINT).toContain('omb-r8')
+    expect(RESIDENT_HINT).toContain('omb-depth')
   })
 
   it('不再提已删除的三个工具（工具面在 v4 清空）', () => {

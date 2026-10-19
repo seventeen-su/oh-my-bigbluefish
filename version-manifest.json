@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.9.4 = 项目画像包导出映射（x3），并完成剩余项收口文档。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.9.5 = 命令简介精简与过程卡隐藏（x3）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -53,7 +53,7 @@
       "name": "推理技能化",
       "since": "4.0",
       "subfeatures": [
-        "omb-r1…r8 过程卡",
+        "8 张过程卡（隐藏用户入口）",
         "48 字符常驻提示",
         "循环/无进展提示",
         "/omb-depth effort 映射"
@@ -264,5 +264,5 @@
       ]
     }
   ],
-  "version": "4.9.4"
+  "version": "4.9.5"
 }

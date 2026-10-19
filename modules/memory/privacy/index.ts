@@ -556,7 +556,7 @@ export function installPrivacy(
       const returned = commands.register({
         definitionId: PRIVACY_COMMAND_ID,
         name: PRIVACY_COMMAND_NAME,
-        description: '设置当前对话记忆库隐私开关',
+        description: '设置当前对话的记忆隐私模式',
         /**
          * ⚠️ **声明 `input` 是"带参数的命令能用"的前提**——这一行是缺了它才出的 bug。
          *
@@ -607,7 +607,7 @@ export function installPrivacy(
       const returnedClean = commands.register({
         definitionId: PRIVACY_CLEAN_COMMAND_ID,
         name: PRIVACY_CLEAN_COMMAND_NAME,
-        description: '清除当前/指定会话或全部已结束会话的受限记录',
+        description: '清理对话的隐私限制记录',
         input: { hint: '[会话id | clear]（缺省=当前会话）' },
         handler: (invocation: CommandInvocationLike): CommandResultLike => {
           const session = sessionOfInvocation(invocation)

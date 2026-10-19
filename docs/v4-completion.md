@@ -662,3 +662,44 @@
 - 完整类型图/类型解析：需要 TS program，成本与画像预算冲突（见收口文档 §2.3）；
 - 语义冲突提示依赖嵌入器与已编码向量；证据映射只到文件、不解析符号；
 - precision@k 是使用归因口径，不是标注集评测。
+
+---
+
+# OMB v4.9.5 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.5**（`24 功能 / 93 小功能`；x3 修复位：命令简介与技能可见性收口） |
+| 构建 | **g116**；`generation: 116`、`outDir: lib-gen/g116` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **117 files / 1460 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`/` 菜单不再出现 `/omb-r*`；四个命令简介为新文案；`omb_status` 构建 116/116、版本 4.9.5 |
+
+## 本版内容
+
+1. **命令简介精简**（只改注册 description）：
+   - `/omb-privacy`：设置当前对话的记忆隐私模式
+   - `/omb-privacy-clean`：清理对话的隐私限制记录
+   - `/omb-feedback`：标记记忆是否有用、过时或不对
+   - `/omb-confirm`：确认候选记忆，可撤销
+2. **过程卡隐藏 + 改名**：8 张技能 frontmatter 加 `user-invocable: false`（模型可加载、
+   用户斜杠菜单不显示）；编号名改为 `omb-depth/goal/options/testable/cite/failure/honesty/conflict`，
+   描述压到一行（≤120 字符、无括号）；常驻提示同步为 `过程卡见 skills：omb-depth 等。`
+3. 测试改写字面量：`skills.test.ts` 钉住目录名/隐藏标记/短描述/正文锚点；
+   `methods/module.test.ts` 跟随新提示与健康行。
+
+详见 `docs/v4.9.5-naming-cleanup.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.5-naming-cleanup.md`
+- 修改：`modules/memory/{privacy/index,feedback,confirm}.ts`、`skills/omb-*`、
+  `modules/reasoning/{methods,index}.ts`、`kernel/{abi/catalog,display}.ts`、
+  `packages/reasoning/locale/{zh,en}.json`、`tests/modules/reasoning/{skills,methods,module}.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件
+
+## 备注
+
+- 旧技能 id `omb-r1…r8` 不再存在（有意收口）；
+- 隐藏只影响用户菜单，模型技能目录仍可见（`modelInvocable` 保持 true）。
