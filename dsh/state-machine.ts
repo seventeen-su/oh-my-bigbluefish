@@ -86,7 +86,7 @@ export const MAX_SESSION_FILES = 100
 export const MAX_STATE_FILE_BYTES = 64 * 1024
 /** "读取后太久才写"的判据（R10 §2.1：>20 step）。 */
 export const STALE_WRITE_STEPS = 20
-/** 同路径每回合最多 deny 次数；第 3 次放行（R10 §6.5 逃生门）。 */
+/** 同路径每回合连续 deny 的触发阈值；到阈值后**只有重新读取过**才放行（v4.5.3）。 */
 export const MAX_DENIES_PER_PATH_PER_TURN = 2
 /** 读取印记内容哈希的单文件上限（v4.1 §4）。 */
 export const HASH_MAX_BYTES = 2 * 1024 * 1024
@@ -358,9 +358,11 @@ export interface SessionStateConfig {
   /** 指令文件（相对 cwd）；指纹变化时状态行提示"指令已变"。 */
   readonly instructionFiles: readonly string[]
   /**
-   * 缺读取印记且目标已存在时的策略（v4.2）：
-   * - `allow`（默认）：放行 + `blindWrites`（读可能发生在 shell 里，硬拦会误伤）；
-   * - `deny`：拒绝一次，计 `denies`，逃生门仍生效（同路径同回合第 3 次放行）。
+   * 缺读取印记且目标已存在时的策略（v4.2，v4.5.3 默认改为 deny）：
+   * - `deny`（默认）：拒绝，计 `denies`；**重新读取**该文件后再写才放行（见 `denyWith`）。
+   *   失败关闭（fail-closed）在这里是刻意的：没有可核验的读取依据时，
+   *   覆盖已有文件的风险高于误伤；模型可以一次 `read` 就恢复。
+   * - `allow`：放行 + `blindWrites`（读可能发生在 shell 里，硬拦会误伤）。
    */
   readonly blindWritePolicy: 'allow' | 'deny'
   /**
@@ -390,7 +392,7 @@ export const DEFAULT_SESSION_STATE_CONFIG: SessionStateConfig = {
   writeTools: DEFAULT_WRITE_TOOLS,
   shellTools: DEFAULT_SHELL_TOOLS,
   instructionFiles: DEFAULT_INSTRUCTION_FILES,
-  blindWritePolicy: 'allow',
+  blindWritePolicy: 'deny',
   shellInferUnknown: true,
   persist: true,
   persistMinIntervalMs: 30_000,
@@ -489,6 +491,8 @@ interface SessionRecord {
   /** v4.4：读取时保存的正文（冲突包 base；每会话最多 4 条 × 64KB）。 */
   readBases: Map<string, string>
   denyCounts: Map<string, number>
+  /** v4.5.3：同路径最近一次 deny 的内核时钟；只有此后的**重新读取**才能解除逃生门。 */
+  denyAt: Map<string, number>
   denies: number
   gaveUps: number
   writeWarnings: number
@@ -1270,6 +1274,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       instructions: null,
       unreportedInstructions: false,
       denyCounts: new Map(),
+      denyAt: new Map(),
       denies: 0,
       gaveUps: 0,
       writeWarnings: 0,
@@ -1369,6 +1374,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     record.step = stepValue === undefined ? record.step + 1 : Math.max(record.step, Math.floor(stepValue))
     record.lastBoundaryAt = at
     record.denyCounts.clear()
+    record.denyAt.clear()
     // v4.1 §4：writeIntent 按**回合**归因，turn/start 边界清空（上一回合写过什么不再算本回合）。
     record.writeIntent.clear()
 
@@ -1628,7 +1634,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
    * | 印记 hash=null | allow | unverifiable++ |
    * | 当前读不到/超限 | allow | unverifiable++ |
    * | hash 相同 | allow | — |
-   * | hash 不同 | deny（≤120 事实句） | denies++；同路径同回合第 3 次 allow+gaveUps++ |
+   * | hash 不同 | deny（≤120 事实句） | denies++；到阈值后**只有重读**才 allow+gaveUps |
    * | 内部异常 | allow | 日志（fail-open，不成为单点故障） |
    */
   const guardEdit = (sessionId: string, toolName: string, path: string): EditGuardDecision => {
@@ -1644,14 +1650,34 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       const denyKey = absPath ?? normalized
       const stamp = findStamp(record, absPath, normalized)
 
-      /** 统一 deny 记账（逃生门：同路径同回合第 3 次放行）。 */
+      /**
+       * 统一 deny 记账（v4.5.3 逃生门：**重新读取后才放行**）。
+       *
+       * 旧行为"同路径第 3 次自动放行"不是安全策略：模型只要重复调用同一个工具，
+       * 就能绕过哈希冲突检查，把冲突内容覆盖掉。现在的放行条件是：
+       * 该路径在**最近一次 deny 之后**产生过新的读取印记（`stamp.at > denyAt`），
+       * 也就是模型确实重新读了文件（重新读取会刷新哈希，下一次哈希校验自然通过）。
+       * 没有重读 → 继续 deny，并明确告诉模型该做什么，而不是靠计数硬闯。
+       */
       const denyWith = (reason: string): EditGuardDecision => {
         const denied = record.denyCounts.get(denyKey) ?? 0
         if (denied >= config.maxDeniesPerPathPerTurn) {
-          record.gaveUps += 1
-          return { kind: 'allow', reason: null }
+          const deniedAt = record.denyAt.get(denyKey)
+          const reread = stamp !== undefined && deniedAt !== undefined && stamp.at > deniedAt
+          if (reread) {
+            record.gaveUps += 1
+            record.denyCounts.delete(denyKey)
+            record.denyAt.delete(denyKey)
+            return { kind: 'allow', reason: null }
+          }
+          record.denies += 1
+          return {
+            kind: 'deny',
+            reason: '同路径已连续被拒；未检测到 deny 之后的重新读取，仍不允许写入。先读取该文件再生成补丁。',
+          }
         }
         record.denyCounts.set(denyKey, denied + 1)
+        record.denyAt.set(denyKey, clock.now())
         record.denies += 1
         return { kind: 'deny', reason: reason.length > 120 ? reason.slice(0, 120) : reason }
       }
@@ -1668,7 +1694,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
         return writeConflict({ cwd, path: normalized, reason, base, current })
       }
 
-      // ① 无印记：新建 allow；覆盖既有文件按盲写策略（默认 allow + blindWrites）。
+      // ① 无印记：新建 allow；覆盖既有文件按盲写策略（v4.5.3 默认 deny + blindWrites）。
       if (stamp === undefined) {
         if (absPath === undefined || !fileExists(absPath)) return { kind: 'allow', reason: null }
         record.blindWrites += 1
@@ -1710,7 +1736,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
       }
       // ④ 哈希相同 → 读后未变，放行。
       if (current.value.hash === stamp.hash) return { kind: 'allow', reason: null }
-      // ⑤ 哈希不同（读后被改）→ deny；同路径同回合第 3 次放行并计 gaveUps。
+      // ⑤ 哈希不同（读后被改）→ deny；到阈值后仅有 deny 之后的重读才放行并计 gaveUps。
       {
         const base = `读后内容已变化（${stamp.hash.slice(0, 8)}→${current.value.hash.slice(0, 8)}），编辑未执行。`
         const conflict = conflictFor(stamp, base)

@@ -11,12 +11,11 @@
  *
  * 快照用 Chrome DevTools → Memory → Load 打开，按 Retained Size 找根因。
  */
-import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
-import { getHeapStatistics, writeHeapSnapshot } from 'node:v8'
+import { getHeapStatistics } from 'node:v8'
 import type { HostContextLike } from './host.js'
 import { readService } from './host.js'
 import type { Kernel, Logger } from '../kernel/abi/index.js'
+import { HEAP_SNAPSHOT_PRIVACY_NOTE, writeHeapSnapshotSafely } from './heap-snapshot.js'
 
 interface CommandResultLike {
   readonly kind: 'success' | 'error'
@@ -94,14 +93,16 @@ export function registerHeapCommand(options: {
           return { kind: 'error', text: `/omb-heap：可用参数 snapshot 或留空，收到 ${JSON.stringify(raw)}` }
         }
         try {
-          const dir = join(process.cwd(), '.omb', 'heap')
-          mkdirSync(dir, { recursive: true })
-          const file = join(dir, `${Date.now()}-${process.pid}.heapsnapshot`)
-          // 同步写；此时事件循环暂停，属预期行为（用户显式取证）。
-          writeHeapSnapshot(file)
+          // 磁盘检查 + 保留策略集中在 `heap-snapshot.ts`（与 omb_status 共用）。
+          const written = writeHeapSnapshotSafely(process.cwd())
+          if (!written.ok || written.file === null) {
+            return { kind: 'error', text: `/omb-heap snapshot 失败：${written.detail}` }
+          }
           return {
             kind: 'success',
-            text: `已写 heap snapshot：${file}。用 Chrome DevTools → Memory → Load 打开，按 Retained Size 排序定位。`,
+            text: `已写 heap snapshot：${written.file}（${written.detail}）。`
+              + ' 用 Chrome DevTools → Memory → Load 打开，按 Retained Size 排序定位。'
+              + ` ⚠ ${HEAP_SNAPSHOT_PRIVACY_NOTE}`,
           }
         } catch (error) {
           return { kind: 'error', text: `/omb-heap snapshot 失败：${error instanceof Error ? error.message : String(error)}` }

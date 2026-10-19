@@ -492,9 +492,27 @@ describe('资源级写守卫（v4.1 §4 判定表；edit+write 统一）', () =>
     m.dispose()
   })
 
-  it('判定表：无印记且文件存在 → allow + blindWrites++', () => {
+  it('判定表：无印记且文件存在 → 默认 deny + blindWrites++（v4.5.3 fail-closed）', () => {
     const { m, content, abs } = fixture()
     content.set(abs('src/existing.ts'), 'h0')
+    expect(m.guardEdit(S1, 'edit', 'src/existing.ts').kind).toBe('deny')
+    expect(m.port.snapshot(S1)?.blindWrites).toBe(1)
+    m.dispose()
+  })
+
+  it('判定表：无印记且文件存在、显式 blindWritePolicy=allow → allow + blindWrites++', () => {
+    const clock = new FakeClock()
+    const content = fakeContent()
+    content.set(absPathOf('C:/repo', 'src/existing.ts') ?? 'src/existing.ts', 'h0')
+    const m = createSessionStateMachine({
+      clock,
+      cwdOf: () => 'C:/repo',
+      contentHash: absPath => content.hashOf(absPath),
+      fileExists: absPath => content.exists(absPath),
+      instructionDigest: () => null,
+      config: { persist: false, blindWritePolicy: 'allow' },
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
     expect(m.guardEdit(S1, 'edit', 'src/existing.ts').kind).toBe('allow')
     expect(m.port.snapshot(S1)?.blindWrites).toBe(1)
     m.dispose()
@@ -546,16 +564,36 @@ describe('资源级写守卫（v4.1 §4 判定表；edit+write 统一）', () =>
     m.dispose()
   })
 
-  it('逃生门：同路径同回合前 2 次 deny、第 3 次 allow + gaveUps；step/start 不清预算', () => {
+  it('逃生门：前 2 次 deny 后第 3 次仍 deny（无重读）；重读后才 allow + gaveUps', () => {
     const { m, clock, content, abs, read } = fixture()
     read('src/a.ts', 'h1')
     content.set(abs('src/a.ts'), 'h2')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
-    m.port.observe(event(S1, 'step/start', clock.now(), { turn: 1, step: 2 }))
+    // 没有 deny 之后的重新读取：第 3 次不能自动放行（否则计数就是绕过检查的通道）
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
+    // 重新读取（stamp.at 晚于最近一次 deny），之后内容再被改：重读授权成立
+    clock.advance(1000)
+    read('src/a.ts', 'h2')
+    content.set(abs('src/a.ts'), 'h3')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
     expect(m.port.snapshot(S1)?.guard.gaveUps).toBe(1)
-    expect(m.port.snapshot(S1)?.guard.denies).toBe(2)
+    expect(m.port.snapshot(S1)?.guard.denies).toBe(3)
+    m.dispose()
+  })
+
+  it('逃生门预算按 turn/start 清空（step/start 不清）', () => {
+    const { m, clock, content, abs, read } = fixture()
+    read('src/b.ts', 'h1')
+    content.set(abs('src/b.ts'), 'h2')
+    expect(m.guardEdit(S1, 'edit', 'src/b.ts').kind).toBe('deny')
+    expect(m.guardEdit(S1, 'edit', 'src/b.ts').kind).toBe('deny')
+    m.port.observe(event(S1, 'step/start', clock.now(), { turn: 1, step: 2 }))
+    expect(m.guardEdit(S1, 'edit', 'src/b.ts').kind).toBe('deny')
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 2 }))
+    // 新回合：deny 预算清空，重新从第 1 次开始（仍 deny）
+    expect(m.guardEdit(S1, 'edit', 'src/b.ts').kind).toBe('deny')
+    expect(m.port.snapshot(S1)?.guard.denies).toBe(4)
     m.dispose()
   })
 
@@ -905,7 +943,7 @@ describe('v4.2 留白收尾：指令指纹 / shell 写 / 跨会话 / 盲写策�
     m.dispose()
   })
 
-  it('盲写策略 deny：无印记且文件存在 → 前两次 deny，第 3 次按逃生门放行', () => {
+  it('盲写策略 deny：无印记且文件存在 → 连续 deny，不自动放行（需重读）', () => {
     const clock = new FakeClock()
     const m = createSessionStateMachine({
       clock,
@@ -918,10 +956,11 @@ describe('v4.2 留白收尾：指令指纹 / shell 写 / 跨会话 / 盲写策�
     m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
     expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
-    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('allow')
+    // 第 3 次仍 deny：没有重读就不放行（旧"第 3 次放行"等于给计数开了绕过通道）
+    expect(m.guardEdit(S1, 'edit', 'src/a.ts').kind).toBe('deny')
     const snap = m.port.snapshot(S1)
     expect(snap?.blindWrites).toBe(3)
-    expect(snap?.guard.gaveUps).toBe(1)
+    expect(snap?.guard.gaveUps).toBe(0)
     m.dispose()
   })
 })

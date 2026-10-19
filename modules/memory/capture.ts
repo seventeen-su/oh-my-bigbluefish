@@ -26,10 +26,14 @@
  * - `tool/result`：`ok===true` 写旧文本；`ok===false` 写 `未生效：…`（同一事实轴，
  *   但明确未生效）；`ok===undefined` 不写并计 `unknown-result`；无匹配 pending 计 `no-pending`；
  * - `turn/end` 丢弃未解决 pending 并计 `unconfirmed`（跨回合无法可靠配对）；
- * - 没有 `callId` 时退回旧"调用时写"并计 `unconfirmed-call`（**明确记录的降级**）。
+ * - 没有 `callId` 时也**只挂 pending**（用 tool+args 派生相关键），**绝不在调用时写**；
+ *   结果事件若同样缺 `callId`、也没有可配对的 tool+args，就保持 unknown
+ *   （`unknownCorrelation`），回合结束仍未配对则计 `unconfirmed`。
+ *   `unconfirmedCall` 只表示"这条调用缺少宿主关联 ID"，不再表示"已写入"。
  *
- * 统计（`failed`/`unconfirmed`/`unknownResult`/`noPending`/`unconfirmedCall`/`pending`）
- * 经模块健康面进入 `omb_status` 记忆段：没有成功就没有"完成过"，尝试与结果分开可见。
+ * 统计（`failed`/`unconfirmed`/`unknownResult`/`noPending`/`unconfirmedCall`/
+ * `unknownCorrelation`/`pending`）经模块健康面进入 `omb_status` 记忆段：
+ * 没有成功就没有"完成过"，尝试与结果分开可见；未知也不冒充完成。
  *
  * ## 与 `omb_remember` 的分工
  *
@@ -269,8 +273,10 @@ export interface CaptureStats {
   unknownResult: number
   /** 带 callId 的结果找不到 pending（乱序/重放/超界丢弃）。 */
   noPending: number
-  /** call 事件没有 callId → 退回旧"调用时写"并计数（明确记录的降级）。 */
+  /** call 事件没有 callId → 只能用 tool+args 派生相关键挂 pending；**不再直接写入**。 */
   unconfirmedCall: number
+  /** 结果事件既无 callId 也无 tool+args，无法关联到任何 pending（保持 unknown，不写）。 */
+  unknownCorrelation: number
   /** 当前挂起中的 pending 数（**瞬时量**，不是累计）。 */
   pending: number
   skipped: Record<string, number>
@@ -391,6 +397,7 @@ export function createCapture(ports: CapturePorts): Capture {
     unknownResult: 0,
     noPending: 0,
     unconfirmedCall: 0,
+    unknownCorrelation: 0,
     pending: 0,
     skipped: {},
   }
@@ -567,7 +574,8 @@ export function createCapture(ports: CapturePorts): Capture {
     readonly sessionId: string
     readonly decision: { readonly text: string; readonly dedupeKey: string }
     readonly at: number
-    readonly callId?: string
+    /** 宿主关联 ID（callId）；缺少时用派生键，仍可让同一调用的结果配对。 */
+    readonly correlation?: string
     readonly failed?: boolean
   }): Promise<boolean> => {
     const state = stateOf(input.sessionId)
@@ -580,7 +588,7 @@ export function createCapture(ports: CapturePorts): Capture {
       return false
     }
     const failed = input.failed === true
-    const sourceRef = `session:${input.sessionId}#call:${input.callId ?? input.at}`
+    const sourceRef = `session:${input.sessionId}#call:${input.correlation ?? input.at}`
     const wrote = await write({
       sessionId: input.sessionId,
       scope: 'project',
@@ -599,10 +607,31 @@ export function createCapture(ports: CapturePorts): Capture {
   }
 
   /**
-   * `tool/call`：**只挂 pending**（有 callId 时）。
+   * 调用相关键：有宿主 `callId` 就用它；没有时用 `tool+args` 派生一个确定性键。
    *
-   * v4.1 §3.5：调用成功与否只有 `tool/result` 知道，call 时写就是把"尝试过"
-   * 记成"完成过"。无 callId 时退回旧行为并计 `unconfirmed-call`（明确记录的降级）。
+   * 派生键不是"猜结果"：它只用于把**同一条调用的结果**找回来；
+   * 找不回来时 pending 会在 `turn/end` 被计为 `unconfirmed`，而不是被写成完成。
+   * 这正是"没有结果确认就保持 unknown"的结构保证。
+   */
+  const correlationKey = (input: {
+    readonly callId?: string
+    readonly tool?: string
+    readonly args?: string
+  }): string | undefined => {
+    if (input.callId !== undefined) return `call:${input.callId}`
+    if (input.tool !== undefined && input.args !== undefined) {
+      return `fallback:${contentHashOf(`${input.tool}\u0000${input.args}`)}`
+    }
+    return undefined
+  }
+
+  /**
+   * `tool/call`：**只挂 pending**，任何情况下都不在这里写记忆。
+   *
+   * v4.5.3：无 `callId` 的降级路径不再"调用时写"。旧行为虽然计了
+   * `unconfirmed-call`，但记录正文与成功记录长得一样——读者仍会把
+   * "尝试过"当成"完成过"。现在它只挂一个派生键 pending；结果事件能配上才写，
+   * 配不上就留到 `turn/end` 计 `unconfirmed`，不会与完成混类。
    */
   const captureActivity = async (payload: {
     sessionId: string
@@ -617,11 +646,16 @@ export function createCapture(ports: CapturePorts): Capture {
       skip(decision.reason)
       return
     }
+    const key = correlationKey(payload)
+    if (key === undefined) {
+      stats.unknownCorrelation += 1
+      skip('no-correlation')
+      return
+    }
     if (payload.callId === undefined) {
+      // 只计数（宿主事件缺关联 ID），不再写入；pending 仍受同一套配对上界约束。
       stats.unconfirmedCall += 1
       skip('unconfirmed-call')
-      await writeActivity({ sessionId: payload.sessionId, decision, at: payload.at })
-      return
     }
     const state = stateOf(payload.sessionId)
     if (state.activityKeys.has(decision.dedupeKey)) {
@@ -632,7 +666,7 @@ export function createCapture(ports: CapturePorts): Capture {
       skip('cap')
       return
     }
-    if (state.pending.has(payload.callId)) {
+    if (state.pending.has(key)) {
       skip('pending-duplicate')
       return
     }
@@ -640,7 +674,7 @@ export function createCapture(ports: CapturePorts): Capture {
       skip('pending-cap')
       return
     }
-    state.pending.set(payload.callId, {
+    state.pending.set(key, {
       decision: { text: decision.text, dedupeKey: decision.dedupeKey },
       at: payload.at,
     })
@@ -669,24 +703,35 @@ export function createCapture(ports: CapturePorts): Capture {
       try {
         if (ports.enabledActivity === false) return
         const state = states.get(payload.sessionId)
-        const callId = payload.callId
-        // 旧路径（call 无 callId）已在调用时写过；结果侧没有可配对的 pending，
-        // 但那是已计数的降级，不重复计 no-pending。
-        if (callId === undefined) return
-        const pending = state?.pending.get(callId)
+        const key = correlationKey(payload)
+        // 结果事件连"是哪条调用"都无法确定：保持 unknown，不写。
+        // 若结果本身可判定为非活动（读/状态面），静默忽略，避免把每次 read 撑成"未知"。
+        if (key === undefined) {
+          if (payload.tool !== undefined && classifyToolActivity(payload.tool, payload.args ?? '').ok) {
+            stats.unknownCorrelation += 1
+            skip('no-correlation')
+          }
+          return
+        }
+        const pending = state?.pending.get(key)
         if (state === undefined || pending === undefined) {
-          // **只把"活动调用没配上 pending"算 no-pending**：读文件/状态面等本来就不
-          // 产生 pending，若也计入，这个数会被每次 read 撑大，变成"看起来一直在丢结果"。
-          // 结果事件带 tool+args（dsh 按 callId 从台账反查得到）时重新分类一次：
-          // 不是活动 → 静默忽略，这才与 call 侧"非活动不挂 pending"对称。
+          // **只把"活动调用没配上 pending"算丢失**：读文件/状态面等本来就不
+          // 产生 pending，若也计入，这个数会被每次 read 撑大。
           if (payload.tool !== undefined && payload.args !== undefined) {
             if (!classifyToolActivity(payload.tool, payload.args).ok) return
+          }
+          if (key.startsWith('fallback:')) {
+            // 无 callId 的派生键没配上：不能证明这条结果属于哪次调用，
+            // 计入 unknown（不写），pending 留到 turn/end 再计 unconfirmed。
+            stats.unknownCorrelation += 1
+            skip('no-correlation')
+            return
           }
           stats.noPending += 1
           skip('no-pending')
           return
         }
-        state.pending.delete(callId)
+        state.pending.delete(key)
         globalPending = Math.max(0, globalPending - 1)
         // `ok === undefined` = 结果既没标成功也没标失败（宿主字段缺失/工具未声明）：
         // 不写，但计数可见——"不知道"不能当成"成功"。
@@ -701,7 +746,7 @@ export function createCapture(ports: CapturePorts): Capture {
           sessionId: payload.sessionId,
           decision: pending.decision,
           at: payload.at,
-          callId,
+          correlation: payload.callId ?? key,
           failed,
         })
       } catch (error) {
@@ -755,6 +800,7 @@ export function createCapture(ports: CapturePorts): Capture {
       unknownResult: stats.unknownResult,
       noPending: stats.noPending,
       unconfirmedCall: stats.unconfirmedCall,
+      unknownCorrelation: stats.unknownCorrelation,
       pending: globalPending,
       skipped: { ...stats.skipped },
     }),

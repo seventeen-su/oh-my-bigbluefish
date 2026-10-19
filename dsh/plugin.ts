@@ -371,8 +371,10 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     // goal/change、todo/write…）；状态机自己决定消费哪些，不在这里重复事件词表。
     onSessionEvent: event => sessionState.port.observe(event),
   })
-  // edit 守卫：`tools/pre-execute` 上只 deny edit（读后 epoch 变了），write 只警告；
-  // 同路径每回合最多 2 次 deny，第 3 次放行；守卫自身异常一律放行（R10 §6.5）。
+  // edit 守卫（v4.5.3）：`edit` 与 `write` **同一判定表**，按读取时的内容哈希核验；
+  // 哈希不同 → deny。连续 deny 到阈值后不会自动放行——只有 deny 之后的**重新读取**
+  // 才能解除（`blindWritePolicy` 默认 deny，见 `dsh/state-machine.ts` 的 `denyWith`）。
+  // 校验与宿主真正写入之间仍有非原子窗口（守卫不是权限边界），守卫自身异常一律放行。
   const disposeGuard = wireEditGuard({ ctx, machine: sessionState, logger })
   /**
    * 用户命令 + 真实 effort 映射。

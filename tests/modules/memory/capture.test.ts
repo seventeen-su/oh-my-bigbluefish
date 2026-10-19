@@ -332,14 +332,38 @@ describe('生命周期（v4.1 §3.5）', () => {
     await f.close()
   })
 
-  it('无 callId：退回旧行为（调用时写）并计 unconfirmed-call（明确降级）', async () => {
+  it('无 callId：调用时**不写**，只挂派生 pending 并计 unconfirmed-call', async () => {
     const f = captureFixture()
     await f.capture.onToolCall({ sessionId: 's1', tool: 'edit', args: '{"path":"src/a.ts"}', at: 1 })
-    expect(await rowsOf(f.project)).toHaveLength(1) // 旧行为：call 时写
+    // v4.5.3：没有结果确认就保持 unknown，不能把"尝试过"写成"完成过"
+    expect(await rowsOf(f.project)).toHaveLength(0)
     const stats = f.capture.stats()
     expect(stats.unconfirmedCall).toBe(1)
     expect(stats.skipped['unconfirmed-call']).toBe(1)
-    expect(stats.pending).toBe(0)
+    expect(stats.pending).toBe(1)
+    // 结果事件带同样的 tool+args：可按派生键配对，配对后才写
+    await f.capture.onToolResult({
+      sessionId: 's1',
+      tool: 'edit',
+      args: '{"path":"src/a.ts"}',
+      ok: true,
+      text: '',
+      at: 2,
+    })
+    expect(await rowsOf(f.project)).toHaveLength(1)
+    expect(f.capture.stats().pending).toBe(0)
+    await f.close()
+  })
+
+  it('无 callId 且结果无法关联：不写，回合结束计 unconfirmed', async () => {
+    const f = captureFixture()
+    await f.capture.onToolCall({ sessionId: 's1', tool: 'edit', args: '{"path":"src/a.ts"}', at: 1 })
+    await f.capture.onToolResult({ sessionId: 's1', ok: true, text: '', at: 2 })
+    expect(await rowsOf(f.project)).toHaveLength(0)
+    expect(f.capture.stats().unknownCorrelation).toBe(0) // 连 tool 都没有：不臆测是不是活动
+    await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
+    expect(f.capture.stats().unconfirmed).toBe(1)
+    expect(f.capture.stats().pending).toBe(0)
     await f.close()
   })
 

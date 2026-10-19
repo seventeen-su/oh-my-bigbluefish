@@ -128,6 +128,26 @@ describe('执行结果确认只认真实台账（3.7-M4）', () => {
     const hits = await f.project.searchLexical({ text: '测试结果', scope: 'project', limit: 5 })
     const record = await f.project.get(hits[0]?.id ?? '')
     expect(record?.assertedBy).toBe('execution')
+    // v4.5.3 生命周期：一次执行结果不能直接成为可复用经验，降级为事件
+    expect(record?.kind).toBe('episodic')
+    expect(outcome.text).toContain('路由已调整')
+    await f.close()
+  })
+
+  it('执行确认 + semantic：有实测依据，不会被当成"未确认经验"降级', async () => {
+    const f = fixture(witnessOf({ hasExecution: (_session, reference) => reference === 'execution:pnpm test' }))
+    const outcome = await run(f.tool, {
+      text: '项目使用 pnpm 作为包管理器。',
+      kind: 'semantic',
+      scope: 'project',
+      sourceRef: 'execution:pnpm test',
+      userAsserted: false,
+    })
+    expect(outcome.text).toContain('已记住')
+    expect(outcome.text).not.toContain('路由已调整')
+    const hits = await f.project.searchLexical({ text: 'pnpm', scope: 'project', limit: 5 })
+    const record = await f.project.get(hits[0]?.id ?? '')
+    expect(record?.kind).toBe('semantic')
     await f.close()
   })
 

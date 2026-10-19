@@ -359,6 +359,57 @@ function hasReadableContent(text: string): boolean {
 }
 
 /**
+ * 知识生命周期（v4.5.3，七点审查第 6 点）。
+ *
+ * 层级不是重点，**层级之间不能自动晋升**才是：
+ * - `event`：原始事件（`episodic`）——一次调用/一次观察，永远可以记录；
+ * - `confirmed`：可核对的结论/偏好（`semantic`）——需要用户陈述、可复现工件或执行台账；
+ *   纯模型推断没有 ground，连准入都过不了；
+ * - `experience`：可复用做法（`procedural`）——当前只允许用户显式陈述。
+ *
+ * 本函数只拦**一个明确会出错的晋升**：执行结果确认（`execution-confirmed`）只能证明
+ * "这次发生了什么"，不能证明"以后都这样"，因此不能直接成为可复用经验。
+ * 被拦下的条目不会丢弃，而是降级为 `episodic` 事件并给出可读原因——
+ * 保留事实，不保留未经确认的层级。
+ */
+export type LifecycleStage = 'event' | 'confirmed' | 'experience'
+
+export interface LifecycleDecision {
+  readonly kind: MemoryKind
+  readonly stage: LifecycleStage
+  /** 被降级前的 kind；未降级为 undefined。 */
+  readonly downgradedFrom?: MemoryKind
+  /** 未降级为 null。 */
+  readonly reason: string | null
+}
+
+function stageOfKind(kind: MemoryKind): LifecycleStage {
+  if (kind === 'semantic') return 'confirmed'
+  if (kind === 'procedural') return 'experience'
+  return 'event'
+}
+
+export function decideLifecycle(input: {
+  readonly kind: MemoryKind
+  readonly ground: AdmissionGround
+}): LifecycleDecision {
+  // 只拦"一次执行 → 可复用经验"这一条自动晋升。
+  // `semantic` 不走这条：执行台账是它的准入依据之一（例如"实测更正"），
+  // 而纯模型推断根本没有 ground，连准入都过不了。
+  if (input.ground === 'execution-confirmed' && input.kind === 'procedural') {
+    return {
+      kind: 'episodic',
+      stage: 'event',
+      downgradedFrom: input.kind,
+      reason:
+        '生命周期护栏：执行结果确认只能证明"这次发生了什么"，不足以直接成为可复用经验；'
+        + '先按事件记录，待用户确认或重复验证后再升级。',
+    }
+  }
+  return { kind: input.kind, stage: stageOfKind(input.kind), reason: null }
+}
+
+/**
  * 准入启发式（**纯函数**，规划 §5.6）：写，当且仅当
  * ① 用户显式陈述（且能在会话用户消息里核对到，或明确记为"自报未核对"）
  * ② 可由具体工件复现（路径/命令/URL/哈希/版本号，可核验类别要真的核验通过）
@@ -1103,7 +1154,6 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           witness = undefined
         }
 
-        const requestedScope: MemoryScope = input.scope ?? SCOPE_BY_KIND[input.kind]
         const sourceRef = input.sourceRef ?? defaultSourceRef(sessionId, deps.currentTurn?.(sessionId))
         // 用户消息：见证优先（按会话取），旧字段兜底（单会话装配/测试）
         const userMessage = (sessionId === undefined ? undefined : witness?.lastUserMessage(sessionId)) ?? deps.lastUserMessage?.()
@@ -1143,26 +1193,43 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         }
 
         /**
+         * **生命周期护栏**（v4.5.3）：执行结果确认不能直接晋升为结论/经验。
+         * 拦下时降级为事件（不丢事实），回执说明为什么没有按请求的 kind 落库。
+         */
+        const lifecycle = decideLifecycle({ kind: input.kind, ground: decision.ground })
+        const requestedScope: MemoryScope = input.scope ?? SCOPE_BY_KIND[lifecycle.kind]
+        const lifecycleRouting = lifecycle.reason === null
+          ? undefined
+          : {
+              reason: lifecycle.reason,
+              requestedKind: input.kind,
+              requestedScope: input.scope ?? SCOPE_BY_KIND[input.kind],
+              kind: lifecycle.kind,
+              scope: input.scope ?? SCOPE_BY_KIND[lifecycle.kind],
+            }
+
+        /**
          * **回顾体护栏**（3.7-M4）：命中则不写进用户库。
          *
          * 只在调用方**没有同时显式**给 `kind:'semantic'` + `scope:'user'` 时改路由：
          * 两个都写出来是一次"我知道我在做什么"的显式声明，护栏不再覆盖它。
          */
         const recap = looksLikeRecap(input.text)
-        const explicitUserSemantic = input.kind === 'semantic' && input.scope === 'user'
-        const routing = recap && !explicitUserSemantic
+        const explicitUserSemantic = lifecycle.kind === 'semantic' && input.scope === 'user'
+        const recapRouting = recap && !explicitUserSemantic
           ? {
               reason:
                 `回顾体护栏：正文 ${input.text.length} 字符（>${RECAP_MIN_CHARS}）、`
                 + '含 ≥3 个不同路径且出现总结词——按经验（episodic）落项目库，不进跨项目用户库。'
                 + '若这确是用户级结论，请显式同时给 kind:"semantic" 与 scope:"user"。',
-              requestedKind: input.kind,
+              requestedKind: lifecycle.kind,
               requestedScope,
               kind: 'episodic' as MemoryKind,
               scope: 'project' as MemoryScope,
             }
           : undefined
-        const kind: MemoryKind = routing?.kind ?? input.kind
+        const routing = recapRouting ?? lifecycleRouting
+        const kind: MemoryKind = routing?.kind ?? lifecycle.kind
         const scope: MemoryScope = routing?.scope ?? requestedScope
 
         if (sourceRef === undefined) {

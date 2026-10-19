@@ -14,6 +14,7 @@
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../kernel/index.js'
 import { SERVICES } from '../../kernel/abi/index.js'
+import type { ModuleRegistration } from '../../kernel/abi/index.js'
 import { buildStatusTool, renderBuildSection } from '../../dsh/status-tool.js'
 
 /** 走**模型可见的那条路**：`omb_status` 工具本体。 */
@@ -52,6 +53,38 @@ describe('构建段：加载代数与磁盘代数并排', () => {
     expect(lines).toContain('未知')
     expect(lines).toContain('无法比对')
     expect(lines).not.toContain('与加载代数一致')
+  })
+})
+
+describe('模块段：依赖未挂载时不得显示"正常"', () => {
+  function stub(id: string, requires: readonly string[] = []): ModuleRegistration<unknown> {
+    return {
+      manifest: {
+        id,
+        version: '1.0.0',
+        requires,
+        capabilities: [],
+        configSchema: { parse: (input: unknown) => input },
+        health: () => ({ state: 'ok', detail: 'stub 运行中' }),
+      },
+      apply: (kernel) => {
+        kernel.report({ state: 'ok', detail: 'stub 运行中' })
+        return () => {}
+      },
+    }
+  }
+
+  it('关闭记忆库后，依赖它的画像行变为"降级——依赖未挂载"（即使它还自报 ok）', () => {
+    const handle = createKernel()
+    const offMemory = handle.mount(stub('omb-memory'))
+    handle.mount(stub('omb-profile', ['omb-memory']))
+    const before = statusOf(handle)
+    expect(before).toContain('omb-profile：正常——stub 运行中')
+    offMemory()
+    const after = statusOf(handle)
+    expect(after).toContain('omb-profile：降级——stub 运行中')
+    expect(after).toContain('**依赖未挂载**：omb-memory')
+    expect(after).toContain('前置已被宿主卸载')
   })
 })
 

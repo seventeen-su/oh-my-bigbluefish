@@ -30,8 +30,10 @@
    子目录会话**不得**另起项目库；非 git 目录退化为 cwd。解析在 `dsh/`（模块不跑子进程），失败绝不抛。
 10. **守卫 = 资源级内容哈希 + 显式未知**：写守卫按**该文件内容哈希**（读取时固化 `sha256` 前 16，≤2MB）
     判定，不用全局 epoch；`edit` 与 `write` 同一判定表；缺印记/超限/读失败一律放行但必须计
-    `blindWrites`/`unverifiable`，**不得静默**；fail-open 是设计（守卫不是权限边界），但异常必须留声。
-    逃生门：同路径同回合第 3 次放行并计 `gaveUps`（防死锁，参见 Claude Code issue #33856）。
+    `blindWrites`/`unverifiable`，**不得静默**；守卫自身异常 fail-open（守卫不是权限边界），但必须留声。
+    覆盖**已存在**文件且无可核验读取印记时默认 `blindWritePolicy='deny'`（v4.5.3）；
+    连续 deny 到阈值后**不再自动放行**，只有 deny 之后的重新读取才解除并计 `gaveUps`。
+    校验（`tools/pre-execute`）与宿主真正写入之间仍有**非原子窗口**：守卫能缩小但不能消除覆盖竞态。
 11. **写可见性三件套（v4.2）**：shell 写路径（正则提取，提取不到记 `shellUnknown`，不猜）、
     其他会话/子代理写（`recentWrites` + `otherSessionWrites`）、指令文件指纹（`AGENTS.md`/`CLAUDE.md`
     进 epoch）。三者都只用于"读后是否已被改/规则是否已变"的事实提示与无法核验时的保守拒绝，
@@ -62,7 +64,14 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.4（当前，版本 4.5.2 / g97）** = **版本号 x1.x2.x3 + 剩余项收尾**：
+- **v4.5.3（当前） = 七点审查修复**：
+  依赖未挂载的模块（画像等）不得在 `omb_status` 显示"运行中"（内核账本现算覆盖 + 画像
+  `availability()` 先探服务）；`scripts/heap-snapshot.ps1` 拆 `repro`/`early` 两种模式，
+  保留并合并 `NODE_OPTIONS`、核对快照 PID 职责、磁盘检查/保留/敏感提示；进程内快照统一走
+  `dsh/heap-snapshot.ts`；capture 无 `callId` 只挂 pending、不写完成；守卫默认 `deny`、
+  逃生前须重读、注释漂移清理；`decideLifecycle` 禁止"执行确认直接晋升 procedural"；
+  记忆健康面报有效命中（exposed/used/effectiveRate）。契约：`docs/v4.5.3-review-fixes.md`。
+- **v4.4** = **版本号 x1.x2.x3 + 剩余项收尾**：
   版本号改为 `x1.x2.x3`（大版本 / 功能更新 / 修复；`version-manifest.json` + `scripts/version.mjs`，
   禁止手写 4.x）；导入图支持 tsconfig `paths` 别名、文件级边与近似调用边；
   shell 未知写用命令前后 `git status` 差分推断；守卫拒绝时写 base/current 冲突材料包；
@@ -73,7 +82,7 @@ node scripts/check-resolution.mjs
   契约：`docs/v4.3-bounded-and-imports.md`。
 - v4.2 = **写可见性收尾**：指令文件指纹（`AGENTS.md`/`CLAUDE.md` →"指令已变"）、shell 写路径提取
   （提取不到记未知）、跨会话/子代理写归因（`recentWrites` + `otherSessionWrites`）、符号级 repo-map、
-  盲写策略可配置（默认 `allow`，`deny` 时逃生门仍生效）。
+  盲写策略可配置（v4.2 默认 `allow`；v4.5.3 起默认 `deny`，逃生前须重读，见上）。
 - v4.1 = **时空坐标**：项目身份 = git root；写守卫 = 资源级内容哈希（edit+write）；
   自主捕获 = `tool/call` → `tool/result` 生命周期；`omb_project` = L0–L5 分层时空快照（≤2,400 字符，隐私先于读取）。
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。

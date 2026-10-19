@@ -25,10 +25,10 @@ import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
 import { generationFromUrl, parseGeneration } from '../kernel/buildInfo.js'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { writeHeapSnapshot } from 'node:v8'
+import { HEAP_SNAPSHOT_PRIVACY_NOTE, writeHeapSnapshotSafely } from './heap-snapshot.js'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
   ok: '正常',
@@ -317,19 +317,47 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
   // 快照取在**全部贡献者渲染之后**（见上方"组件自述：必须先渲染"）：
   // 这一步的先后就是"模块行会不会停在最后一次上报那一刻"的全部差别。
   const health = handle.health()
+  /**
+   * **依赖未挂载的模块不得显示"正常"**（v4.5.3）。
+   *
+   * `handle.health()` 是模块**自报快照**；前置被关闭后，依赖方通常不会主动再报一次，
+   * 于是画像这类模块会在 `omb_status` 里继续显示"正常——运行中"。
+   * 内核账本 `moduleGraph().missingDependencies` 是同一时刻的**现算事实**，
+   * 渲染时用它覆盖该行的状态，并把"缺的是谁"写进原因。
+   *
+   * 这不是文案修饰：微内核关闭时宿主显示"等待依赖"，记忆库关闭时这里显示
+   * "降级——依赖未挂载"，两种依赖断裂因此有了同一种可见语义。
+   */
+  const missingByDependent = new Map<string, string[]>()
+  for (const pair of handle.moduleGraph().missingDependencies) {
+    const [dependent, dependency] = pair.split('←').map(part => part.trim())
+    if (dependent === undefined || dependency === undefined || dependent.length === 0) continue
+    const list = missingByDependent.get(dependent) ?? []
+    list.push(dependency)
+    missingByDependent.set(dependent, list)
+  }
   const ids = Object.keys(health).sort()
   lines.push('## 模块', '')
   if (ids.length === 0) {
     lines.push('（无模块上报健康）', '')
   } else {
+    let degradedCount = 0
+    let failedCount = 0
     for (const id of ids) {
       const entry = health[id]
       if (entry === undefined) continue
-      lines.push(`- ${id}：${STATE_LABEL[entry.state]}——${entry.detail}`)
+      const unmet = missingByDependent.get(id)
+      // 依赖未挂载 = 降级（模块仍挂载、服务仍在，但前置不在；不是 failed——
+      // 恢复前置即可，模块本身没有失败）。
+      const state = unmet === undefined ? entry.state : 'degraded'
+      if (state === 'degraded') degradedCount += 1
+      else if (state === 'failed') failedCount += 1
+      const dependencyNote = unmet === undefined
+        ? ''
+        : `；**依赖未挂载**：${unmet.join('、')}（前置已被宿主卸载，本模块仍处于启用状态）`
+      lines.push(`- ${id}：${STATE_LABEL[state]}——${entry.detail}${dependencyNote}`)
     }
-    const failed = ids.filter(id => health[id]?.state === 'failed')
-    const degraded = ids.filter(id => health[id]?.state === 'degraded')
-    lines.push('', `合计：${ids.length} 个模块，${degraded.length} 降级，${failed.length} 失败。`, '')
+    lines.push('', `合计：${ids.length} 个模块，${degradedCount} 降级，${failedCount} 失败。`, '')
     // **这一行是必须的**：自检报告明确指出过——
     // 「我不知道『正常』是『模块进程活着』还是『功能可用』；如果是前者，这个字段
     // 对使用者有误导性」。
@@ -339,7 +367,8 @@ export function renderStatus(options: StatusToolOptions, sessionId?: string): st
     // 把这句话写出来，读者就不必猜这个字段的语义。
     lines.push(
       '说明：上面的状态是**模块自报**——`正常` 只表示它注册了服务且没报降级，'
-      + '**不等于它的每项能力都在工作**。某项能力是否真的有输入，看「组件自述」里的计数。',
+      + '**不等于它的每项能力都在工作**。某项能力是否真的有输入，看「组件自述」里的计数。'
+      + '「依赖未挂载」一行为内核账本现算（不依赖模块再上报一次）。',
       '',
     )
   }
@@ -570,13 +599,17 @@ export function buildStatusTool(handle: KernelHandle): ToolSpec {
         const wantSnapshot = (args as { snapshot?: unknown } | undefined)?.snapshot === true
         if (!wantSnapshot) return { kind: 'text' as const, text }
         try {
-          const dir = join(process.cwd(), '.omb', 'heap')
-          mkdirSync(dir, { recursive: true })
-          const file = join(dir, `${Date.now()}-${process.pid}.heapsnapshot`)
-          writeHeapSnapshot(file)
+          // 磁盘检查 + 保留策略与 `/omb-heap snapshot` 共用（见 heap-snapshot.ts）。
+          const written = writeHeapSnapshotSafely(process.cwd())
+          if (!written.ok || written.file === null) {
+            return {
+              kind: 'error' as const,
+              text: `${text}\n\n## heap snapshot\n- 写入失败：${written.detail}`,
+            }
+          }
           return {
             kind: 'text' as const,
-            text: `${text}\n\n## heap snapshot\n- ${file}`,
+            text: `${text}\n\n## heap snapshot\n- ${written.file}\n- ${written.detail}\n- ⚠ ${HEAP_SNAPSHOT_PRIVACY_NOTE}`,
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)

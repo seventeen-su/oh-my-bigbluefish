@@ -447,6 +447,8 @@ async function describeHealth(
     readonly relatedExpanded?: number
     readonly feedback?: FeedbackLedger
     readonly floor?: { readonly q: number; readonly recalls: number; readonly precision: number | null; readonly mode: string }
+    /** v4.5.3 有效命中读数（曝光/使用来自 `used_tool` 实体键匹配，不是检索次数）。 */
+    readonly usage?: { readonly exposed: number; readonly used: number }
   },
 ): Promise<ModuleHealth> {
   const status = service.status()
@@ -511,6 +513,7 @@ async function describeHealth(
     metrics['capture.unknownResult'] = runtime.capture.unknownResult
     metrics['capture.noPending'] = runtime.capture.noPending
     metrics['capture.unconfirmedCall'] = runtime.capture.unconfirmedCall
+    metrics['capture.unknownCorrelation'] = runtime.capture.unknownCorrelation
     metrics['capture.pending'] = runtime.capture.pending
     for (const [reason, count] of Object.entries(runtime.capture.skipped)) {
       if (count > 0) metrics[`capture.skipped.${reason}`] = count
@@ -542,6 +545,18 @@ async function describeHealth(
     metrics['lexical.floor.recalls'] = runtime.floor.recalls
     metrics[runtime.floor.mode === 'relative' ? 'lexical.floor.relative' : 'lexical.floor.fixed'] = 1
     if (runtime.floor.precision !== null) metrics['lexical.floor.precision'] = Number(runtime.floor.precision.toFixed(3))
+  }
+  /**
+   * v4.5.3：**有效命中**（不是检索次数）。
+   *
+   * `exposed` 是召回曝光条数、`used` 是之后工具调用实体键命中（`used_tool`）的条数；
+   * 两者都只统计**本进程**。`exposed === 0` 时不给 "0%"——那是"还没有读数"，
+   * 不是"一条都没命中"。
+   */
+  if (runtime?.usage !== undefined && runtime.usage.exposed > 0) {
+    metrics['retrieval.exposed'] = runtime.usage.exposed
+    metrics['retrieval.used'] = runtime.usage.used
+    metrics['retrieval.effectiveRate'] = Number((runtime.usage.used / runtime.usage.exposed).toFixed(3))
   }
 
   /**
@@ -605,7 +620,16 @@ async function describeHealth(
             : `；⚠ 整合最近一次有失败：${consolidation.lastError.slice(0, 120)}${
                 consolidation.lastError.length > 120 ? '…' : ''
               }`)
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${consolidationNote}${privacyNote}`
+  // 有效命中：只报"曝光之后被实体键命中"的条数，不把检索次数当命中率。
+  const effectiveNote =
+    runtime?.usage === undefined
+      ? ''
+      : runtime.usage.exposed === 0
+        ? '；有效命中：本进程还没有曝光读数（**不是命中率 0**）'
+        : `；有效命中 ${runtime.usage.used}/${runtime.usage.exposed}`
+          + `（${(runtime.usage.used / runtime.usage.exposed * 100).toFixed(1)}%；`
+          + 'used_tool 实体键匹配，不是检索次数）'
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${consolidationNote}${privacyNote}`
 
   // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
   // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。
@@ -642,6 +666,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   let projectLedgerRef: ProjectToolLedger | undefined
   let coldStartRef: ColdStartLedger | undefined
   let relatedExpandedRef = 0
+  /** v4.5.3：有效命中读数（apply 装配 usageTracker 后设置；未设置 = 未测量）。 */
+  let usageStatsRef: (() => { exposed: number; used: number }) | undefined
   let feedbackLedgerRef: FeedbackLedger | undefined
   let floorRef: { q: number; recalls: number; precision: number | null; mode: string } | undefined
 
@@ -671,6 +697,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             relatedExpanded: relatedExpandedRef,
             ...(feedbackLedgerRef === undefined ? {} : { feedback: feedbackLedgerRef }),
             ...(floorRef === undefined ? {} : { floor: floorRef }),
+            ...(usageStatsRef === undefined ? {} : { usage: usageStatsRef() }),
           },
         )
       } catch (error) {
@@ -940,6 +967,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
 
       // ── 3.7 Wave 2（R9 C1/C2/C3）：隐式效用、显式反馈、自适应下限 ──────────
       const usageTracker = createUsageTracker()
+      usageStatsRef = () => usageTracker.stats()
       const feedbackLedger: FeedbackLedger = {
         commands: 0, useful: 0, wrongPending: 0, wrongConfirmed: 0, archived: 0, revived: 0, refused: 0, lastChange: '',
       }

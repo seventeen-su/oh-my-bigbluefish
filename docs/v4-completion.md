@@ -231,3 +231,44 @@
 - 完整类型图/类型解析与包导出映射（v4.5）。
 - 真正三方自动合并（当前只出材料）。
 - OOM 根因最终定位（依赖宿主 heap snapshot；脚本已备）。
+
+---
+
+# OMB v4.5.3 交付记录（2026-10-19）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.5.3**（`24 功能 / 79 小功能`，由 `version-manifest.json` 计算） |
+| 构建 | **g99**；`generation: 99`、`outDir: lib-gen/g99`、`builtAt: 2026-10-20T01:39Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **111 files / 1355 passed | 1 skipped**；`build` 成功（g99）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 99/99、版本 4.5.3；关闭 `omb-memory` 后画像行显示"降级——依赖未挂载" |
+
+## 本版内容（七点审查的 1–4，以及 6/7 的第一刀）
+
+1. **依赖态统一**：`omb_status` 用内核 `moduleGraph().missingDependencies` 现算覆盖模块行；
+   画像 `availability()` 先探 `stores` 服务再看缓存，记忆库热卸载后不再显示运行中。
+2. **heap 取证**：`scripts/heap-snapshot.ps1` 拆 `repro`/`early` 双模式，合并 `NODE_OPTIONS`、
+   核对快照 PID 职责、磁盘检查/保留/敏感提示；进程内快照统一走 `dsh/heap-snapshot.ts`。
+3. **自主捕获**：无 `callId` 时只挂派生 pending、不写完成；配不上结果计 `unknownCorrelation`，
+   回合结束计 `unconfirmed`。
+4. **写守卫**：修 `dsh/plugin.ts` 注释漂移；默认 `blindWritePolicy='deny'`；
+   连续 deny 后须**重读**才放行（不再第 3 次自动放行）；记录非原子窗口。
+5. **生命周期闸门**：`execution-confirmed` 不能直接写 `procedural`
+   （降级为 `episodic` 并在回执说明，`decideLifecycle`）；`semantic` 仍需准入依据。
+6. **有效命中读数**：记忆健康面给 `retrieval.exposed/used/effectiveRate`，
+   `exposed=0` 明确为"暂无读数"而不是 0%。
+
+详见 `docs/v4.5.3-review-fixes.md`。5–7 中：6 已落"执行确认不得晋升"闸门、7 已落
+有效命中读数；5（项目地图与构建/测试证据闭环）与 6/7 的完整链仍是下一阶段，未在本版声称完成。
+
+## 文件
+
+- `dsh/heap-snapshot.ts`（新增）、`dsh/heap-command.ts`、`dsh/status-tool.ts`
+- `modules/profile/storage.ts`、`modules/memory/capture.ts`、`modules/memory/index.ts`
+- `dsh/state-machine.ts`、`dsh/plugin.ts`
+- `scripts/heap-snapshot.ps1`、`version-manifest.json`（4.5.3）
+- 测试：`tests/dsh/heap-snapshot.test.ts`（新增）、`tests/dsh/status-diagnostics.test.ts`、
+  `tests/dsh/state-machine.test.ts`、`tests/modules/memory/capture.test.ts`、
+  `tests/modules/profile/storage.test.ts`

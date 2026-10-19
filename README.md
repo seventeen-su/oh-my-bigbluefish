@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.4 · 4.5.2)
+# Oh-My-BigBlueFish (OMB v4.4 · 4.5.3)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -6,15 +6,17 @@ DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按
 但设计为一起使用的共享层**；v4.1 给四个组件加**同一套时空坐标**（项目身份 = git 根、资源级内容哈希、
 `omb_project` 的 L0–L5 分层快照）；v4.2 把写可见性补到 shell、其他会话/子代理与规则文件；
 v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改为 **x1.x2.x3**（大版本 / 功能更新 / 修复），
-并购入路径别名/文件级依赖/近似调用图、shell 推断写与冲突材料包。详见
+并购入路径别名/文件级依赖/近似调用图、shell 推断写与冲突材料包；v4.5.3 修复依赖态、
+heap 取证与捕获/守卫的四类审查问题。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
-[`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md) 与
-[`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)。
+[`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md)、
+[`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md) 与
+[`docs/v4.5.3-review-fixes.md`](docs/v4.5.3-review-fixes.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.2**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.3**。
 
 ## v4.4 结构（2026-10）
 
@@ -22,12 +24,12 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 | --- | --- | --- |
 | **记忆库（核心）** | 双库长期记忆、逐字召回、**自主捕获**（偏好/决定 + 项目活动 + 会话结果，确定性零 LLM；v4.1 起按 `tool/result` 生命周期写，失败写"未生效"）、多跳关联 + 自动连边、反馈效用（`/omb-feedback`）、隐私闸门（`/omb-privacy`）；v4.3 起会话/失败/索引缓存全部有界 | 只有工具描述；召回按需 |
 | **项目层** | `omb_project` 读 **L0–L5 分层时空快照**（身份/结构/空间状态/时间/知识/意图，≤2,400 字符）：git 根身份、画像（含符号与跨模块导入摘要）、读取印记与外部改动、回合/空闲、项目记忆 top 3、开放目标；仓库根 `AGENTS.md` 由宿主自动加载 | 按需；不占常驻 |
-| **状态层** | `omb:session-state`：工作区 epoch（含 `AGENTS.md`/`CLAUDE.md` 指纹）、空闲分级、外部改动、读取戳（**内容哈希**）、shell 写路径、跨会话写、目标/待办；**edit+write 写守卫**（读后被外部改/shell 写/其他会话写 → 拒绝一次，重读后可再编辑）；仅在真实变化时注入一行 ≤120 字符 | 正常 0 字节 |
+| **状态层** | `omb:session-state`：工作区 epoch（含 `AGENTS.md`/`CLAUDE.md` 指纹）、空闲分级、外部改动、读取戳（**内容哈希**）、shell 写路径、跨会话写、目标/待办；**edit+write 写守卫**（读后被外部改 → 拒绝；覆盖既有文件且无读取印记默认也拒绝，v4.5.3），连续拒绝后须重读才放行；仅在真实变化时注入一行 ≤120 字符 | 正常 0 字节 |
 | **过程层** | 8 张过程卡迁到 `skills/omb-r1…r8`，模型按需加载；循环/无进展才注入一行 | 技能目录会话级 |
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
 
 v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
-（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.2）、**导入图支持 tsconfig 别名 +
+（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.3）、**导入图支持 tsconfig 别名 +
 文件级边 + 近似调用边**、**shell 未知写按 git status 差分推断**、**守卫拒绝时写 base/current
 冲突材料包**、**OOM 取证脚本与证据结论**。
 
@@ -262,8 +264,10 @@ node scripts/check-resolution.mjs   # 行名解析 + 中文名（不需要装进
 
 - **不接管 Agent Loop**：不代替宿主决定回合推进、不在 `apply` 返回后注册工具或提示段
   （宿主挂载审计只查一次）。**v4.1 例外（明示）**：写守卫在 `tools/pre-execute` 上对单次
-  `edit`/`write` 返回 deny——**只在"读后被外部改"时拒绝一次**（≤120 字符事实句，同路径同回合第 3 次放行），
+  `edit`/`write` 返回 deny——**只在"读后内容哈希不符"或"覆盖既有文件但无可核验读取印记"时拒绝**
+  （≤120 字符事实句）；连续 deny 到阈值后不再自动放行，须先重新读取（v4.5.3），
   不接管回合推进、不重试、不回滚、不修改历史；这是宿主明示的扩展缝，不是劫持。
+  守卫的校验与宿主真正写入之间仍有非原子窗口，因此它**不能保证绝不覆盖**，只能缩小竞态。
 - 所有 `apply` 与 disposer **绝不抛异常**——抛异常会让整个插件行加载失败。
 - 不猜路径：取不到会话 cwd 时如实报"宿主尚未告知"，而不是猜一个可能写错地方的路径。
 

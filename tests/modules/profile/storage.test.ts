@@ -216,6 +216,23 @@ describe('load / save：失败都返回可读错误，绝不抛', () => {
     expect(availability.detail).toContain('尚未完成')
   })
 
+  it('记忆库被热卸载后：先探服务，不能继续用旧的 ok 缓存冒充运行中', async () => {
+    const stores = new FakeStores()
+    let current: FakeStores | undefined = stores
+    const storage = new ProfileStorage({
+      stores: () => current,
+      clock: fakeClock(),
+      logger: silent,
+    })
+    await storage.load()
+    expect(storage.availability().ok).toBe(true)
+    // 模拟用户关闭 omb-memory：服务从内核服务表消失
+    current = undefined
+    const after = storage.availability()
+    expect(after.ok).toBe(false)
+    expect(after.detail).toContain('未加载或已卸载')
+  })
+
   it('服务存在但库未就绪（forSession 返回 undefined）→ 可读原因', async () => {
     const storage = storageWith({
       forSession: async () => undefined,

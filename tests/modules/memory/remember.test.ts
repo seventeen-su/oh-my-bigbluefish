@@ -23,6 +23,7 @@ import {
   contentHashOf,
   createRememberTool,
   decideAdmission,
+  decideLifecycle,
   isGroundedInUserMessage,
   type MemoryWriteDeps,
 } from '../../../modules/memory/remember.js'
@@ -393,6 +394,22 @@ async function onlyRecord(store: SqliteMemoryStore, query: string) {
 }
 
 describe('omb_remember：写入与路由', () => {
+  it('生命周期：执行确认不能直接晋升为结论/经验；用户陈述与工件依据不受影响', () => {
+    // 一次执行结果 → 事件
+    expect(decideLifecycle({ kind: 'procedural', ground: 'execution-confirmed' })).toMatchObject({
+      kind: 'episodic',
+      downgradedFrom: 'procedural',
+    })
+    expect(decideLifecycle({ kind: 'semantic', ground: 'execution-confirmed' })).toMatchObject({
+      kind: 'semantic',
+      reason: null,
+    })
+    // 用户显式陈述 / 可复现工件仍是合法依据
+    expect(decideLifecycle({ kind: 'procedural', ground: 'user-declared' }).kind).toBe('procedural')
+    expect(decideLifecycle({ kind: 'semantic', ground: 'reproducible-artifact' }).kind).toBe('semantic')
+    // 原始事件永远可写
+    expect(decideLifecycle({ kind: 'episodic', ground: 'execution-confirmed' }).kind).toBe('episodic')
+  })
   it('schema 与校验同源（jsonSchema 与 parse 出自同一个 zod schema）', () => {
     expect(REMEMBER_TOOL).toBe('omb_remember')
     expect(REMEMBER_JSON_SCHEMA).toMatchObject({ type: 'object', required: ['text', 'kind'] })

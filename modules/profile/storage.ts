@@ -145,10 +145,19 @@ export class ProfileStorage {
    * 不假装知道库是否就绪，也不用"还没有请求"这类不实描述。
    */
   availability(): ProfileAvailability {
+    /**
+     * **先探服务，再看缓存**：`#lastResolve` 只是"上一次取库"的结果，
+     * 不是"记忆库现在还在"的事实。热卸载 `omb-memory` 后，缓存的
+     * `{ok:true}` 会让画像继续显示"运行中"——这与微内核关闭时依赖方
+     * 显示的"等待依赖"直接矛盾，也正是 v4.5.3 修掉的缺陷。
+     *
+     * 服务表每次 `kernel.service()` 都重新问，所以这一句能立刻看到卸载。
+     */
+    if (this.#resolveService() === undefined) {
+      return { ok: false, detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）' }
+    }
     if (this.#lastResolve !== null) return this.#lastResolve
-    return this.#resolveService() === undefined
-      ? { ok: false, detail: '内核服务 stores 不可用（omb-memory 未加载或已卸载）' }
-      : { ok: true, detail: '记忆库服务已就绪（首次取库尚未完成，库状态未探明）' }
+    return { ok: true, detail: '记忆库服务已就绪（首次取库尚未完成，库状态未探明）' }
   }
 
   /**
