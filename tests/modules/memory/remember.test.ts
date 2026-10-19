@@ -512,6 +512,26 @@ describe('omb_remember：写入与路由', () => {
     expect((await fixture.user.stats()).rows).toBe(1)
     await fixture.close()
   })
+
+  it('回执提示可能的既有结论（共享实体键；只提示，不写边、不改库）', async () => {
+    const fixture = writeFixture({
+      findRelated: async () => [{
+        id: 'mem_old',
+        scope: 'project',
+        kind: 'semantic',
+        text: '旧结论：提交前先跑 pnpm verify',
+        shared: ['cmd:pnpm verify'],
+      }],
+    })
+    const outcome = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
+    expect(outcome.text).toContain('可能的既有结论')
+    expect(outcome.text).toContain('mem_old')
+    expect(outcome.text).toContain('只提示，未改库')
+    expect(outcome.text).toContain('supersedes')
+    // 只提示：新条目照常写入，旧条目不被连边/改库（夹具的 findRelated 是纯函数）
+    expect((await fixture.project.stats()).rows).toBe(1)
+    await fixture.close()
+  })
 })
 
 describe('omb_remember：弃权、事件与降级', () => {

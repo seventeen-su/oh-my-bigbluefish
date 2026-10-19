@@ -10,7 +10,7 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { MemoryRecord } from '../../../kernel/abi/index.js'
-import { autoLinkRelated, extractEntityKeys, keysAsQuery, sharedEntityKeys } from '../../../modules/memory/link.js'
+import { autoLinkRelated, extractEntityKeys, findRelatedRecords, keysAsQuery, sharedEntityKeys } from '../../../modules/memory/link.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { clockAt, fakeStore, hits, makeRecord, tagged } from '../retrieval/fakes.js'
@@ -137,5 +137,33 @@ describe('实体键与自动连边（3.7 Wave 2 §4）', () => {
     const result = await retrieve([tagged(store)], { text: '端口', limit: 1, expandRelated: true }, { clock: CLOCK })
     expect(result.items.map(item => item.id)).toEqual(['x', 'y'])
     expect(result.stats.relatedExpanded).toBe(1)
+  })
+})
+
+describe('findRelatedRecords：只读的相关/冲突提示（v4.9.0）', () => {
+  it('共享 ≥2 实体键的活跃条目被返回；自身/失效/被取代/同内容被排除', async () => {
+    const f = fixture()
+    const old = record('old', 'pnpm test 在 modules/memory/store.ts 上失败过')
+    await f.store.put(old)
+    await f.store.put({ ...old, id: 'stale', validTo: 1 })
+    await f.store.put({ ...record('gone', 'pnpm test modules/memory/store.ts 已取代'), supersededBy: 'old' })
+    const fresh = record('fresh', 'pnpm test modules/memory/store.ts 现在已经通过')
+    await f.store.put(fresh)
+    await f.store.put({ ...record('same', 'pnpm test modules/memory/store.ts 同内容'), contentHash: fresh.contentHash })
+
+    const related = await findRelatedRecords(f.store, fresh)
+    expect(related.map(item => item.record.id)).toEqual(['old'])
+    expect(related[0]?.shared).toEqual(expect.arrayContaining(['cmd:pnpm test', 'path:modules/memory/store.ts']))
+    await f.cleanup()
+  })
+
+  it('不足 2 个共享键不返回（避免"都用同一个文件"就报冲突）', async () => {
+    const f = fixture()
+    await f.store.put(record('a', '修改 modules/memory/store.ts'))
+    const b = record('b', '重写 modules/memory/store.ts 的缓存层')
+    await f.store.put(b)
+    // 两条只共享一个 path 键（键数不足 MIN_KEYS 时直接返回空）
+    expect(await findRelatedRecords(f.store, b)).toEqual([])
+    await f.cleanup()
   })
 })

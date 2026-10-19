@@ -709,6 +709,16 @@ export interface SupersedeReport {
   readonly entries: readonly SupersedeEntry[]
 }
 
+/** 一条可能相关/冲突的既有结论（v4.9.0：只提示，不自动处理）。 */
+export interface RememberRelatedItem {
+  readonly id: string
+  readonly scope: MemoryScope
+  readonly kind: MemoryKind
+  readonly text: string
+  /** 与新条目共享的实体键（判据可解释；空数组不会出现在回执里）。 */
+  readonly shared: readonly string[]
+}
+
 /** 写入结果的可读回执（供 `renderRemember` 与测试断言）。 */
 export interface RememberOutcome {
   readonly written: boolean
@@ -724,6 +734,8 @@ export interface RememberOutcome {
   readonly contentHash?: string
   /** 本次声明了 `supersedes` 时：逐条标注结果。 */
   readonly supersede?: SupersedeReport
+  /** v4.9.0：共享实体键的既有活跃条目（可能相关/冲突；只提示，未改库）。 */
+  readonly related?: readonly RememberRelatedItem[]
   /**
    * 回顾体护栏改变了路由（3.7-M4）。
    *
@@ -783,6 +795,13 @@ export interface MemoryWriteDeps {
    * 在 `put` 成功之后、回执之前调用；**失败不影响"已写入"**（由调用方隔离）。
    */
   readonly onStored?: (store: MemoryStore, record: MemoryRecord) => Promise<void>
+  /**
+   * 找**可能相关/冲突**的既有结论（v4.9.0）。
+   *
+   * 判据由装配层提供（与自动连边同源：共享实体键 ≥2、同作用域、活跃、不同内容）。
+   * 返回结果只进回执提示，**不改变写入决定**；缺省/失败时为空，不影响"已写入"。
+   */
+  readonly findRelated?: (store: MemoryStore, record: MemoryRecord) => Promise<readonly RememberRelatedItem[]>
   /** 可读日志口（附加索引失败时留声；缺省不日志）。 */
   readonly logger?: { warn(message: string): void }
   /** 某会话的项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
@@ -854,6 +873,24 @@ function echoLines(text: string, contentHash: string | undefined): readonly stri
   if (contentHash !== undefined) {
     lines.push(`原文哈希=${contentHash}（与库中 content_hash 一致即为逐字保真）`)
   }
+  return lines
+}
+
+/**
+ * "可能相关/冲突"的提示（v4.9.0）。
+ *
+ * 只呈现事实 + 可选动作，**不做判断**：判据是共享实体键（同作用域、活跃），
+ * 可能是同一主题的不同方面，也可能是旧结论已被这次陈述取代。
+ * 所以措辞必须是"可能"，并明确写出"未改库"。
+ */
+export function renderRelated(related: readonly RememberRelatedItem[]): readonly string[] {
+  const lines = ['可能的既有结论（共享实体键；只提示，未改库）：']
+  for (const item of related) {
+    const text = item.text.replace(/\s+/g, ' ').trim()
+    const shown = text.length > 100 ? `${text.slice(0, 100)}…` : text
+    lines.push(`- id=${item.id} · ${item.scope}/${item.kind} · ${shown}`)
+  }
+  lines.push('若本条是对其中某条的更正，请用 supersedes=["id"] 重写；若两条都成立，忽略本提示。')
   return lines
 }
 
@@ -946,6 +983,7 @@ export function renderRemember(outcome: RememberOutcome): string {
   }
   if (outcome.text !== undefined) lines.push(...echoLines(outcome.text, outcome.contentHash))
   if (outcome.supersede !== undefined) lines.push(...renderSupersede(outcome.supersede))
+  if (outcome.related !== undefined && outcome.related.length > 0) lines.push(...renderRelated(outcome.related))
   return lines.join('\n')
 }
 
@@ -1366,6 +1404,15 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
             ? undefined
             : await applySupersedes(deps, store, input.supersedes, record, now, sessionId)
 
+        /**
+         * 可能相关/冲突的既有结论（v4.9.0）：**只提示，不自动处理**。
+         *
+         * 判据与自动连边同源（共享实体键 ≥2、同作用域、活跃、不同内容）；
+         * 提示放在回执里让调用方自己判断：是更正就 supersedes，是并列就忽略。
+         * 查询失败不影响"已写入"（返回空数组）。
+         */
+        const related = (await deps.findRelated?.(store, record)) ?? []
+
         return {
           kind: 'text',
           text: renderRemember({
@@ -1380,6 +1427,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
             contentHash: record.contentHash,
             ...(routing === undefined ? {} : { routing }),
             ...(supersede === undefined ? {} : { supersede }),
+            ...(related.length === 0 ? {} : { related }),
           }),
         }
       } catch (error) {

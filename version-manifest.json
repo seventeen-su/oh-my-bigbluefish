@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.8.1 = 候选确认的撤销与审计（4.8.0 功能的收尾修复，不是独立功能）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.9.0 = 写入冲突提示（独立功能；确认撤销已在 4.8.1 收尾）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -18,7 +18,8 @@
         "控制器旧结论查找与任务 TTL",
         "候选确认命令",
         "跨写入路径同内容去重",
-        "确认撤销与审计"
+        "确认撤销与审计",
+        "写入冲突提示"
       ]
     },
     {
@@ -259,5 +260,5 @@
       ]
     }
   ],
-  "version": "4.8.1"
+  "version": "4.9.0"
 }

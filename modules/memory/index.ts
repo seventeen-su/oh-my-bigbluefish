@@ -44,7 +44,7 @@ import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
 import { installConfirm } from './confirm.js'
-import { autoLinkRelated } from './link.js'
+import { autoLinkRelated, findRelatedRecords } from './link.js'
 import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
 import { AdaptiveFloorCalibrator } from './utility.js'
@@ -1356,6 +1356,20 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           witness: () => readSessionWitness(name => kernel.service(name)),
           // 3.7 Wave 2：写入成功后自动连 `related` 边（仅附加索引，失败不影响写入）
           onStored: linkOnStored,
+          /**
+           * v4.9.0：回执里的"可能相关/冲突"提示。判据与自动连边同源，
+           * 但**只读**——不建边、不改库，由调用方自己判断要不要 supersedes。
+           */
+          findRelated: async (store, record) => {
+            const related = await findRelatedRecords(store, record)
+            return related.map(item => ({
+              id: item.record.id,
+              scope: item.record.scope,
+              kind: item.record.kind,
+              text: item.record.text,
+              shared: item.shared,
+            }))
+          },
           logger: kernel.logger,
           onAbstained: info => {
             ledger.abstentions += 1

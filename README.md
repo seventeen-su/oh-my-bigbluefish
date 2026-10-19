@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.8.1)
+# Oh-My-BigBlueFish (OMB v4.9 · 4.9.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -12,7 +12,8 @@ v4.6.1 修正证据退出码语义、临时约束误记与并发持久化；v4.7
 （确定性决策 + 执行：persist 走既有写入并查回验证、lookup 找旧条目给 supersedes 用法、
 任务约束 TTL/回合双过期；`dry-run`/`off` 为回滚档）；v4.8.0 补上**候选确认命令**
 `/omb-confirm` 与**跨写入路径同内容去重**；v4.8.1 是该功能的收尾（x3 修复位）：
-**确认撤销与审计**（schema v5、`/omb-confirm undo/log`、批量撤销、候选年龄）。详见
+**确认撤销与审计**（schema v5、`/omb-confirm undo/log`、批量撤销、候选年龄）；
+v4.9.0 新增独立能力**写入冲突提示**（回执给出共享实体键的既有条目，只提示不自动处理）。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -22,11 +23,12 @@ v4.6.1 修正证据退出码语义、临时约束误记与并发持久化；v4.7
 [`docs/v4.6.0-proactive-memory-and-evidence.md`](docs/v4.6.0-proactive-memory-and-evidence.md)、
 [`docs/v4.6.1-review-fixes.md`](docs/v4.6.1-review-fixes.md)、
 [`docs/v4.7.0-memory-controller.md`](docs/v4.7.0-memory-controller.md)、
-[`docs/v4.8.0-lifecycle-confirm-and-dedupe.md`](docs/v4.8.0-lifecycle-confirm-and-dedupe.md) 与
-[`docs/v4.8.1-confirm-undo-and-audit.md`](docs/v4.8.1-confirm-undo-and-audit.md)。
+[`docs/v4.8.0-lifecycle-confirm-and-dedupe.md`](docs/v4.8.0-lifecycle-confirm-and-dedupe.md)、
+[`docs/v4.8.1-confirm-undo-and-audit.md`](docs/v4.8.1-confirm-undo-and-audit.md) 与
+[`docs/v4.9.0-conflict-hints.md`](docs/v4.9.0-conflict-hints.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 88 小功能 → 4.8.1**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 89 小功能 → 4.9.0**。
 
 ## v4.4 结构（2026-10）
 

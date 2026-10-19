@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.8.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.8.1（当前） = 候选确认的撤销与审计（4.8.0 功能的收尾，x3 修复位）**：
+- **v4.9.0（当前） = 写入冲突提示（独立功能）**：`link.ts` 的 `findRelatedRecords`
+  只读地找共享实体键（≥2）的活跃既有条目（同作用域、内容不同、最多 3 条），
+  通过 `MemoryWriteDeps.findRelated` 端口进入 `omb_remember` 成功回执与
+  `/omb-confirm` 确认回执，作为**可能冲突提示**；**不自动 supersedes、不改库、不建边**。
+  契约：`docs/v4.9.0-conflict-hints.md`。
+- **v4.8.1** = 候选确认的撤销与审计（4.8.0 功能的收尾，x3 修复位）：
   存储 schema **v5** 增加只增审计表 `memory_confirm`（confirm/undo），v4→v5 纯加法，
   `SCHEMA_VERSION=5`；`asConfirmStore` 探测不到时撤销 fail-closed。
   `/omb-confirm undo <id>...`（≤10 条，逐条报告）只在"审计最后一次动作是 confirm +

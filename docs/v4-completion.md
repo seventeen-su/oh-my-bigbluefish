@@ -481,3 +481,41 @@
 - 没有自动晋升/自动撤销（确认与撤销都是用户命令）；
 - 撤销只逐条或 ≤10 条批量，没有"全库撤销"；
 - 写入冲突提示不在本版（独立能力，见下一个功能版本）。
+
+---
+
+# OMB v4.9.0 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.0**（`24 功能 / 89 小功能`；x2 功能更新：写入冲突提示，独立于 4.8.0/4.8.1 的候选确认链路） |
+| 构建 | **g111**；`generation: 111`、`outDir: lib-gen/g111`、`builtAt: 2026-10-19T18:57:07Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 111/111、版本 4.9.0；`omb_remember` 成功回执出现"可能的既有结论（只提示，未改库）"；`/omb-confirm <id>` 回执同样给出相关条目 |
+
+## 本版内容（独立功能）
+
+1. `link.ts` 新增只读 `findRelatedRecords`：同作用域、活跃、内容不同、共享实体键 ≥2
+   的既有条目（每库候选 20、最多返回 3），失败返回空数组。
+2. 通过 `MemoryWriteDeps.findRelated` 端口进入 `omb_remember` 成功回执与
+   `/omb-confirm` 确认回执，作为"可能的既有结论"提示。
+3. **不自动 supersedes、不自动拒绝写入、不建边、不改库**：判据只能证明"相关"，
+   判断交给用户/模型。
+4. 模块不直接依赖 `link.ts`（避免 remember → link → capture → remember 循环）。
+
+详见 `docs/v4.9.0-conflict-hints.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.0-conflict-hints.md`
+- 修改：`modules/memory/link.ts`、`modules/memory/remember.ts`、`modules/memory/confirm.ts`、
+  `modules/memory/index.ts`、`tests/modules/memory/{link-related,remember,confirm}.test.ts`、
+  版本文件
+
+## 仍未做
+
+- 冲突提示是启发式：共享实体键说明"相关"，不保证"矛盾"；近义改写、无实体键的
+  纯自然语言矛盾仍不可见（语义通道属后续）；
+- 提示只出现在写入/确认回执，召回结果里不标注相关关系。

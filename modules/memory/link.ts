@@ -132,3 +132,71 @@ export async function autoLinkRelated(
     return { linked: [], skipped: 'no-candidates' }
   }
 }
+
+/** 一条"可能相关/冲突"的既有记录（只读，不建边、不改库）。 */
+export interface RelatedRecord {
+  readonly record: MemoryRecord
+  readonly shared: readonly string[]
+}
+
+export interface RelatedLookupOptions {
+  /** 最多返回几条（默认 3）。 */
+  readonly maxResults?: number
+  /** 至少共享几个实体键（默认 2，与自动连边同阈值）。 */
+  readonly minSharedKeys?: number
+  /** 候选池上限（默认 20）。 */
+  readonly candidates?: number
+  /** 该会话的项目身份（用于 `project:` 实体键）。 */
+  readonly projectName?: string | null
+}
+
+/**
+ * 找与给定记录共享实体键的**活跃**既有记录（v4.9.0：冲突/相关性可见）。
+ *
+ * 与 `autoLinkRelated` 同一套判据（实体键 + 共享 ≥2），但**只读**：
+ * 不建边、不改库、不决定是否冲突。调用方把结果放进回执让**用户/模型**判断
+ * （"若这条是对旧结论的更正，用 supersedes；若两条都成立，忽略提示"）。
+ *
+ * 排除：自身、非活跃（失效/被取代）、同作用域之外、完全相同内容。
+ * 失败一律返回空数组（可见性提示不能影响写入本身）。
+ */
+export async function findRelatedRecords(
+  store: MemoryStore,
+  record: MemoryRecord,
+  options: RelatedLookupOptions = {},
+): Promise<readonly RelatedRecord[]> {
+  const maxResults = options.maxResults ?? 3
+  const minSharedKeys = options.minSharedKeys ?? MIN_SHARED_KEYS
+  try {
+    const keys = extractEntityKeys(record.text, options.projectName ?? record.project)
+    if (keys.length < MIN_KEYS) return []
+    const query = keysAsQuery(keys)
+    if (query.length === 0) return []
+    let hits
+    try {
+      hits = await store.searchLexical({
+        text: query,
+        scope: record.scope,
+        limit: options.candidates ?? AUTO_LINK_CANDIDATES,
+      })
+    } catch {
+      return []
+    }
+    if (hits.length === 0) return []
+    const candidates = await store.getMany(hits.map(hit => hit.id))
+    const related: RelatedRecord[] = []
+    for (const candidate of candidates) {
+      if (candidate.id === record.id) continue
+      if (candidate.scope !== record.scope) continue
+      if (candidate.validTo !== null || candidate.supersededBy !== null) continue
+      if (candidate.contentHash === record.contentHash) continue
+      const shared = sharedEntityKeys(keys, extractEntityKeys(candidate.text, options.projectName ?? candidate.project))
+      if (shared.length < minSharedKeys) continue
+      related.push({ record: candidate, shared })
+      if (related.length >= maxResults) break
+    }
+    return related
+  } catch {
+    return []
+  }
+}

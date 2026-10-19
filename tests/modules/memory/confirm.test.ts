@@ -393,6 +393,30 @@ describe('确认命令：真实 SQLite', () => {
     await f.close()
   })
 
+  it('确认回执给出共享实体键的既有结论（只提示，不改库）', async () => {
+    const f = fixture()
+    await putRecord(f.project, makeRecord({
+      id: 'mem_old',
+      scope: 'project',
+      text: 'pnpm test 在 modules/memory/store.ts 上失败过',
+      assertedBy: 'user',
+    }))
+    await putRecord(f.project, makeRecord({
+      id: 'mem_cand',
+      scope: 'project',
+      text: 'pnpm test modules/memory/store.ts 现在已经通过',
+      assertedBy: 'model',
+    }))
+
+    const result = await runConfirmCommand('mem_cand', 's1', f.deps)
+    expect(result.kind).toBe('success')
+    expect(result.text).toContain('可能相关的既有结论')
+    expect(result.text).toContain('mem_old')
+    expect(result.text).toContain('只提示，未改库')
+    // 只提示：旧条目一个字没改
+    expect(await f.project.get('mem_old')).toMatchObject({ assertedBy: 'user', validTo: null, supersededBy: null })
+    await f.close()
+  })
 })
 
 describe('确认命令：装配', () => {

@@ -39,6 +39,7 @@ import { sessionOfInvocation } from './privacy/command.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { stageLabel, stageOfMemory } from './lifecycle.js'
 import { isoUtc } from './retrieve.js'
+import { findRelatedRecords, type RelatedRecord } from './link.js'
 
 export const CONFIRM_COMMAND_NAME = 'omb-confirm'
 export const CONFIRM_COMMAND_ID = 'omb-memory/confirm'
@@ -261,9 +262,23 @@ export function renderAuditLog(
   return lines.join('\n')
 }
 
+function relatedLines(related: readonly RelatedRecord[]): readonly string[] {
+  if (related.length === 0) return []
+  const lines = ['可能相关的既有结论（共享实体键；只提示，未改库）：']
+  for (const item of related) {
+    const stage = stageOfMemory({ kind: item.record.kind, assertedBy: item.record.assertedBy })
+    lines.push(
+      `- id=${item.record.id} · ${item.record.scope}/${item.record.kind} · 阶段 ${stageLabel(stage)} · ${excerpt(item.record.text, 80)}`,
+    )
+  }
+  lines.push('若本条与其中某条矛盾，请先用 /omb-feedback 或 omb_remember(supersedes) 处理旧条目。')
+  return lines
+}
+
 /** 确认回执（纯函数）。 */
 export function renderConfirmResult(input: {
   readonly record: MemoryRecord
+  readonly related?: readonly RelatedRecord[]
   /** 审计写入失败时的可读原因（确认已生效，但撤销入口会失效）。 */
   readonly auditWarning?: string
 }): string {
@@ -275,6 +290,7 @@ export function renderConfirmResult(input: {
     `原文：${excerpt(record.text, 240)}`,
     `撤销：/omb-confirm undo ${record.id}`,
   ]
+  lines.push(...relatedLines(input.related ?? []))
   if (input.auditWarning !== undefined) lines.push(`⚠ 审计写入失败：${input.auditWarning}（确认已生效，但本条无法撤销）`)
   return lines.join('\n')
 }
@@ -503,6 +519,13 @@ async function runPromote(
     auditWarning = messageOf(error)
   }
 
+  let related: readonly RelatedRecord[] = []
+  try {
+    related = await findRelatedRecords(found.store.store, stored)
+  } catch {
+    related = []
+  }
+
   try {
     deps.onConfirm?.({ action: 'promote', changed: true, reason: 'confirmed', sessionId })
   } catch {
@@ -513,6 +536,7 @@ async function runPromote(
     kind: 'success',
     text: renderConfirmResult({
       record: stored,
+      ...(related.length === 0 ? {} : { related }),
       ...(auditWarning === undefined ? {} : { auditWarning }),
     }),
   }
