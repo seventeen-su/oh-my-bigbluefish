@@ -62,8 +62,8 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.4（当前，计算版本 4.5.1 / g95）** = **版本号实测计算 + 剩余项收尾**：
-  版本号改为 `major.累计功能数.累计小功能数`（`version-manifest.json` + `scripts/version.mjs`，
+- **v4.4（当前，版本 4.5.2 / g97）** = **版本号 x1.x2.x3 + 剩余项收尾**：
+  版本号改为 `x1.x2.x3`（大版本 / 功能更新 / 修复；`version-manifest.json` + `scripts/version.mjs`，
   禁止手写 4.x）；导入图支持 tsconfig `paths` 别名、文件级边与近似调用边；
   shell 未知写用命令前后 `git status` 差分推断；守卫拒绝时写 base/current 冲突材料包；
   OOM 取证脚本 `scripts/heap-snapshot.ps1` 与证据结论。
@@ -79,7 +79,7 @@ node scripts/check-resolution.mjs
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。
 - 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 / §11 v4.3 / §12 v4.4 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
 - 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
-- **版本纪律（v4.4）**：新增/完成功能或小功能 → 改 `version-manifest.json` → `node scripts/version.mjs --write`；
+- **版本纪律（v4.4）**：新增功能 → x2+1，单个修复 → x3+1；改 `version-manifest.json` 的 `version` 字段 → `node scripts/version.mjs --write`；
   门禁用 `node scripts/version.mjs`（漂移退出码 1）。不要把版本号手写回 4.x。
 - v4.4 仍未做（不要在文档里假装已做）：完整类型图/类型解析与包导出映射、真正三方自动合并
   （当前只出冲突材料）、OOM 根因最终定位（依赖宿主 heap snapshot，脚本已备）、`dsh-path-guard` 的

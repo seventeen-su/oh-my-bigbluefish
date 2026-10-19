@@ -1,11 +1,11 @@
-# Oh-My-BigBlueFish (OMB v4.4 · 4.5.1)
+# Oh-My-BigBlueFish (OMB v4.4 · 4.5.2)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
 不是编程专用——生活、情感陪伴、闲聊、一次性提问同样适用。v4 把它们组织成**一个可拼装、
 但设计为一起使用的共享层**；v4.1 给四个组件加**同一套时空坐标**（项目身份 = git 根、资源级内容哈希、
 `omb_project` 的 L0–L5 分层快照）；v4.2 把写可见性补到 shell、其他会话/子代理与规则文件；
-v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改为按**功能数/小功能数实际计算**，
+v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改为 **x1.x2.x3**（大版本 / 功能更新 / 修复），
 并购入路径别名/文件级依赖/近似调用图、shell 推断写与冲突材料包。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
@@ -13,8 +13,8 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 [`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md) 与
 [`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)。
 
-> 版本规则：`major.累计功能数.累计小功能数`。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.1**。
+> 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.2**。
 
 ## v4.4 结构（2026-10）
 
@@ -27,7 +27,7 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
 
 v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
-（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.1）、**导入图支持 tsconfig 别名 +
+（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.2）、**导入图支持 tsconfig 别名 +
 文件级边 + 近似调用边**、**shell 未知写按 git status 差分推断**、**守卫拒绝时写 base/current
 冲突材料包**、**OOM 取证脚本与证据结论**。
 

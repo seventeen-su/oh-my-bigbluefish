@@ -25,9 +25,10 @@ import type { KernelHandle } from '../kernel/index.js'
 import type { ToolSpec } from './tools.js'
 import { PARAM } from './tools.js'
 import { generationFromUrl, parseGeneration } from '../kernel/buildInfo.js'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { writeHeapSnapshot } from 'node:v8'
 
 const STATE_LABEL: Record<ModuleHealth['state'], string> = {
   ok: '正常',
@@ -553,6 +554,10 @@ export function buildStatusTool(handle: KernelHandle): ToolSpec {
       type: 'object',
       properties: {
         session: PARAM.optionalString('会话 id，缺省当前活跃会话'),
+        snapshot: {
+          type: 'boolean',
+          description: '为 true 时写 V8 heap snapshot（同步暂停事件循环，可能数 GB；仅 OOM 取证时用）',
+        },
       },
       additionalProperties: false,
     },
@@ -561,7 +566,22 @@ export function buildStatusTool(handle: KernelHandle): ToolSpec {
         const session = typeof (args as { session?: unknown } | undefined)?.session === 'string'
           ? (args as { session: string }).session
           : undefined
-        return { kind: 'text' as const, text: renderStatus({ handle }, session) }
+        const text = renderStatus({ handle }, session)
+        const wantSnapshot = (args as { snapshot?: unknown } | undefined)?.snapshot === true
+        if (!wantSnapshot) return { kind: 'text' as const, text }
+        try {
+          const dir = join(process.cwd(), '.omb', 'heap')
+          mkdirSync(dir, { recursive: true })
+          const file = join(dir, `${Date.now()}-${process.pid}.heapsnapshot`)
+          writeHeapSnapshot(file)
+          return {
+            kind: 'text' as const,
+            text: `${text}\n\n## heap snapshot\n- ${file}`,
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          return { kind: 'error' as const, text: `${text}\n\n## heap snapshot\n- 写入失败：${message}` }
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { kind: 'error' as const, text: `状态面渲染失败——${message}` }

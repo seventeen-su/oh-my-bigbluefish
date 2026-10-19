@@ -202,10 +202,10 @@
 
 | 项 | 结果 |
 | --- | --- |
-| 版本 | **4.5.1**（`24 功能 / 79 小功能`，由 `version-manifest.json` 计算） |
-| 构建 | **g95**；`generation: 95`、`outDir: lib-gen/g95`、`builtAt: 2026-10-19T15:37:00Z` |
-| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **110 files / 1344 passed | 1 skipped**；`build` 成功（g95）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
-| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 93/93、计算版本 4.5.1、`## 进程` 段；`omb_project` L1 含 `别名/文件依赖/调用` |
+| 版本 | **4.5.2**（`24 功能 / 79 小功能`，由 `version-manifest.json` 计算） |
+| 构建 | **g97**；`generation: 97`、`outDir: lib-gen/g97`、`builtAt: 2026-10-19T17:03:46Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **110 files / 1344 passed | 1 skipped**；`build` 成功（g97）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 97/97、版本 4.5.2、`## 进程` 段；`omb_project` L1 含 `别名/文件依赖/调用` |
 
 ## 本版内容
 
