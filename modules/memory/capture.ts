@@ -42,7 +42,7 @@
  *   但同样受隐私闸门约束、同样拒绝密钥模式。
  */
 import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../../kernel/abi/index.js'
-import { contentHashOf, newMemoryId } from './remember.js'
+import { contentHashOf, findSameContent, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
 import { detectProactiveCue } from './proactive.js'
 import { classifyMemoryIntent, isDurableIntent } from './intent.js'
@@ -556,23 +556,14 @@ export function createCapture(ports: CapturePorts): Capture {
   }
 
   /**
-   * 内容去重：内存集合（快）+ 库内同内容（跨进程）。
+   * 库内同内容检查（跨进程去重）。
    *
-   * 库内检查用「正文前 60 字符的词法命中 + content_hash 比对」：不引入新端口，
-   * 也只对"同一段文字"生效（近义改写不拦——那是离线整合的活）。
+   * 判据本身已抽到 `remember.ts` 的 `findSameContent`：控制器自动写入、重复捕获、
+   * 模型 `omb_remember` 三条路径必须用**同一份**去重判据，否则同一句话会在库里
+   * 变成多条记录（召回时彼此挤占名额）。
    */
-  const alreadyStored = async (store: MemoryStore, text: string): Promise<boolean> => {
-    const hash = contentHashOf(text)
-    try {
-      const probe = text.slice(0, 60)
-      const hits = await store.searchLexical({ text: probe, scope: store.scope, limit: 5 })
-      if (hits.length === 0) return false
-      const records = await store.getMany(hits.map(hit => hit.id))
-      return records.some(record => record.contentHash === hash)
-    } catch {
-      return false
-    }
-  }
+  const alreadyStored = async (store: MemoryStore, text: string): Promise<boolean> =>
+    (await findSameContent(store, text)) !== undefined
 
   /**
    * 写入结果。

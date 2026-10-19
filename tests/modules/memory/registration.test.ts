@@ -176,6 +176,7 @@ describe('omb-memory 配置', () => {
       lexicalFloorMode: 'relative',
       lexicalFloorTargetPrecision: 0.6,
       feedbackCommand: true,
+      confirmCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -196,6 +197,7 @@ describe('omb-memory 配置', () => {
       lexicalFloorMode: 'relative',
       lexicalFloorTargetPrecision: 0.6,
       feedbackCommand: true,
+      confirmCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
     expect(memoryConfigSchema.parse({ embeddingThreads: 4 })).toEqual({
@@ -213,6 +215,7 @@ describe('omb-memory 配置', () => {
       lexicalFloorMode: 'relative',
       lexicalFloorTargetPrecision: 0.6,
       feedbackCommand: true,
+      confirmCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })
@@ -259,6 +262,7 @@ describe('omb-memory 配置', () => {
       lexicalFloorMode: 'relative',
       lexicalFloorTargetPrecision: 0.6,
       feedbackCommand: true,
+      confirmCommand: true,
       privacy: { failClosedMode: 'sealed', path: null },
     })
   })

@@ -41,7 +41,7 @@ import type {
 import { MEMORY_KINDS, MEMORY_SCOPES, RESERVED_SOURCE_PREFIX, SCOPE_BY_KIND } from '../../kernel/abi/index.js'
 import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { hasSecret } from './secrets.js'
-import { stageOfMemory } from './lifecycle.js'
+import { stageLabel, stageOfMemory } from './lifecycle.js'
 import type { LifecycleStage } from './lifecycle.js'
 import type { SessionWitnessPort } from './witness.js'
 
@@ -90,6 +90,32 @@ export function contentHashOf(text: string): string {
     hash = (hash * prime) & mask
   }
   return hash.toString(16).padStart(16, '0')
+}
+
+/**
+ * 在**同一个库**里找"正文完全相同"的活跃条目（v4.8.0：跨写入路径去重）。
+ *
+ * 为什么必须有它：库按 `id` upsert，但没有正文唯一索引；同一条内容从
+ * 控制器自动写入、模型 `omb_remember`、重复捕获三条路进来会变成多条记录，
+ * 召回时彼此挤占名额，冲突判断也会把"同一条"当成"两条不同结论"。
+ *
+ * 判据与捕获路径的 `alreadyStored` 完全一致：正文前 60 字符做词法探测 +
+ * `contentHash` 精确比对。只认**活跃**条目（`searchLexical` 已过滤失效/被取代），
+ * 所以"旧结论被取代后再次写同一句"仍会正常落库（那是新的事实，不是重复）。
+ *
+ * 失败一律返回 `undefined`（去重是优化，不是安全边界；查询失败不能阻断写入）。
+ */
+export async function findSameContent(store: MemoryStore, text: string): Promise<MemoryRecord | undefined> {
+  const hash = contentHashOf(text)
+  try {
+    const probe = text.slice(0, 60)
+    const hits = await store.searchLexical({ text: probe, scope: store.scope, limit: 5 })
+    if (hits.length === 0) return undefined
+    const records = await store.getMany(hits.map(hit => hit.id))
+    return records.find(record => record.contentHash === hash)
+  } catch {
+    return undefined
+  }
 }
 
 /** 准入依据。可审计：准入与弃权都必须说得出为什么。 */
@@ -923,6 +949,29 @@ export function renderRemember(outcome: RememberOutcome): string {
   return lines.join('\n')
 }
 
+/**
+ * 同内容去重的回执（v4.8.0）。
+ *
+ * 必须在回执里给出**已存在条目的 id 与阶段**：只说"重复了"会让调用方无从判断
+ * 该改为 supersedes、该请用户确认，还是该放弃——那等于把去重变成一条静默丢失。
+ */
+export function renderDuplicateRemember(input: { readonly duplicate: MemoryRecord }): string {
+  const { duplicate } = input
+  const stage = stageOfMemory({ kind: duplicate.kind, assertedBy: duplicate.assertedBy })
+  const excerpt = duplicate.text.length > 120
+    ? `${duplicate.text.slice(0, 120)}…（共 ${duplicate.text.length} 字符）`
+    : duplicate.text
+  const lines = [
+    `未写入：库中已有同内容条目 id=${duplicate.id}（${duplicate.scope}/${duplicate.kind} · 阶段 ${stageLabel(stage)}）。`,
+    `原文：${excerpt}`,
+  ]
+  if (stage === 'candidate') {
+    lines.push(`这条目前是"候选"：用户可用 /omb-confirm ${duplicate.id} 确认；模型不能自行确认。`)
+  }
+  lines.push('重复写入不会新增条目；若要更正内容，请用 supersedes 指向这个 id。')
+  return lines.join('\n')
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 推翻标注（supersedes）
 // ────────────────────────────────────────────────────────────────────────────
@@ -1258,6 +1307,21 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
               why === undefined ? '' : `——${why}`
             }`,
           }
+        }
+
+        /**
+         * **跨路径同内容去重**（v4.8.0）。
+         *
+         * 控制器自动写入、重复捕获、模型主动写入走的是同一条库；库按 id upsert 但
+         * 没有正文唯一约束，同一条内容会变成多条记录。命中时**不写、不触发向量事件**，
+         * 回执给出已存在条目的 id 与阶段（候选还会附上 `/omb-confirm` 用法）。
+         *
+         * 放在准入之后：准入是"该不该记"的判断，去重是"是否已经记过"的事实；
+         * 先准入再查重能保证弃权计数与既有权重逻辑完全不变。
+         */
+        const duplicate = await findSameContent(store, input.text)
+        if (duplicate !== undefined) {
+          return { kind: 'text', text: renderDuplicateRemember({ duplicate }) }
         }
 
         const now = deps.clock.now()

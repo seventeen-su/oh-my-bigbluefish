@@ -191,8 +191,8 @@ describe('注册面', () => {
 
       expect(() => booted.dispose()).not.toThrow()
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeUndefined()
-      // 隐私两条 + v4 的 /omb-feedback（记忆模块现在共注册 3 条命令）
-      expect(booted.commands.disposed()).toBe(3)
+      // 隐私两条 + /omb-feedback + v4.8.0 的 /omb-confirm（记忆模块现在共注册 4 条命令）
+      expect(booted.commands.disposed()).toBe(4)
     } finally {
       ws.cleanup()
     }

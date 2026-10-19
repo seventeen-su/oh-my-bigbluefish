@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.7 · 4.7.0)
+# Oh-My-BigBlueFish (OMB v4.8 · 4.8.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -10,7 +10,8 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 heap 取证与捕获/守卫；v4.6.0 提高**主动记忆**积极性、给记忆加**生命周期阶段**并把构建/测试运行证据接进项目地图；
 v4.6.1 修正证据退出码语义、临时约束误记与并发持久化；v4.7.0 引入**事件驱动记忆控制器**
 （确定性决策 + 执行：persist 走既有写入并查回验证、lookup 找旧条目给 supersedes 用法、
-任务约束 TTL/回合双过期；`dry-run`/`off` 为回滚档）。详见
+任务约束 TTL/回合双过期；`dry-run`/`off` 为回滚档）；v4.8.0 补上**候选确认命令**
+`/omb-confirm` 与**跨写入路径同内容去重**。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -18,11 +19,12 @@ v4.6.1 修正证据退出码语义、临时约束误记与并发持久化；v4.7
 [`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)、
 [`docs/v4.5.3-review-fixes.md`](docs/v4.5.3-review-fixes.md)、
 [`docs/v4.6.0-proactive-memory-and-evidence.md`](docs/v4.6.0-proactive-memory-and-evidence.md)、
-[`docs/v4.6.1-review-fixes.md`](docs/v4.6.1-review-fixes.md) 与
-[`docs/v4.7.0-memory-controller.md`](docs/v4.7.0-memory-controller.md)。
+[`docs/v4.6.1-review-fixes.md`](docs/v4.6.1-review-fixes.md)、
+[`docs/v4.7.0-memory-controller.md`](docs/v4.7.0-memory-controller.md) 与
+[`docs/v4.8.0-lifecycle-confirm-and-dedupe.md`](docs/v4.8.0-lifecycle-confirm-and-dedupe.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 85 小功能 → 4.7.0**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 87 小功能 → 4.8.0**。
 
 ## v4.4 结构（2026-10）
 

@@ -482,6 +482,36 @@ describe('omb_remember：写入与路由', () => {
     expect(record?.sourceRef).toBe('session:s1#turn-7')
     await fixture.close()
   })
+
+  it('跨路径同内容去重：第二次写同一句不新增记录，也不触发编码事件', async () => {
+    const fixture = writeFixture()
+    const first = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
+    expect(first.text).toContain('已记住')
+    const writtenBefore = fixture.written.length
+
+    const second = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
+    expect(second.kind).toBe('text')
+    expect(second.text).toContain('未写入：库中已有同内容条目')
+    expect(second.text).toContain('阶段')
+    expect((await fixture.project.stats()).rows).toBe(1)
+    expect(fixture.written).toHaveLength(writtenBefore)
+    await fixture.close()
+  })
+
+  it('候选被重复写入时，回执提示用户可以用 /omb-confirm 确认', async () => {
+    const fixture = writeFixture()
+    // 无用户断言、但有可复现工件 → assertedBy=model → 生命周期"候选"
+    await run(fixture.tool, { text: '端口配置在 src/config/server.ts 里', kind: 'semantic' })
+    const record = await onlyRecord(fixture.user, '端口配置')
+    expect(record?.assertedBy).toBe('model')
+
+    const again = await run(fixture.tool, { text: '端口配置在 src/config/server.ts 里', kind: 'semantic' })
+    expect(again.text).toContain('未写入：库中已有同内容条目')
+    expect(again.text).toContain('候选')
+    expect(again.text).toContain(`/omb-confirm ${record?.id ?? ''}`)
+    expect((await fixture.user.stats()).rows).toBe(1)
+    await fixture.close()
+  })
 })
 
 describe('omb_remember：弃权、事件与降级', () => {

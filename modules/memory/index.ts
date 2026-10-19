@@ -43,6 +43,7 @@ import { planConsolidation } from './consolidate.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
+import { installConfirm } from './confirm.js'
 import { autoLinkRelated } from './link.js'
 import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
@@ -163,6 +164,8 @@ const rawConfigSchema = z.object({
   lexicalFloorTargetPrecision: z.number().min(0.3).max(0.9).default(0.6),
   /** `/omb-feedback` 命令开关（默认开；关掉只影响显式反馈，隐式效用照常）。 */
   feedbackCommand: z.boolean().default(true),
+  /** `/omb-confirm` 命令开关（默认开；关掉只影响候选确认入口，候选本身仍在）。 */
+  confirmCommand: z.boolean().default(true),
   /**
    * **隐私闸门**（3.6 从独立的 `omb-privacy` 行并入本行）。
    *
@@ -200,6 +203,7 @@ export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   lexicalFloorMode: 'relative',
   lexicalFloorTargetPrecision: 0.6,
   feedbackCommand: true,
+  confirmCommand: true,
   privacy: PRIVACY_DEFAULT_CONFIG,
 }
 
@@ -347,6 +351,18 @@ export interface FeedbackLedger {
   lastChange: string
 }
 
+/** `/omb-confirm` 的运行读数（v4.8.0：候选确认只由用户触发）。 */
+export interface ConfirmLedger {
+  commands: number
+  /** 列出候选的次数（只读命令）。 */
+  listed: number
+  /** 真正把候选改成"已确认"的条数。 */
+  promoted: number
+  /** 拒绝次数（不是候选/隐私/写回失败）。 */
+  refused: number
+  lastChange: string
+}
+
 /**
  * 跑一轮离线整合（M3）：**离线、无 LLM、非破坏性**。
  *
@@ -475,6 +491,20 @@ export function controllerHealthNote(stats: ControllerStats | undefined): string
     + '（dry-run：只决策、不改写入路径）'
 }
 
+/**
+ * 候选确认的状态面文案（v4.8.0）。
+ *
+ * 诚实性要求：**没按过命令就不写**——把"0 条确认"印出来会让状态面看起来像
+ * "确认功能在跑但没人用"，而事实只是这个进程里没发生过用户动作。
+ */
+export function confirmHealthNote(confirm: ConfirmLedger | undefined): string {
+  if (confirm === undefined || confirm.commands === 0) return ''
+  return `；候选确认：已确认 ${confirm.promoted} 条（命令 ${confirm.commands} 次`
+    + `，列出 ${confirm.listed} 次`
+    + (confirm.refused > 0 ? `，拒绝 ${confirm.refused} 次` : '')
+    + '）'
+}
+
 async function describeHealth(
   service: MemoryStoresService,
   ledger: MemoryWriteLedger | undefined,
@@ -487,6 +517,8 @@ async function describeHealth(
     readonly coldStart?: ColdStartLedger
     readonly relatedExpanded?: number
     readonly feedback?: FeedbackLedger
+    /** v4.8.0：候选确认读数（用户命令触发，模型无入口）。 */
+    readonly confirm?: ConfirmLedger
     readonly floor?: { readonly q: number; readonly recalls: number; readonly precision: number | null; readonly mode: string }
     /** v4.5.3 有效命中读数（曝光/使用来自 `used_tool` 实体键匹配，不是检索次数）。 */
     readonly usage?: { readonly exposed: number; readonly used: number }
@@ -596,6 +628,12 @@ async function describeHealth(
     if (runtime.feedback.revived > 0) metrics['feedback.revived'] = runtime.feedback.revived
     if (runtime.feedback.refused > 0) metrics['feedback.refused'] = runtime.feedback.refused
   }
+  if (runtime?.confirm !== undefined) {
+    metrics['confirm.commands'] = runtime.confirm.commands
+    metrics['confirm.listed'] = runtime.confirm.listed
+    metrics['confirm.promoted'] = runtime.confirm.promoted
+    if (runtime.confirm.refused > 0) metrics['confirm.refused'] = runtime.confirm.refused
+  }
   if (runtime?.floor !== undefined) {
     metrics['lexical.floor.q'] = Number(runtime.floor.q.toFixed(3))
     metrics['lexical.floor.recalls'] = runtime.floor.recalls
@@ -688,7 +726,9 @@ async function describeHealth(
   // v4.7.0：事件控制器的模式与执行结果必须在状态面可见，否则"接入了但没人知道"。
   // `execute` 与 `dry-run` 的文案必须不同：只改了计数却写"已执行"就是伪报。
   const controllerNote = controllerHealthNote(runtime?.capture?.controller)
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${consolidationNote}${privacyNote}`
+  // v4.8.0：候选确认是用户动作；没按过命令就不写这一句（不把"没有候选"伪装成"确认了 0 条"）。
+  const confirmNote = confirmHealthNote(runtime?.confirm)
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${confirmNote}${consolidationNote}${privacyNote}`
 
   // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
   // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。
@@ -728,6 +768,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   /** v4.5.3：有效命中读数（apply 装配 usageTracker 后设置；未设置 = 未测量）。 */
   let usageStatsRef: (() => { exposed: number; used: number }) | undefined
   let feedbackLedgerRef: FeedbackLedger | undefined
+  let confirmLedgerRef: ConfirmLedger | undefined
   let floorRef: { q: number; recalls: number; precision: number | null; mode: string } | undefined
 
   const manifest: ModuleManifest<MemoryConfig> = {
@@ -755,6 +796,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             ...(coldStartRef === undefined ? {} : { coldStart: coldStartRef }),
             relatedExpanded: relatedExpandedRef,
             ...(feedbackLedgerRef === undefined ? {} : { feedback: feedbackLedgerRef }),
+            ...(confirmLedgerRef === undefined ? {} : { confirm: confirmLedgerRef }),
             ...(floorRef === undefined ? {} : { floor: floorRef }),
             ...(usageStatsRef === undefined ? {} : { usage: usageStatsRef() }),
           },
@@ -1032,6 +1074,10 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         commands: 0, useful: 0, wrongPending: 0, wrongConfirmed: 0, archived: 0, revived: 0, refused: 0, lastChange: '',
       }
       feedbackLedgerRef = feedbackLedger
+      const confirmLedger: ConfirmLedger = {
+        commands: 0, listed: 0, promoted: 0, refused: 0, lastChange: '',
+      }
+      confirmLedgerRef = confirmLedger
       let calibrator = new AdaptiveFloorCalibrator({}, config.lexicalFloorTargetPrecision)
       const floorState = {
         q: calibrator.q,
@@ -1131,6 +1177,31 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           })
         : {
             commandState: () => '未启用（config.feedbackCommand=false）',
+            dispose: (): void => {},
+          }
+
+      /**
+       * `/omb-confirm`（v4.8.0）：候选记忆的**用户**确认入口。
+       *
+       * 与 `/omb-feedback` 同一条原则：确认改变证据等级，只有用户有权做，
+       * 所以模型工具面一个字都不加。命令不可用不影响记忆写入/召回。
+       */
+      const confirm = config.confirmCommand
+        ? installConfirm(kernel, {
+            clock: kernel.clock,
+            resolveStores: sessionId => resolveStores(sessionId),
+            privacy: () => kernel.service(SERVICES.privacy),
+            logger: kernel.logger,
+            onConfirm: info => {
+              confirmLedger.commands += 1
+              if (info.action === 'list') confirmLedger.listed += 1
+              else if (info.changed) confirmLedger.promoted += 1
+              else confirmLedger.refused += 1
+              confirmLedger.lastChange = info.changed ? 'promoted' : info.reason.slice(0, 80)
+            },
+          })
+        : {
+            commandState: () => '未启用（config.confirmCommand=false）',
             dispose: (): void => {},
           }
 
@@ -1433,6 +1504,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           ['常驻提示', offPrompt],
           ['捕获·用户消息订阅', offCaptureMessage],
           ['反馈命令', () => feedback.dispose()],
+          ['确认命令', () => confirm.dispose()],
           ['捕获·工具调用订阅', offCaptureCall],
           ['捕获·工具结果订阅', offCaptureResult],
           ['捕获·回合结局订阅', offCaptureOutcome],

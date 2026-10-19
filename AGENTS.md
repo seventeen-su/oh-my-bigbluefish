@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.7.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.8.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,16 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.7.0（当前） = 事件驱动记忆控制器（决策 + 执行）**：`modules/memory/controller.ts`
+- **v4.8.0（当前） = 候选确认与跨路径写入去重**：
+  `/omb-confirm [id]` 是**用户**确认候选的斜杠命令（不新增模型工具）：不带参数列出
+  候选（每库最近 50 条里筛、最多显示 5 条），带 id 把 `assertedBy` 从 `model` 改为
+  `user`（正文/id/来源/时间一字不改），写回后查回验证；sealed 不读、read-only 不写。
+  只接受 `semantic`/`procedural` + `model` + 未失效 + 未被取代的候选。
+  去重判据 `remember.ts` 的 `findSameContent` 由捕获路径与 `omb_remember` 共用：
+  同内容命中时**不写、不触发向量事件**，回执给出已存在条目的 id/阶段（候选附
+  `/omb-confirm` 用法）。健康面 `confirmHealthNote()` 只在按过命令后报数。
+  契约：`docs/v4.8.0-lifecycle-confirm-and-dedupe.md`。
+- **v4.7.0** = 事件驱动记忆控制器（决策 + 执行）：`modules/memory/controller.ts`
   纯 reducer（user-message/tool-result/turn-end/memory-written → persist/lookup/
   request-model/track-task/expire-task），TTL 在事件到达时清算、回合结束清空剩余任务。
   `memoryController` 三档（`execute` 缺省 / `dry-run` / `off`）：execute 下

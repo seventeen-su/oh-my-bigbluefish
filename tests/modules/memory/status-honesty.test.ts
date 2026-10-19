@@ -14,7 +14,8 @@
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import type { MemoryStore, ModuleRegistration, ScoredHit, TaggedStore } from '../../../kernel/abi/index.js'
-import { createMemoryRegistration, controllerHealthNote } from '../../../modules/memory/index.js'
+import { createMemoryRegistration, confirmHealthNote, controllerHealthNote } from '../../../modules/memory/index.js'
+import type { ConfirmLedger } from '../../../modules/memory/index.js'
 import type { ControllerStats } from '../../../modules/memory/capture.js'
 import type { MemoryStoresService } from '../../../modules/memory/store.js'
 import { createStoresService, openMemoryStore } from '../../../modules/memory/store.js'
@@ -213,6 +214,27 @@ describe('事件控制器状态面：dry-run 与执行不能混说（v4.7.0）',
     expect(controllerHealthNote({ ...base, mode: 'off' })).toContain('已关闭')
     expect(controllerHealthNote({ ...base, events: 0 })).toContain('尚无事件')
     expect(controllerHealthNote(undefined)).toBe('')
+  })
+})
+
+describe('候选确认状态面：没按过命令就不写（v4.8.0）', () => {
+  const ledger: ConfirmLedger = { commands: 2, listed: 1, promoted: 1, refused: 0, lastChange: 'promoted' }
+
+  it('按过命令才报；确认与列出分开计数', () => {
+    const note = confirmHealthNote(ledger)
+    expect(note).toContain('候选确认：已确认 1 条')
+    expect(note).toContain('命令 2 次')
+    expect(note).toContain('列出 1 次')
+  })
+
+  it('拒绝次数为 0 时不印"拒绝 0 次"（0 与未发生不同形）', () => {
+    expect(confirmHealthNote(ledger)).not.toContain('拒绝')
+    expect(confirmHealthNote({ ...ledger, refused: 2 })).toContain('拒绝 2 次')
+  })
+
+  it('没按过命令 / 未接线：一个字都不写', () => {
+    expect(confirmHealthNote({ ...ledger, commands: 0 })).toBe('')
+    expect(confirmHealthNote(undefined)).toBe('')
   })
 })
 

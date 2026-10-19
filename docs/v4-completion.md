@@ -398,3 +398,46 @@
 - lookup 只走词法，不做向量/语义；
 - 候选晋升命令仍未实现；
 - 模型主动 `omb_remember` 与控制器写入之间仍无正文唯一约束（靠提示抑制降低重复概率）。
+
+---
+
+# OMB v4.8.0 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.8.0**（`24 功能 / 87 小功能`；x2 功能更新） |
+| 构建 | **g109**；`generation: 109`、`outDir: lib-gen/g109`、`builtAt: 2026-10-19T18:44:49Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **117 files / 1433 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 109/109、版本 4.8.0；`/omb-confirm` 能列出候选并把阶段从"候选"改为"已确认"；重复 `omb_remember` 返回"未写入：库中已有同内容条目" |
+
+## 本版内容
+
+1. **`/omb-confirm [id]` 候选确认命令**（用户命令，不新增模型工具）：不带参数列出候选
+   （每库最近 50 条里筛、最多 5 条）；带 id 把 `assertedBy` 从 `model` 改为 `user`，
+   正文/id/来源/时间一字不改，写回后查回验证。sealed 不读、read-only/未知归属不写。
+2. **跨写入路径同内容去重**：`remember.ts` 的 `findSameContent` 由捕获路径与
+   `omb_remember` 共用；同内容命中时不写、不触发 `memory/written`/向量编码，回执给出
+   已存在条目的 id/阶段（候选附 `/omb-confirm` 用法）。只认活跃条目，旧结论被取代后
+   重写同一句仍会正常落库。
+3. **健康面**：`confirm.commands/listed/promoted/refused`；记忆行只在按过命令后追加
+   `候选确认：已确认 N 条（命令 M 次…）`，文案由 `confirmHealthNote()` 生成并有单测。
+4. 配置新增 `confirmCommand`（默认 true），关掉只影响确认入口，候选本身仍在。
+
+详见 `docs/v4.8.0-lifecycle-confirm-and-dedupe.md`。
+
+## 文件
+
+- 新增：`modules/memory/confirm.ts`、`tests/modules/memory/confirm.test.ts`、
+  `docs/v4.8.0-lifecycle-confirm-and-dedupe.md`
+- 修改：`modules/memory/remember.ts`、`modules/memory/capture.ts`、`modules/memory/index.ts`、
+  `tests/modules/memory/{remember,registration,status-honesty}.test.ts`、
+  `tests/modules/privacy/module.test.ts`、版本文件
+
+## 仍未做（v4.8.0 结束时）
+
+- 没有自动晋升（候选只能由用户确认，这是不变量）；
+- 确认不可撤销（没有"退回候选"命令）；
+- 候选列表有界（最近 50 条/库、最多显示 5 条），更早的候选从 `omb_recall` 回执拿 id 确认；
+- 去重只认精确同内容，不做向量近似与跨作用域去重。
