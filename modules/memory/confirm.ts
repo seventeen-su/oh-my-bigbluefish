@@ -33,7 +33,7 @@
  *
  * 隐私：sealed 不读；read-only 与归属未知不写。
  */
-import type { Kernel, MemoryRecord, TaggedStore } from '../../kernel/abi/index.js'
+import type { Kernel, MemoryRecord, MemoryStore, TaggedStore } from '../../kernel/abi/index.js'
 import type { CommandInvocationLike, CommandResultLike } from './privacy/command.js'
 import { sessionOfInvocation } from './privacy/command.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
@@ -264,11 +264,17 @@ export function renderAuditLog(
 
 function relatedLines(related: readonly RelatedRecord[]): readonly string[] {
   if (related.length === 0) return []
-  const lines = ['可能相关的既有结论（共享实体键；只提示，未改库）：']
+  const lexical = related.filter(item => item.via === 'lexical').length
+  const vector = related.filter(item => item.via === 'vector').length
+  const channels: string[] = []
+  if (lexical > 0) channels.push('共享实体键')
+  if (vector > 0) channels.push('语义相近')
+  const lines = [`可能相关的既有结论（${channels.join(' / ')}；只提示，未改库）：`]
   for (const item of related) {
     const stage = stageOfMemory({ kind: item.record.kind, assertedBy: item.record.assertedBy })
+    const via = item.via === 'vector' ? '语义' : '词法'
     lines.push(
-      `- id=${item.record.id} · ${item.record.scope}/${item.record.kind} · 阶段 ${stageLabel(stage)} · ${excerpt(item.record.text, 80)}`,
+      `- id=${item.record.id} · ${item.record.scope}/${item.record.kind} · 阶段 ${stageLabel(stage)} · ${via} · ${excerpt(item.record.text, 80)}`,
     )
   }
   lines.push('若本条与其中某条矛盾，请先用 /omb-feedback 或 omb_remember(supersedes) 处理旧条目。')
@@ -314,6 +320,11 @@ export interface ConfirmDeps {
     decideUnattributed(): { readonly allowRead: boolean; readonly allowWrite: boolean }
   } | undefined
   readonly logger?: { info(message: string): void; warn(message: string): void }
+  /**
+   * v4.9.1：相关条目查找端口（词法 + 语义由装配层合并）。
+   * 缺省退回词法 `findRelatedRecords`（单测/旧装配）。
+   */
+  readonly findRelated?: (store: MemoryStore, record: MemoryRecord) => Promise<readonly RelatedRecord[]>
   /** 观测口（健康面按动作计数；绝不改变命令结果）。 */
   readonly onConfirm?: (info: {
     readonly action: 'list' | 'log' | 'promote' | 'undo'
@@ -521,7 +532,9 @@ async function runPromote(
 
   let related: readonly RelatedRecord[] = []
   try {
-    related = await findRelatedRecords(found.store.store, stored)
+    related = deps.findRelated !== undefined
+      ? await deps.findRelated(found.store.store, stored)
+      : await findRelatedRecords(found.store.store, stored)
   } catch {
     related = []
   }

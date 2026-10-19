@@ -18,7 +18,7 @@
  *
  * 失败**不抛**：连边只是附加索引，不能影响"记忆已写入"这个事实。
  */
-import type { Edge, EdgeType, MemoryRecord, MemoryStore } from '../../kernel/abi/index.js'
+import type { Edge, EdgeType, Embedder, MemoryRecord, MemoryStore } from '../../kernel/abi/index.js'
 import { extractEntityKeys } from './capture.js'
 
 /** 便利 re-export：连边与实体键是同一套语义，调用方不必 import 两个模块。 */
@@ -137,6 +137,8 @@ export async function autoLinkRelated(
 export interface RelatedRecord {
   readonly record: MemoryRecord
   readonly shared: readonly string[]
+  /** 判据来源：实体键词法（v4.9.0）或向量通道（v4.9.1）。 */
+  readonly via: 'lexical' | 'vector'
 }
 
 export interface RelatedLookupOptions {
@@ -192,8 +194,65 @@ export async function findRelatedRecords(
       if (candidate.contentHash === record.contentHash) continue
       const shared = sharedEntityKeys(keys, extractEntityKeys(candidate.text, options.projectName ?? candidate.project))
       if (shared.length < minSharedKeys) continue
-      related.push({ record: candidate, shared })
+      related.push({ record: candidate, shared, via: 'lexical' })
       if (related.length >= maxResults) break
+    }
+    return related
+  } catch {
+    return []
+  }
+}
+
+export interface SemanticLookupOptions {
+  /** 最多返回几条（默认 2；语义通道在词法之外补充，不抢主位）。 */
+  readonly maxResults?: number
+  /** 向量检索候选上限（默认 5）。 */
+  readonly limit?: number
+  /** 余弦下限（由装配层给 `cosineFloorFor(embedder)`；缺省 0 = 只丢非正）。 */
+  readonly minScore?: number
+}
+
+/**
+ * 向量通道的"可能相关"（v4.9.1）：补上**没有共享实体键**的自然语言条目。
+ *
+ * 与词法通道同一约束：只读、同作用域、活跃、内容不同、排除自身；
+ * 归属（model/dim/revision）由 `searchVector` 校验，跨空间向量宁可不召回。
+ * 任何一步失败（无嵌入器、无向量、库报错）都返回空数组——提示不能影响写入。
+ *
+ * **不改变写入决定**：语义相似只能说明"可能相关"，由回执交给用户/模型判断。
+ */
+export async function findSemanticRelated(
+  store: MemoryStore,
+  record: MemoryRecord,
+  embedder: Embedder,
+  options: SemanticLookupOptions = {},
+): Promise<readonly RelatedRecord[]> {
+  try {
+    const vectors = await embedder.embed([record.text])
+    const embedding = vectors[0]
+    if (!(embedding instanceof Float32Array)) return []
+    if (embedding.length !== embedder.dimensions) return []
+    let hits
+    try {
+      hits = await store.searchVector({
+        embedding,
+        expect: { modelId: embedder.id, dim: embedder.dimensions, revision: embedder.revision },
+        limit: options.limit ?? 5,
+        minScore: options.minScore ?? 0,
+      })
+    } catch {
+      return []
+    }
+    if (hits.length === 0) return []
+    const candidates = await store.getMany(hits.map(hit => hit.id))
+    const related: RelatedRecord[] = []
+    for (const candidate of candidates) {
+      if (candidate.id === record.id) continue
+      if (candidate.scope !== record.scope) continue
+      if (candidate.validTo !== null || candidate.supersededBy !== null) continue
+      if (candidate.contentHash === record.contentHash) continue
+      related.push({ record: candidate, shared: [], via: 'vector' })
+      if (related.length >= (options.maxResults ?? 2)) break
     }
     return related
   } catch {

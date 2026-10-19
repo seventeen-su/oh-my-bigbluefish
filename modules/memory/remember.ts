@@ -715,8 +715,10 @@ export interface RememberRelatedItem {
   readonly scope: MemoryScope
   readonly kind: MemoryKind
   readonly text: string
-  /** 与新条目共享的实体键（判据可解释；空数组不会出现在回执里）。 */
+  /** 与新条目共享的实体键（词法判据可解释；向量通道为空数组）。 */
   readonly shared: readonly string[]
+  /** 判据来源：实体键词法 / 向量语义（v4.9.1）。 */
+  readonly via: 'lexical' | 'vector'
 }
 
 /** 写入结果的可读回执（供 `renderRemember` 与测试断言）。 */
@@ -877,18 +879,24 @@ function echoLines(text: string, contentHash: string | undefined): readonly stri
 }
 
 /**
- * "可能相关/冲突"的提示（v4.9.0）。
+ * "可能相关/冲突"的提示（v4.9.0；v4.9.1 加语义通道标注）。
  *
- * 只呈现事实 + 可选动作，**不做判断**：判据是共享实体键（同作用域、活跃），
- * 可能是同一主题的不同方面，也可能是旧结论已被这次陈述取代。
- * 所以措辞必须是"可能"，并明确写出"未改库"。
+ * 只呈现事实 + 可选动作，**不做判断**：判据是共享实体键或向量相似
+ * （同作用域、活跃），可能是同一主题的不同方面，也可能是旧结论已被这次陈述取代。
+ * 所以措辞必须是"可能"，并明确写出"未改库"与判据来源。
  */
 export function renderRelated(related: readonly RememberRelatedItem[]): readonly string[] {
-  const lines = ['可能的既有结论（共享实体键；只提示，未改库）：']
+  const lexical = related.filter(item => item.via === 'lexical').length
+  const vector = related.filter(item => item.via === 'vector').length
+  const channels: string[] = []
+  if (lexical > 0) channels.push('共享实体键')
+  if (vector > 0) channels.push('语义相近')
+  const lines = [`可能的既有结论（${channels.join(' / ')}；只提示，未改库）：`]
   for (const item of related) {
     const text = item.text.replace(/\s+/g, ' ').trim()
     const shown = text.length > 100 ? `${text.slice(0, 100)}…` : text
-    lines.push(`- id=${item.id} · ${item.scope}/${item.kind} · ${shown}`)
+    const via = item.via === 'vector' ? '语义' : '词法'
+    lines.push(`- id=${item.id} · ${item.scope}/${item.kind} · ${via} · ${shown}`)
   }
   lines.push('若本条是对其中某条的更正，请用 supersedes=["id"] 重写；若两条都成立，忽略本提示。')
   return lines

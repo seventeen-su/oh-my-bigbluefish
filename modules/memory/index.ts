@@ -44,7 +44,8 @@ import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
 import { installConfirm } from './confirm.js'
-import { autoLinkRelated, findRelatedRecords } from './link.js'
+import { autoLinkRelated, findRelatedRecords, findSemanticRelated, type RelatedRecord } from './link.js'
+import { cosineFloorFor } from './vector.js'
 import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
 import { AdaptiveFloorCalibrator } from './utility.js'
@@ -1057,6 +1058,37 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         }
       }
 
+      /**
+       * 冲突/相关提示（v4.9.0 词法 + v4.9.1 语义）：只读，最多 3 条。
+       *
+       * 词法通道先跑（实体键 ≥2，可解释）；语义通道在**有嵌入器**时补充
+       * 没有共享实体键的条目（向量归属由 store 校验，跨空间不召回）。
+       * 任一通道失败都只是少几条提示，不影响写入。
+       */
+      const relatedFor = async (store: MemoryStore, record: MemoryRecord): Promise<readonly RelatedRecord[]> => {
+        const lexical = await findRelatedRecords(store, record)
+        const seen = new Set(lexical.map(item => item.record.id))
+        let semantic: readonly RelatedRecord[] = []
+        try {
+          const embedder = kernel.service<Embedder>(SERVICES.embedder)
+          if (embedder !== undefined) {
+            semantic = await findSemanticRelated(store, record, embedder, {
+              minScore: cosineFloorFor(embedder),
+            })
+          }
+        } catch {
+          semantic = []
+        }
+        const merged = [...lexical]
+        for (const item of semantic) {
+          if (seen.has(item.record.id)) continue
+          seen.add(item.record.id)
+          merged.push(item)
+          if (merged.length >= 3) break
+        }
+        return merged.slice(0, 3)
+      }
+
       const capture: Capture = createCapture({
         clock: kernel.clock,
         resolveStore: resolveWriteStore,
@@ -1201,6 +1233,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             resolveStores: sessionId => resolveStores(sessionId),
             privacy: () => kernel.service(SERVICES.privacy),
             logger: kernel.logger,
+            // v4.9.1：确认回执也走同一条"词法 + 语义"相关提示
+            findRelated: (store, record) => relatedFor(store, record),
             onConfirm: info => {
               confirmLedger.commands += 1
               const count = info.count ?? 1
@@ -1357,17 +1391,18 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           // 3.7 Wave 2：写入成功后自动连 `related` 边（仅附加索引，失败不影响写入）
           onStored: linkOnStored,
           /**
-           * v4.9.0：回执里的"可能相关/冲突"提示。判据与自动连边同源，
-           * 但**只读**——不建边、不改库，由调用方自己判断要不要 supersedes。
+           * v4.9.0/v4.9.1：回执里的"可能相关/冲突"提示（词法 + 语义），
+           * 只读——不建边、不改库，由调用方自己判断要不要 supersedes。
            */
           findRelated: async (store, record) => {
-            const related = await findRelatedRecords(store, record)
+            const related = await relatedFor(store, record)
             return related.map(item => ({
               id: item.record.id,
               scope: item.record.scope,
               kind: item.record.kind,
               text: item.record.text,
               shared: item.shared,
+              via: item.via,
             }))
           },
           logger: kernel.logger,

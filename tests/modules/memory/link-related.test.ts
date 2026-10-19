@@ -9,8 +9,15 @@
  */
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { MemoryRecord } from '../../../kernel/abi/index.js'
-import { autoLinkRelated, extractEntityKeys, findRelatedRecords, keysAsQuery, sharedEntityKeys } from '../../../modules/memory/link.js'
+import type { Embedder, MemoryRecord, MemoryStore } from '../../../kernel/abi/index.js'
+import {
+  autoLinkRelated,
+  extractEntityKeys,
+  findRelatedRecords,
+  findSemanticRelated,
+  keysAsQuery,
+  sharedEntityKeys,
+} from '../../../modules/memory/link.js'
 import { retrieve } from '../../../modules/memory/retrieve.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { clockAt, fakeStore, hits, makeRecord, tagged } from '../retrieval/fakes.js'
@@ -165,5 +172,52 @@ describe('findRelatedRecords：只读的相关/冲突提示（v4.9.0）', () => 
     // 两条只共享一个 path 键（键数不足 MIN_KEYS 时直接返回空）
     expect(await findRelatedRecords(f.store, b)).toEqual([])
     await f.cleanup()
+  })
+})
+
+describe('findSemanticRelated：向量通道补充（v4.9.1）', () => {
+  const embedder: Embedder = {
+    id: 'fake-embed',
+    dimensions: 3,
+    revision: 'test-1',
+    async embed(texts: readonly string[]) {
+      return texts.map(() => new Float32Array([1, 0, 0]))
+    },
+  }
+
+  function semanticStore(candidates: readonly MemoryRecord[], hitIds: readonly string[], scope = 'project'): MemoryStore {
+    return {
+      scope,
+      async searchVector() {
+        return hitIds.map(id => ({ id, score: 0.9, channel: 'vector' as const }))
+      },
+      async getMany(ids: readonly string[]) {
+        return candidates.filter(candidate => ids.includes(candidate.id))
+      },
+    } as unknown as MemoryStore
+  }
+
+  it('返回同作用域活跃条目，排除自身/已失效/已被取代/同内容；标注 via=vector', async () => {
+    const self = record('self', '语义查询条目')
+    const candidate = record('candidate', '相关但没有共享实体键的旧结论')
+    const stale = { ...record('stale', '已失效的相关结论'), validTo: 1 }
+    const gone = { ...record('gone', '已被取代的相关结论'), supersededBy: 'candidate' }
+    const same = { ...record('same', '同内容'), contentHash: self.contentHash }
+    const store = semanticStore([self, candidate, stale, gone, same], ['self', 'candidate', 'stale', 'gone', 'same'])
+
+    const related = await findSemanticRelated(store, self, embedder)
+    expect(related.map(item => item.record.id)).toEqual(['candidate'])
+    expect(related[0]).toMatchObject({ shared: [], via: 'vector' })
+  })
+
+  it('嵌入器返回空/维度不符/检索抛错 → 空数组（提示不影响写入）', async () => {
+    const self = record('self', '语义查询条目')
+    const store = semanticStore([record('candidate', '相关结论')], ['candidate'])
+    const emptyEmbedder: Embedder = { ...embedder, embed: async () => [] }
+    expect(await findSemanticRelated(store, self, emptyEmbedder)).toEqual([])
+    const wrongDim: Embedder = { ...embedder, embed: async () => [new Float32Array([1, 0])] }
+    expect(await findSemanticRelated(store, self, wrongDim)).toEqual([])
+    const broken = { ...store, searchVector: async () => { throw new Error('库忙') } } as unknown as MemoryStore
+    expect(await findSemanticRelated(broken, self, embedder)).toEqual([])
   })
 })

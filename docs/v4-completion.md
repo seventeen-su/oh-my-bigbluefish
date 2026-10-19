@@ -519,3 +519,39 @@
 - 冲突提示是启发式：共享实体键说明"相关"，不保证"矛盾"；近义改写、无实体键的
   纯自然语言矛盾仍不可见（语义通道属后续）；
 - 提示只出现在写入/确认回执，召回结果里不标注相关关系。
+
+---
+
+# OMB v4.9.1 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.1**（`24 功能 / 90 小功能`；x3 修复位：4.9.0 冲突提示的语义通道收尾，不是独立功能） |
+| 构建 | **g112**；`generation: 112`、`outDir: lib-gen/g112`、`builtAt: 2026-10-19T19:01:11Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 112/112、版本 4.9.1；`omb_remember` 回执在向量可用时出现"语义相近"条目并标注通道；无嵌入器时退回词法 |
+
+## 本版内容（4.9.0 功能收尾）
+
+1. `link.ts` 新增 `findSemanticRelated`：嵌入新条目正文 → `searchVector`
+   （归属 model/dim/revision 由库校验）→ 同作用域、活跃、内容不同、排除自身，最多 2 条。
+2. 装配层 `relatedFor`：**先词法后语义**、按 id 去重、最多 3 条；无嵌入器/无向量/
+   维度不符/检索异常时静默退回词法。
+3. 回执标注判据来源：词法条目带共享键并标注"词法"，语义条目标注"语义"；
+   标题写作"共享实体键 / 语义相近"。
+4. 确认回执同样走这条合并通道（`ConfirmDeps.findRelated`）。
+
+详见 `docs/v4.9.0-conflict-hints.md` §3.1。
+
+## 文件
+
+- 修改：`modules/memory/link.ts`、`modules/memory/remember.ts`、`modules/memory/confirm.ts`、
+  `modules/memory/index.ts`、`tests/modules/memory/{link-related,remember,confirm}.test.ts`、
+  `docs/v4.9.0-conflict-hints.md`、版本文件
+
+## 仍未做
+
+- 语义相似不等于矛盾：提示仍由用户/模型判断是否 supersedes；
+- 向量通道依赖 `omb-memory-vector` 与已编码向量；未编码的近期条目不参与语义提示。

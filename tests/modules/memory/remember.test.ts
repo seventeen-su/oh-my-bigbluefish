@@ -521,6 +521,7 @@ describe('omb_remember：写入与路由', () => {
         kind: 'semantic',
         text: '旧结论：提交前先跑 pnpm verify',
         shared: ['cmd:pnpm verify'],
+        via: 'lexical',
       }],
     })
     const outcome = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
@@ -530,6 +531,23 @@ describe('omb_remember：写入与路由', () => {
     expect(outcome.text).toContain('supersedes')
     // 只提示：新条目照常写入，旧条目不被连边/改库（夹具的 findRelated 是纯函数）
     expect((await fixture.project.stats()).rows).toBe(1)
+    await fixture.close()
+  })
+
+  it('语义通道的条目在回执里标注"语义"', async () => {
+    const fixture = writeFixture({
+      findRelated: async () => [{
+        id: 'mem_sem',
+        scope: 'project',
+        kind: 'semantic',
+        text: '语义相近但没有共享实体键的旧结论',
+        shared: [],
+        via: 'vector',
+      }],
+    })
+    const outcome = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
+    expect(outcome.text).toContain('语义相近')
+    expect(outcome.text).toContain('语义 ·')
     await fixture.close()
   })
 })

@@ -160,6 +160,26 @@ describe('确认变换：只改证据归属', () => {
     expect(confirmed).toContain('/omb-confirm undo mem_x')
   })
 
+  it('确认回执标注相关条目的判据通道（词法 / 语义）', () => {
+    const record = makeRecord({ id: 'mem_x', text: '回答要简洁', assertedBy: 'user' })
+    const lexical = renderConfirmResult({
+      record,
+      related: [{ record: makeRecord({ id: 'mem_l', text: '词法相关' }), shared: ['cmd:pnpm test'], via: 'lexical' }],
+    })
+    expect(lexical).toContain('共享实体键')
+    expect(lexical).toContain('词法 ·')
+
+    const semantic = renderConfirmResult({
+      record,
+      related: [
+        { record: makeRecord({ id: 'mem_l', text: '词法相关' }), shared: ['cmd:pnpm test'], via: 'lexical' },
+        { record: makeRecord({ id: 'mem_s', text: '语义相关' }), shared: [], via: 'vector' },
+      ],
+    })
+    expect(semantic).toContain('共享实体键 / 语义相近')
+    expect(semantic).toContain('语义 ·')
+  })
+
   it('撤销变换：只接受已确认的活跃语义条目', () => {
     const record = makeRecord({ id: 'mem_x', kind: 'semantic', assertedBy: 'user' })
     const undone = undoConfirmedRecord(record)
