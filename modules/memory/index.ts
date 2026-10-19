@@ -1496,6 +1496,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
                 readonly command: string
                 readonly commandOutcome: 'succeeded' | 'failed' | 'unknown'
                 readonly exitCode?: number | null
+                /** v4.9.3：命令里提到的文件（证据 → 文件映射）。 */
+                readonly paths?: readonly string[]
                 readonly at: number
                 readonly recoveredFromFailure?: boolean
               }[]

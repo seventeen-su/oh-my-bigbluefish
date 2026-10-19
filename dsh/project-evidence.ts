@@ -43,6 +43,13 @@ export interface ProjectEvidenceEntry {
   /** 工具调用本身是否报错（isError）；**只作诊断，不参与命令成功判定**。 */
   readonly toolSucceeded?: boolean
   /**
+   * 命令里提到的**文件路径**（v4.9.3：证据 → 文件映射）。
+   *
+   * 只认带扩展名的文件形态（`modules/memory/store.ts` 一类）；不解析目录与符号，
+   * 符号级映射需要类型解析（见文档"未做"边界）。命令里没有文件路径时字段缺省。
+   */
+  readonly paths?: readonly string[]
+  /**
    * 同一命令**紧邻的上一条**是失败、本次成功 → 只表示"失败后再次成功"。
    *
    * 不叫 `verifiedFix`：这不能证明代码/配置被修过（网络恢复、服务重启也会让它变绿）。
@@ -96,6 +103,8 @@ export const MAX_EVIDENCE_PER_PROJECT = 8
 export const MAX_EVIDENCE_PROJECTS = 16
 /** 单条命令的展示上限。 */
 export const MAX_EVIDENCE_COMMAND_CHARS = 160
+/** 单条证据最多记几个文件路径（展示与落盘的有界性）。 */
+export const MAX_EVIDENCE_PATHS = 5
 
 /** 命令行工具名（只有这些工具的 args 才可能是"命令"）。 */
 const SHELL_TOOL_PATTERN = /(pwsh|powershell|bash|shell|zsh|sh|exec|run|command|terminal)/i
@@ -144,6 +153,36 @@ export function classifyEvidenceCommand(command: string): ProjectEvidenceKind | 
     if (entry.pattern.test(command)) return entry.kind
   }
   return null
+}
+
+/**
+ * 从命令里抽**文件路径**（v4.9.3：证据 → 文件映射）。
+ *
+ * 判据保守：只认带扩展名的文件形态（`modules/memory/store.ts`、`src/a.test.ts`、
+ * Windows 绝对路径）；URL 里的 `https://…` 剥掉后再匹配；目录、包名、符号不记
+ * （符号级映射需要类型解析，不在本版）。最多 `MAX_EVIDENCE_PATHS` 个，按出现顺序。
+ */
+export function extractEvidencePaths(command: string): readonly string[] {
+  if (typeof command !== 'string' || command.length === 0) return []
+  // URL 的路径段不是仓库文件（`https://example.com/api` 不该映射成 `example.com/api`）
+  const text = command.replace(/https?:\/\/[^\s"'`]+/gi, ' ')
+  const found: string[] = []
+  const seen = new Set<string>()
+  const push = (value: string): void => {
+    const normalized = value.replace(/\\/g, '/').replace(/^\.\//, '')
+    if (normalized.length < 3 || normalized.length > 200) return
+    if (!/\.[A-Za-z0-9]{1,8}$/.test(normalized)) return
+    if (seen.has(normalized)) return
+    seen.add(normalized)
+    found.push(normalized)
+  }
+  for (const match of text.matchAll(/[A-Za-z]:\\[^\s"'`）)，,。；;]+/g)) push(match[0])
+  for (const match of text.matchAll(/(?:\.{1,2}\/)[\w.@/-]+\.[A-Za-z0-9]{1,8}/g)) push(match[0])
+  for (const match of text.matchAll(/(?:^|[\s"'=:(])((?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})/g)) {
+    const value = match[1]
+    if (value !== undefined) push(value)
+  }
+  return found.slice(0, MAX_EVIDENCE_PATHS)
 }
 
 /**
@@ -264,6 +303,9 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
             ? { exitCode: entry.exitCode as number | null }
             : {}),
           ...(typeof entry.toolSucceeded === 'boolean' ? { toolSucceeded: entry.toolSucceeded } : {}),
+          ...(version >= 3 && Array.isArray(entry.paths)
+            ? { paths: (entry.paths as unknown[]).filter((p): p is string => typeof p === 'string').slice(0, MAX_EVIDENCE_PATHS) }
+            : {}),
           recoveredFromFailure: entry.recoveredFromFailure === true,
           at: entry.at,
           projectRoot: root,
@@ -292,13 +334,15 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
     try {
       if (!existsSync(file)) return []
       const raw = JSON.parse(readFileSync(file, 'utf8')) as { readonly version?: unknown; readonly entries?: readonly unknown[] }
-      if (typeof raw.version !== 'number' || raw.version < 2) return []
+      const version = typeof raw.version === 'number' ? raw.version : 0
+      if (version < 2) return []
       const entries: ProjectEvidenceRecord[] = []
       for (const item of raw.entries ?? []) {
         if (item === null || typeof item !== 'object') continue
         const entry = item as Record<string, unknown>
         if (typeof entry.kind !== 'string' || typeof entry.command !== 'string' || typeof entry.at !== 'number') continue
         if (entry.commandOutcome !== 'succeeded' && entry.commandOutcome !== 'failed' && entry.commandOutcome !== 'unknown') continue
+        if (!(entry.kind in KIND_LABEL_SET)) continue
         entries.push({
           kind: entry.kind as ProjectEvidenceKind,
           command: entry.command,
@@ -307,6 +351,9 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
             ? { exitCode: entry.exitCode as number | null }
             : {}),
           ...(typeof entry.toolSucceeded === 'boolean' ? { toolSucceeded: entry.toolSucceeded } : {}),
+          ...(version >= 3 && Array.isArray(entry.paths)
+            ? { paths: (entry.paths as unknown[]).filter((p): p is string => typeof p === 'string').slice(0, MAX_EVIDENCE_PATHS) }
+            : {}),
           recoveredFromFailure: entry.recoveredFromFailure === true,
           at: entry.at,
           projectRoot: '',
@@ -357,7 +404,7 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
       const temp = `${file}.tmp-${process.pid}-${Date.now()}`
       try {
         writeFileSync(temp, JSON.stringify({
-          version: 2,
+          version: 3,
           entries: entries.map(({ projectRoot: _projectRoot, ...entry }) => entry),
         }, null, 2))
         renameSync(temp, file)
@@ -413,6 +460,8 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
       const redacted = redactEvidenceCommand(command).slice(0, MAX_EVIDENCE_COMMAND_CHARS)
       const normalized = normalizeCommand(redacted)
       const parsed = parseCommandOutcome(input.text)
+      // v4.9.3：从**未截断的命令**抽文件路径（截断可能切掉后半段路径）
+      const paths = extractEvidencePaths(command)
       /**
        * 只标"失败后再次成功"：同一命令**紧邻的上一条**是失败、本次成功。
        * 连续成功不会重复标记；也不声称代码被修复。
@@ -425,6 +474,7 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
         commandOutcome: parsed.commandOutcome,
         ...(parsed.exitCode === undefined ? {} : { exitCode: parsed.exitCode }),
         ...(typeof input.toolOk === 'boolean' ? { toolSucceeded: input.toolOk } : {}),
+        ...(paths.length === 0 ? {} : { paths }),
         recoveredFromFailure,
         at: input.at,
         projectRoot: root,
@@ -446,13 +496,14 @@ export function createProjectEvidence(options: ProjectEvidenceOptions): {
       record,
       snapshot(projectRoot) {
         const list = load(projectRoot)
-        return list.map(({ kind, command, commandOutcome, exitCode, toolSucceeded, recoveredFromFailure, at }) => ({
+        return list.map(({ kind, command, commandOutcome, exitCode, toolSucceeded, paths, recoveredFromFailure, at }) => ({
           kind,
           command,
           commandOutcome,
           at,
           ...(exitCode === undefined ? {} : { exitCode }),
           ...(toolSucceeded === undefined ? {} : { toolSucceeded }),
+          ...(paths === undefined || paths.length === 0 ? {} : { paths }),
           ...(recoveredFromFailure === true ? { recoveredFromFailure: true } : {}),
         }))
       },

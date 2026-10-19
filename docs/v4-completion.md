@@ -589,3 +589,39 @@
 
 - 这不是标注集上的 precision@k：没有被人用到的召回不进入分母；
 - 只统计本进程，不做跨进程/跨模型对比实验。
+
+---
+
+# OMB v4.9.3 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.3**（`24 功能 / 92 小功能`；x3 修复位：既有项目证据功能的细化，不是独立功能） |
+| 构建 | **g114**；`generation: 114`、`outDir: lib-gen/g114`、`builtAt: 2026-10-19T19:05:39Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 114/114、版本 4.9.3；`omb_project` L1 证据行出现"→ 文件"映射；旧的 `.omb/evidence.json`（v2）照常读取 |
+
+## 本版内容（既有功能细化）
+
+1. `extractEvidencePaths`：从命令里抽带扩展名的文件路径（相对/Windows 绝对路径），
+   URL、目录、包名、符号不记；去重、按出现顺序、单条 ≤5 个；抽不出就不写 `paths`。
+2. 证据落盘格式升 **v3**（paths 随条目写入）；v2 旧文件照常读取（路径缺省）；
+   读取时对 paths 做类型过滤与截断。
+3. `omb_project` L1 证据行追加文件映射（最多 2 个路径，更多写"等 N 个"）；
+   `ProjectEvidenceView.paths` 与 `SERVICES.projectEvidence` 端口形状同步。
+
+详见 `docs/v4.9.3-evidence-file-mapping.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.3-evidence-file-mapping.md`
+- 修改：`dsh/project-evidence.ts`、`modules/memory/project.ts`、`modules/memory/index.ts`、
+  `tests/dsh/project-evidence.test.ts`、版本文件
+
+## 仍未做
+
+- 不解析符号（函数/类级映射需要类型解析）；
+- 路径只表示"命令提到过"，不核验文件存在、也不声称测试覆盖范围；
+- 命令里没写文件（如 `pnpm test` 跑全量）时没有映射，不猜。

@@ -156,6 +156,8 @@ export interface ProjectEvidenceView {
   /** 命令退出状态；unknown = 结果文本里没有可解析的退出码（不是"通过"）。 */
   readonly commandOutcome: 'succeeded' | 'failed' | 'unknown'
   readonly exitCode?: number | null
+  /** v4.9.3：命令里提到的文件（证据 → 文件映射；符号不解析）。 */
+  readonly paths?: readonly string[]
   readonly at: number
   /** 同一命令紧邻的上一条失败、本次成功 → 只表示"失败后再次成功"。 */
   readonly recoveredFromFailure?: boolean
@@ -520,7 +522,11 @@ export function renderProjectEvidence(
         : '⚠️未知'
     const fix = entry.recoveredFromFailure === true ? '（失败后再次成功）' : ''
     const code = entry.exitCode === undefined || entry.exitCode === null ? '' : ` exit ${entry.exitCode}`
-    return `${label}${mark}${code} ${clip(entry.command, 28)}${fix} ${describeAge(now, entry.at)}`
+    // v4.9.3：证据 → 文件映射（命令被截断时仍能看见它覆盖了哪些文件）
+    const files = entry.paths === undefined || entry.paths.length === 0
+      ? ''
+      : ` → ${entry.paths.slice(0, 2).map(path => clip(path, 36)).join('、')}${entry.paths.length > 2 ? ` 等 ${entry.paths.length} 个` : ''}`
+    return `${label}${mark}${code} ${clip(entry.command, 28)}${fix} ${describeAge(now, entry.at)}${files}`
   })
   return `证据：${parts.join('；')}`
 }

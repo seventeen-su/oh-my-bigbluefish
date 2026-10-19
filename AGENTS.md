@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.2**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,11 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.2（当前） = 检索命中排名读数（x3）**：`usageTracker` 按召回顺序记曝光排名；
+- **v4.9.3（当前） = 项目证据到文件映射（x3）**：`extractEvidencePaths` 从命令里
+  抽带扩展名的文件路径（URL/目录/符号不记，单条 ≤5），证据落盘升 v3（v2 旧文件照读）；
+  `omb_project` L1 在证据后显示"→ 文件"（最多 2 个，更多写"等 N 个"）。
+  契约：`docs/v4.9.3-evidence-file-mapping.md`。
+- **v4.9.2** = 检索命中排名读数（x3）：`usageTracker` 按召回顺序记曝光排名；
   `used_tool` 命中时统计使用命中的 @1/@3/@5 分布（同一 id 取最好排名，分母是使用命中数）；
   健康面 `retrieval.ranked/precisionAt1/3/5` + `retrievalRankNote()`（无读数不写）。
   契约：`docs/v4.9.2-retrieval-precision.md`。

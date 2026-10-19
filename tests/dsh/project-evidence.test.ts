@@ -5,15 +5,17 @@
  * `isError:false`，只在结果文本末尾附 `[exit code: N]`；证据必须解析该标记，
  * 没有标记一律 unknown，不能显示成测试通过。
  */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  MAX_EVIDENCE_PATHS,
   MAX_EVIDENCE_PER_PROJECT,
   classifyEvidenceCommand,
   createProjectEvidence,
   extractEvidenceCommand,
+  extractEvidencePaths,
   parseCommandOutcome,
   redactEvidenceCommand,
 } from '../../dsh/project-evidence.js'
@@ -36,6 +38,24 @@ describe('命令抽取与分类', () => {
     expect(classifyEvidenceCommand('node scripts/check-resolution.mjs')).toBe('verify')
     expect(classifyEvidenceCommand('pnpm install')).toBe('install')
     expect(classifyEvidenceCommand('git status')).toBeNull()
+  })
+
+  it('从命令里抽文件路径（证据 → 文件映射）；URL/目录不记', () => {
+    expect(extractEvidencePaths('npx vitest run tests/modules/memory/store.test.ts')).toEqual([
+      'tests/modules/memory/store.test.ts',
+    ])
+    expect(extractEvidencePaths('npx tsc --noEmit modules/memory/confirm.ts')).toContain('modules/memory/confirm.ts')
+    expect(extractEvidencePaths('./src/a.ts')).toEqual(['src/a.ts'])
+    expect(extractEvidencePaths('C:\\repo\\src\\a.ts')).toEqual(['C:/repo/src/a.ts'])
+    expect(extractEvidencePaths('curl https://example.com/api/v1.json')).toEqual([])
+    expect(extractEvidencePaths('pnpm test')).toEqual([])
+    expect(extractEvidencePaths('')).toEqual([])
+  })
+
+  it('路径去重且有界（单条最多 MAX_EVIDENCE_PATHS 个）', () => {
+    const command = Array.from({ length: MAX_EVIDENCE_PATHS + 3 }, (_, index) => `src/f${index}.ts`).join(' ')
+    expect(extractEvidencePaths(command)).toHaveLength(MAX_EVIDENCE_PATHS)
+    expect(extractEvidencePaths('src/a.ts src/a.ts')).toEqual(['src/a.ts'])
   })
 })
 
@@ -103,6 +123,18 @@ describe('证据账本', () => {
       })
     }
     expect(ledger.port.snapshot('/repo')).toHaveLength(MAX_EVIDENCE_PER_PROJECT)
+  })
+
+  it('记录命令里的文件路径（证据 → 文件映射）', () => {
+    const ledger = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => '/repo', persist: false })
+    ledger.port.record({
+      sessionId: 's1',
+      tool: 'pwsh',
+      args: JSON.stringify({ command: 'npx vitest run tests/a.test.ts' }),
+      text: 'ok\n[exit code: 0]',
+      at: 1,
+    })
+    expect(ledger.port.snapshot('/repo')[0]?.paths).toEqual(['tests/a.test.ts'])
   })
 })
 
@@ -240,6 +272,30 @@ describe('证据持久化、失败后恢复与损坏现场', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('路径随证据落盘（JSON v3），重启后仍可见', () => {
+    const root = mkdtempSync(join(tmpdir(), 'omb-evidence-'))
+    try {
+      const first = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      first.port.record({
+        sessionId: 's1',
+        tool: 'pwsh',
+        args: JSON.stringify({ command: 'npx vitest run tests/modules/memory/store.test.ts' }),
+        text: 'ok\n[exit code: 0]',
+        at: 1,
+      })
+      first.dispose()
+
+      const raw = JSON.parse(readFileSync(join(root, '.omb', 'evidence.json'), 'utf8')) as { version: number }
+      expect(raw.version).toBe(3)
+
+      const second = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      expect(second.port.snapshot(root)[0]?.paths).toEqual(['tests/modules/memory/store.test.ts'])
+      second.dispose()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('L1 证据行', () => {
@@ -261,5 +317,20 @@ describe('L1 证据行', () => {
     )
     expect(text).toContain('⚠️未知')
     expect(text).not.toContain('✅')
+  })
+
+  it('证据行显示文件映射（命令被截断也能看见覆盖了哪些文件）', () => {
+    const text = renderProjectEvidence(
+      [{
+        kind: 'test',
+        command: 'npx vitest run 一个非常长长长长长长长长长长长长长长长长长长的路径名称/tests/a.test.ts',
+        commandOutcome: 'succeeded',
+        at: 0,
+        paths: ['testers/a.test.ts', 'src/b.ts', 'src/c.ts'],
+      }],
+      1000,
+    )
+    expect(text).toContain('→ testers/a.test.ts、src/b.ts')
+    expect(text).toContain('等 3 个')
   })
 })
