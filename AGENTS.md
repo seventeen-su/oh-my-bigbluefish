@@ -62,7 +62,7 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.4（当前，计算版本 4.5.0 / g94）** = **版本号实测计算 + 剩余项收尾**：
+- **v4.4（当前，计算版本 4.5.1 / g95）** = **版本号实测计算 + 剩余项收尾**：
   版本号改为 `major.累计功能数.累计小功能数`（`version-manifest.json` + `scripts/version.mjs`，
   禁止手写 4.x）；导入图支持 tsconfig `paths` 别名、文件级边与近似调用边；
   shell 未知写用命令前后 `git status` 差分推断；守卫拒绝时写 base/current 冲突材料包；

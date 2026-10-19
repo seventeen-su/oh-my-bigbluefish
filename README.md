@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.4 · 4.5.0)
+# Oh-My-BigBlueFish (OMB v4.4 · 4.5.1)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -14,7 +14,7 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 [`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)。
 
 > 版本规则：`major.累计功能数.累计小功能数`。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.0**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.1**。
 
 ## v4.4 结构（2026-10）
 
@@ -27,7 +27,7 @@ v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改�
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
 
 v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
-（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.0）、**导入图支持 tsconfig 别名 +
+（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.1）、**导入图支持 tsconfig 别名 +
 文件级边 + 近似调用边**、**shell 未知写按 git status 差分推断**、**守卫拒绝时写 base/current
 冲突材料包**、**OOM 取证脚本与证据结论**。
 

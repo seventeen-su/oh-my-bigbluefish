@@ -135,14 +135,14 @@
 | D14 | **进程内存进 `omb_status`**：`## 进程` 段（rss/heapUsed/heapTotal/external/uptime） | OOM 现场只有崩溃栈；状态面是唯一模型可见诊断入口 | `status-process.test.ts`（格式/非法值"未测量"） | 不做自动重启/自愈；只报事实 |
 | D15 | **跨顶层目录相对导入图**：`extractRelativeImports` + `resolveImportTarget` + `structure.imports`（≤12 边）；`omb_project` L1 显示前 4 条 | v4.2 明确留白"完整导入图"；只做确定性、无语言服务依赖的部分 | `project-profile.test.ts`（`src → lib` 边、确定性不变） | 完整调用图/类型图、路径别名（`@/…`）、包导出映射（v4.4） |
 
-## 12. v4.4 决策（2026-10-19，计算版本 4.5.0 / g94）
+## 12. v4.4 决策（2026-10-19，计算版本 4.5.1 / g95）
 
 > 依据：`docs/v4.4-versioning-alias-and-oom.md`。版本号改为从功能清单实际计算；
 > 收掉 v4.3 末尾的导入图/别名/调用图、shell 未知写、冲突材料与 OOM 取证。
 
 | # | 决策 | 为什么（证据） | 验收 | 明确不做 |
 | --- | --- | --- | --- | --- |
-| D16 | **版本号 = `major.累计功能数.累计小功能数`**：`version-manifest.json` 单一真源，`scripts/version.mjs --write` 生成 `kernel/version.ts` 并写回 8 个 package.json；`--check` 门禁 | 手写 4.1/4.2/4.3 无法反映实际功能量；用户要求按功能/小功能实际计算 | 当前 **24 功能 / 79 小功能 → 4.5.0**；`version.mjs` 校验一致；包与模块常量均来自 `OMB_VERSION` | 不自动改 major（架构代手写）；不把版本脚本塞进 build 隐式改写 |
+| D16 | **版本号 = `major.累计功能数.累计小功能数`**：`version-manifest.json` 单一真源，`scripts/version.mjs --write` 生成 `kernel/version.ts` 并写回 8 个 package.json；`--check` 门禁 | 手写 4.1/4.2/4.3 无法反映实际功能量；用户要求按功能/小功能实际计算 | 当前 **24 功能 / 79 小功能 → 4.5.1**；`version.mjs` 校验一致；包与模块常量均来自 `OMB_VERSION` | 不自动改 major（架构代手写）；不把版本脚本塞进 build 隐式改写 |
 | D17 | **导入图升级**：tsconfig `paths/baseUrl` 别名、文件级边、近似调用边（导入符号在调用点出现 `name(`） | v4.3 只到目录边；审查/用户要求"完整导入图/调用图" | `project-profile.test.ts` 别名仓库用例（`@lib/*` → 目录/文件/调用边） | 类型解析、包导出映射、真正调用图（v4.5） |
 | D18 | **shell 未知写推断**：未知写命令前后 `git status --porcelain=v2 -z` 差分，新增路径记 `shellInferred`，可触发守卫/通知 | v4.2 只计数不定位；`git apply`/构建脚本是剩余盲区 | 状态机单测（基线→差分→guard deny）；`situation.sideEffects.shellInferred`；状态行"shell 推断写 N" | 不声称精确归属（并发写可能混入）；不执行命令 |
 | D19 | **冲突材料包**：读取时缓存 base 正文（≤4 条/会话、≤64KB），守卫拒绝时写 `.omb/conflicts/*.md`（base/current + 事实说明），最多 20 份 | 用户要求三方合并；自动改写绕过裁决，改为"可核验材料" | 单测（拒绝理由指向材料；base/current 正确）；默认 writer 有界清理 | 不自动合并、不生成补丁；材料需人工/git 裁决 |

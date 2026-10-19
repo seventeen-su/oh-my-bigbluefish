@@ -1,6 +1,6 @@
 {
   "name": "@omb/notify",
-  "version": "4.5.0",
+  "version": "4.5.1",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — desktop notifications for the few events worth interrupting for, throttled and deduplicated.",

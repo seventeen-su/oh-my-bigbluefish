@@ -58,6 +58,7 @@ import { createPressureBridge } from './pressure.js'
 import { createProjectRootResolver } from './project-root.js'
 import { createProjectProfile } from './project-profile.js'
 import { registerDepthCommand } from './depth-command.js'
+import { registerHeapCommand } from './heap-command.js'
 import { wireReasoningEffort } from './reasoning-effort.js'
 import { wireArtifactIndex } from './hooks.js'
 import { buildStatusTool } from './status-tool.js'
@@ -381,6 +382,8 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
    * agent 作用域的 model-selection 覆盖，症状是"设了 quick 但请求头仍是 max"）。
    */
   const disposeDepth = registerDepthCommand({ ctx, kernel: handle.kernel, logger })
+  // v4.4：OOM 取证命令（/omb-heap）。只在用户显式取证时同步写快照。
+  const disposeHeap = registerHeapCommand({ ctx, kernel: handle.kernel, logger })
   const disposeEffort = wireReasoningEffort({ ctx, kernel: handle.kernel })
   /**
    * 制品索引的**生产者**。
@@ -429,6 +432,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       () => sessionState.dispose(),
       disposeEffort,
       disposeDepth,
+      disposeHeap,
       () => {
         try {
           disposeProjectRoot?.()
