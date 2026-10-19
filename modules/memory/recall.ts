@@ -25,6 +25,7 @@ import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { MEMORY_KINDS, MEMORY_SCOPES } from '../../kernel/abi/index.js'
 import type { RetrievePorts, RetrieveQuery, RetrieveResult } from './retrieve.js'
 import { isoUtc, retrieve } from './retrieve.js'
+import { stageLabel } from './lifecycle.js'
 import { asUsageStore } from './store.js'
 
 export const RECALL_TOOL = 'omb_recall'
@@ -410,8 +411,9 @@ export function createRecallTool(deps: MemoryToolDeps): ToolDefinition {
       // ① 常驻预算总共 120 字符，推理那条已占 104，新增段要么截断它、要么抬高全体成本；
       // ② 工具描述与能力**同处一个清单**，模型在考虑用哪些工具时正好读到它；
       // ③ 常驻提示必须逐字节稳定（否则整个前缀缓存失效），做成"按需出现"反而更贵。
-      '当问题涉及"之前/上次、讨论/做过的、我的（偏好）、纠错"，或当前任务可能为过去某次工作的延续时，先查这里的跨会话既往结论再回答。' +
-      '从记忆库召回相关的既往结论/偏好/经验，逐字返回并附溯源（sourceRef 与 observedAt），便于判断证据新旧。' +
+      '当问题涉及"之前/上次、讨论/做过的、我的（偏好）、纠错"，或当前任务可能为过去某次工作的延续时，先查这里的跨会话既往结论再回答。'
+      + '写新结论前先查重；纠正旧结论时先召回旧条目，再用 omb_remember(supersedes) 更正。'
+      + '从记忆库召回相关的既往结论/偏好/经验，逐字返回并附溯源（sourceRef 与 observedAt），便于判断证据新旧。' +
       '已被推翻的条目不作为有效结论注入；若存在这类候选，回执会列出 id——那是历史痕迹，追溯用 omb_relate。' +
       '需要多跳关联（这条结论被谁取代、还有哪些冲突）时也用 omb_relate。',
     parameters,
@@ -569,7 +571,7 @@ function itemHeader(item: RetrieveResult['items'][number]): string {
   if (item.channels.includes('graph')) signals.push('1-hop 关联（弱）')
   const signalText = signals.length === 0 ? '信号 未测' : `信号 ${signals.join(' / ')}`
   return (
-    `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · observedAt=${formatTime(item.observedAt)}` +
+    `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · 阶段 ${stageLabel(item.lifecycle)} · observedAt=${formatTime(item.observedAt)}` +
     ` · 融合分 ${item.score.toFixed(4)}（仅排序，不是相关度） · ${signalText} · 通道 ${channels}` +
     ` · sourceRef=${item.sourceRef}` +
     validityMark(item.supersededBy, item.validTo)

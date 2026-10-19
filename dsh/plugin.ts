@@ -57,6 +57,7 @@ import { STORAGE_HOST_SERVICE, createStorageHost } from './stores.js'
 import { createPressureBridge } from './pressure.js'
 import { createProjectRootResolver } from './project-root.js'
 import { createProjectProfile } from './project-profile.js'
+import { createProjectEvidence } from './project-evidence.js'
 import { registerDepthCommand } from './depth-command.js'
 import { registerHeapCommand } from './heap-command.js'
 import { wireReasoningEffort } from './reasoning-effort.js'
@@ -172,6 +173,35 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   } catch (error) {
     logger.warn(`OMB：项目画像服务注册失败——${String(error)}（omb_project 将只给记忆、无画像）`)
   }
+  /**
+   * 项目证据账本（v4.5.3 审查第 5 点）：把"最近一次构建/测试过没过"接进 `omb_project`。
+   *
+   * 只订阅 `tool/result/observed`（dsh 亲眼看到的结果）；项目根经
+   * `SERVICES.activeSession` + 同一个 `projectRoot` 解析，子目录会话不会另算一个项目。
+   */
+  const projectEvidence = createProjectEvidence({
+    clock,
+    resolveRoot: sessionId => {
+      try {
+        const sessions = handle.kernel.service<{ cwd(session?: string): string | null }>(SERVICES.activeSession)
+        const cwd = sessions?.cwd(sessionId)
+        return cwd === null || cwd === undefined || cwd.length === 0
+          ? undefined
+          : projectRoot.port.resolve(cwd)
+      } catch {
+        return undefined
+      }
+    },
+  })
+  let disposeProjectEvidence: (() => void) | undefined
+  try {
+    disposeProjectEvidence = handle.kernel.provide(SERVICES.projectEvidence, projectEvidence.port)
+  } catch (error) {
+    logger.warn(`OMB：项目证据服务注册失败——${String(error)}（omb_project 不会显示构建/测试证据）`)
+  }
+  const disposeEvidenceEvents = handle.kernel.on('tool/result/observed', payload => {
+    projectEvidence.port.record(payload)
+  })
   // ── 会话状态机（R10）：共享状态服务 + edit 守卫 ─────────────────────────
   //
   // 宿主 `workspace-changes` 已在本 profile 运行（520 事件 / 27 会话）：状态机的
@@ -431,6 +461,15 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     const steps: readonly (() => void)[] = [
       disposeGuard,
       disposeEvents,
+      disposeEvidenceEvents,
+      () => projectEvidence.dispose(),
+      () => {
+        try {
+          disposeProjectEvidence?.()
+        } catch {
+          // H-1：注销失败不向宿主传播（内核注销时也会清理服务表）
+        }
+      },
       () => sessionState.dispose(),
       disposeEffort,
       disposeDepth,

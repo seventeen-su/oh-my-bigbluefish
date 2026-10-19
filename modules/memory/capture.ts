@@ -44,6 +44,7 @@
 import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../../kernel/abi/index.js'
 import { contentHashOf, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
+import { detectProactiveCue } from './proactive.js'
 
 export { hasSecret } from './secrets.js'
 
@@ -371,6 +372,10 @@ export interface Capture {
     readonly at: number
   }) => Promise<void>
   readonly onTurnEnd: (payload: { readonly sessionId: string; readonly turn: number }) => Promise<void>
+  /** 当前用户消息触发的主动性提示（易变上下文；无信号时 undefined）。 */
+  readonly nudge: (sessionId: string) => string | undefined
+  /** 显式清除某会话的主动性提示（回合结束/用户消息无信号时）。 */
+  readonly clearNudge: (sessionId: string) => void
   readonly stats: () => CaptureStats
   /** 预热会话状态（turn/start）：不清空已捕获的计数——同一会话跨回合。 */
   readonly warm: (sessionId: string) => void
@@ -403,6 +408,26 @@ export function createCapture(ports: CapturePorts): Capture {
   }
   /** pending 全局计数（stats.pending 每次读快照；不靠遍历会话求和）。 */
   let globalPending = 0
+  /**
+   * 主动性提示：每会话一条，命中即覆盖、回合结束清空。
+   *
+   * 有界（最多 64 会话）：它只服务当前对话，不需要跨会话保留。
+   */
+  const nudges = new Map<string, string>()
+  const MAX_NUDGE_SESSIONS = 64
+
+  const clearNudge = (sessionId: string): void => {
+    nudges.delete(sessionId)
+  }
+
+  const setNudge = (sessionId: string, text: string): void => {
+    if (nudges.size >= MAX_NUDGE_SESSIONS && !nudges.has(sessionId)) {
+      const oldest = nudges.keys().next().value
+      if (oldest !== undefined) nudges.delete(oldest)
+    }
+    nudges.delete(sessionId)
+    nudges.set(sessionId, text)
+  }
 
   const stateOf = (sessionId: string): SessionCaptureState => {
     const existing = states.get(sessionId)
@@ -683,6 +708,10 @@ export function createCapture(ports: CapturePorts): Capture {
 
   return {
     async onUserMessage(payload) {
+      // 主动性提示与自动捕获解耦：即使偏好捕获被关闭/失败，提示仍按用户消息更新。
+      const cue = detectProactiveCue(payload.text)
+      if (cue === null) clearNudge(payload.sessionId)
+      else setNudge(payload.sessionId, cue.text)
       try {
         await capturePreference(payload)
       } catch (error) {
@@ -755,6 +784,8 @@ export function createCapture(ports: CapturePorts): Capture {
     },
     async onTurnEnd(payload) {
       try {
+        // 主动性提示只服务当前回合；回合结束即清，避免下一轮还在念叨上一轮的话。
+        clearNudge(payload.sessionId)
         // v4.1 生命周期：回合结束仍未等到结果的 pending 一律丢弃并计 unconfirmed。
         // 跨回合结果本就不可靠配对；留在表里只会在下一回合再数一次。
         const pendingState = states.get(payload.sessionId)
@@ -804,6 +835,8 @@ export function createCapture(ports: CapturePorts): Capture {
       pending: globalPending,
       skipped: { ...stats.skipped },
     }),
+    nudge: (sessionId: string) => nudges.get(sessionId),
+    clearNudge,
     warm(sessionId) {
       stateOf(sessionId)
     },

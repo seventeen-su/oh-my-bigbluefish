@@ -2,7 +2,7 @@
  * 3.7-M1：记忆模块的常驻提示。
  *
  * 三条判据：
- * ① 提示 ≤24 字符（常驻总预算 120，推理用短变体后余量足够）；
+ * ① 提示 ≤40 字符（常驻总预算 120，推理用短变体后余量足够）；
  * ② **逐字节稳定**（它进静态前缀，任何跨轮变化都会让缓存失效）；
  * ③ 与推理模块短变体合计 ≤ `RESIDENT_HINT_MAX`；关掉配置时服务不存在（回滚开关）。
  */
@@ -60,14 +60,14 @@ function fakeKernel(): FakeKernel {
 }
 
 describe('常驻提示（3.7-M1）', () => {
-  it('≤24 字符、不含易变内容（时间/计数/会话 id）、逐字节稳定', () => {
-    expect(MEMORY_RESIDENT_HINT.length).toBeLessThanOrEqual(24)
+  it('≤40 字符、不含易变内容（时间/计数/会话 id）、逐字节稳定', () => {
+    expect(MEMORY_RESIDENT_HINT.length).toBeLessThanOrEqual(40)
     expect(MEMORY_RESIDENT_HINT).not.toMatch(/\d{4}-\d{2}-\d{2}|#\d+|session:/)
     // 常量本身就是"稳定"的证据：两次读同一常量逐字节相同
     expect(MEMORY_RESIDENT_HINT).toBe(MEMORY_RESIDENT_HINT)
   })
 
-  it('与推理短变体合计 ≤120 字符（推理 71 + 记忆 ≤24）', () => {
+  it('与推理短变体合计 ≤120 字符（推理 71 + 记忆 ≤40）', () => {
     const reasoning = reasoningResidentHint(71)
     expect(reasoning.length).toBeLessThanOrEqual(71)
     const total = `${reasoning}\n${MEMORY_RESIDENT_HINT}`.length

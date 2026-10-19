@@ -33,6 +33,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
 import { asOverturnedProbe, type OverturnedHit } from './overturned.js'
+import { stageOfMemory, type LifecycleStage } from './lifecycle.js'
 import { RELATED_EDGE } from './link.js'
 import {
   LEXICAL_QUANTILE_INITIAL,
@@ -253,6 +254,8 @@ export interface RetrievedItem {
   readonly scope: MemoryScope
   readonly kind: MemoryKind
   readonly assertedBy: AssertedBy
+  /** v4.6.0：由 kind + assertedBy 推导的知识阶段（不据召回次数自动晋升）。 */
+  readonly lifecycle: LifecycleStage
   readonly project: string | null
   readonly validTo: number | null
   readonly supersededBy: string | null
@@ -1012,6 +1015,7 @@ function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
     scope: record.scope,
     kind: record.kind,
     assertedBy: record.assertedBy,
+    lifecycle: stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy }),
     project: record.project,
     validTo: record.validTo,
     supersededBy: record.supersededBy,
@@ -1088,6 +1092,7 @@ async function expandRelatedItems(
         scope: record.scope,
         kind: record.kind,
         assertedBy: record.assertedBy,
+        lifecycle: stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy }),
         project: record.project,
         validTo: record.validTo,
         supersededBy: record.supersededBy,

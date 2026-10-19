@@ -93,10 +93,12 @@ export function rememberTurn(
  *   的使用率只有 27/391 会话；而修这条不需要第二个常驻段——推理模块换短变体后
  *   （71 字符）余量足够放下这一句；
  * - 常驻预算 120 字符是**所有模块合计**（`kernel/abi/host.ts:110-122`），
- *   所以这句必须 ≤24 字符且**逐字节稳定**（进静态前缀，跨轮不变才能保缓存）；
+ *   所以这句必须 ≤40 字符且**逐字节稳定**（进静态前缀，跨轮不变才能保缓存）；
+ * - v4.5.3 起同时点"写"：用户要的是模型**主动**记忆/管理，而不是等用户提醒；
+ *   逐条触发条件放在易变 `context` 槽（见 `proactive.ts`），不塞进常驻。
  * - 只点"何时用"，不承诺返回什么（与 `omb_recall` 描述同一分工）。
  */
-export const MEMORY_RESIDENT_HINT = '跨会话结论用 omb_recall 查'
+export const MEMORY_RESIDENT_HINT = '长期偏好/决定主动 omb_remember；跨会话结论先 omb_recall'
 
 /**
  * 提示贡献的服务名。
@@ -1260,6 +1262,26 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           },
           // v4.1 §3.1：项目根解析与记忆库共用同一闭包
           projectRoot: projectRootOf,
+          /**
+           * v4.5.3 第 5 点：把 dsh 亲眼看过的构建/测试结果接进 L1。
+           * 服务缺席 = 未接线（渲染会明说），不是"0 条=没有失败"。
+           */
+          evidence: root => {
+            const port = kernel.service<{
+              snapshot(projectRoot: string): readonly {
+                readonly kind: string
+                readonly command: string
+                readonly ok: boolean
+                readonly at: number
+              }[]
+            }>(SERVICES.projectEvidence)
+            if (port === undefined) return undefined
+            try {
+              return port.snapshot(root)
+            } catch {
+              return undefined
+            }
+          },
           profile: () => {
             const port = kernel.service<ProjectProfilePort>(SERVICES.projectProfile)
             if (port === undefined) return undefined
@@ -1300,7 +1322,16 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
        * 配置 `residentHint:false` 时不注册（回滚开关），行为回到 3.6。
        */
       const offPrompt = config.residentHint
-        ? kernel.provide(PROMPT_SERVICE, { id: MODULE_ID, resident: MEMORY_RESIDENT_HINT })
+        ? kernel.provide(PROMPT_SERVICE, {
+            id: MODULE_ID,
+            resident: MEMORY_RESIDENT_HINT,
+            /**
+             * 主动性提示（易变槽）：只在用户消息命中明确信号时给一行，
+             * 回合结束/下一条无信号消息即清。**不放进 resident**——它每轮可变，
+             * 进静态前缀会破坏缓存。
+             */
+            context: (input: { readonly sessionId: string }) => capture.nudge(input.sessionId) ?? '',
+          })
         : () => {}
       // 打开是异步的，但注册已经全部完成——这里只填内部状态（H-2）。
       // `start()` 内部吞掉一切异常，`.catch` 只是防止未来的改动引入 unhandled rejection。

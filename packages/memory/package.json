@@ -1,15 +1,15 @@
 {
   "name": "@omb/memory",
-  "version": "4.5.3",
+  "version": "4.6.0",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — dual-store long-term memory with admission control, verbatim recall, multi-hop relations, and forgetting.",
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g99/index.js",
+  "main": "./lib-gen/g102/index.js",
   "exports": {
-    ".": "./lib-gen/g99/index.js",
+    ".": "./lib-gen/g102/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"

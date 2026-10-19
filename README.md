@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.4 · 4.5.3)
+# Oh-My-BigBlueFish (OMB v4.6 · 4.6.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -7,16 +7,17 @@ DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按
 `omb_project` 的 L0–L5 分层快照）；v4.2 把写可见性补到 shell、其他会话/子代理与规则文件；
 v4.3 把内存增长点有界化并补跨模块导入图；v4.4 把版本号改为 **x1.x2.x3**（大版本 / 功能更新 / 修复），
 并购入路径别名/文件级依赖/近似调用图、shell 推断写与冲突材料包；v4.5.3 修复依赖态、
-heap 取证与捕获/守卫的四类审查问题。详见
+heap 取证与捕获/守卫；v4.6.0 提高**主动记忆**积极性、给记忆加**生命周期阶段**并把构建/测试运行证据接进项目地图。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
 [`docs/v4.3-bounded-and-imports.md`](docs/v4.3-bounded-and-imports.md)、
-[`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md) 与
-[`docs/v4.5.3-review-fixes.md`](docs/v4.5.3-review-fixes.md)。
+[`docs/v4.4-versioning-alias-and-oom.md`](docs/v4.4-versioning-alias-and-oom.md)、
+[`docs/v4.5.3-review-fixes.md`](docs/v4.5.3-review-fixes.md) 与
+[`docs/v4.6.0-proactive-memory-and-evidence.md`](docs/v4.6.0-proactive-memory-and-evidence.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 79 小功能 → 4.5.3**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 82 小功能 → 4.6.0**。
 
 ## v4.4 结构（2026-10）
 
@@ -29,7 +30,7 @@ heap 取证与捕获/守卫的四类审查问题。详见
 | **诊断层** | `omb_status`：压力/cache/压缩/工具调用/收益读数 + 状态机守卫计数（拒写/盲写/无法核验/shell/其他会话）+ **进程内存 rss/heap/uptime**，带来源与时间 | 仅人工/按需 |
 
 v4.4 的关键变化（与 v4.3 的差别）：**版本号由 `version-manifest.json` 实际计算**
-（`scripts/version.mjs`，当前 24 功能 / 79 小功能 → 4.5.3）、**导入图支持 tsconfig 别名 +
+（`scripts/version.mjs`，当前 24 功能 / 82 小功能 → 4.6.0）、**导入图支持 tsconfig 别名 +
 文件级边 + 近似调用边**、**shell 未知写按 git status 差分推断**、**守卫拒绝时写 base/current
 冲突材料包**、**OOM 取证脚本与证据结论**。
 

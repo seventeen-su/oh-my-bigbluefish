@@ -41,6 +41,8 @@ import type {
 import { MEMORY_KINDS, MEMORY_SCOPES, RESERVED_SOURCE_PREFIX, SCOPE_BY_KIND } from '../../kernel/abi/index.js'
 import type { ToolCallContext } from '../../kernel/sessionRuntime.js'
 import { hasSecret } from './secrets.js'
+import { stageOfMemory } from './lifecycle.js'
+import type { LifecycleStage } from './lifecycle.js'
 import type { SessionWitnessPort } from './witness.js'
 
 /** 工具名 = `MODULE_CATALOG` 里 `omb-memory` 的 tools 之一（目录是唯一契约）。 */
@@ -372,7 +374,7 @@ function hasReadableContent(text: string): boolean {
  * 被拦下的条目不会丢弃，而是降级为 `episodic` 事件并给出可读原因——
  * 保留事实，不保留未经确认的层级。
  */
-export type LifecycleStage = 'event' | 'confirmed' | 'experience'
+export type { LifecycleStage } from './lifecycle.js'
 
 export interface LifecycleDecision {
   readonly kind: MemoryKind
@@ -381,12 +383,6 @@ export interface LifecycleDecision {
   readonly downgradedFrom?: MemoryKind
   /** 未降级为 null。 */
   readonly reason: string | null
-}
-
-function stageOfKind(kind: MemoryKind): LifecycleStage {
-  if (kind === 'semantic') return 'confirmed'
-  if (kind === 'procedural') return 'experience'
-  return 'event'
 }
 
 export function decideLifecycle(input: {
@@ -406,7 +402,16 @@ export function decideLifecycle(input: {
         + '先按事件记录，待用户确认或重复验证后再升级。',
     }
   }
-  return { kind: input.kind, stage: stageOfKind(input.kind), reason: null }
+  const assertedBy = input.ground === 'user-declared'
+    ? 'user'
+    : input.ground === 'execution-confirmed'
+      ? 'execution'
+      : 'model'
+  return {
+    kind: input.kind,
+    stage: stageOfMemory({ kind: input.kind, assertedBy }),
+    reason: null,
+  }
 }
 
 /**
@@ -1122,8 +1127,9 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
   return {
     name: REMEMBER_TOOL,
     description:
-      '将值得记住的内容写入记忆库（逐字原文+溯源）。仅在满足准入时写入：用户原话、可由工件（文件/命令/URL/提交）复现的事实、'
-      + '或执行结果确认的结论；模糊印象会被拒绝并给出原因。即时生效。',
+      '用户表达长期偏好/决定、纠正旧结论、或你得到可复用结论时**主动调用**，不要等用户提醒。'
+      + '将值得记住的内容写入记忆库（逐字原文+溯源）。仅在满足准入时写入：用户原话、可由工件（文件/命令/URL/提交）复现的事实、'
+      + '或执行结果确认的结论；模糊印象会被拒绝并给出原因。纠正旧结论时先 omb_recall 查到旧 id，再用 supersedes 标注。即时生效。',
     parameters,
 
     async execute(args: unknown, call?: ToolCallContext): Promise<ToolOutcome> {

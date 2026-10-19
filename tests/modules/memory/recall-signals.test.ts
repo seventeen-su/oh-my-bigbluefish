@@ -23,6 +23,7 @@ function item(overrides: Partial<RetrieveResult['items'][number]>): RetrieveResu
     scope: 'user',
     kind: 'semantic',
     assertedBy: 'user',
+    lifecycle: 'confirmed',
     project: null,
     validTo: null,
     supersededBy: null,

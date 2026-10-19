@@ -37,6 +37,7 @@ import type {
 } from '../../kernel/abi/index.js'
 import { SERVICES } from '../../kernel/abi/index.js'
 import { isoUtc } from './retrieve.js'
+import { stageLabel, stageOfMemory } from './lifecycle.js'
 
 /** 工具名（目录白名单之外的新工具：3.7 Wave 2 经用户批准，工具面 10 → 11）。 */
 export const PROJECT_TOOL = 'omb_project'
@@ -144,8 +145,21 @@ export interface ProjectProfileGate {
   readonly command: string
 }
 
-/** 画像视图（v4.1 §3.2：结构化字段与 `text` 同源）。 */
-export interface ProjectProfileView {
+/**
+ * 项目运行证据（v4.5.3 审查第 5 点；由 `dsh/project-evidence.ts` provide）。
+ *
+ * 与静态画像的区别：画像说"项目长什么样"，证据说"最近一次测试过没过"。
+ */
+export interface ProjectEvidenceView {
+  readonly kind: string
+  readonly command: string
+  readonly ok: boolean
+  readonly at: number
+  /** 同一命令此前失败、这次成功 → 修复已验证（只是证据标记）。 */
+  readonly verifiedFix?: boolean
+}
+
+/** 画像视图（v4.1 §3.2：结构化字段与 `text` 同源）。 */export interface ProjectProfileView {
   readonly text: string
   readonly generatedAt: number
   readonly gitHead?: string
@@ -221,6 +235,11 @@ export interface ProjectToolDeps {
   ) => { readonly cwd?: string; readonly store?: MemoryStore } | undefined
   /** 画像服务（每次调用惰性解析：热插拔可能换实例/关闭）。 */
   readonly profile?: () => ProjectProfilePort | undefined
+  /**
+   * 项目运行证据（v4.5.3 审查第 5 点）：最近构建/测试/类型检查等结果。
+   * 缺省 = 未接线（渲染明确写"证据未接线"，不冒充"没有失败"）。
+   */
+  readonly evidence?: (root: string) => readonly ProjectEvidenceView[] | undefined
   /** 会话/工作区状态（v4.1 §3.3；缺省 = 状态未知）。 */
   readonly situation?: (sessionId?: string) => SessionSituationView | undefined
   /** 隐私读许可（v4.1 §5）。缺省 = 可读（服务缺席）；抛错 = 判定失败 → 视为不可读。 */
@@ -468,6 +487,35 @@ function renderStructure(view: ProjectProfileView | undefined, missingReason: st
   return joinParts(parts)
 }
 
+const EVIDENCE_KIND_LABEL: Readonly<Record<string, string>> = {
+  test: '测试',
+  build: '构建',
+  typecheck: '类型',
+  lint: 'Lint',
+  verify: '验收',
+  install: '安装',
+}
+
+/**
+ * L1 的运行证据行（v4.5.3 第 5 点）。
+ *
+ * 三种说法必须分开：未接线 / 本进程暂无读数 / 有读数。前两者都不能写成
+ * "0 条证据"——那会被读成"没有失败"。
+ */
+export function renderProjectEvidence(
+  evidence: readonly ProjectEvidenceView[] | undefined,
+  now: number,
+): string {
+  if (evidence === undefined) return '证据未接线（项目证据服务未注册——不是"没有运行证据"）'
+  if (evidence.length === 0) return '本进程暂无构建/测试读数（不是"没跑过"）'
+  const parts = evidence.slice(0, 3).map(entry => {
+    const label = EVIDENCE_KIND_LABEL[entry.kind] ?? entry.kind
+    const fix = entry.verifiedFix === true ? '（修复已验证）' : ''
+    return `${label}${entry.ok ? '✅' : '❌'} ${clip(entry.command, 28)}${fix} ${describeAge(now, entry.at)}`
+  })
+  return `证据：${parts.join('；')}`
+}
+
 /** L2 空间状态：epoch、脏文件数、外部改动、读取印记、守卫计数。 */
 function renderSpace(situation: SessionSituationView | undefined): string {
   if (situation === undefined) return '状态未知（会话状态机未接线或无快照）'
@@ -541,7 +589,8 @@ function renderIntent(situation: SessionSituationView | undefined, sessionId: st
 /** 一条项目记忆的摘要行（时间/类型/摘要；带 id 便于后续 relate/forget）。 */
 function memoryLine(rank: number, record: MemoryRecord, now: number): string {
   const kind: MemoryKind = record.kind
-  return `[${rank}] ${isoUtc(record.observedAt)}（${describeAge(now, record.observedAt)}） · ${kind} · id=${record.id} · ${clip(record.text, MAX_MEMORY_CHARS)}`
+  const stage = stageLabel(stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy }))
+  return `[${rank}] ${isoUtc(record.observedAt)}（${describeAge(now, record.observedAt)}） · ${kind}/${stage} · id=${record.id} · ${clip(record.text, MAX_MEMORY_CHARS)}`
 }
 
 /** 关联边计数（top 3 的 1-hop related；失败返回 undefined = 未统计，不写 0）。 */
@@ -695,13 +744,31 @@ export function createProjectTool(deps: ProjectToolDeps): ToolDefinition {
           }
         }
 
+        /**
+         * 运行证据（v4.5.3 第 5 点）：项目根为键，读最近构建/测试结果。
+         * 没有根 / 没接线 → undefined，渲染时明确写"未接线"，不写"0 条=没有失败"。
+         */
+        let evidence: readonly ProjectEvidenceView[] | undefined
+        if (root !== undefined && deps.evidence !== undefined) {
+          try {
+            evidence = deps.evidence(root)
+          } catch {
+            evidence = undefined
+          }
+        }
+
         const layers: Layer[] = [
           {
             index: 0,
             title: LAYER_TITLES[0] as string,
             body: renderIdentity({ root, cwd, view, now, profileMissingReason }),
           },
-          { index: 1, title: LAYER_TITLES[1] as string, body: renderStructure(view, profileMissingReason) },
+          {
+            index: 1,
+            title: LAYER_TITLES[1] as string,
+            // 结构与运行证据并排：地图不是"只有边"，还要回答"最近一次过没过"。
+            body: joinParts([renderStructure(view, profileMissingReason), renderProjectEvidence(evidence, now)]),
+          },
           { index: 2, title: LAYER_TITLES[2] as string, body: renderSpace(situation) },
           { index: 3, title: LAYER_TITLES[3] as string, body: renderTime(situation, sessionId) },
           {

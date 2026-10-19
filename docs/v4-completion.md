@@ -272,3 +272,47 @@
 - 测试：`tests/dsh/heap-snapshot.test.ts`（新增）、`tests/dsh/status-diagnostics.test.ts`、
   `tests/dsh/state-machine.test.ts`、`tests/modules/memory/capture.test.ts`、
   `tests/modules/profile/storage.test.ts`
+
+---
+
+# OMB v4.6.0 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.6.0**（`24 功能 / 82 小功能`，由 `version-manifest.json` 计算；x2 功能更新） |
+| 构建 | **g102**；`generation: 102`、`outDir: lib-gen/g102`、`builtAt: 2026-10-19T17:48:03Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **114 files / 1374 passed | 1 skipped**；`build` 成功（g102）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 102/102、版本 4.6.0；`omb_project` L1 出现"证据："行、L4 行含阶段；用户说"记住…"后下一轮出现主动提示 |
+
+## 本版内容
+
+1. **主动记忆（用户新增需求）**：
+   - 常驻提示改为 `长期偏好/决定主动 omb_remember；跨会话结论先 omb_recall`（≤40 字符，合计预算内）；
+   - `omb_remember`/`omb_recall` 描述把触发条件前置；
+   - `modules/memory/proactive.ts` 识别"显式要求记住/纠正旧结论/项目决定/长期偏好"，
+     通过 `prompt:omb-memory` 的**易变 context 槽**给一行提示；回合结束清空。
+2. **项目运行证据（审查第 5 点）**：
+   - `dsh/project-evidence.ts` + `SERVICES.projectEvidence`：记录 dsh 亲眼看到的
+     build/test/typecheck/lint/verify/install 结果；落盘 `.omb/evidence.json`、
+     凭据脱敏、同一命令失败→成功标"修复已验证"；
+   - `omb_project` L1 与结构并排显示"证据："行；未接线/暂无读数/有读数三种说法分开。
+3. **审查 1–4 的修复**保持 v4.5.3 内容不变（依赖态、heap 取证、capture、守卫）。
+4. **知识生命周期阶段**：`modules/memory/lifecycle.ts` 按 `kind + assertedBy` 推导
+   事件/候选/已确认/经验；召回回执与 `omb_project` L4 展示阶段；`useCount`/召回次数
+   不参与推导，没有自动晋升路径。
+
+详见 `docs/v4.6.0-proactive-memory-and-evidence.md`。第 6 点的用户显式晋升命令与
+第 7 点 precision@k/排序对照实验仍未做；第 5 点的故障复现与"已验证修复"自动关联、
+证据与具体节点映射也仍是下一阶段。
+
+## 文件
+
+- 新增：`modules/memory/proactive.ts`、`modules/memory/lifecycle.ts`、
+  `dsh/project-evidence.ts`、`tests/modules/memory/proactive.test.ts`、
+  `tests/modules/memory/lifecycle.test.ts`、`tests/dsh/project-evidence.test.ts`
+- 修改：`modules/memory/capture.ts`、`modules/memory/index.ts`、
+  `modules/memory/remember.ts`、`modules/memory/recall.ts`、`modules/memory/retrieve.ts`、
+  `modules/memory/project.ts`、`dsh/plugin.ts`、`kernel/abi/catalog.ts`
+- 版本：`version-manifest.json`（4.6.0 / 82 小功能）

@@ -344,6 +344,17 @@ export const SERVICES = {
    */
   projectProfile: 'omb:project-profile',
   /**
+   * **项目证据账本**（v4.5.3，`dsh/project-evidence.ts` provide）。
+   *
+   * 项目画像本身是**静态结构**（目录/导入/符号），它回答"项目长什么样"，
+   * 不回答"最近一次构建/测试/故障复现到底过没过"。这里由 `dsh/` 亲眼看过的
+   * 工具调用结果提供**运行证据**（命令、类别、成功/失败、时间、项目根），
+   * 供 `omb_project` 的 L1 把结构地图与真实结果并排显示。
+   *
+   * 取不到 = 明确写"证据未接线"，不得用"0 条"冒充"没有失败"。
+   */
+  projectEvidence: 'omb:project-evidence',
+  /**
    * **项目根解析**（`ProjectRootPort`，由 `dsh/project-root.ts` provide）。
    *
    * 为什么需要独立服务：记忆库按 cwd 开项目库，同一个 git 仓库从子目录启动的

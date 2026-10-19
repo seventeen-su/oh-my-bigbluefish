@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.6.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,16 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.5.3（当前） = 七点审查修复**：
+- **v4.6.0（当前） = 主动记忆 + 项目运行证据**：
+  常驻提示同时点"写"（`长期偏好/决定主动 omb_remember；跨会话结论先 omb_recall`）；
+  `modules/memory/proactive.ts` 在用户消息命中"显式要求记住/纠正旧结论/项目决定/长期偏好"
+  时给一行易变提示（`prompt:omb-memory` 的 context 槽，回合结束清空）；
+  工具描述把触发条件前置。`dsh/project-evidence.ts` 记录由 `dsh/` 亲眼看到的
+  构建/测试/类型/Lint/验收结果，`SERVICES.projectEvidence` → `omb_project` L1 与结构并排；
+  未接线/暂无读数/有读数三种说法严格分开。`modules/memory/lifecycle.ts` 按
+  `kind + assertedBy` 推导阶段（事件/候选/已确认/经验），召回与 L4 展示阶段；
+  `useCount`/召回次数不参与推导，**没有自动晋升路径**。契约：`docs/v4.6.0-proactive-memory-and-evidence.md`。
+- **v4.5.3** = **七点审查修复**：
   依赖未挂载的模块（画像等）不得在 `omb_status` 显示"运行中"（内核账本现算覆盖 + 画像
   `availability()` 先探服务）；`scripts/heap-snapshot.ps1` 拆 `repro`/`early` 两种模式，
   保留并合并 `NODE_OPTIONS`、核对快照 PID 职责、磁盘检查/保留/敏感提示；进程内快照统一走

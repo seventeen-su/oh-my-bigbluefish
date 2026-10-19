@@ -221,6 +221,7 @@ describe('被推翻的结论：后续会话看得见', () => {
           scope: 'user',
           kind: 'semantic',
           assertedBy: 'model',
+          lifecycle: 'candidate',
           project: null,
           validTo: 2,
           supersededBy: 'mem_live',

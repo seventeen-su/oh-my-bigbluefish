@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.5.3 = 七点审查修复（依赖态/取证/捕获/守卫）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.6.0 = 主动记忆 + 知识生命周期 + 项目运行证据（x2 功能更新）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -10,7 +10,9 @@
         "偏好/决定自动捕获",
         "项目活动捕获",
         "会话结果捕获",
-        "去重与每会话上限"
+        "去重与每会话上限",
+        "主动记忆提示与更正引导",
+        "知识生命周期阶段展示"
       ]
     },
     {
@@ -21,7 +23,8 @@
         "确定性项目画像",
         "omb_project 入口",
         "缓存与显式刷新",
-        "项目记忆 top3"
+        "项目记忆 top3",
+        "构建/测试运行证据"
       ]
     },
     {
@@ -250,5 +253,5 @@
       ]
     }
   ],
-  "version": "4.5.3"
+  "version": "4.6.0"
 }

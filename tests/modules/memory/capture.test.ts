@@ -426,4 +426,19 @@ describe('生命周期（v4.1 §3.5）', () => {
     expect(f.capture.stats().pending).toBe(0)
     await f.close()
   })
+
+  it('主动性提示：命中用户信号时给一行，普通消息/回合结束清空', async () => {
+    const f = captureFixture()
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后都用 pnpm。', at: 1 })
+    expect(f.capture.nudge('s1')).toContain('omb_remember')
+    // 下一条普通消息覆盖（不继续念叨上一条）
+    await f.capture.onUserMessage({ sessionId: 's1', text: '好的，继续。', at: 2 })
+    expect(f.capture.nudge('s1')).toBeUndefined()
+    // 再命中后，回合结束清空
+    await f.capture.onUserMessage({ sessionId: 's1', text: '之前说的方案不对，改成 B。', at: 3 })
+    expect(f.capture.nudge('s1')).toContain('supersedes')
+    await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
+    expect(f.capture.nudge('s1')).toBeUndefined()
+    await f.close()
+  })
 })
