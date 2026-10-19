@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.2**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,11 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.1（当前） = 冲突提示的语义通道（4.9.0 功能收尾，x3）**：`link.ts` 的
+- **v4.9.2（当前） = 检索命中排名读数（x3）**：`usageTracker` 按召回顺序记曝光排名；
+  `used_tool` 命中时统计使用命中的 @1/@3/@5 分布（同一 id 取最好排名，分母是使用命中数）；
+  健康面 `retrieval.ranked/precisionAt1/3/5` + `retrievalRankNote()`（无读数不写）。
+  契约：`docs/v4.9.2-retrieval-precision.md`。
+- **v4.9.1** = 冲突提示的语义通道（4.9.0 功能收尾，x3）：`link.ts` 的
   `findSemanticRelated` 在**有嵌入器**时用向量通道补充没有共享实体键的活跃条目
   （归属由库校验，跨空间不召回）；装配层先词法后语义、按 id 去重、最多 3 条，
   无嵌入器/无向量/异常时静默退回词法；回执标注判据通道（词法/语义）。

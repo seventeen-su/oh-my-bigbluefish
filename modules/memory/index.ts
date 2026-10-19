@@ -513,6 +513,24 @@ export function confirmHealthNote(confirm: ConfirmLedger | undefined): string {
     + '）'
 }
 
+/**
+ * 使用命中时的曝光排名读数（v4.9.2）。
+ *
+ * 口径必须说清：分母是**使用命中数**（used_tool 归因成功、且能对上曝光记录的事件），
+ * 不是召回次数、也不是曝光条数。没有排名读数时一个字都不写（不印 "@1 0/0"）。
+ */
+export function retrievalRankNote(usage: {
+  readonly ranked?: number
+  readonly top1?: number
+  readonly top3?: number
+  readonly top5?: number
+} | undefined): string {
+  const ranked = usage?.ranked ?? 0
+  if (usage === undefined || ranked === 0) return ''
+  return `；命中排名：@1 ${usage.top1 ?? 0}/${ranked}、@3 ${usage.top3 ?? 0}/${ranked}` +
+    `、@5 ${usage.top5 ?? 0}/${ranked}（used_tool 归因，分母是使用命中数）`
+}
+
 async function describeHealth(
   service: MemoryStoresService,
   ledger: MemoryWriteLedger | undefined,
@@ -528,8 +546,15 @@ async function describeHealth(
     /** v4.8.0：候选确认读数（用户命令触发，模型无入口）。 */
     readonly confirm?: ConfirmLedger
     readonly floor?: { readonly q: number; readonly recalls: number; readonly precision: number | null; readonly mode: string }
-    /** v4.5.3 有效命中读数（曝光/使用来自 `used_tool` 实体键匹配，不是检索次数）。 */
-    readonly usage?: { readonly exposed: number; readonly used: number }
+    /** v4.5.3 有效命中读数；v4.9.2 增加使用命中时的曝光排名分布。 */
+    readonly usage?: {
+      readonly exposed: number
+      readonly used: number
+      readonly ranked?: number
+      readonly top1?: number
+      readonly top3?: number
+      readonly top5?: number
+    }
   },
 ): Promise<ModuleHealth> {
   const status = service.status()
@@ -661,6 +686,13 @@ async function describeHealth(
     metrics['retrieval.exposed'] = runtime.usage.exposed
     metrics['retrieval.used'] = runtime.usage.used
     metrics['retrieval.effectiveRate'] = Number((runtime.usage.used / runtime.usage.exposed).toFixed(3))
+    const ranked = runtime.usage.ranked ?? 0
+    if (ranked > 0) {
+      metrics['retrieval.ranked'] = ranked
+      metrics['retrieval.precisionAt1'] = Number(((runtime.usage.top1 ?? 0) / ranked).toFixed(3))
+      metrics['retrieval.precisionAt3'] = Number(((runtime.usage.top3 ?? 0) / ranked).toFixed(3))
+      metrics['retrieval.precisionAt5'] = Number(((runtime.usage.top5 ?? 0) / ranked).toFixed(3))
+    }
   }
 
   /**
@@ -733,6 +765,7 @@ async function describeHealth(
         : `；有效命中 ${runtime.usage.used}/${runtime.usage.exposed}`
           + `（${(runtime.usage.used / runtime.usage.exposed * 100).toFixed(1)}%；`
           + 'used_tool 实体键匹配，不是检索次数）'
+          + retrievalRankNote(runtime.usage)
   // v4.7.0：事件控制器的模式与执行结果必须在状态面可见，否则"接入了但没人知道"。
   // `execute` 与 `dry-run` 的文案必须不同：只改了计数却写"已执行"就是伪报。
   const controllerNote = controllerHealthNote(runtime?.capture?.controller)

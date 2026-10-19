@@ -132,7 +132,28 @@ describe('used_tool 隐式使用匹配（R9 C1）', () => {
     )
     expect(tracker.matchToolCall('s1', 'pwsh', '{"command":"pnpm test tests/modules/memory/store.test.ts"}')).toEqual(['m1'])
     expect(tracker.matchToolCall('s1', 'read', '{"path":"README.md"}')).toEqual([])
-    expect(tracker.stats()).toEqual({ exposed: 1, used: 1 })
+    expect(tracker.stats()).toEqual({ exposed: 1, used: 1, ranked: 1, top1: 1, top3: 1, top5: 1 })
+  })
+
+  it('使用命中时记录曝光排名（分母是使用命中数，不是召回次数）', () => {
+    const tracker = createUsageTracker()
+    // 一次召回 4 条，按排名顺序给
+    tracker.noteExposure('s1', [
+      { id: 'm1', text: '改 modules/memory/store.ts 与 tests/a.test.ts，跑 pnpm test' },
+      { id: 'm2', text: '临时笔记' },
+      { id: 'm3', text: 'modules/memory/feedback.ts 的二次确认' },
+      { id: 'm4', text: '另一个无关条目' },
+    ], NOW)
+    // 用的是排名第 3 的条目
+    expect(tracker.matchToolCall('s1', 'read', 'modules/memory/feedback.ts')).toEqual(['m3'])
+    expect(tracker.stats()).toMatchObject({ used: 1, ranked: 1, top1: 0, top3: 1, top5: 1 })
+
+    // 第二次命中排名第 1 的条目
+    expect(tracker.matchToolCall('s1', 'edit', 'modules/memory/store.ts tests/a.test.ts')).toEqual(['m1'])
+    expect(tracker.stats()).toMatchObject({ used: 2, ranked: 2, top1: 1, top3: 2, top5: 2 })
+    // 重复命中同一 id：排名取最好值，但每次命中都算一次 used
+    expect(tracker.matchToolCall('s1', 'edit', 'modules/memory/store.ts tests/a.test.ts')).toEqual(['m1'])
+    expect(tracker.stats()).toMatchObject({ used: 3, ranked: 3, top1: 2, top3: 3, top5: 3 })
   })
 
   it('单个足够长的路径键也算命中（短名不算）', () => {

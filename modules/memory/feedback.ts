@@ -316,17 +316,29 @@ interface Exposure {
   readonly memoryId: string
   readonly keys: readonly string[]
   readonly at: number
+  /** 本次召回里的排名（1 起；v4.9.2 的 precision@k 需要它）。 */
+  readonly rank: number
+}
+
+/** 使用命中时的曝光排名分布（只在 `used` 事件里统计，不把每次召回当分母）。 */
+export interface UsageRankStats {
+  /** 有排名可用的使用命中数（= used 里能对上曝光记录的部分）。 */
+  readonly ranked: number
+  /** 命中时排名 ≤1 / ≤3 / ≤5 的次数。 */
+  readonly top1: number
+  readonly top3: number
+  readonly top5: number
 }
 
 export interface UsageTracker {
-  /** 记一次召回曝光（每会话保留最近 `EXPOSURE_WINDOW` 条）。 */
+  /** 记一次召回曝光（每会话保留最近 `EXPOSURE_WINDOW` 条）；items 必须按召回顺序给。 */
   noteExposure(sessionId: string, items: readonly { readonly id: string; readonly text: string }[], at: number): void
   /**
    * 匹配一次工具调用：与最近曝光条目共享 ≥2 个实体键（或 1 个足够长的路径键）→ used。
    * 返回命中的 memory id（调用方负责写账本）。
    */
   matchToolCall(sessionId: string, tool: string, args: string): readonly string[]
-  stats(): { readonly exposed: number; readonly used: number }
+  stats(): { readonly exposed: number; readonly used: number } & UsageRankStats
   forget(sessionId: string): void
 }
 
@@ -341,6 +353,8 @@ export function createUsageTracker(): UsageTracker {
   const sessions = new Map<string, Exposure[]>()
   let exposed = 0
   let used = 0
+  /** v4.9.2：使用命中时的曝光排名分布（分母是 used，不是召回次数）。 */
+  const rankStats = { ranked: 0, top1: 0, top3: 0, top5: 0 }
   const stateOf = (sessionId: string): Exposure[] => {
     let list = sessions.get(sessionId)
     if (list === undefined) {
@@ -356,10 +370,10 @@ export function createUsageTracker(): UsageTracker {
   return {
     noteExposure(sessionId, items, at) {
       const list = stateOf(sessionId)
-      for (const item of items) {
-        list.push({ memoryId: item.id, keys: extractEntityKeys(item.text), at })
-        exposed += 1
-      }
+      items.forEach((item, index) => {
+        list.push({ memoryId: item.id, keys: extractEntityKeys(item.text), at, rank: index + 1 })
+      })
+      exposed += items.length
       while (list.length > EXPOSURE_WINDOW) list.shift()
     },
     matchToolCall(sessionId, tool, args) {
@@ -368,17 +382,27 @@ export function createUsageTracker(): UsageTracker {
       const haystack = `${tool} ${args}`
       const keys = extractEntityKeys(haystack)
       if (keys.length === 0) return []
-      const matched = new Set<string>()
+      // 同一个 id 可能在窗口里被多次曝光：取**最好（最小）排名**，
+      // 口径是"这条被用到时，它最好排在第几"——不把同一 id 的重复曝光算多次。
+      const bestRank = new Map<string, number>()
       for (const exposure of list) {
         if (exposure.keys.length === 0) continue
         const shared = sharedEntityKeys(exposure.keys, keys)
         const strongPath = shared.some(key => key.startsWith('path:') && key.length - 5 >= USED_LONE_KEY_MIN_CHARS)
-        if (shared.length >= USED_MIN_SHARED_KEYS || strongPath) matched.add(exposure.memoryId)
+        if (shared.length < USED_MIN_SHARED_KEYS && !strongPath) continue
+        const previous = bestRank.get(exposure.memoryId)
+        if (previous === undefined || exposure.rank < previous) bestRank.set(exposure.memoryId, exposure.rank)
       }
-      used += matched.size
-      return [...matched].sort()
+      used += bestRank.size
+      for (const rank of bestRank.values()) {
+        rankStats.ranked += 1
+        if (rank <= 1) rankStats.top1 += 1
+        if (rank <= 3) rankStats.top3 += 1
+        if (rank <= 5) rankStats.top5 += 1
+      }
+      return [...bestRank.keys()].sort()
     },
-    stats: () => ({ exposed, used }),
+    stats: () => ({ exposed, used, ...rankStats }),
     forget(sessionId) {
       sessions.delete(sessionId)
     },

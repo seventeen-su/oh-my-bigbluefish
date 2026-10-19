@@ -14,7 +14,7 @@
 import { describe, expect, it } from 'vitest'
 import { createKernel } from '../../../kernel/index.js'
 import type { MemoryStore, ModuleRegistration, ScoredHit, TaggedStore } from '../../../kernel/abi/index.js'
-import { createMemoryRegistration, confirmHealthNote, controllerHealthNote } from '../../../modules/memory/index.js'
+import { createMemoryRegistration, confirmHealthNote, controllerHealthNote, retrievalRankNote } from '../../../modules/memory/index.js'
 import type { ConfirmLedger } from '../../../modules/memory/index.js'
 import type { ControllerStats } from '../../../modules/memory/capture.js'
 import type { MemoryStoresService } from '../../../modules/memory/store.js'
@@ -245,6 +245,22 @@ describe('候选确认状态面：没按过命令就不写（v4.8.0 / v4.8.1）'
   it('没按过命令 / 未接线：一个字都不写', () => {
     expect(confirmHealthNote({ ...ledger, commands: 0 })).toBe('')
     expect(confirmHealthNote(undefined)).toBe('')
+  })
+})
+
+describe('检索命中排名：没有读数就不写（v4.9.2）', () => {
+  it('有排名读数才报 @1/@3/@5，且分母写明是使用命中数', () => {
+    const note = retrievalRankNote({ ranked: 4, top1: 2, top3: 3, top5: 4 })
+    expect(note).toContain('@1 2/4')
+    expect(note).toContain('@3 3/4')
+    expect(note).toContain('@5 4/4')
+    expect(note).toContain('分母是使用命中数')
+  })
+
+  it('ranked=0 / 未接线：不印 "@1 0/0"', () => {
+    expect(retrievalRankNote({ ranked: 0, top1: 0, top3: 0, top5: 0 })).toBe('')
+    expect(retrievalRankNote(undefined)).toBe('')
+    expect(retrievalRankNote({})).toBe('')
   })
 })
 

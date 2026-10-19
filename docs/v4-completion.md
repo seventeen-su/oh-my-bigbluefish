@@ -555,3 +555,37 @@
 
 - 语义相似不等于矛盾：提示仍由用户/模型判断是否 supersedes；
 - 向量通道依赖 `omb-memory-vector` 与已编码向量；未编码的近期条目不参与语义提示。
+
+---
+
+# OMB v4.9.2 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.2**（`24 功能 / 91 小功能`；x3 修复位：既有有效命中读数的细化，不是独立功能） |
+| 构建 | **g113**；`generation: 113`、`outDir: lib-gen/g113`、`builtAt: 2026-10-19T19:03:27Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **117 files / 1453 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 113/113、版本 4.9.2；记忆行在"有效命中"后出现"命中排名 @1/@3/@5"，分母写明是使用命中数 |
+
+## 本版内容（既有读数细化）
+
+1. `usageTracker` 按召回顺序记录曝光排名；`used_tool` 命中时统计**使用命中的曝光排名**，
+   同一 id 多次曝光取最好排名，分母是使用命中数（不是召回次数）。
+2. 健康面新增 `retrieval.ranked/precisionAt1/precisionAt3/precisionAt5`，
+   记忆行追加"命中排名 @1/@3/@5（used_tool 归因，分母是使用命中数）"。
+3. `ranked=0` / 未接线时一个字不写（不印 "@1 0/0"）；文案由 `retrievalRankNote()` 生成。
+
+详见 `docs/v4.9.2-retrieval-precision.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.2-retrieval-precision.md`
+- 修改：`modules/memory/feedback.ts`、`modules/memory/index.ts`、
+  `tests/modules/memory/{utility-ledger,status-honesty}.test.ts`、版本文件
+
+## 仍未做
+
+- 这不是标注集上的 precision@k：没有被人用到的召回不进入分母；
+- 只统计本进程，不做跨进程/跨模型对比实验。
