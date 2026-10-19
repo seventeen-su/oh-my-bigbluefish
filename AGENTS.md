@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.5**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.6**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,10 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.5（当前） = 命令简介精简与过程卡隐藏（x3）**：四个用户命令的简介改短、
+- **v4.9.6（当前） = 补齐深度与堆快照命令简介（x3）**：`/omb-depth` → 设置本会话的思考深度；
+  `/omb-heap` → 查看进程内存，可抓堆快照排查。六个用户命令简介统一为一行、无括号。
+  契约：`docs/v4.9.6-depth-heap-descriptions.md`。
+- **v4.9.5** = 命令简介精简与过程卡隐藏（x3）：四个用户命令的简介改短、
   去括号、说人话（只改 `description`，不动命令名与用法）；8 张过程卡 frontmatter 加
   `user-invocable: false`（模型技能，不再出现在用户斜杠菜单），并改名为
   `omb-depth/goal/options/testable/cite/failure/honesty/conflict`。

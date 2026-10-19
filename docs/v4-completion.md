@@ -703,3 +703,33 @@
 
 - 旧技能 id `omb-r1…r8` 不再存在（有意收口）；
 - 隐藏只影响用户菜单，模型技能目录仍可见（`modelInvocable` 保持 true）。
+
+---
+
+# OMB v4.9.6 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.6**（`24 功能 / 93 小功能`；x3 修复位：补齐 depth/heap 命令简介） |
+| 构建 | **g117**；`generation: 117`、`outDir: lib-gen/g117` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` 全量通过；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`/` 菜单六个命令简介为新文案；`omb_status` 构建 117/117、版本 4.9.6 |
+
+## 本版内容
+
+补齐上一版漏掉的两个用户命令简介（只改注册 description）：
+
+- `/omb-depth`：设置本会话的思考深度
+- `/omb-heap`：查看进程内存，可抓堆快照排查
+
+六个用户命令现在统一为一行、无括号、无实现细节：参数枚举在 `input.hint`，
+副作用（暂停事件循环、影响 reasoningEffort）留在回执与文档里。
+
+详见 `docs/v4.9.6-depth-heap-descriptions.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.6-depth-heap-descriptions.md`
+- 修改：`dsh/depth-command.ts`、`dsh/heap-command.ts`、`README.md`、`AGENTS.md`、版本文件

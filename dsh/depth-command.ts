@@ -80,7 +80,7 @@ export function registerDepthCommand(options: {
     const returned = commands.register({
       definitionId: DEPTH_COMMAND_ID,
       name: DEPTH_COMMAND_NAME,
-      description: '设置本会话推理深度（quick/standard/deep；影响真实 reasoningEffort，仅用户可用）',
+      description: '设置本会话的思考深度',
       input: { hint: '[quick | standard | deep]' },
       handler: invocation => {
         const sessionId = sessionOfInvocation(invocation)

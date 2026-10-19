@@ -1,6 +1,6 @@
 {
   "name": "@omb/plugin",
-  "version": "4.9.5",
+  "version": "4.9.6",
   "private": true,
   "engines": {
     "dsh": ">=0.2.0-rc.2 <=0.2.1-rc.2"

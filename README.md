@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.9.5)
+# Oh-My-BigBlueFish (OMB v4.9.6)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -19,7 +19,8 @@ v4.9.2 补上**检索命中排名读数**（使用命中时的 @1/@3/@5 分布�
 v4.9.3 给项目证据加**文件映射**（命令里提到的文件随证据落盘并在 L1 显示）；
 v4.9.4 补上**workspace 包导出映射**并完成**剩余项收口**（类型图/三方合并为设计不变量、
 OOM 为外部依赖、selfProtection 为用户设置）；
-v4.9.5 精简四个用户命令的简介、把 8 张过程卡标成**用户不可见**（不再出现在 `/` 菜单）。详见
+v4.9.5 精简四个用户命令的简介、把 8 张过程卡标成**用户不可见**（不再出现在 `/` 菜单）；
+v4.9.6 补齐 `/omb-depth` 与 `/omb-heap` 的简介，六个命令文案统一。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -35,11 +36,12 @@ v4.9.5 精简四个用户命令的简介、把 8 张过程卡标成**用户不�
 [`docs/v4.9.2-retrieval-precision.md`](docs/v4.9.2-retrieval-precision.md)、
 [`docs/v4.9.3-evidence-file-mapping.md`](docs/v4.9.3-evidence-file-mapping.md)、
 [`docs/v4.9.4-import-graph-package-exports.md`](docs/v4.9.4-import-graph-package-exports.md)、
-[`docs/v4.9.5-naming-cleanup.md`](docs/v4.9.5-naming-cleanup.md) 与
+[`docs/v4.9.5-naming-cleanup.md`](docs/v4.9.5-naming-cleanup.md)、
+[`docs/v4.9.6-depth-heap-descriptions.md`](docs/v4.9.6-depth-heap-descriptions.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 93 小功能 → 4.9.5**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 93 小功能 → 4.9.6**。
 
 ## v4.4 结构（2026-10）
 

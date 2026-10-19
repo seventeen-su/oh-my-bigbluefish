@@ -76,7 +76,7 @@ export function registerHeapCommand(options: {
     const returned = commands.register({
       definitionId: HEAP_COMMAND_ID,
       name: HEAP_COMMAND_NAME,
-      description: '进程内存读数；/omb-heap snapshot 写 V8 heap snapshot（会暂停事件循环，仅在取证时用）',
+      description: '查看进程内存，可抓堆快照排查',
       input: { hint: '[snapshot]' },
       handler: invocation => {
         const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput.trim().toLowerCase() : ''
