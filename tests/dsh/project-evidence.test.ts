@@ -1,10 +1,11 @@
 /**
- * 项目运行证据（v4.5.3 审查第 5 点）。
+ * 项目运行证据（v4.5.3 审查第 5 点；v4.6.1 修 P1 成功语义）。
  *
- * 判据：只记录 dsh 亲眼看到的、能归类的构建/测试结果；无法归属或无法分类的
- * 一律跳过并计数，不猜。`omb_project` 的 L1 用这些结果与静态结构并排。
+ * 关键判据：**工具没报错 ≠ 命令成功**。shell 工具对非零退出码通常仍返回
+ * `isError:false`，只在结果文本末尾附 `[exit code: N]`；证据必须解析该标记，
+ * 没有标记一律 unknown，不能显示成测试通过。
  */
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -13,6 +14,7 @@ import {
   classifyEvidenceCommand,
   createProjectEvidence,
   extractEvidenceCommand,
+  parseCommandOutcome,
   redactEvidenceCommand,
 } from '../../dsh/project-evidence.js'
 import { renderProjectEvidence } from '../../modules/memory/project.js'
@@ -37,27 +39,46 @@ describe('命令抽取与分类', () => {
   })
 })
 
+describe('命令结论解析：退出码而不是 isError', () => {
+  it('exit 0 → succeeded；非零 → failed；null/无标记 → unknown', () => {
+    expect(parseCommandOutcome('ok\n[exit code: 0]')).toEqual({ commandOutcome: 'succeeded', exitCode: 0 })
+    expect(parseCommandOutcome('fail\n[exit code: 2]')).toEqual({ commandOutcome: 'failed', exitCode: 2 })
+    expect(parseCommandOutcome('timeout\n[exit code: null]')).toEqual({ commandOutcome: 'unknown', exitCode: null })
+    // 关键：没有退出码标记时不能当成通过
+    expect(parseCommandOutcome('all tests passed')).toEqual({ commandOutcome: 'unknown' })
+    expect(parseCommandOutcome(undefined)).toEqual({ commandOutcome: 'unknown' })
+  })
+
+  it('被信号终止 → failed（exitCode null）', () => {
+    expect(parseCommandOutcome('killed\n[killed by signal: SIGKILL]')).toEqual({
+      commandOutcome: 'failed',
+      exitCode: null,
+    })
+  })
+})
+
 describe('证据账本', () => {
-  it('只记 shell 工具 + 已知结果；成功/失败都记，未知结果跳过', () => {
+  it('成功/失败/未知都记录，但未知不显示为通过；非 shell 工具跳过', () => {
     const ledger = createProjectEvidence({
       clock: fixedClock(),
       resolveRoot: () => '/repo',
       persist: false,
     })
-    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: true, at: 1 })
-    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: false, at: 2 })
-    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: undefined, at: 3 })
-    ledger.port.record({ sessionId: 's1', tool: 'edit', args: '{"command":"pnpm test"}', ok: true, at: 4 })
+    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'ok\n[exit code: 0]', at: 1 })
+    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'fail\n[exit code: 1]', at: 2 })
+    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'all passed', at: 3 })
+    ledger.port.record({ sessionId: 's1', tool: 'edit', args: '{"command":"pnpm test"}', text: 'ok\n[exit code: 0]', at: 4 })
     const entries = ledger.port.snapshot('/repo')
-    expect(entries).toHaveLength(2)
-    expect(entries[0]).toMatchObject({ kind: 'test', ok: false, at: 2 })
-    expect(entries[1]).toMatchObject({ kind: 'test', ok: true, at: 1 })
-    expect(ledger.port.stats()).toMatchObject({ recorded: 2, skipped: 2 })
+    expect(entries).toHaveLength(3)
+    expect(entries[0]).toMatchObject({ kind: 'test', commandOutcome: 'unknown', at: 3 })
+    expect(entries[1]).toMatchObject({ kind: 'test', commandOutcome: 'failed', exitCode: 1, at: 2 })
+    expect(entries[2]).toMatchObject({ kind: 'test', commandOutcome: 'succeeded', exitCode: 0, at: 1 })
+    expect(ledger.port.stats()).toMatchObject({ recorded: 3, skipped: 1 })
   })
 
   it('无法归属项目 → 跳过（不写进别的项目）', () => {
     const ledger = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => undefined, persist: false })
-    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: true, at: 1 })
+    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'ok\n[exit code: 0]', at: 1 })
     expect(ledger.port.snapshot('/repo')).toHaveLength(0)
     expect(ledger.port.stats().skipped).toBe(1)
   })
@@ -69,15 +90,15 @@ describe('证据账本', () => {
       resolveRoot: sessionId => roots.get(sessionId),
       persist: false,
     })
-    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: true, at: 1 })
-    ledger.port.record({ sessionId: 's2', tool: 'pwsh', args: '{"command":"pnpm test"}', ok: true, at: 2 })
+    ledger.port.record({ sessionId: 's1', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'ok\n[exit code: 0]', at: 1 })
+    ledger.port.record({ sessionId: 's2', tool: 'pwsh', args: '{"command":"pnpm test"}', text: 'ok\n[exit code: 0]', at: 2 })
     expect(ledger.port.snapshot('/repo')).toHaveLength(2)
     for (let index = 0; index < MAX_EVIDENCE_PER_PROJECT + 4; index += 1) {
       ledger.port.record({
         sessionId: 's1',
         tool: 'pwsh',
         args: '{"command":"pnpm test"}',
-        ok: true,
+        text: 'ok\n[exit code: 0]',
         at: 100 + index,
       })
     }
@@ -85,8 +106,8 @@ describe('证据账本', () => {
   })
 })
 
-describe('证据持久化与修复验证', () => {
-  it('失败证据落盘，进程重启后仍可见；同命令再成功 → 标记修复已验证', () => {
+describe('证据持久化、失败后恢复与损坏现场', () => {
+  it('失败证据落盘，重启后仍可见；紧邻失败后成功才标"失败后再次成功"', () => {
     const root = mkdtempSync(join(tmpdir(), 'omb-evidence-'))
     try {
       const first = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
@@ -94,24 +115,103 @@ describe('证据持久化与修复验证', () => {
         sessionId: 's1',
         tool: 'pwsh',
         args: JSON.stringify({ command: 'pnpm test' }),
-        ok: false,
+        text: 'fail\n[exit code: 1]',
         at: 1,
       })
       expect(existsSync(join(root, '.omb', 'evidence.json'))).toBe(true)
       first.dispose()
 
       const second = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
-      expect(second.port.snapshot(root)[0]).toMatchObject({ kind: 'test', ok: false })
+      expect(second.port.snapshot(root)[0]).toMatchObject({ commandOutcome: 'failed' })
       second.port.record({
         sessionId: 's1',
         tool: 'pwsh',
         args: JSON.stringify({ command: 'pnpm test' }),
-        ok: true,
+        text: 'ok\n[exit code: 0]',
         at: 2,
       })
-      expect(second.port.snapshot(root)[0]).toMatchObject({ ok: true, verifiedFix: true })
-      expect(renderProjectEvidence(second.port.snapshot(root), 3)).toContain('修复已验证')
+      expect(second.port.snapshot(root)[0]).toMatchObject({ commandOutcome: 'succeeded', recoveredFromFailure: true })
+      expect(renderProjectEvidence(second.port.snapshot(root), 3)).toContain('失败后再次成功')
+      // 连续成功不再重复标记
+      second.port.record({
+        sessionId: 's1',
+        tool: 'pwsh',
+        args: JSON.stringify({ command: 'pnpm test' }),
+        text: 'ok\n[exit code: 0]',
+        at: 3,
+      })
+      expect(second.port.snapshot(root)[0]?.recoveredFromFailure).toBeUndefined()
       second.dispose()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('两个进程各自的旧快照：写入时合并磁盘条目，不丢另一个进程新增的证据', () => {
+    const root = mkdtempSync(join(tmpdir(), 'omb-evidence-'))
+    try {
+      const first = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      first.port.record({
+        sessionId: 's1',
+        tool: 'pwsh',
+        args: '{"command":"pnpm test"}',
+        text: 'ok\n[exit code: 0]',
+        at: 1,
+      })
+      // second 读到 at=1 后，first 又新增 at=2；second 再写 at=3
+      const second = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      expect(second.port.snapshot(root)).toHaveLength(1)
+      first.port.record({
+        sessionId: 's1',
+        tool: 'pwsh',
+        args: '{"command":"pnpm build"}',
+        text: 'ok\n[exit code: 0]',
+        at: 2,
+      })
+      second.port.record({
+        sessionId: 's1',
+        tool: 'pwsh',
+        args: '{"command":"pnpm lint"}',
+        text: 'ok\n[exit code: 0]',
+        at: 3,
+      })
+      const times = second.port.snapshot(root).map(entry => entry.at)
+      expect(times).toEqual([3, 2, 1])
+      first.dispose()
+      second.dispose()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('损坏的 evidence.json 被保留为 .corrupt-*，不静默覆盖', () => {
+    const root = mkdtempSync(join(tmpdir(), 'omb-evidence-'))
+    try {
+      const file = join(root, '.omb', 'evidence.json')
+      mkdirSync(join(root, '.omb'), { recursive: true })
+      writeFileSync(file, '{ not json')
+      const ledger = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      expect(ledger.port.snapshot(root)).toEqual([])
+      expect(readdirSync(join(root, '.omb')).some(name => name.startsWith('evidence.json.corrupt-'))).toBe(true)
+      expect(ledger.port.stats().persistFailures).toBe(1)
+      ledger.dispose()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('旧版 v1 的 ok=true 不能当成命令成功（降为 unknown）', () => {
+    const root = mkdtempSync(join(tmpdir(), 'omb-evidence-'))
+    try {
+      const file = join(root, '.omb', 'evidence.json')
+      mkdirSync(join(root, '.omb'), { recursive: true })
+      writeFileSync(file, JSON.stringify({
+        version: 1,
+        entries: [{ kind: 'test', command: 'pnpm test', ok: true, at: 1 }],
+      }))
+      const ledger = createProjectEvidence({ clock: fixedClock(), resolveRoot: () => root })
+      expect(ledger.port.snapshot(root)[0]).toMatchObject({ commandOutcome: 'unknown' })
+      ledger.dispose()
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -130,7 +230,7 @@ describe('证据持久化与修复验证', () => {
         sessionId: 's1',
         tool: 'pwsh',
         args: JSON.stringify({ command: 'pnpm test --token abc123' }),
-        ok: true,
+        text: 'ok\n[exit code: 0]',
         at: 1,
       })
       expect(ledger.port.snapshot(root)[0]?.command).not.toContain('abc123')
@@ -146,8 +246,20 @@ describe('L1 证据行', () => {
   it('未接线、暂无读数、有读数三种说法互不冒充', () => {
     expect(renderProjectEvidence(undefined, 1000)).toContain('证据未接线')
     expect(renderProjectEvidence([], 1000)).toContain('暂无构建/测试读数')
-    const text = renderProjectEvidence([{ kind: 'test', command: 'pnpm test', ok: true, at: 0 }], 600_000)
+    const text = renderProjectEvidence(
+      [{ kind: 'test', command: 'pnpm test', commandOutcome: 'succeeded', exitCode: 0, at: 0 }],
+      600_000,
+    )
     expect(text).toContain('测试✅')
     expect(text).toContain('10 分钟前')
+  })
+
+  it('unknown 显示 ⚠️未知，不显示 ✅', () => {
+    const text = renderProjectEvidence(
+      [{ kind: 'test', command: 'pnpm test', commandOutcome: 'unknown', at: 0 }],
+      1,
+    )
+    expect(text).toContain('⚠️未知')
+    expect(text).not.toContain('✅')
   })
 })

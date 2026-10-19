@@ -101,6 +101,9 @@ describe('规则（纯函数）', () => {
     expect(classifyUserMessage('/compact')).toEqual({ ok: false, reason: 'command-or-code' })
     expect(classifyUserMessage('```ts\nconst x = 1\n``` 以后都用这个')).toEqual({ ok: false, reason: 'command-or-code' })
     expect(classifyUserMessage('以后必须用 sk-abcdefghijklmnopqrstuvwxyz 这个 key')).toEqual({ ok: false, reason: 'secret' })
+    // v4.6.1 P1：临时任务约束不能自动写成长期偏好
+    expect(classifyUserMessage('这次不要联网，先离线测试')).toEqual({ ok: false, reason: 'task-constraint' })
+    expect(classifyUserMessage('不要用 npm 安装依赖')).toEqual({ ok: false, reason: 'candidate' })
     expect(isQuestion('是否要记住？')).toBe(true)
     expect(isCommandOrCode('$ pnpm test')).toBe(true)
     expect(hasSecret('password: hunter2hunter2')).toBe(true)

@@ -1,15 +1,15 @@
 {
   "name": "@omb/memory-vector",
-  "version": "4.6.0",
+  "version": "4.6.1",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — semantic recall channel over BGE Chinese embeddings; lexical recall stays complete without it.",
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g102/index.js",
+  "main": "./lib-gen/g104/index.js",
   "exports": {
-    ".": "./lib-gen/g102/index.js",
+    ".": "./lib-gen/g104/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"

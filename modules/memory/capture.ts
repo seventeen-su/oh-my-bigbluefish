@@ -45,6 +45,7 @@ import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '
 import { contentHashOf, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
 import { detectProactiveCue } from './proactive.js'
+import { classifyMemoryIntent, isDurableIntent } from './intent.js'
 
 export { hasSecret } from './secrets.js'
 
@@ -120,7 +121,9 @@ export type PreferenceDecision =
 /**
  * 判断一条用户消息是否值得作为**跨会话偏好/决定**写入。
  *
- * 判据顺序固定（确定性）：长度 → 疑问/命令/代码 → 标记 → 密钥。
+ * 判据顺序固定（确定性）：长度 → 疑问/命令/代码 → 标记 → 密钥 → **记忆意图**。
+ * 最后一步是关键：命中“这次/先/当前任务”等临时边界时，即使含“不要/必须”，
+ * 也不写长期记忆（v4.6.1 P1）。
  */
 export function classifyUserMessage(text: string): PreferenceDecision {
   const trimmed = typeof text === 'string' ? text.trim() : ''
@@ -131,6 +134,8 @@ export function classifyUserMessage(text: string): PreferenceDecision {
   if (isCommandOrCode(trimmed)) return { ok: false, reason: 'command-or-code' }
   if (!PREFERENCE_MARKERS.some(marker => trimmed.includes(marker))) return { ok: false, reason: 'no-marker' }
   if (hasSecret(trimmed)) return { ok: false, reason: 'secret' }
+  const intent = classifyMemoryIntent(trimmed)
+  if (!isDurableIntent(intent.intent)) return { ok: false, reason: intent.intent }
   return { ok: true, text: trimmed }
 }
 

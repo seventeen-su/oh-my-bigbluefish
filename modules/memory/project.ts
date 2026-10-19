@@ -153,13 +153,16 @@ export interface ProjectProfileGate {
 export interface ProjectEvidenceView {
   readonly kind: string
   readonly command: string
-  readonly ok: boolean
+  /** 命令退出状态；unknown = 结果文本里没有可解析的退出码（不是"通过"）。 */
+  readonly commandOutcome: 'succeeded' | 'failed' | 'unknown'
+  readonly exitCode?: number | null
   readonly at: number
-  /** 同一命令此前失败、这次成功 → 修复已验证（只是证据标记）。 */
-  readonly verifiedFix?: boolean
+  /** 同一命令紧邻的上一条失败、本次成功 → 只表示"失败后再次成功"。 */
+  readonly recoveredFromFailure?: boolean
 }
 
-/** 画像视图（v4.1 §3.2：结构化字段与 `text` 同源）。 */export interface ProjectProfileView {
+/** 画像视图（v4.1 §3.2：结构化字段与 `text` 同源）。 */
+export interface ProjectProfileView {
   readonly text: string
   readonly generatedAt: number
   readonly gitHead?: string
@@ -510,8 +513,14 @@ export function renderProjectEvidence(
   if (evidence.length === 0) return '本进程暂无构建/测试读数（不是"没跑过"）'
   const parts = evidence.slice(0, 3).map(entry => {
     const label = EVIDENCE_KIND_LABEL[entry.kind] ?? entry.kind
-    const fix = entry.verifiedFix === true ? '（修复已验证）' : ''
-    return `${label}${entry.ok ? '✅' : '❌'} ${clip(entry.command, 28)}${fix} ${describeAge(now, entry.at)}`
+    const mark = entry.commandOutcome === 'succeeded'
+      ? '✅'
+      : entry.commandOutcome === 'failed'
+        ? '❌'
+        : '⚠️未知'
+    const fix = entry.recoveredFromFailure === true ? '（失败后再次成功）' : ''
+    const code = entry.exitCode === undefined || entry.exitCode === null ? '' : ` exit ${entry.exitCode}`
+    return `${label}${mark}${code} ${clip(entry.command, 28)}${fix} ${describeAge(now, entry.at)}`
   })
   return `证据：${parts.join('；')}`
 }

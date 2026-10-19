@@ -316,3 +316,39 @@
   `modules/memory/remember.ts`、`modules/memory/recall.ts`、`modules/memory/retrieve.ts`、
   `modules/memory/project.ts`、`dsh/plugin.ts`、`kernel/abi/catalog.ts`
 - 版本：`version-manifest.json`（4.6.0 / 82 小功能）
+
+---
+
+# OMB v4.6.1 交付记录（2026-10-20）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.6.1**（`24 功能 / 82 小功能`；x3 修复位） |
+| 构建 | **g104**；`generation: 104`、`outDir: lib-gen/g104`、`builtAt: 2026-10-19T18:18:55Z` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **115 files / 1387 passed | 1 skipped**；`build` 成功（g104）；`check-resolution` **7/7**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_status` 构建 104/104、版本 4.6.1；失败测试后再次成功显示"失败后再次成功"；"这次不要联网"不写长期记忆 |
+
+## 本版内容（审查 P1/P2）
+
+1. **证据成功语义**：解析 shell 结果 `[exit code: N]`，`isError` 不再当命令成功；
+   无标记 = `unknown`（显示 ⚠️未知）；旧 v1 的 `ok` 降为 unknown。
+2. **记忆意图分流**：新增 `modules/memory/intent.ts`；临时任务约束/候选不自动写长期；
+   `proactive` 对临时约束给"不要写成长期记忆"提示。
+3. **恢复标记收紧**：`verifiedFix` → `recoveredFromFailure`，仅"紧邻失败后成功"，
+   连续成功不重复标记，展示为"失败后再次成功"。
+4. **并发持久化**：目录锁 + 临时文件 + 原子 `rename` + 磁盘合并 + 损坏现场保留。
+
+详见 `docs/v4.6.1-review-fixes.md`。P2 的"主动记忆有限状态工作流"仍未实现，
+当前仍是行动建议；`precision@k`、用户显式晋升命令、证据与节点映射仍是后续。
+
+## 文件
+
+- 新增：`modules/memory/intent.ts`、`tests/modules/memory/intent.test.ts`、
+  `docs/v4.6.1-review-fixes.md`
+- 修改：`dsh/project-evidence.ts`、`modules/memory/project.ts`、`modules/memory/index.ts`、
+  `modules/memory/capture.ts`、`modules/memory/proactive.ts`、
+  `tests/dsh/project-evidence.test.ts`、`tests/modules/memory/capture.test.ts`、
+  `tests/modules/memory/proactive.test.ts`
+- 版本：`version-manifest.json`（4.6.1 / 82 小功能）

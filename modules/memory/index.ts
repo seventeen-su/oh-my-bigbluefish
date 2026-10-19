@@ -1271,8 +1271,10 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
               snapshot(projectRoot: string): readonly {
                 readonly kind: string
                 readonly command: string
-                readonly ok: boolean
+                readonly commandOutcome: 'succeeded' | 'failed' | 'unknown'
+                readonly exitCode?: number | null
                 readonly at: number
+                readonly recoveredFromFailure?: boolean
               }[]
             }>(SERVICES.projectEvidence)
             if (port === undefined) return undefined

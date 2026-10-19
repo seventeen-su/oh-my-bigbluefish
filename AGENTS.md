@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.6.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.6.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.6.0（当前） = 主动记忆 + 项目运行证据**：
+- **v4.6.1（当前） = 审查修复**：项目证据改为解析 shell 结果里的 `[exit code: N]`
+  （工具 `isError` 不再当命令成功；无标记=unknown），旧 v1 落盘 `ok` 降为 unknown；
+  记忆意图分流（临时/任务约束不自动写长期；`modules/memory/intent.ts`）；
+  `verifiedFix` 改名 `recoveredFromFailure`（仅"失败后再次成功"，连续成功不重复标记）；
+  证据落盘加目录锁/原子替换/磁盘合并/损坏现场保留。契约：`docs/v4.6.1-review-fixes.md`。
+- **v4.6.0** = 主动记忆 + 项目运行证据：
   常驻提示同时点"写"（`长期偏好/决定主动 omb_remember；跨会话结论先 omb_recall`）；
   `modules/memory/proactive.ts` 在用户消息命中"显式要求记住/纠正旧结论/项目决定/长期偏好"
   时给一行易变提示（`prompt:omb-memory` 的 context 槽，回合结束清空）；

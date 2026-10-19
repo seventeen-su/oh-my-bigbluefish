@@ -16,8 +16,10 @@
  * 宁可漏提示，也不把每句闲聊都变成"快写记忆"。
  */
 
+import { classifyMemoryIntent } from './intent.js'
+
 /** 触发记忆操作的信号类别。 */
-export type ProactiveCue = 'explicit-remember' | 'correction' | 'decision' | 'preference'
+export type ProactiveCue = 'explicit-remember' | 'correction' | 'decision' | 'preference' | 'task-constraint'
 
 export interface ProactiveNudge {
   readonly cue: ProactiveCue
@@ -30,8 +32,6 @@ export const PROACTIVE_MAX_CHARS = 600
 
 const EXPLICIT_REMEMBER = /(记住|帮我记|记一下|别忘了|不要忘记|存一下|记下来)/u
 const CORRECTION = /(不对|错了|不是这样|改主意|改成|改为|更正|修正|撤销|收回|别再|不要再用|之前说|上次说|更新一下)/u
-const DECISION = /(决定|采用|统一用|规定|约定|以后都|就这么|方案定|确认用)/u
-const PREFERENCE = /(喜欢|不喜欢|讨厌|偏好|习惯|总是|一直|每次|永远|不要|必须|不准)/u
 
 function looksLikeQuestion(text: string): boolean {
   return /[?？]\s*$/u.test(text)
@@ -60,13 +60,21 @@ export function detectProactiveCue(raw: string): ProactiveNudge | null {
       text: '用户在纠正旧结论：先用 omb_recall 查旧条目，再用 omb_remember(supersedes) 更正，不要只口头承认。',
     }
   }
-  if (DECISION.test(text)) {
+  const intent = classifyMemoryIntent(text)
+  // 临时约束先分流：不要让“这次不要联网”被提示成“长期偏好”。
+  if (intent.intent === 'task-constraint' || intent.intent === 'temporary-instruction') {
+    return {
+      cue: 'task-constraint',
+      text: '这是当前任务约束（不是长期偏好）：不要写成长期记忆；若用户明确要求记住，请限定失效边界。',
+    }
+  }
+  if (intent.intent === 'stable-decision') {
     return {
       cue: 'decision',
       text: '这是项目决定/长期约定：主动用 omb_remember 记为 semantic（项目库），并写清来源。',
     }
   }
-  if (PREFERENCE.test(text)) {
+  if (intent.intent === 'long-term-preference') {
     return {
       cue: 'preference',
       text: '用户表达了长期偏好：主动用 omb_remember 记为 semantic（用户库），不要等用户提醒。',

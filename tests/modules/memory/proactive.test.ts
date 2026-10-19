@@ -34,6 +34,12 @@ describe('detectProactiveCue', () => {
     expect(cue?.text).toContain('用户库')
   })
 
+  it('临时任务约束 → 不提示写长期，改为提醒限定边界', () => {
+    const cue = detectProactiveCue('这次不要联网，先离线测试。')
+    expect(cue?.cue).toBe('task-constraint')
+    expect(cue?.text).toContain('不是长期偏好')
+  })
+
   it('普通问句/闲聊/超长文本 → 不提示（不打扰）', () => {
     expect(detectProactiveCue('这个函数为什么返回 undefined？')).toBeNull()
     expect(detectProactiveCue('好的，继续。')).toBeNull()

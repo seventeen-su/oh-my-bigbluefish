@@ -200,7 +200,8 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     logger.warn(`OMB：项目证据服务注册失败——${String(error)}（omb_project 不会显示构建/测试证据）`)
   }
   const disposeEvidenceEvents = handle.kernel.on('tool/result/observed', payload => {
-    projectEvidence.port.record(payload)
+    // `ok` 是工具级 isError（仅诊断）；命令成功与否由 project-evidence 解析退出码决定。
+    projectEvidence.port.record({ ...payload, toolOk: payload.ok })
   })
   // ── 会话状态机（R10）：共享状态服务 + edit 守卫 ─────────────────────────
   //
