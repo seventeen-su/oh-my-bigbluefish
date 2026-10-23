@@ -38,6 +38,26 @@ import { hasSecret } from './secrets.js'
 
 export type ControllerStage = 'confirmed' | 'candidate'
 
+/**
+ * 控制器的显式阶段（v4.13.0，系统化重构）。
+ *
+ * 状态由**当前表内容**决定，不另存影子变量：
+ * - `idle`：没有候选也没有任务；
+ * - `candidate-pending`：有候选等待写入/去重；
+ * - `tracking-tasks`：有任务约束（TTL/回合结束过期）；
+ * - `mixed`：两者都有（不同事件的到达顺序都能得到同一结论）。
+ */
+export type ControllerPhase = 'idle' | 'candidate-pending' | 'tracking-tasks' | 'mixed'
+
+/** 最近一次事件转移（每个会话只留最后一条；有界，不进 ring）。 */
+export interface ControllerTransition {
+  readonly event: ControllerEvent['type']
+  readonly from: ControllerPhase
+  readonly to: ControllerPhase
+  readonly actions: readonly ControllerAction['type'][]
+  readonly at: number
+}
+
 export interface ControllerCandidate {
   /** 确定性 id（文本指纹），便于去重与审计。 */
   readonly id: string
@@ -59,12 +79,18 @@ export interface ControllerSessionState {
   readonly candidates: readonly ControllerCandidate[]
   readonly tasks: readonly ControllerTask[]
   readonly lastEventAt: number | null
+  /** v4.13.0：显式阶段（由表内容推导，不独立存储额外事实）。 */
+  readonly phase: ControllerPhase
+  /** v4.13.0：最近一次转移（事件 → 阶段 → 动作类型）。 */
+  readonly transition: ControllerTransition | null
 }
 
 export const EMPTY_CONTROLLER_STATE: ControllerSessionState = {
   candidates: [],
   tasks: [],
   lastEventAt: null,
+  phase: 'idle',
+  transition: null,
 }
 
 export type ControllerEvent =
@@ -74,11 +100,11 @@ export type ControllerEvent =
   | { readonly type: 'memory-written'; readonly text: string; readonly at: number }
 
 export type ControllerAction =
-  | { readonly type: 'persist'; readonly candidate: ControllerCandidate; readonly explicit: boolean }
-  | { readonly type: 'lookup'; readonly query: string; readonly reason: string }
-  | { readonly type: 'request-model'; readonly hint: string; readonly reason: string }
-  | { readonly type: 'track-task'; readonly text: string; readonly expiresAt: number; readonly reason: string }
-  | { readonly type: 'expire-task'; readonly text: string; readonly reason: string }
+  | { readonly type: 'persist'; readonly id: string; readonly candidate: ControllerCandidate; readonly explicit: boolean }
+  | { readonly type: 'lookup'; readonly id: string; readonly query: string; readonly reason: string }
+  | { readonly type: 'request-model'; readonly id: string; readonly hint: string; readonly reason: string }
+  | { readonly type: 'track-task'; readonly id: string; readonly text: string; readonly expiresAt: number; readonly reason: string }
+  | { readonly type: 'expire-task'; readonly id: string; readonly text: string; readonly reason: string }
 
 export interface ControllerReduction {
   readonly state: ControllerSessionState
@@ -104,6 +130,21 @@ function fingerprint(text: string): string {
     hash = Math.imul(hash, 0x01000193) >>> 0
   }
   return `ctrl_${hash.toString(36)}`
+}
+
+/** 动作 id（v4.13.0）：同一输入得到同一 id，执行侧据此做幂等/审计。 */
+function actionId(prefix: string, ...parts: readonly string[]): string {
+  return `${prefix}_${fingerprint(parts.join('\u0000'))}`
+}
+
+/** 由表内容推导阶段（纯函数，不存影子变量）。 */
+function derivePhase(state: Pick<ControllerSessionState, 'candidates' | 'tasks'>): ControllerPhase {
+  const candidates = state.candidates.length > 0
+  const tasks = state.tasks.length > 0
+  if (candidates && tasks) return 'mixed'
+  if (candidates) return 'candidate-pending'
+  if (tasks) return 'tracking-tasks'
+  return 'idle'
 }
 
 function normalize(text: string): string {
@@ -156,8 +197,13 @@ function reduceUserMessage(
     return {
       state: { ...state, lastEventAt: event.at },
       actions: [
-        { type: 'lookup', query: text.slice(0, 120), reason: 'correction-needs-old-id' },
-        { type: 'request-model', hint: '纠正旧结论：先用 lookup 结果里的旧 id，再 omb_remember(supersedes)。', reason: 'correction' },
+        { type: 'lookup', id: actionId('lk', 'correction', text.slice(0, 120)), query: text.slice(0, 120), reason: 'correction-needs-old-id' },
+        {
+          type: 'request-model',
+          id: actionId('rm', 'correction'),
+          hint: '纠正旧结论：先用 lookup 结果里的旧 id，再 omb_remember(supersedes)。',
+          reason: 'correction',
+        },
       ],
     }
   }
@@ -169,6 +215,7 @@ function reduceUserMessage(
         state: { ...state, lastEventAt: event.at },
         actions: [{
           type: 'request-model',
+          id: actionId('rm', 'explicit-temporary'),
           hint: '用户明确要求记住的是临时约束：请限定作用域/失效边界，不要写成长期偏好。',
           reason: 'explicit-temporary',
         }],
@@ -177,7 +224,13 @@ function reduceUserMessage(
     const expiresAt = event.at + CONTROLLER_TASK_TTL_MS
     return {
       state: { ...addTask(state, text, event.at, expiresAt), lastEventAt: event.at },
-      actions: [{ type: 'track-task', text, expiresAt, reason: `intent:${intent.intent}` }],
+      actions: [{
+        type: 'track-task',
+        id: actionId('tt', text),
+        text,
+        expiresAt,
+        reason: `intent:${intent.intent}`,
+      }],
     }
   }
 
@@ -200,7 +253,7 @@ function reduceUserMessage(
     }
     return {
       state: { ...addCandidate(state, candidate), lastEventAt: event.at },
-      actions: [{ type: 'persist', candidate, explicit }],
+      actions: [{ type: 'persist', id: candidate.id, candidate, explicit }],
     }
   }
 
@@ -218,9 +271,11 @@ export function clearControllerCandidate(
   text: string,
 ): ControllerSessionState {
   const key = normalize(text)
+  const candidates = state.candidates.filter(candidate => normalize(candidate.text) !== key)
   return {
     ...state,
-    candidates: state.candidates.filter(candidate => normalize(candidate.text) !== key),
+    candidates,
+    phase: derivePhase({ candidates, tasks: state.tasks }),
   }
 }
 
@@ -230,7 +285,12 @@ function sweepExpiredTasks(state: ControllerSessionState, now: number): Controll
   if (expired.length === 0) return { state, actions: [] }
   return {
     state: { ...state, tasks: state.tasks.filter(task => task.expiresAt > now) },
-    actions: expired.map(task => ({ type: 'expire-task', text: task.text, reason: 'ttl' })),
+    actions: expired.map(task => ({
+      type: 'expire-task' as const,
+      id: actionId('ex', task.text, 'ttl'),
+      text: task.text,
+      reason: 'ttl',
+    })),
   }
 }
 
@@ -245,9 +305,33 @@ export function reduceMemoryEvent(
   state: ControllerSessionState,
   event: ControllerEvent,
 ): ControllerReduction {
+  const from = state.phase
+  const reduced = reduceCore(state, event)
+  const to = derivePhase(reduced.state)
+  return {
+    state: {
+      ...reduced.state,
+      phase: to,
+      transition: {
+        event: event.type,
+        from,
+        to,
+        actions: reduced.actions.map(action => action.type),
+        at: event.at,
+      },
+    },
+    actions: reduced.actions,
+  }
+}
+
+function reduceCore(
+  state: ControllerSessionState,
+  event: ControllerEvent,
+): ControllerReduction {
   if (event.type === 'turn-end') {
     const actions: ControllerAction[] = state.tasks.map(task => ({
       type: 'expire-task',
+      id: actionId('ex', task.text, 'turn-end'),
       text: task.text,
       reason: 'turn-end',
     }))

@@ -366,13 +366,18 @@ export function controllerHealthNote(stats: ControllerStats | undefined): string
     return `；事件控制器（${stats.mode === 'execute' ? '执行' : 'dry-run'}）：本进程尚无事件`
   }
   if (stats.mode === 'execute') {
+    const failures = (Object.entries(stats.failures) as [string, number][])
+      .filter(([, count]) => count > 0)
+      .map(([kind, count]) => `${kind} ${count}`)
     return `；事件控制器（执行）：${stats.events} 事件 → persist ${stats.persist}`
       + `（写入 ${stats.persisted}/查回 ${stats.verified}`
-      + `/验证失败 ${stats.verifyFailed}/写路径拒绝 ${stats.persistSkipped}）`
+      + `/验证失败 ${stats.verifyFailed}/写路径拒绝 ${stats.persistSkipped}`
+      + (stats.duplicateActions > 0 ? `/幂等跳过 ${stats.duplicateActions}` : '') + `）`
       + `/lookup ${stats.lookup}（命中 ${stats.lookupHits}）`
       + `/request ${stats.requestModel}（注入 ${stats.requestInjections}）`
       + `/track ${stats.trackTask}/expire ${stats.expireTask}`
       + `；当前任务约束 ${stats.tasksActive} 条（回合结束失效）`
+      + (failures.length === 0 ? '' : `；失败分类：${failures.join('、')}`)
   }
   return `；事件控制器 dry-run：${stats.events} 事件 → persist ${stats.persist}`
     + `/lookup ${stats.lookup}/request ${stats.requestModel}`
@@ -516,6 +521,12 @@ async function describeHealth(
     metrics['capture.controller.persisted'] = runtime.capture.controller.persisted
     metrics['capture.controller.verified'] = runtime.capture.controller.verified
     metrics['capture.controller.verifyFailed'] = runtime.capture.controller.verifyFailed
+    if (runtime.capture.controller.duplicateActions > 0) {
+      metrics['capture.controller.duplicateActions'] = runtime.capture.controller.duplicateActions
+    }
+    for (const [kind, count] of Object.entries(runtime.capture.controller.failures)) {
+      if (count > 0) metrics[`capture.controller.failures.${kind}`] = count
+    }
     metrics['capture.controller.persistSkipped'] = runtime.capture.controller.persistSkipped
     metrics['capture.controller.lookupHits'] = runtime.capture.controller.lookupHits
     metrics['capture.controller.requestInjections'] = runtime.capture.controller.requestInjections
@@ -962,6 +973,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         },
         onMemoryStored: linkOnStored,
         logger: kernel.logger,
+        // v4.13.0：控制器动作与失败进活动日志（不含正文）
+        activity: noteActivity,
         enabledPreferences: config.autoCapturePreferences,
         enabledActivity: config.autoCaptureActivity,
         enabledOutcome: config.autoCaptureOutcome,

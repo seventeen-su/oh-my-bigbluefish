@@ -17,6 +17,7 @@ export type ActivityKind =
   | 'abstain'
   | 'retrieve'
   | 'confirm'
+  | 'controller'
   | 'error'
 
 /** 最近活动保留条数（够看清一次排障窗口，不撑内存）。 */
@@ -52,6 +53,7 @@ const EMPTY_COUNTS: Readonly<Record<ActivityKind, number>> = {
   abstain: 0,
   retrieve: 0,
   confirm: 0,
+  controller: 0,
   error: 0,
 }
 
@@ -104,6 +106,7 @@ export function renderActivityNote(summary: ActivitySummary | undefined): string
     ['abstain', '弃权'],
     ['retrieve', '召回'],
     ['confirm', '确认'],
+    ['controller', '控制器'],
   ]
   const parts = labels
     .filter(([kind]) => summary.byKind[kind] > 0)

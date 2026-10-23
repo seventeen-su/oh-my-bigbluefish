@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.12.0)
+# Oh-My-BigBlueFish (OMB v4.13.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -25,7 +25,8 @@ v4.9.7 修复用户断言的模糊去重与压缩后追忆被拒（近似同内�
 v4.10.0 给 `omb_recall` 加**状态/标签过滤与模糊回退**（schema v6 的 `memory.tags`）；
 v4.10.1 **取消离线整合**，去重只发生在写入路径（确定性判据，不自动标失效）；
 v4.11.0 加**活动日志**（写入/去重/升级/召回/错误）与 SIGKILL 崩溃窗口验证；
-v4.12.0 加**跨工作区状态机**（会话换项目可见）与**文件索引**（按符号/导入排序）。详见
+v4.12.0 加**跨工作区状态机**（会话换项目可见）与**文件索引**（按符号/导入排序）；
+v4.13.0 把**事件控制器**整理成显式状态机（阶段/转移审计、动作幂等、失败分类）。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -47,11 +48,12 @@ v4.12.0 加**跨工作区状态机**（会话换项目可见）与**文件索引
 [`docs/v4.10.0-retrieval-filters.md`](docs/v4.10.0-retrieval-filters.md)、
 [`docs/v4.10.1-write-time-dedupe.md`](docs/v4.10.1-write-time-dedupe.md)、
 [`docs/v4.11.0-activity-log-and-crash-tests.md`](docs/v4.11.0-activity-log-and-crash-tests.md)、
-[`docs/v4.12.0-workspace-state-and-file-index.md`](docs/v4.12.0-workspace-state-and-file-index.md) 与
+[`docs/v4.12.0-workspace-state-and-file-index.md`](docs/v4.12.0-workspace-state-and-file-index.md)、
+[`docs/v4.13.0-controller-state-machine.md`](docs/v4.13.0-controller-state-machine.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 99 小功能 → 4.12.0**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 100 小功能 → 4.13.0**。
 
 ## v4.4 结构（2026-10）
 

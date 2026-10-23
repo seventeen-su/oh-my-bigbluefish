@@ -262,6 +262,30 @@ export type ControllerLookup = (input: {
   readonly limit: number
 }) => Promise<readonly ControllerLookupHit[]>
 
+/** 控制器动作失败的分类（v4.13.0）：不把"去重/隐私/库未就绪/查回失败"混成一个数。 */
+export type ControllerFailure =
+  | 'privacy'
+  | 'dedupe'
+  | 'cap'
+  | 'disabled'
+  | 'store-missing'
+  | 'verify-failed'
+  | 'lookup-failed'
+  | 'unknown'
+
+/** 由写路径/执行路径的可读原因归到失败类别（确定性字符串判据，纯函数）。 */
+export function classifyControllerFailure(reason: string): ControllerFailure {
+  const text = typeof reason === 'string' ? reason : ''
+  if (/隐私|privacy|read-only|sealed/i.test(text)) return 'privacy'
+  if (/去重|已存在|duplicate|same content/i.test(text)) return 'dedupe'
+  if (/上限|cap|限额/i.test(text)) return 'cap'
+  if (/关闭|disabled|未启用/i.test(text)) return 'disabled'
+  if (/库.*未就绪|not ready|store missing/i.test(text)) return 'store-missing'
+  if (/查回|verify/i.test(text)) return 'verify-failed'
+  if (/lookup|检索/i.test(text)) return 'lookup-failed'
+  return 'unknown'
+}
+
 /** 事件驱动记忆控制器（v4.7.0：决策 + 执行）的计数。 */
 export interface ControllerStats {
   /** 运行模式（状态面据此区分"只决策"与"已执行"）。 */
@@ -279,6 +303,10 @@ export interface ControllerStats {
   verifyFailed: number
   /** execute：写路径拒绝（去重/隐私/库未就绪/上限/写入异常）。 */
   persistSkipped: number
+  /** v4.13.0：同一候选 id 被重复执行而跳过的次数（幂等）。 */
+  duplicateActions: number
+  /** v4.13.0：按类统计的控制器失败（互不掩盖）。 */
+  failures: Record<ControllerFailure, number>
   /** execute：lookup 命中旧条目的次数。 */
   lookupHits: number
   /** execute：注入到易变上下文槽的控制器提示次数。 */
@@ -343,6 +371,11 @@ export interface CapturePorts extends CaptureFeatureSwitches {
   readonly controllerMode?: ControllerMode
   /** lookup 端口（缺省用 `resolveStore` + `searchLexical`；测试可注入）。 */
   readonly lookupEntries?: ControllerLookup
+  /**
+   * v4.13.0：活动日志口（控制器动作与失败）。缺省不记（单测/旧装配）。
+   * 只记动作类型/原因，不记正文。
+   */
+  readonly activity?: (kind: 'controller' | 'error', detail: string) => void
 }
 
 /** 单会话捕获状态。有界（见 `SESSION_STATE_MAX` 与 pending 上限）。 */
@@ -364,6 +397,8 @@ interface SessionCaptureState {
   pending: Map<string, PendingActivity>
   /** 事件驱动记忆控制器状态（v4.7.0 execute：动作会被执行；dry-run/off 见 `controllerMode`）。 */
   controller: ControllerSessionState
+  /** v4.13.0：已执行过的 persist 动作 id（有界，幂等用）。 */
+  executedPersistIds: string[]
 }
 
 export const SESSION_STATE_MAX = 64
@@ -385,6 +420,7 @@ function emptyState(): SessionCaptureState {
     tools: new Map(),
     pending: new Map(),
     controller: EMPTY_CONTROLLER_STATE,
+    executedPersistIds: [],
   }
 }
 
@@ -458,6 +494,17 @@ export function createCapture(ports: CapturePorts): Capture {
       verified: 0,
       verifyFailed: 0,
       persistSkipped: 0,
+      duplicateActions: 0,
+      failures: {
+        privacy: 0,
+        dedupe: 0,
+        cap: 0,
+        disabled: 0,
+        'store-missing': 0,
+        'verify-failed': 0,
+        'lookup-failed': 0,
+        unknown: 0,
+      },
       lookupHits: 0,
       requestInjections: 0,
       tasksActive: 0,
@@ -748,12 +795,20 @@ export function createCapture(ports: CapturePorts): Capture {
     if (ports.enabledPreferences === false) {
       skip('controller-disabled')
       stats.controller.persistSkipped += 1
+      stats.controller.failures.disabled += 1
+      ports.activity?.('error', '控制器 persist 跳过：偏好捕获已关闭')
       return
     }
     const state = stateOf(sessionId)
+    // v4.13.0 幂等：同一候选 id 已成功执行过 → 不再重复尝试（去重仍在写路径兜底）。
+    if (state.executedPersistIds.includes(candidate.id)) {
+      stats.controller.duplicateActions += 1
+      return
+    }
     if (!explicit && state.preferences >= maxPreferences) {
       skip('cap')
       stats.controller.persistSkipped += 1
+      stats.controller.failures.cap += 1
       return
     }
     const outcome = await write({
@@ -769,9 +824,15 @@ export function createCapture(ports: CapturePorts): Capture {
     })
     if (!outcome.ok) {
       stats.controller.persistSkipped += 1
+      const category = classifyControllerFailure(outcome.reason)
+      stats.controller.failures[category] += 1
+      ports.activity?.('error', `控制器 persist 失败（${category}）：${outcome.reason.slice(0, 120)}`)
       return
     }
     stats.controller.persisted += 1
+    // 幂等记录有界（只保留最近 64 个候选 id）
+    state.executedPersistIds = [...state.executedPersistIds, candidate.id].slice(-64)
+    ports.activity?.('controller', `persist ${candidate.stage}/${candidate.scope}`)
     state.preferences += 1
     stats.preferences += 1
     // 真实写入已覆盖该候选：从控制器状态里清掉，避免同一文本反复产生 persist 动作。
@@ -781,6 +842,8 @@ export function createCapture(ports: CapturePorts): Capture {
       return
     }
     stats.controller.verifyFailed += 1
+    stats.controller.failures['verify-failed'] += 1
+    ports.activity?.('error', `控制器 persist 查回失败：${outcome.record.id}`)
     controllerHint(sessionId, `写入后查回失败（${candidate.scope}）：不要重复写，先用 omb_recall 核对。`)
     ports.logger?.warn(
       `OMB 事件控制器：persist 查回验证失败（${candidate.scope}/${candidate.kind}，id=${outcome.record.id}）`,
@@ -834,7 +897,15 @@ export function createCapture(ports: CapturePorts): Capture {
           await executeLookup(sessionId, action)
         }
         // request-model 已在上一步执行；track-task / expire-task 只改控制器状态（reducer 已完成）。
+        if (action.type !== 'request-model') {
+          const detail = action.type === 'persist'
+            ? `persist:${action.candidate.reason}`
+            : `${action.type}:${action.reason}`
+          ports.activity?.('controller', detail)
+        }
       } catch (error) {
+        stats.controller.failures['lookup-failed'] += action.type === 'lookup' ? 1 : 0
+        ports.activity?.('error', `控制器 ${action.type} 执行失败`)
         ports.logger?.warn(
           `OMB 事件控制器：执行 ${action.type} 失败（已隔离）——${error instanceof Error ? error.message : String(error)}`,
         )

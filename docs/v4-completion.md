@@ -904,3 +904,36 @@
 - 修改：`dsh/{state-machine,project-profile,plugin}.ts`、`modules/memory/project.ts`、
   `tests/dsh/{state-machine,project-profile}.test.ts`、`tests/modules/memory/project-tool.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.13.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.13.0**（`24 功能 / 100 小功能`；x2：事件控制器显式状态机） |
+| 构建 | **g123**；`generation: 123`、`outDir: lib-gen/g123` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **118 files / 1463 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：版本 4.13.0/构建 123；健康面控制器行出现失败分类/幂等跳过（仅在有发生时） |
+
+## 本版内容
+
+1. `ControllerSessionState` 增加 `phase`（idle/candidate-pending/tracking-tasks/mixed）
+   与 `transition`（事件→阶段→动作）；由表内容推导，不在各分支各写一份。
+2. 动作带确定性 `id`；`persist` 每会话幂等（最近 64 个候选 id），重复投递计
+   `duplicateActions` 并跳过。
+3. `ControllerStats.failures` 按 8 类统计（privacy/dedupe/cap/disabled/store-missing/
+   verify-failed/lookup-failed/unknown）；健康面只在有失败时列 "失败分类：…"，
+   metrics 按类输出。
+4. 控制器动作/失败接入活动日志（`controller`/`error`，不含正文）。
+
+详见 `docs/v4.13.0-controller-state-machine.md`。
+
+## 文件
+
+- 新增：`docs/v4.13.0-controller-state-machine.md`
+- 修改：`modules/memory/{controller,capture,activity,index}.ts`、
+  `tests/modules/memory/{controller,capture,status-honesty}.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件

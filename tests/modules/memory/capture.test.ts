@@ -52,6 +52,8 @@ function captureFixture(options: {
   readonly retryMs?: number
   readonly controllerMode?: ControllerMode
   readonly lookupEntries?: ControllerLookup
+  /** v4.13.0：活动日志口（测试注入）。 */
+  readonly activity?: (kind: 'controller' | 'error', detail: string) => void
 } = {}): CaptureFixture {
   const ws: TempWorkspace = tempWorkspace('omb-capture-')
   const clock = fixedClock()
@@ -86,6 +88,7 @@ function captureFixture(options: {
     enabledOutcome: true,
     controllerMode: options.controllerMode ?? 'execute',
     ...(options.lookupEntries === undefined ? {} : { lookupEntries: options.lookupEntries }),
+    ...(options.activity === undefined ? {} : { activity: options.activity }),
     projectRetryMs: options.retryMs ?? 0,
   })
   return {
@@ -618,8 +621,32 @@ describe('控制器执行（v4.7.0，execute）', () => {
     expect(stats.controller.persist).toBe(1)
     expect(stats.controller.persisted).toBe(0)
     expect(stats.controller.persistSkipped).toBe(1)
+    expect(stats.controller.failures.privacy).toBe(1)
     expect(stats.skipped.privacy).toBeGreaterThan(0)
     expect(await rowsOf(f.user)).toHaveLength(0)
+    await f.close()
+  })
+
+  it('查回失败计 verify-failed 类别（v4.13.0 失败分类）', async () => {
+    const f = captureFixture()
+    const spy = vi.spyOn(f.user, 'getMany').mockResolvedValue([])
+    await f.capture.onUserMessage({ sessionId: 's1', text: '记住：以后回答不要分点。', at: 1 })
+    expect(f.capture.stats().controller.failures['verify-failed']).toBe(1)
+    spy.mockRestore()
+    await f.close()
+  })
+
+  it('同一候选重复投递：幂等跳过，不重复写（v4.13.0）', async () => {
+    const events: string[] = []
+    const f = captureFixture({ activity: (kind, detail) => events.push(`${kind}:${detail}`) })
+    const text = '记住：以后回答不要分点。'
+    await f.capture.onUserMessage({ sessionId: 's1', text, at: 1 })
+    await f.capture.onUserMessage({ sessionId: 's1', text, at: 2 })
+    const stats = f.capture.stats()
+    expect(stats.controller.persisted).toBe(1)
+    expect(stats.controller.duplicateActions).toBe(1)
+    expect(await rowsOf(f.user)).toHaveLength(1)
+    expect(events.some(event => event.startsWith('controller:persist'))).toBe(true)
     await f.close()
   })
 })

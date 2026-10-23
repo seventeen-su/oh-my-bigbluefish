@@ -116,4 +116,25 @@ describe('MemoryController：安全闸门', () => {
     expect(ended.actions[0]).toMatchObject({ type: 'expire-task', reason: 'turn-end' })
     expect(ended.state.tasks).toHaveLength(0)
   })
+
+  it('显式阶段、转移审计与动作 id（v4.13.0）', () => {
+    const persist = run([{ type: 'user-message', text: '以后都用 pnpm。', at: 1 }])
+    expect(persist.state.phase).toBe('candidate-pending')
+    expect(persist.state.transition).toMatchObject({
+      event: 'user-message',
+      from: 'idle',
+      to: 'candidate-pending',
+      actions: ['persist'],
+    })
+    expect(persist.actions[0]?.id).toMatch(/^ctrl_/)
+
+    const task = run([{ type: 'user-message', text: '这次不要联网，先离线测试。', at: 1 }])
+    expect(task.state.phase).toBe('tracking-tasks')
+    expect(task.state.transition?.actions).toEqual(['track-task'])
+    expect(task.actions[0]?.id).toMatch(/^tt_/)
+
+    const ended = reduceMemoryEvent(task.state, { type: 'turn-end', at: 2 })
+    expect(ended.state.phase).toBe('idle')
+    expect(ended.state.transition).toMatchObject({ event: 'turn-end', from: 'tracking-tasks', to: 'idle' })
+  })
 })

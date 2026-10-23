@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.12.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.13.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.12.0（当前） = 跨工作区状态机与文件索引（x2）**：`situation().workspace`
+- **v4.13.0（当前） = 事件控制器显式状态机（x2）**：`ControllerSessionState` 加
+  `phase`（idle/candidate-pending/tracking-tasks/mixed）与 `transition`（事件→阶段→动作）；
+  动作带确定性 id，persist 每会话幂等（最近 64 个候选，计 `duplicateActions`）；
+  `ControllerStats.failures` 按 8 类计失败，健康面只列发生的类别，metrics 按类输出；
+  控制器动作/失败进活动日志（`controller`/`error`）。契约：`docs/v4.13.0-controller-state-machine.md`。
+- **v4.12.0** = 跨工作区状态机与文件索引（x2）：`situation().workspace`
   惰性记录会话在 git root 之间的切换（`switches`/`previousRoot`/`since`，子目录变化不算），
   `omb_project` L0 显示切换次数；画像 `ProjectProfileStructure.files` 按符号+导入数
   排序前 12 个文件，L1 显示前 4 个（规模索引，不是完整 repo-map）。
