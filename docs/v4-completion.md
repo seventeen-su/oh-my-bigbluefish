@@ -937,3 +937,36 @@
 - 修改：`modules/memory/{controller,capture,activity,index}.ts`、
   `tests/modules/memory/{controller,capture,status-honesty}.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.14.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.14.0**（`24 功能 / 101 小功能`；x2：主动提示扩展与跟进） |
+| 构建 | **g124**；`generation: 124`、`outDir: lib-gen/g124` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **118 files / 1466 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：版本 4.14.0/构建 124；`omb_status` 记忆行出现"主动提示：命中 N 次"（仅在发生时） |
+
+## 本版内容
+
+1. `proactive.ts` 新增 `recall-first`（引用过去结论先 omb_recall）与
+   `project-fact`（路径/命令/端口/版本/URL → 记 semantic 项目库并写来源）两类 cue。
+2. execute 模式不再整体抑制提示：控制器精确提示优先；控制器没写时才给 cue
+   （task-constraint 仍由 nudge 专门措辞）。
+3. 未写入的 cue 在**下一条用户消息**给一次跟进（仅 execute 且偏好捕获开启；
+   task-constraint 不跟进；回合结束保留 pendingCue 供下一轮判断）。
+4. 活动日志加 `proactive`；`CaptureStats.proactiveCues/cueFollowUps`；
+   健康面与 metrics 只报发生过的读数。
+5. 用户补充的版本纪律写入 AGENTS：**新界面（含侧边栏 UI）也只升 x2，只有重构才升 x1**。
+
+详见 `docs/v4.14.0-proactive-initiative.md`。
+
+## 文件
+
+- 新增：`docs/v4.14.0-proactive-initiative.md`
+- 修改：`modules/memory/{proactive,capture,activity,index}.ts`、
+  `tests/modules/memory/{proactive,capture}.test.ts`、`README.md`、`AGENTS.md`、版本文件

@@ -19,7 +19,14 @@
 import { classifyMemoryIntent } from './intent.js'
 
 /** 触发记忆操作的信号类别。 */
-export type ProactiveCue = 'explicit-remember' | 'correction' | 'decision' | 'preference' | 'task-constraint'
+export type ProactiveCue =
+  | 'explicit-remember'
+  | 'correction'
+  | 'decision'
+  | 'preference'
+  | 'task-constraint'
+  | 'project-fact'
+  | 'recall-first'
 
 export interface ProactiveNudge {
   readonly cue: ProactiveCue
@@ -32,6 +39,10 @@ export const PROACTIVE_MAX_CHARS = 600
 
 const EXPLICIT_REMEMBER = /(记住|帮我记|记一下|别忘了|不要忘记|存一下|记下来)/u
 const CORRECTION = /(不对|错了|不是这样|改主意|改成|改为|更正|修正|撤销|收回|别再|不要再用|之前说|上次说|更新一下)/u
+/** v4.14.0：可复现的项目事实形态（路径/命令/端口/版本/URL）。 */
+const PROJECT_FACT = /(?:[A-Za-z]:\\|\/|\.{1,2}\/)[^\s，。；;]+\.\w+|\bpnpm\b|\bnpm\b|\bnpx\b|\bvitest\b|\btsc\b|\beslint\b|端口\s*\d+|port\s*\d+|https?:\/\/\S+/iu
+/** v4.14.0：引用过去结论（先查再写；与"纠正"分开，不冒充更正）。 */
+const HISTORY_REF = /(上次|之前|以前|当时|原先|早先|刚才说|说过|之前说过)/u
 
 function looksLikeQuestion(text: string): boolean {
   return /[?？]\s*$/u.test(text)
@@ -60,6 +71,13 @@ export function detectProactiveCue(raw: string): ProactiveNudge | null {
       text: '用户在纠正旧结论：先用 omb_recall 查旧条目，再用 omb_remember(supersedes) 更正，不要只口头承认。',
     }
   }
+  // v4.14.0：引用过去结论 → 先查，不冒充更正（没有"改"的证据）。
+  if (HISTORY_REF.test(text)) {
+    return {
+      cue: 'recall-first',
+      text: '用户在引用过去的结论：先 omb_recall 查旧条目（id/原文），再决定是否更新或 supersedes，别凭印象回答。',
+    }
+  }
   const intent = classifyMemoryIntent(text)
   // 临时约束先分流：不要让“这次不要联网”被提示成“长期偏好”。
   if (intent.intent === 'task-constraint' || intent.intent === 'temporary-instruction') {
@@ -78,6 +96,13 @@ export function detectProactiveCue(raw: string): ProactiveNudge | null {
     return {
       cue: 'preference',
       text: '用户表达了长期偏好：主动用 omb_remember 记为 semantic（用户库），不要等用户提醒。',
+    }
+  }
+  // v4.14.0：可复现的项目事实（路径/命令/端口/版本/URL）——主动性最容易漏的一类。
+  if (PROJECT_FACT.test(text)) {
+    return {
+      cue: 'project-fact',
+      text: '这是可复现的项目事实：若会长期有效，用 omb_remember 记为 semantic（项目库），来源写文件/命令。',
     }
   }
   return null

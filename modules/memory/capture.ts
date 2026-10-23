@@ -44,7 +44,7 @@
 import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../../kernel/abi/index.js'
 import { contentHashOf, findSimilarContent, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
-import { detectProactiveCue } from './proactive.js'
+import { detectProactiveCue, type ProactiveCue } from './proactive.js'
 import { classifyMemoryIntent, isDurableIntent } from './intent.js'
 import { isCommandOrCode, isQuestion, PREFERENCE_MARKERS } from './message-filter.js'
 import {
@@ -336,6 +336,9 @@ export interface CaptureStats {
   pending: number
   /** 事件驱动记忆控制器的决策与执行计数（v4.7.0：默认执行，可回滚 dry-run）。 */
   controller: ControllerStats
+  /** v4.14.0：命中的主动提示信号数 / 上一轮未写入的跟进数。 */
+  proactiveCues: number
+  cueFollowUps: number
   skipped: Record<string, number>
 }
 
@@ -375,7 +378,7 @@ export interface CapturePorts extends CaptureFeatureSwitches {
    * v4.13.0：活动日志口（控制器动作与失败）。缺省不记（单测/旧装配）。
    * 只记动作类型/原因，不记正文。
    */
-  readonly activity?: (kind: 'controller' | 'error', detail: string) => void
+  readonly activity?: (kind: 'controller' | 'proactive' | 'error', detail: string) => void
 }
 
 /** 单会话捕获状态。有界（见 `SESSION_STATE_MAX` 与 pending 上限）。 */
@@ -399,6 +402,10 @@ interface SessionCaptureState {
   controller: ControllerSessionState
   /** v4.13.0：已执行过的 persist 动作 id（有界，幂等用）。 */
   executedPersistIds: string[]
+  /** v4.14.0：本回合命中的主动提示信号（未写入则下一轮补一次跟进）。 */
+  pendingCue?: { readonly at: number; readonly cue: ProactiveCue; written: boolean }
+  /** v4.14.0：最近一次 persist 成功的事件时间（判断本回合是否真的写了）。 */
+  lastPersistAt: number
 }
 
 export const SESSION_STATE_MAX = 64
@@ -421,6 +428,7 @@ function emptyState(): SessionCaptureState {
     pending: new Map(),
     controller: EMPTY_CONTROLLER_STATE,
     executedPersistIds: [],
+    lastPersistAt: 0,
   }
 }
 
@@ -509,6 +517,8 @@ export function createCapture(ports: CapturePorts): Capture {
       requestInjections: 0,
       tasksActive: 0,
     },
+    proactiveCues: 0,
+    cueFollowUps: 0,
     skipped: {},
   }
   /** pending 全局计数（stats.pending 每次读快照；不靠遍历会话求和）。 */
@@ -832,6 +842,8 @@ export function createCapture(ports: CapturePorts): Capture {
     stats.controller.persisted += 1
     // 幂等记录有界（只保留最近 64 个候选 id）
     state.executedPersistIds = [...state.executedPersistIds, candidate.id].slice(-64)
+    state.lastPersistAt = at
+    if (state.pendingCue !== undefined) state.pendingCue.written = true
     ports.activity?.('controller', `persist ${candidate.stage}/${candidate.scope}`)
     state.preferences += 1
     stats.preferences += 1
@@ -1070,22 +1082,28 @@ export function createCapture(ports: CapturePorts): Capture {
 
   return {
     async onUserMessage(payload) {
-      // 主动性提示与自动捕获解耦：即使偏好捕获被关闭/失败，提示仍按用户消息更新。
-      //
-      // execute 模式（v4.7.0）：控制器**自己执行** persist/lookup/任务跟踪，此时再提示
-      // "立即调用 omb_remember" 只会让模型把同一条内容写第二遍（库里没有正文唯一约束）。
-      // 所以执行模式下 proactive 提示让位给控制器；只有自动捕获被关掉时才保留提示，
-      // 因为那时控制器不会写、模型仍需要知道该主动记。
-      const suppressCue = controllerMode === 'execute' && ports.enabledPreferences !== false
-      if (suppressCue) {
-        clearNudge(payload.sessionId)
-      } else {
-        const cue = detectProactiveCue(payload.text)
-        if (cue === null) clearNudge(payload.sessionId)
-        else setNudge(payload.sessionId, cue.text)
+      // v4.14.0：主动性两段式。
+      // ① 先把上一轮"命中信号但没写入"变成一次跟进（只提示一次，不写入）；
+      // ② 本轮的 cue 先算出来，但**等控制器执行完**再决定是否提示——控制器已经写了就不提示，
+      //    否则模型会把同一条内容写第二遍。自动捕获关闭时控制器不写，提示照常给模型。
+      const state = stateOf(payload.sessionId)
+      const canFollowUp = controllerMode === 'execute' && ports.enabledPreferences !== false
+      const previousCue = state.pendingCue
+      const followUp = canFollowUp && previousCue !== undefined && !previousCue.written && previousCue.at < payload.at
+        ? '上一轮命中记忆信号但未写入：若仍值得记，现在补 omb_remember；不需要就忽略。'
+        : undefined
+      if (followUp !== undefined) {
+        stats.cueFollowUps += 1
+        ports.activity?.('proactive', 'follow-up')
       }
+      const cue = detectProactiveCue(payload.text)
+      if (cue !== null) {
+        stats.proactiveCues += 1
+        ports.activity?.('proactive', cue.cue)
+      }
+      clearNudge(payload.sessionId)
 
-      const actions = observeController(stateOf(payload.sessionId), {
+      const actions = observeController(state, {
         type: 'user-message',
         text: payload.text,
         at: payload.at,
@@ -1103,6 +1121,20 @@ export function createCapture(ports: CapturePorts): Capture {
         }
       } catch (error) {
         ports.logger?.warn(`OMB 自主捕获（偏好）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      }
+
+      const wrote = state.lastPersistAt === payload.at
+      // 控制器的精确提示（旧 id/临时约束）优先于通用 cue：提示槽只有一个。
+      const controllerHinted = nudges.has(payload.sessionId)
+      if (cue !== null && canFollowUp && cue.cue !== 'task-constraint') {
+        state.pendingCue = { at: payload.at, cue: cue.cue, written: wrote }
+      }
+      if (!controllerHinted) {
+        if (cue !== null && cue.cue !== 'task-constraint' && !wrote) {
+          setNudge(payload.sessionId, cue.text)
+        } else if (followUp !== undefined) {
+          setNudge(payload.sessionId, followUp)
+        }
       }
     },
     async onToolCall(payload) {
@@ -1245,6 +1277,8 @@ export function createCapture(ports: CapturePorts): Capture {
         unknownCorrelation: stats.unknownCorrelation,
         pending: globalPending,
         controller: { ...stats.controller, tasksActive },
+        proactiveCues: stats.proactiveCues,
+        cueFollowUps: stats.cueFollowUps,
         skipped: { ...stats.skipped },
       }
     },

@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.13.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.14.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,13 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.13.0（当前） = 事件控制器显式状态机（x2）**：`ControllerSessionState` 加
+- **v4.14.0（当前） = 主动记忆提示扩展与跟进（x2）**：新增 `recall-first`
+  （引用过去结论先查）与 `project-fact`（路径/命令/端口/版本/URL）两类 cue；
+  execute 模式不再整体抑制提示：控制器精确提示优先，没写时才给 cue；
+  未写入的 cue 在**下一条用户消息**给一次跟进（dry-run/off/任务约束不跟进）；
+  活动日志加 `proactive`，健康面/metrics 报命中与跟进数。
+  契约：`docs/v4.14.0-proactive-initiative.md`。
+- **v4.13.0** = 事件控制器显式状态机（x2）：`ControllerSessionState` 加
   `phase`（idle/candidate-pending/tracking-tasks/mixed）与 `transition`（事件→阶段→动作）；
   动作带确定性 id，persist 每会话幂等（最近 64 个候选，计 `duplicateActions`）；
   `ControllerStats.failures` 按 8 类计失败，健康面只列发生的类别，metrics 按类输出；
@@ -150,7 +156,8 @@ node scripts/check-resolution.mjs
   `supersedes` 用法（不自动 supersedes）；request-model 只注入一行。临时/任务约束
   永不 persist，只在会话内跟踪、易变槽可见。疑问/命令/代码/偏好标记判据抽到
   `modules/memory/message-filter.ts`，捕获与控制器共用一份。execute 且自动捕获开启时
-  **抑制 proactive 提示**（避免模型重复 `omb_remember`）；健康面 `controllerHealthNote()`
+  **抑制 proactive 提示**（避免模型重复 `omb_remember`；v4.14.0 起改为：
+  控制器精确提示优先，未写入时 cue 仍生效，未写入的 cue 下一轮跟进）；健康面 `controllerHealthNote()`
   区分 dry-run 与执行，决策计数与执行计数分开。契约：`docs/v4.7.0-memory-controller.md`。
 - **v4.6.1** = 审查修复：项目证据改为解析 shell 结果里的 `[exit code: N]`
   （工具 `isError` 不再当命令成功；无标记=unknown），旧 v1 落盘 `ok` 降为 unknown；
@@ -190,7 +197,9 @@ node scripts/check-resolution.mjs
 - v4.0 = 记忆自主化 + 项目画像 + 事件图 + 推理技能化 + 上下文归零。
 - 依据：`docs/v4-decision.md`（含 §9 v4.1 / §10 v4.2 / §11 v4.3 / §12 v4.4 决策）与 `docs/research/2026-10-18-*.md`（14 份）。
 - 不要恢复：`omb_verify`、逐回合控制散文、未接线服务、写入时 LLM 抽取、GraphRAG、替换宿主压缩。
-- **版本纪律（v4.4）**：新增功能 → x2+1，单个修复 → x3+1；改 `version-manifest.json` 的 `version` 字段 → `node scripts/version.mjs --write`；
+- **版本纪律（v4.4 + 用户补充）**：新增功能 → x2+1，单个修复 → x3+1；
+  **新界面（含侧边栏 UI）也只升 x2，只有重构才升 x1 大版本**；
+  改 `version-manifest.json` 的 `version` 字段 → `node scripts/version.mjs --write`；
   门禁用 `node scripts/version.mjs`（漂移退出码 1）。不要把版本号手写回 4.x。
 - v4.4 遗留项已收口：完整类型图/类型解析（设计边界）、三方自动合并（设计不变量）、
   OOM 根因（宿主快照外部依赖）、`dsh-path-guard` 的 `selfProtection`（用户设置）——

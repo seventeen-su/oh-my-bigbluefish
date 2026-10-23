@@ -510,6 +510,9 @@ async function describeHealth(
     metrics['capture.noPending'] = runtime.capture.noPending
     metrics['capture.unconfirmedCall'] = runtime.capture.unconfirmedCall
     metrics['capture.unknownCorrelation'] = runtime.capture.unknownCorrelation
+    // v4.14.0：主动性信号与跟进读数
+    if (runtime.capture.proactiveCues > 0) metrics['capture.proactiveCues'] = runtime.capture.proactiveCues
+    if (runtime.capture.cueFollowUps > 0) metrics['capture.cueFollowUps'] = runtime.capture.cueFollowUps
     // v4.7.0 阶段 1：事件驱动控制器的决策计数
     metrics['capture.controller.events'] = runtime.capture.controller.events
     metrics['capture.controller.persist'] = runtime.capture.controller.persist
@@ -655,7 +658,12 @@ async function describeHealth(
   const confirmNote = confirmHealthNote(runtime?.confirm)
   // v4.11.0：活动日志只列发生过的事件；错误单列（没有活动就一个字都不写）。
   const activityNote = renderActivityNote(runtime?.activity)
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${confirmNote}${activityNote}${privacyNote}`
+  // v4.14.0：主动性读数（只报发生过的；没有信号就不写这一句）。
+  const proactiveNote = runtime?.capture === undefined || runtime.capture.proactiveCues === 0
+    ? ''
+    : `；主动提示：命中 ${runtime.capture.proactiveCues} 次`
+      + (runtime.capture.cueFollowUps > 0 ? `、跟进 ${runtime.capture.cueFollowUps} 次` : '')
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${confirmNote}${activityNote}${proactiveNote}${privacyNote}`
 
   // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
   // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。

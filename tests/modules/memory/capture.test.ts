@@ -53,7 +53,7 @@ function captureFixture(options: {
   readonly controllerMode?: ControllerMode
   readonly lookupEntries?: ControllerLookup
   /** v4.13.0：活动日志口（测试注入）。 */
-  readonly activity?: (kind: 'controller' | 'error', detail: string) => void
+  readonly activity?: (kind: 'controller' | 'proactive' | 'error', detail: string) => void
 } = {}): CaptureFixture {
   const ws: TempWorkspace = tempWorkspace('omb-capture-')
   const clock = fixedClock()
@@ -475,6 +475,23 @@ describe('生命周期（v4.1 §3.5）', () => {
     expect(f.capture.nudge('s1')).toContain('supersedes')
     await f.capture.onTurnEnd({ sessionId: 's1', turn: 1 })
     expect(f.capture.nudge('s1')).toBeUndefined()
+    await f.close()
+  })
+
+  it('主动性提示（execute）：项目事实 cue 不写库时提示；下一轮未写入给一次跟进（v4.14.0）', async () => {
+    const events: string[] = []
+    const f = captureFixture({ activity: (kind, detail) => events.push(`${kind}:${detail}`) })
+    await f.capture.onUserMessage({
+      sessionId: 's1',
+      text: '端口 8080 上跑的是网关，配置在 src/config/server.ts',
+      at: 1,
+    })
+    expect(f.capture.nudge('s1')).toContain('项目事实')
+    expect(f.capture.stats().proactiveCues).toBe(1)
+    await f.capture.onUserMessage({ sessionId: 's1', text: '好的，继续。', at: 2 })
+    expect(f.capture.nudge('s1')).toContain('上一轮')
+    expect(f.capture.stats().cueFollowUps).toBe(1)
+    expect(events.some(event => event.startsWith('proactive:'))).toBe(true)
     await f.close()
   })
 
