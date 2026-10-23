@@ -1004,3 +1004,38 @@
   `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、`docs/v4.15.0-sidebar-ui.md`
 - 修改：`modules/memory/index.ts`、`packages/memory/{index.ts,package.json}`、
   `kernel/abi/catalog.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.15.1 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.15.1**（`24 功能 / 102 小功能`；x3：4.15.0 侧边栏同功能收尾） |
+| 构建 | **g126**；`generation: 126`、`outDir: lib-gen/g126` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **120 files / 1477 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 浏览器 bundle | `node --check packages/memory/client.js` 通过 |
+| 真机验收 | **待重启 `dsh web` 后核对**：候选详情出现"确认为已确认"，点击后阶段变化并刷新审计/列表；撤销确认同理；版本 4.15.1/构建 126 |
+
+## 本版内容
+
+1. `confirm.ts` 新增 `createConfirmAction(confirmDeps)`：复用 `/omb-confirm` 的
+   promote/undo（查库、形态校验、写回、查回、审计、相关条目、观测口）。
+2. `modules/memory/ui.ts` 新增 `act(id, action, sessionId?)`，与命令同一实现；
+   未启用确认命令时如实拒绝。
+3. `dsh/ui-route.ts` 新增 `POST /omb/api/confirm`：仅 JSON（415）、校验 id/action（400）、
+   成功 200 / 业务拒绝 409；同源检查、no-store 沿用。
+4. 客户端详情面板：候选→确认按钮、已确认且审计最后动作为 confirm→撤销按钮；
+   动作后刷新详情/列表/概览并展示服务端回执。
+5. **没有模型工具入口**；审计 sessionId 为 null（全局面板不绑定会话）。
+
+详见 `docs/v4.15.1-sidebar-confirm-actions.md`。
+
+## 文件
+
+- 新增：`docs/v4.15.1-sidebar-confirm-actions.md`
+- 修改：`modules/memory/{confirm,ui,index}.ts`、`dsh/ui-route.ts`、
+  `packages/memory/client.js`、`tests/modules/memory/ui.test.ts`、
+  `tests/dsh/ui-route.test.ts`、`README.md`、`AGENTS.md`、版本文件

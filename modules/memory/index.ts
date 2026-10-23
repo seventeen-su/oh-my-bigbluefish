@@ -43,7 +43,7 @@ import { createUiService } from './ui.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
-import { installConfirm } from './confirm.js'
+import { createConfirmAction, installConfirm, type ConfirmDeps } from './confirm.js'
 import { autoLinkRelated, findRelatedRecords, findSemanticRelated, type RelatedRecord } from './link.js'
 import { cosineFloorFor } from './vector.js'
 import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
@@ -814,8 +814,6 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 若宿主实现真的抛，apply 抛出会由内核记为本模块 failed，语义正确。
       const off = kernel.provide(SERVICES.stores, service)
       current = service
-      // ── 管理侧边栏数据面（v4.15.0）：只读服务，供 `dsh/ui-route.ts` 使用 ──
-      const offUi = kernel.provide(SERVICES.ui, createUiService({ stores: service }))
 
       // ── 工具面（`tools:omb-memory` → ToolDefinition[]，契约见 SERVICES.toolsPrefix）──
       // 工具**定义**在 `recall.ts`/`graph.ts`，**装配**在本模块的 apply：
@@ -1113,30 +1111,39 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
        * 与 `/omb-feedback` 同一条原则：确认改变证据等级，只有用户有权做，
        * 所以模型工具面一个字都不加。命令不可用不影响记忆写入/召回。
        */
+      const confirmDeps: ConfirmDeps = {
+        clock: kernel.clock,
+        resolveStores: sessionId => resolveStores(sessionId),
+        privacy: () => kernel.service(SERVICES.privacy),
+        logger: kernel.logger,
+        // v4.9.1：确认回执也走同一条"词法 + 语义"相关提示
+        findRelated: (store, record) => relatedFor(store, record),
+        onConfirm: info => {
+          confirmLedger.commands += 1
+          const count = info.count ?? 1
+          if (info.action === 'list') confirmLedger.listed += 1
+          else if (info.action === 'log') confirmLedger.logged += 1
+          else if (info.changed && info.action === 'promote') confirmLedger.promoted += count
+          else if (info.changed) confirmLedger.undone += count
+          else confirmLedger.refused += 1
+          confirmLedger.lastChange = info.changed ? `${info.action}×${count}` : info.reason.slice(0, 80)
+          noteActivity('confirm', `${info.action}${info.changed ? '✓' : '×'}×${count}`)
+        },
+      }
       const confirm = config.confirmCommand
-        ? installConfirm(kernel, {
-            clock: kernel.clock,
-            resolveStores: sessionId => resolveStores(sessionId),
-            privacy: () => kernel.service(SERVICES.privacy),
-            logger: kernel.logger,
-            // v4.9.1：确认回执也走同一条"词法 + 语义"相关提示
-            findRelated: (store, record) => relatedFor(store, record),
-            onConfirm: info => {
-              confirmLedger.commands += 1
-              const count = info.count ?? 1
-              if (info.action === 'list') confirmLedger.listed += 1
-              else if (info.action === 'log') confirmLedger.logged += 1
-              else if (info.changed && info.action === 'promote') confirmLedger.promoted += count
-              else if (info.changed) confirmLedger.undone += count
-              else confirmLedger.refused += 1
-              confirmLedger.lastChange = info.changed ? `${info.action}×${count}` : info.reason.slice(0, 80)
-              noteActivity('confirm', `${info.action}${info.changed ? '✓' : '×'}×${count}`)
-            },
-          })
+        ? installConfirm(kernel, confirmDeps)
         : {
             commandState: () => '未启用（config.confirmCommand=false）',
             dispose: (): void => {},
           }
+
+      // ── 管理侧边栏数据面（v4.15.0/v4.15.1）──
+      // 与 `/omb-confirm` 复用同一个 `createConfirmAction`：UI 不另写写逻辑。
+      const confirmAction = createConfirmAction(confirmDeps)
+      const offUi = kernel.provide(SERVICES.ui, createUiService({
+        stores: service,
+        confirm: confirmAction,
+      }))
 
       const offCaptureMessage = kernel.on('user/message/observed', payload => {
         void capture.onUserMessage(payload)

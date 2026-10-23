@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
 import { openMemoryStore, asConfirmStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
+import { createConfirmAction } from '../../../modules/memory/confirm.js'
 import { createUiService } from '../../../modules/memory/ui.js'
 import { fixedClock, tempWorkspace, testPort } from './helpers.js'
 import { makeRecord } from '../retrieval/fakes.js'
@@ -45,6 +46,14 @@ function fixture(): Fixture {
         projects: [{ projectScope: '/work/demo', stores: [{ scope: 'project', store: project }] }],
       }),
     },
+    confirm: createConfirmAction({
+      clock,
+      resolveStores: () => [
+        { scope: 'user', store: user },
+        { scope: 'project', store: project },
+      ],
+      logger,
+    }),
   })
   return {
     user,
@@ -128,6 +137,40 @@ describe('createUiService', () => {
     const candidates = await f.service.candidates(10)
     expect(candidates.items.map(item => item.id)).toEqual(['c1'])
     await f.close()
+  })
+
+  it('用户动作：确认候选/撤销确认（与 /omb-confirm 同一实现，v4.15.1）', async () => {
+    const f = fixture()
+    await f.put('user', recordOf({ id: 'cand', scope: 'user', kind: 'semantic', assertedBy: 'model', text: '候选结论：端口 8080' }))
+    expect((await f.user.get('cand'))?.assertedBy).toBe('model')
+
+    const confirmed = await f.service.act('cand', 'confirm')
+    expect(confirmed.ok).toBe(true)
+    expect(confirmed.text).toContain('已确认')
+    expect((await f.user.get('cand'))?.assertedBy).toBe('user')
+
+    const undone = await f.service.act('cand', 'undo')
+    expect(undone.ok).toBe(true)
+    expect((await f.user.get('cand'))?.assertedBy).toBe('model')
+
+    // 已确认条目不能再确认（如实拒绝，不改库）
+    await f.put('user', recordOf({ id: 'not-cand', scope: 'user', kind: 'semantic', assertedBy: 'user', text: '用户已确认' }))
+    const refused = await f.service.act('not-cand', 'confirm')
+    expect(refused.ok).toBe(false)
+    expect(refused.text).toContain('未确认')
+
+    expect((await f.service.act('', 'confirm')).ok).toBe(false)
+    expect((await f.service.act('cand', 'nope' as never)).ok).toBe(false)
+    await f.close()
+  })
+
+  it('确认功能未启用：act 如实拒绝（不假装成功）', async () => {
+    const service = createUiService({
+      stores: { status: () => ({ ready: false, detail: '未接线', openProjects: [], maxOpenProjects: 8 }), snapshot: () => ({ user: undefined, projects: [] }) },
+    })
+    const result = await service.act('x', 'confirm')
+    expect(result.ok).toBe(false)
+    expect(result.text).toContain('未启用')
   })
 
   it('详情：正文 + 确认审计 + 共享实体键的相关条目', async () => {

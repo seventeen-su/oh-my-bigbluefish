@@ -47,11 +47,20 @@ function fakeKernel(ui: unknown): Kernel {
 
 async function request(
   route: Captured,
-  input: { method?: string; url: string; origin?: string; host?: string },
+  input: { method?: string; url: string; origin?: string; host?: string; body?: unknown; contentType?: string },
 ): Promise<{ status: number; body: unknown }> {
   const headers: Record<string, string> = { host: input.host ?? '127.0.0.1:3080' }
   if (input.origin !== undefined) headers.origin = input.origin
-  const req = { method: input.method ?? 'GET', url: input.url, headers } as unknown as IncomingMessage
+  if (input.contentType !== undefined) headers['content-type'] = input.contentType
+  const text = input.body === undefined ? '' : JSON.stringify(input.body)
+  const req = {
+    method: input.method ?? 'GET',
+    url: input.url,
+    headers,
+    async *[Symbol.asyncIterator]() {
+      if (text.length > 0) yield Buffer.from(text, 'utf8')
+    },
+  } as unknown as IncomingMessage
   let status = 0
   let payload = ''
   const res = {
@@ -77,6 +86,9 @@ const UI = {
   detail: async (id: string) => (id === 'seen'
     ? { record: { id }, audit: [], auditAvailable: true, related: [] }
     : undefined),
+  act: async (id: string, action: string) => (id === 'cand'
+    ? { ok: true, text: `${action} 成功` }
+    : { ok: false, text: `未确认：${id}` }),
 }
 
 describe('installUiRoute', () => {
@@ -112,11 +124,42 @@ describe('installUiRoute', () => {
     const fake = fakeWeb(null)
     installUiRoute(fake.webCtx, () => fakeKernel(UI))
     const route = fake.captured() as Captured
-    expect((await request(route, { method: 'POST', url: '/omb/api/list' })).status).toBe(405)
+    expect((await request(route, { method: 'POST', url: '/omb/api/list', body: {}, contentType: 'application/json' })).status).toBe(405)
     expect((await request(route, { url: '/omb/api/overview', origin: 'https://evil.example' })).status).toBe(403)
     expect((await request(route, { url: '/omb/api/nope' })).status).toBe(404)
     const badId = await request(route, { url: '/omb/api/detail' })
     expect(badId.status).toBe(400)
+  })
+
+  it('用户动作：POST /confirm 成功 200 / 拒绝 409 / 参数与编码校验', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+    const ok = await request(route, {
+      method: 'POST', url: '/omb/api/confirm', body: { id: 'cand', action: 'confirm' }, contentType: 'application/json',
+    })
+    expect(ok.status).toBe(200)
+    expect(ok.body).toMatchObject({ ok: true })
+    expect(String((ok.body as { text: string }).text)).toContain('confirm 成功')
+
+    const refused = await request(route, {
+      method: 'POST', url: '/omb/api/confirm', body: { id: 'nope', action: 'undo' }, contentType: 'application/json',
+    })
+    expect(refused.status).toBe(409)
+    expect(refused.body).toMatchObject({ ok: false })
+
+    const wrongType = await request(route, {
+      method: 'POST', url: '/omb/api/confirm', body: { id: 'cand', action: 'confirm' }, contentType: 'text/plain',
+    })
+    expect(wrongType.status).toBe(415)
+    const badAction = await request(route, {
+      method: 'POST', url: '/omb/api/confirm', body: { id: 'cand', action: 'delete' }, contentType: 'application/json',
+    })
+    expect(badAction.status).toBe(400)
+    const badBody = await request(route, {
+      method: 'POST', url: '/omb/api/confirm', body: undefined, contentType: 'application/json',
+    })
+    expect(badBody.status).toBe(400)
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

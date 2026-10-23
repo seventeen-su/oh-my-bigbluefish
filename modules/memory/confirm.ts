@@ -658,6 +658,46 @@ async function runUndoBatch(
 }
 
 /**
+ * 供**用户界面**（侧边栏）复用的确认/撤销动作（v4.15.1）。
+ *
+ * 与 `/omb-confirm` **同一份实现**：查库、候选形态校验、写回、查回验证、审计、
+ * 相关条目、观测口都走 `runPromote` / `runUndo`。UI 不复制任何写逻辑。
+ *
+ * 边界：`sessionId` 是 UI 传入的宿主会话（用于审计），没有会话时写 `null`；
+ * 动作仍是**用户动作**（浏览器点击），不是模型工具入口。
+ */
+export function createConfirmAction(deps: ConfirmDeps): (input: {
+  readonly action: 'confirm' | 'undo'
+  readonly id: string
+  readonly sessionId?: string | null
+}) => Promise<{ readonly ok: boolean; readonly text: string }> {
+  return async (input) => {
+    const id = typeof input.id === 'string' ? input.id.trim() : ''
+    if (id.length === 0) return { ok: false, text: '未执行：id 不能为空。' }
+    const sessionId = input.sessionId ?? null
+    let stores: readonly TaggedStore[] | undefined
+    try {
+      stores = deps.resolveStores(sessionId ?? undefined)
+    } catch (error) {
+      return { ok: false, text: `未执行：解析记忆库失败（${messageOf(error)}）。` }
+    }
+    if (stores === undefined || stores.length === 0) {
+      return { ok: false, text: '记忆服务未就绪：没有可查的库（omb-memory 未挂载或项目库尚未打开）。' }
+    }
+    const found = await findRecord(stores, id)
+    if (found === undefined) {
+      return { ok: false, text: `未知 id：${id}。用户库/项目库都没有这条记忆（不会按"最近一条"猜）。` }
+    }
+    const at = deps.clock.now()
+    if (input.action === 'confirm') {
+      const result = await runPromote(found, id, sessionId, at, deps)
+      return { ok: result.kind === 'success', text: result.text }
+    }
+    return await runUndo(found, id, sessionId, at, deps)
+  }
+}
+
+/**
  * 装配 `/omb-confirm`（通过宿主 `commands` 服务；不可用则如实记录原因）。
  */
 export function installConfirm(kernel: Kernel, deps: ConfirmDeps): ConfirmInstallation {

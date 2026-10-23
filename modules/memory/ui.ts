@@ -89,11 +89,24 @@ export interface UiDetail {
   readonly related: readonly RelatedRecord[]
 }
 
+export type UiConfirmAction = 'confirm' | 'undo'
+
+export interface UiActionResult {
+  readonly ok: boolean
+  readonly text: string
+}
+
 export interface UiService {
   overview(): Promise<UiOverview>
   list(query?: UiListQuery): Promise<UiListResult>
   candidates(limit?: number): Promise<UiListResult>
   detail(id: string): Promise<UiDetail | undefined>
+  /**
+   * 用户动作：确认候选 / 撤销确认（v4.15.1）。
+   *
+   * 与 `/omb-confirm` **同一实现**（`createConfirmAction`）；UI 不写库、不复制判据。
+   */
+  act(id: string, action: UiConfirmAction, sessionId?: string | null): Promise<UiActionResult>
 }
 
 export interface UiServiceDeps {
@@ -101,6 +114,12 @@ export interface UiServiceDeps {
     status(): { readonly ready: boolean; readonly detail: string; readonly openProjects: readonly string[]; readonly maxOpenProjects: number }
     snapshot(): { readonly user: { readonly stores: readonly TaggedStore[] } | undefined; readonly projects: readonly { readonly projectScope: string | null; readonly stores: readonly TaggedStore[] }[] }
   }
+  /** 确认动作（`createConfirmAction(confirmDeps)`）；缺省 = 功能未启用，动作如实拒绝。 */
+  readonly confirm?: (input: {
+    readonly action: UiConfirmAction
+    readonly id: string
+    readonly sessionId?: string | null
+  }) => Promise<UiActionResult>
 }
 
 /** 状态判据（与检索侧的 `statusClause` 同一语义，前端不需要知道 SQL）。 */
@@ -309,5 +328,18 @@ export function createUiService(deps: UiServiceDeps): UiService {
     return undefined
   }
 
-  return { overview, list, candidates, detail }
+  return { overview, list, candidates, detail, act }
+
+  async function act(id: string, action: UiConfirmAction, sessionId?: string | null): Promise<UiActionResult> {
+    const trimmed = typeof id === 'string' ? id.trim() : ''
+    if (trimmed.length === 0) return { ok: false, text: '未执行：id 不能为空。' }
+    if (action !== 'confirm' && action !== 'undo') return { ok: false, text: `未执行：未知动作 ${String(action)}。` }
+    const confirm = deps.confirm
+    if (confirm === undefined) return { ok: false, text: '确认功能未启用（config.confirmCommand=false）。' }
+    try {
+      return await confirm({ action, id: trimmed, sessionId: sessionId ?? null })
+    } catch (error) {
+      return { ok: false, text: `执行失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
 }

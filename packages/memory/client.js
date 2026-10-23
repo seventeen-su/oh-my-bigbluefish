@@ -207,10 +207,34 @@ window.__ModuleLoader__.load({
             item.tags.length > 0 ? h('span', null, `#${item.tags.join(' #')}`) : null)))))
     }
 
-    function Detail({ id }) {
+    async function post(path, body) {
+      const response = await fetch(`/omb/api${path}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(body),
+      })
+      let payload = null
+      try {
+        payload = await response.json()
+      } catch {
+        payload = null
+      }
+      if (!response.ok) {
+        const text = payload && typeof payload.text === 'string' ? payload.text : `HTTP ${response.status}`
+        throw new Error(text)
+      }
+      return payload || { ok: true, text: '' }
+    }
+
+    function Detail({ id, onChanged }) {
       const [data, setData] = React.useState(null)
       const [error, setError] = React.useState('')
       const [loading, setLoading] = React.useState(false)
+      const [actionText, setActionText] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [revision, setRevision] = React.useState(0)
+
       React.useEffect(() => {
         let alive = true
         setLoading(true)
@@ -224,11 +248,29 @@ window.__ModuleLoader__.load({
           if (alive) setLoading(false)
         })
         return () => { alive = false }
-      }, [id])
+      }, [id, revision])
+
+      const run = (action) => {
+        if (busy) return
+        setBusy(true)
+        setActionText('')
+        void post('/confirm', { id, action }).then((payload) => {
+          setActionText(payload.text || '完成')
+          setRevision((value) => value + 1)
+          if (onChanged) onChanged()
+        }, (failure) => {
+          setActionText(failure instanceof Error ? failure.message : String(failure))
+        }).finally(() => setBusy(false))
+      }
+
       if (loading) return h('div', { style: styles.empty }, '读取详情…')
       if (error) return h('div', { style: styles.error }, `详情读取失败：${error}`)
       if (!data) return h('div', { style: styles.empty }, '未选择条目')
       const record = data.record
+      const canConfirm = record.stage === 'candidate' && record.kind !== 'episodic'
+      const lastAudit = data.auditAvailable ? data.audit[0] : undefined
+      const canUndo = data.auditAvailable && record.stage === 'confirmed'
+        && lastAudit !== undefined && lastAudit.action === 'confirm'
       return h('div', { style: styles.detail },
         h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
           h(StatusPill, { item: record }),
@@ -239,6 +281,18 @@ window.__ModuleLoader__.load({
           h('span', null, `时间：${formatTime(record.observedAt)}`),
           record.projectScope ? h('span', null, `项目：${record.projectScope}`) : null,
           record.tags.length > 0 ? h('span', null, `标签：${record.tags.join('、')}`) : null),
+        h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+          canConfirm
+            ? h('button', { style: styles.button, disabled: busy, onClick: () => run('confirm') }, busy ? '处理中…' : '确认为已确认')
+            : null,
+          canUndo
+            ? h('button', { style: styles.button, disabled: busy, onClick: () => run('undo') }, busy ? '处理中…' : '撤销确认')
+            : null,
+          h('span', { style: styles.hint },
+            canConfirm || canUndo ? '动作走 /omb-confirm 同一实现；只改证据归属，不改正文。' : '这条当前没有可执行的确认动作。')),
+        actionText.length === 0
+          ? null
+          : h('div', { style: actionText.startsWith('未') || actionText.includes('失败') ? styles.error : styles.hint, whiteSpace: 'pre-wrap' }, actionText),
         record.validTo === null && record.supersededBy === null
           ? null
           : h('div', { style: styles.hint },
@@ -268,6 +322,7 @@ window.__ModuleLoader__.load({
       const [overviewError, setOverviewError] = React.useState('')
       const [overviewLoading, setOverviewLoading] = React.useState(false)
       const [selectedId, setSelectedId] = React.useState(null)
+      const [refreshKey, setRefreshKey] = React.useState(0)
 
       const loadOverview = React.useCallback(async () => {
         setOverviewLoading(true)
@@ -288,7 +343,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.page },
         h('div', { style: styles.header },
           h('h2', { style: styles.title }, 'OMB 记忆'),
-          h('span', { style: styles.hint }, '只读管理面：记忆库 / 候选 / 审计 / 相关条目')),
+          h('span', { style: styles.hint }, '手动管理面：记忆库 / 候选 / 审计 / 相关条目（确认走 /omb-confirm 同一实现）')),
         h('div', { style: styles.tabs },
           ...TABS.map((entry) => h('button', {
             key: entry.id, style: styles.tab(tab === entry.id),
@@ -297,8 +352,14 @@ window.__ModuleLoader__.load({
         tab === 'overview'
           ? h(Overview, { data: overview, loading: overviewLoading, error: overviewError, onRefresh: () => void loadOverview() })
           : h('div', { style: styles.columns },
-            h(MemoryList, { tab, selectedId, onOpen: setSelectedId }),
-            h(Detail, { id: selectedId })))
+            h(MemoryList, { key: `${tab}-${refreshKey}`, tab, selectedId, onOpen: setSelectedId }),
+            h(Detail, {
+              id: selectedId,
+              onChanged: () => {
+                setRefreshKey((value) => value + 1)
+                void loadOverview()
+              },
+            })))
     }
 
     function MemoryIcon({ size }) {

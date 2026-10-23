@@ -63,6 +63,28 @@ function sameOrigin(req: IncomingMessage): boolean {
   }
 }
 
+/** 请求体上限（确认动作只发 id + action；4KB 足够，超出拒绝）。 */
+const MAX_BODY_BYTES = 4 * 1024
+
+/** 读取 JSON 请求体；超限/非 JSON/解析失败返回 undefined（不抛）。 */
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []
+  let size = 0
+  try {
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+      size += buffer.length
+      if (size > MAX_BODY_BYTES) return undefined
+      chunks.push(buffer)
+    }
+    const text = Buffer.concat(chunks).toString('utf8').trim()
+    if (text.length === 0) return undefined
+    return JSON.parse(text) as unknown
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 注册 UI 路由。
  *
@@ -86,10 +108,6 @@ export function installUiRoute(
         json(res, 403, { error: 'cross-origin request rejected' })
         return
       }
-      if (req.method !== 'GET') {
-        json(res, 405, { error: 'read-only endpoint' })
-        return
-      }
       const kernel = kernelOf()
       const ui = kernel?.service<UiService>(SERVICES.ui)
       if (ui === undefined) {
@@ -98,6 +116,37 @@ export function installUiRoute(
       }
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
+      if (req.method === 'POST') {
+        // 唯一的写入口：用户点击的确认/撤销。**没有模型工具调用它**。
+        if (path !== '/confirm') {
+          json(res, 405, { error: 'write endpoint is /confirm only' })
+          return
+        }
+        const contentType = req.headers['content-type'] ?? ''
+        if (typeof contentType !== 'string' || !contentType.toLowerCase().includes('application/json')) {
+          json(res, 415, { error: 'content-type must be application/json' })
+          return
+        }
+        const body = await readJsonBody(req)
+        const record = body !== null && typeof body === 'object' ? body as Record<string, unknown> : undefined
+        const id = record?.['id']
+        const action = record?.['action']
+        if (typeof id !== 'string' || id.trim().length === 0) {
+          json(res, 400, { error: 'missing id' })
+          return
+        }
+        if (action !== 'confirm' && action !== 'undo') {
+          json(res, 400, { error: 'action must be confirm or undo' })
+          return
+        }
+        const outcome = await ui.act(id.trim(), action, null)
+        json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+        return
+      }
+      if (req.method !== 'GET') {
+        json(res, 405, { error: 'read-only endpoint' })
+        return
+      }
       if (path === '/overview') {
         json(res, 200, await ui.overview())
         return
