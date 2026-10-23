@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.11.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.12.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.11.0（当前） = 活动日志与崩溃窗口验证（x2）**：`modules/memory/activity.ts`
+- **v4.12.0（当前） = 跨工作区状态机与文件索引（x2）**：`situation().workspace`
+  惰性记录会话在 git root 之间的切换（`switches`/`previousRoot`/`since`，子目录变化不算），
+  `omb_project` L0 显示切换次数；画像 `ProjectProfileStructure.files` 按符号+导入数
+  排序前 12 个文件，L1 显示前 4 个（规模索引，不是完整 repo-map）。
+  契约：`docs/v4.12.0-workspace-state-and-file-index.md`。
+- **v4.11.0** = 活动日志与崩溃窗口验证（x2）：`modules/memory/activity.ts`
   有界环形（200 条）记录写入/去重/升级/弃权/召回/确认/错误，健康面只列发生过的事件、
   不含正文、不落盘；`tests/dsh/project-evidence-crash.test.ts` 用真实 SIGKILL
   验证证据文件原子写（JSON 可解析、可读回、无损坏现场）。

@@ -210,6 +210,19 @@ export interface SessionSituation {
     /** v4.2：其他会话写过的、本会话读过且写时间晚于读取的路径数（子代理/并发会话）。 */
     readonly otherSessionWrites: number
   }
+  /**
+   * v4.12.0：跨工作区状态机读数（会话在 cwd/git root 之间切换）。
+   *
+   * 只在 `situation()` 被读取时更新（惰性观测）：不新增订阅、不读墙钟之外的状态。
+   * `switches` = 本会话观测到的 root 变化次数；`since` = 当前 root 的首次观测时间。
+   */
+  readonly workspace?: {
+    readonly root: string
+    readonly cwd: string
+    readonly since: number
+    readonly switches: number
+    readonly previousRoot: string | null
+  }
 }
 
 /** 一条写入印记（只用于归因与陈旧判定，不用于拦截）。 */
@@ -407,6 +420,11 @@ export interface SessionStateOptions {
   readonly workspaceChanges?: () => WorkspaceChangesLike | undefined
   /** 会话 → cwd；缺省没有（epoch 恒为"无git"降级）。 */
   readonly cwdOf?: (sessionId: string) => string | undefined
+  /**
+   * v4.12.0：cwd → 项目根（git root）。缺省恒等；生产由 `dsh/project-root.ts` 注入，
+   * 使"切换工作区"按 git root 判定（子目录之间切换不算换项目）。
+   */
+  readonly rootOf?: (cwd: string) => string
   /** 状态目录（`<cwd>/.omb/state`）；缺省由 cwd 推导。返回 undefined = 不持久化。 */
   readonly stateDirOf?: (cwd: string) => string | undefined
   /** 持久化 fs；缺省 node:fs。 */
@@ -1003,6 +1021,48 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * v4.12.0：跨工作区状态机的唯一存放处（会话 → 当前/上一个 root）。
+   *
+   * 只在读取 `situation()` 时更新——这是"惰性观测"：没有新增订阅、没有后台任务。
+   * root 相同但 cwd 变化只更新 cwd（子目录切换不是换项目）。
+   */
+  const rootOf = options.rootOf ?? ((cwd: string) => cwd)
+  const workspaceBySession = new Map<string, {
+    readonly root: string
+    readonly cwd: string
+    readonly since: number
+    readonly switches: number
+    readonly previousRoot: string | null
+  }>()
+  const MAX_WORKSPACE_TRACKED = 256
+  const safeRoot = (cwd: string): string => {
+    try {
+      return nonEmpty(rootOf(cwd)) ?? cwd
+    } catch {
+      return cwd
+    }
+  }
+  const noteWorkspace = (sessionId: string, cwd: string | undefined): SessionSituation['workspace'] => {
+    if (cwd === undefined) return undefined
+    const root = safeRoot(cwd)
+    const now = clock.now()
+    const previous = workspaceBySession.get(sessionId)
+    const next = previous === undefined
+      ? { root, cwd, since: now, switches: 0, previousRoot: null }
+      : previous.root !== root
+        ? { root, cwd, since: now, switches: previous.switches + 1, previousRoot: previous.root }
+        : { ...previous, cwd }
+    if (previous?.root !== next.root || previous.cwd !== next.cwd) {
+      workspaceBySession.set(sessionId, next)
+      if (workspaceBySession.size > MAX_WORKSPACE_TRACKED) {
+        const oldest = workspaceBySession.keys().next().value
+        if (oldest !== undefined && oldest !== sessionId) workspaceBySession.delete(oldest)
+      }
+    }
+    return next
   }
 
   /** 原子写；超 64KB 直接放弃（有界优先）。返回错误文本。 */
@@ -2034,9 +2094,11 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
           const entry = recentWrites.get(key)
           return entry !== undefined && entry.sessionId !== sessionId && entry.at > stamp.at ? count + 1 : count
         }, 0)
+        const resolvedCwd = safeCwd(sessionId)
+        const workspace = noteWorkspace(sessionId, resolvedCwd)
         return {
           sessionId,
-          cwd: safeCwd(sessionId) ?? null,
+          cwd: resolvedCwd ?? null,
           state: record.state,
           tier: record.tier,
           turn: record.turn,
@@ -2066,6 +2128,7 @@ export function createSessionStateMachine(options: SessionStateOptions): Session
             shellInferred: record.shellInferred,
             otherSessionWrites,
           },
+          ...(workspace === undefined ? {} : { workspace }),
         }
       } catch (error) {
         warn('situation', error)

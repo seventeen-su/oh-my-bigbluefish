@@ -127,6 +127,10 @@ function machine(options: {
   clock: FakeClock
   git?: ReturnType<typeof fakeGit>
   cwd?: string
+  /** v4.12.0：动态 cwd（跨工作区测试用；优先于 cwd）。 */
+  cwdOf?: () => string
+  /** v4.12.0：cwd → 项目根。 */
+  rootOf?: (cwd: string) => string
   content?: FakeContent
   instruction?: (cwd: string) => string | null
   summaries?: (sessionId: string, seq: number) => WorkspaceChangesSummaryLike | undefined
@@ -141,7 +145,8 @@ function machine(options: {
     : () => ({ summary: summaries })
   return createSessionStateMachine({
     clock: options.clock,
-    cwdOf: options.cwd === undefined ? undefined : () => options.cwd,
+    cwdOf: options.cwdOf ?? (options.cwd === undefined ? undefined : () => options.cwd),
+    ...(options.rootOf === undefined ? {} : { rootOf: options.rootOf }),
     git: options.git?.run,
     stateDirOf: options.stateDir === undefined ? undefined : () => options.stateDir,
     fs: options.fs,
@@ -742,6 +747,37 @@ describe('situation 快照（v4.1 §3.3：只读 / 同步 / 绝不抛 / ≤16 �
     content.failHash = true
     expect(() => m.port.situation(S1)).not.toThrow()
     expect(m.port.situation(S1)?.reads.entries[0]?.status).toBe('unknown')
+    m.dispose()
+  })
+
+  it('跨工作区状态机：root 变化才计切换，子目录变化不算（v4.12.0）', () => {
+    const clock = new FakeClock()
+    let cwd = 'C:/repoA'
+    const m = machine({
+      clock,
+      cwdOf: () => cwd,
+      rootOf: value => (value.startsWith('C:/repoA') ? 'C:/repoA' : 'C:/repoB'),
+    })
+    m.port.observe(event(S1, 'turn/start', clock.now(), { turn: 1 }))
+    const first = m.port.situation(S1)
+    expect(first?.workspace).toMatchObject({ root: 'C:/repoA', switches: 0, previousRoot: null, cwd: 'C:/repoA' })
+
+    // 同一 git root 下换子目录：只更新 cwd，不算切换
+    clock.advance(1_000)
+    cwd = 'C:/repoA/packages/core'
+    const same = m.port.situation(S1)
+    expect(same?.workspace).toMatchObject({ root: 'C:/repoA', switches: 0, cwd: 'C:/repoA/packages/core' })
+
+    // 真正换 root：切换次数 +1，记下上一处与时间
+    clock.advance(5_000)
+    cwd = 'C:/repoB'
+    const switched = m.port.situation(S1)
+    expect(switched?.workspace).toMatchObject({
+      root: 'C:/repoB',
+      switches: 1,
+      previousRoot: 'C:/repoA',
+      since: clock.now(),
+    })
     m.dispose()
   })
 

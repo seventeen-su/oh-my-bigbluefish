@@ -279,4 +279,21 @@ describe('v4.4 导入图升级', () => {
     expect(view?.structure?.imports).toContainEqual({ from: 'app', to: 'packages', count: 1 })
     dispose()
   })
+
+  it('文件索引：按符号+导入排序、路径稳定（v4.12.0）', () => {
+    const root = makeAliasRepo()
+    const { port, dispose } = createProjectProfile({ clock: { now: () => 1 }, rootOf: () => root })
+    const view = port.read(root)
+    const files = view?.structure?.files ?? []
+    expect(files.length).toBeGreaterThan(0)
+    expect(files.map(file => file.path)).toContain('lib/helper.ts')
+    expect(files.map(file => file.path)).toContain('src/app.ts')
+    // app.ts 有 1 个导出 + 1 个导入；helper.ts 1 个导出
+    const app = files.find(file => file.path === 'src/app.ts')
+    expect(app).toMatchObject({ symbols: 1, imports: 1 })
+    // 确定性：同一棵树两次读结果一致（缓存命中也是）
+    const again = port.read(root)
+    expect(again?.structure?.files).toEqual(files)
+    dispose()
+  })
 })

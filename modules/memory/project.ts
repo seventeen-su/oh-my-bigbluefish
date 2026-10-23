@@ -127,6 +127,13 @@ export interface ProjectProfileStructure {
   readonly calls?: readonly ProjectProfileCall[]
   /** v4.4：tsconfig 路径别名（展示用）。 */
   readonly aliases?: readonly string[]
+  /** v4.12.0：文件索引（按符号+导入数排序的前 12 个文件；不是完整 repo-map）。 */
+  readonly files?: readonly {
+    readonly path: string
+    readonly lines: number
+    readonly symbols: number
+    readonly imports: number
+  }[]
 }
 
 export interface ProjectProfileCommit {
@@ -225,6 +232,14 @@ export interface SessionSituationView {
     readonly otherSessionWrites?: number
     /** v4.4：shell 未知写经 git status 差分推断出的写次数。 */
     readonly shellInferred?: number
+  }
+  /** v4.12.0：跨工作区状态机（会话在 git root 之间切换的读数）。 */
+  readonly workspace?: {
+    readonly root?: string
+    readonly cwd?: string
+    readonly since?: number
+    readonly switches?: number
+    readonly previousRoot?: string | null
   }
 }
 
@@ -389,6 +404,7 @@ function renderIdentity(input: {
   readonly view: ProjectProfileView | undefined
   readonly now: number
   readonly profileMissingReason: string | undefined
+  readonly workspace?: SessionSituationView['workspace']
 }): string {
   const { root, cwd, view } = input
   const identity = view?.identity
@@ -401,6 +417,14 @@ function renderIdentity(input: {
     : `${identity.name}${identity.version === undefined ? '' : ` v${identity.version}`}`
   parts.push(nameVersion)
   parts.push(`git root ${root}`)
+  const switches = input.workspace?.switches ?? 0
+  if (switches > 0) {
+    const since = input.workspace?.since
+    parts.push(
+      `本会话切换工作区 ${switches} 次`
+      + (since === undefined ? '' : `（自 ${describeAge(input.now, since)}；上一处 ${input.workspace?.previousRoot ?? '未知'}）`),
+    )
+  }
   const relative = view?.cwdRel ?? (cwd === undefined ? undefined : cwdRelative(root, cwd))
   parts.push(`cwd 相对根 ${relative === undefined ? '未知' : relative === '' ? '.' : relative}`)
   if (identity?.branch !== undefined && identity.branch.length > 0) parts.push(`分支 ${identity.branch}`)
@@ -459,6 +483,15 @@ function renderStructure(view: ProjectProfileView | undefined, missingReason: st
       `文件依赖 ${structure.fileImports
         .slice(0, 3)
         .map(edge => `${shortFile(edge.from)}→${shortFile(edge.to)}(${edge.count})`)
+        .join('、')}`,
+    )
+  }
+  // v4.12.0：文件索引（谁最"重"：符号+导入数），不是完整 repo-map。
+  if (structure?.files !== undefined && structure.files.length > 0) {
+    parts.push(
+      `文件索引 ${structure.files
+        .slice(0, 4)
+        .map(file => `${shortFile(file.path)}(${file.symbols}符号/${file.imports}导入)`)
         .join('、')}`,
     )
   }
@@ -776,7 +809,14 @@ export function createProjectTool(deps: ProjectToolDeps): ToolDefinition {
           {
             index: 0,
             title: LAYER_TITLES[0] as string,
-            body: renderIdentity({ root, cwd, view, now, profileMissingReason }),
+            body: renderIdentity({
+              root,
+              cwd,
+              view,
+              now,
+              profileMissingReason,
+              ...(situation?.workspace === undefined ? {} : { workspace: situation.workspace }),
+            }),
           },
           {
             index: 1,

@@ -55,6 +55,7 @@ function fakeProfile(): ProjectProfilePort & { reads: number; refreshes: number 
           sources: [{ dir: 'modules/memory', files: 12, lines: 3456, tests: 120 }],
           entries: ['modules/memory/index.ts'],
           docs: [{ path: 'docs/a.md', title: '空间规格' }],
+          files: [{ path: 'modules/memory/index.ts', lines: 900, symbols: 12, imports: 3 }],
         },
         history: { commits: [{ hash: 'abc123def456', subject: 'feat: v4.1', at: NOW - 7_200_000 }], dirty: 3 },
         gates: [{ name: 'test', command: 'pnpm test' }],
@@ -281,6 +282,34 @@ describe('omb_project 六层时空快照（v4.1 §2）', () => {
     expect(l0).toContain('cwd 相对根 sub')
     // 旧画像没有结构字段 → L1 退回画像文本（不是"结构为空"）
     expect(outcome.text.split('\n')[1]).toContain('无结构字段的旧画像')
+  })
+
+  it('文件索引：L1 显示路径/符号/导入（v4.12.0）', async () => {
+    const outcome = (await toolOf({ profile: fakeProfile(), situation: fakeSituation() }).tool.execute(
+      {},
+      { sessionId: 's1', attribution: 'session' },
+    )) as { text: string }
+    expect(outcome.text).toContain('文件索引')
+    expect(outcome.text).toContain('modules/memory/index.ts')
+  })
+
+  it('跨工作区：L0 显示切换次数、当前 root 与上一处（v4.12.0）', async () => {
+    const outcome = (await toolOf({
+      profile: fakeProfile(),
+      situation: fakeSituation({
+        workspace: {
+          root: 'D:\\work\\repoB',
+          cwd: 'D:\\work\\repoB',
+          since: NOW - 60_000,
+          switches: 2,
+          previousRoot: 'D:\\work\\repoA',
+        },
+      }),
+      projectRoot: () => 'D:\\work\\repoB',
+    }).tool.execute({}, { sessionId: 's1', attribution: 'session' })) as { text: string }
+    const l0 = outcome.text.split('\n')[0] ?? ''
+    expect(l0).toContain('切换工作区 2 次')
+    expect(l0).toContain('repoA')
   })
 
   it('总长 ≤ 2400：超限时按层压缩正文，六层标题都在，且同一输入同一文本', async () => {

@@ -99,6 +99,16 @@ export interface ProjectProfileStructure {
   readonly calls?: readonly ProjectProfileCall[]
   /** v4.4：tsconfig 里识别到的路径别名（`@/* → src/*` 形式，最多 4 条）。 */
   readonly aliases?: readonly string[]
+  /** v4.12.0：文件索引（按符号+导入数排序的前 12 个文件）。 */
+  readonly files?: readonly ProjectProfileFileIndex[]
+}
+
+/** 文件索引的一条（v4.12.0）：只给规模信号，不给正文。 */
+export interface ProjectProfileFileIndex {
+  readonly path: string
+  readonly lines: number
+  readonly symbols: number
+  readonly imports: number
 }
 
 /** 一条提交（短 hash + 主题 + 作者时间）。 */
@@ -434,6 +444,8 @@ interface ScanResult {
   readonly fileImports: ProjectProfileFileImport[]
   /** v4.4：近似调用边（最多 `CALL_EDGE_MAX` 条）。 */
   readonly calls: ProjectProfileCall[]
+  /** v4.12.0：文件索引（最多 `FILE_INDEX_MAX` 个文件）。 */
+  readonly files: ProjectProfileFileIndex[]
   /** v4.4：tsconfig 路径别名（展示用，最多 4 条）。 */
   readonly aliases: readonly string[]
   /** 是否因为文件上限而截断（状态面/文本不假装"这就是全部"）。 */
@@ -445,7 +457,10 @@ const IMPORT_EDGE_MAX = 12
 /** v4.4：文件级导入边上限。 */
 const FILE_EDGE_MAX = 12
 /** v4.4：近似调用边上限。 */
+/** v4.4：近似调用边上限。 */
 const CALL_EDGE_MAX = 12
+/** v4.12.0：文件索引上限（按符号+导入数排序后的文件数）。 */
+const FILE_INDEX_MAX = 12
 
 interface AliasRule {
   readonly prefix: string
@@ -628,6 +643,8 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
     readonly topName: string
     readonly relativePath: string
     readonly absolutePath: string
+    /** v4.12.0：文件行数（文件索引用；已由 analyzeSource 算出）。 */
+    readonly lines: number
     readonly imports: readonly string[]
     readonly importCalls: readonly { readonly specifier: string; readonly name: string }[]
   }[] = []
@@ -642,7 +659,7 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
       .map(entry => entry.name)
       .sort()
   } catch {
-    return { topDirs: [], sources: [], imports: [], fileImports: [], calls: [], aliases: alias.display, truncated: false }
+    return { topDirs: [], sources: [], imports: [], fileImports: [], calls: [], files: [], aliases: alias.display, truncated: false }
   }
 
   /** 记一个源码文件的规模/导出/导入（非源码扩展名直接跳过）。 */
@@ -661,6 +678,7 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
       topName,
       relativePath,
       absolutePath,
+      lines: analyzed.lines,
       imports: analyzed.imports,
       importCalls: analyzed.importCalls,
     })
@@ -768,12 +786,25 @@ function scanTree(root: string, maxFiles: number, alias: AliasConfig): ScanResul
     .sort((a, b) => b.count - a.count || a.caller.localeCompare(b.caller) || a.callee.localeCompare(b.callee))
     .slice(0, CALL_EDGE_MAX)
 
+  /** v4.12.0：文件索引——按符号+导入数排序的前 12 个文件（确定性）。 */
+  const files: ProjectProfileFileIndex[] = scanned
+    .map(file => ({
+      path: file.relativePath,
+      lines: file.lines,
+      symbols: fileExports.get(file.relativePath)?.size ?? 0,
+      imports: file.imports.length,
+    }))
+    .sort((a, b) =>
+      (b.symbols + b.imports) - (a.symbols + a.imports) || a.path.localeCompare(b.path))
+    .slice(0, FILE_INDEX_MAX)
+
   return {
     topDirs: topDirs.slice(0, TOP_DIR_MAX),
     sources,
     imports,
     fileImports,
     calls,
+    files,
     aliases: alias.display,
     truncated,
   }
@@ -1016,6 +1047,7 @@ function buildProfile(cwd: string, now: number, rootOf: (cwd: string) => string,
     ...(scan.imports.length === 0 ? {} : { imports: scan.imports }),
     ...(scan.fileImports.length === 0 ? {} : { fileImports: scan.fileImports }),
     ...(scan.calls.length === 0 ? {} : { calls: scan.calls }),
+    ...(scan.files.length === 0 ? {} : { files: scan.files }),
     ...(scan.aliases.length === 0 ? {} : { aliases: scan.aliases }),
   }
   const history: ProjectProfileHistory = {

@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.11.0 = 活动日志与崩溃窗口验证（x2）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.12.0 = 跨工作区状态机与文件索引（x2）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -39,7 +39,9 @@
         "项目记忆 top3",
         "构建/测试运行证据",
         "证据到文件映射",
-        "工作区包导出映射"
+        "工作区包导出映射",
+        "跨工作区状态机",
+        "文件索引"
       ]
     },
     {
@@ -268,5 +270,5 @@
       ]
     }
   ],
-  "version": "4.11.0"
+  "version": "4.12.0"
 }

@@ -216,6 +216,8 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     cwdOf: sessionId =>
       handle.kernel.service<{ cwd(session: string): string | null }>(SERVICES.activeSession)
         ?.cwd(sessionId) ?? undefined,
+    // v4.12.0：切换工作区按 git root 判定（子目录之间切换不算换项目）
+    rootOf: cwd => projectRoot.port.resolve(cwd),
     // 每次现取：宿主服务可能晚于插件就绪，也可能中途被开关（与通知服务同一条口径）。
     workspaceChanges: () => readService<WorkspaceChangesLike>(ctx, 'workspaceChanges'),
   })

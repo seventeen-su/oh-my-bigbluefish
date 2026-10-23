@@ -873,3 +873,34 @@
 - 新增：`modules/memory/activity.ts`、`tests/modules/memory/activity.test.ts`、
   `tests/dsh/project-evidence-crash.test.ts`、`docs/v4.11.0-activity-log-and-crash-tests.md`
 - 修改：`modules/memory/{index,remember}.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.12.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.12.0**（`24 功能 / 99 小功能`；x2 新功能：跨工作区状态机 + 文件索引） |
+| 构建 | **g122**；`generation: 122`、`outDir: lib-gen/g122` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **118 files / 1460 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：`omb_project` L0 出现"本会话切换工作区 N 次"，L1 出现"文件索引"；版本 4.12.0/构建 122 |
+
+## 本版内容
+
+1. **跨工作区状态机**：`situation()` 惰性记录会话的 `workspace`
+   `{root, cwd, since, switches, previousRoot}`；`rootOf` 由 `dsh/plugin.ts` 注入
+   （git root 判定，子目录变化不算切换）；`omb_project` L0 显示切换次数/上一处。
+2. **文件索引**：`ProjectProfileStructure.files`（`path/lines/symbols/imports`）按
+   符号+导入数排序前 12；`omb_project` L1 显示前 4；确定性排序，复用同一次扫描。
+3. 测试：状态机 root 切换用例、项目工具 L0/L1 用例、画像 files 排序/确定性用例。
+
+详见 `docs/v4.12.0-workspace-state-and-file-index.md`。
+
+## 文件
+
+- 新增：`docs/v4.12.0-workspace-state-and-file-index.md`
+- 修改：`dsh/{state-machine,project-profile,plugin}.ts`、`modules/memory/project.ts`、
+  `tests/dsh/{state-machine,project-profile}.test.ts`、`tests/modules/memory/project-tool.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件
