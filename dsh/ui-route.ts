@@ -4,8 +4,9 @@
  * 边界：
  * - 只挂在宿主 `webServer` 的 `/omb/api` 前缀上；没有 webServer（CLI/桌面载体）时
  *   本路由不注册，侧边栏自然不出现——不假装已经可用；
- * - **只读**：GET + 只调用 `omb:ui` 服务；写操作仍走用户命令 `/omb-confirm`，
- *   本路由不提供任何写入入口；
+ * - **读**：GET 只调用 `omb:ui` 服务；**写**入口只有用户点击触发的
+ *   `/confirm`、`/resolve`、`/privacy`（v4.17 会话隐私设置）。**没有模型工具入口**：
+ *   模型不能通过这些端点放开自己的隐私限制；
  * - 同源保护：浏览器跨站请求带的 `Origin` 与 `Host` 不一致时 403（GET 的简单请求本来就
  *   不发 Origin，所以这层只在异常情形生效；不是权限边界，真正的边界是本机回环监听）；
  * - 所有响应 `no-store`，JSON 编码，错误不泄漏内部异常文本（只给类别）。
@@ -15,6 +16,7 @@ import type { Kernel } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
 import type { MemoryKind } from '../kernel/abi/index.js'
 import type { UiListQuery, UiScope, UiStatus, UiService } from '../modules/memory/ui.js'
+import type { PrivacyMode } from '../modules/memory/privacy/modes.js'
 
 /** 路由前缀（与 `cordis.patch.yml` 的组件行无关，纯宿主 URL 命名空间）。 */
 export const UI_ROUTE_PREFIX = '/omb/api'
@@ -117,9 +119,10 @@ export function installUiRoute(
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
       if (req.method === 'POST') {
-        // 写入口只有两个：用户点击的确认/撤销与冲突裁决。**没有模型工具调用它们**。
-        if (path !== '/confirm' && path !== '/resolve') {
-          json(res, 405, { error: 'write endpoints are /confirm and /resolve' })
+        // 写入口只有三个：用户点击的确认/撤销、冲突裁决、会话隐私设置。
+        // **没有模型工具调用它们**。
+        if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy') {
+          json(res, 405, { error: 'write endpoints are /confirm, /resolve, and /privacy' })
           return
         }
         const contentType = req.headers['content-type'] ?? ''
@@ -129,6 +132,38 @@ export function installUiRoute(
         }
         const body = await readJsonBody(req)
         const record = body !== null && typeof body === 'object' ? body as Record<string, unknown> : undefined
+        if (path === '/privacy') {
+          const action = record?.['action']
+          if (action !== 'set' && action !== 'clear' && action !== 'clear-inactive' && action !== 'trust') {
+            json(res, 400, { error: 'action must be set, clear, clear-inactive, or trust' })
+            return
+          }
+          let sessionId: string | undefined
+          if (action === 'set' || action === 'clear') {
+            const rawSessionId = record?.['sessionId']
+            if (typeof rawSessionId !== 'string' || rawSessionId.trim().length === 0) {
+              json(res, 400, { error: 'missing sessionId' })
+              return
+            }
+            sessionId = rawSessionId.trim()
+          }
+          let mode: PrivacyMode | undefined
+          if (action === 'set') {
+            const rawMode = record?.['mode']
+            if (rawMode !== 'normal' && rawMode !== 'read-only' && rawMode !== 'sealed') {
+              json(res, 400, { error: 'mode must be normal, read-only, or sealed' })
+              return
+            }
+            mode = rawMode
+          }
+          const outcome = await ui.privacyAct({
+            action,
+            ...(sessionId === undefined ? {} : { sessionId }),
+            ...(mode === undefined ? {} : { mode }),
+          })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
         if (path === '/resolve') {
           const action = record?.['action']
           const fromId = record?.['fromId']
@@ -174,6 +209,10 @@ export function installUiRoute(
       }
       if (path === '/profile') {
         json(res, 200, await ui.profile())
+        return
+      }
+      if (path === '/privacy') {
+        json(res, 200, await ui.privacy())
         return
       }
       if (path === '/list') {

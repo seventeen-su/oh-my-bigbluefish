@@ -7,6 +7,7 @@ import type { MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
 import { openMemoryStore, asConfirmStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { createConfirmAction } from '../../../modules/memory/confirm.js'
 import { createUiService } from '../../../modules/memory/ui.js'
+import type { PrivacyAdminPort, UiPrivacyView } from '../../../modules/memory/privacy/contract.js'
 import { fixedClock, tempWorkspace, testPort } from './helpers.js'
 import { makeRecord } from '../retrieval/fakes.js'
 
@@ -288,5 +289,189 @@ describe('createUiService', () => {
     expect(detail?.related.map(item => item.record.id)).toContain('r2')
     expect(await f.service.detail('missing')).toBeUndefined()
     await f.close()
+  })
+
+  // ── 会话隐私页（v4.17）────────────────────────────────────────────
+  const minimalStores = {
+    status: () => ({ ready: false, detail: '测试未接线', openProjects: [], maxOpenProjects: 8 }),
+    snapshot: () => ({ user: undefined, projects: [] }),
+  }
+
+  function privacyView(overrides: Partial<UiPrivacyView> = {}): UiPrivacyView {
+    return {
+      available: true,
+      baseline: { mode: 'normal', origin: 'default', detail: '该会话没有隐私设置（默认 normal）' },
+      current: null,
+      sessions: [],
+      restricted: null,
+      durable: {
+        path: '/tmp/session-modes.json',
+        ok: true,
+        detail: '状态文件可读写',
+        savedAt: NOW,
+      },
+      commands: {
+        privacy: '/omb-privacy',
+        clean: '/omb-privacy-clean',
+        state: '已注册（宿主返回 function）',
+      },
+      stats: {
+        decisions: 3,
+        readDenials: 1,
+        writeDenials: 1,
+        unattributedWriteDenials: 0,
+        lastDeniedSession: 's1',
+        lastDeniedReason: 'sealed',
+      },
+      ...overrides,
+    }
+  }
+
+  it('隐私设置：privacy() 正常透传当前会话；未接线与异常降级为完整形状', async () => {
+    const wired = createUiService({
+      stores: minimalStores,
+      privacy: {
+        current: () => 's1',
+        admin: {
+          view: currentSessionId => privacyView({
+            current: currentSessionId === null
+              ? null
+              : {
+                  sessionId: currentSessionId,
+                  mode: 'sealed',
+                  origin: 'command',
+                  inheritedFrom: null,
+                  detail: '本会话由命令显式设置为 sealed',
+                  parentSessionId: null,
+                },
+          }),
+          setMode: () => ({ ok: true, text: 'ok' }),
+          clear: () => ({ ok: true, text: 'ok' }),
+          clearInactive: () => ({ ok: true, text: 'ok' }),
+          trust: () => ({ ok: true, text: 'ok' }),
+        },
+      },
+    })
+    const view = await wired.privacy()
+    expect(view.available).toBe(true)
+    expect(view.current).toMatchObject({ sessionId: 's1', mode: 'sealed', origin: 'command' })
+    expect(view.commands).toMatchObject({ privacy: '/omb-privacy', clean: '/omb-privacy-clean' })
+    expect(view.stats.decisions).toBe(3)
+
+    // 未接线：不省略任何字段，文案说清原因
+    const absent = await createUiService({ stores: minimalStores }).privacy()
+    expect(absent).toMatchObject({
+      available: false,
+      current: null,
+      sessions: [],
+      restricted: null,
+      durable: { path: null, ok: false, detail: '未知', savedAt: null },
+      commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '未接线' },
+      stats: { decisions: 0, readDenials: 0, writeDenials: 0, unattributedWriteDenials: 0, lastDeniedSession: null, lastDeniedReason: null },
+    })
+    expect(absent.reason).toContain('未接线')
+
+    // 内部异常 → 降级，不抛
+    const broken = createUiService({
+      stores: minimalStores,
+      privacy: {
+        current: () => 's1',
+        admin: {
+          view: () => {
+            throw new Error('状态文件坏了')
+          },
+          setMode: () => ({ ok: true, text: 'ok' }),
+          clear: () => ({ ok: true, text: 'ok' }),
+          clearInactive: () => ({ ok: true, text: 'ok' }),
+          trust: () => ({ ok: true, text: 'ok' }),
+        },
+      },
+    })
+    const degraded = await broken.privacy()
+    expect(degraded.available).toBe(false)
+    expect(degraded.reason).toContain('已隔离')
+    expect(degraded.reason).toContain('状态文件坏了')
+
+    // current() 自己抛错也走同一条降级路径
+    const brokenCurrent = createUiService({
+      stores: minimalStores,
+      privacy: {
+        current: () => {
+          throw new Error('没有活跃会话')
+        },
+        admin: {
+          view: () => privacyView(),
+          setMode: () => ({ ok: true, text: 'ok' }),
+          clear: () => ({ ok: true, text: 'ok' }),
+          clearInactive: () => ({ ok: true, text: 'ok' }),
+          trust: () => ({ ok: true, text: 'ok' }),
+        },
+      },
+    })
+    expect((await brokenCurrent.privacy()).available).toBe(false)
+  })
+
+  it('隐私设置：privacyAct 四动作透传、非法参数拒绝、admin 抛错隔离', async () => {
+    const calls: string[] = []
+    const admin: PrivacyAdminPort = {
+      view: () => privacyView(),
+      setMode: (sessionId, mode) => {
+        calls.push(`set:${sessionId}:${mode}`)
+        return { ok: true, text: `已设置 ${sessionId}=${mode}` }
+      },
+      clear: sessionId => {
+        calls.push(`clear:${sessionId}`)
+        return { ok: true, text: `已清除 ${sessionId}` }
+      },
+      clearInactive: () => {
+        calls.push('clear-inactive')
+        return { ok: true, text: '已清理已结束会话' }
+      },
+      trust: () => {
+        calls.push('trust')
+        return { ok: true, text: '已解除 fail-closed' }
+      },
+    }
+    const service = createUiService({ stores: minimalStores, privacy: { current: () => 's1', admin } })
+
+    expect(await service.privacyAct({ action: 'set', sessionId: 's1', mode: 'sealed' })).toMatchObject({ ok: true })
+    expect(await service.privacyAct({ action: 'clear', sessionId: 's2' })).toMatchObject({ ok: true })
+    expect(await service.privacyAct({ action: 'clear-inactive' })).toMatchObject({ ok: true })
+    expect(await service.privacyAct({ action: 'trust' })).toMatchObject({ ok: true })
+    expect(calls).toEqual(['set:s1:sealed', 'clear:s2', 'clear-inactive', 'trust'])
+
+    // 非法参数：一律 {ok:false, text 以「未执行」开头}，且不触碰 admin
+    const before = calls.length
+    expect(await service.privacyAct({ action: 'nope' as never })).toMatchObject({ ok: false })
+    expect((await service.privacyAct({ action: 'set', sessionId: 's1' })).text).toContain('mode')
+    expect((await service.privacyAct({ action: 'set', sessionId: 's1', mode: 'deep' as never })).ok).toBe(false)
+    expect((await service.privacyAct({ action: 'set', sessionId: '', mode: 'normal' })).text).toContain('sessionId')
+    expect((await service.privacyAct({ action: 'clear' })).text).toContain('sessionId')
+    // 超长 id（可能是误贴了别的东西）：拒绝写进状态文件，也不触碰 admin
+    expect((await service.privacyAct({ action: 'set', sessionId: 'x'.repeat(201), mode: 'sealed' })).text).toContain('超过')
+    expect((await service.privacyAct({ action: 'clear', sessionId: 'x'.repeat(201) })).text).toContain('超过')
+    expect(calls.length).toBe(before)
+
+    // 未接线：如实拒绝
+    const absent = createUiService({ stores: minimalStores })
+    expect((await absent.privacyAct({ action: 'trust' })).text).toContain('未接线')
+
+    // admin 抛错 → 隔离成 {ok:false}，不冒泡
+    const broken = createUiService({
+      stores: minimalStores,
+      privacy: {
+        current: () => 's1',
+        admin: {
+          ...admin,
+          setMode: () => {
+            throw new Error('持久化失败')
+          },
+        },
+      },
+    })
+    const isolated = await broken.privacyAct({ action: 'set', sessionId: 's1', mode: 'sealed' })
+    expect(isolated.ok).toBe(false)
+    expect(isolated.text).toContain('已隔离')
+    expect(isolated.text).toContain('持久化失败')
   })
 })

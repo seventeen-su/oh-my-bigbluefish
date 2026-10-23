@@ -24,6 +24,8 @@ import { OMB_VERSION } from '../../kernel/version.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { findRelatedRecords, type RelatedRecord } from './link.js'
 import { stageLabel, stageOfMemory, type LifecycleStage } from './lifecycle.js'
+import { isPrivacyMode, type PrivacyMode } from './privacy/modes.js'
+import type { PrivacyActionName, PrivacyAdminPort, UiPrivacyView } from './privacy/contract.js'
 
 /** 侧边栏单次列表上限（超出由前端分页/缩小搜索）。 */
 export const UI_LIST_MAX = 50
@@ -204,6 +206,20 @@ export interface UiService {
   runtime(): Promise<UiRuntime>
   /** 项目画像（v4.15.2）；缺省/未知 → 如实说明原因。 */
   profile(): Promise<UiProfile>
+  /**
+   * 会话隐私页的完整视图（v4.17）。未接线/异常 → 返回**完整形状**的降级视图，
+   * 不抛到 HTTP 层（页面要能显示"未接线"而不是白屏）。
+   */
+  privacy(): Promise<UiPrivacyView>
+  /**
+   * 会话隐私页的用户动作（v4.17）。只接受白名单动作；写操作只来自 HTTP POST，
+   * 模型工具没有隐私入口。参数非法 → `{ok:false}`，不猜。
+   */
+  privacyAct(input: {
+    readonly action: PrivacyActionName
+    readonly sessionId?: string
+    readonly mode?: PrivacyMode
+  }): Promise<UiActionResult>
 }
 
 export interface UiServiceDeps {
@@ -221,6 +237,11 @@ export interface UiServiceDeps {
   readonly runtime?: () => Promise<Omit<UiRuntime, 'version' | 'stores'>>
   /** 项目画像装配（经 `SERVICES.projectProfile`）；缺省 = 未接线。 */
   readonly profile?: () => Promise<UiProfile>
+  /** 会话隐私管理（v4.17）：`current` 取当前会话 id，`admin` 是 installPrivacy 的管理端口。 */
+  readonly privacy?: {
+    readonly current: () => string | null
+    readonly admin: PrivacyAdminPort
+  }
   /** 时钟（裁决动作需要时间）；缺省 = 写动作如实拒绝。 */
   readonly clock?: { now(): number }
   /** 活动日志口（裁决动作记账；不含正文）。 */
@@ -267,6 +288,41 @@ function clampLimit(value: number | undefined, fallback: number, max: number): n
 
 /** 有界扫描（`listRecentRecords` 没有状态/类型过滤；在 JS 里裁剪，但先限总量）。 */
 const SCAN_MAX = 500
+
+/** 设置页允许的隐私动作白名单（与 `POST /privacy` 同步）。 */
+const PRIVACY_ACTIONS: readonly PrivacyActionName[] = ['set', 'clear', 'clear-inactive', 'trust']
+/**
+ * 会话 id 的长度上限（v4.17）。设置页允许手填会话 id；不设上限时 4KB 请求体
+ * 可以把任意长字符串写进隐私状态文件。宿主会话 id 远小于这个值。
+ */
+const MAX_PRIVACY_SESSION_ID = 200
+
+/**
+ * 完整形状的隐私降级视图（v4.17）。
+ *
+ * 为什么字段一个都不能少：前端按 `available` 渲染提示，但其余字段仍会被读取；
+ * 少一个键就会在浏览器里变成 `undefined`，页面把"未接线"画成"0 条设置"。
+ */
+function emptyPrivacyView(reason: string): UiPrivacyView {
+  return {
+    available: false,
+    reason,
+    baseline: { mode: 'normal', origin: 'default', detail: reason },
+    current: null,
+    sessions: [],
+    restricted: null,
+    durable: { path: null, ok: false, detail: '未知', savedAt: null },
+    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '未接线' },
+    stats: {
+      decisions: 0,
+      readDenials: 0,
+      writeDenials: 0,
+      unattributedWriteDenials: 0,
+      lastDeniedSession: null,
+      lastDeniedReason: null,
+    },
+  }
+}
 
 interface StoreRef {
   readonly projectScope: string | null
@@ -466,7 +522,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
     return undefined
   }
 
-  return { overview, list, candidates, detail, act, resolve, runtime, profile }
+  return { overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct }
 
   async function resolve(input: UiResolveInput): Promise<UiActionResult> {
     const { action } = input
@@ -571,6 +627,52 @@ export function createUiService(deps: UiServiceDeps): UiService {
       return await deps.profile()
     } catch (error) {
       return { available: false, reason: `画像读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+
+  async function privacy(): Promise<UiPrivacyView> {
+    const wired = deps.privacy
+    if (wired === undefined) return emptyPrivacyView('未接线：隐私管理服务不可用（installPrivacy 未执行）')
+    try {
+      return wired.admin.view(wired.current())
+    } catch (error) {
+      return emptyPrivacyView(`隐私视图读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  async function privacyAct(input: {
+    readonly action: PrivacyActionName
+    readonly sessionId?: string
+    readonly mode?: PrivacyMode
+  }): Promise<UiActionResult> {
+    const action = input?.action
+    if (!PRIVACY_ACTIONS.includes(action)) {
+      return { ok: false, text: `未执行：未知隐私动作 ${String(action)}。` }
+    }
+    const wired = deps.privacy
+    if (wired === undefined) {
+      return { ok: false, text: '未执行：隐私管理服务未接线（installPrivacy 未执行）。' }
+    }
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
+    const sessionIdTooLong = sessionId.length > MAX_PRIVACY_SESSION_ID
+    try {
+      if (action === 'set') {
+        if (sessionId.length === 0) return { ok: false, text: '未执行：设置模式需要 sessionId。' }
+        if (sessionIdTooLong) return { ok: false, text: `未执行：sessionId 超过 ${MAX_PRIVACY_SESSION_ID} 字符（疑似不是会话 id）。` }
+        if (input.mode === undefined || !isPrivacyMode(input.mode)) {
+          return { ok: false, text: '未执行：mode 必须是 normal / read-only / sealed。' }
+        }
+        return wired.admin.setMode(sessionId, input.mode)
+      }
+      if (action === 'clear') {
+        if (sessionId.length === 0) return { ok: false, text: '未执行：清除设置需要 sessionId。' }
+        if (sessionIdTooLong) return { ok: false, text: `未执行：sessionId 超过 ${MAX_PRIVACY_SESSION_ID} 字符（疑似不是会话 id）。` }
+        return wired.admin.clear(sessionId)
+      }
+      if (action === 'clear-inactive') return wired.admin.clearInactive()
+      return wired.admin.trust()
+    } catch (error) {
+      return { ok: false, text: `执行失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
     }
   }
 

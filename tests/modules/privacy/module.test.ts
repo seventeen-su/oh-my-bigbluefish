@@ -99,6 +99,8 @@ function boot(options: {
   readonly failClosedMode?: 'sealed' | 'read-only'
   /** false = 宿主没有 commands 服务（命令面应如实缺席，闸门照常生效）。 */
   readonly withCommands?: boolean
+  /** 宿主「当前会话」读数（`SERVICES.activeSession.current()`）；缺省 = 不提供该服务。 */
+  readonly currentSession?: string | null
 }): {
   kernel: Kernel
   dispose: () => void
@@ -108,6 +110,9 @@ function boot(options: {
   const handle = createKernel({ logger: capturingLogger() })
   const commands = options.commands ?? fakeCommands()
   if (options.withCommands !== false) handle.kernel.provide('commands', commands.service)
+  if (options.currentSession !== undefined) {
+    handle.kernel.provide(SERVICES.activeSession, { current: () => options.currentSession ?? null })
+  }
   const registration = memoryRegistrationFor(options.path)
   const blocked = handle.start(
     [kernelRow, registration],
@@ -421,6 +426,29 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
       expect(gateOf(second)?.decide('live'), '活跃会话的限制不许被批量清理顺手放宽').toMatchObject({ allowRead: true, allowWrite: false })
       const doc = JSON.parse(readFileSync(path, 'utf8')) as { modes: Record<string, string> }
       expect(Object.keys(doc.modes)).toEqual(['live'])
+      second.dispose()
+    } finally {
+      ws.cleanup()
+    }
+  })
+
+  it('clear 不把"当前会话"当已结束：刚设的档位不会被批量清理顺手放宽', async () => {
+    const ws = tempWorkspace('omb-privacy-clear-current-')
+    const path = join(ws.dir, 'session-modes.json')
+    try {
+      const first = boot({ path })
+      await runCommand(first.commands, 'sealed', { id: 'blank' })
+      first.dispose()
+
+      // 重启后：记录从文件重放（无任何观测 = isActive false），但宿主告诉我它是当前会话
+      const second = boot({ path, currentSession: 'blank' })
+      const result = await runCommand(second.commands, 'clear', undefined, 'omb-privacy-clean')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('已清除 0 个已结束会话')
+      expect(result.text).toContain('活跃的 1 个会话')
+      expect(gateOf(second)?.decide('blank'), '当前会话的限制不许被批量清理放宽').toMatchObject({ allowRead: false, allowWrite: false })
+      const doc = JSON.parse(readFileSync(path, 'utf8')) as { modes: Record<string, string> }
+      expect(doc.modes).toEqual({ blank: 'sealed' })
       second.dispose()
     } finally {
       ws.cleanup()

@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.16.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.17.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,15 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.16.0（当前） = 侧边栏控件与弹性排版规范化（x2）**：浏览器 bundle 改用
+- **v4.17.0（当前） = OMB 设置：二级侧边栏、动效、会话隐私页（x2）**：面板标题
+  「OMB 设置」；主导航改为左侧二级侧边栏（六页签，窄容器图标轨），容器查询
+  （`@container omb-panel`）+ flex/grid 弹性；页面切换 160ms、详情栏 220ms
+  `flex-basis`/滑入过渡，`prefers-reduced-motion` 取消运动；**未选中条目时详情栏收起**
+  （`data-detail` + `inert`）；新增会话隐私管理页：`UiPrivacyView`/`PrivacyAdminPort`、
+  `GET/POST /omb/api/privacy`（set/clear/clear-inactive/trust，400/409），
+  **没有模型工具入口**。契约：`docs/v4.17.0-settings-navigation-and-privacy.md`
+  （含"部分会话命令消失"= DSH 斜杠菜单对带 `input.hint` 命令的 inline 隐藏规则）。
+- **v4.16.0** = 侧边栏控件与弹性排版规范化（x2）：浏览器 bundle 改用
   基线共享控件 `@deepseek-ai/dsh-client-ui-primitives`（Button/Input/Pill/Tag/
   SegmentedTabs/SegmentedControl/StateDot），颜色/圆角走 `--dsw-*` token，
   grid/flex + `minmax(0, …)` 自适应；**修复未选条目时误发 `/detail` 导致

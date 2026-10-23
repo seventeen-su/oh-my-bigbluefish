@@ -94,6 +94,22 @@ const UI = {
   resolve: async (input: { action: string; fromId: string; toId: string }) => (input.fromId === 'a' && input.toId === 'b'
     ? { ok: true, text: `${input.action} 成功` }
     : { ok: false, text: '未执行：测试拒绝' }),
+  privacy: async () => ({
+    available: true,
+    baseline: { mode: 'normal', origin: 'default', detail: '默认 normal' },
+    current: null,
+    sessions: [],
+    restricted: null,
+    durable: { path: '/tmp/session-modes.json', ok: true, detail: '状态文件可读写', savedAt: null },
+    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '已注册' },
+    stats: {
+      decisions: 0, readDenials: 0, writeDenials: 0, unattributedWriteDenials: 0,
+      lastDeniedSession: null, lastDeniedReason: null,
+    },
+  }),
+  privacyAct: async (input: { action: string; sessionId?: string; mode?: string }) => (input.sessionId === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `${input.action} 成功` }),
 }
 
 describe('installUiRoute', () => {
@@ -198,6 +214,66 @@ describe('installUiRoute', () => {
       method: 'POST', url: '/omb/api/resolve', body: { action: 'relate', fromId: 'a' }, contentType: 'application/json',
     })
     expect(missing.status).toBe(400)
+  })
+
+  it('会话隐私：GET /privacy 200；POST 四动作 200；参数校验 400；拒绝 409；其它 POST 405', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+
+    const got = await request(route, { url: '/omb/api/privacy' })
+    expect(got.status).toBe(200)
+    expect(got.body).toMatchObject({ available: true, commands: { privacy: '/omb-privacy' } })
+
+    const post = (body: unknown) => request(route, {
+      method: 'POST', url: '/omb/api/privacy', body, contentType: 'application/json',
+    })
+    const set = await post({ action: 'set', sessionId: 's1', mode: 'sealed' })
+    expect(set.status).toBe(200)
+    expect(String((set.body as { text: string }).text)).toContain('set 成功')
+    expect((await post({ action: 'clear', sessionId: 's1' })).status).toBe(200)
+    expect((await post({ action: 'clear-inactive' })).status).toBe(200)
+    expect((await post({ action: 'trust' })).status).toBe(200)
+
+    const badAction = await post({ action: 'delete', sessionId: 's1' })
+    expect(badAction.status).toBe(400)
+    expect((badAction.body as { error: string }).error).toBe('action must be set, clear, clear-inactive, or trust')
+    expect((await post({ action: 'set', sessionId: 's1' })).status).toBe(400)
+    expect((await post({ action: 'set', sessionId: 's1', mode: 'deep' })).status).toBe(400)
+    expect((await post({ action: 'set', mode: 'normal' })).status).toBe(400)
+    expect((await post({ action: 'clear' })).status).toBe(400)
+    expect((await post({})).status).toBe(400)
+    expect((await post({ action: 'trust' })).body).toEqual({ ok: true, text: 'trust 成功' })
+
+    const denied = await post({ action: 'clear', sessionId: 'denied' })
+    expect(denied.status).toBe(409)
+    expect(denied.body).toMatchObject({ ok: false })
+
+    // 其它 POST 路径 405，文案必须点名 /privacy（新增写入口）
+    const list = await request(route, {
+      method: 'POST', url: '/omb/api/list', body: {}, contentType: 'application/json',
+    })
+    expect(list.status).toBe(405)
+    expect(String((list.body as { error: string }).error)).toContain('/privacy')
+  })
+
+  it('会话隐私：写入口同样要 JSON + 同源（415/403），GET 也拒绝跨源', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+    const plain = await request(route, {
+      method: 'POST', url: '/omb/api/privacy', body: { action: 'trust' }, contentType: 'text/plain',
+    })
+    expect(plain.status).toBe(415)
+
+    const crossPost = await request(route, {
+      method: 'POST', url: '/omb/api/privacy', origin: 'http://evil.example', host: '127.0.0.1:3080',
+      body: { action: 'trust' }, contentType: 'application/json',
+    })
+    expect(crossPost.status).toBe(403)
+
+    const crossGet = await request(route, { url: '/omb/api/privacy', origin: 'http://evil.example' })
+    expect(crossGet.status).toBe(403)
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

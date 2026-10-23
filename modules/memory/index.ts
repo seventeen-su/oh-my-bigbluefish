@@ -1142,6 +1142,18 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       const confirmAction = createConfirmAction(confirmDeps)
       const offUi = kernel.provide(SERVICES.ui, createUiService({
         stores: service,
+        // ── 会话隐私页（v4.17）：用户点击 → HTTP → ui.privacyAct → admin ──
+        // current 只取「这次是谁在问」；取不到就 null（页面显示"无会话归属"，不猜）。
+        privacy: {
+          current: () => {
+            try {
+              return kernel.service<{ current(): string | null }>(SERVICES.activeSession)?.current() ?? null
+            } catch {
+              return null
+            }
+          },
+          admin: privacy.admin,
+        },
         confirm: confirmAction,
         clock: kernel.clock,
         activity: (kind, detail) => noteActivity(kind, detail),

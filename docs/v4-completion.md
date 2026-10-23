@@ -1197,3 +1197,70 @@
   `tests/dsh/{ui-bundle,no-host-imports}.test.ts`、`tests/modules/memory/ui.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
 - 新增：`docs/v4.16.0-sidebar-ui-standardization.md`
+
+---
+
+# OMB v4.17.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.17.0**（`24 功能 / 104 小功能`；x2：OMB 设置页二级侧边栏/动效与会话隐私管理） |
+| 构建 | **g132**；`generation: 132`、`outDir: lib-gen/g132` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **121 files / 1498 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：标题「OMB 设置」、左侧二级侧边栏、窄容器图标轨、详情栏未选中时收起、会话隐私页读写、动效与 `prefers-reduced-motion` |
+
+## 本版内容（对应用户六点）
+
+1. **响应式 + 弹性**：`container-type: inline-size` + `@container omb-panel`
+   （720px 展开导航文字、900px 列表/详情并排），flex/grid、`minmax(min(180px,100%),1fr)`、
+   `min-width:0` 与独立滚动；触屏放大点击目标。
+2. **二级侧边栏而非顶部菜单栏**：主导航改为左侧 `nav`（六项，`aria-current="page"`），
+   `SegmentedTabs` 主导航移除；窄容器收成 46px 图标轨（`title` 保留文字）。
+3. **DSH 标准控件**：Button/Input/Pill/Tag/SegmentedControl/StateDot 与标准图标来自
+   `@deepseek-ai/dsh-client-ui-primitives`；颜色/圆角/焦点环走 `--dsw-*`。
+4. **优雅动效**：页面 160ms 淡入、详情栏 220ms `flex-basis`/`translateX` 展开收起、
+   hover 100–120ms；`prefers-reduced-motion: reduce` 取消运动。**未选中条目时详情栏收起**
+   （`data-detail="closed"` + `inert` + `aria-hidden`），Escape/关闭按钮/再次点同行均可收起。
+5. **命令消失排查**：根因是 DSH 客户端斜杠菜单规则——带 `input.hint` 的命令只在 `/`
+   位于草稿最前（leading）时显示（`ui-commands` 的 `c.position` 过滤、`ui-input-trigger`
+   的 `draft.search(/\S/) === index` 计算；`+` 菜单同样按草稿前缀算 position）。
+   OMB 六个命令与 `/goal`、`/plan`、`/feedback` 都带 hint，因此草稿里 `/` 前有文字时
+   整类消失；`/compact`、`/export`、`/file`、`/model`（无 hint）仍显示。
+   会话日志佐证 OMB 命令确实执行过（`/omb-privacy` 8 次等），注册与执行正常。
+   本轮未改 DSH 客户端（跨仓库），文档给出可用性建议与 DSH 侧最小改法。
+6. **标题与隐私页**：`TITLE = 'OMB 设置'`（面板 label 与 h2 同源）；新增「会话隐私」页：
+   基线/当前会话解析/状态文件/受限会话（未测量不写 0）/当前会话一键设置/按会话 id 设置/
+   显式设置列表（活跃、继承来源、父会话）/危险操作二次确认/命令面与拒绝计数。
+   数据面 `UiPrivacyView` + `PrivacyAdminPort`，`GET/POST /omb/api/privacy`
+   （set/clear/clear-inactive/trust；400/409；同源、no-store、415、4KB）；
+   **没有模型工具入口**。
+
+## 自主阶段追加（界面打磨与补漏）
+
+- 品牌头（图标块 + 实时状态点）、页头分隔线、内容最大宽 1120px；
+- 二级导航条目计数（活跃/候选）、每页标题 + 一句话说明、概览快捷入口；
+- 加载态统一 `TextShimmer`；空状态用虚线容器 + 标题 + 建议；
+- 卡片改用 DSH 设置页同源 token（`--dsw-alias-settings-card-fill/stroke`）；
+- 隐私操作结果改为顶部通知条（`StateDot` + `aria-live`），危险操作改标准 `Modal` 二次确认；
+- 首屏 `loading` 初值 true 消除"暂无数据"闪帧；详情 404 友好空态；详情等待首帧不闪空态；
+- 隐私分段控件首屏显示真实档位（避免误点放宽 sealed）；按会话 id 设置限 200 字符；
+- **补漏**：批量清理"已结束会话"不再把宿主当前会话当已结束（避免刚设的档位被顺手放宽），
+  设置页 `active` 展示用同一判据；
+- 技能护栏：responsive audit A1/A3/A4 全过；motion audit 0 硬违规（reduced-motion 用
+  `transition: none` 已注释说明无 `transitionend` 依赖）。
+
+## 已知边界
+
+- 浏览器视觉/交互人工核对需用户重启 `dsh web` 后完成（本会话无浏览器控制，也不另起服务器）；
+- 隐私页显示会话 id，不显示会话标题：模块层没有会话标题服务，`sessionTitle` 只对活会话可取；
+- DSH 斜杠菜单的 inline 隐藏规则是 DSH 仓库行为，本轮只定位并写清改法，未改 DSH 源码。
+
+## 文件
+
+- 新增：`modules/memory/privacy/contract.ts`、`docs/v4.17.0-settings-navigation-and-privacy.md`
+- 修改：`packages/memory/client.js`、`modules/memory/ui.ts`、`modules/memory/index.ts`、
+  `modules/memory/privacy/index.ts`、`dsh/ui-route.ts`、
+  `tests/dsh/{ui-bundle,ui-route}.test.ts`、`tests/modules/memory/ui.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件

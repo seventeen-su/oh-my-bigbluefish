@@ -61,7 +61,8 @@ import { SERVICES } from '../../../kernel/abi/index.js'
 import { heartbeat } from '../../../kernel/hostEntry.js'
 import { SessionRuntimeTable } from '../../../kernel/sessionRuntime.js'
 import type { PrivacyMode } from './modes.js'
-import { modeTitle, originTitle, type ResolvedPrivacy } from './modes.js'
+import { isPrivacyMode, modeTitle, originTitle, type ResolvedPrivacy } from './modes.js'
+import type { PrivacyAdminPort, PrivacyActionResult, UiPrivacyView } from './contract.js'
 import { PrivacyState } from './state.js'
 import { PrivacyGate } from './gate.js'
 import type { PrivacyDoc } from './codec.js'
@@ -181,6 +182,11 @@ export interface PrivacyInstallation {
   readonly statusContributor: StatusContributor
   /** 命令面读数（`已注册/未注册 + 原因`，进 `/omb-privacy status`）。 */
   readonly commandState: () => string
+  /**
+   * 设置页的**管理端口**（v4.17）：只供 `omb:ui` 的 `privacy/privacyAct` 调用。
+   * 模型工具拿不到它——隐私的控制面只有用户点击与斜杠命令。
+   */
+  readonly admin: PrivacyAdminPort
   dispose(): void
 }
 
@@ -438,6 +444,22 @@ export function installPrivacy(
     }
   }
 
+  /**
+   * 当前会话 id（宿主最后观测到的会话）。
+   *
+   * 批量清理**不得**把它当"已结束"：设置页刚给当前会话设过档位、而该会话还没有
+   * 任何 turn 观测时，`isActive()` 会返回 false——把它清掉等于用户刚设的限制
+   * 被自己页面上的"清理已结束会话"顺手放宽。取不到/异常一律返回 null（不猜）。
+   */
+  const currentSessionId = (): string | null => {
+    try {
+      const table = kernel.service<{ current(): string | null }>(SERVICES.activeSession)
+      return table?.current() ?? null
+    } catch {
+      return null
+    }
+  }
+
   const api: PrivacyCommandApi = {
     statusText: sessionId => renderStatus(sessionId),
     setMode: (sessionId, mode) => {
@@ -504,11 +526,12 @@ export function installPrivacy(
     },
     clearInactive: () => {
       const entries = created.overrides()
+      const current = currentSessionId()
       const removed: string[] = []
       const activeKept: string[] = []
       const inheritanceKept: string[] = []
       for (const entry of entries) {
-        if (created.isActive(entry.sessionId)) {
+        if (created.isActive(entry.sessionId) || entry.sessionId === current) {
           activeKept.push(entry.sessionId)
           continue
         }
@@ -533,6 +556,117 @@ export function installPrivacy(
       }
       const persisted = persist()
       return { kind: persisted.kind, text: `${summary}。\n${persisted.text}` }
+    },
+  }
+
+  // ── 4a) 设置页管理端口（v4.17）────────────────────────────────────
+  //
+  // 只被 `omb:ui` 的 `privacy()` / `privacyAct()` 调用（HTTP POST /privacy 由用户
+  // 点击触发）。**没有模型工具入口**：这里的动作能放宽隐私，绝不能由模型自己发起。
+  // 全部同步、绝不抛；异常只变成 `{ok:false,text}`，页面不白屏。
+  const asActionResult = (result: CommandResultLike): PrivacyActionResult =>
+    ({ ok: result.kind === 'success', text: result.text })
+
+  /** 完整形状的降级视图（缺字段会让前端拿不到键、把"未接线"渲染成空）。 */
+  const emptyPrivacyView = (reason: string): UiPrivacyView => ({
+    available: false,
+    reason,
+    baseline: { mode: 'normal', origin: 'default', detail: reason },
+    current: null,
+    sessions: [],
+    restricted: null,
+    durable: { path: null, ok: false, detail: '未知', savedAt: null },
+    commands: {
+      privacy: PRIVACY_COMMAND_NAME,
+      clean: PRIVACY_CLEAN_COMMAND_NAME,
+      state: '未接线',
+    },
+    stats: {
+      decisions: 0,
+      readDenials: 0,
+      writeDenials: 0,
+      unattributedWriteDenials: 0,
+      lastDeniedSession: null,
+      lastDeniedReason: null,
+    },
+  })
+
+  const isolateAction = (label: string, run: () => PrivacyActionResult): PrivacyActionResult => {
+    try {
+      return run()
+    } catch (error) {
+      return { ok: false, text: `${label}（已隔离）：${messageOf(error)}` }
+    }
+  }
+
+  const admin: PrivacyAdminPort = {
+    view(currentSessionId: string | null): UiPrivacyView {
+      try {
+        const currentId = typeof currentSessionId === 'string' ? currentSessionId.trim() : ''
+        let current: UiPrivacyView['current'] = null
+        if (currentId.length > 0) {
+          const resolved = created.resolve(currentId)
+          current = {
+            sessionId: currentId,
+            mode: resolved.mode,
+            origin: resolved.origin,
+            inheritedFrom: resolved.inheritedFrom,
+            detail: resolved.detail,
+            parentSessionId: runtimeTable.for(currentId)?.parentSessionId ?? null,
+          }
+        }
+        return {
+          available: true,
+          baseline: baseline(),
+          current,
+          sessions: created.overrides().map(entry => ({
+            sessionId: entry.sessionId,
+            mode: entry.mode,
+            updatedAt: entry.updatedAt,
+            // 当前会话即使还没有 turn 观测，也不算"已结束"（与 clearInactive 同一判据）。
+            active: created.isActive(entry.sessionId) || entry.sessionId === currentId,
+            parentSessionId: runtimeTable.for(entry.sessionId)?.parentSessionId ?? null,
+            inheritanceSource: isInheritanceSource(entry.sessionId),
+          })),
+          restricted: createdGate.restrictedCounts(),
+          durable: {
+            path: durablePath,
+            ok: durableError === null && durablePath !== null,
+            detail: durableError ?? (durablePath === null ? '无法解析状态文件路径（未持久化）' : '状态文件可读写'),
+            savedAt,
+          },
+          commands: {
+            privacy: PRIVACY_COMMAND_NAME,
+            clean: PRIVACY_CLEAN_COMMAND_NAME,
+            state: commandState,
+          },
+          stats: createdGate.stats(),
+        }
+      } catch (error) {
+        return emptyPrivacyView(`隐私视图读取失败（已隔离）：${messageOf(error)}`)
+      }
+    },
+
+    setMode(sessionId: string, mode: PrivacyMode): PrivacyActionResult {
+      return isolateAction('设置隐私模式失败', () => {
+        const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+        if (id.length === 0) return { ok: false, text: '未执行：sessionId 不能为空。' }
+        if (!isPrivacyMode(mode)) return { ok: false, text: `未执行：未知隐私模式 ${String(mode)}。` }
+        return asActionResult(api.setMode(id, mode))
+      })
+    },
+
+    clear(sessionId: string): PrivacyActionResult {
+      return isolateAction('清除隐私设置失败', () =>
+        asActionResult(api.forget(typeof sessionId === 'string' ? sessionId : '')))
+    },
+
+    clearInactive(): PrivacyActionResult {
+      return isolateAction('清理已结束会话失败', () => asActionResult(api.clearInactive()))
+    },
+
+    trust(): PrivacyActionResult {
+      return isolateAction('解除 fail-closed 失败', () => asActionResult(api.trust()))
     },
   }
 
@@ -743,6 +877,7 @@ export function installPrivacy(
     health,
     statusContributor,
     commandState: () => commandState,
+    admin,
     dispose: () => {
       if (disposed) return
       disposed = true
