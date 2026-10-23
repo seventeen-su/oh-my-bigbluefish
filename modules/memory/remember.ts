@@ -741,6 +741,11 @@ const rememberArgsSchema = z.object({
     .boolean()
     .optional()
     .describe('仅当用户原话时 true'),
+  tags: z
+    .array(z.string().trim().min(1).max(24))
+    .max(8)
+    .optional()
+    .describe('可选标签（最多 8 个、每个 ≤24 字符）；检索可用 tags 过滤'),
   supersedes: z
     .array(z.string().min(1))
     .max(MAX_SUPERSEDE_TARGETS)
@@ -1580,6 +1585,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           lastUsedAt: now,
           useCount: 0,
           project: deps.currentProject?.(sessionId) ?? null,
+          ...(input.tags === undefined ? {} : { tags: input.tags }),
         }
 
         await store.put(record)

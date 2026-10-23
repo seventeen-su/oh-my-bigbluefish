@@ -220,6 +220,7 @@ export function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord 
     lastUsedAt: overrides.lastUsedAt !== undefined ? overrides.lastUsedAt : 1_700_000_000_000,
     useCount: overrides.useCount !== undefined ? overrides.useCount : 0,
     project: overrides.project !== undefined ? overrides.project : null,
+    ...(overrides.tags !== undefined ? { tags: overrides.tags } : {}),
   }
 }
 

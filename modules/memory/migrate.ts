@@ -194,6 +194,7 @@ export const SCHEMA_MIGRATIONS: readonly MigrationStep[] = [
   { version: 3, name: 'edge-related', up: applySchemaV3 },
   { version: 4, name: 'utility-and-feedback', up: applySchemaV4 },
   { version: 5, name: 'confirm-audit', up: applySchemaV5 },
+  { version: 6, name: 'memory-tags', up: applySchemaV6 },
 ]
 
 
@@ -454,5 +455,18 @@ function applySchemaV5(db: SqliteLike): void {
     ) STRICT;
 
     CREATE INDEX memory_confirm_memory ON memory_confirm(memory_id, at);
+  `)
+}
+
+/**
+ * v6：**纯加法**。`memory.tags`（JSON 字符串数组，默认 `[]`）。
+ *
+ * 为什么需要：检索要支持"按标签过滤"（用户/模型写入时打标签），而标签不是
+ * 结构化的关系，放 JSON 列即可用 `json_each` 过滤；旧库原地升级，历史条目
+ * 没有标签是事实（`[]`），不是错误。
+ */
+function applySchemaV6(db: SqliteLike): void {
+  db.exec(`
+    ALTER TABLE memory ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
   `)
 }

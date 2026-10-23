@@ -764,3 +764,41 @@
 - 新增：`docs/v4.9.7-fuzzy-dedupe.md`
 - 修改：`modules/memory/remember.ts`、`modules/memory/capture.ts`、
   `tests/modules/memory/remember.test.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.10.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.10.0**（`24 功能 / 95 小功能`；x2 新功能：检索过滤与模糊回退） |
+| 构建 | **g119**；`generation: 119`、`outDir: lib-gen/g119` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **118 files / 1474 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：旧库打开后 schema v6；`omb_recall` 可用 status/tags/fuzzy；标签写读正常 |
+
+## 本版内容
+
+1. **schema v6**：`memory.tags`（JSON 数组，默认 `[]`，纯加法）；`SCHEMA_VERSION=6`；
+   写入校验 ≤8 个、每个 ≤24 字符、去重；读库归一为 `[]`。
+2. **omb_remember** 新增可选 `tags`；召回头部显示标签。
+3. **omb_recall** 新增 `status`（active/stale/superseded/all）、`tags`（AND）、`fuzzy`（默认开）；
+   过滤在 SQL 下推（`json_each`），非 JS 事后裁剪；显式查非活跃时跳过兜底过滤与过时探测。
+4. **模糊回退**：词法 0 命中时 `searchFuzzy` 用 `LIKE ESCAPE` 有界子串匹配，通道标 `fuzzy`，
+   信号显示"模糊子串"；`fuzzy=false` 为严格词法对照。
+5. 测试：schema v6、标签往返/非法拒绝、AND 过滤、状态过滤、子串命中与对照；
+   版本断言全部抬到 6。
+
+详见 `docs/v4.10.0-retrieval-filters.md`。
+
+## 文件
+
+- 新增：`docs/v4.10.0-retrieval-filters.md`、`tests/modules/retrieval/filter-fuzzy.test.ts`
+- 修改：`kernel/abi/{storage,ports,index}.ts`、`modules/memory/{migrate,store,retrieve,recall,remember}.ts`、
+  `tests/modules/memory/*`、`README.md`、`AGENTS.md`、版本文件
+
+## 备注
+
+- 这是第 2 项指令；第 1 项（用户断言模糊去重）已在 4.9.7 交付。
+- 后续项（离线整合取消、崩溃验证/日志、跨工作区状态机、控制器重构、主动性、侧边栏 UI）仍在目标中。

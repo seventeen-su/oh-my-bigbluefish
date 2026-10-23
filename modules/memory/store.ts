@@ -22,12 +22,14 @@ import { dirname, isAbsolute, join } from 'node:path'
 import type {
   Clock,
   Edge,
+  FuzzyQuery,
   GraphQuery,
   GraphWalk,
   LexicalQuery,
   Logger,
   MemoryRecord,
   MemoryScope,
+  MemoryStatusFilter,
   MemoryStore,
   ScoredHit,
   SqliteLike,
@@ -436,7 +438,7 @@ export function asRecordScanner(store: MemoryStore): RecordScanApi | undefined {
 // ────────────────────────────────────────────────────────────────────────────
 
 const RECORD_COLUMNS = `id, scope, kind, text, content_hash, source_ref, asserted_by,
-  observed_at, valid_to, superseded_by, last_used_at, use_count, project`
+  observed_at, valid_to, superseded_by, last_used_at, use_count, project, tags`
 
 /**
  * 读取路径随行带出的**效用账本列**（3.7 Wave 2 / R9 C1）。
@@ -453,8 +455,8 @@ const UTILITY_COLUMNS = `u.exposed AS utility_exposed, u.used AS utility_used,
 const INSERT_RECORD_SQL = `
 INSERT INTO memory (
   id, scope, kind, text, content_hash, source_ref, asserted_by,
-  observed_at, valid_to, superseded_by, last_used_at, use_count, project, payload_fts
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  observed_at, valid_to, superseded_by, last_used_at, use_count, project, tags, payload_fts
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   scope = excluded.scope,
   kind = excluded.kind,
@@ -468,6 +470,7 @@ ON CONFLICT(id) DO UPDATE SET
   last_used_at = excluded.last_used_at,
   use_count = excluded.use_count,
   project = excluded.project,
+  tags = excluded.tags,
   payload_fts = excluded.payload_fts`
 
 const UPSERT_EDGE_SQL = `
@@ -652,6 +655,78 @@ function enumOf<T extends string>(value: unknown, allowed: readonly T[], field: 
   )
 }
 
+/** 单条记忆最多标签数（有界，写入与过滤共用）。 */
+export const MAX_TAGS_PER_RECORD = 8
+/** 单个标签最大字符数（有界）。 */
+export const MAX_TAG_CHARS = 24
+
+/** 读库时的标签解析：损坏/非数组 → `[]`（旧库默认值也是 `[]`）。 */
+function parseTags(value: unknown): readonly string[] {
+  if (typeof value !== 'string' || value.length === 0) return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0).slice(0, MAX_TAGS_PER_RECORD)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 写库前的标签校验（v4.10.0）：数组、≤8 个、每个去空白后非空且 ≤24 字符、去重保序。
+ * 违规直接抛——标签是检索过滤条件，静默截断会让"按标签查"结果不可解释。
+ */
+function normalizeTags(tags: readonly string[] | undefined): readonly string[] {
+  if (tags === undefined) return []
+  if (!Array.isArray(tags)) {
+    throw new Error(`OMB：记忆写入被拒——tags 必须是字符串数组，收到 ${typeof tags}`)
+  }
+  const result: string[] = []
+  for (const tag of tags) {
+    if (typeof tag !== 'string') {
+      throw new Error(`OMB：记忆写入被拒——tags 里必须是字符串，收到 ${typeof tag}`)
+    }
+    const trimmed = tag.trim()
+    if (trimmed.length === 0) continue
+    if (trimmed.length > MAX_TAG_CHARS) {
+      throw new Error(`OMB：记忆写入被拒——标签 ${JSON.stringify(trimmed)} 超过 ${MAX_TAG_CHARS} 字符`)
+    }
+    if (!result.includes(trimmed)) result.push(trimmed)
+  }
+  if (result.length > MAX_TAGS_PER_RECORD) {
+    throw new Error(`OMB：记忆写入被拒——标签最多 ${MAX_TAGS_PER_RECORD} 个，收到 ${result.length} 个`)
+  }
+  return result
+}
+
+/** 状态过滤 SQL 片段（默认只看活跃）。 */
+function statusClause(status: MemoryStatusFilter | undefined, alias = 'm'): string {
+  switch (status ?? 'active') {
+    case 'all':
+      return ''
+    case 'stale':
+      return ` AND ${alias}.valid_to IS NOT NULL AND ${alias}.superseded_by IS NULL`
+    case 'superseded':
+      return ` AND ${alias}.superseded_by IS NOT NULL`
+    default:
+      return ` AND ${alias}.valid_to IS NULL AND ${alias}.superseded_by IS NULL`
+  }
+}
+
+/** 标签过滤 SQL 片段（多个标签是 AND）；参数以 JSON 数组绑定。 */
+function tagsFilterClause(tags: readonly string[] | undefined, params: unknown[], alias = 'm'): string {
+  const wanted = tags === undefined ? [] : [...new Set(tags.filter(tag => typeof tag === 'string' && tag.length > 0))]
+  if (wanted.length === 0) return ''
+  params.push(JSON.stringify(wanted), wanted.length)
+  return ` AND (SELECT COUNT(DISTINCT value) FROM json_each(${alias}.tags)
+            WHERE value IN (SELECT value FROM json_each(?))) >= ?`
+}
+
+/** `LIKE` 的转义（`%`/`_`/`\` 必须转义，否则查询串会变成通配符）。 */
+function likeNeedle(text: string): string {
+  return `%${text.replace(/[\\%_]/g, match => `\\${match}`)}%`
+}
+
 function toRecord(row: unknown): MemoryRecord {
   const r = asRow(row, 'memory 行')
   return {
@@ -668,6 +743,7 @@ function toRecord(row: unknown): MemoryRecord {
     lastUsedAt: integerOf(r['last_used_at'], 'last_used_at'),
     useCount: integerOf(r['use_count'], 'use_count'),
     project: nullableTextOf(r['project'], 'project'),
+    tags: parseTags(r['tags']),
   }
 }
 
@@ -804,6 +880,7 @@ function normalizeRecord(record: MemoryRecord, clock: Clock): MemoryRecord {
   if (record.project !== null && record.project !== undefined) {
     project = requireNonEmptyText(record.project, 'project')
   }
+  const tags = normalizeTags(record.tags)
   // 未给有限值时退化为事件时间（"刚写入"的合理语义）
   const lastUsedAt = Number.isInteger(record.lastUsedAt) ? record.lastUsedAt : clock.now()
   return {
@@ -820,6 +897,7 @@ function normalizeRecord(record: MemoryRecord, clock: Clock): MemoryRecord {
     lastUsedAt,
     useCount: record.useCount,
     project,
+    tags,
   }
 }
 
@@ -977,6 +1055,7 @@ class SqliteStore implements SqliteMemoryStore {
         row.lastUsedAt,
         row.useCount,
         row.project,
+        JSON.stringify(row.tags ?? []),
         tokenizeForFts(row.text),
       ])
     })
@@ -1613,11 +1692,12 @@ class SqliteStore implements SqliteMemoryStore {
     for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')
 
     const params: unknown[] = [expression, this.scope]
-    let kindClause = ''
+    let clause = statusClause(query.status)
     if (kinds.length > 0) {
-      kindClause = ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
+      clause += ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
       params.push(...kinds)
     }
+    clause += tagsFilterClause(query.tags, params)
     params.push(limit)
 
     // 长度偏好系数：N/(N + max(0, LENGTH(text) − SHORT))，N = SHORT + GUARD。
@@ -1630,9 +1710,7 @@ class SqliteStore implements SqliteMemoryStore {
          FROM memory_fts
          JOIN memory m ON m.rowid = memory_fts.rowid
         WHERE memory_fts MATCH ?
-          AND m.scope = ?
-          AND m.valid_to IS NULL
-          AND m.superseded_by IS NULL${kindClause}
+          AND m.scope = ?${clause}
         ORDER BY score DESC, m.observed_at DESC, m.id ASC
         LIMIT ?`,
       params,
@@ -1643,6 +1721,51 @@ class SqliteStore implements SqliteMemoryStore {
         id: textOf(r['id'], 'id'),
         score: numberOf(r['score']),
         channel: 'lexical' as const,
+      }
+    })
+  }
+
+  /**
+   * 子串回退检索（v4.10.0）：FTS 0 命中时用 `LIKE` 做部分匹配。
+   *
+   * 边界：`LIKE` 无法走 FTS 索引，因此只在**词法通道 0 命中**时由检索侧调用；
+   * 查询串截到 120 字符、按状态/类型/标签过滤、`LIMIT` 有界。分数只用于排序
+   * （长度差越小越靠前），通道标记 `fuzzy`，与词法分不混算。
+   */
+  async searchFuzzy(query: FuzzyQuery): Promise<readonly ScoredHit[]> {
+    this.#assertUsable()
+    if (query.scope !== this.scope) return []
+    const limit = Number.isFinite(query.limit) ? Math.max(0, Math.floor(query.limit)) : 0
+    const needle = typeof query.text === 'string' ? query.text.trim().slice(0, 120) : ''
+    if (limit === 0 || needle.length < 2) return []
+
+    const kinds = query.kinds === undefined ? [] : [...new Set(query.kinds)]
+    for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')
+
+    const filterParams: unknown[] = []
+    let clause = statusClause(query.status)
+    if (kinds.length > 0) {
+      clause += ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
+      filterParams.push(...kinds)
+    }
+    clause += tagsFilterClause(query.tags, filterParams)
+    const params: unknown[] = [needle.length, this.scope, likeNeedle(needle), ...filterParams, limit]
+    const rows = this.#all(
+      `SELECT m.id AS id,
+              1.0 / (1.0 + ABS(LENGTH(m.text) - ?)) AS score
+         FROM memory m
+        WHERE m.scope = ?
+          AND m.text LIKE ? ESCAPE '\\'${clause}
+        ORDER BY score DESC, m.observed_at DESC, m.id ASC
+        LIMIT ?`,
+      params,
+    )
+    return rows.map(row => {
+      const r = asRow(row, '模糊命中')
+      return {
+        id: textOf(r['id'], 'id'),
+        score: numberOf(r['score']),
+        channel: 'fuzzy' as const,
       }
     })
   }
@@ -1943,11 +2066,12 @@ class SqliteStore implements SqliteMemoryStore {
     for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')
 
     const params: unknown[] = [expect.modelId, expect.dim, expect.revision, this.scope]
-    let kindClause = ''
+    let clause = statusClause(query.status)
     if (kinds.length > 0) {
-      kindClause = ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
+      clause += ` AND m.kind IN (${kinds.map(() => '?').join(', ')})`
       params.push(...kinds)
     }
+    clause += tagsFilterClause(query.tags, params)
 
     const rows = this.#all(
       `SELECT e.memory_id AS id, e.vector AS vector
@@ -1956,9 +2080,7 @@ class SqliteStore implements SqliteMemoryStore {
         WHERE e.model_id = ?
           AND e.dim = ?
           AND e.revision = ?
-          AND m.scope = ?
-          AND m.valid_to IS NULL
-          AND m.superseded_by IS NULL${kindClause}`,
+          AND m.scope = ?${clause}`,
       params,
     )
 

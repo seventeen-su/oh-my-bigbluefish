@@ -27,6 +27,7 @@ import type {
   MemoryKind,
   MemoryRecord,
   MemoryScope,
+  MemoryStatusFilter,
   PressureBand,
   ScoredHit,
   TaggedStore,
@@ -128,6 +129,9 @@ export interface ChannelQuery {
   readonly text: string
   readonly scope: MemoryScope
   readonly kinds?: readonly MemoryKind[]
+  /** v4.10.0：状态/标签过滤与词法通道一致。 */
+  readonly status?: MemoryStatusFilter
+  readonly tags?: readonly string[]
   readonly limit: number
   readonly embedding?: Float32Array
 }
@@ -165,6 +169,15 @@ export interface RetrieveQuery {
    */
   readonly scope?: MemoryScope
   readonly kinds?: readonly MemoryKind[]
+  /** 状态过滤（v4.10.0）：缺省只看活跃；可查 stale/superseded/all。 */
+  readonly status?: MemoryStatusFilter
+  /** 标签过滤（v4.10.0）：多个标签是 AND。 */
+  readonly tags?: readonly string[]
+  /**
+   * 模糊回退（v4.10.0，默认开启）：词法通道 0 命中时，用 `LIKE` 子串匹配再试一次。
+   * 关掉它（`false`）即得到严格词法行为（回归对照）。
+   */
+  readonly fuzzy?: boolean
   readonly limit?: number
   /** 融合后的硬候选上限（默认 20）。 */
   readonly maxCandidates?: number
@@ -257,6 +270,8 @@ export interface RetrievedItem {
   /** v4.6.0：由 kind + assertedBy 推导的知识阶段（不据召回次数自动晋升）。 */
   readonly lifecycle: LifecycleStage
   readonly project: string | null
+  /** v4.10.0：标签（旧条目为 `[]`；缺省表示调用方未提供）。 */
+  readonly tags?: readonly string[]
   readonly validTo: number | null
   readonly supersededBy: string | null
   /** RRF 分（同 `FusedCandidate.score`）。**只用于排序**，不是相关度——展示时不得标成 score。 */
@@ -271,6 +286,8 @@ export interface RetrievedItem {
   readonly signals: {
     readonly lexical?: number
     readonly vector?: number
+    /** v4.10.0：子串回退通道的原始分（长度差越小越高）。 */
+    readonly fuzzy?: number
   }
   readonly channels: readonly ChannelName[]
   readonly ranks: readonly ChannelMatch[]
@@ -703,6 +720,8 @@ export async function retrieve(
             text: query.text,
             scope: tagged.scope,
             ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+            ...(query.status !== undefined ? { status: query.status } : {}),
+            ...(query.tags !== undefined ? { tags: query.tags } : {}),
             limit: poolLimit,
           }),
         degraded,
@@ -723,6 +742,29 @@ export async function retrieve(
           rankings.push({ channel: 'lexical', scope: tagged.scope, hits: rankHits(decision.kept) })
         }
       }
+      /**
+       * v4.10.0：**模糊回退**。词法通道 0 命中（或全部低于下限）时才做子串匹配，
+       * 通道标记 `fuzzy`；不改变词法排名，也不与词法分混算。
+       */
+      const lexicalEmpty = rankings.every(ranking => ranking.channel !== 'lexical')
+      if (lexicalEmpty && query.fuzzy !== false && tagged.store.searchFuzzy !== undefined) {
+        const fuzzy = await safeSearch(
+          () =>
+            tagged.store.searchFuzzy!({
+              text: query.text,
+              scope: tagged.scope,
+              ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+              ...(query.status !== undefined ? { status: query.status } : {}),
+              ...(query.tags !== undefined ? { tags: query.tags } : {}),
+              limit: poolLimit,
+            }),
+          degraded,
+          `库 ${tagged.scope} 模糊通道失败`,
+        )
+        if (fuzzy !== null && fuzzy.length > 0) {
+          rankings.push({ channel: 'fuzzy', scope: tagged.scope, hits: rankHits(fuzzy) })
+        }
+      }
       for (const channel of channels) {
         const hits = await safeSearch(
           () =>
@@ -731,6 +773,8 @@ export async function retrieve(
               text: query.text,
               scope: tagged.scope,
               ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+              ...(query.status !== undefined ? { status: query.status } : {}),
+              ...(query.tags !== undefined ? { tags: query.tags } : {}),
               limit: poolLimit,
               ...(embedding !== undefined ? { embedding } : {}),
             }),
@@ -763,6 +807,8 @@ export async function retrieve(
   const overturnedById = new Map<string, { supersededBy: string | null; validTo: number | null }>()
   let reservedSkipped = 0
   const usable: HydratedCandidate[] = []
+  // v4.10.0：显式查 stale/superseded/all 时**不**在兜底过滤里丢失效行（那是调用方要的）。
+  const activeOnly = query.status === undefined || query.status === 'active'
   for (const entry of hydrated) {
     if (isReservedSource(entry.record.sourceRef)) {
       reservedSkipped += 1
@@ -773,7 +819,7 @@ export async function retrieve(
     // 所以这里通常什么也拦不到；"曾经有过一条已被推翻的结论"靠**过时探测**（见下）而非本行。
     // 只设了 `supersededBy`（`validTo` 仍为空）的半成品行会走到注入列表里——
     // 那是刻意的：与其静默丢弃，不如注入并逐条标注"不是有效结论"（渲染层负责标注）。
-    if (entry.record.validTo !== null) {
+    if (activeOnly && entry.record.validTo !== null) {
       noteOverturned(overturnedById, entry.record.id, entry.record.supersededBy, entry.record.validTo)
       continue
     }
@@ -782,8 +828,11 @@ export async function retrieve(
   const capped = usable.slice(0, maxCandidates)
   const dropped = orderedFused.length - usable.length
 
-  for (const hit of await probeOverturned(ordered, query, degraded)) {
-    noteOverturned(overturnedById, hit.id, hit.supersededBy, hit.validTo)
+  // 显式查非活跃状态时跳过"过时探测"：那些行已经在结果里，再报"曾被推翻"会自相矛盾。
+  if (activeOnly) {
+    for (const hit of await probeOverturned(ordered, query, degraded)) {
+      noteOverturned(overturnedById, hit.id, hit.supersededBy, hit.validTo)
+    }
   }
   const supersededIds = [...overturnedById]
     .filter(([, value]) => value.supersededBy !== null)
@@ -997,13 +1046,15 @@ async function probeOverturned(
 
 function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
   const { candidate, record } = hydrated
-  const signals: { lexical?: number; vector?: number } = {}
+  const signals: { lexical?: number; vector?: number; fuzzy?: number } = {}
   for (const match of candidate.matches) {
     if (match.rawScore === undefined) continue
     if (match.channel === 'lexical') {
       signals.lexical = Math.max(signals.lexical ?? Number.NEGATIVE_INFINITY, match.rawScore)
     } else if (match.channel === 'vector') {
       signals.vector = Math.max(signals.vector ?? Number.NEGATIVE_INFINITY, match.rawScore)
+    } else if (match.channel === 'fuzzy') {
+      signals.fuzzy = Math.max(signals.fuzzy ?? Number.NEGATIVE_INFINITY, match.rawScore)
     }
   }
   return {
@@ -1017,6 +1068,7 @@ function toItem(hydrated: HydratedCandidate, rank: number): RetrievedItem {
     assertedBy: record.assertedBy,
     lifecycle: stageOfMemory({ kind: record.kind, assertedBy: record.assertedBy }),
     project: record.project,
+    tags: record.tags ?? [],
     validTo: record.validTo,
     supersededBy: record.supersededBy,
     score: candidate.score,

@@ -94,6 +94,7 @@ describe('MemoryStore：写入与读取', () => {
       lastUsedAt: 2_000,
       useCount: 7,
       project: 'demo',
+      tags: [],
     })
     await store.put(record)
     expect(await store.get('a')).toEqual(record)
@@ -824,7 +825,7 @@ describe('MemoryStore：stats 与类型守卫', () => {
     const { store, ws } = fixtureOf('project')
     await putAll(store, [makeRecord({ scope: 'project', id: 'p1' }), makeRecord({ scope: 'project', id: 'p2' })])
     const stats = await store.stats()
-    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 5, vectors: null })
+    expect(stats).toEqual({ scope: 'project', rows: 2, schemaVersion: 6, vectors: null })
     ws.cleanup()
   })
 
@@ -853,8 +854,8 @@ describe('MemoryStore：stats 与类型守卫', () => {
 
   it('打开时就完成迁移：migrated 记录 0 → 最新（含 v2 的 embedding.content_hash、v3 的 edge.related）', async () => {
     const { store, ws } = fixtureOf()
-    // 0 → 5：v1 建表 + v2 加列 + v3 重建 edge 表（CHECK 增加 related）+ v4 效用账本 + v5 确认审计。
-    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 5 })
+    // 0 → 6：v1 建表 + v2 加列 + v3 重建 edge 表（CHECK 增加 related）+ v4 效用账本 + v5 确认审计 + v6 标签列。
+    expect(asMemoryStore(store)?.migrated).toEqual({ from: 0, to: 6 })
     ws.cleanup()
   })
 })
@@ -1089,6 +1090,69 @@ describe('MemoryStore：陈旧向量的待重建判定（回填的输入）', ()
     await expect(store.countStaleEmbeddingsByCause({ modelId: '', dim: 256, revision: '1' })).rejects.toThrow(
       /model_id/,
     )
+    ws.cleanup()
+  })
+})
+
+describe('MemoryStore：标签（v4.10.0）', () => {
+  it('put/get 往返保留标签；旧记录没有标签时读出 []', async () => {
+    const { store, ws } = fixtureOf()
+    const tagged = makeRecord({ id: 'tag-1', text: '标签往返测试', tags: ['pref', 'work'] })
+    await store.put(tagged)
+    const plain = makeRecord({ id: 'tag-2', text: '没有标签的条目' })
+    await store.put(plain)
+
+    expect((await store.get('tag-1'))?.tags).toEqual(['pref', 'work'])
+    expect((await store.get('tag-2'))?.tags).toEqual([])
+    ws.cleanup()
+  })
+
+  it('标签非法时写入被拒（不是静默截断）', async () => {
+    const { store, ws } = fixtureOf()
+    await expect(store.put(makeRecord({ tags: ['x'.repeat(25)] }))).rejects.toThrow(/超过 24 字符/)
+    await expect(store.put(makeRecord({ tags: Array.from({ length: 9 }, (_, i) => `t${i}`) })))
+      .rejects.toThrow(/最多 8 个/)
+    ws.cleanup()
+  })
+
+  it('标签过滤是 AND：多个标签要同时具备', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'a', text: '记忆甲 共享内容', tags: ['p', 'q'] }))
+    await store.put(makeRecord({ id: 'b', text: '记忆乙 共享内容', tags: ['p'] }))
+    await store.put(makeRecord({ id: 'c', text: '记忆丙 共享内容' }))
+    const ids = (await store.searchLexical({ text: '共享内容', scope: 'user', tags: ['p', 'q'], limit: 10 }))
+      .map(hit => hit.id)
+    expect(ids).toEqual(['a'])
+    ws.cleanup()
+  })
+
+  it('状态过滤：默认 active，可查 stale / superseded / all', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'live', text: '状态过滤词 活跃' }))
+    await store.put(makeRecord({ id: 'old', text: '状态过滤词 失效', validTo: 1_700_000_001_000 }))
+    await store.put(makeRecord({ id: 'gone', text: '状态过滤词 被取代', supersededBy: 'live' }))
+
+    const active = (await store.searchLexical({ text: '状态过滤词', scope: 'user', limit: 10 })).map(hit => hit.id)
+    const stale = (await store.searchLexical({ text: '状态过滤词', scope: 'user', status: 'stale', limit: 10 })).map(hit => hit.id)
+    const superseded = (await store.searchLexical({ text: '状态过滤词', scope: 'user', status: 'superseded', limit: 10 })).map(hit => hit.id)
+    const all = (await store.searchLexical({ text: '状态过滤词', scope: 'user', status: 'all', limit: 10 })).map(hit => hit.id)
+    expect(active).toEqual(['live'])
+    expect(stale).toEqual(['old'])
+    expect(superseded).toEqual(['gone'])
+    expect(all.sort()).toEqual(['gone', 'live', 'old'])
+    ws.cleanup()
+  })
+
+  it('子串回退：FTS 零命中时 searchFuzzy 能找到部分匹配，且遵守标签过滤', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'f1', text: '超长路径 src/config/server.ts 里放着端口', tags: ['arch'] }))
+    await store.put(makeRecord({ id: 'f2', text: '同样是 src/config/server.ts 但标签不同', tags: ['other'] }))
+    await store.put(makeRecord({ id: 'f3', text: '无关条目', tags: ['other'] }))
+    const fuzzy = await store.searchFuzzy!({ text: 'config/server', scope: 'user', limit: 10 })
+    expect(fuzzy.map(hit => hit.id).sort()).toEqual(['f1', 'f2'])
+    expect(fuzzy.every(hit => hit.channel === 'fuzzy')).toBe(true)
+    const filtered = await store.searchFuzzy!({ text: 'config/server', scope: 'user', tags: ['other'], limit: 10 })
+    expect(filtered.map(hit => hit.id)).toEqual(['f2'])
     ws.cleanup()
   })
 })

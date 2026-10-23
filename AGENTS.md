@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.7**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.10.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.7（当前） = 用户断言的模糊去重与压缩后追忆修复（x3）**：`findSimilarContent`
+- **v4.10.0（当前） = 检索过滤与模糊回退（x2）**：schema v6 加 `memory.tags`（JSON 数组，
+  默认 `[]`，最多 8 个、每个 ≤24 字符）；`omb_recall` 新增 `status`（active/stale/superseded/all）、
+  `tags`（AND）、`fuzzy`（默认开）；词法 0 命中时用 `searchFuzzy` 的 `LIKE` 子串回退，
+  通道标记 `fuzzy`。过滤全部在 SQL 下推（`json_each`），不是 JS 事后裁剪。
+  契约：`docs/v4.10.0-retrieval-filters.md`。
+- **v4.9.7** = 用户断言的模糊去重与压缩后追忆修复（x3）：`findSimilarContent`
   在内容哈希之外用归一化 bigram（≥0.9）判近似同内容，**数字不同不合并**；用户断言
   命中既有候选时就地把 `assertedBy` 升为 `user`（正文/id/时间不改）；压缩后当前上下文
   没有原话时，若库里已有同内容已确认记录，记 `previously-verified` 继续写入，否则仍拒绝。

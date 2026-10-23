@@ -29,7 +29,15 @@ export interface MemoryRecord {
   readonly useCount: number
   /** 来源项目；跨项目库中作为溯源保留，**不作为检索过滤条件**。 */
   readonly project: string | null
+  /**
+   * 可选标签（v4.10.0）：用户/模型写入时打的结构化标记。
+   * 检索可按标签过滤；旧条目没有标签时缺省（读库时归一为 `[]`）。
+   */
+  readonly tags?: readonly string[]
 }
+
+/** 记忆状态过滤（v4.10.0）：检索默认只看活跃条目，可显式放开。 */
+export type MemoryStatusFilter = 'active' | 'stale' | 'superseded' | 'all'
 
 /** 一条边。 */
 export interface Edge {
@@ -44,7 +52,7 @@ export interface ScoredHit {
   readonly id: string
   /** 通道原始分。**不同通道的分不可比较**——融合只允许按排名（RRF）。 */
   readonly score: number
-  readonly channel: 'lexical' | 'vector' | 'graph'
+  readonly channel: 'lexical' | 'vector' | 'graph' | 'fuzzy'
 }
 
 /** 词法检索请求。 */
@@ -52,6 +60,20 @@ export interface LexicalQuery {
   readonly text: string
   readonly scope: MemoryScope
   readonly kinds?: readonly MemoryKind[]
+  /** 状态过滤；缺省 = 只看活跃（`valid_to` 与 `superseded_by` 均为空）。 */
+  readonly status?: MemoryStatusFilter
+  /** 标签过滤；多个标签是 **AND**（同一条要同时带这些标签）。 */
+  readonly tags?: readonly string[]
+  readonly limit: number
+}
+
+/** 子串回退检索（v4.10.0）：FTS 0 命中时用 `LIKE` 找部分匹配，有界、只读。 */
+export interface FuzzyQuery {
+  readonly text: string
+  readonly scope: MemoryScope
+  readonly kinds?: readonly MemoryKind[]
+  readonly status?: MemoryStatusFilter
+  readonly tags?: readonly string[]
   readonly limit: number
 }
 
@@ -68,6 +90,10 @@ export interface VectorQuery {
   /** 期望归属；与库内不符的行被排除。 */
   readonly expect: VectorAttribution
   readonly kinds?: readonly MemoryKind[]
+  /** 状态过滤；缺省 = 只看活跃。 */
+  readonly status?: MemoryStatusFilter
+  /** 标签过滤；多个标签是 AND。 */
+  readonly tags?: readonly string[]
   readonly limit: number
   /** 低于该余弦值的候选被丢弃（由调用方按模型标定，见 `searchVector` 的说明）。 */
   readonly minScore?: number
@@ -110,6 +136,15 @@ export interface MemoryStore {
   /** **必须批量**——禁止 N+1（旧实现每 id 一次 SELECT）。 */
   getMany(ids: readonly string[]): Promise<readonly MemoryRecord[]>
   searchLexical(query: LexicalQuery): Promise<readonly ScoredHit[]>
+  /**
+   * 子串回退检索（v4.10.0，**可选**）。
+   *
+   * 只在词法通道 0 命中时由检索侧调用：FTS 是 bigram 索引，写错一个字/拆词方式
+   * 不同就会 0 命中；这里用 `LIKE` 做**有界**的部分匹配兜底。实现方必须：
+   * 只读、限定 `limit`、遵守与词法通道相同的状态/类型/标签过滤。
+   * 老实现没有这个方法时检索侧跳过（不假装支持）。
+   */
+  searchFuzzy?(query: FuzzyQuery): Promise<readonly ScoredHit[]>
   /**
    * 向量检索。
    *

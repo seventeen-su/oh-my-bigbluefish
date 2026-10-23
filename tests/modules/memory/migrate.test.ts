@@ -50,7 +50,7 @@ describe('迁移框架', () => {
 
     expect(outcome.from).toBe(0)
     expect(outcome.to).toBe(LATEST_SCHEMA)
-    expect(outcome.applied.map(step => step.version)).toEqual([1, 2, 3, 4, 5])
+    expect(outcome.applied.map(step => step.version)).toEqual([1, 2, 3, 4, 5, 6])
     expect(readUserVersion(db)).toBe(LATEST_SCHEMA)
 
     expect(tableNames(db)).toEqual(
@@ -153,8 +153,8 @@ describe('迁移框架', () => {
     // 本轮加了 v2（`embedding.content_hash`）后，`kernel/abi` 的 `SCHEMA_VERSION`
     // 已同步抬到 2，**漂移自检重新生效**：两件事现在必须相等，
     // 且缺省步骤表路径必须能正常工作（不再需要 `openMemoryStore` 显式传表绕过）。
-    expect(latestVersion(SCHEMA_MIGRATIONS)).toBe(5)
-    expect(SCHEMA_VERSION).toBe(5)
+    expect(latestVersion(SCHEMA_MIGRATIONS)).toBe(6)
+    expect(SCHEMA_VERSION).toBe(6)
     expect(LATEST_SCHEMA).toBe(SCHEMA_VERSION)
 
     // 缺省步骤表下**照常迁移**（自检通过）。这条同时钉住了"自检是活的"：
@@ -215,6 +215,7 @@ describe('v1 结构（规划 §5.2 的字段依据）', () => {
       'use_count',
       'project',
       'payload_fts',
+      'tags',
     ])
   })
 
@@ -322,7 +323,13 @@ describe('v2 迁移：embedding.content_hash（加法，旧库原地升级）', 
     const outcome = upToDate(db)
     expect(outcome.from).toBe(1)
     expect(outcome.to).toBe(LATEST_SCHEMA)
-    expect(outcome.applied.map(step => step.name)).toEqual(['embedding-content-hash', 'edge-related', 'utility-and-feedback', 'confirm-audit'])
+    expect(outcome.applied.map(step => step.name)).toEqual([
+      'embedding-content-hash',
+      'edge-related',
+      'utility-and-feedback',
+      'confirm-audit',
+      'memory-tags',
+    ])
 
     // ① 加法：新旧列并存，历史行仍在（没有重建库、没有丢数据）
     expect(columnNames(db, 'embedding')).toEqual([

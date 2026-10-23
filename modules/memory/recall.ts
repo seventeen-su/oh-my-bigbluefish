@@ -73,6 +73,17 @@ const RECALL_JSON_SCHEMA: Record<string, unknown> = {
       items: { type: 'string', enum: [...MEMORY_KINDS] },
       description: '记忆类型，省略=不限',
     },
+    status: {
+      type: 'string',
+      enum: ['active', 'stale', 'superseded', 'all'],
+      description: '状态：active（默认，只看有效条目）/ stale / superseded / all',
+    },
+    tags: {
+      type: 'array',
+      items: { type: 'string' },
+      description: '标签过滤（多个标签需同时具备）；省略=不限',
+    },
+    fuzzy: { type: 'boolean', description: '模糊回退：词法零命中时再用子串匹配，默认开' },
     rerank: { type: 'boolean', description: '启用廉价重排，默认关' },
     detail: {
       type: 'string',
@@ -107,6 +118,12 @@ export interface RecallArgs {
   readonly limit?: number
   readonly scope?: MemoryScope
   readonly kinds?: readonly MemoryKind[]
+  /** v4.10.0：状态过滤（默认 active）。 */
+  readonly status?: 'active' | 'stale' | 'superseded' | 'all'
+  /** v4.10.0：标签过滤（AND）。 */
+  readonly tags?: readonly string[]
+  /** v4.10.0：模糊回退开关（默认 true）。 */
+  readonly fuzzy?: boolean
   readonly rerank?: boolean
   readonly detail?: RecallDetail
   readonly mode?: RecallMode
@@ -130,6 +147,9 @@ export function parseRecallArgs(input: unknown): ArgsResult<RecallArgs> {
     limit?: unknown
     scope?: unknown
     kinds?: unknown
+    status?: unknown
+    tags?: unknown
+    fuzzy?: unknown
     rerank?: unknown
     detail?: unknown
     mode?: unknown
@@ -142,6 +162,9 @@ export function parseRecallArgs(input: unknown): ArgsResult<RecallArgs> {
     limit?: number
     scope?: MemoryScope
     kinds?: readonly MemoryKind[]
+    status?: 'active' | 'stale' | 'superseded' | 'all'
+    tags?: readonly string[]
+    fuzzy?: boolean
     rerank?: boolean
     detail?: RecallDetail
     mode?: RecallMode
@@ -172,6 +195,30 @@ export function parseRecallArgs(input: unknown): ArgsResult<RecallArgs> {
       if (!kinds.includes(kind as MemoryKind)) kinds.push(kind as MemoryKind)
     }
     value.kinds = kinds
+  }
+  if (raw.status !== undefined) {
+    const allowed = ['active', 'stale', 'superseded', 'all'] as const
+    if (typeof raw.status !== 'string' || !(allowed as readonly string[]).includes(raw.status)) {
+      return { ok: false, error: `status 只能是 ${allowed.join(' / ')}` }
+    }
+    value.status = raw.status as typeof allowed[number]
+  }
+  if (raw.tags !== undefined) {
+    if (!Array.isArray(raw.tags)) return { ok: false, error: 'tags 必须是字符串数组' }
+    const tags: string[] = []
+    for (const tag of raw.tags) {
+      if (typeof tag !== 'string' || tag.trim().length === 0) {
+        return { ok: false, error: 'tags 里的每一项都必须是非空字符串' }
+      }
+      if (tag.length > 24) return { ok: false, error: `标签 ${JSON.stringify(tag)} 超过 24 字符` }
+      if (!tags.includes(tag)) tags.push(tag)
+    }
+    if (tags.length > 8) return { ok: false, error: 'tags 最多 8 个' }
+    value.tags = tags
+  }
+  if (raw.fuzzy !== undefined) {
+    if (typeof raw.fuzzy !== 'boolean') return { ok: false, error: 'fuzzy 必须是布尔值' }
+    value.fuzzy = raw.fuzzy
   }
   if (raw.rerank !== undefined) {
     if (typeof raw.rerank !== 'boolean') return { ok: false, error: 'rerank 必须是布尔值' }
@@ -568,11 +615,14 @@ function itemHeader(item: RetrieveResult['items'][number]): string {
   const signals: string[] = []
   if (item.signals.lexical !== undefined) signals.push(`词法 ${item.signals.lexical.toFixed(2)}`)
   if (item.signals.vector !== undefined) signals.push(`向量 ${item.signals.vector.toFixed(2)}`)
+  if (item.signals.fuzzy !== undefined) signals.push('模糊子串')
   if (item.channels.includes('graph')) signals.push('1-hop 关联（弱）')
   const signalText = signals.length === 0 ? '信号 未测' : `信号 ${signals.join(' / ')}`
+  const tagsText = (item.tags ?? []).length === 0 ? '' : ` · 标签 ${(item.tags ?? []).join(',')}`
   return (
     `[${item.rank + 1}] id=${item.id} · ${item.scope}/${item.kind} · 阶段 ${stageLabel(item.lifecycle)} · observedAt=${formatTime(item.observedAt)}` +
     ` · 融合分 ${item.score.toFixed(4)}（仅排序，不是相关度） · ${signalText} · 通道 ${channels}` +
+    tagsText +
     ` · sourceRef=${item.sourceRef}` +
     validityMark(item.supersededBy, item.validTo)
   )
@@ -665,6 +715,9 @@ function toRetrieveQuery(
     ...(args.limit !== undefined ? { limit: args.limit } : {}),
     ...(args.scope !== undefined ? { scope: args.scope } : {}),
     ...(args.kinds !== undefined ? { kinds: args.kinds } : {}),
+    ...(args.status !== undefined ? { status: args.status } : {}),
+    ...(args.tags !== undefined ? { tags: args.tags } : {}),
+    ...(args.fuzzy !== undefined ? { fuzzy: args.fuzzy } : {}),
     ...(args.rerank !== undefined ? { rerank: args.rerank } : {}),
     // `auto` 不写字面量：门控默认行为就是 auto；`always` 是唯一需要穿透的档位。
     ...(args.mode === 'always' ? { mode: 'always' as const } : {}),

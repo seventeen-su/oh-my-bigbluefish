@@ -19,9 +19,11 @@ export { MEMORY_KINDS, MEMORY_SCOPES, ASSERTED_BY, EDGE_TYPES, FOCUS_DEPTHS } fr
 
 export type {
   MemoryRecord,
+  MemoryStatusFilter,
   Edge,
   ScoredHit,
   LexicalQuery,
+  FuzzyQuery,
   VectorAttribution,
   VectorQuery,
   GraphQuery,
