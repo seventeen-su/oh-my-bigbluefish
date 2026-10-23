@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.9.6**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.9.7**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.9.6（当前） = 补齐深度与堆快照命令简介（x3）**：`/omb-depth` → 设置本会话的思考深度；
+- **v4.9.7（当前） = 用户断言的模糊去重与压缩后追忆修复（x3）**：`findSimilarContent`
+  在内容哈希之外用归一化 bigram（≥0.9）判近似同内容，**数字不同不合并**；用户断言
+  命中既有候选时就地把 `assertedBy` 升为 `user`（正文/id/时间不改）；压缩后当前上下文
+  没有原话时，若库里已有同内容已确认记录，记 `previously-verified` 继续写入，否则仍拒绝。
+  契约：`docs/v4.9.7-fuzzy-dedupe.md`。
+- **v4.9.6** = 补齐深度与堆快照命令简介（x3）：`/omb-depth` → 设置本会话的思考深度；
   `/omb-heap` → 查看进程内存，可抓堆快照排查。六个用户命令简介统一为一行、无括号。
   契约：`docs/v4.9.6-depth-heap-descriptions.md`。
 - **v4.9.5** = 命令简介精简与过程卡隐藏（x3）：四个用户命令的简介改短、

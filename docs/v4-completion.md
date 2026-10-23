@@ -733,3 +733,34 @@
 
 - 新增：`docs/v4.9.6-depth-heap-descriptions.md`
 - 修改：`dsh/depth-command.ts`、`dsh/heap-command.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.9.7 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.9.7**（`24 功能 / 93 小功能`；x3 修复位：用户断言模糊去重 + 压缩后追忆） |
+| 构建 | **g118**；`generation: 118`、`outDir: lib-gen/g118` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **117 files / 1465 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：压缩后追忆旧断言不再被拒；用户断言命中候选时回执出现"已升级" |
+
+## 本版内容
+
+1. **模糊同内容判据**：`findSimilarContent` 在内容哈希之外用归一化 bigram（Dice ≥0.9）
+   判近似；**数字不同不合并**（端口/版本/序号/测试名是事实）；仅认活跃、同 scope。
+2. **用户断言升级**：用户断言命中既有候选/事件时，就地改 `assertedBy:user`
+   （正文/id/sourceRef/observedAt 不改），回执"已升级"；已确认再写回执"无需重写"。
+3. **压缩后兜底**：当前上下文无原话、但库里已有同内容且 `assertedBy:user` 时，
+   记 `verification='previously-verified'` 继续写入；没有既有已确认记录仍拒绝。
+4. 捕获路径与 `omb_remember` 共用同一模糊判据（`alreadyStored` 也改用 `findSimilarContent`）。
+
+详见 `docs/v4.9.7-fuzzy-dedupe.md`。
+
+## 文件
+
+- 新增：`docs/v4.9.7-fuzzy-dedupe.md`
+- 修改：`modules/memory/remember.ts`、`modules/memory/capture.ts`、
+  `tests/modules/memory/remember.test.ts`、`README.md`、`AGENTS.md`、版本文件

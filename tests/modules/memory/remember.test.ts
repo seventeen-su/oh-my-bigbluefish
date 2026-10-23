@@ -16,6 +16,7 @@ import type {
   ToolOutcome,
 } from '../../../kernel/abi/index.js'
 import {
+  FUZZY_DUPLICATE_MIN,
   MAX_TEXT_CHARS,
   RECEIPT_ECHO_CHARS,
   REMEMBER_JSON_SCHEMA,
@@ -24,7 +25,9 @@ import {
   createRememberTool,
   decideAdmission,
   decideLifecycle,
+  findSimilarContent,
   isGroundedInUserMessage,
+  textSimilarity,
   type MemoryWriteDeps,
 } from '../../../modules/memory/remember.js'
 import { openMemoryStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
@@ -299,6 +302,26 @@ describe('内容哈希（离线精确去重的原语）', () => {
   })
 })
 
+describe('模糊同内容判据（v4.9.7）', () => {
+  it('标点/空白差异仍视为高相似；无关文本低相似', () => {
+    expect(textSimilarity('提交前先跑 pnpm verify', '提交前先跑  pnpm verify.'))
+      .toBeGreaterThanOrEqual(FUZZY_DUPLICATE_MIN)
+    expect(textSimilarity('提交前先跑 pnpm verify', '今天天气不错，适合散步'))
+      .toBeLessThan(0.5)
+  })
+
+  it('findSimilarContent 返回 fuzzy 命中并带相似度', async () => {
+    const fixture = writeFixture()
+    await run(fixture.tool, { text: '端口配置在 src/config/server.ts 里', kind: 'semantic' })
+    const found = await findSimilarContent(fixture.user, '端口配置在 src/config/server.ts 里。')
+    expect(found?.via).toBe('fuzzy')
+    expect(found?.similarity).toBeGreaterThanOrEqual(FUZZY_DUPLICATE_MIN)
+    const exact = await findSimilarContent(fixture.user, '端口配置在 src/config/server.ts 里')
+    expect(exact?.via).toBe('exact')
+    await fixture.close()
+  })
+})
+
 // ────────────────────────────────────────────────────────────────────────────
 // ② 工具执行体（真实 SQLite）
 // ────────────────────────────────────────────────────────────────────────────
@@ -491,10 +514,72 @@ describe('omb_remember：写入与路由', () => {
 
     const second = await run(fixture.tool, { text: '提交前先跑 pnpm verify', kind: 'procedural', userAsserted: true })
     expect(second.kind).toBe('text')
-    expect(second.text).toContain('未写入：库中已有同内容条目')
-    expect(second.text).toContain('阶段')
+    // 已是用户确认的同内容：回执说"无需重写"，而不是把用户的话当重复退回去
+    expect(second.text).toContain('无需重写：库中已有同内容条目')
+    expect(second.text).toContain('已确认')
     expect((await fixture.project.stats()).rows).toBe(1)
     expect(fixture.written).toHaveLength(writtenBefore)
+    await fixture.close()
+  })
+
+  it('用户断言命中既有候选：就地升级为已确认，不新增记录（模糊匹配）', async () => {
+    const fixture = writeFixture()
+    await run(fixture.tool, { text: '端口配置在 src/config/server.ts 里', kind: 'semantic' })
+    const before = await onlyRecord(fixture.user, '端口配置')
+    expect(before?.assertedBy).toBe('model')
+
+    // 只差一个句号：内容哈希不同，但归一化后是同一句
+    const outcome = await run(fixture.tool, {
+      text: '端口配置在 src/config/server.ts 里。',
+      kind: 'semantic',
+      userAsserted: true,
+    })
+    expect(outcome.text).toContain('已升级')
+    expect(outcome.text).toContain('近似')
+    expect((await fixture.user.stats()).rows).toBe(1)
+    const after = await onlyRecord(fixture.user, '端口配置')
+    expect(after?.id).toBe(before?.id)
+    expect(after?.assertedBy).toBe('user')
+    await fixture.close()
+  })
+
+  it('压缩后追忆压缩前的用户断言：按既有已确认记录核对，不再拒绝', async () => {
+    const witnessState: { lastUserMessage?: string } = {}
+    const fixture = writeFixture({
+      witness: () => ({
+        lastUserMessage: () => witnessState.lastUserMessage,
+        hasExecution: () => false,
+        surfaceGeneration: () => 2,
+      }),
+    })
+    const text = '回答要简洁'
+    const first = await run(fixture.tool, { text, kind: 'semantic', userAsserted: true })
+    expect(first.text).toContain('已记住')
+
+    // 宿主压缩后：最后一条用户消息被摘要替换，不再包含原话
+    witnessState.lastUserMessage = '（压缩摘要）我们讨论了回答风格与协作方式。'
+    const second = await run(fixture.tool, { text, kind: 'semantic', userAsserted: true })
+    expect(second.text).not.toContain('准入弃权')
+    expect(second.text).toContain('无需重写')
+    expect((await fixture.user.stats()).rows).toBe(1)
+    await fixture.close()
+  })
+
+  it('压缩后首次追忆未确认过的内容仍然拒绝（防伪造不放松）', async () => {
+    const fixture = writeFixture({
+      witness: () => ({
+        lastUserMessage: () => '（压缩摘要）旧对话已折叠。',
+        hasExecution: () => false,
+        surfaceGeneration: () => 1,
+      }),
+    })
+    const outcome = await run(fixture.tool, {
+      text: '用户从没说过的一条结论 abc',
+      kind: 'semantic',
+      userAsserted: true,
+    })
+    expect(outcome.text).toContain('未写入（准入弃权）')
+    expect((await fixture.user.stats()).rows).toBe(0)
     await fixture.close()
   })
 

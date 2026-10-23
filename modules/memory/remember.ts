@@ -105,24 +105,89 @@ export function contentHashOf(text: string): string {
  *
  * 失败一律返回 `undefined`（去重是优化，不是安全边界；查询失败不能阻断写入）。
  */
-export async function findSameContent(store: MemoryStore, text: string): Promise<MemoryRecord | undefined> {
+/**
+ * 同内容查找的结果（v4.9.7）：区分**逐字相同**与**近似相同**。
+ *
+ * 为什么必须区分：逐字相同可以直接去重；近似相同只说明"可能是同一条"，
+ * 仍要在回执里说清相似度，让调用方决定是放弃、改为 supersedes，还是保留两份。
+ */
+export interface SimilarContentResult {
+  readonly record: MemoryRecord
+  /** 1 = 逐字相同（内容哈希一致）；否则为 bigram 相似度。 */
+  readonly similarity: number
+  readonly via: 'exact' | 'fuzzy'
+}
+
+/**
+ * 查找"库里是否已有同内容/近似内容"（v4.8.0 精确版 → v4.9.7 模糊版）。
+ *
+ * 为什么不能只用 `contentHash` 精确比对：压缩之后模型追忆旧结论时常常重排空白、
+ * 换标点、改一两个字，精确哈希会漏掉它们，于是同一条内容在库里越积越多；
+ * 反过来，用户断言命中旧候选时又因为"未写入"而永远升不了级。
+ *
+ * 判据（保守）：
+ * - 先词法探测（正文前 60 字符）拿候选；探测不到再用归一化正文探测一次；
+ * - 内容哈希一致 → `exact`（相似度 1）；
+ * - 否则归一化后 bigram Dice 相似度 ≥ {@link FUZZY_DUPLICATE_MIN} → `fuzzy`；
+ * - 只认活跃条目（`searchLexical` 已过滤失效/被取代），只认同 scope。
+ *
+ * 失败一律返回 `undefined`（去重是优化，不是安全边界；查询失败不能阻断写入）。
+ */
+export async function findSimilarContent(
+  store: MemoryStore,
+  text: string,
+): Promise<SimilarContentResult | undefined> {
   const hash = contentHashOf(text)
+  const normalized = normalizeForCompare(text)
+  const probes = [text.slice(0, 60)]
+  if (normalized.length >= 8 && normalized.slice(0, 60) !== probes[0]) probes.push(normalized.slice(0, 60))
+  let records: readonly MemoryRecord[] = []
   try {
-    const probe = text.slice(0, 60)
-    const hits = await store.searchLexical({ text: probe, scope: store.scope, limit: 5 })
-    if (hits.length === 0) return undefined
-    const records = await store.getMany(hits.map(hit => hit.id))
-    return records.find(record => record.contentHash === hash)
+    for (const probe of probes) {
+      const hits = await store.searchLexical({ text: probe, scope: store.scope, limit: 8 })
+      if (hits.length === 0) continue
+      records = await store.getMany(hits.map(hit => hit.id))
+      if (records.length > 0) break
+    }
   } catch {
     return undefined
   }
+  if (records.length === 0) return undefined
+  const exact = records.find(record => record.contentHash === hash)
+  if (exact !== undefined) return { record: exact, similarity: 1, via: 'exact' }
+  if (normalized.length < 10) return undefined
+  let best: SimilarContentResult | undefined
+  const textDigits = digitsOf(normalized)
+  for (const record of records) {
+    if (record.scope !== store.scope) continue
+    if (record.validTo !== null || record.supersededBy !== null) continue
+    // 数字不同 = 不同的端口/版本/序号，不能当近似重复（`case-0` 与 `case-1` 是两件事）
+    if (digitsOf(record.text) !== textDigits) continue
+    const similarity = textSimilarity(normalized, record.text)
+    if (similarity < FUZZY_DUPLICATE_MIN) continue
+    if (best === undefined || similarity > best.similarity) {
+      best = { record, similarity, via: 'fuzzy' }
+    }
+  }
+  return best
+}
+
+/** 兼容旧调用方：只要"命中哪条"，不要相似度。 */
+export async function findSameContent(store: MemoryStore, text: string): Promise<MemoryRecord | undefined> {
+  return (await findSimilarContent(store, text))?.record
 }
 
 /** 准入依据。可审计：准入与弃权都必须说得出为什么。 */
 export type AdmissionGround = 'user-declared' | 'reproducible-artifact' | 'execution-confirmed'
 
 /** `assertedBy` 的可核对性等级（本次写入只有两档可用，见文件头）。 */
-export type AssertionVerification = 'verified-in-user-message' | 'claimed-unverified' | 'not-user'
+export type AssertionVerification =
+  /** 当前用户消息里能核对到原话。 */
+  | 'verified-in-user-message'
+  /** 用户此前已确认过同内容；当前上下文（常见于压缩后）里没有原话，按已确认记录核对。 */
+  | 'previously-verified'
+  | 'claimed-unverified'
+  | 'not-user'
 
 export interface AdmissionInput {
   readonly text: string
@@ -364,10 +429,48 @@ function isReservedSource(sourceRef: string): boolean {
 /** 规范化：用于"用户是不是真的这么说过"的核对（大小写、空白、标点差异不该阻断核对）。 */
 function normalizeForCompare(text: string): string {
   return text
+    .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s\u3000]+/g, '')
-    .replace(/[.,;:!?'"“”‘’()（）[\]{}<>《》—–-]+/g, '')
+    .replace(/[.,;:!?'"“”‘’()（）[\]{}<>《》—–\-~·、，。！？；：…]+/g, '')
 }
+
+/** 归一化文本里的数字串（端口/版本/序号是事实，数字不同就不算同一条）。 */
+function digitsOf(text: string): string {
+  return (normalizeForCompare(text).match(/\d+/g) ?? []).join('|')
+}
+
+/** 字符二元组 Dice 相似度（0–1）；中文没有空格，bigram 是最稳的相似判据。 */
+export function textSimilarity(left: string, right: string): number {
+  const a = normalizeForCompare(left)
+  const b = normalizeForCompare(right)
+  if (a.length === 0 || b.length === 0) return 0
+  if (a === b) return 1
+  if (a.length < 2 || b.length < 2) return 0
+  const counts = new Map<string, number>()
+  for (let index = 0; index < a.length - 1; index += 1) {
+    const gram = a.slice(index, index + 2)
+    counts.set(gram, (counts.get(gram) ?? 0) + 1)
+  }
+  let common = 0
+  for (let index = 0; index < b.length - 1; index += 1) {
+    const gram = b.slice(index, index + 2)
+    const left = counts.get(gram) ?? 0
+    if (left > 0) {
+      common += 1
+      counts.set(gram, left - 1)
+    }
+  }
+  return (2 * common) / ((a.length - 1) + (b.length - 1))
+}
+
+/**
+ * 近似同内容阈值（v4.9.7）。
+ *
+ * 0.9 是保守值：只把"同一句话的标点/空白/个别字差异"当同一条；
+ * 低于它的改写不当重复（逐字保真优先，宁可多一条也不静默合并两份不同原文）。
+ */
+export const FUZZY_DUPLICATE_MIN = 0.9
 
 /**
  * 核对"用户消息里是否真的包含这条陈述"。
@@ -981,6 +1084,9 @@ export function renderRemember(outcome: RememberOutcome): string {
   if (outcome.verification === 'claimed-unverified') {
     lines.push('注意：断言来源按"用户陈述"记录，但本进程拿不到用户消息原文，未能核对。')
   }
+  if (outcome.verification === 'previously-verified') {
+    lines.push('注意：当前上下文没有用户原话（常见于压缩之后）；本条按此前已确认的同内容记录核对，未要求重复原话。')
+  }
   if (outcome.routing !== undefined) {
     // 护栏改了路由就必须在回执里说清：调用方按 semantic/user 写的，实际进了 episodic/project。
     lines.push(`⚠ 路由已调整：${outcome.routing.reason}`)
@@ -996,26 +1102,54 @@ export function renderRemember(outcome: RememberOutcome): string {
 }
 
 /**
- * 同内容去重的回执（v4.8.0）。
+ * 同内容去重的回执（v4.8.0；v4.9.7 支持近似匹配与用户断言）。
  *
  * 必须在回执里给出**已存在条目的 id 与阶段**：只说"重复了"会让调用方无从判断
  * 该改为 supersedes、该请用户确认，还是该放弃——那等于把去重变成一条静默丢失。
  */
-export function renderDuplicateRemember(input: { readonly duplicate: MemoryRecord }): string {
+export function renderDuplicateRemember(input: {
+  readonly duplicate: MemoryRecord
+  readonly similarity?: number
+  readonly via?: 'exact' | 'fuzzy'
+  readonly userAsserted?: boolean
+}): string {
   const { duplicate } = input
   const stage = stageOfMemory({ kind: duplicate.kind, assertedBy: duplicate.assertedBy })
+  const match = input.via === 'fuzzy' && input.similarity !== undefined
+    ? `近似同内容（相似度 ${input.similarity.toFixed(2)}）`
+    : '同内容'
   const excerpt = duplicate.text.length > 120
     ? `${duplicate.text.slice(0, 120)}…（共 ${duplicate.text.length} 字符）`
     : duplicate.text
   const lines = [
-    `未写入：库中已有同内容条目 id=${duplicate.id}（${duplicate.scope}/${duplicate.kind} · 阶段 ${stageLabel(stage)}）。`,
+    input.userAsserted === true
+      ? `无需重写：库中已有${match}条目 id=${duplicate.id}（${duplicate.scope}/${duplicate.kind} · 阶段 ${stageLabel(stage)}）。`
+      : `未写入：库中已有${match}条目 id=${duplicate.id}（${duplicate.scope}/${duplicate.kind} · 阶段 ${stageLabel(stage)}）。`,
     `原文：${excerpt}`,
   ]
-  if (stage === 'candidate') {
+  if (duplicate.assertedBy === 'user') {
+    lines.push('这条已经是"已确认"（用户断言），无需再写；正文、来源、时间都没有改动。')
+  } else if (stage === 'candidate') {
     lines.push(`这条目前是"候选"：用户可用 /omb-confirm ${duplicate.id} 确认；模型不能自行确认。`)
   }
   lines.push('重复写入不会新增条目；若要更正内容，请用 supersedes 指向这个 id。')
   return lines.join('\n')
+}
+
+/** 用户断言命中既有条目时：把来源等级就地升级为"已确认"的回执（v4.9.7）。 */
+export function renderPromotedRemember(input: {
+  readonly record: MemoryRecord
+  readonly similarity: number
+  readonly via: 'exact' | 'fuzzy'
+}): string {
+  const { record } = input
+  return [
+    `已升级：库里已有条目 id=${record.id}（${record.scope}/${record.kind}），这次按你的断言标记为"已确认"。`,
+    input.via === 'fuzzy'
+      ? `匹配方式：近似同内容（相似度 ${input.similarity.toFixed(2)}）——正文仍是库里的原文，没有改写。`
+      : '匹配方式：逐字相同。',
+    '没有新增记录；正文、来源、observedAt 均未改。',
+  ].join('\n')
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1267,7 +1401,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
             executionConfirmed = false
           }
         }
-        const decision = decideAdmission({
+        let decision = decideAdmission({
           text: input.text,
           sourceRef: sourceRef ?? '',
           claimedUserAssertion: input.userAsserted === true,
@@ -1283,6 +1417,39 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           // 自动生成的来源（`session:<uuid>#turn-N`）不算工件；显式给的才算。
           sourceRefExplicit: input.sourceRef !== undefined && input.sourceRef.length > 0,
         })
+
+        /**
+         * **压缩后的用户断言兜底**（v4.9.7，用户实测：压缩后追忆压缩前内容总被拒）。
+         *
+         * 严格的 `isGroundedInUserMessage` 只核对**当前**用户消息；宿主压缩后，原话
+         * 已被摘要替换，于是同一条已被用户确认过的旧内容再写一次会以
+         * `user-claim-unverified` 被拒。这里不放松"用户是不是说过"的判据，而是承认
+         * **此前已核对通过并落成 `assertedBy:user`** 这个事实：库里已有同内容/近似内容
+         * 且来源等级是 `user`，即视为"此前已验证"，不再要求当前上下文重复原话。
+         *
+         * 没有既有已确认记录时**仍然拒绝**（防伪造），这条兜底不是万能豁免。
+         */
+        if (!decision.ok && decision.category === 'user-claim-unverified' && input.userAsserted === true) {
+          try {
+            const rescueStore = await deps.resolveStore(input.scope ?? SCOPE_BY_KIND[input.kind], sessionId)
+            if (rescueStore !== undefined) {
+              const previous = await findSimilarContent(rescueStore, input.text)
+              if (previous !== undefined && previous.record.assertedBy === 'user') {
+                decision = {
+                  ok: true,
+                  ground: 'user-declared',
+                  assertedBy: 'user',
+                  verification: 'previously-verified',
+                  reason:
+                    `用户此前已确认过同内容（相似度 ${previous.similarity.toFixed(2)}，id=${previous.record.id}）；`
+                    + '当前上下文没有原话（常见于压缩之后），按既有已确认记录核对，不要求重复原话',
+                }
+              }
+            }
+          } catch {
+            // 兜底查询失败时保持原判（拒绝写入），不静默放宽
+          }
+        }
 
         if (!decision.ok) {
           try {
@@ -1356,18 +1523,44 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         }
 
         /**
-         * **跨路径同内容去重**（v4.8.0）。
+         * **跨路径同内容去重**（v4.8.0；v4.9.7 加模糊判据与用户断言升级）。
          *
          * 控制器自动写入、重复捕获、模型主动写入走的是同一条库；库按 id upsert 但
          * 没有正文唯一约束，同一条内容会变成多条记录。命中时**不写、不触发向量事件**，
          * 回执给出已存在条目的 id 与阶段（候选还会附上 `/omb-confirm` 用法）。
          *
-         * 放在准入之后：准入是"该不该记"的判断，去重是"是否已经记过"的事实；
-         * 先准入再查重能保证弃权计数与既有权重逻辑完全不变。
+         * 两条 v4.9.7 规则：
+         * ① 近似命中（bigram ≥0.9）也算同一条，回执写明相似度；
+         * ② 本次是**用户断言**、库里命中条目还是候选（或事件）时，**就地升级**
+         *    来源等级（正文/id/时间一字不改），而不是把用户的话当成"重复"退回去。
          */
-        const duplicate = await findSameContent(store, input.text)
+        const duplicate = await findSimilarContent(store, input.text)
         if (duplicate !== undefined) {
-          return { kind: 'text', text: renderDuplicateRemember({ duplicate }) }
+          const existing = duplicate.record
+          if (decision.assertedBy === 'user' && existing.assertedBy !== 'user') {
+            const promoted: MemoryRecord = { ...existing, assertedBy: 'user' }
+            try {
+              await store.put(promoted)
+              return {
+                kind: 'text',
+                text: renderPromotedRemember({ record: promoted, similarity: duplicate.similarity, via: duplicate.via }),
+              }
+            } catch (error) {
+              return {
+                kind: 'error',
+                text: `omb_remember 无法把既有条目升级为用户断言：${messageOf(error)}`,
+              }
+            }
+          }
+          return {
+            kind: 'text',
+            text: renderDuplicateRemember({
+              duplicate: existing,
+              similarity: duplicate.similarity,
+              via: duplicate.via,
+              userAsserted: decision.assertedBy === 'user',
+            }),
+          }
         }
 
         const now = deps.clock.now()
