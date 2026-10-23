@@ -89,6 +89,8 @@ const UI = {
   act: async (id: string, action: string) => (id === 'cand'
     ? { ok: true, text: `${action} 成功` }
     : { ok: false, text: `未确认：${id}` }),
+  runtime: async () => ({ version: '4.15.2', stores: { ready: true, detail: 'ok', openProjects: [], maxOpenProjects: 8 } }),
+  profile: async () => ({ available: false, reason: '测试未接线' }),
 }
 
 describe('installUiRoute', () => {
@@ -112,6 +114,13 @@ describe('installUiRoute', () => {
     const detail = await request(route as Captured, { url: '/omb/api/detail?id=seen' })
     expect(detail.status).toBe(200)
     expect(detail.body).toMatchObject({ record: { id: 'seen' } })
+
+    const runtime = await request(route as Captured, { url: '/omb/api/runtime' })
+    expect(runtime.status).toBe(200)
+    expect(runtime.body).toMatchObject({ version: '4.15.2' })
+    const profile = await request(route as Captured, { url: '/omb/api/profile' })
+    expect(profile.status).toBe(200)
+    expect(profile.body).toMatchObject({ available: false })
 
     const missing = await request(route as Captured, { url: '/omb/api/detail?id=nope' })
     expect(missing.status).toBe(404)

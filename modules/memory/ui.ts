@@ -20,6 +20,7 @@ import type {
   StoreStats,
   TaggedStore,
 } from '../../kernel/abi/index.js'
+import { OMB_VERSION } from '../../kernel/version.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { findRelatedRecords, type RelatedRecord } from './link.js'
 import { stageLabel, stageOfMemory, type LifecycleStage } from './lifecycle.js'
@@ -96,6 +97,60 @@ export interface UiActionResult {
   readonly text: string
 }
 
+/** 运行时读数（v4.15.2）：来自各模块自己的台账，不是"被观测对象自报"。 */
+export interface UiRuntime {
+  readonly version: string
+  readonly stores: {
+    readonly ready: boolean
+    readonly detail: string
+    readonly openProjects: readonly string[]
+    readonly maxOpenProjects: number
+  }
+  readonly privacy?: {
+    readonly allowRead: boolean
+    readonly allowWrite: boolean
+    readonly reason: string
+  }
+  readonly activity?: {
+    readonly total: number
+    readonly errors: number
+    readonly byKind: Readonly<Record<string, number>>
+    readonly recent: readonly { readonly kind: string; readonly detail: string; readonly at: number }[]
+  }
+  readonly controller?: {
+    readonly mode: string
+    readonly events: number
+    readonly persist: number
+    readonly persisted: number
+    readonly verifyFailed: number
+    readonly failures: Readonly<Record<string, number>>
+    readonly duplicateActions: number
+  }
+  readonly capture?: {
+    readonly preferences: number
+    readonly failed: number
+    readonly proactiveCues: number
+    readonly cueFollowUps: number
+  }
+}
+
+/** 项目画像（v4.15.2）：只读、有界，复用 `SERVICES.projectProfile`。 */
+export interface UiProfile {
+  readonly available: boolean
+  readonly reason?: string
+  readonly root?: string
+  readonly cwdRel?: string
+  readonly branch?: string | null
+  readonly head?: string | null
+  readonly text?: string
+  readonly structure?: {
+    readonly topDirs: readonly { readonly name: string; readonly files: number }[]
+    readonly sources: readonly { readonly dir: string; readonly files: number; readonly lines: number; readonly tests: number }[]
+    readonly files: readonly { readonly path: string; readonly lines: number; readonly symbols: number; readonly imports: number }[]
+  }
+  readonly evidence?: string
+}
+
 export interface UiService {
   overview(): Promise<UiOverview>
   list(query?: UiListQuery): Promise<UiListResult>
@@ -107,6 +162,10 @@ export interface UiService {
    * 与 `/omb-confirm` **同一实现**（`createConfirmAction`）；UI 不写库、不复制判据。
    */
   act(id: string, action: UiConfirmAction, sessionId?: string | null): Promise<UiActionResult>
+  /** 运行时读数（v4.15.2）；缺省 = 未接线，返回最小事实。 */
+  runtime(): Promise<UiRuntime>
+  /** 项目画像（v4.15.2）；缺省/未知 → 如实说明原因。 */
+  profile(): Promise<UiProfile>
 }
 
 export interface UiServiceDeps {
@@ -120,6 +179,10 @@ export interface UiServiceDeps {
     readonly id: string
     readonly sessionId?: string | null
   }) => Promise<UiActionResult>
+  /** 运行时读数装配（内存核里闭包读台账）；缺省只报版本与库状态。 */
+  readonly runtime?: () => Promise<Omit<UiRuntime, 'version' | 'stores'>>
+  /** 项目画像装配（经 `SERVICES.projectProfile`）；缺省 = 未接线。 */
+  readonly profile?: () => Promise<UiProfile>
 }
 
 /** 状态判据（与检索侧的 `statusClause` 同一语义，前端不需要知道 SQL）。 */
@@ -328,7 +391,28 @@ export function createUiService(deps: UiServiceDeps): UiService {
     return undefined
   }
 
-  return { overview, list, candidates, detail, act }
+  return { overview, list, candidates, detail, act, runtime, profile }
+
+  async function runtime(): Promise<UiRuntime> {
+    const base: UiRuntime = { version: OMB_VERSION, stores: deps.stores.status() }
+    if (deps.runtime === undefined) return base
+    try {
+      return { ...base, ...(await deps.runtime()) }
+    } catch {
+      return base
+    }
+  }
+
+  async function profile(): Promise<UiProfile> {
+    if (deps.profile === undefined) {
+      return { available: false, reason: '未接线：项目画像服务不可用（dsh/project-profile 未挂载）' }
+    }
+    try {
+      return await deps.profile()
+    } catch (error) {
+      return { available: false, reason: `画像读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
 
   async function act(id: string, action: UiConfirmAction, sessionId?: string | null): Promise<UiActionResult> {
     const trimmed = typeof id === 'string' ? id.trim() : ''

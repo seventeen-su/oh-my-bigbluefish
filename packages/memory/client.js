@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({
       { id: 'overview', label: '概览' },
       { id: 'memory', label: '记忆库' },
       { id: 'candidates', label: '候选确认' },
+      { id: 'runtime', label: '运行状态' },
+      { id: 'profile', label: '项目画像' },
     ]
 
     const styles = {
@@ -135,6 +137,96 @@ window.__ModuleLoader__.load({
         h('span', null, `行 ${store.stats.rows} · 活跃 ${store.active} · 候选 ${store.candidates}`))),
         h('div', { style: styles.hint }, '页面只读：确认候选请用 /omb-confirm；本面板不写库。'),
         h('button', { style: styles.button, onClick: onRefresh }, '刷新'))
+    }
+
+    function RuntimeView() {
+      const [data, setData] = React.useState(null)
+      const [error, setError] = React.useState('')
+      const [loading, setLoading] = React.useState(false)
+      const load = React.useCallback(async () => {
+        setLoading(true)
+        setError('')
+        try {
+          setData(await api('/runtime'))
+        } catch (failure) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setLoading(false)
+        }
+      }, [])
+      React.useEffect(() => { void load() }, [load])
+      if (loading && !data) return h('div', { style: styles.empty }, '读取运行时读数…')
+      if (error) return h('div', { style: styles.error }, `读取失败：${error}`)
+      if (!data) return h('div', { style: styles.empty }, '暂无读数')
+      const controller = data.controller || {}
+      const capture = data.capture || {}
+      const activity = data.activity
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        h('div', { style: styles.stat }, h('span', null, 'OMB 版本'), h('strong', null, data.version || '未知')),
+        h('div', { style: styles.stat }, h('span', null, '记忆库'),
+          h('strong', null, `${data.stores.ready ? '就绪' : '未就绪'} · 项目库 ${data.stores.openProjects.length}/${data.stores.maxOpenProjects}`)),
+        data.privacy
+          ? h('div', { style: styles.stat }, h('span', null, '隐私闸门'),
+            h('strong', null, `${data.privacy.allowWrite ? '可写' : '禁写'} · ${data.privacy.reason || '无原因'} `))
+          : null,
+        h('p', { style: styles.sectionTitle }, '事件控制器'),
+        h('div', { style: styles.hint },
+          `模式 ${controller.mode || '未知'} · 事件 ${controller.events ?? 0} · persist ${controller.persist ?? 0}`
+          + `（写入 ${controller.persisted ?? 0}/查回失败 ${controller.verifyFailed ?? 0}）· 幂等跳过 ${controller.duplicateActions ?? 0}`),
+        h('p', { style: styles.sectionTitle }, '捕获与主动性'),
+        h('div', { style: styles.hint },
+          `偏好写入 ${capture.preferences ?? 0} · 失败 ${capture.failed ?? 0}`
+          + ` · 主动提示命中 ${capture.proactiveCues ?? 0} / 跟进 ${capture.cueFollowUps ?? 0}`),
+        activity
+          ? h('div', null,
+            h('p', { style: styles.sectionTitle }, `活动日志（${activity.total} 条，错误 ${activity.errors}）`),
+            h('div', { style: styles.hint },
+              Object.entries(activity.byKind || {}).filter(([, count]) => count > 0).map(([kind, count]) => `${kind} ${count}`).join(' · ') || '无'),
+            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 } },
+              (activity.recent || []).map((entry, index) => h('div', { key: `${entry.at}-${index}`, style: styles.meta },
+                h('span', null, entry.kind), h('span', null, entry.detail), h('span', null, formatTime(entry.at))))))
+          : h('div', { style: styles.hint }, '活动日志未接线（旧装配）。'),
+        h('button', { style: styles.button, onClick: () => void load() }, '刷新'))
+    }
+
+    function ProfileView() {
+      const [data, setData] = React.useState(null)
+      const [error, setError] = React.useState('')
+      const [loading, setLoading] = React.useState(false)
+      const load = React.useCallback(async () => {
+        setLoading(true)
+        setError('')
+        try {
+          setData(await api('/profile'))
+        } catch (failure) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setLoading(false)
+        }
+      }, [])
+      React.useEffect(() => { void load() }, [load])
+      if (loading && !data) return h('div', { style: styles.empty }, '读取项目画像…')
+      if (error) return h('div', { style: styles.error }, `读取失败：${error}`)
+      if (!data) return h('div', { style: styles.empty }, '暂无画像')
+      if (!data.available) return h('div', { style: styles.hint }, `画像不可用：${data.reason || '未知原因'}`)
+      const structure = data.structure || {}
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        h('div', { style: styles.stat }, h('span', null, '项目根'), h('strong', null, data.root || '未知')),
+        h('div', { style: styles.stat }, h('span', null, 'cwd 相对根'), h('strong', null, data.cwdRel === '' ? '.' : data.cwdRel || '未知')),
+        h('div', { style: styles.stat }, h('span', null, '分支 / HEAD'),
+          h('strong', null, `${data.branch || '未知'} / ${data.head ? String(data.head).slice(0, 12) : '未知'}`)),
+        h('p', { style: styles.sectionTitle }, '顶层目录'),
+        h('div', { style: styles.hint },
+          (structure.topDirs || []).map(dir => `${dir.name}(${dir.files})`).join(' · ') || '无'),
+        h('p', { style: styles.sectionTitle }, '文件索引'),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          (structure.files || []).map(file => h('div', { key: file.path, style: styles.meta },
+            h('span', null, file.path), h('span', null, `${file.lines} 行 · ${file.symbols} 符号 · ${file.imports} 导入`)))),
+        data.text
+          ? h('div', null, h('p', { style: styles.sectionTitle }, '画像摘要'),
+            h('div', { style: { ...styles.body, maxHeight: 220, overflowY: 'auto' } }, data.text))
+          : null,
+        h('button', { style: styles.button, onClick: () => void load() }, '刷新'))
     }
 
     function MemoryList({ tab, onOpen, selectedId }) {
@@ -343,7 +435,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.page },
         h('div', { style: styles.header },
           h('h2', { style: styles.title }, 'OMB 记忆'),
-          h('span', { style: styles.hint }, '手动管理面：记忆库 / 候选 / 审计 / 相关条目（确认走 /omb-confirm 同一实现）')),
+          h('span', { style: styles.hint }, '手动管理面：记忆库 / 候选 / 审计 / 相关条目；运行状态与项目画像只读')),
         h('div', { style: styles.tabs },
           ...TABS.map((entry) => h('button', {
             key: entry.id, style: styles.tab(tab === entry.id),
@@ -351,15 +443,19 @@ window.__ModuleLoader__.load({
           }, entry.label))),
         tab === 'overview'
           ? h(Overview, { data: overview, loading: overviewLoading, error: overviewError, onRefresh: () => void loadOverview() })
-          : h('div', { style: styles.columns },
-            h(MemoryList, { key: `${tab}-${refreshKey}`, tab, selectedId, onOpen: setSelectedId }),
-            h(Detail, {
-              id: selectedId,
-              onChanged: () => {
-                setRefreshKey((value) => value + 1)
-                void loadOverview()
-              },
-            })))
+          : tab === 'runtime'
+            ? h(RuntimeView)
+            : tab === 'profile'
+              ? h(ProfileView)
+              : h('div', { style: styles.columns },
+                h(MemoryList, { key: `${tab}-${refreshKey}`, tab, selectedId, onOpen: setSelectedId }),
+                h(Detail, {
+                  id: selectedId,
+                  onChanged: () => {
+                    setRefreshKey((value) => value + 1)
+                    void loadOverview()
+                  },
+                })))
     }
 
     function MemoryIcon({ size }) {

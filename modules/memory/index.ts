@@ -1143,6 +1143,113 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       const offUi = kernel.provide(SERVICES.ui, createUiService({
         stores: service,
         confirm: confirmAction,
+        // ── 运行时读数（v4.15.2）：只读各自台账，不新增订阅 ──
+        runtime: async () => {
+          const gate = kernel.service<{
+            decideUnattributed(): {
+              readonly allowRead: boolean
+              readonly allowWrite: boolean
+              readonly readReason: string
+              readonly writeReason: string
+            }
+          }>(SERVICES.privacy)
+          let privacy: {
+            readonly allowRead: boolean
+            readonly allowWrite: boolean
+            readonly reason: string
+          } | undefined
+          if (gate !== undefined) {
+            try {
+              const decision = gate.decideUnattributed()
+              privacy = {
+                allowRead: decision.allowRead,
+                allowWrite: decision.allowWrite,
+                reason: decision.writeReason.length > 0 ? decision.writeReason : decision.readReason,
+              }
+            } catch {
+              privacy = undefined
+            }
+          }
+          const cap = capture.stats()
+          const activity = activityRef?.summary()
+          return {
+            ...(privacy === undefined ? {} : { privacy }),
+            ...(activity === undefined
+              ? {}
+              : {
+                  activity: {
+                    total: activity.total,
+                    errors: activity.errors,
+                    byKind: { ...activity.byKind },
+                    recent: activityRef!.recent(8).map(entry => ({ kind: entry.kind, detail: entry.detail, at: entry.at })),
+                  },
+                }),
+            controller: {
+              mode: cap.controller.mode,
+              events: cap.controller.events,
+              persist: cap.controller.persist,
+              persisted: cap.controller.persisted,
+              verifyFailed: cap.controller.verifyFailed,
+              failures: { ...cap.controller.failures },
+              duplicateActions: cap.controller.duplicateActions,
+            },
+            capture: {
+              preferences: cap.preferences,
+              failed: cap.failed,
+              proactiveCues: cap.proactiveCues,
+              cueFollowUps: cap.cueFollowUps,
+            },
+          }
+        },
+        // ── 项目画像（v4.15.2）：读宿主画像服务；没有会话 cwd 就如实说未知 ──
+        profile: async () => {
+          const port = kernel.service<ProjectProfilePort>(SERVICES.projectProfile)
+          if (port === undefined) {
+            return { available: false, reason: '未接线：项目画像服务不可用（dsh/project-profile 未挂载）' }
+          }
+          const sessions = kernel.service<{ cwd(session?: string): string | null }>(SERVICES.activeSession)
+          let cwd: string | undefined
+          try {
+            cwd = sessions?.cwd() ?? undefined
+          } catch {
+            cwd = undefined
+          }
+          if (cwd === undefined || cwd.length === 0) {
+            return { available: false, reason: '宿主尚未告知当前会话 cwd：无法定位项目根（不猜路径）' }
+          }
+          const view = port.read(cwd)
+          if (view === undefined) {
+            return { available: false, reason: '画像暂不可用：读取返回空（非 git 目录或尚未构建）' }
+          }
+          const structure = view.structure
+          return {
+            available: true,
+            ...(view.root === undefined ? {} : { root: view.root }),
+            ...(view.cwdRel === undefined ? {} : { cwdRel: view.cwdRel }),
+            branch: view.identity?.branch ?? null,
+            head: view.identity?.head ?? view.gitHead ?? null,
+            ...(view.text === undefined ? {} : { text: view.text.slice(0, 1500) }),
+            ...(structure === undefined
+              ? {}
+              : {
+                  structure: {
+                    topDirs: (structure.topDirs ?? []).slice(0, 12).map(dir => ({ name: dir.name, files: dir.files })),
+                    sources: (structure.sources ?? []).slice(0, 8).map(source => ({
+                      dir: source.dir,
+                      files: source.files,
+                      lines: source.lines,
+                      tests: source.tests,
+                    })),
+                    files: (structure.files ?? []).slice(0, 12).map(file => ({
+                      path: file.path,
+                      lines: file.lines,
+                      symbols: file.symbols,
+                      imports: file.imports,
+                    })),
+                  },
+                }),
+          }
+        },
       }))
 
       const offCaptureMessage = kernel.on('user/message/observed', payload => {

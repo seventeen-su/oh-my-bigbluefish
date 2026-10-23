@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.15.1 = 侧边栏手动确认动作（x3，4.15.0 同功能收尾）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.15.2 = 侧边栏运行状态与项目画像页（x3，4.15.0 同功能收尾）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -273,5 +273,5 @@
       ]
     }
   ],
-  "version": "4.15.1"
+  "version": "4.15.2"
 }

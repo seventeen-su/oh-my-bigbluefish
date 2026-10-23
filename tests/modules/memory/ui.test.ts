@@ -173,6 +173,33 @@ describe('createUiService', () => {
     expect(result.text).toContain('未启用')
   })
 
+  it('运行时读数与项目画像：缺省如实降级，接线后返回接线数据（v4.15.2）', async () => {
+    const minimal = {
+      status: () => ({ ready: false, detail: '测试未接线', openProjects: [], maxOpenProjects: 8 }),
+      snapshot: () => ({ user: undefined, projects: [] }),
+    }
+    const base = createUiService({ stores: minimal })
+    const runtime = await base.runtime()
+    expect(runtime.version).toMatch(/^4\./)
+    expect(runtime.stores).toMatchObject({ ready: false })
+    const profile = await base.profile()
+    expect(profile.available).toBe(false)
+    expect(profile.reason).toContain('未接线')
+
+    const wired = createUiService({
+      stores: minimal,
+      runtime: async () => ({
+        privacy: { allowRead: true, allowWrite: false, reason: '测试 sealed' },
+        controller: { mode: 'execute', events: 1, persist: 1, persisted: 1, verifyFailed: 0, failures: {}, duplicateActions: 0 },
+      }),
+      profile: async () => ({ available: true, root: '/work/demo', branch: 'main' }),
+    })
+    const wiredRuntime = await wired.runtime()
+    expect(wiredRuntime.privacy).toMatchObject({ allowWrite: false })
+    expect(wiredRuntime.controller).toMatchObject({ mode: 'execute', persisted: 1 })
+    expect((await wired.profile()).root).toBe('/work/demo')
+  })
+
   it('详情：正文 + 确认审计 + 共享实体键的相关条目', async () => {
     const f = fixture()
     await f.put('user', recordOf({ id: 'r1', scope: 'user', kind: 'semantic', text: 'pnpm test 覆盖 src/config/app.ts 的端口 8080' }))

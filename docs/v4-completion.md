@@ -1039,3 +1039,35 @@
 - 修改：`modules/memory/{confirm,ui,index}.ts`、`dsh/ui-route.ts`、
   `packages/memory/client.js`、`tests/modules/memory/ui.test.ts`、
   `tests/dsh/ui-route.test.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.15.2 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.15.2**（`24 功能 / 102 小功能`；x3：4.15.0 侧边栏同功能收尾） |
+| 构建 | **g127**；`generation: 127`、`outDir: lib-gen/g127` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **120 files / 1478 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：侧边栏出现"运行状态""项目画像"页签；运行状态显示版本/库/隐私/控制器/活动；画像显示根/分支/文件索引；版本 4.15.2/构建 127 |
+
+## 本版内容
+
+1. `ui.runtime()`：读已有台账（版本、库状态、隐私闸门 decideUnattributed、
+   控制器/捕获读数、活动日志摘要与最近 8 条），不新增订阅。
+2. `ui.profile()`：经 `SERVICES.projectProfile.read(activeSession.cwd())` 返回
+   项目根/cwd 相对根/分支/HEAD/顶层目录/文件索引/画像摘要（≤1500 字符）；
+   无 cwd 或服务未接线时如实返回原因。
+3. 路由 `GET /omb/api/runtime`、`GET /omb/api/profile`（只读、同源、no-store）。
+4. 客户端新增"运行状态""项目画像"两页签。
+
+详见 `docs/v4.15.2-sidebar-runtime-profile.md`。
+
+## 文件
+
+- 新增：`docs/v4.15.2-sidebar-runtime-profile.md`
+- 修改：`modules/memory/{ui,index}.ts`、`dsh/ui-route.ts`、`packages/memory/client.js`、
+  `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件

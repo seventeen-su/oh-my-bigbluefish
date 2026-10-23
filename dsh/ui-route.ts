@@ -151,6 +151,14 @@ export function installUiRoute(
         json(res, 200, await ui.overview())
         return
       }
+      if (path === '/runtime') {
+        json(res, 200, await ui.runtime())
+        return
+      }
+      if (path === '/profile') {
+        json(res, 200, await ui.profile())
+        return
+      }
       if (path === '/list') {
         json(res, 200, await ui.list(parseListQuery(url.searchParams)))
         return

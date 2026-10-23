@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.15.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.15.2**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.15.1（当前） = 侧边栏手动确认动作（x3，4.15.0 收尾）**：`createConfirmAction`
+- **v4.15.2（当前） = 侧边栏运行状态与项目画像页（x3，4.15.0 收尾）**：
+  `ui.runtime()` 读已有台账（版本/库状态/隐私闸门/控制器/捕获/活动日志），
+  `ui.profile()` 经 `SERVICES.projectProfile.read(activeSession.cwd())`；
+  路由 `GET /runtime`、`GET /profile`；页面新增"运行状态""项目画像"两个只读页签。
+  契约：`docs/v4.15.2-sidebar-runtime-profile.md`。
+- **v4.15.1** = 侧边栏手动确认动作（x3，4.15.0 收尾）：`createConfirmAction`
   复用 `/omb-confirm` 的 promote/undo；`POST /omb/api/confirm`（JSON、同源、200/409/415/400）
   供页面按钮确认候选/撤销确认；**没有模型工具入口**；审计 sessionId=null（全局面板）。
   契约：`docs/v4.15.1-sidebar-confirm-actions.md`。
