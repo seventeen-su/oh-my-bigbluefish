@@ -1162,3 +1162,38 @@
 - **唯一未做的一步是浏览器页面级人工确认**：需要用户重启 `dsh web` 后打开侧边栏核对
   （本会话无法重启宿主进程，也不应另起替代服务器）。重启后应看到：版本 4.15.4/构建 129、
   侧边栏 OMB 记忆图标、五个页签、候选确认/撤销、冲突关联/取代、运行状态含会话状态机、项目画像。
+
+---
+
+# OMB v4.16.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.16.0**（`24 功能 / 102 小功能`；x2：侧边栏控件与弹性排版规范化） |
+| 构建 | **g130**；`generation: 130`、`outDir: lib-gen/g130` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **121 files / 1487 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：页签/输入/按钮为 DSH 标准控件；窄窗口自动堆叠；未选条目时详情为空态且 Network 无 `/detail` 无 id 请求 |
+
+## 本版内容
+
+1. **修复 HTTP 400 missing id（前端 bug）**：详情组件挂载时 `selectedId=null` 仍请求
+   `/omb/api/detail`，参数被跳过 → 请求无 id → 宿主 400 → 前端误显示错误。
+   现在 effect 先判空再请求；空态显示"从左侧选择一条记忆"。
+2. **标准控件**：浏览器 bundle 复用 `@deepseek-ai/dsh-client-ui-primitives` 的
+   Button/Input/Pill/Tag/SegmentedTabs/SegmentedControl/StateDot；
+   颜色/圆角走 `--dsw-*` token，不写死色值。
+3. **弹性排版**：页面 flex 纵向、列表/详情独立滚动、卡片 `auto-fit minmax`、
+   工作区窄单列/宽两列 `minmax(0,5fr)/minmax(0,7fr)`。
+4. **其它修复**：候选先过滤再截断；概览 `scanLimited` 如实标注 500 行扫描上限；
+   搜索输入防抖（不再每键一次请求）；宿主护栏按"文件+说明符"放行浏览器共享模块请求并防过期例外。
+
+详见 `docs/v4.16.0-sidebar-ui-standardization.md`。
+
+## 文件
+
+- 修改：`packages/memory/client.js`、`modules/memory/ui.ts`、
+  `tests/dsh/{ui-bundle,no-host-imports}.test.ts`、`tests/modules/memory/ui.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件
+- 新增：`docs/v4.16.0-sidebar-ui-standardization.md`

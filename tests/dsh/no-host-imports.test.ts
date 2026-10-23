@@ -41,6 +41,18 @@ const FORBIDDEN: readonly { readonly label: string; readonly test: (spec: string
   { label: '@deepseek-ai/cordis*（同上，属宿主）', test: spec => spec.startsWith('@deepseek-ai/cordis') },
 ]
 
+/**
+ * 浏览器 bundle 的**共享模块表**请求（v4.16.0）。
+ *
+ * 这不是 Node 侧 `import`：`packages/memory/client.js` 只由宿主模块加载器在浏览器里
+ * 按 `PLATFORM_MODULES` 基线解析（React 同一条通道），不会进 Node 解析器。
+ * 例外的范围精确到「文件 + 说明符」，并由下面一条测试证明它仍被使用——
+ * 过期的例外同样失败（沿用地板规则的同一原则）。
+ */
+const BROWSER_MODULE_REQUESTS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['packages/memory/client.js', new Set(['@deepseek-ai/dsh-client-ui-primitives'])],
+])
+
 /** 递归收集受检查的文件（绝对路径）。 */
 function collect(dir: string, into: string[] = []): string[] {
   let entries: string[]
@@ -110,11 +122,22 @@ describe('宿主包护栏', () => {
         continue
       }
       for (const spec of specifiersOf(source)) {
+        const rel = relative(REPO_ROOT, file).replace(/\\/g, '/')
+        if (BROWSER_MODULE_REQUESTS.get(rel)?.has(spec) === true) continue
         const hit = FORBIDDEN.find(rule => rule.test(spec))
         if (hit !== undefined) offences.push(`${relative(REPO_ROOT, file)} → ${spec}（${hit.label}）`)
       }
     }
     expect(offences, '本仓库经结构化接口访问宿主，不得 import 宿主的包').toEqual([])
+  })
+
+  it('浏览器 bundle 的例外清单仍被使用（过期例外也失败）', () => {
+    for (const [rel, specs] of BROWSER_MODULE_REQUESTS) {
+      const source = readFileSync(join(REPO_ROOT, rel), 'utf8')
+      for (const spec of specs) {
+        expect(source, `${rel} 已经不再请求 ${spec}，请删除这条例外`).toContain(`require('${spec}')`)
+      }
+    }
   })
 
   it('注释里提到宿主包名**不算**违规（解释"为什么不用"正是这些注释的价值）', () => {

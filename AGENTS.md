@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.15.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.16.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,14 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.15.4（当前） = 运行状态页会话状态机 + bundle 发布契约（x3，4.15.x 收尾）**：
+- **v4.16.0（当前） = 侧边栏控件与弹性排版规范化（x2）**：浏览器 bundle 改用
+  基线共享控件 `@deepseek-ai/dsh-client-ui-primitives`（Button/Input/Pill/Tag/
+  SegmentedTabs/SegmentedControl/StateDot），颜色/圆角走 `--dsw-*` token，
+  grid/flex + `minmax(0, …)` 自适应；**修复未选条目时误发 `/detail` 导致
+  `HTTP 400 missing id`**（详情 effect 先判空）；候选分页改为先过滤再截断；
+  概览计数用 `scanLimited` 如实标注扫描上限；搜索输入防抖。契约：
+  `docs/v4.16.0-sidebar-ui-standardization.md`。
+- **v4.15.4** = 运行状态页会话状态机 + bundle 发布契约（x3，4.15.x 收尾）：
   `UiRuntime.situation`（state/tier/turn/idle/目标/待办/工作区切换）来自
   `activeSession.current()` + `sessionState.situation()`；`tests/dsh/ui-bundle.test.ts`
   钉住 `dsh.client`/`exports["./client"]`/文件/id/slots/写端点，防部署漂移。

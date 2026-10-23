@@ -236,6 +236,41 @@ describe('createUiService', () => {
     await f.close()
   })
 
+  it('候选：先按判据过滤再截断（v4.16.0，排在后面的候选不会被漏掉）', async () => {
+    const f = fixture()
+    // 55 条更新的已确认条目，把候选挤到 50 名之外
+    for (let index = 0; index < 55; index += 1) {
+      await f.put('user', recordOf({
+        id: `u-${index}`,
+        scope: 'user',
+        kind: 'semantic',
+        assertedBy: 'user',
+        text: `已确认条目 ${index}`,
+        observedAt: NOW - index,
+      }))
+    }
+    await f.put('user', recordOf({
+      id: 'candidate-old',
+      scope: 'user',
+      kind: 'semantic',
+      assertedBy: 'model',
+      text: '更早的候选结论',
+      observedAt: NOW - 10_000,
+    }))
+    const result = await f.service.candidates(5)
+    expect(result.items.map(item => item.id)).toContain('candidate-old')
+    expect(result.total).toBe(1)
+    await f.close()
+  })
+
+  it('概览：扫描受限时如实标记（不把最近 500 行当成全量）', async () => {
+    const f = fixture()
+    await f.put('user', recordOf({ id: 'x1', scope: 'user', kind: 'semantic', text: '一条' }))
+    const overview = await f.service.overview()
+    expect(overview.stores.every(store => store.scanLimited === false)).toBe(true)
+    await f.close()
+  })
+
   it('详情：正文 + 确认审计 + 共享实体键的相关条目', async () => {
     const f = fixture()
     await f.put('user', recordOf({ id: 'r1', scope: 'user', kind: 'semantic', text: 'pnpm test 覆盖 src/config/app.ts 的端口 8080' }))

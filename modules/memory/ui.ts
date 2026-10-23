@@ -48,6 +48,8 @@ export interface UiStoreView {
   readonly stats: StoreStats
   readonly active: number
   readonly candidates: number
+  /** v4.16.0：活跃/候选计数只覆盖最近 `SCAN_MAX` 行（库更大时不得冒充全量）。 */
+  readonly scanLimited: boolean
 }
 
 export interface UiOverview {
@@ -367,7 +369,8 @@ export function createUiService(deps: UiServiceDeps): UiService {
         }
         let active = 0
         let candidates = 0
-        for (const record of await scanRecent({ projectScope: set.projectScope, store: tagged.store })) {
+        const scannedRows = await scanRecent({ projectScope: set.projectScope, store: tagged.store })
+        for (const record of scannedRows) {
           if (uiRecordStatus(record) === 'active') {
             active += 1
             if (record.assertedBy === 'model' && (record.kind === 'semantic' || record.kind === 'procedural')) {
@@ -377,7 +380,14 @@ export function createUiService(deps: UiServiceDeps): UiService {
         }
         totalActive += active
         totalCandidates += candidates
-        stores.push({ scope: tagged.store.scope, projectScope: set.projectScope, stats, active, candidates })
+        stores.push({
+          scope: tagged.store.scope,
+          projectScope: set.projectScope,
+          stats,
+          active,
+          candidates,
+          scanLimited: stats.rows > scannedRows.length,
+        })
       }
     }
     if (snapshot.user !== undefined) await pushSet({ projectScope: null, stores: snapshot.user.stores })
@@ -394,10 +404,23 @@ export function createUiService(deps: UiServiceDeps): UiService {
   }
 
   const candidates = async (limit?: number): Promise<UiListResult> => {
-    const result = await list({ scope: 'all', status: 'active', limit: clampLimit(limit, 20, UI_LIST_MAX) })
-    const items = result.items.filter(item =>
-      item.assertedBy === 'model' && (item.kind === 'semantic' || item.kind === 'procedural'))
-    return { items, total: items.length, truncated: result.truncated }
+    // v4.16.0：先按候选判据过滤**再**截断。旧实现先 list 再 filter，
+    // 当库里有大量已确认/事件条目时会漏掉排在后面的候选（分页语义错了）。
+    const effective = clampLimit(limit, 20, UI_LIST_MAX)
+    const gathered: { record: MemoryRecord; projectScope: string | null }[] = []
+    for (const ref of collectStores(deps, 'all')) {
+      const scanned = await scanRecent(ref)
+      for (const record of scanned) {
+        if (uiRecordStatus(record) !== 'active') continue
+        if (record.assertedBy !== 'model') continue
+        if (record.kind !== 'semantic' && record.kind !== 'procedural') continue
+        gathered.push({ record, projectScope: ref.projectScope })
+      }
+    }
+    gathered.sort((left, right) =>
+      right.record.observedAt - left.record.observedAt || left.record.id.localeCompare(right.record.id))
+    const items = gathered.slice(0, effective).map(entry => toUiListItem(entry.record, entry.projectScope))
+    return { items, total: gathered.length, truncated: gathered.length > effective }
   }
 
   const detail = async (id: string): Promise<UiDetail | undefined> => {
