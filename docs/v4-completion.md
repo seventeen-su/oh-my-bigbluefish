@@ -1133,3 +1133,32 @@
 - 新增：`tests/dsh/ui-bundle.test.ts`、`docs/v4.15.4-runtime-situation-and-bundle-contract.md`
 - 修改：`modules/memory/{ui,index}.ts`、`packages/memory/client.js`、
   `tests/modules/memory/ui.test.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# 九项升级总验收（OMB 4.9.7 → 4.15.4，2026-10-24）
+
+用户指令是"按 9 条自主完成 OMB 记忆系统升级；每项都要有测试、文档、版本按 x1.x2.x3、
+构建与部署同步并核验"。逐项证据如下（全部已推送、部署副本与 HEAD 一致）：
+
+| 指令 | 交付 | 版本 | 契约/证据 |
+| --- | --- | --- | --- |
+| ① 用户断言模糊去重（压缩后追忆不被全量匹配拒绝） | `findSimilarContent` 归一化 bigram ≥0.9（数字不同不合并）；用户断言命中候选就地升级；压缩后 `previously-verified` 放行 | 4.9.7（x3） | `docs/v4.9.7-fuzzy-dedupe.md`、remember 测试 |
+| ② 检索模糊搜索 + 类型/状态/标签过滤 | schema v6 `memory.tags`；`omb_recall` 的 `status/tags/fuzzy`；SQL 下推（`json_each`），词法 0 命中走 LIKE 回退 | 4.10.0（x2） | `docs/v4.10.0-retrieval-filters.md`、filter-fuzzy 测试 |
+| ③ 侧边栏前端 UI（记忆库/状态机/画像/确认/审计/冲突） | 侧边栏"OMB 记忆"面板：概览、记忆库（搜索/过滤/详情/审计/相关）、候选确认（确认/撤销）、运行状态（控制器/会话状态机/隐私/活动）、项目画像（目录/文件索引）；手动冲突裁决（关联/取代） | 4.15.0→4.15.4（x2 + x3 收尾） | `docs/v4.15.0..4.15.4-*.md`、ui/ui-route/ui-bundle 测试 |
+| ④ 取消每 32 回合离线整合，改写入时确定性去重 | 删除 `consolidate.ts`、`turn/end` 订阅与配置；去重只在写入路径（contentHash / bigram ≥0.9，不自动 supersede） | 4.10.1（x3） | `docs/v4.10.1-write-time-dedupe.md` |
+| ⑤ 崩溃验证 + 日志系统 | 有界活动日志（200 条，7+2 类动作，健康面/metrics）；SIGKILL 子进程验证证据文件原子写 | 4.11.0（x2） | `docs/v4.11.0-activity-log-and-crash-tests.md` |
+| ⑥ 跨工作区状态机 + 文件索引级项目认知 | `situation().workspace`（git root 切换计数/上一处）；画像 `files`（符号+导入排序前 12），L1 显示前 4 | 4.12.0（x2） | `docs/v4.12.0-workspace-state-and-file-index.md` |
+| ⑦ 系统化事件驱动控制器 | `phase` + `transition` 转移审计；动作 id 与 persist 幂等；8 类失败分类；控制器动作进活动日志 | 4.13.0（x2） | `docs/v4.13.0-controller-state-machine.md` |
+| ⑧ 提高模型自主记忆主动性 | 新增 `recall-first`/`project-fact` cue；控制器精确提示优先、未写才提示；未写入 cue 下一轮跟进 | 4.14.0（x2） | `docs/v4.14.0-proactive-initiative.md` |
+| ⑨ 其它修复与优化 | 去重后升级/候选确认/审计撤销、状态面诚实性、ACTIVITY 边界、bundle 发布契约、运行状态页、测试加固等 | 见上各版 | 各版 doc + 全量测试 |
+
+## 最终门禁与部署
+
+- `tsc --noEmit` 0；`eslint .` 0；`vitest run` **121 files / 1482 passed | 1 skipped**；
+- `node scripts/version.mjs`：4.15.4（24 功能 / 102 小功能）一致；`build-generation.json` = **g129**；
+- git：HEAD = origin/main = `92961e5`，工作树干净；部署副本已同步 g129 并 relink 8/8，
+  `@omb/plugin` 部署版本 = **4.15.4**，`@omb/memory/client.js` 存在且包含侧边栏注册；
+- **唯一未做的一步是浏览器页面级人工确认**：需要用户重启 `dsh web` 后打开侧边栏核对
+  （本会话无法重启宿主进程，也不应另起替代服务器）。重启后应看到：版本 4.15.4/构建 129、
+  侧边栏 OMB 记忆图标、五个页签、候选确认/撤销、冲突关联/取代、运行状态含会话状态机、项目画像。
