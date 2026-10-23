@@ -914,6 +914,11 @@ export interface MemoryWriteDeps {
   readonly findRelated?: (store: MemoryStore, record: MemoryRecord) => Promise<readonly RememberRelatedItem[]>
   /** 可读日志口（附加索引失败时留声；缺省不日志）。 */
   readonly logger?: { warn(message: string): void }
+  /**
+   * 活动日志口（v4.11.0）：写入/去重/升级/弃权/异常的最近事件。
+   * 只记 id 与原因类别，不记正文；缺省不记（单测/旧装配）。
+   */
+  readonly activity?: (kind: 'write' | 'dedupe' | 'promote' | 'abstain' | 'error', detail: string) => void
   /** 某会话的项目身份（cwd 的规范化形式），作为 `project` 溯源写入。 */
   readonly currentProject?: (sessionId?: string) => string | undefined
   /**
@@ -1462,6 +1467,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
           } catch {
             // 记账失败不得改变"没写入"这个结论
           }
+          deps.activity?.('abstain', decision.category)
           return { kind: 'text', text: renderRemember({ written: false, reason: decision.reason }) }
         }
 
@@ -1546,17 +1552,20 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
             const promoted: MemoryRecord = { ...existing, assertedBy: 'user' }
             try {
               await store.put(promoted)
+              deps.activity?.('promote', promoted.id)
               return {
                 kind: 'text',
                 text: renderPromotedRemember({ record: promoted, similarity: duplicate.similarity, via: duplicate.via }),
               }
             } catch (error) {
+              deps.activity?.('error', `升级失败：${messageOf(error)}`)
               return {
                 kind: 'error',
                 text: `omb_remember 无法把既有条目升级为用户断言：${messageOf(error)}`,
               }
             }
           }
+          deps.activity?.('dedupe', existing.id)
           return {
             kind: 'text',
             text: renderDuplicateRemember({
@@ -1589,6 +1598,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         }
 
         await store.put(record)
+        deps.activity?.('write', `${record.scope}/${record.kind} ${record.id}`)
 
         // 事件必须在 put **成功之后**发：失败的写入不该触发向量编码。
         // 订阅者的异常由事件总线隔离；这里再包一层，确保写入结果不被影响。
@@ -1639,6 +1649,7 @@ export function createRememberTool(deps: MemoryWriteDeps): ToolDefinition {
         }
       } catch (error) {
         // H-3：执行体绝不抛异常
+        deps.activity?.('error', `写入异常：${messageOf(error)}`)
         return { kind: 'error', text: `omb_remember 执行失败：${messageOf(error)}` }
       }
     },

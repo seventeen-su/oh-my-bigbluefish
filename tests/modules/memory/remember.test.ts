@@ -598,6 +598,21 @@ describe('omb_remember：写入与路由', () => {
     await fixture.close()
   })
 
+  it('活动日志记录写入/去重/升级，且不复制正文（v4.11.0）', async () => {
+    const events: { kind: string; detail: string }[] = []
+    const fixture = writeFixture({ activity: (kind, detail) => events.push({ kind, detail }) })
+    await run(fixture.tool, { text: '端口配置在 src/config/app.ts 里', kind: 'semantic' })
+    await run(fixture.tool, { text: '端口配置在 src/config/app.ts 里。', kind: 'semantic', userAsserted: true })
+    await run(fixture.tool, { text: '端口配置在 src/config/app.ts 里。', kind: 'semantic' })
+    expect(events.some(event => event.kind === 'write')).toBe(true)
+    expect(events.some(event => event.kind === 'promote')).toBe(true)
+    expect(events.some(event => event.kind === 'dedupe')).toBe(true)
+    for (const event of events) {
+      expect(event.detail).not.toContain('端口配置')
+    }
+    await fixture.close()
+  })
+
   it('候选被重复写入时，回执提示用户可以用 /omb-confirm 确认', async () => {
     const fixture = writeFixture()
     // 无用户断言、但有可复现工件 → assertedBy=model → 生命周期"候选"

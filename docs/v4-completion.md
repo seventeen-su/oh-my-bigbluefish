@@ -837,3 +837,39 @@
 ## 备注
 
 - 这是第 4 项指令；剩余：崩溃验证/日志、跨工作区状态机与项目认知、控制器重构、主动性、侧边栏 UI。
+
+---
+
+# OMB v4.11.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.11.0**（`24 功能 / 97 小功能`；x2 新功能：活动日志 + 崩溃窗口验证） |
+| 构建 | **g121**；`generation: 121`、`outDir: lib-gen/g121` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **118 files / 1456 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：版本 4.11.0/构建 121；`omb_status` 记忆行出现"活动："读数；写入/召回后活动更新 |
+
+## 本版内容
+
+1. `modules/memory/activity.ts`：有界环形（200 条）活动日志，记录
+   write/dedupe/promote/abstain/retrieve/confirm/error；详情截断、不含正文、不落盘；
+   健康面只列发生过的事件、错误单列（`renderActivityNote`）。
+2. 接线：`omb_remember` 写入/去重/升级/弃权/异常、`omb_recall` 检索、`/omb-confirm` 动作。
+3. `tests/dsh/project-evidence-crash.test.ts`：子进程真实 SIGKILL 后验证 evidence.json
+   仍是完整 JSON、可读回、无 `.corrupt-*` 现场（原子替换）。
+4. 测试：活动日志 5 用例 + remember 活动事件断言 + SIGKILL 崩溃窗口用例。
+
+详见 `docs/v4.11.0-activity-log-and-crash-tests.md`。
+
+## 边界
+
+- 活动日志不是审计（审计在 `memory_confirm`/`memory_feedback` 表），进程重启即清空；
+- 崩溃验证只覆盖证据文件原子写；SQLite 的崩溃恢复由 SQLite/WAL 自身保证，未做 kill 测试。
+
+## 文件
+
+- 新增：`modules/memory/activity.ts`、`tests/modules/memory/activity.test.ts`、
+  `tests/dsh/project-evidence-crash.test.ts`、`docs/v4.11.0-activity-log-and-crash-tests.md`
+- 修改：`modules/memory/{index,remember}.ts`、`README.md`、`AGENTS.md`、版本文件

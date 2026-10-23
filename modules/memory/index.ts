@@ -54,6 +54,7 @@ import { createRememberTool } from './remember.js'
 import { artifactVerificationDegradeReason, verifyArtifactExists } from './artifacts.js'
 import type { RetrievalChannel } from './retrieve.js'
 import { readSessionWitness } from './witness.js'
+import { createActivityLog, renderActivityNote, type ActivityKind, type ActivitySummary } from './activity.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
@@ -427,6 +428,8 @@ async function describeHealth(
     readonly feedback?: FeedbackLedger
     /** v4.8.0：候选确认读数（用户命令触发，模型无入口）。 */
     readonly confirm?: ConfirmLedger
+    /** v4.11.0：活动日志摘要（进程内环形；只读展示，不落盘）。 */
+    readonly activity?: ActivitySummary
     readonly floor?: { readonly q: number; readonly recalls: number; readonly precision: number | null; readonly mode: string }
     /** v4.5.3 有效命中读数；v4.9.2 增加使用命中时的曝光排名分布。 */
     readonly usage?: {
@@ -639,7 +642,9 @@ async function describeHealth(
   const controllerNote = controllerHealthNote(runtime?.capture?.controller)
   // v4.8.0：候选确认是用户动作；没按过命令就不写这一句（不把"没有候选"伪装成"确认了 0 条"）。
   const confirmNote = confirmHealthNote(runtime?.confirm)
-  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${confirmNote}${privacyNote}`
+  // v4.11.0：活动日志只列发生过的事件；错误单列（没有活动就一个字都不写）。
+  const activityNote = renderActivityNote(runtime?.activity)
+  const detail = `${pointer}${why === undefined ? '' : `；本模块记录的失败原因：${why}`}${ledgerNote}${catalogNote}${artifactNote}${usageNote}${effectiveNote}${controllerNote}${confirmNote}${activityNote}${privacyNote}`
 
   // 隐私闸门降级也是**本行**的降级：它现在是同一个组件的一部分。
   // 三处都不满足才算 ok：存储就绪、没有记录的失败、隐私读数 ok。
@@ -668,6 +673,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
   let current: MemoryStoresService | undefined
   let ledgerRef: MemoryWriteLedger | undefined
   let usageRef: MemoryUsageLedger | undefined
+  /** 活动日志（v4.11.0）：进程内环形，健康面只读展示。 */
+  let activityRef: ReturnType<typeof createActivityLog> | undefined
   /** 隐私闸门的装配产物（3.6 并入；见 `./privacy/index.js`）。 */
   let privacyRef: PrivacyInstallation | undefined
   /** 3.7 Wave 2 运行读数（惰性读：热插拔会换实例）。 */
@@ -706,6 +713,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             relatedExpanded: relatedExpandedRef,
             ...(feedbackLedgerRef === undefined ? {} : { feedback: feedbackLedgerRef }),
             ...(confirmLedgerRef === undefined ? {} : { confirm: confirmLedgerRef }),
+            ...(activityRef === undefined ? {} : { activity: activityRef.summary() }),
             ...(floorRef === undefined ? {} : { floor: floorRef }),
             ...(usageStatsRef === undefined ? {} : { usage: usageStatsRef() }),
           },
@@ -821,6 +829,11 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       /** 使用计数账本（见 `MemoryUsageLedger`）：写不成也要可见。 */
       const usageLedger: MemoryUsageLedger = { failures: 0, lastFailure: '' }
       usageRef = usageLedger
+      /** 活动日志（v4.11.0）：写入/去重/升级/弃权/召回/确认/错误，有界环形。 */
+      const activityLog = createActivityLog()
+      activityRef = activityLog
+      const noteActivity = (kind: ActivityKind, detail: string): void =>
+        activityLog.note({ kind, detail, at: kernel.clock.now() })
 
       /**
        * 解析本次调用该用哪些库。
@@ -1093,6 +1106,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
               else if (info.changed) confirmLedger.undone += count
               else confirmLedger.refused += 1
               confirmLedger.lastChange = info.changed ? `${info.action}×${count}` : info.reason.slice(0, 80)
+              noteActivity('confirm', `${info.action}${info.changed ? '✓' : '×'}×${count}`)
             },
           })
         : {
@@ -1148,6 +1162,10 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           lexicalFloorQuantile: () => floorState.q,
           onRetrieved: (result, sessionId) => {
             relatedExpandedRef += result.stats.relatedExpanded
+            noteActivity(
+              'retrieve',
+              `${result.items.length} 条 / ${result.stats.channelsUsed.join('+') || '无通道'}`,
+            )
             // 曝光登记（隐式效用的分母；`markUsed` 已写 exposed，这里登记实体键供 used_tool 匹配）
             if (result.items.length > 0 && sessionId !== undefined) {
               usageTracker.noteExposure(
@@ -1230,6 +1248,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             ledger.writes += 1
             kernel.emit('memory/written', payload)
           },
+          // v4.11.0：活动日志（写入/去重/升级/弃权/异常；不含正文）
+          activity: noteActivity,
           /**
            * **会话见证**（3.7-M4）：惰性读内核服务，拿不到就退化为旧行为。
            *
@@ -1432,6 +1452,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         if (current === service) current = undefined
         if (ledgerRef === ledger) ledgerRef = undefined
         if (usageRef === usageLedger) usageRef = undefined
+        if (activityRef === activityLog) activityRef = undefined
         if (privacyRef === privacy) privacyRef = undefined
         await service.dispose()
       }

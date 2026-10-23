@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.10.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.11.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.10.1（当前） = 取消离线整合、写入时确定性去重（x3）**：删除
+- **v4.11.0（当前） = 活动日志与崩溃窗口验证（x2）**：`modules/memory/activity.ts`
+  有界环形（200 条）记录写入/去重/升级/弃权/召回/确认/错误，健康面只列发生过的事件、
+  不含正文、不落盘；`tests/dsh/project-evidence-crash.test.ts` 用真实 SIGKILL
+  验证证据文件原子写（JSON 可解析、可读回、无损坏现场）。
+  契约：`docs/v4.11.0-activity-log-and-crash-tests.md`。
+- **v4.10.1** = 取消离线整合、写入时确定性去重（x3）：删除
   `modules/memory/consolidate.ts` 与 `turn/end` 订阅、`consolidationEveryTurns` 配置、
   整合台账/健康读数（0.7 近似合并会自动标失效，有损且不可解释）。去重只发生在写入路径：
   `contentHash` 精确或归一化 bigram ≥0.9（数字不同不合并），用户断言命中候选就升级；
