@@ -117,9 +117,9 @@ export function installUiRoute(
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
       if (req.method === 'POST') {
-        // 唯一的写入口：用户点击的确认/撤销。**没有模型工具调用它**。
-        if (path !== '/confirm') {
-          json(res, 405, { error: 'write endpoint is /confirm only' })
+        // 写入口只有两个：用户点击的确认/撤销与冲突裁决。**没有模型工具调用它们**。
+        if (path !== '/confirm' && path !== '/resolve') {
+          json(res, 405, { error: 'write endpoints are /confirm and /resolve' })
           return
         }
         const contentType = req.headers['content-type'] ?? ''
@@ -129,6 +129,23 @@ export function installUiRoute(
         }
         const body = await readJsonBody(req)
         const record = body !== null && typeof body === 'object' ? body as Record<string, unknown> : undefined
+        if (path === '/resolve') {
+          const action = record?.['action']
+          const fromId = record?.['fromId']
+          const toId = record?.['toId']
+          if (action !== 'relate' && action !== 'supersede') {
+            json(res, 400, { error: 'action must be relate or supersede' })
+            return
+          }
+          if (typeof fromId !== 'string' || typeof toId !== 'string'
+            || fromId.trim().length === 0 || toId.trim().length === 0) {
+            json(res, 400, { error: 'missing fromId/toId' })
+            return
+          }
+          const outcome = await ui.resolve({ action, fromId: fromId.trim(), toId: toId.trim() })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
         const id = record?.['id']
         const action = record?.['action']
         if (typeof id !== 'string' || id.trim().length === 0) {

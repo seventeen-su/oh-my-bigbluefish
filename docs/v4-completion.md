@@ -1071,3 +1071,36 @@
 - 修改：`modules/memory/{ui,index}.ts`、`dsh/ui-route.ts`、`packages/memory/client.js`、
   `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.15.3 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.15.3**（`24 功能 / 102 小功能`；x3：4.15.0 侧边栏同功能收尾） |
+| 构建 | **g128**；`generation: 128`、`outDir: lib-gen/g128` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **120 files / 1480 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：详情页"可能相关/冲突"条目出现「建立关联」「本条取代该条」；动作后状态/图边可见；版本 4.15.3/构建 128 |
+
+## 本版内容
+
+1. `UiService.resolve({action: 'relate'|'supersede', fromId, toId})`：
+   - `relate`：`related` 边（普通关联，无时序含义）；
+   - `supersede`：旧条目 `validTo=max(now, observedAt)` + `supersededBy=fromId`，
+     并建 `supersedes` 边（与 `omb_remember(supersedes=…)` 同一语义，非破坏）。
+2. 判据：两条存在、不同、同作用域同库、都活跃；写后查回验证；边失败如实分档。
+3. `POST /omb/api/resolve`（JSON、同源、200/409/400）；活动日志记 `write`（不含正文）。
+4. 客户端详情页相关条目给两个裁决按钮，动作后刷新详情/列表/概览。
+5. **没有模型工具入口**：仍是用户点击（本机回环 + 同源）。
+
+详见 `docs/v4.15.3-sidebar-conflict-resolution.md`。
+
+## 文件
+
+- 新增：`docs/v4.15.3-sidebar-conflict-resolution.md`
+- 修改：`modules/memory/{ui,index}.ts`、`dsh/ui-route.ts`、`packages/memory/client.js`、
+  `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件

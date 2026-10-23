@@ -54,6 +54,7 @@ function fixture(): Fixture {
       ],
       logger,
     }),
+    clock,
   })
   return {
     user,
@@ -198,6 +199,38 @@ describe('createUiService', () => {
     expect(wiredRuntime.privacy).toMatchObject({ allowWrite: false })
     expect(wiredRuntime.controller).toMatchObject({ mode: 'execute', persisted: 1 })
     expect((await wired.profile()).root).toBe('/work/demo')
+  })
+
+  it('手动冲突裁决：related 建边 / supersede 标旧条目（非破坏，v4.15.3）', async () => {
+    const f = fixture()
+    await f.put('user', recordOf({ id: 'n1', scope: 'user', kind: 'semantic', text: '新结论：端口 8080' }))
+    await f.put('user', recordOf({ id: 'o1', scope: 'user', kind: 'semantic', text: '旧结论：端口 9090' }))
+    await f.put('project', recordOf({ id: 'p1', scope: 'project', kind: 'semantic', text: '项目端口 8080' }))
+
+    const related = await f.service.resolve({ action: 'relate', fromId: 'n1', toId: 'o1' })
+    expect(related.ok).toBe(true)
+    const walk = await f.user.walkGraph({ fromId: 'n1', depth: 1, types: ['related'] })
+    expect(walk.nodes.map(node => node.id)).toContain('o1')
+
+    const superseded = await f.service.resolve({ action: 'supersede', fromId: 'n1', toId: 'o1' })
+    expect(superseded.ok).toBe(true)
+    expect(superseded.text).toContain('取代')
+    const older = await f.user.get('o1')
+    expect(older?.supersededBy).toBe('n1')
+    expect(older?.validTo).not.toBeNull()
+    // 正文与来源不变（非破坏）
+    expect(older?.text).toBe('旧结论：端口 9090')
+    const supersedeWalk = await f.user.walkGraph({ fromId: 'n1', depth: 1, types: ['supersedes'] })
+    expect(supersedeWalk.nodes.map(node => node.id)).toContain('o1')
+
+    // 已被取代的不能再被取代 / 不能指向自己 / 不跨作用域
+    const again = await f.service.resolve({ action: 'supersede', fromId: 'n1', toId: 'o1' })
+    expect(again.ok).toBe(false)
+    expect((await f.service.resolve({ action: 'relate', fromId: 'n1', toId: 'n1' })).ok).toBe(false)
+    const cross = await f.service.resolve({ action: 'relate', fromId: 'n1', toId: 'p1' })
+    expect(cross.ok).toBe(false)
+    expect(cross.text).toContain('作用域')
+    await f.close()
   })
 
   it('详情：正文 + 确认审计 + 共享实体键的相关条目', async () => {

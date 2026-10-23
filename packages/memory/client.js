@@ -355,6 +355,19 @@ window.__ModuleLoader__.load({
         }).finally(() => setBusy(false))
       }
 
+      const runResolve = (action, toId) => {
+        if (busy) return
+        setBusy(true)
+        setActionText('')
+        void post('/resolve', { action, fromId: id, toId }).then((payload) => {
+          setActionText(payload.text || '完成')
+          setRevision((value) => value + 1)
+          if (onChanged) onChanged()
+        }, (failure) => {
+          setActionText(failure instanceof Error ? failure.message : String(failure))
+        }).finally(() => setBusy(false))
+      }
+
       if (loading) return h('div', { style: styles.empty }, '读取详情…')
       if (error) return h('div', { style: styles.error }, `详情读取失败：${error}`)
       if (!data) return h('div', { style: styles.empty }, '未选择条目')
@@ -405,7 +418,17 @@ window.__ModuleLoader__.load({
           : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
             ...data.related.map((item) => h('div', { key: item.record.id, style: { ...styles.card(false), cursor: 'default' } },
               h('div', { style: styles.body }, item.record.text),
-              h('div', { style: styles.meta }, h('span', null, item.record.id), h('span', null, formatTime(item.record.observedAt)), h('span', null, item.shared.join('、')))))))
+              h('div', { style: styles.meta }, h('span', null, item.record.id), h('span', null, formatTime(item.record.observedAt)), h('span', null, item.shared.join('、'))),
+              h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                h('button', {
+                  style: styles.button, disabled: busy,
+                  onClick: () => runResolve('relate', item.record.id),
+                }, '建立关联'),
+                h('button', {
+                  style: styles.button, disabled: busy,
+                  onClick: () => runResolve('supersede', item.record.id),
+                }, '本条取代该条'),
+                h('span', { style: styles.hint }, '取代 = validTo + supersededBy + supersedes 边（非破坏）'))))))
     }
 
     function MemoryPanel() {

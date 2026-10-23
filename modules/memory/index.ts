@@ -1143,6 +1143,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       const offUi = kernel.provide(SERVICES.ui, createUiService({
         stores: service,
         confirm: confirmAction,
+        clock: kernel.clock,
+        activity: (kind, detail) => noteActivity(kind, detail),
         // ── 运行时读数（v4.15.2）：只读各自台账，不新增订阅 ──
         runtime: async () => {
           const gate = kernel.service<{

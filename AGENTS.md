@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.15.2**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.15.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.15.2（当前） = 侧边栏运行状态与项目画像页（x3，4.15.0 收尾）**：
+- **v4.15.3（当前） = 侧边栏手动冲突裁决（x3，4.15.0 收尾）**：
+  `POST /omb/api/resolve` 支持 `relate`（related 边）与 `supersede`
+  （旧条目 validTo+supersededBy + supersedes 边，非破坏）；要求两条活跃、同作用域同库，
+  写后查回验证；页面在相关条目上给「建立关联」「本条取代该条」。
+  契约：`docs/v4.15.3-sidebar-conflict-resolution.md`。
+- **v4.15.2** = 侧边栏运行状态与项目画像页（x3，4.15.0 收尾）：
   `ui.runtime()` 读已有台账（版本/库状态/隐私闸门/控制器/捕获/活动日志），
   `ui.profile()` 经 `SERVICES.projectProfile.read(activeSession.cwd())`；
   路由 `GET /runtime`、`GET /profile`；页面新增"运行状态""项目画像"两个只读页签。

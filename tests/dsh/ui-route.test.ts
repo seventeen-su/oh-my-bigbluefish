@@ -91,6 +91,9 @@ const UI = {
     : { ok: false, text: `未确认：${id}` }),
   runtime: async () => ({ version: '4.15.2', stores: { ready: true, detail: 'ok', openProjects: [], maxOpenProjects: 8 } }),
   profile: async () => ({ available: false, reason: '测试未接线' }),
+  resolve: async (input: { action: string; fromId: string; toId: string }) => (input.fromId === 'a' && input.toId === 'b'
+    ? { ok: true, text: `${input.action} 成功` }
+    : { ok: false, text: '未执行：测试拒绝' }),
 }
 
 describe('installUiRoute', () => {
@@ -169,6 +172,32 @@ describe('installUiRoute', () => {
       method: 'POST', url: '/omb/api/confirm', body: undefined, contentType: 'application/json',
     })
     expect(badBody.status).toBe(400)
+  })
+
+  it('用户动作：POST /resolve 建关联/取代 200 / 拒绝 409 / 参数校验 400', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+    const ok = await request(route, {
+      method: 'POST', url: '/omb/api/resolve', body: { action: 'supersede', fromId: 'a', toId: 'b' }, contentType: 'application/json',
+    })
+    expect(ok.status).toBe(200)
+    expect(String((ok.body as { text: string }).text)).toContain('supersede')
+
+    const refused = await request(route, {
+      method: 'POST', url: '/omb/api/resolve', body: { action: 'relate', fromId: 'x', toId: 'b' }, contentType: 'application/json',
+    })
+    expect(refused.status).toBe(409)
+    expect(refused.body).toMatchObject({ ok: false })
+
+    const badAction = await request(route, {
+      method: 'POST', url: '/omb/api/resolve', body: { action: 'delete', fromId: 'a', toId: 'b' }, contentType: 'application/json',
+    })
+    expect(badAction.status).toBe(400)
+    const missing = await request(route, {
+      method: 'POST', url: '/omb/api/resolve', body: { action: 'relate', fromId: 'a' }, contentType: 'application/json',
+    })
+    expect(missing.status).toBe(400)
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

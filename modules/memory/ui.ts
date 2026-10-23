@@ -91,10 +91,20 @@ export interface UiDetail {
 }
 
 export type UiConfirmAction = 'confirm' | 'undo'
+/** 手动冲突裁决动作（v4.15.3）：related 只建普通关联；supersede 标"被取代"（非破坏）。 */
+export type UiResolveAction = 'relate' | 'supersede'
 
 export interface UiActionResult {
   readonly ok: boolean
   readonly text: string
+}
+
+export interface UiResolveInput {
+  readonly action: UiResolveAction
+  /** 取代方 / 关联起点（必须活跃）。 */
+  readonly fromId: string
+  /** 被取代方 / 关联终点（必须活跃）。 */
+  readonly toId: string
 }
 
 /** 运行时读数（v4.15.2）：来自各模块自己的台账，不是"被观测对象自报"。 */
@@ -162,6 +172,13 @@ export interface UiService {
    * 与 `/omb-confirm` **同一实现**（`createConfirmAction`）；UI 不写库、不复制判据。
    */
   act(id: string, action: UiConfirmAction, sessionId?: string | null): Promise<UiActionResult>
+  /**
+   * 手动冲突裁决（v4.15.3）：建 related 边，或把 `toId` 标为"被 `fromId` 取代"。
+   *
+   * 语义与 `omb_remember(supersedes=…)` 一致：`validTo + supersededBy + supersedes 边`，
+   * **非破坏**（旧条目仍在库里、历史可查）；要求两条都活跃且同作用域，失败如实拒绝。
+   */
+  resolve(input: UiResolveInput): Promise<UiActionResult>
   /** 运行时读数（v4.15.2）；缺省 = 未接线，返回最小事实。 */
   runtime(): Promise<UiRuntime>
   /** 项目画像（v4.15.2）；缺省/未知 → 如实说明原因。 */
@@ -183,6 +200,10 @@ export interface UiServiceDeps {
   readonly runtime?: () => Promise<Omit<UiRuntime, 'version' | 'stores'>>
   /** 项目画像装配（经 `SERVICES.projectProfile`）；缺省 = 未接线。 */
   readonly profile?: () => Promise<UiProfile>
+  /** 时钟（裁决动作需要时间）；缺省 = 写动作如实拒绝。 */
+  readonly clock?: { now(): number }
+  /** 活动日志口（裁决动作记账；不含正文）。 */
+  readonly activity?: (kind: 'write', detail: string) => void
 }
 
 /** 状态判据（与检索侧的 `statusClause` 同一语义，前端不需要知道 SQL）。 */
@@ -391,7 +412,104 @@ export function createUiService(deps: UiServiceDeps): UiService {
     return undefined
   }
 
-  return { overview, list, candidates, detail, act, runtime, profile }
+  const findRef = async (id: string): Promise<{ readonly ref: StoreRef; readonly record: MemoryRecord } | undefined> => {
+    for (const ref of collectStores(deps, 'all')) {
+      try {
+        const record = await ref.store.get(id)
+        if (record !== undefined) return { ref, record }
+      } catch {
+        // 单库失败不拦：另一个库可能还有这条
+      }
+    }
+    return undefined
+  }
+
+  return { overview, list, candidates, detail, act, resolve, runtime, profile }
+
+  async function resolve(input: UiResolveInput): Promise<UiActionResult> {
+    const { action } = input
+    if (action !== 'relate' && action !== 'supersede') {
+      return { ok: false, text: `未执行：未知动作 ${String(action)}。` }
+    }
+    const fromId = typeof input.fromId === 'string' ? input.fromId.trim() : ''
+    const toId = typeof input.toId === 'string' ? input.toId.trim() : ''
+    if (fromId.length === 0 || toId.length === 0) return { ok: false, text: '未执行：fromId/toId 不能为空。' }
+    if (fromId === toId) return { ok: false, text: '未执行：两条 id 相同（不能指向自己）。' }
+    const clock = deps.clock
+    if (clock === undefined) return { ok: false, text: '未执行：时钟未接线（裁决动作需要时间戳）。' }
+    const newer = await findRef(fromId)
+    const older = await findRef(toId)
+    if (newer === undefined || older === undefined) {
+      return {
+        ok: false,
+        text: `未执行：${newer === undefined ? `找不到 fromId=${fromId}` : `找不到 toId=${toId}`}（用户库/项目库都查过）。`,
+      }
+    }
+    if (newer.ref.store.scope !== older.ref.store.scope) {
+      return { ok: false, text: '未执行：两条不在同一作用域（用户库 / 项目库），裁决不跨库。' }
+    }
+    if (newer.ref.store !== older.ref.store) {
+      return { ok: false, text: '未执行：两条属于不同的项目库（跨工作区），裁决不跨库。' }
+    }
+    const active = (record: MemoryRecord): boolean => record.validTo === null && record.supersededBy === null
+    const now = clock.now()
+    const store = newer.ref.store
+
+    if (action === 'relate') {
+      if (!active(newer.record) || !active(older.record)) {
+        return { ok: false, text: '未执行：关联要求两条都活跃（已失效/被取代的条目不参与）。' }
+      }
+      try {
+        await store.upsertEdge({ fromId, toId, type: 'related', createdAt: now })
+      } catch (error) {
+        return { ok: false, text: `建立关联失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
+      }
+      deps.activity?.('write', `ui:relate ${fromId}→${toId}`)
+      return { ok: true, text: `已建立关联：${fromId} → ${toId}（related 边；不改任何正文/状态）。` }
+    }
+
+    // supersede：fromId（新）取代 toId（旧）
+    if (!active(newer.record)) return { ok: false, text: '未执行：取代方必须活跃（已失效/被取代的条目不能再取代别人）。' }
+    if (!active(older.record)) {
+      return {
+        ok: false,
+        text: `未执行：被取代条目已处于非活跃状态（${older.record.supersededBy === null ? '已失效' : `已被 ${older.record.supersededBy} 取代`}）。`,
+      }
+    }
+    const marked: MemoryRecord = {
+      ...older.record,
+      validTo: Math.max(now, older.record.observedAt),
+      supersededBy: newer.record.id,
+    }
+    try {
+      await store.put(marked)
+    } catch (error) {
+      return { ok: false, text: `标注旧条目失败（已隔离，未改动任何数据）：${error instanceof Error ? error.message : String(error)}` }
+    }
+    let verified: MemoryRecord | undefined
+    try {
+      verified = (await store.getMany([older.record.id]))[0]
+    } catch {
+      verified = undefined
+    }
+    if (verified === undefined || verified.supersededBy !== newer.record.id) {
+      return { ok: false, text: `标注后查回失败（id=${older.record.id}）：状态未确认，请重试或检查库。` }
+    }
+    let edgeError: string | undefined
+    try {
+      await store.upsertEdge({ fromId: newer.record.id, toId: older.record.id, type: 'supersedes', createdAt: now })
+    } catch (error) {
+      edgeError = error instanceof Error ? error.message : String(error)
+    }
+    deps.activity?.('write', `ui:supersede ${fromId}→${toId}`)
+    const lines = [
+      `已标注：${older.record.id} 被 ${newer.record.id} 取代（validTo + supersededBy；非破坏，旧条目仍在库里）。`,
+      edgeError === undefined
+        ? 'supersedes 边已建立（omb_relate 可追溯这一跳）。'
+        : `⚠ supersedes 边未建成：${edgeError}（状态已生效，只是 omb_relate 追不到这一跳）。`,
+    ]
+    return { ok: true, text: lines.join('\n') }
+  }
 
   async function runtime(): Promise<UiRuntime> {
     const base: UiRuntime = { version: OMB_VERSION, stores: deps.stores.status() }
