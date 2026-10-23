@@ -192,12 +192,15 @@ describe('createUiService', () => {
       runtime: async () => ({
         privacy: { allowRead: true, allowWrite: false, reason: '测试 sealed' },
         controller: { mode: 'execute', events: 1, persist: 1, persisted: 1, verifyFailed: 0, failures: {}, duplicateActions: 0 },
+        situation: { state: 'active', turn: 3, workspace: { root: '/work/demo', switches: 2, previousRoot: '/work/old', since: NOW } },
       }),
       profile: async () => ({ available: true, root: '/work/demo', branch: 'main' }),
     })
     const wiredRuntime = await wired.runtime()
     expect(wiredRuntime.privacy).toMatchObject({ allowWrite: false })
     expect(wiredRuntime.controller).toMatchObject({ mode: 'execute', persisted: 1 })
+    expect(wiredRuntime.situation).toMatchObject({ state: 'active' })
+    expect(wiredRuntime.situation?.workspace?.switches).toBe(2)
     expect((await wired.profile()).root).toBe('/work/demo')
   })
 

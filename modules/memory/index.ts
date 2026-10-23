@@ -1174,6 +1174,61 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           }
           const cap = capture.stats()
           const activity = activityRef?.summary()
+          // 当前活跃会话的状态机读数：只取展示所需字段（不把整份 situation 塞给页面）。
+          let situation: {
+            readonly sessionId?: string
+            readonly state?: string
+            readonly tier?: string
+            readonly turn?: number
+            readonly idleMs?: number | null
+            readonly lastTurnEndReason?: string | null
+            readonly interrupted?: boolean
+            readonly unresolved?: boolean
+            readonly goals?: { readonly open: number; readonly total: number }
+            readonly todos?: { readonly open: number; readonly total: number }
+            readonly workspace?: {
+              readonly root?: string
+              readonly switches?: number
+              readonly previousRoot?: string | null
+              readonly since?: number
+            }
+          } | undefined
+          try {
+            const sessions = kernel.service<{ current(): string | null }>(SERVICES.activeSession)
+            const sessionId = sessions?.current() ?? undefined
+            const stateService = kernel.service<{
+              situation?(id: string): SessionSituationView | undefined
+            }>(SERVICES.sessionState)
+            const current = sessionId !== undefined && stateService?.situation !== undefined
+              ? stateService.situation(sessionId)
+              : undefined
+            if (current !== undefined) {
+              situation = {
+                sessionId: current.sessionId,
+                state: current.state,
+                tier: current.tier,
+                turn: current.turn,
+                idleMs: current.idleMs,
+                lastTurnEndReason: current.lastTurnEndReason,
+                interrupted: current.interrupted,
+                unresolved: current.unresolved,
+                goals: current.goals,
+                todos: current.todos,
+                ...(current.workspace === undefined
+                  ? {}
+                  : {
+                      workspace: {
+                        root: current.workspace.root,
+                        switches: current.workspace.switches,
+                        previousRoot: current.workspace.previousRoot,
+                        since: current.workspace.since,
+                      },
+                    }),
+              }
+            }
+          } catch {
+            situation = undefined
+          }
           return {
             ...(privacy === undefined ? {} : { privacy }),
             ...(activity === undefined
@@ -1201,6 +1256,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
               proactiveCues: cap.proactiveCues,
               cueFollowUps: cap.cueFollowUps,
             },
+            ...(situation === undefined ? {} : { situation }),
           }
         },
         // ── 项目画像（v4.15.2）：读宿主画像服务；没有会话 cwd 就如实说未知 ──

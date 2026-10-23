@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.15.3)
+# Oh-My-BigBlueFish (OMB v4.15.4)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -31,7 +31,8 @@ v4.14.0 扩展**主动记忆提示**（项目事实/引用历史）并加未写�
 v4.15.0 新增**管理侧边栏**（只读：概览/记忆库/候选/审计/相关条目）；
 v4.15.1 侧边栏可**手动确认/撤销确认**（与 /omb-confirm 同一实现）；
 v4.15.2 侧边栏新增**运行状态**与**项目画像**页签（只读）；
-v4.15.3 侧边栏可**手动建关联/标记取代**（非破坏冲突裁决）。详见
+v4.15.3 侧边栏可**手动建关联/标记取代**（非破坏冲突裁决）；
+v4.15.4 运行状态页补**会话状态机**读数并加 bundle 发布契约测试。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -59,11 +60,12 @@ v4.15.3 侧边栏可**手动建关联/标记取代**（非破坏冲突裁决）�
 [`docs/v4.15.0-sidebar-ui.md`](docs/v4.15.0-sidebar-ui.md)、
 [`docs/v4.15.1-sidebar-confirm-actions.md`](docs/v4.15.1-sidebar-confirm-actions.md)、
 [`docs/v4.15.2-sidebar-runtime-profile.md`](docs/v4.15.2-sidebar-runtime-profile.md)、
-[`docs/v4.15.3-sidebar-conflict-resolution.md`](docs/v4.15.3-sidebar-conflict-resolution.md) 与
+[`docs/v4.15.3-sidebar-conflict-resolution.md`](docs/v4.15.3-sidebar-conflict-resolution.md)、
+[`docs/v4.15.4-runtime-situation-and-bundle-contract.md`](docs/v4.15.4-runtime-situation-and-bundle-contract.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 102 小功能 → 4.15.3**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 102 小功能 → 4.15.4**。
 
 ## v4.4 结构（2026-10）
 

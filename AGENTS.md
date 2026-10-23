@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.15.3**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.15.4**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.15.3（当前） = 侧边栏手动冲突裁决（x3，4.15.0 收尾）**：
+- **v4.15.4（当前） = 运行状态页会话状态机 + bundle 发布契约（x3，4.15.x 收尾）**：
+  `UiRuntime.situation`（state/tier/turn/idle/目标/待办/工作区切换）来自
+  `activeSession.current()` + `sessionState.situation()`；`tests/dsh/ui-bundle.test.ts`
+  钉住 `dsh.client`/`exports["./client"]`/文件/id/slots/写端点，防部署漂移。
+  契约：`docs/v4.15.4-runtime-situation-and-bundle-contract.md`。
+- **v4.15.3** = 侧边栏手动冲突裁决（x3，4.15.0 收尾）：
   `POST /omb/api/resolve` 支持 `relate`（related 边）与 `supersede`
   （旧条目 validTo+supersededBy + supersedes 边，非破坏）；要求两条活跃、同作用域同库，
   写后查回验证；页面在相关条目上给「建立关联」「本条取代该条」。

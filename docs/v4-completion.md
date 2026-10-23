@@ -1104,3 +1104,32 @@
 - 修改：`modules/memory/{ui,index}.ts`、`dsh/ui-route.ts`、`packages/memory/client.js`、
   `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.15.4 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.15.4**（`24 功能 / 102 小功能`；x3：4.15.x 收尾） |
+| 构建 | **g129**；`generation: 129`、`outDir: lib-gen/g129` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **121 files / 1482 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：运行状态页出现"会话状态机"（状态/回合/空闲/目标/待办/工作区切换）；版本 4.15.4/构建 129 |
+
+## 本版内容
+
+1. `UiRuntime.situation`：`activeSession.current()` + `sessionState.situation()` 的
+   state/tier/turn/idle/lastTurnEndReason/interrupted/unresolved/goals/todos/
+   workspace{root,switches,previousRoot,since}；页面"运行状态"新增"会话状态机"一节。
+2. `tests/dsh/ui-bundle.test.ts`：钉住 `dsh.client`、`exports["./client"]`、文件存在、
+   `__ModuleLoader__`/id/slots/写端点，防部署漂移。
+
+详见 `docs/v4.15.4-runtime-situation-and-bundle-contract.md`。
+
+## 文件
+
+- 新增：`tests/dsh/ui-bundle.test.ts`、`docs/v4.15.4-runtime-situation-and-bundle-contract.md`
+- 修改：`modules/memory/{ui,index}.ts`、`packages/memory/client.js`、
+  `tests/modules/memory/ui.test.ts`、`README.md`、`AGENTS.md`、版本文件

@@ -173,6 +173,29 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.hint },
           `模式 ${controller.mode || '未知'} · 事件 ${controller.events ?? 0} · persist ${controller.persist ?? 0}`
           + `（写入 ${controller.persisted ?? 0}/查回失败 ${controller.verifyFailed ?? 0}）· 幂等跳过 ${controller.duplicateActions ?? 0}`),
+        data.situation
+          ? h('div', null,
+            h('p', { style: styles.sectionTitle }, '会话状态机'),
+            h('div', { style: styles.hint },
+              `会话 ${data.situation.sessionId || '未知'} · 状态 ${data.situation.state || '未知'}`
+              + (data.situation.tier ? `/${data.situation.tier}` : '')
+              + ` · 第 ${data.situation.turn ?? '?'} 回合`
+              + ` · 空闲 ${typeof data.situation.idleMs === 'number' ? `${Math.round(data.situation.idleMs / 1000)}s` : '未知'}`
+              + (data.situation.lastTurnEndReason ? ` · 上回合 ${data.situation.lastTurnEndReason}` : '')
+              + (data.situation.interrupted ? ' · 已中断' : '')
+              + (data.situation.unresolved ? ' · 未解决' : '')),
+            data.situation.goals || data.situation.todos
+              ? h('div', { style: styles.hint },
+                `目标 ${data.situation.goals ? `${data.situation.goals.open}/${data.situation.goals.total}` : '未知'}`
+                + ` · 待办 ${data.situation.todos ? `${data.situation.todos.open}/${data.situation.todos.total}` : '未知'}`)
+              : null,
+            data.situation.workspace
+              ? h('div', { style: styles.hint },
+                `工作区 ${data.situation.workspace.root || '未知'}`
+                + ` · 本会话切换 ${data.situation.workspace.switches ?? 0} 次`
+                + (data.situation.workspace.previousRoot ? ` · 上一处 ${data.situation.workspace.previousRoot}` : ''))
+              : null)
+          : h('div', { style: styles.hint }, '会话状态未接线（session-state 服务不可用）。'),
         h('p', { style: styles.sectionTitle }, '捕获与主动性'),
         h('div', { style: styles.hint },
           `偏好写入 ${capture.preferences ?? 0} · 失败 ${capture.failed ?? 0}`

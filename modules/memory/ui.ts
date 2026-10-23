@@ -142,6 +142,25 @@ export interface UiRuntime {
     readonly proactiveCues: number
     readonly cueFollowUps: number
   }
+  /** 当前活跃会话的状态机读数（v4.15.4）：会话/空闲/目标/工作区切换。 */
+  readonly situation?: {
+    readonly sessionId?: string
+    readonly state?: string
+    readonly tier?: string
+    readonly turn?: number
+    readonly idleMs?: number | null
+    readonly lastTurnEndReason?: string | null
+    readonly interrupted?: boolean
+    readonly unresolved?: boolean
+    readonly goals?: { readonly open: number; readonly total: number }
+    readonly todos?: { readonly open: number; readonly total: number }
+    readonly workspace?: {
+      readonly root?: string
+      readonly switches?: number
+      readonly previousRoot?: string | null
+      readonly since?: number
+    }
+  }
 }
 
 /** 项目画像（v4.15.2）：只读、有界，复用 `SERVICES.projectProfile`。 */
