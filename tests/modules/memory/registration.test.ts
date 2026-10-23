@@ -162,7 +162,6 @@ describe('omb-memory 配置', () => {
     // 3.6：隐私闸门并入记忆库，配置多了一个 `privacy` 子块（原 `omb-privacy` 行的 config 块）
     // 3.7：新增两个**回滚开关**（`residentHint`/`recallDetail`），缺省即新行为
     expect(MEMORY_CONFIG_DEFAULTS).toEqual({
-      consolidationEveryTurns: 32,
       embeddingThreads: 2,
       residentHint: true,
       recallDetail: 'snippet',
@@ -182,26 +181,7 @@ describe('omb-memory 配置', () => {
   })
 
   it('部分配置补齐其余缺省值（apply 永远收到完整配置）', () => {
-    expect(memoryConfigSchema.parse({ consolidationEveryTurns: 8 })).toEqual({
-      consolidationEveryTurns: 8,
-      embeddingThreads: 2,
-      residentHint: true,
-      recallDetail: 'snippet',
-      autoCapturePreferences: true,
-      autoCaptureActivity: true,
-      autoCaptureOutcome: true,
-      memoryController: 'execute',
-      autoLinkRelated: true,
-      relatedExpansion: true,
-      coldStartRetryMs: 250,
-      lexicalFloorMode: 'relative',
-      lexicalFloorTargetPrecision: 0.6,
-      feedbackCommand: true,
-      confirmCommand: true,
-      privacy: { failClosedMode: 'sealed', path: null },
-    })
     expect(memoryConfigSchema.parse({ embeddingThreads: 4 })).toEqual({
-      consolidationEveryTurns: 32,
       embeddingThreads: 4,
       residentHint: true,
       recallDetail: 'snippet',
@@ -235,8 +215,6 @@ describe('omb-memory 配置', () => {
   })
 
   it('非法配置被拒（路径可读）', () => {
-    expect(() => memoryConfigSchema.parse({ consolidationEveryTurns: 0 })).toThrow()
-    expect(() => memoryConfigSchema.parse({ consolidationEveryTurns: 1.5 })).toThrow()
     expect(() => memoryConfigSchema.parse({ embeddingThreads: 'many' })).toThrow()
     // 隐私档位只允许两种受限档（`normal` 不是"基线档"，它是按会话设置的档位）
     expect(() => memoryConfigSchema.parse({ privacy: { failClosedMode: 'normal' } })).toThrow()
@@ -248,7 +226,6 @@ describe('omb-memory 配置', () => {
 
     services.set(SERVICES.stores, { config: { embeddingThreads: 4 } })
     expect(readMemoryConfig(kernel)).toEqual({
-      consolidationEveryTurns: 32,
       embeddingThreads: 4,
       residentHint: true,
       recallDetail: 'snippet',

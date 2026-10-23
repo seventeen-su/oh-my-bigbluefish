@@ -802,3 +802,38 @@
 
 - 这是第 2 项指令；第 1 项（用户断言模糊去重）已在 4.9.7 交付。
 - 后续项（离线整合取消、崩溃验证/日志、跨工作区状态机、控制器重构、主动性、侧边栏 UI）仍在目标中。
+
+---
+
+# OMB v4.10.1 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.10.1**（`24 功能 / 96 小功能`；x3：取消离线整合、写入时确定性去重） |
+| 构建 | **g120**；`generation: 120`、`outDir: lib-gen/g120` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **116 files / 1449 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：版本 4.10.1/构建 120；健康面不再出现"离线整合"读数；重复写入仍按确定性判据处理 |
+
+## 本版内容
+
+1. 删除 `modules/memory/consolidate.ts`（0.7 近似合并、自动 supersedes/conflicts_with 边）、
+   `turn/end` 订阅、`consolidationEveryTurns` 配置、整合台账与健康读数、预设行。
+2. 写入路径维持并明确确定性去重：`contentHash` 精确 / 归一化 bigram ≥0.9（数字不同不合并）；
+   用户断言命中候选就地升级；**不自动标失效**（supersedes 只能显式给出）。
+3. 新测试：数字不同的近似内容不合并、两条都保持有效；既有模糊去重/升级/压缩兜底用例保留。
+4. 清理 `consolidate.ts` 相关注释与测试（删除 2 个测试文件）。
+
+详见 `docs/v4.10.1-write-time-dedupe.md`。
+
+## 文件
+
+- 删除：`modules/memory/consolidate.ts`、`tests/modules/retrieval/consolidate.test.ts`、
+  `tests/modules/memory/consolidation-wiring.test.ts`
+- 修改：`modules/memory/{index,remember,retrieve,store,recall}.ts`、`cordis.patch.yml`、
+  `tests/modules/memory/{registration,remember}.test.ts`、`README.md`、`AGENTS.md`、版本文件
+
+## 备注
+
+- 这是第 4 项指令；剩余：崩溃验证/日志、跨工作区状态机与项目认知、控制器重构、主动性、侧边栏 UI。

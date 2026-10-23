@@ -1257,7 +1257,7 @@ async function linkSupersedes(
 /**
  * 把请求里的旧条目标为"已被本条取代"。
  *
- * 语义（与离线整合一致，见 `consolidate.ts`）：
+ * 语义（v4.10.1：离线整合已取消，不变量保留在在线写入路径）：
  * ① **非破坏性**：只写 `validTo` + `supersededBy`，**不删行**——"我当时相信什么"必须可回答
  * ② 边方向 `newer → older`，便于 `omb_relate` 顺着链往下走
  * ③ 已在取代链里的条目**不改写**既有标注（改写会让"谁取代了谁"失真），只补边
@@ -1328,7 +1328,7 @@ async function applySupersedes(
     try {
       await lookup.store.put({
         ...target,
-        // 与 consolidate.ts 同一口径：失效时间取"新证据时间"与"旧条目时间"的较晚者
+        // 失效时间取"新证据时间"与"旧条目时间"的较晚者（非破坏性，历史仍可查）
         validTo: Math.max(now, target.observedAt),
         supersededBy: record.id,
       })

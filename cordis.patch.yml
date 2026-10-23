@@ -44,7 +44,6 @@
       name: '@omb/memory'
       inject: ['omb:kernel', 'commands']
       config:
-        consolidationEveryTurns: 32
         embeddingThreads: 2
         # 隐私闸门（原 omb-privacy 行的 config 块，逐项照搬）
         privacy:

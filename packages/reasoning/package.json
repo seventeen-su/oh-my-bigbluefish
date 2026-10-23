@@ -1,15 +1,15 @@
 {
   "name": "@omb/reasoning",
-  "version": "4.10.0",
+  "version": "4.10.1",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — chain-of-thought quality: eight method cards, loop detection, three focus depths.",
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g119/index.js",
+  "main": "./lib-gen/g120/index.js",
   "exports": {
-    ".": "./lib-gen/g119/index.js",
+    ".": "./lib-gen/g120/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"

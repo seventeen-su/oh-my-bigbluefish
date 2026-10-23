@@ -361,7 +361,7 @@ export interface RetrieveResult {
 /**
  * 保留来源（`omb-doc:` 前缀）判定：画像这类"单文档结构化状态"**不是经验痕迹**，
  * 不得参与经验召回排名（`kernel/abi/catalog.ts` 的 `RESERVED_SOURCE_PREFIX`）。
- * 离线整合侧（`consolidate.ts`）复用同一判定。
+ * 保留来源不参与召回与统计（`omb-doc:` 前缀；v4.10.1 起也没有离线整合这一侧了）。
  */
 export function isReservedSource(sourceRef: string): boolean {
   return sourceRef.startsWith(RESERVED_SOURCE_PREFIX)

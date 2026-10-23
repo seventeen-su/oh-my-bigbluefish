@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.10.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.10.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.10.0（当前） = 检索过滤与模糊回退（x2）**：schema v6 加 `memory.tags`（JSON 数组，
+- **v4.10.1（当前） = 取消离线整合、写入时确定性去重（x3）**：删除
+  `modules/memory/consolidate.ts` 与 `turn/end` 订阅、`consolidationEveryTurns` 配置、
+  整合台账/健康读数（0.7 近似合并会自动标失效，有损且不可解释）。去重只发生在写入路径：
+  `contentHash` 精确或归一化 bigram ≥0.9（数字不同不合并），用户断言命中候选就升级；
+  **不自动 `supersedes`**，是否推翻由调用方显式给。契约：`docs/v4.10.1-write-time-dedupe.md`。
+- **v4.10.0** = 检索过滤与模糊回退（x2）：schema v6 加 `memory.tags`（JSON 数组，
   默认 `[]`，最多 8 个、每个 ≤24 字符）；`omb_recall` 新增 `status`（active/stale/superseded/all）、
   `tags`（AND）、`fuzzy`（默认开）；词法 0 命中时用 `searchFuzzy` 的 `LIKE` 子串回退，
   通道标记 `fuzzy`。过滤全部在 SQL 下推（`json_each`），不是 JS 事后裁剪。

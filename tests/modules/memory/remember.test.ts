@@ -583,6 +583,21 @@ describe('omb_remember：写入与路由', () => {
     await fixture.close()
   })
 
+  it('数字不同的近似内容不会被合并/标失效（写入时去重不越界）', async () => {
+    const fixture = writeFixture()
+    const first = await run(fixture.tool, { text: '服务监听 http://localhost:8080/api', kind: 'semantic' })
+    expect(first.text).toContain('已记住')
+    const second = await run(fixture.tool, { text: '服务监听 http://localhost:8081/api', kind: 'semantic' })
+    expect(second.text).toContain('已记住')
+    expect((await fixture.user.stats()).rows).toBe(2)
+    // 去重只在写入时判定，**不再有离线整合**去自动标失效：两条都保持有效
+    const hits = await fixture.user.searchLexical({ text: '服务监听', scope: 'user', limit: 5 })
+    const records = await fixture.user.getMany(hits.map(hit => hit.id))
+    expect(records).toHaveLength(2)
+    expect(records.every(record => record.validTo === null && record.supersededBy === null)).toBe(true)
+    await fixture.close()
+  })
+
   it('候选被重复写入时，回执提示用户可以用 /omb-confirm 确认', async () => {
     const fixture = writeFixture()
     // 无用户断言、但有可复现工件 → assertedBy=model → 生命周期"候选"

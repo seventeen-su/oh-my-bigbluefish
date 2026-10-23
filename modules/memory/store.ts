@@ -1129,8 +1129,7 @@ class SqliteStore implements SqliteMemoryStore {
    * ## 为什么需要它（M5）
    *
    * `use_count` / `last_used_at` 有三个消费者，却长期**零个生产者**：
-   * - `retrieve.ts` 的重排先验 `usage = useCount/(1+useCount)` 乘 `RERANK_WEIGHTS.usage = 0.12`；
-   * - `consolidate.ts` 的 `decayPrior` usage 因子与"回响塌缩累加 useCount"。
+   * - `retrieve.ts` 的重排先验 `usage = useCount/(1+useCount)` 乘 `RERANK_WEIGHTS.usage = 0.12`。
    *
    * 而写入侧恒写 `useCount: 0`、`lastUsedAt: now` —— 于是 0.12 的权重永远是死分量，
    * "多久没被用过"永远等于"多久前写的"，且**没有任何读数能看出来**（典型的静默失效）。

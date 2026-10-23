@@ -284,7 +284,7 @@ export interface MemoryToolDeps {
   readonly resolveStores: (sessionId?: string) => readonly TaggedStore[] | undefined
   /**
    * 时钟。**必填**：模块层不读墙钟，一律由 `dsh/` 传 `kernel.clock`
-   * （团队约定；`retrieve`/`consolidate` 因此保持纯函数）。
+   * （团队约定；`retrieve` 因此保持纯函数）。
    */
   readonly clock: Clock
   /** 检索端口（嵌入器/第二通道）。缺省只用注入的时钟 + 纯词法。 */
