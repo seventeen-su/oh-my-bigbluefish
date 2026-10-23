@@ -800,38 +800,55 @@ window.__ModuleLoader__.load({
             messageBlock,
             h('div', { className: 'omb-grid' },
               h(Card, {
-                label: '基线', value: modeText(data.baseline.mode),
-                note: `${originText(data.baseline.origin)} · ${data.baseline.detail}`,
-                state: data.baseline.origin === 'fail-closed' ? 'warning' : 'idle',
+                label: '基线',
+                value: data.available ? modeText(data.baseline.mode) : '未接线',
+                note: data.available
+                  ? `${originText(data.baseline.origin)} · ${data.baseline.detail}`
+                  : (data.reason || '隐私管理服务不可用'),
+                state: data.available
+                  ? (data.baseline.origin === 'fail-closed' ? 'warning' : 'idle')
+                  : 'warning',
               }),
               h(Card, {
                 label: '当前会话',
-                value: data.current ? modeText(data.current.mode) : '未知',
-                note: data.current
-                  ? `${originText(data.current.origin)}`
-                    + (data.current.inheritedFrom ? ` · 继承自 ${shortId(data.current.inheritedFrom, 28)}` : '')
-                    + ` · ${shortId(data.current.sessionId, 34)}`
-                    + (data.current.parentSessionId ? ` · 父 ${shortId(data.current.parentSessionId, 28)}` : '')
-                  : '宿主未提供当前会话标识（不猜）',
-                state: data.current ? (data.current.mode === 'normal' ? 'done' : 'warning') : 'idle',
+                value: data.available ? (data.current ? modeText(data.current.mode) : '未知') : '未接线',
+                note: data.available
+                  ? (data.current
+                    ? `${originText(data.current.origin)}`
+                      + (data.current.inheritedFrom ? ` · 继承自 ${shortId(data.current.inheritedFrom, 28)}` : '')
+                      + ` · ${shortId(data.current.sessionId, 34)}`
+                      + (data.current.parentSessionId ? ` · 父 ${shortId(data.current.parentSessionId, 28)}` : '')
+                    : '宿主未提供当前会话标识（不猜）')
+                  : '隐私管理不可用，无法读取当前会话',
+                state: data.available
+                  ? (data.current ? (data.current.mode === 'normal' ? 'done' : 'warning') : 'idle')
+                  : 'warning',
               }),
               h(Card, {
                 label: '状态文件',
-                value: data.durable.ok ? '可读写' : '降级/未持久化',
-                note: data.durable.path
-                  ? `${data.durable.path}${data.durable.savedAt ? `（最近写入 ${formatTime(data.durable.savedAt)}）` : ''}`
-                  : data.durable.detail,
-                state: data.durable.ok ? 'done' : 'error',
+                value: data.available ? (data.durable.ok ? '可读写' : '降级/未持久化') : '未接线',
+                note: data.available
+                  ? (data.durable.path
+                    ? `${data.durable.path}${data.durable.savedAt ? `（最近写入 ${formatTime(data.durable.savedAt)}）` : ''}`
+                    : data.durable.detail)
+                  : '隐私管理不可用，状态文件未核对',
+                state: data.available ? (data.durable.ok ? 'done' : 'error') : 'warning',
               }),
               h(Card, {
                 label: '受限会话',
-                value: data.restricted === null
+                value: !data.available
                   ? '未测量'
-                  : `${data.restricted.active} 活跃 / ${data.restricted.history} 历史`,
-                note: data.restricted === null
-                  ? '读会话运行态失败：不写 0，按未测量处理'
-                  : '只有本进程活跃的受限会话会掐住"归属未知"的写',
-                state: data.restricted === null ? 'warning' : (data.restricted.active > 0 ? 'warning' : 'idle'),
+                  : data.restricted === null
+                    ? '未测量'
+                    : `${data.restricted.active} 活跃 / ${data.restricted.history} 历史`,
+                note: !data.available
+                  ? '隐私管理不可用，计数未测量'
+                  : data.restricted === null
+                    ? '读会话运行态失败：不写 0，按未测量处理'
+                    : '只有本进程活跃的受限会话会掐住"归属未知"的写',
+                state: !data.available ? 'warning'
+                  : data.restricted === null ? 'warning'
+                    : (data.restricted.active > 0 ? 'warning' : 'idle'),
               })),
             h('div', { className: 'omb-section' },
               h('p', { className: 'omb-section-title' }, '给当前会话设模式'),

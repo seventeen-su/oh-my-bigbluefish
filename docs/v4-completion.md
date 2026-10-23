@@ -1264,3 +1264,22 @@
   `modules/memory/privacy/index.ts`、`dsh/ui-route.ts`、
   `tests/dsh/{ui-bundle,ui-route}.test.ts`、`tests/modules/memory/ui.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.17.1 交付记录（2026-10-24，x3）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.17.1**（`24 功能 / 104 小功能`；x3：隐私设置页降级态如实标注） |
+| 构建 | **g133**；`generation: 133`、`outDir: lib-gen/g133` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **121 files / 1498 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**（与 4.17.0 相同的界面清单；4.17.1 只改降级态文案） |
+
+## 修复
+
+- 隐私视图不可用/读取失败时，页面不再把占位值画成"基线 normal / 状态文件可读写"：
+  四张卡片写"未接线 / 未测量"并给出原因；
+- `omb:ui` 读取失败时命令面状态写"读取失败"（不冒充"未接线"）；
+- 隐私管理端口在视图异常时保留真实 `commandState`（视图坏了不等于命令没注册）。
+- 契约详情见 `docs/v4.17.0-settings-navigation-and-privacy.md` §6。

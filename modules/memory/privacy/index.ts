@@ -567,7 +567,10 @@ export function installPrivacy(
   const asActionResult = (result: CommandResultLike): PrivacyActionResult =>
     ({ ok: result.kind === 'success', text: result.text })
 
-  /** 完整形状的降级视图（缺字段会让前端拿不到键、把"未接线"渲染成空）。 */
+  /**
+   * 完整形状的降级视图（缺字段会让前端拿不到键、把"未接线"渲染成空）。
+   * 命令面状态用**真实** `commandState`：视图读取失败不代表命令没注册。
+   */
   const emptyPrivacyView = (reason: string): UiPrivacyView => ({
     available: false,
     reason,
@@ -579,7 +582,7 @@ export function installPrivacy(
     commands: {
       privacy: PRIVACY_COMMAND_NAME,
       clean: PRIVACY_CLEAN_COMMAND_NAME,
-      state: '未接线',
+      state: commandState,
     },
     stats: {
       decisions: 0,

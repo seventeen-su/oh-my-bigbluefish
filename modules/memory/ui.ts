@@ -303,7 +303,7 @@ const MAX_PRIVACY_SESSION_ID = 200
  * 为什么字段一个都不能少：前端按 `available` 渲染提示，但其余字段仍会被读取；
  * 少一个键就会在浏览器里变成 `undefined`，页面把"未接线"画成"0 条设置"。
  */
-function emptyPrivacyView(reason: string): UiPrivacyView {
+function emptyPrivacyView(reason: string, commandState = '未接线'): UiPrivacyView {
   return {
     available: false,
     reason,
@@ -312,7 +312,7 @@ function emptyPrivacyView(reason: string): UiPrivacyView {
     sessions: [],
     restricted: null,
     durable: { path: null, ok: false, detail: '未知', savedAt: null },
-    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '未接线' },
+    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: commandState },
     stats: {
       decisions: 0,
       readDenials: 0,
@@ -636,7 +636,10 @@ export function createUiService(deps: UiServiceDeps): UiService {
     try {
       return wired.admin.view(wired.current())
     } catch (error) {
-      return emptyPrivacyView(`隐私视图读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      return emptyPrivacyView(
+        `隐私视图读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}`,
+        '读取失败',
+      )
     }
   }
 
