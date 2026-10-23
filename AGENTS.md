@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.14.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.15.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.14.0（当前） = 主动记忆提示扩展与跟进（x2）**：新增 `recall-first`
+- **v4.15.0（当前） = 管理侧边栏（只读 UI，x2）**：`modules/memory/ui.ts` 提供
+  `omb:ui` 只读服务（概览/列表/候选/详情+审计+相关条目）；`dsh/ui-route.ts` 在宿主
+  `webServer` 注册 `/omb/api`（仅 GET、同源、no-store）；`packages/memory/client.js`
+  是手写浏览器 bundle，经 `dsh.client` 注册侧边栏图标与 `main` 面板。
+  **写操作仍走 `/omb-confirm`**，UI 不写库。契约：`docs/v4.15.0-sidebar-ui.md`。
+- **v4.14.0** = 主动记忆提示扩展与跟进（x2）：新增 `recall-first`
   （引用过去结论先查）与 `project-fact`（路径/命令/端口/版本/URL）两类 cue；
   execute 模式不再整体抑制提示：控制器精确提示优先，没写时才给 cue；
   未写入的 cue 在**下一条用户消息**给一次跟进（dry-run/off/任务约束不跟进）；

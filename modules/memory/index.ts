@@ -39,6 +39,7 @@ import {
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
+import { createUiService } from './ui.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
@@ -813,6 +814,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 若宿主实现真的抛，apply 抛出会由内核记为本模块 failed，语义正确。
       const off = kernel.provide(SERVICES.stores, service)
       current = service
+      // ── 管理侧边栏数据面（v4.15.0）：只读服务，供 `dsh/ui-route.ts` 使用 ──
+      const offUi = kernel.provide(SERVICES.ui, createUiService({ stores: service }))
 
       // ── 工具面（`tools:omb-memory` → ToolDefinition[]，契约见 SERVICES.toolsPrefix）──
       // 工具**定义**在 `recall.ts`/`graph.ts`，**装配**在本模块的 apply：
@@ -1463,6 +1466,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           // 而"卸载后 SERVICES.privacy 立刻消失"是测试与热插拔都依赖的可见事实。
           ['隐私闸门', () => privacy.dispose()],
           ['stores 服务', off],
+          ['ui 服务', offUi],
         ] as const) {
           try {
             close()

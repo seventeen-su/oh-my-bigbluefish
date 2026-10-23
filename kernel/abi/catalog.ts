@@ -96,6 +96,7 @@ export const MODULE_CATALOG: readonly CatalogEntry[] = [
       'memory.retain',
       'memory.recall.related',
       'memory.recall.multiquery',
+      'memory.ui',
       'privacy.modes',
     ],
     tools: ['omb_recall', 'omb_forget', 'omb_relate', 'omb_remember', 'omb_project'],
@@ -382,6 +383,13 @@ export const SERVICES = {
    * 模型面只有 `consumeNotice()` 在真实变化时返回的一行（≤120 字符）。
    */
   sessionState: 'omb:session-state',
+  /**
+   * **管理侧边栏数据面**（`modules/memory/ui.ts`，v4.15.0）。
+   *
+   * 只读：概览/列表/详情/候选；由 `dsh/ui-route.ts` 挂在宿主 `/omb/api` 前缀路由上，
+   * 供浏览器侧边栏取数。**不是模型工具、不注入提示、不写库**。
+   */
+  ui: 'omb:ui',
 } as const
 
 export type ServiceName = (typeof SERVICES)[keyof typeof SERVICES]

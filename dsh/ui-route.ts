@@ -1,0 +1,141 @@
+/**
+ * 记忆管理侧边栏的**宿主 HTTP 路由**（v4.15.0）。
+ *
+ * 边界：
+ * - 只挂在宿主 `webServer` 的 `/omb/api` 前缀上；没有 webServer（CLI/桌面载体）时
+ *   本路由不注册，侧边栏自然不出现——不假装已经可用；
+ * - **只读**：GET + 只调用 `omb:ui` 服务；写操作仍走用户命令 `/omb-confirm`，
+ *   本路由不提供任何写入入口；
+ * - 同源保护：浏览器跨站请求带的 `Origin` 与 `Host` 不一致时 403（GET 的简单请求本来就
+ *   不发 Origin，所以这层只在异常情形生效；不是权限边界，真正的边界是本机回环监听）；
+ * - 所有响应 `no-store`，JSON 编码，错误不泄漏内部异常文本（只给类别）。
+ */
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Kernel } from '../kernel/abi/index.js'
+import { SERVICES } from '../kernel/abi/index.js'
+import type { MemoryKind } from '../kernel/abi/index.js'
+import type { UiListQuery, UiScope, UiStatus, UiService } from '../modules/memory/ui.js'
+
+/** 路由前缀（与 `cordis.patch.yml` 的组件行无关，纯宿主 URL 命名空间）。 */
+export const UI_ROUTE_PREFIX = '/omb/api'
+
+/** 允许的类型/状态取值（解析用；未知值忽略而不是 400——前端可以渐进增强）。 */
+const KINDS: readonly MemoryKind[] = ['semantic', 'procedural', 'episodic']
+const SCOPES: readonly UiScope[] = ['user', 'project', 'all']
+const STATUSES: readonly UiStatus[] = ['active', 'stale', 'superseded', 'all']
+
+function parseListQuery(search: URLSearchParams): UiListQuery {
+  const scope = search.get('scope') as UiScope | null
+  const status = search.get('status') as UiStatus | null
+  const kind = search.get('kind') as MemoryKind | null
+  const limitRaw = search.get('limit')
+  const tagsRaw = search.get('tags')
+  const tags = tagsRaw === null ? undefined : tagsRaw.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0)
+  return {
+    ...(scope !== null && SCOPES.includes(scope) ? { scope } : {}),
+    ...(status !== null && STATUSES.includes(status) ? { status } : {}),
+    ...(kind !== null && KINDS.includes(kind) ? { kind } : {}),
+    ...(search.get('q') === null ? {} : { q: search.get('q') as string }),
+    ...(tags === undefined || tags.length === 0 ? {} : { tags }),
+    ...(limitRaw === null ? {} : { limit: Number(limitRaw) }),
+  }
+}
+
+function json(res: ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload)
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.end(body)
+}
+
+/** 同源判定：没有 Origin 视为同源（同源 GET 的常态）；有则必须与 Host 一致。 */
+function sameOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin
+  if (origin === undefined || origin.length === 0) return true
+  const host = req.headers.host
+  if (host === undefined || host.length === 0) return false
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 注册 UI 路由。
+ *
+ * @param webCtx 注入 `webServer` 之后的宿主作用域（Cordis context）。
+ * @param kernelOf 每次请求现取内核（热插拔会换内核实例；缓存住会指向旧库）。
+ * @returns 注销函数（幂等）；注册失败时返回空函数并由调用方留声。
+ */
+export function installUiRoute(
+  webCtx: unknown,
+  kernelOf: () => Kernel | undefined,
+): () => void {
+  const scope = webCtx as {
+    readonly webServer?: { register(route: { kind: 'prefix'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void }
+    readonly effect?: (fn: () => (() => void)) => () => void
+  }
+  const webServer = scope.webServer
+  if (webServer === undefined || typeof webServer.register !== 'function') return () => {}
+  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      if (!sameOrigin(req)) {
+        json(res, 403, { error: 'cross-origin request rejected' })
+        return
+      }
+      if (req.method !== 'GET') {
+        json(res, 405, { error: 'read-only endpoint' })
+        return
+      }
+      const kernel = kernelOf()
+      const ui = kernel?.service<UiService>(SERVICES.ui)
+      if (ui === undefined) {
+        json(res, 503, { error: 'memory ui service unavailable' })
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
+      if (path === '/overview') {
+        json(res, 200, await ui.overview())
+        return
+      }
+      if (path === '/list') {
+        json(res, 200, await ui.list(parseListQuery(url.searchParams)))
+        return
+      }
+      if (path === '/candidates') {
+        const limit = Number(url.searchParams.get('limit') ?? '')
+        json(res, 200, await ui.candidates(Number.isFinite(limit) ? limit : undefined))
+        return
+      }
+      if (path === '/detail') {
+        const id = url.searchParams.get('id')
+        if (id === null || id.trim().length === 0) {
+          json(res, 400, { error: 'missing id' })
+          return
+        }
+        const detail = await ui.detail(id.trim())
+        if (detail === undefined) {
+          json(res, 404, { error: 'memory not found' })
+          return
+        }
+        json(res, 200, detail)
+        return
+      }
+      json(res, 404, { error: 'unknown endpoint' })
+    } catch (error) {
+      json(res, 500, { error: 'internal error' })
+      void error
+    }
+  }
+  const route = { kind: 'prefix' as const, path: UI_ROUTE_PREFIX, handler }
+  try {
+    if (typeof scope.effect === 'function') return scope.effect(() => webServer.register(route))
+    return webServer.register(route)
+  } catch {
+    return () => {}
+  }
+}

@@ -970,3 +970,37 @@
 - 新增：`docs/v4.14.0-proactive-initiative.md`
 - 修改：`modules/memory/{proactive,capture,activity,index}.ts`、
   `tests/modules/memory/{proactive,capture}.test.ts`、`README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.15.0 交付记录（2026-10-24）
+
+## 交付
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.15.0**（`24 功能 / 102 小功能`；x2：管理侧边栏，按用户口径新界面不升 x1） |
+| 构建 | **g125**；`generation: 125`、`outDir: lib-gen/g125`、7 个组件包指向本代 |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **120 files / 1474 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 浏览器 bundle | `node --check packages/memory/client.js` 通过；`dsh.client` 声明（platform web、immediately）保留在 `packages/memory/package.json` |
+| 真机验收 | **待重启 `dsh web` 后核对**：侧边栏出现"OMB 记忆"图标；概览/记忆库/候选/详情可读；`/omb/api/overview` 返回 JSON；版本 4.15.0/构建 125 |
+
+## 本版内容
+
+1. `modules/memory/ui.ts`：只读服务 `omb:ui`（overview/list/candidates/detail），
+   数据源 `StoresService.snapshot()`；单页 ≤50、候选 ≤20、详情审计 ≤20、扫描 ≤500 行/库。
+2. `dsh/ui-route.ts`：宿主 `webServer` 的 `/omb/api` 前缀路由，仅 GET、同源检查、
+   no-store、服务缺席 503、无 webServer 不注册。
+3. `packages/memory/client.js`：手写 `window.__ModuleLoader__` bundle，
+   注册 `main`（key=omb-memory）与 `sidebar.panellist`；数据走 fetch。
+4. 服务接线：记忆模块 `provide(SERVICES.ui)`，注销顺序含 ui 服务。
+5. **写操作仍走 `/omb-confirm`**：UI 只读，不写库、不自动 supersede（写入口留给下一版 x3）。
+
+详见 `docs/v4.15.0-sidebar-ui.md`。
+
+## 文件
+
+- 新增：`modules/memory/ui.ts`、`dsh/ui-route.ts`、`packages/memory/client.js`、
+  `tests/modules/memory/ui.test.ts`、`tests/dsh/ui-route.test.ts`、`docs/v4.15.0-sidebar-ui.md`
+- 修改：`modules/memory/index.ts`、`packages/memory/{index.ts,package.json}`、
+  `kernel/abi/catalog.ts`、`README.md`、`AGENTS.md`、版本文件

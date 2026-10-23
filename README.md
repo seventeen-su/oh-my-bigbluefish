@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.14.0)
+# Oh-My-BigBlueFish (OMB v4.15.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -27,7 +27,8 @@ v4.10.1 **取消离线整合**，去重只发生在写入路径（确定性判�
 v4.11.0 加**活动日志**（写入/去重/升级/召回/错误）与 SIGKILL 崩溃窗口验证；
 v4.12.0 加**跨工作区状态机**（会话换项目可见）与**文件索引**（按符号/导入排序）；
 v4.13.0 把**事件控制器**整理成显式状态机（阶段/转移审计、动作幂等、失败分类）；
-v4.14.0 扩展**主动记忆提示**（项目事实/引用历史）并加未写入跟进。详见
+v4.14.0 扩展**主动记忆提示**（项目事实/引用历史）并加未写入跟进；
+v4.15.0 新增**管理侧边栏**（只读：概览/记忆库/候选/审计/相关条目）。详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
 [`docs/v4.2-gap-closure.md`](docs/v4.2-gap-closure.md)、
@@ -51,11 +52,12 @@ v4.14.0 扩展**主动记忆提示**（项目事实/引用历史）并加未写�
 [`docs/v4.11.0-activity-log-and-crash-tests.md`](docs/v4.11.0-activity-log-and-crash-tests.md)、
 [`docs/v4.12.0-workspace-state-and-file-index.md`](docs/v4.12.0-workspace-state-and-file-index.md)、
 [`docs/v4.13.0-controller-state-machine.md`](docs/v4.13.0-controller-state-machine.md)、
-[`docs/v4.14.0-proactive-initiative.md`](docs/v4.14.0-proactive-initiative.md) 与
+[`docs/v4.14.0-proactive-initiative.md`](docs/v4.14.0-proactive-initiative.md)、
+[`docs/v4.15.0-sidebar-ui.md`](docs/v4.15.0-sidebar-ui.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 101 小功能 → 4.14.0**。
+> 生成器 `scripts/version.mjs`；当前 **24 功能 / 102 小功能 → 4.15.0**。
 
 ## v4.4 结构（2026-10）
 

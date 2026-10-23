@@ -1,0 +1,325 @@
+// OMB 记忆管理侧边栏（v4.15.0）——手写浏览器 bundle，不需要打包器。
+// 宿主 `dsh-client-modules` 扫描到本包 `dsh.client` 后把它作为懒加载工厂注册；
+// 只有用户第一次打开面板时才会执行。
+//
+// 数据面：宿主 `/omb/api`（只读 GET）。写操作（确认候选）仍走 `/omb-confirm`，
+// 本面板不提供写入口——"手动管理"的第一阶段先把**看见与审计**做好。
+window.__ModuleLoader__.load({
+  id: '@omb/memory',
+  factory(require) {
+    const React = require('react')
+    const h = React.createElement
+
+    const PANEL_ID = 'omb-memory'
+    const TABS = [
+      { id: 'overview', label: '概览' },
+      { id: 'memory', label: '记忆库' },
+      { id: 'candidates', label: '候选确认' },
+    ]
+
+    const styles = {
+      page: {
+        display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0,
+        padding: '16px 20px', gap: 12, boxSizing: 'border-box', color: 'inherit',
+        font: 'inherit',
+        overflow: 'hidden',
+      },
+      header: { display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' },
+      title: { margin: 0, fontSize: 18, fontWeight: 600 },
+      hint: { opacity: 0.65, fontSize: 12, lineHeight: 1.5 },
+      tabs: { display: 'flex', gap: 6, flexWrap: 'wrap' },
+      tab: (active) => ({
+        appearance: 'none', cursor: 'pointer', fontSize: 13,
+        padding: '5px 12px', borderRadius: 999,
+        border: `1px solid ${active ? 'currentColor' : 'rgba(127,127,127,.35)'}`,
+        background: active ? 'rgba(127,127,127,.16)' : 'transparent',
+        color: 'inherit', opacity: active ? 1 : 0.75,
+      }),
+      toolbar: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
+      input: {
+        flex: '1 1 220px', minWidth: 160, padding: '6px 10px', fontSize: 13,
+        borderRadius: 8, border: '1px solid rgba(127,127,127,.35)',
+        background: 'transparent', color: 'inherit',
+      },
+      select: {
+        padding: '6px 8px', fontSize: 13, borderRadius: 8,
+        border: '1px solid rgba(127,127,127,.35)', background: 'transparent', color: 'inherit',
+      },
+      button: {
+        appearance: 'none', cursor: 'pointer', fontSize: 13, padding: '5px 12px',
+        borderRadius: 8, border: '1px solid rgba(127,127,127,.4)',
+        background: 'transparent', color: 'inherit',
+      },
+      columns: { display: 'flex', gap: 16, flex: 1, minHeight: 0, alignItems: 'stretch' },
+      list: {
+        flex: '1 1 44%', minWidth: 260, overflowY: 'auto', display: 'flex',
+        flexDirection: 'column', gap: 8, paddingRight: 4,
+      },
+      card: (active) => ({
+        textAlign: 'left', cursor: 'pointer', padding: '10px 12px', borderRadius: 10,
+        border: `1px solid ${active ? 'rgba(120,180,255,.75)' : 'rgba(127,127,127,.28)'}`,
+        background: active ? 'rgba(120,180,255,.10)' : 'transparent', color: 'inherit',
+        display: 'flex', flexDirection: 'column', gap: 6,
+      }),
+      meta: { fontSize: 11, opacity: 0.65, display: 'flex', gap: 8, flexWrap: 'wrap' },
+      body: {
+        whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 13, lineHeight: 1.55,
+      },
+      detail: {
+        flex: '1 1 56%', minWidth: 280, overflowY: 'auto', padding: 14, borderRadius: 12,
+        border: '1px solid rgba(127,127,127,.28)', display: 'flex',
+        flexDirection: 'column', gap: 10, minHeight: 0,
+      },
+      badge: {
+        fontSize: 11, padding: '2px 8px', borderRadius: 999,
+        border: '1px solid rgba(127,127,127,.35)', display: 'inline-block',
+      },
+      error: { color: '#ff9a9a', fontSize: 12 },
+      empty: { opacity: 0.6, fontSize: 13, padding: '10px 0' },
+      stat: { display: 'flex', justifyContent: 'space-between', fontSize: 13, gap: 12 },
+      sectionTitle: { fontSize: 13, fontWeight: 600, margin: '6px 0 0' },
+    }
+
+    async function api(path, params) {
+      const search = new URLSearchParams()
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value === undefined || value === null || value === '') continue
+        search.set(key, String(value))
+      }
+      const suffix = search.toString()
+      const response = await fetch(`/omb/api${path}${suffix ? `?${suffix}` : ''}`, {
+        credentials: 'same-origin', headers: { accept: 'application/json' },
+      })
+      if (!response.ok) {
+        let detail = ''
+        try {
+          detail = (await response.json()).error || ''
+        } catch {
+          detail = ''
+        }
+        throw new Error(`HTTP ${response.status}${detail ? `：${detail}` : ''}`)
+      }
+      return response.json()
+    }
+
+    function formatTime(at) {
+      if (typeof at !== 'number' || !Number.isFinite(at)) return '时间未知'
+      const date = new Date(at)
+      const pad = (value) => String(value).padStart(2, '0')
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+    }
+
+    function StatusPill({ item }) {
+      const label = item.stageLabel || item.stage || ''
+      return h('span', { style: styles.badge }, `${item.scope}/${item.kind} · ${label} · ${item.assertedBy}`)
+    }
+
+    function Overview({ data, loading, error, onRefresh }) {
+      if (loading && !data) return h('div', { style: styles.empty }, '读取中…')
+      if (error) return h('div', { style: styles.error }, `读取失败：${error}`)
+      if (!data) return h('div', { style: styles.empty }, '暂无数据')
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+        h('div', { style: styles.hint },
+          `库状态：${data.ready ? '就绪' : '未就绪'}——${data.detail}`),
+        h('div', { style: styles.stat }, h('span', null, '活跃条目'), h('strong', null, String(data.totalActive))),
+        h('div', { style: styles.stat }, h('span', null, '候选条目'), h('strong', null, String(data.totalCandidates))),
+        h('div', { style: styles.stat }, h('span', null, '已打开项目库'),
+          h('strong', null, data.openProjects.length > 0 ? data.openProjects.join('、') : '无')),
+        h('div', { style: styles.stat }, h('span', null, '项目库连接上限'), h('strong', null, String(data.maxOpenProjects))),
+        h('p', { style: styles.sectionTitle }, '各库'),
+        ...data.stores.map((store) => h('div', {
+          key: `${store.scope}:${store.projectScope || ''}`,
+          style: { ...styles.stat, borderTop: '1px solid rgba(127,127,127,.2)', paddingTop: 6 },
+        },
+        h('span', null, `${store.scope}${store.projectScope ? `（${store.projectScope}）` : ''}`),
+        h('span', null, `行 ${store.stats.rows} · 活跃 ${store.active} · 候选 ${store.candidates}`))),
+        h('div', { style: styles.hint }, '页面只读：确认候选请用 /omb-confirm；本面板不写库。'),
+        h('button', { style: styles.button, onClick: onRefresh }, '刷新'))
+    }
+
+    function MemoryList({ tab, onOpen, selectedId }) {
+      const [items, setItems] = React.useState([])
+      const [total, setTotal] = React.useState(0)
+      const [query, setQuery] = React.useState('')
+      const [scope, setScope] = React.useState('all')
+      const [status, setStatus] = React.useState(tab === 'candidates' ? 'active' : 'active')
+      const [kind, setKind] = React.useState('')
+      const [loading, setLoading] = React.useState(false)
+      const [error, setError] = React.useState('')
+
+      const load = React.useCallback(async () => {
+        setLoading(true)
+        setError('')
+        try {
+          const data = tab === 'candidates'
+            ? await api('/candidates', { limit: 50 })
+            : await api('/list', { q: query, scope, status, kind, limit: 50 })
+          setItems(data.items || [])
+          setTotal(data.total || 0)
+        } catch (failure) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setLoading(false)
+        }
+      }, [tab, query, scope, status, kind])
+
+      React.useEffect(() => {
+        void load()
+      }, [load])
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minHeight: 0, flex: 1 } },
+        tab === 'memory'
+          ? h('div', { style: styles.toolbar },
+            h('input', {
+              style: styles.input, placeholder: '搜索记忆（词法 + 子串回退）', value: query,
+              onChange: (event) => setQuery(event.target.value),
+              onKeyDown: (event) => { if (event.key === 'Enter') void load() },
+            }),
+            h('select', { style: styles.select, value: scope, onChange: (event) => setScope(event.target.value) },
+              h('option', { value: 'all' }, '全部作用域'),
+              h('option', { value: 'user' }, '用户库'),
+              h('option', { value: 'project' }, '项目库')),
+            h('select', { style: styles.select, value: status, onChange: (event) => setStatus(event.target.value) },
+              h('option', { value: 'active' }, '活跃'),
+              h('option', { value: 'stale' }, '已失效'),
+              h('option', { value: 'superseded' }, '已被取代'),
+              h('option', { value: 'all' }, '全部状态')),
+            h('select', { style: styles.select, value: kind, onChange: (event) => setKind(event.target.value) },
+              h('option', { value: '' }, '全部类型'),
+              h('option', { value: 'semantic' }, '语义'),
+              h('option', { value: 'procedural' }, '流程'),
+              h('option', { value: 'episodic' }, '事件')),
+            h('button', { style: styles.button, onClick: () => void load() }, '搜索'))
+          : h('div', { style: styles.hint }, '候选 = 模型推断写入、等待用户确认的条目（/omb-confirm <id>）。'),
+        error ? h('div', { style: styles.error }, `读取失败：${error}`) : null,
+        h('div', { style: styles.hint },
+          loading ? '读取中…' : `显示 ${items.length} / ${total} 条${total > items.length ? '（超出单页上限）' : ''}`),
+        h('div', { style: styles.list },
+          items.length === 0 && !loading ? h('div', { style: styles.empty }, '没有匹配条目') : null,
+          ...items.map((item) => h('button', {
+            key: item.id, style: styles.card(item.id === selectedId),
+            onClick: () => onOpen(item.id),
+          },
+          h('div', { style: styles.body }, item.text.length > 180 ? `${item.text.slice(0, 180)}…` : item.text),
+          h('div', { style: styles.meta },
+            h(StatusPill, { item }),
+            h('span', null, formatTime(item.observedAt)),
+            item.tags.length > 0 ? h('span', null, `#${item.tags.join(' #')}`) : null)))))
+    }
+
+    function Detail({ id }) {
+      const [data, setData] = React.useState(null)
+      const [error, setError] = React.useState('')
+      const [loading, setLoading] = React.useState(false)
+      React.useEffect(() => {
+        let alive = true
+        setLoading(true)
+        setError('')
+        setData(null)
+        void api('/detail', { id }).then((detail) => {
+          if (alive) setData(detail)
+        }, (failure) => {
+          if (alive) setError(failure instanceof Error ? failure.message : String(failure))
+        }).finally(() => {
+          if (alive) setLoading(false)
+        })
+        return () => { alive = false }
+      }, [id])
+      if (loading) return h('div', { style: styles.empty }, '读取详情…')
+      if (error) return h('div', { style: styles.error }, `详情读取失败：${error}`)
+      if (!data) return h('div', { style: styles.empty }, '未选择条目')
+      const record = data.record
+      return h('div', { style: styles.detail },
+        h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+          h(StatusPill, { item: record }),
+          h('span', { style: styles.hint }, record.id)),
+        h('div', { style: styles.body }, record.text),
+        h('div', { style: styles.meta },
+          h('span', null, `来源：${record.sourceRef}`),
+          h('span', null, `时间：${formatTime(record.observedAt)}`),
+          record.projectScope ? h('span', null, `项目：${record.projectScope}`) : null,
+          record.tags.length > 0 ? h('span', null, `标签：${record.tags.join('、')}`) : null),
+        record.validTo === null && record.supersededBy === null
+          ? null
+          : h('div', { style: styles.hint },
+            `状态：${record.supersededBy ? `被 ${record.supersededBy} 取代` : `有效至 ${formatTime(record.validTo)}`}`),
+        h('p', { style: styles.sectionTitle }, `确认审计（${data.auditAvailable ? data.audit.length : '不可读'}）`),
+        data.auditAvailable
+          ? (data.audit.length === 0
+            ? h('div', { style: styles.empty }, '没有经 /omb-confirm 的记录')
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+              ...data.audit.map((entry, index) => h('div', { key: `${entry.action}-${entry.at}-${index}`, style: styles.meta },
+                h('span', null, entry.action === 'undo' ? '撤销' : '确认'),
+                h('span', null, formatTime(entry.at)),
+                h('span', null, entry.sessionId ? `会话 ${entry.sessionId}` : '无会话')))))
+          : h('div', { style: styles.hint }, '该库没有确认审计面（旧实现），无法证明确认历史。'),
+        h('p', { style: styles.sectionTitle }, `可能相关 / 冲突（${data.related.length}）`),
+        data.related.length === 0
+          ? h('div', { style: styles.empty }, '没有共享实体键的活跃条目')
+          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+            ...data.related.map((item) => h('div', { key: item.record.id, style: { ...styles.card(false), cursor: 'default' } },
+              h('div', { style: styles.body }, item.record.text),
+              h('div', { style: styles.meta }, h('span', null, item.record.id), h('span', null, formatTime(item.record.observedAt)), h('span', null, item.shared.join('、')))))))
+    }
+
+    function MemoryPanel() {
+      const [tab, setTab] = React.useState('overview')
+      const [overview, setOverview] = React.useState(null)
+      const [overviewError, setOverviewError] = React.useState('')
+      const [overviewLoading, setOverviewLoading] = React.useState(false)
+      const [selectedId, setSelectedId] = React.useState(null)
+
+      const loadOverview = React.useCallback(async () => {
+        setOverviewLoading(true)
+        setOverviewError('')
+        try {
+          setOverview(await api('/overview'))
+        } catch (failure) {
+          setOverviewError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setOverviewLoading(false)
+        }
+      }, [])
+
+      React.useEffect(() => {
+        void loadOverview()
+      }, [loadOverview])
+
+      return h('div', { style: styles.page },
+        h('div', { style: styles.header },
+          h('h2', { style: styles.title }, 'OMB 记忆'),
+          h('span', { style: styles.hint }, '只读管理面：记忆库 / 候选 / 审计 / 相关条目')),
+        h('div', { style: styles.tabs },
+          ...TABS.map((entry) => h('button', {
+            key: entry.id, style: styles.tab(tab === entry.id),
+            onClick: () => { setTab(entry.id); setSelectedId(null) },
+          }, entry.label))),
+        tab === 'overview'
+          ? h(Overview, { data: overview, loading: overviewLoading, error: overviewError, onRefresh: () => void loadOverview() })
+          : h('div', { style: styles.columns },
+            h(MemoryList, { tab, selectedId, onOpen: setSelectedId }),
+            h(Detail, { id: selectedId })))
+    }
+
+    function MemoryIcon({ size }) {
+      return h('svg', {
+        viewBox: '0 0 24 24', width: size || 20, height: size || 20, 'aria-hidden': true,
+        fill: 'none', stroke: 'currentColor', strokeWidth: 1.6,
+        strokeLinecap: 'round', strokeLinejoin: 'round',
+      }, h('path', { d: 'M9 4.5a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6A3 3 0 0 0 7 18.5h2' }),
+      h('path', { d: 'M15 4.5a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6A3 3 0 0 1 17 18.5h-2' }),
+      h('path', { d: 'M9 4.5V19.5M15 4.5V19.5M9 9h6M9 13h6M9 17h6' }))
+    }
+
+    return {
+      inject: ['slots', 'layout'],
+      apply(ctx) {
+        ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID }, MemoryPanel))
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist', id: PANEL_ID, order: 20,
+          label: () => 'OMB 记忆',
+        }, MemoryIcon))
+      },
+    }
+  },
+})
