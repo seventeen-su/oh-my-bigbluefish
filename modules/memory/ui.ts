@@ -714,6 +714,11 @@ function collectStores(deps: UiServiceDeps, scope: UiScope): readonly StoreRef[]
  * 每个方法都只读、失败返回空/如实降级（**不抛到 HTTP 层**——页面要能显示"库未就绪"）。
  */
 export function createUiService(deps: UiServiceDeps): UiService {
+  /**
+   * 手动新建的串行队列：同一时刻只允许一个"查重 + 写入"在飞。
+   * 不串行时，双击/连点会让两个请求都通过查重再各写一条（同内容不同 id）。
+   */
+  let createWriteQueue: Promise<unknown> = Promise.resolve()
   const scanRecent = async (ref: StoreRef, limit: number): Promise<readonly MemoryRecord[]> => {
     const scanner = asRecordScanner(ref.store)
     if (scanner === undefined) return []
@@ -956,56 +961,77 @@ export function createUiService(deps: UiServiceDeps): UiService {
     if (input.scope === 'project' && currentSessionId() === null) {
       return { ok: false, text: '未执行：项目作用域需要当前会话（拿不到会话归属，不猜项目库）。' }
     }
-    const ref = await storeForScope(input.scope)
-    if (ref === undefined) {
-      return { ok: false, text: `未执行：${input.scope === 'user' ? '用户库' : '项目库'}不可用（未打开或未接线）。` }
+    // v4.23.x：手动新建**串行化**。两次点击几乎同时到达时，各自先去重、再去写，
+    // 会都通过"当前不存在"检查 —— 这正是 mem_…_7 / mem_…_8 同内容的成因。
+    // 串行队列让"查重 + 写入"成为一个原子段；队列只串行手动新建，不影响读路径。
+    const enqueueCreate = <T>(run: () => Promise<T>): Promise<T> => {
+      const next = createWriteQueue.then(run, run)
+      createWriteQueue = next.then(() => undefined, () => undefined)
+      return next
     }
-    // v4.22.2：手动新建也做**精确同内容**去重。
-    // 旧实现每次点击都生成新 id（`newMemoryId` 带时间/序号），双击或连点就会留下
-    // 两条同样正文的记忆；这里命中 contentHash 相同就拒绝重复写入并返回既有 id。
-    // 只认精确同内容：用户手写的两条不同表述要保留，不做近似合并。
-    try {
-      const similar = await findSimilarContent(ref.store, textCheck.text)
-      if (similar !== undefined && similar.similarity === 1) {
-        return { ok: true, text: `已存在相同内容的记忆 ${similar.record.id}（未重复写入）` }
+    return enqueueCreate(async (): Promise<UiActionResult> => {
+      const ref = await storeForScope(input.scope)
+      if (ref === undefined) {
+        return { ok: false, text: `未执行：${input.scope === 'user' ? '用户库' : '项目库'}不可用（未打开或未接线）。` }
       }
-    } catch {
-      // 去重探测失败不阻止写入（写入路径本身仍有内容哈希与捕获侧去重）
-    }
-    const hash = contentHashOf(textCheck.text)
-    const id = newMemoryId(clock, hash)
-    const now = clock.now()
-    const record: MemoryRecord = {
-      id,
-      scope: input.scope,
-      kind: input.kind,
-      text: textCheck.text,
-      contentHash: hash,
-      sourceRef: 'ui:manual',
-      assertedBy: 'user',
-      observedAt: now,
-      validTo: null,
-      supersededBy: null,
-      lastUsedAt: now,
-      useCount: 0,
-      project: input.scope === 'project' ? ref.projectScope ?? null : null,
-      tags: tagsCheck.tags,
-    }
-    try {
-      await ref.store.put(record)
-    } catch (error) {
-      return { ok: false, text: `新建失败：${errorMessageOf(error)}` }
-    }
-    try {
-      const back = await ref.store.get(id)
-      if (back === undefined || back.text !== textCheck.text) {
-        return { ok: false, text: '新建后查回失败：记录未确认写入，请重试。' }
+      const hash = contentHashOf(textCheck.text)
+      // 精确同内容去重：直接用**内容哈希**扫最近记录（比 FTS 探测可靠；
+      // 中文 bigram 索引在短文本/特殊字符上可能 0 命中）。只认精确同内容，
+      // 近似文本不合并 —— 用户手写的两条不同表述要保留。
+      const scanner = asRecordScanner(ref.store)
+      if (scanner !== undefined) {
+        try {
+          const recent = await scanner.listRecentRecords({ limit: 500 })
+          const existing = recent.find(record => record.contentHash === hash && isActiveRecord(record))
+          if (existing !== undefined) {
+            return { ok: true, text: `已存在相同内容的记忆 ${existing.id}（未重复写入）` }
+          }
+        } catch {
+          // 扫描失败退回 FTS 探测；再失败也不阻止写入（有内容哈希供后续核对）
+        }
       }
-    } catch (error) {
-      return { ok: false, text: `新建后查回失败（已隔离）：${errorMessageOf(error)}` }
-    }
-    deps.activity?.('write', `ui:create ${id}`)
-    return { ok: true, text: `已新建记忆 ${id}（${input.scope}/${input.kind}）。` }
+      try {
+        const similar = await findSimilarContent(ref.store, textCheck.text)
+        if (similar !== undefined && similar.similarity === 1) {
+          return { ok: true, text: `已存在相同内容的记忆 ${similar.record.id}（未重复写入）` }
+        }
+      } catch {
+        // 去重探测失败不阻止写入
+      }
+      const id = newMemoryId(clock, hash)
+      const now = clock.now()
+      const record: MemoryRecord = {
+        id,
+        scope: input.scope,
+        kind: input.kind,
+        text: textCheck.text,
+        contentHash: hash,
+        sourceRef: 'ui:manual',
+        assertedBy: 'user',
+        observedAt: now,
+        validTo: null,
+        supersededBy: null,
+        lastUsedAt: now,
+        useCount: 0,
+        project: input.scope === 'project' ? ref.projectScope ?? null : null,
+        tags: tagsCheck.tags,
+      }
+      try {
+        await ref.store.put(record)
+      } catch (error) {
+        return { ok: false, text: `新建失败：${errorMessageOf(error)}` }
+      }
+      try {
+        const back = await ref.store.get(id)
+        if (back === undefined || back.text !== textCheck.text) {
+          return { ok: false, text: '新建后查回失败：记录未确认写入，请重试。' }
+        }
+      } catch (error) {
+        return { ok: false, text: `新建后查回失败（已隔离）：${errorMessageOf(error)}` }
+      }
+      deps.activity?.('write', `ui:create ${id}`)
+      return { ok: true, text: `已新建记忆 ${id}（${input.scope}/${input.kind}）。` }
+    })
   }
 
   async function updateMemory(input: UiMemoryUpdateInput): Promise<UiActionResult> {
@@ -1373,8 +1399,9 @@ export function createUiService(deps: UiServiceDeps): UiService {
    * 「状态机」页（v4.22.2）：**会话时空状态机**的按工作区聚合快照。
    *
    * 数据源是 `SERVICES.sessionState.situation(id)`；`sealed`/归档不读状态（显示"未观测"）。
-   * 没有 situation 的会话（历史/重启前/未被事件推进）保留在列表里但 `observed:false`，
-   * 页面写"未观测"而不是一串 0。**这不是记忆控制器的任务/候选表**。
+   * 只返回**真实存在的状态机**（本进程观测到 situation 的会话）；没有读数的历史会话
+   * 不进列表（否则页面看起来就是"一堆会话"）。归档/封存不读状态，因此也不出现。
+   * **这不是记忆控制器的任务/候选表**。
    */
   async function machines(): Promise<UiMachinesView> {
     const read = deps.situationOf
@@ -1388,7 +1415,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
     const buckets = new Map<string, { readonly createdAt: number; readonly session: UiMachineSession }[]>()
     for (const item of listing.items) {
       const key = (item.root ?? item.cwd).trim().length > 0 ? (item.root ?? item.cwd).trim() : item.cwd
-      // sealed 不读状态；归档保留在列表里（灰色）但也不读状态。
+      // sealed 不读状态；归档会话也不读状态。
       const skip = item.archived || item.privacy?.mode === 'sealed'
       let situation: SessionSituationView | undefined
       if (!skip) {
@@ -1399,6 +1426,9 @@ export function createUiService(deps: UiServiceDeps): UiService {
         }
       }
       const observed = situation !== undefined
+      // v4.23.x：只列**有状态机的会话**。没有 situation 的历史会话不进页面，
+      // 否则"状态机页"会退化成会话列表（用户第 9 点反馈）。
+      if (!observed) continue
       const session: UiMachineSession = {
         id: item.id,
         title: item.title,

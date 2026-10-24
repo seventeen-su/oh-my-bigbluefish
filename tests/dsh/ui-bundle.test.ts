@@ -50,7 +50,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("'大肥鱼增强'")
     expect(code).not.toContain("'OMB 设置'")
     expect(code).not.toContain('OMB 记忆')
-    for (const label of ['记忆', '项目', '状态机', '个人画像']) {
+    for (const label of ['记忆', '项目', '状态机', '画像']) {
       expect(code).toContain(`label: '${label}'`)
     }
     expect(code).not.toContain("label: '概览'")
@@ -98,6 +98,10 @@ describe('OMB 设置 bundle 发布契约', () => {
     // 二级侧栏只有一处尺寸切换（980px），617/760 不再各自改宽度（窗口拖动时会连续跳两次）
     expect(code).toContain('@container omb-panel (min-width: 980px)')
     expect(code).not.toMatch(/@container omb-panel \(max-width: 617px\) \{\s*\.omb-nav \{/)
+    // 容器查询里**不能**改 `.omb-page` 自己的 padding：那会改掉容器查询的 content box，
+    // 在阈值附近形成 618±2 的翻转死循环（712px 窗口抖动的根因）。
+    expect(code).not.toMatch(/@container omb-panel[^{]*\{\s*\.omb-page \{/)
+    expect(code).toMatch(/\.omb-page \{[^}]*transition: none/)
     // v4.22.2：详情并排断点从 820 降到 560（820 落在常见窗口宽度里，拖动时会反复横跳）
     expect(code).toContain('@container omb-panel (min-width: 560px)')
     expect(code).toContain('@container omb-panel (max-width: 559px)')
@@ -146,6 +150,23 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('positioned.current')
     // 菜单项间距（用户要求稍微加大）
     expect(code).toMatch(/\.omb-nav \{[^}]*gap: 4px/)
+  })
+
+  it('列表间距、收起留白、加载文案、下拉间距与对齐基准（v4.23.x 反馈）', () => {
+    const code = source()
+    expect(code).toMatch(/\.omb-list \{[^}]*gap: 8px/)
+    // 收起时高度 0，但 flex gap 仍留一份间距：用等量负 margin 抵消
+    expect(code).toMatch(/\.omb-collapse\[data-open='false'\] \{[^}]*margin-top: -4px/)
+    // 所有子页统一一行加载文案
+    expect(code).toContain("label = '正在加载中...'")
+    expect(code).not.toContain('h(Loading, { label:')
+    // 选项之间留 2px，避免选中高亮与相邻 hover 底重叠
+    expect(code).toMatch(/\.omb-select-menu \{[^}]*gap: 2px/)
+    // 下拉左右对齐的基准是面板中心，不是窗口中心（要扣掉 DSH 一级侧边栏）
+    expect(code).toContain("closest('.omb-page')")
+    // 表单外层已有 label 时不再给 Select 传 label（否则「轴」显示两遍）
+    expect(code).not.toContain("h(Select, { label: '轴'")
+    expect(code).not.toContain("h(Select, { label: '类型', value: kind, options: CREATABLE_KINDS")
   })
 
   it('检索栏：搜索+新建在上、筛选在下、搜索弹性填充不设上限', () => {
@@ -244,7 +265,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('depthText')
     expect(code).toContain('隐私模式')
     expect(code).toContain('工作区画像')
-    expect(code).toContain('个人画像')
+    expect(code).toContain("label: '画像'")
     expect(code).toContain("api('/personal')")
   })
 

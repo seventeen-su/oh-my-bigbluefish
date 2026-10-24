@@ -561,6 +561,15 @@ describe('createUiService', () => {
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: 'x'.repeat(4001) })).ok).toBe(false)
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太多', tags: Array.from({ length: 9 }, (_, i) => `t${i}`) })).ok).toBe(false)
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太长', tags: ['x'.repeat(25)] })).ok).toBe(false)
+
+    // v4.23.x：并发双击（两个请求同时在飞）也只留一条 —— 查重+写入串行化。
+    const [first, second] = await Promise.all([
+      service.createMemory({ scope: 'user', kind: 'semantic', text: '并发同内容' }),
+      service.createMemory({ scope: 'user', kind: 'semantic', text: '并发同内容' }),
+    ])
+    expect([first, second].filter(result => result.text.includes('已新建')).length).toBe(1)
+    expect([first, second].filter(result => result.text.includes('已存在')).length).toBe(1)
+    expect((await recentRecords(f.user)).filter(record => record.text === '并发同内容')).toHaveLength(1)
     await f.close()
   })
 
@@ -1072,11 +1081,9 @@ describe('createUiService', () => {
     expect(view.available).toBe(true)
     expect(view.groups.map(group => group.root)).toEqual(['/work/a', '/work/b'])
     const groupA = view.groups[0]!
-    expect(groupA.sessions.map(session => session.id)).toEqual(['s5', 's4', 's2', 's1'])
-    const sealed = groupA.sessions.find(session => session.id === 's5')!
-    expect(sealed).toMatchObject({ archived: false, observed: false, state: 'unknown', privacy: 'sealed' })
-    const archived = groupA.sessions.find(session => session.id === 's4')!
-    expect(archived).toMatchObject({ archived: true, observed: false, state: 'unknown' })
+    expect(groupA.sessions.map(session => session.id)).toEqual(['s2', 's1'])
+    // v4.23.x：只列有状态机的会话；sealed/归档/无读数会话（s5/s4）不再出现。
+    expect(view.groups[0]!.sessions.every(session => session.observed)).toBe(true)
     const active = groupA.sessions.find(session => session.id === 's2')!
     expect(active).toMatchObject({
       observed: true,

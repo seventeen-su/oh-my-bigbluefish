@@ -32,7 +32,7 @@ window.__ModuleLoader__.load({
       { value: 'memory', label: '记忆', icon: IconDatabaseOutlineRegular },
       { value: 'project', label: '项目', icon: IconWorkspaceTreeOutlineRegular },
       { value: 'machines', label: '状态机', icon: IconChecklistOutlineRegular },
-      { value: 'personal', label: '个人画像', icon: IconUserOutlineRegular },
+      { value: 'personal', label: '画像', icon: IconUserOutlineRegular },
     ]
     const PAGE_HINTS = {
       memory: '搜索、编辑与确认记忆',
@@ -74,11 +74,11 @@ window.__ModuleLoader__.load({
         container-type: inline-size; container-name: omb-panel;
         display: flex; flex-direction: column; box-sizing: border-box;
         height: 100%; min-height: 0; min-width: 0; overflow: hidden;
-        padding: 16px 20px; gap: 12px;
+        padding: 12px 16px; gap: 12px;
         background: var(--dsw-alias-bg-layer-1);
         color: var(--dsw-alias-label-primary);
         font-family: var(--dsw-font-family, inherit);
-        transition: padding 180ms var(--ds-ease-in-out, ease-out), gap 180ms var(--ds-ease-in-out, ease-out);
+        transition: none;
       }
       .omb-head {
         flex: none; display: flex; flex-wrap: wrap; align-items: center;
@@ -101,7 +101,8 @@ window.__ModuleLoader__.load({
         background: transparent; border: none; border-right: 0.5px solid var(--dsw-alias-border-l2);
         border-radius: 0;
         user-select: none;
-        transition: width 180ms var(--ds-ease-in-out, ease-out), padding 180ms var(--ds-ease-in-out, ease-out);
+        /* 不用 width/padding 过渡：容器宽度是宿主实时改的，过渡会"追"着指针走。 */
+        transition: none;
       }
       /* 首次出现只做淡入：位置/高度先无过渡地就位，再打开滑动过渡。
          滑动过渡用**内联样式**给（见 MemoryPanel）：CSS 里任何后置规则（减弱动效等）
@@ -138,7 +139,7 @@ window.__ModuleLoader__.load({
         flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box; overflow: hidden;
         display: flex; flex-direction: column; gap: 12px; padding: 16px;
         background: transparent; border: none; border-radius: 0;
-        transition: padding 180ms var(--ds-ease-in-out, ease-out);
+        transition: none;
       }
       .omb-content-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-width: 0; user-select: none; }
       .omb-content-title { margin: 0; font-size: 15px; line-height: 22px; font-weight: 600; }
@@ -208,7 +209,7 @@ window.__ModuleLoader__.load({
       .omb-select-menu {
         position: absolute; z-index: 120; top: calc(100% + 4px);
         box-sizing: border-box; min-width: 132px; max-width: 240px; max-height: 280px; overflow-y: auto;
-        padding: 4px; display: flex; flex-direction: column; gap: 1px;
+        padding: 4px; display: flex; flex-direction: column; gap: 2px;
         border: none; border-radius: var(--dsw-radius-lg, 14px);
         background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 74%, transparent);
         color: var(--dsw-alias-label-primary);
@@ -219,7 +220,7 @@ window.__ModuleLoader__.load({
       .omb-select-menu[data-align='left'] { left: 0; right: auto; }
       .omb-select-menu[data-align='right'] { right: 0; left: auto; }
       .omb-select-item {
-        display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px;
+        display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px; flex: 0 0 auto;
         padding: 0 8px; box-sizing: border-box; border: none; border-radius: var(--dsw-radius-sm, 8px);
         background: transparent; color: inherit; font: inherit; font-size: 13px; line-height: 18px;
         text-align: left; cursor: pointer; white-space: nowrap;
@@ -240,7 +241,7 @@ window.__ModuleLoader__.load({
 
       .omb-workspace { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
       .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; transition: opacity 180ms var(--ds-ease-in-out, ease-out), transform 180ms var(--ds-ease-in-out, ease-out); }
-      .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 2px; }
+      .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px; }
       .omb-row {
         display: flex; flex-direction: column; gap: 4px; width: 100%; min-width: 0;
         padding: 10px 12px; box-sizing: border-box;
@@ -258,7 +259,13 @@ window.__ModuleLoader__.load({
       .omb-row-sub { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .omb-workspace-group { display: flex; flex-direction: column; gap: 4px; }
       .omb-workspace-sessions { display: flex; flex-direction: column; gap: 4px; margin-left: 10px; padding-left: 8px; border-left: 0.5px solid var(--dsw-alias-border-l2); }
-      .omb-collapse { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 200ms var(--ds-ease-in-out, ease-out); }
+      .omb-collapse {
+        display: grid; grid-template-rows: 0fr;
+        transition: grid-template-rows 200ms var(--ds-ease-in-out, ease-out), margin-top 200ms var(--ds-ease-in-out, ease-out);
+      }
+      /* 收起时高度为 0，但父容器的 flex gap 仍会留一份间距（看起来空白翻倍）：
+         用等量负 margin 抵消那一份 gap；展开时 margin 回到 0。 */
+      .omb-collapse[data-open='false'] { margin-top: -4px; }
       .omb-collapse[data-open='true'] { grid-template-rows: 1fr; }
       .omb-collapse > div { overflow: hidden; min-height: 0; }
       .omb-row-split { flex-direction: row; align-items: center; gap: 4px; padding: 0; }
@@ -326,7 +333,8 @@ window.__ModuleLoader__.load({
       .omb-detail::-webkit-scrollbar, .omb-nav::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
       @container omb-panel (min-width: 618px) {
-        .omb-page { padding: 20px 24px; gap: 16px; }
+        /* 只改内容内边距；`.omb-page` 自己的 padding 变化会改变容器查询的 content box，
+           在阈值附近形成 618↔620 的翻转死循环（712px 窗口抖动的根因）。 */
         .omb-content { padding: 20px; gap: 16px; }
       }
       @container omb-panel (min-width: 760px) {
@@ -371,15 +379,12 @@ window.__ModuleLoader__.load({
         .omb-nav-cell { justify-content: center; padding: 8px; min-height: 42px; }
       }
       @container omb-panel (max-width: 520px) {
-        .omb-page { padding: 12px; gap: 10px; }
         .omb-content { padding: 12px; }
         .omb-grid { grid-template-columns: minmax(0, 1fr); }
       }
       @container omb-panel (max-width: 380px) {
-        .omb-page { padding: 8px; gap: 8px; }
         .omb-content { padding: 8px; }
         .omb-toolbar { gap: 6px; }
-        .omb-select { max-width: 100%; }
       }
       @media (pointer: coarse) { .omb-nav-cell, .omb-row { min-height: 44px; } }
       @media (prefers-reduced-motion: reduce) {
@@ -479,7 +484,7 @@ window.__ModuleLoader__.load({
     function originText(origin) { return ORIGIN_TEXT[origin] || String(origin || '未知') }
     function depthText(depth) { return DEPTH_TEXT[depth] || (depth ? String(depth) : '默认') }
 
-    function Loading({ label }) {
+    function Loading({ label = '正在加载中...' }) {
       return h('p', { className: 'omb-note omb-loading', 'aria-live': 'polite' }, h(TextShimmer, { active: true }, label))
     }
 
@@ -556,7 +561,13 @@ window.__ModuleLoader__.load({
         if (disabled) return
         if (!open && anchor.current && typeof anchor.current.getBoundingClientRect === 'function') {
           const rect = anchor.current.getBoundingClientRect()
-          const middle = (window.innerWidth || document.documentElement.clientWidth || 0) / 2
+          // 对齐基准是**大肥鱼增强面板**的中心（不是画面中心）：
+          // 面板左边还有 DSH 一级侧边栏，用 window.innerWidth/2 会让整页偏右。
+          const page = typeof anchor.current.closest === 'function' ? anchor.current.closest('.omb-page') : null
+          const pageRect = page && typeof page.getBoundingClientRect === 'function' ? page.getBoundingClientRect() : null
+          const middle = pageRect && pageRect.width > 0
+            ? pageRect.left + pageRect.width / 2
+            : (window.innerWidth || document.documentElement.clientWidth || 0) / 2
           setAlign(rect.left + rect.width / 2 <= middle ? 'left' : 'right')
         }
         setOpen((value) => !value)
@@ -760,7 +771,7 @@ window.__ModuleLoader__.load({
             h(Select, { label: '类型', value: kind, options: KINDS, onChange: (next) => { setKind(next); resetForFilter() } })),
           h('div', { className: 'omb-toolbar' },
             h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-              loading ? h(TextShimmer, { active: true }, '读取中…') : `已加载 ${items.length} 条`)),
+              loading ? h(TextShimmer, { active: true }, '正在加载中...') : `已加载 ${items.length} 条`)),
           error ? h(ErrorLine, null, `读取失败：${error}`) : null,
           h('div', {
             className: 'omb-list',
@@ -844,7 +855,7 @@ window.__ModuleLoader__.load({
         onClose ? h(Button, { variant: 'ghost', size: 'sm', icon: h(IconCloseOutlineRegular, { size: 16 }), onClick: onClose }, '收起') : null)
 
       if (!requested) return h('div', { className: 'omb-detail' }, head, h('p', { className: 'omb-note' }, '选一条记忆查看详情。'))
-      if (loading || waiting) return h('div', { className: 'omb-detail' }, head, h(Loading, { label: '读取记忆…' }))
+      if (loading || waiting) return h('div', { className: 'omb-detail' }, head, h(Loading, null))
       if (error) {
         return h('div', { className: 'omb-detail' }, head, /HTTP 404/.test(error)
           ? h(Empty, { title: '找不到这条记忆', hint: '它可能已被删除。' })
@@ -954,6 +965,7 @@ window.__ModuleLoader__.load({
       const [tags, setTags] = React.useState(editing ? record.tags.join(', ') : '')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
+      const [toastNode, showToast] = useToast()
       const submit = () => {
         if (busy) return
         setBusy(true); setError('')
@@ -964,7 +976,9 @@ window.__ModuleLoader__.load({
         void post('/memory', body).then((payload) => {
           onSaved(payload.text || (editing ? '已保存' : '已添加'))
         }, (failure) => {
-          setError(messageOf(failure))
+          const message = messageOf(failure)
+          setError(message)
+          showToast(message)
         }).finally(() => setBusy(false))
       }
       return h(Modal, {
@@ -983,13 +997,13 @@ window.__ModuleLoader__.load({
         editing
           ? h('div', { className: 'omb-actions' }, h(Tag, { tone: 'outline' }, scope === 'user' ? '用户库' : '项目库'))
           : h(Select, {
-            label: '库', value: scope,
+            value: scope,
             options: [{ value: 'user', label: '用户库' }, { value: 'project', label: '项目库' }],
             onChange: setScope,
           })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '类型'),
-        h(Select, { label: '类型', value: kind, options: CREATABLE_KINDS, onChange: setKind })),
+        h(Select, { value: kind, options: CREATABLE_KINDS, onChange: setKind })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '内容'),
         h('textarea', {
@@ -999,7 +1013,8 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '标签（可选）'),
         h(Input, { value: tags, placeholder: '用逗号分隔，最多 8 个', onChange: (event) => setTags(event.target.value) })),
-      error ? h(ErrorLine, null, error) : null))
+      error ? h(ErrorLine, null, error) : null,
+      toastNode))
     }
 
     // ── 项目：会话 × 工作区 × 深度 × 隐私 ───────────────────────────
@@ -1156,7 +1171,7 @@ window.__ModuleLoader__.load({
         : null
 
       const listBody = !sessions.data
-        ? (sessions.loading ? h(Loading, { label: '读取会话…' }) : null)
+        ? (sessions.loading ? h(Loading, null) : null)
         : !sessions.data.available
           ? h(Empty, { title: '暂时读不到会话目录', hint: sessions.data.reason || '宿主没有提供会话列表。' })
           : listRows || h(Empty, { title: '还没有大肥鱼模式的会话', hint: '在模式里选择大肥鱼后开始对话。' })
@@ -1164,7 +1179,7 @@ window.__ModuleLoader__.load({
       const listPane = h('div', { className: 'omb-list-pane' },
         h('div', { className: 'omb-toolbar' },
           h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-            sessions.loading ? h(TextShimmer, { active: true }, '读取中…') : groups.length > 0 ? `${groups.length} 个工作区` : '')),
+            sessions.loading ? h(TextShimmer, { active: true }, '正在加载中...') : groups.length > 0 ? `${groups.length} 个工作区` : '')),
         sessions.error ? h(ErrorLine, null, `读取失败：${sessions.error}`) : null,
         listBody)
 
@@ -1189,7 +1204,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'omb-toolbar-note' }, selected.privacy ? `${originText(selected.privacy.origin)}${selected.privacy.inheritedFrom ? ' · 继承' : ''}` : '默认')))
 
       const profileSection = h(Section, { title: '工作区画像' },
-        profileLoading ? h(Loading, { label: '读取画像…' })
+        profileLoading ? h(Loading, null)
           : profileError ? h(ErrorLine, null, `画像读取失败：${profileError}`)
             : !profile || !profile.available
               ? h(Empty, { title: '暂无可用的工作区画像', hint: profile ? profile.reason || '非 git 工作区或尚未构建。' : '' })
@@ -1301,7 +1316,7 @@ window.__ModuleLoader__.load({
       return h(Section, { title: '状态机' },
         h('p', { className: 'omb-note' }, '会话内的任务约束与候选；手改立即生效，任务在回合结束失效。'),
         readOnly ? h('p', { className: 'omb-note' }, '只读会话：可以查看，不能编辑状态机。') : null,
-        resource.loading && !view ? h(Loading, { label: '读取状态机…' })
+        resource.loading && !view ? h(Loading, null)
           : resource.error ? h(ErrorLine, null, `状态机读取失败：${resource.error}`)
             : !view || !view.available
               ? h(Empty, { title: '状态机暂不可用', hint: view ? view.reason || '' : '' })
@@ -1473,7 +1488,7 @@ window.__ModuleLoader__.load({
           onChange: setStateFilter,
         }))
       const content = !data
-        ? (resource.loading ? h(Loading, { label: '读取状态机…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
+        ? (resource.loading ? h(Loading, null) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
         : !data.available
           ? h(Empty, { title: '状态机暂不可用', hint: data.reason || '' })
           : h(React.Fragment, null, filters, stats,
@@ -1492,6 +1507,7 @@ window.__ModuleLoader__.load({
       const [evidence, setEvidence] = React.useState(editing && record.evidence ? record.evidence.join('；') : '')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
+      const [toastNode, showToast] = useToast()
       const submit = () => {
         if (busy || key.trim().length === 0 || value.trim().length === 0) return
         setBusy(true); setError('')
@@ -1504,7 +1520,11 @@ window.__ModuleLoader__.load({
         const run = editing && record.provenance === 'declared'
           ? post('/personal', { action: 'retract', axis: record.axis, key: record.key }).then(declare)
           : declare()
-        void run.then((payload) => onSaved(payload.text || '已保存'), (failure) => setError(messageOf(failure)))
+        void run.then((payload) => onSaved(payload.text || '已保存'), (failure) => {
+          const message = messageOf(failure)
+          setError(message)
+          showToast(message)
+        })
           .finally(() => setBusy(false))
       }
       return h(Modal, {
@@ -1522,7 +1542,7 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-form' },
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '轴'),
-        h(Select, { label: '轴', value: axis, options: PROFILE_AXES, onChange: setAxis })),
+        h(Select, { value: axis, options: PROFILE_AXES, onChange: setAxis })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '键'),
         h(Input, { value: key, placeholder: '例如：回答语言', 'aria-label': '画像键', onChange: (event) => setKey(event.target.value) })),
@@ -1532,7 +1552,8 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '依据（可选）'),
         h(Input, { value: evidence, placeholder: '用；分隔', onChange: (event) => setEvidence(event.target.value) })),
-      error ? h(ErrorLine, null, error) : null))
+      error ? h(ErrorLine, null, error) : null,
+      toastNode))
     }
 
     // ── 记忆生命周期：手动指定取代目标（v4.19） ───────────────────
@@ -1542,12 +1563,17 @@ window.__ModuleLoader__.load({
       const [target, setTarget] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
+      const [toastNode, showToast] = useToast()
       const options = (resource.data && resource.data.items ? resource.data.items : [])
         .filter((item) => item.id !== currentId && (query.trim().length === 0 || item.text.includes(query.trim())))
       const submit = () => {
         if (target === null || busy) return
         setBusy(true); setError('')
-        void post('/resolve', { action: 'supersede', fromId: currentId, toId: target.id }).then(() => onDone(target), (failure) => setError(messageOf(failure)))
+        void post('/resolve', { action: 'supersede', fromId: currentId, toId: target.id }).then(() => onDone(target), (failure) => {
+          const message = messageOf(failure)
+          setError(message)
+          showToast(message)
+        })
           .finally(() => setBusy(false))
       }
       return h(Modal, {
@@ -1563,7 +1589,8 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-toolbar' },
         h(Input, { className: 'omb-search', value: query, placeholder: '搜索目标记忆', onChange: (event) => setQuery(event.target.value) })),
       error ? h(ErrorLine, null, error) : null,
-      resource.loading ? h(Loading, { label: '读取候选记忆…' })
+      toastNode,
+      resource.loading ? h(Loading, null)
         : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`)
           : options.length === 0 ? h(Empty, { title: '没有可选的记忆', hint: '换个关键词，或先新建一条。' })
             : h('div', { className: 'omb-list', style: { maxHeight: '280px' } }, ...options.map((item) => h('button', {
@@ -1633,16 +1660,16 @@ window.__ModuleLoader__.load({
           actions)
       }
       const groups = grouped.length === 0
-        ? h(Empty, { title: '还没有个人画像', hint: '点“新增条目”写下你的长期偏好；聊到习惯后也会自动出现推断。' })
+        ? h(Empty, { title: '还没有画像', hint: '点“新增条目”写下你的长期偏好；聊到习惯后也会自动出现推断。' })
         : h(React.Fragment, null, ...grouped.map(([axis, entries]) => h(Section, { key: axis, title: (entries[0] && entries[0].axisLabel) || axis }, ...entries.map(entryCard))))
       const summary = data && data.text
         ? h(Collapsible, { icon: h(IconUserOutlineRegular, { size: 16 }), title: '画像摘要', summary: '' }, h('p', { className: 'omb-note omb-selectable' }, data.text))
         : null
 
       const content = !data
-        ? (resource.loading ? h(Loading, { label: '读取个人画像…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
+        ? (resource.loading ? h(Loading, null) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
         : !data.available
-          ? h(Empty, { title: '个人画像暂不可用', hint: data.reason || '' })
+          ? h(Empty, { title: '画像暂不可用', hint: data.reason || '' })
           : h(React.Fragment, null, actionsRow, stats, conflicts, groups, summary)
 
       const formModal = form
