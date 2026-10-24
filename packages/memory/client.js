@@ -96,7 +96,7 @@ window.__ModuleLoader__.load({
       }
       .omb-nav {
         position: relative;
-        flex: none; width: 52px; box-sizing: border-box; padding: 6px;
+        flex: none; width: 56px; box-sizing: border-box; padding: 6px;
         display: flex; flex-direction: column; gap: 4px; overflow-y: auto;
         background: transparent; border: none; border-right: 0.5px solid var(--dsw-alias-border-l2);
         border-radius: 0;
@@ -121,7 +121,7 @@ window.__ModuleLoader__.load({
         border: none; border-radius: var(--dsw-radius-md); background: transparent;
         color: var(--dsw-alias-label-primary);
         font: inherit; font-size: 13px; line-height: 20px; font-weight: 500;
-        text-align: left; cursor: pointer; justify-content: flex-start;
+        text-align: left; cursor: pointer; justify-content: center;
         transition: background-color 120ms var(--ds-ease-in-out, ease-out), color 120ms var(--ds-ease-in-out, ease-out);
       }
       /* 0.2.1-rc.3 之后 DSH 移除了 --dsw-specific-sidebar-nav-item-hover，
@@ -132,7 +132,7 @@ window.__ModuleLoader__.load({
         outline-offset: 1px;
       }
       .omb-nav-icon { flex: none; }
-      .omb-nav-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; opacity: 0; transition: opacity 120ms var(--ds-ease-in-out, ease-out); }
+      .omb-nav-label { display: none; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
       .omb-content {
         flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box; overflow: hidden;
@@ -330,10 +330,20 @@ window.__ModuleLoader__.load({
         .omb-content { padding: 20px; gap: 16px; }
       }
       @container omb-panel (min-width: 760px) {
+        .omb-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      }
+      /*
+       * 二级侧栏的**唯一**尺寸切换点（v4.23.0 收尾）：
+       *   · 容器 < 980px：56px 图标轨（标签不渲染，尺寸恒定）；
+       *   · 容器 ≥ 980px：190px 带文字。
+       * 以前在 617/760 两处各调一次宽度（56→52→190），窗口/面板拖动时会连续跳两次，
+       * 看起来像"侧栏大小抖动"。现在只留一个断点，且远离开常见的 700–900px 区间。
+       */
+      @container omb-panel (min-width: 980px) {
         .omb-nav { width: 190px; padding: 10px 8px; }
         .omb-nav-indicator { left: 8px; right: 8px; }
-        .omb-nav-label { opacity: 1; }
-        .omb-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .omb-nav-label { display: block; }
+        .omb-nav-cell { justify-content: flex-start; padding: 8px 9px; }
       }
       /*
        * 详情栏的两种形态（v4.22.2 重新划断点）：
@@ -358,8 +368,6 @@ window.__ModuleLoader__.load({
         }
       }
       @container omb-panel (max-width: 617px) {
-        .omb-nav { width: 56px; padding: 6px; }
-        .omb-nav-label { display: none; }
         .omb-nav-cell { justify-content: center; padding: 8px; min-height: 42px; }
       }
       @container omb-panel (max-width: 520px) {
@@ -1732,7 +1740,7 @@ window.__ModuleLoader__.load({
       const indicatorTransition = reducedMotion || !indicator.animate
         ? 'opacity 220ms var(--ds-ease-in-out, ease-out)'
         // 起步慢、中后段加速、末尾小幅过冲再收束：Q 弹感来自 y2>1，但不拉开两端差距。
-        : 'transform 460ms cubic-bezier(.42, .04, .2, 1.24), height 460ms cubic-bezier(.42, .04, .2, 1.24), opacity 220ms var(--ds-ease-in-out, ease-out)'
+        : 'transform 340ms cubic-bezier(.38, .02, .2, 1.4), height 340ms cubic-bezier(.38, .02, .2, 1.4), opacity 220ms var(--ds-ease-in-out, ease-out)'
       return h('div', { className: 'omb-page' },
         h('style', null, CSS),
         h('div', { className: 'omb-head' },

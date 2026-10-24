@@ -95,6 +95,9 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('container-type: inline-size')
     expect(code).toContain('@container omb-panel (min-width: 618px)')
     expect(code).toContain('@container omb-panel (min-width: 760px)')
+    // 二级侧栏只有一处尺寸切换（980px），617/760 不再各自改宽度（窗口拖动时会连续跳两次）
+    expect(code).toContain('@container omb-panel (min-width: 980px)')
+    expect(code).not.toMatch(/@container omb-panel \(max-width: 617px\) \{\s*\.omb-nav \{/)
     // v4.22.2：详情并排断点从 820 降到 560（820 落在常见窗口宽度里，拖动时会反复横跳）
     expect(code).toContain('@container omb-panel (min-width: 560px)')
     expect(code).toContain('@container omb-panel (max-width: 559px)')
@@ -133,7 +136,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("data-ready")
     expect(code).toContain("data-animate")
     // 小回弹 + 优雅曲线；**内联** transition（CSS 后置规则曾把回弹覆盖掉）
-    expect(code).toContain('cubic-bezier(.42, .04, .2, 1.24)')
+    expect(code).toContain('cubic-bezier(.38, .02, .2, 1.4)')
     expect(code).toContain('transition: indicatorTransition')
     expect(code).toContain('translateY(${indicator.top}px)')
     expect(code).toContain('ResizeObserver')
