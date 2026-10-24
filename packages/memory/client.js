@@ -333,7 +333,7 @@ window.__ModuleLoader__.load({
       .omb-detail::-webkit-scrollbar, .omb-nav::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
       @container omb-panel (min-width: 618px) {
-        /* 只改内容内边距；`.omb-page` 自己的 padding 变化会改变容器查询的 content box，
+        /* 只改内容内边距；「.omb-page」自己的 padding 变化会改变容器查询的 content box，
            在阈值附近形成 618↔620 的翻转死循环（712px 窗口抖动的根因）。 */
         .omb-content { padding: 20px; gap: 16px; }
       }

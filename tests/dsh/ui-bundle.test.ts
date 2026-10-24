@@ -45,6 +45,18 @@ describe('OMB 设置 bundle 发布契约', () => {
     }
   })
 
+  it('CSS 模板字符串里不能出现反引号（否则整个 client bundle import 失败）', () => {
+    const code = source()
+    const start = code.indexOf('const CSS = `')
+    expect(start).toBeGreaterThan(-1)
+    const end = code.indexOf('\n    `\n', start)
+    expect(end).toBeGreaterThan(start)
+    const css = code.slice(start + 'const CSS = `'.length, end)
+    // 之前一条 CSS 注释里写了 `.omb-page`，反引号提前关闭模板，
+    // 剩余 CSS 被当 JS 求值 → ReferenceError: page is not defined → 插件 import failed。
+    expect(css).not.toContain('`')
+  })
+
   it('标题与四个页面（无概览，默认不激活）', () => {
     const code = source()
     expect(code).toContain("'大肥鱼增强'")
