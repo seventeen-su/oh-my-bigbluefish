@@ -3,7 +3,7 @@
  */
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { ControllerAdminPort, ControllerAdminState, MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
+import type { ControllerAdminPort, ControllerAdminState, MemoryRecord, MemoryScope, SessionSituationView } from '../../../kernel/abi/index.js'
 import { openMemoryStore, asConfirmStore, asRecordScanner, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { createConfirmAction } from '../../../modules/memory/confirm.js'
 import { createUiService } from '../../../modules/memory/ui.js'
@@ -540,6 +540,12 @@ describe('createUiService', () => {
     expect(userRecord?.tags).toEqual(['ui', '手动'])
     expect(userRecord?.contentHash).toBeTruthy()
 
+    // v4.22.2：同内容再点一次不新增记录（旧实现每次点击都生成新 id，连点会留下两条）
+    const duplicate = await service.createMemory({ scope: 'user', kind: 'semantic', text: '用户手动写入的偏好' })
+    expect(duplicate.ok).toBe(true)
+    expect(duplicate.text).toContain('已存在')
+    expect((await recentRecords(f.user)).filter(record => record.text === '用户手动写入的偏好')).toHaveLength(1)
+
     const projectCreated = await service.createMemory({ scope: 'project', kind: 'procedural', text: '项目手动写入' })
     expect(projectCreated.ok).toBe(true)
     const projectRecord = (await recentRecords(f.project)).find(record => record.text === '项目手动写入')
@@ -555,6 +561,23 @@ describe('createUiService', () => {
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: 'x'.repeat(4001) })).ok).toBe(false)
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太多', tags: Array.from({ length: 9 }, (_, i) => `t${i}`) })).ok).toBe(false)
     expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太长', tags: ['x'.repeat(25)] })).ok).toBe(false)
+    await f.close()
+  })
+
+  it('保留来源（画像文档 omb-doc:）不出现在列表/候选/概览（v4.22.2）', async () => {
+    const f = fixture()
+    await f.put('user', recordOf({
+      id: 'doc-user', text: '{"version":1,"entries":[]}',
+      sourceRef: 'omb-doc:profile/user', assertedBy: 'model', kind: 'semantic',
+    }))
+    await f.put('project', recordOf({
+      id: 'doc-project', scope: 'project', text: '{"version":1,"entries":[]}',
+      sourceRef: 'omb-doc:profile/project', assertedBy: 'model', kind: 'semantic',
+    }))
+    await f.put('user', recordOf({ id: 'real', text: '真实偏好', assertedBy: 'model', kind: 'semantic' }))
+    expect((await f.service.list({ scope: 'all', status: 'all' })).items.map(item => item.id)).toEqual(['real'])
+    expect((await f.service.candidates(10)).items.map(item => item.id)).toEqual(['real'])
+    expect((await f.service.overview()).totalCandidates).toBe(1)
     await f.close()
   })
 
@@ -903,7 +926,7 @@ describe('createUiService', () => {
   })
 
   // ── v4.20.0：所有状态机聚合 / 反馈 / 推理深度 ─────────────────────
-  function machinesService(options: { readonly withAdmin?: boolean; readonly withCatalog?: boolean } = {}) {
+  function machinesService(options: { readonly withAdmin?: boolean; readonly withSituation?: boolean; readonly withCatalog?: boolean } = {}) {
     const calls: string[] = []
     const catalog = {
       list: async () => ({
@@ -935,6 +958,85 @@ describe('createUiService', () => {
       },
       edit: () => ({ phase: 'idle', tasks: [], candidates: [], lastEventAt: null }),
     }
+    const situationOf = (sessionId: string): SessionSituationView | undefined => {
+      calls.push(sessionId)
+      const base: SessionSituationView = {
+        sessionId,
+        cwd: '/work/a/sub2',
+        state: 'idle',
+        tier: 'fresh',
+        turn: 0,
+        step: 0,
+        lastEventAt: NOW - 1_000,
+        idleMs: 1_000,
+        lastTurnEndReason: null,
+        interrupted: false,
+        unresolved: false,
+        goals: { open: 0, total: 0 },
+        todos: { open: 0, total: 0 },
+        epoch: null,
+        reads: { count: 0, changed: 0, unknown: 0, entries: [] },
+        sideEffects: {
+          blindWrites: 0, staleWrites: 0, denies: 0, gaveUps: 0, unverifiable: 0,
+          shellWrites: 0, shellUnknown: 0, shellInferred: 0, otherSessionWrites: 0,
+        },
+      }
+      if (sessionId === 's2') {
+        return {
+          ...base,
+          sessionId: 's2',
+          state: 'active',
+          tier: 'active',
+          turn: 3,
+          step: 2,
+          lastEventAt: NOW,
+          idleMs: 0,
+          lastTurnEndReason: 'complete',
+          unresolved: true,
+          goals: { open: 1, total: 2 },
+          todos: { open: 0, total: 1 },
+          epoch: {
+            id: 'epoch-1',
+            head: 'abcdef1234567890',
+            branch: 'main',
+            dirtyCount: 2,
+            digest: 'digest',
+            at: NOW,
+            degraded: false,
+            source: 'host',
+            treeBefore: null,
+            treeAfter: null,
+            instructions: 'fingerprint',
+          },
+          reads: {
+            count: 2,
+            changed: 1,
+            unknown: 0,
+            entries: [{ path: 'src/a.ts', status: 'changed', hash: 'h1' }],
+          },
+          sideEffects: {
+            blindWrites: 1, staleWrites: 0, denies: 2, gaveUps: 0, unverifiable: 1,
+            shellWrites: 3, shellUnknown: 1, shellInferred: 0, otherSessionWrites: 1,
+          },
+          workspace: { root: '/work/a', cwd: '/work/a/sub2', since: NOW - 100, switches: 1, previousRoot: '/work/b' },
+        }
+      }
+      if (sessionId === 's3') {
+        return {
+          ...base,
+          sessionId: 's3',
+          cwd: '/work/b',
+          state: 'stale',
+          tier: 'stale',
+          turn: 1,
+          step: 1,
+          lastEventAt: NOW - 120_000,
+          idleMs: 120_000,
+          lastTurnEndReason: 'aborted',
+        }
+      }
+      return { ...base, sessionId }
+    }
     const service = createUiService({
       stores: minimalStores,
       currentSession: () => 's1',
@@ -943,6 +1045,7 @@ describe('createUiService', () => {
       rootOf: cwd => (cwd.startsWith('/work/a') ? '/work/a' : '/work/b'),
       focusOf: () => 'standard',
       ...(options.withAdmin === false ? {} : { controllerAdmin: admin }),
+      ...(options.withSituation === false ? {} : { situationOf }),
       privacy: {
         current: () => 's1',
         admin: {
@@ -963,7 +1066,7 @@ describe('createUiService', () => {
     return { service, calls }
   }
 
-  it('machines()：按 root 分组、组内 createdAt 降序；sealed/归档不读状态；未接线降级', async () => {
+  it('machines()：会话时空状态机按 root 分组、sealed/归档不读状态、未接线降级', async () => {
     const { service, calls } = machinesService()
     const view = await service.machines()
     expect(view.available).toBe(true)
@@ -971,24 +1074,33 @@ describe('createUiService', () => {
     const groupA = view.groups[0]!
     expect(groupA.sessions.map(session => session.id)).toEqual(['s5', 's4', 's2', 's1'])
     const sealed = groupA.sessions.find(session => session.id === 's5')!
-    expect(sealed).toMatchObject({ archived: false, phase: 'unknown', tasks: [], candidates: [], privacy: 'sealed', lastEventAt: null })
+    expect(sealed).toMatchObject({ archived: false, observed: false, state: 'unknown', privacy: 'sealed' })
     const archived = groupA.sessions.find(session => session.id === 's4')!
-    expect(archived).toMatchObject({ archived: true, phase: 'unknown', tasks: [], candidates: [] })
-    const mixed = groupA.sessions.find(session => session.id === 's2')!
-    expect(mixed).toMatchObject({
-      phase: 'mixed',
-      tasks: [{ text: '别改测试', expiresAt: NOW + 60_000 }],
-      candidates: [{ id: 'c1', text: '项目统一 pnpm', kind: 'procedural' }],
-      lastEventAt: NOW,
+    expect(archived).toMatchObject({ archived: true, observed: false, state: 'unknown' })
+    const active = groupA.sessions.find(session => session.id === 's2')!
+    expect(active).toMatchObject({
+      observed: true,
+      state: 'active',
+      tier: 'active',
+      turn: 3,
+      step: 2,
+      lastTurnEndReason: 'complete',
+      unresolved: true,
+      goals: { open: 1, total: 2 },
+      todos: { open: 0, total: 1 },
       privacy: 'normal',
     })
-    expect(view.groups[1]?.sessions[0]).toMatchObject({ id: 's3', phase: 'tracking-tasks' })
+    expect(active.epoch).toMatchObject({ head: 'abcdef1234567890', branch: 'main', dirtyCount: 2, source: 'host', instructions: true })
+    expect(active.reads).toMatchObject({ count: 2, changed: 1, unknown: 0 })
+    expect(active.sideEffects).toMatchObject({ denies: 2, shellWrites: 3, otherSessionWrites: 1 })
+    expect(active.workspace).toMatchObject({ switches: 1, previousRoot: '/work/b' })
+    expect(view.groups[1]?.sessions[0]).toMatchObject({ id: 's3', observed: true, state: 'stale', lastTurnEndReason: 'aborted' })
     // sealed 与归档不读状态：只读了 s1/s2/s3
     expect(calls.sort()).toEqual(['s1', 's2', 's3'])
 
-    const noAdmin = await machinesService({ withAdmin: false }).service.machines()
-    expect(noAdmin).toMatchObject({ available: false, groups: [] })
-    expect(noAdmin.reason).toContain('未接线')
+    const noSituation = await machinesService({ withSituation: false }).service.machines()
+    expect(noSituation).toMatchObject({ available: false, groups: [] })
+    expect(noSituation.reason).toContain('未接线')
     const noCatalog = await machinesService({ withCatalog: false }).service.machines()
     expect(noCatalog).toMatchObject({ available: false, groups: [] })
     expect(noCatalog.reason).toContain('未接线')

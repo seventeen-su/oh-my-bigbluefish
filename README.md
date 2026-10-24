@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.22.1)
+# Oh-My-BigBlueFish (OMB v4.23.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -48,7 +48,10 @@ v4.21.0 拼接侧边栏/主卡、去掉概览默认空白、标准下拉框、�
 v4.22.0 打磨极窄布局、历史标题端口、状态机总页检索/管理、仿桌面通知控件与操作 Toast；
 v4.22.1 适配 DSH **0.2.1-rc.3**（`engines.dsh` 精确钉版、子会话判据改 `origin=subagent`、
 主题 token 与投影读法跟进），并修掉发布依赖里的 `workspace:` 协议（外部 profile 的
-`ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`）。
+`ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`）；
+v4.23.0 设置台第二轮重做：**状态机页改为会话时空状态机**、二级导航滑动高亮（小回弹）、
+菜单型下拉框（仿 desktop-notify）、检索栏弹性布局、子会话组左边框与整卡展开、
+操作提醒去句号、重复记忆/画像文档行清理。
 详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
@@ -86,7 +89,7 @@ v4.22.1 适配 DSH **0.2.1-rc.3**（`engines.dsh` 精确钉版、子会话判据
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **25 功能 / 129 小功能 → 4.22.1**。
+> 生成器 `scripts/version.mjs`；当前 **25 功能 / 135 小功能 → 4.23.0**。
 
 ## v4.4 结构（2026-10）
 

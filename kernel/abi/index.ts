@@ -53,6 +53,15 @@ export { STORES_SERVICE, SCHEMA_VERSION } from './storage.js'
 export type { SessionCatalogEntry, SessionCatalogListing, SessionCatalogPort } from './session-catalog.js'
 
 export type {
+  SessionSituationState,
+  SessionSituationEpoch,
+  SessionSituationRead,
+  SessionSituationSideEffects,
+  SessionSituationView,
+  SessionStatePort,
+} from './session-situation.js'
+
+export type {
   ControllerAdminCandidate,
   ControllerAdminEdit,
   ControllerAdminPhase,

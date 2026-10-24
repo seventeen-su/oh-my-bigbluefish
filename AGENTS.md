@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.22.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.23.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -70,7 +70,15 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.22.1（当前） = DSH 0.2.1-rc.3 适配 + 发布依赖修复（x3）**：
+- **v4.23.0（当前） = 设置台第二轮重做（x2）**：状态机页改为**会话时空状态机**
+  （`SERVICES.sessionState.situation`，无观测会话写"未观测"；控制器编辑留在项目页）；二级导航
+  选中高亮改**滑动块**（首次淡入、随后滑动小回弹，`cubic-bezier(.22,1.12,.36,1)` 420ms，
+  ResizeObserver 重测）；原生 `<select>` 全部换**菜单型下拉**（仿 desktop-notify：玻璃透明、
+  大圆角、无边框、按侧对齐）；检索栏改**弹性填充**（搜索+新建一行、筛选在下方一行）；
+  项目页子会话组加左边框、母会话整卡展开、chevron 右置；操作提醒去句号；列表过滤
+  `omb-doc:` 画像文档行、手动新建精确同内容去重；详情并排断点 820→560 修横跳。
+  契约：`docs/v4.23.0-state-machine-and-controls.md`。
+- **v4.22.1 = DSH 0.2.1-rc.3 适配 + 发布依赖修复（x3）**：
   `engines.dsh` 精确钉到 `=0.2.1-rc.3`（36 条 peer 同步写 `^0.2.1-rc.3`）；
   子会话判据从"有 `parentSession`"改为 `origin === 'subagent'`（rc.3 之后普通 fork
   不再写父 id，历史残留也不算父子）；导航 hover 改用 `--dsw-alias-interactive-bg-hover`

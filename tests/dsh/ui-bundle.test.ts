@@ -94,8 +94,10 @@ describe('OMB 设置 bundle 发布契约', () => {
     const code = source()
     expect(code).toContain('container-type: inline-size')
     expect(code).toContain('@container omb-panel (min-width: 618px)')
-    expect(code).toContain('@container omb-panel (min-width: 820px)')
     expect(code).toContain('@container omb-panel (min-width: 760px)')
+    // v4.22.2：详情并排断点从 820 降到 560（820 落在常见窗口宽度里，拖动时会反复横跳）
+    expect(code).toContain('@container omb-panel (min-width: 560px)')
+    expect(code).toContain('@container omb-panel (max-width: 559px)')
     expect(code).toContain('repeat(2, minmax(0, 1fr))')
     expect(code).toContain('repeat(4, minmax(0, 1fr))')
     expect(code).toContain('font-size: 20px')
@@ -123,6 +125,35 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).not.toContain("'刷新'")
     expect(code).toContain('flex-basis 220ms var(--ds-ease-in-out')
     expect(code).toContain('@media (prefers-reduced-motion: reduce)')
+  })
+
+  it('二级菜单：选中高亮是滑动块（旧位置滑到新位置，小回弹）；首次只淡入', () => {
+    const code = source()
+    expect(code).toContain('omb-nav-indicator')
+    expect(code).toContain("data-ready")
+    expect(code).toContain("data-animate")
+    // 小回弹 + 优雅曲线；**内联** transition（CSS 后置规则曾把回弹覆盖掉）
+    expect(code).toContain('cubic-bezier(.2, 1.32, .3, 1)')
+    expect(code).toContain('transition: indicatorTransition')
+    expect(code).toContain('translateY(${indicator.top}px)')
+    expect(code).toContain('ResizeObserver')
+    expect(code).toContain('prefers-reduced-motion: reduce')
+    // 首帧位置先无过渡就位、下一帧才开滑动（否则首次选中会从顶部滑下来）
+    expect(code).toContain('requestAnimationFrame')
+    expect(code).toContain('positioned.current')
+    // 菜单项间距（用户要求稍微加大）
+    expect(code).toMatch(/\.omb-nav \{[^}]*gap: 4px/)
+  })
+
+  it('检索栏：搜索+新建在上、筛选在下、搜索弹性填充不设上限', () => {
+    const code = source()
+    const searchAt = code.indexOf('搜索记忆')
+    const filterAt = code.indexOf("h(Select, { label: '库'")
+    expect(searchAt).toBeGreaterThan(-1)
+    expect(filterAt).toBeGreaterThan(searchAt)
+    expect(code).toContain('max-width: none')
+    // 搜索框自身不再有固定上限（520px 只允许出现在容器查询的断点里，不属于 .omb-search 规则）
+    expect(code).not.toMatch(/\.omb-search \{[^}]*max-width:\s*520px/)
   })
 
   it('手动记忆操作：新建/编辑/删除/标记/取代都在前端可达', () => {
@@ -161,28 +192,33 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('改为确认')
   })
 
-  it('筛选/新建/设置使用标准下拉框，无滑块控件', () => {
+  it('筛选/新建/设置使用菜单型下拉框（仿 desktop-notify），无滑块控件', () => {
     const code = source()
     expect(code).toContain('function Select(')
-    expect(code).toContain('className: \'omb-select\'')
+    expect(code).toContain('className: \'omb-select-trigger\'')
+    expect(code).toContain('className: \'omb-select-menu\'')
     expect(code).toContain("h(Select, { label: '库'")
     expect(code).toContain("h(Select, { label: '类型'")
     expect(code).toContain('推理深度')
     expect(code).not.toContain('SegmentedControl')
     expect(code).not.toContain('type="range"')
     expect(code).not.toContain('Slider')
+    // 原生 <select> 已整体替换：它的浮层外观跟系统走，无法做出大圆角玻璃浮层
+    expect(code).not.toContain('h(\'select\'')
   })
 
-  it('工作区/母会话默认收起：箭头 + 展开动效 + 子会话缩进不溢出', () => {
+  it('工作区/母会话默认收起：整卡可点 + 箭头 + 子会话组左边框 + 展开动效', () => {
     const code = source()
     expect(code).toContain("className: 'omb-collapse'")
     expect(code).toContain('data-open')
-    expect(code).toContain('omb-session-toggle')
+    expect(code).toContain('omb-row-chevron')
+    expect(code).toContain('omb-session-children')
+    expect(code).toContain('omb-workspace-card')
     expect(code).toContain('IconChevronUpOutlineRegular')
     expect(code).toContain('IconChevronDownOutlineRegular')
-    expect(code).toContain('depth * 14')
-    expect(code).toContain('width: `calc(100% - ${indent}px)`')
     expect(code).toContain('grid-template-rows 200ms')
+    // 母会话卡片整卡点击（不再是单独的 toggle 按钮）
+    expect(code).not.toContain('omb-session-toggle')
   })
 
   it('运行中的会话设置锁定，只读/封存状态机不可改', () => {

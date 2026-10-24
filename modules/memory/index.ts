@@ -24,6 +24,7 @@ import type {
   ControllerAdminPort,
   SecondaryChannelRegistry,
   SessionCatalogPort,
+  SessionStatePort,
   StorageHostPort,
   TaggedStore,
   ToolDefinition,
@@ -1260,6 +1261,14 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         setDepth: (sessionId, depth) => kernel.setFocus(sessionId, depth, '设置台手动设置'),
         // v4.21：状态机端口必须显式注入 deps，否则 ui 永远显示“未接线”。
         controllerAdmin: kernel.service<ControllerAdminPort>(SERVICES.memoryControllerAdmin),
+        // v4.22.2：状态机页改用**会话时空状态机**（situation）；控制器编辑仍留给项目页。
+        situationOf: sessionId => {
+          try {
+            return kernel.service<SessionStatePort>(SERVICES.sessionState)?.situation?.(sessionId)
+          } catch {
+            return undefined
+          }
+        },
         // ── 项目页（v4.18）：会话目录 / 活跃 / 根 / 深度来自各自内核服务 ──
         sessionCatalog: kernel.service<SessionCatalogPort>(SERVICES.sessionCatalog),
         sessionRuntime: kernel.service<{

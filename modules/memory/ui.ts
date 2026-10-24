@@ -20,14 +20,16 @@ import type {
   MemoryScope,
   MemoryStatusFilter,
   SessionCatalogPort,
+  SessionSituationView,
   StoreStats,
   TaggedStore,
 } from '../../kernel/abi/index.js'
+import { RESERVED_SOURCE_PREFIX } from '../../kernel/abi/index.js'
 import { OMB_VERSION } from '../../kernel/version.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { findRelatedRecords, type RelatedRecord } from './link.js'
 import { stageLabel, stageOfMemory, type LifecycleStage } from './lifecycle.js'
-import { contentHashOf, newMemoryId } from './remember.js'
+import { contentHashOf, findSimilarContent, newMemoryId } from './remember.js'
 import { isPrivacyMode, type PrivacyMode } from './privacy/modes.js'
 import type { PrivacyActionName, PrivacyAdminPort, UiPrivacyView } from './privacy/contract.js'
 
@@ -183,18 +185,65 @@ export type UiPersonalEditInput =
       readonly key: string
     }
 
-/** 「所有状态机」页的单个会话（v4.20.0）：只有 phase/两张表/时间，不含正文。 */
+/**
+ * 「状态机」页的单个会话（v4.22.2）：**会话时空状态机**的只读快照。
+ *
+ * 数据源是 `SERVICES.sessionState.situation(sessionId)`（`dsh/state-machine.ts`）：
+ * 世界身份（workspace epoch）+ 我信过什么（读取印记/写印记）+ 增量（外部改动）
+ * + 时间（回合/步骤/空闲/上次结束原因）。**不再是记忆控制器的任务/候选表**。
+ *
+ * `observed === false` 表示**本进程没有该会话的状态**（历史会话、重启前会话、
+ * 未被事件推进过）：页面必须写"未观测"，不能显示一串 0。
+ */
 export interface UiMachineSession {
   readonly id: string
   readonly title: string | null
   readonly cwd: string
+  readonly root: string
   readonly archived: boolean
   readonly active: boolean
-  readonly phase: 'idle' | 'candidate-pending' | 'tracking-tasks' | 'mixed' | 'unknown'
-  readonly tasks: readonly { readonly text: string; readonly expiresAt: number }[]
-  readonly candidates: readonly { readonly id: string; readonly text: string; readonly kind: string }[]
-  readonly lastEventAt: number | null
   readonly privacy: 'normal' | 'read-only' | 'sealed' | null
+  /** 本进程是否观测到该会话（false = 没有 situation）。 */
+  readonly observed: boolean
+  readonly state: 'active' | 'idle' | 'stale' | 'recovering' | 'unknown'
+  readonly tier: string | null
+  readonly turn: number | null
+  readonly step: number | null
+  readonly lastEventAt: number | null
+  readonly idleMs: number | null
+  readonly lastTurnEndReason: string | null
+  readonly interrupted: boolean
+  readonly unresolved: boolean
+  readonly goals: { readonly open: number; readonly total: number }
+  readonly todos: { readonly open: number; readonly total: number }
+  readonly epoch: {
+    readonly head: string | null
+    readonly branch: string | null
+    readonly dirtyCount: number
+    readonly at: number
+    readonly degraded: boolean
+    readonly source: 'host' | 'git' | 'none'
+    /** 本会话是否见过指令文件（AGENTS.md/CLAUDE.md）指纹。 */
+    readonly instructions: boolean
+  } | null
+  readonly reads: {
+    readonly count: number
+    readonly changed: number
+    readonly unknown: number
+    readonly entries: readonly { readonly path: string; readonly status: 'same' | 'changed' | 'unknown' }[]
+  }
+  readonly sideEffects: {
+    readonly blindWrites: number
+    readonly staleWrites: number
+    readonly denies: number
+    readonly gaveUps: number
+    readonly unverifiable: number
+    readonly shellWrites: number
+    readonly shellUnknown: number
+    readonly shellInferred: number
+    readonly otherSessionWrites: number
+  }
+  readonly workspace: { readonly switches: number; readonly previousRoot: string | null } | null
 }
 
 export interface UiMachineGroup {
@@ -468,6 +517,13 @@ export interface UiServiceDeps {
   /** 控制器管理端口（v4.19.0；由 memory/index 把 capture 的读写包成服务）；缺省 = 未接线。 */
   readonly controllerAdmin?: ControllerAdminPort
   /**
+   * 会话时空状态机读数（v4.22.2；memory/index 经 `SERVICES.sessionState.situation`）。
+   *
+   * 缺省或返回 undefined 都表示**本进程没有该会话的状态**：页面必须写"未观测"，
+   * 不能把"没读到"画成 0（状态面与项目页同一条口径）。
+   */
+  readonly situationOf?: (sessionId: string) => SessionSituationView | undefined
+  /**
    * 个人画像写入（v4.19.0；memory/index 闭包调 `SERVICES.profile.declare/retract`）。
    * 允许同步或异步结果：profile 服务是异步的，provider 可以 await 后再返回。
    */
@@ -583,6 +639,18 @@ function isActiveRecord(record: Pick<MemoryRecord, 'validTo' | 'supersededBy'>):
   return record.validTo === null && record.supersededBy === null
 }
 
+/**
+ * 保留来源（`omb-doc:`）是**结构化单文档状态**（用户画像），不是经验痕迹。
+ *
+ * v4.22.2：设置页的列表/候选/概览此前没有过滤它们，于是"撤销画像卡片"后
+ * 用户会在记忆列表里看到 `{"version":1,"entries":[]}` 的画像文档行（user/project
+ * 两个库各一条，看起来像重复记忆）。检索侧早就按这个前缀跳过（`retrieve.ts:366`），
+ * 设置页必须同一条口径。
+ */
+function isReservedRecord(record: Pick<MemoryRecord, 'sourceRef'>): boolean {
+  return record.sourceRef.startsWith(RESERVED_SOURCE_PREFIX)
+}
+
 /** 有界扫描（`listRecentRecords` 没有状态/类型过滤；在 JS 里裁剪，但先限总量）。 */
 const SCAN_MAX = 500
 
@@ -695,6 +763,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
     for (const ref of refs) {
       const records = await search(ref, query, searchLimit)
       for (const record of records) {
+        if (isReservedRecord(record)) continue
         if (!matchesStatus(record, status)) continue
         if (query.kind !== undefined && record.kind !== query.kind) continue
         if (query.tags !== undefined && query.tags.length > 0) {
@@ -729,6 +798,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
         let candidates = 0
         const scannedRows = await scanRecent({ projectScope: set.projectScope, store: tagged.store }, SCAN_MAX)
         for (const record of scannedRows) {
+          if (isReservedRecord(record)) continue
           if (uiRecordStatus(record) === 'active') {
             active += 1
             if (record.assertedBy === 'model' && (record.kind === 'semantic' || record.kind === 'procedural')) {
@@ -769,6 +839,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
     for (const ref of collectStores(deps, 'all')) {
       const scanned = await scanRecent(ref, SCAN_MAX)
       for (const record of scanned) {
+        if (isReservedRecord(record)) continue
         if (uiRecordStatus(record) !== 'active') continue
         if (record.assertedBy !== 'model') continue
         if (record.kind !== 'semantic' && record.kind !== 'procedural') continue
@@ -888,6 +959,18 @@ export function createUiService(deps: UiServiceDeps): UiService {
     const ref = await storeForScope(input.scope)
     if (ref === undefined) {
       return { ok: false, text: `未执行：${input.scope === 'user' ? '用户库' : '项目库'}不可用（未打开或未接线）。` }
+    }
+    // v4.22.2：手动新建也做**精确同内容**去重。
+    // 旧实现每次点击都生成新 id（`newMemoryId` 带时间/序号），双击或连点就会留下
+    // 两条同样正文的记忆；这里命中 contentHash 相同就拒绝重复写入并返回既有 id。
+    // 只认精确同内容：用户手写的两条不同表述要保留，不做近似合并。
+    try {
+      const similar = await findSimilarContent(ref.store, textCheck.text)
+      if (similar !== undefined && similar.similarity === 1) {
+        return { ok: true, text: `已存在相同内容的记忆 ${similar.record.id}（未重复写入）` }
+      }
+    } catch {
+      // 去重探测失败不阻止写入（写入路径本身仍有内容哈希与捕获侧去重）
     }
     const hash = contentHashOf(textCheck.text)
     const id = newMemoryId(clock, hash)
@@ -1286,10 +1369,17 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
   }
 
+  /**
+   * 「状态机」页（v4.22.2）：**会话时空状态机**的按工作区聚合快照。
+   *
+   * 数据源是 `SERVICES.sessionState.situation(id)`；`sealed`/归档不读状态（显示"未观测"）。
+   * 没有 situation 的会话（历史/重启前/未被事件推进）保留在列表里但 `observed:false`，
+   * 页面写"未观测"而不是一串 0。**这不是记忆控制器的任务/候选表**。
+   */
   async function machines(): Promise<UiMachinesView> {
-    const admin = deps.controllerAdmin
-    if (admin === undefined) {
-      return { available: false, reason: '未接线：记忆控制器管理端口不可用（capture 未装配）', groups: [] }
+    const read = deps.situationOf
+    if (read === undefined) {
+      return { available: false, reason: '未接线：会话状态机不可用（宿主未装配 session-state）', groups: [] }
     }
     const listing = await sessions()
     if (!listing.available) {
@@ -1300,36 +1390,71 @@ export function createUiService(deps: UiServiceDeps): UiService {
       const key = (item.root ?? item.cwd).trim().length > 0 ? (item.root ?? item.cwd).trim() : item.cwd
       // sealed 不读状态；归档保留在列表里（灰色）但也不读状态。
       const skip = item.archived || item.privacy?.mode === 'sealed'
-      let phase: UiMachineSession['phase'] = 'unknown'
-      let tasks: UiMachineSession['tasks'] = []
-      let candidates: UiMachineSession['candidates'] = []
-      let lastEventAt: number | null = null
+      let situation: SessionSituationView | undefined
       if (!skip) {
         try {
-          const state = admin.state(item.id)
-          phase = state.phase
-          tasks = state.tasks.map(task => ({ text: task.text, expiresAt: task.expiresAt }))
-          candidates = state.candidates.map(candidate => ({
-            id: candidate.id,
-            text: candidate.text,
-            kind: candidate.kind,
-          }))
-          lastEventAt = state.lastEventAt
+          situation = read(item.id)
         } catch {
-          phase = 'unknown'
+          situation = undefined
         }
       }
+      const observed = situation !== undefined
       const session: UiMachineSession = {
         id: item.id,
         title: item.title,
         cwd: item.cwd,
+        root: key,
         archived: item.archived,
         active: item.active,
-        phase,
-        tasks,
-        candidates,
-        lastEventAt,
         privacy: item.privacy?.mode ?? null,
+        observed,
+        state: situation?.state ?? 'unknown',
+        tier: situation?.tier ?? null,
+        turn: situation?.turn ?? null,
+        step: situation?.step ?? null,
+        lastEventAt: situation?.lastEventAt ?? null,
+        idleMs: situation?.idleMs ?? null,
+        lastTurnEndReason: situation?.lastTurnEndReason ?? null,
+        interrupted: situation?.interrupted ?? false,
+        unresolved: situation?.unresolved ?? false,
+        goals: situation?.goals ?? { open: 0, total: 0 },
+        todos: situation?.todos ?? { open: 0, total: 0 },
+        epoch: situation?.epoch === null || situation?.epoch === undefined
+          ? null
+          : {
+            head: situation.epoch.head,
+            branch: situation.epoch.branch,
+            dirtyCount: situation.epoch.dirtyCount,
+            at: situation.epoch.at,
+            degraded: situation.epoch.degraded,
+            source: situation.epoch.source,
+            instructions: typeof situation.epoch.instructions === 'string' && situation.epoch.instructions.length > 0,
+          },
+        reads: situation?.reads === undefined
+          ? { count: 0, changed: 0, unknown: 0, entries: [] }
+          : {
+            count: situation.reads.count,
+            changed: situation.reads.changed,
+            unknown: situation.reads.unknown,
+            entries: situation.reads.entries.map(entry => ({ path: entry.path, status: entry.status })),
+          },
+        sideEffects: situation?.sideEffects ?? {
+          blindWrites: 0,
+          staleWrites: 0,
+          denies: 0,
+          gaveUps: 0,
+          unverifiable: 0,
+          shellWrites: 0,
+          shellUnknown: 0,
+          shellInferred: 0,
+          otherSessionWrites: 0,
+        },
+        workspace: situation?.workspace === undefined
+          ? null
+          : {
+            switches: situation.workspace.switches,
+            previousRoot: situation.workspace.previousRoot,
+          },
       }
       const bucket = buckets.get(key)
       if (bucket === undefined) buckets.set(key, [{ createdAt: item.createdAt, session }])
