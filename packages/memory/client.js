@@ -579,6 +579,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null)
       const [revision, setRevision] = React.useState(0)
       const [confirmDelete, setConfirmDelete] = React.useState(false)
+      const [supersedeOpen, setSupersedeOpen] = React.useState(false)
 
       React.useEffect(() => {
         if (typeof id !== 'string' || id.length === 0) {
@@ -635,6 +636,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'omb-detail-actions' },
           canConfirm ? h(Button, { variant: 'primary', size: 'sm', icon: h(IconCheckOutlineRegular, { size: 16 }), disabled: busy, onClick: () => act({ action: 'mark', id, mark: 'confirm' }) }, '确认') : null,
           active ? h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => act({ action: 'mark', id, mark: 'obsolete' }) }, '标记过时') : null,
+          active ? h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => setSupersedeOpen(true) }, '取代…') : null,
           record.validTo !== null && record.supersededBy === null ? h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => act({ action: 'mark', id, mark: 'revive' }) }, '恢复') : null,
           onEdit ? h(Button, { variant: 'ghost', size: 'sm', icon: h(IconEditOutlineRegular, { size: 16 }), disabled: busy, onClick: () => onEdit(record) }, '编辑') : null,
           h(Button, { variant: 'ghost', size: 'sm', icon: h(IconTrashOutlineRegular, { size: 16 }), disabled: busy, onClick: () => setConfirmDelete(true) }, '删除')),
@@ -669,7 +671,19 @@ window.__ModuleLoader__.load({
           footer: h('div', { className: 'omb-modal-actions' },
             h(Button, { variant: 'ghost', size: 'sm', onClick: () => setConfirmDelete(false) }, '取消'),
             h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => { setConfirmDelete(false); act({ action: 'delete', id }, true) } }, '删除')),
-        }))
+        }),
+        supersedeOpen
+          ? h(SupersedeModal, {
+            currentId: id,
+            onClose: () => setSupersedeOpen(false),
+            onDone: (target) => {
+              setSupersedeOpen(false)
+              setNotice({ text: `已用「${target.text.slice(0, 24)}…」取代这条`, failed: false })
+              setRevision((value) => value + 1)
+              onChanged()
+            },
+          })
+          : null)
     }
 
     function MemoryForm({ form, onClose, onSaved }) {
@@ -842,7 +856,11 @@ window.__ModuleLoader__.load({
 
       const detailBody = selected && selected.archived
         ? h(Empty, { title: '已归档会话不可读', hint: '归档是保护状态：不会读取工作区画像，也不能改隐私。' })
-        : h(React.Fragment, null, privacySection, profileSection, privacyMaintenance)
+        : h(React.Fragment, null,
+          privacySection,
+          selected ? h(ControllerSection, { sessionId: selected.id }) : null,
+          profileSection,
+          privacyMaintenance)
 
       const detail = selected
         ? h('div', { className: 'omb-detail' },
@@ -883,8 +901,193 @@ window.__ModuleLoader__.load({
     }
 
     // ── 个人画像 ────────────────────────────────────────────────────
+    const PHASE_TEXT = {
+      idle: '空闲',
+      'candidate-pending': '待确认候选',
+      'tracking-tasks': '跟踪任务',
+      mixed: '混合',
+    }
+    const PROFILE_AXES = [
+      { value: 'stable', label: '稳定偏好' },
+      { value: 'intent', label: '意图' },
+      { value: 'collaboration', label: '协作方式' },
+    ]
+
+    // ── 控制器状态机：手动查看/增删任务与候选（v4.19） ─────────────
+    function ControllerSection({ sessionId }) {
+      const [tick, setTick] = React.useState(0)
+      const resource = useLoad(() => api('/controller', { sessionId }), [sessionId, tick])
+      const [task, setTask] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [notice, setNotice] = React.useState(null)
+      const [confirm, setConfirm] = React.useState('')
+      const view = resource.data
+      const state = view && view.available ? view : null
+      const act = (body) => {
+        if (busy) return
+        setBusy(true); setNotice(null)
+        void post('/controller', { sessionId, ...body }).then((payload) => {
+          setNotice({ text: payload.text || '已更新', failed: false })
+          setTick((value) => value + 1)
+        }, (failure) => {
+          setNotice({ text: messageOf(failure), failed: true })
+        }).finally(() => setBusy(false))
+      }
+      const addTask = () => {
+        const text = task.trim()
+        if (text.length === 0) return
+        act({ action: 'add-task', text })
+        setTask('')
+      }
+      return h(Section, { title: '状态机' },
+        h('p', { className: 'omb-note' }, '会话内的任务约束与候选；手改立即生效，任务在回合结束失效。'),
+        notice
+          ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
+            h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
+          : null,
+        resource.loading && !view ? h(Loading, { label: '读取状态机…' })
+          : resource.error ? h(ErrorLine, null, `状态机读取失败：${resource.error}`)
+            : !view || !view.available
+              ? h(Empty, { title: '状态机暂不可用', hint: view ? view.reason || '' : '' })
+              : h(React.Fragment, null,
+                h('div', { className: 'omb-meta' },
+                  h(Tag, { tone: state && state.phase !== 'idle' ? 'warning' : 'outline' }, PHASE_TEXT[state ? state.phase : 'idle'] || '空闲'),
+                  h('span', null, `任务 ${state ? state.tasks.length : 0} 条`),
+                  h('span', null, `候选 ${state ? state.candidates.length : 0} 条`)),
+                h('div', { className: 'omb-toolbar' },
+                  h(Input, {
+                    className: 'omb-search', value: task, placeholder: '添加一条任务约束', 'aria-label': '添加任务约束',
+                    onChange: (event) => setTask(event.target.value),
+                    onKeyDown: (event) => { if (event.key === 'Enter') addTask() },
+                  }),
+                  h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), disabled: busy || task.trim().length === 0, onClick: addTask }, '添加任务')),
+                state && state.tasks.length > 0
+                  ? h('div', null, ...state.tasks.map((entry, index) => h('div', { key: `${entry.text}-${index}`, className: 'omb-card' },
+                    h('p', { className: 'omb-row-text omb-selectable' }, entry.text),
+                    h('div', { className: 'omb-meta' }, h('span', null, `到期 ${formatTime(entry.expiresAt)}`)),
+                    h('div', { className: 'omb-actions' },
+                      h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act({ action: 'remove-task', text: entry.text }) }, '移除')))))
+                  : h('p', { className: 'omb-note' }, '没有任务约束。'),
+                state && state.candidates.length > 0
+                  ? h('div', null, ...state.candidates.map((entry) => h('div', { key: entry.id, className: 'omb-card' },
+                    h('p', { className: 'omb-row-text omb-selectable' }, entry.text),
+                    h('div', { className: 'omb-meta' }, h(Tag, { tone: 'outline' }, entry.kind), h('span', null, entry.reason)),
+                    h('div', { className: 'omb-actions' },
+                      h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act({ action: 'remove-candidate', text: entry.text }) }, '移除')))))
+                  : h('p', { className: 'omb-note' }, '没有待确认候选。'),
+                h('div', { className: 'omb-actions' },
+                  h(Button, { variant: 'ghost', size: 'sm', disabled: busy || !state || state.tasks.length === 0, onClick: () => setConfirm('tasks') }, '清空任务'),
+                  h(Button, { variant: 'ghost', size: 'sm', disabled: busy || !state || state.candidates.length === 0, onClick: () => setConfirm('candidates') }, '清空候选'))),
+        h(Modal, {
+          open: confirm !== '',
+          onClose: () => setConfirm(''),
+          title: confirm === 'tasks' ? '清空任务约束？' : '清空待确认候选？',
+          closeLabel: '取消',
+          description: '只影响当前会话的控制器状态，不改已写入的记忆。',
+          footer: h('div', { className: 'omb-modal-actions' },
+            h(Button, { variant: 'ghost', size: 'sm', onClick: () => setConfirm('') }, '取消'),
+            h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => { setConfirm(''); act({ action: confirm === 'tasks' ? 'clear-tasks' : 'clear-candidates' }) } }, '清空')),
+        }))
+    }
+
+    // ── 个人画像手动编辑（v4.19） ─────────────────────────────────
+    function PersonalForm({ record, onClose, onSaved }) {
+      const editing = record !== null
+      const [axis, setAxis] = React.useState(editing ? record.axis : 'stable')
+      const [key, setKey] = React.useState(editing ? record.key : '')
+      const [value, setValue] = React.useState(editing ? record.value : '')
+      const [evidence, setEvidence] = React.useState(editing && record.evidence ? record.evidence.join('；') : '')
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const submit = () => {
+        if (busy || key.trim().length === 0 || value.trim().length === 0) return
+        setBusy(true); setError('')
+        const evidenceList = evidence.split(/[；;]/).map((item) => item.trim()).filter((item) => item.length > 0)
+        const declare = () => post('/personal', {
+          action: 'declare', axis, key: key.trim(), value: value.trim(),
+          ...(evidenceList.length === 0 ? {} : { evidence: evidenceList }),
+        })
+        // 改写一条已声明条目：先撤掉同键旧声明，再写新值（避免留下两条冲突）。
+        const run = editing && record.provenance === 'declared'
+          ? post('/personal', { action: 'retract', axis: record.axis, key: record.key }).then(declare)
+          : declare()
+        void run.then((payload) => onSaved(payload.text || '已保存'), (failure) => setError(messageOf(failure)))
+          .finally(() => setBusy(false))
+      }
+      return h(Modal, {
+        open: true,
+        onClose,
+        title: editing ? '改写画像条目' : '新增画像条目',
+        closeLabel: '取消',
+        description: editing && record.provenance === 'declared'
+          ? '保存会替换同键的旧声明。'
+          : editing ? '保存后转为“你确认”的条目，覆盖同键推断。' : '写你确认的长期偏好，之后可以再改。',
+        footer: h('div', { className: 'omb-modal-actions' },
+          h(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, '取消'),
+          h(Button, { variant: 'primary', size: 'sm', disabled: busy || key.trim().length === 0 || value.trim().length === 0, onClick: submit }, '保存')),
+      },
+      h('div', { className: 'omb-field' },
+        h('span', { className: 'omb-field-label' }, '轴'),
+        h(SegmentedControl, { id: 'omb-profile-axis', label: '轴', value: axis, options: PROFILE_AXES, onChange: setAxis })),
+      h('div', { className: 'omb-field' },
+        h('span', { className: 'omb-field-label' }, '键'),
+        h(Input, { value: key, placeholder: '例如：回答语言', 'aria-label': '画像键', onChange: (event) => setKey(event.target.value) })),
+      h('div', { className: 'omb-field' },
+        h('span', { className: 'omb-field-label' }, '取值'),
+        h('textarea', { className: 'omb-textarea', value, placeholder: '例如：中文', onChange: (event) => setValue(event.target.value) })),
+      h('div', { className: 'omb-field' },
+        h('span', { className: 'omb-field-label' }, '依据（可选）'),
+        h(Input, { value: evidence, placeholder: '用；分隔', onChange: (event) => setEvidence(event.target.value) })),
+      error ? h(ErrorLine, null, error) : null)
+    }
+
+    // ── 记忆生命周期：手动指定取代目标（v4.19） ───────────────────
+    function SupersedeModal({ currentId, onClose, onDone }) {
+      const resource = useLoad(() => api('/list', { status: 'active', scope: 'all', limit: 50 }), [])
+      const [query, setQuery] = React.useState('')
+      const [target, setTarget] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const options = (resource.data && resource.data.items ? resource.data.items : [])
+        .filter((item) => item.id !== currentId && (query.trim().length === 0 || item.text.includes(query.trim())))
+      const submit = () => {
+        if (target === null || busy) return
+        setBusy(true); setError('')
+        void post('/resolve', { action: 'supersede', fromId: currentId, toId: target.id }).then(() => onDone(target), (failure) => setError(messageOf(failure)))
+          .finally(() => setBusy(false))
+      }
+      return h(Modal, {
+        open: true,
+        onClose,
+        title: '用哪条记忆取代这条？',
+        closeLabel: '取消',
+        description: '被取代的旧条目会标为失效但保留历史，不删除。',
+        footer: h('div', { className: 'omb-modal-actions' },
+          h(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, '取消'),
+          h(Button, { variant: 'primary', size: 'sm', disabled: busy || target === null, onClick: submit }, '取代')),
+      },
+      h('div', { className: 'omb-toolbar' },
+        h(Input, { className: 'omb-search', value: query, placeholder: '搜索目标记忆', onChange: (event) => setQuery(event.target.value) })),
+      error ? h(ErrorLine, null, error) : null,
+      resource.loading ? h(Loading, { label: '读取候选记忆…' })
+        : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`)
+          : options.length === 0 ? h(Empty, { title: '没有可选的记忆', hint: '换个关键词，或先新建一条。' })
+            : h('div', { className: 'omb-list', style: { maxHeight: '280px' } }, ...options.map((item) => h('button', {
+              key: item.id, type: 'button', className: 'omb-row',
+              'data-active': target !== null && target.id === item.id,
+              onClick: () => setTarget(item),
+            },
+            h('span', { className: 'omb-row-text' }, item.text.length > 160 ? `${item.text.slice(0, 160)}…` : item.text),
+            h('span', { className: 'omb-row-meta' }, ...StageTags({ item }))))))
+    }
+
     function PersonalPage({ refreshTick }) {
-      const resource = useLoad(() => api('/personal'), [refreshTick])
+      const [revision, setRevision] = React.useState(0)
+      const [form, setForm] = React.useState(null)
+      const [confirmDelete, setConfirmDelete] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
+      const [notice, setNotice] = React.useState(null)
+      const resource = useLoad(() => api('/personal'), [refreshTick, revision])
       const data = resource.data
       const grouped = React.useMemo(() => {
         const map = new Map()
@@ -895,37 +1098,88 @@ window.__ModuleLoader__.load({
         }
         return [...map.entries()].sort((a, b) => AXIS_ORDER.indexOf(a[0]) - AXIS_ORDER.indexOf(b[0]))
       }, [data])
-      return h('div', { className: 'omb-scroll' },
-        resource.loading && !data
-          ? h(Loading, { label: '读取个人画像…' })
-          : resource.error
-            ? h(ErrorLine, null, `读取失败：${resource.error}`)
-            : !data || !data.available
-              ? h(Empty, { title: '个人画像暂不可用', hint: data ? data.reason || '' : '' })
-              : h(React.Fragment, null,
-                h('div', { className: 'omb-grid' },
-                  h(StatCard, { label: '已声明', value: String(data.status ? data.status.declared : data.entries.length), note: '你明确说过的偏好' }),
-                  h(StatCard, { label: '推断', value: String(data.status ? data.status.inferred : 0), note: '从对话里归纳' }),
-                  h(StatCard, { label: '待裁决冲突', value: String(data.status ? data.status.conflicts : data.conflicts.length), state: data.conflicts.length > 0 ? 'warning' : 'idle', note: data.conflicts.length > 0 ? '同一条偏好有两个说法' : '没有冲突' }),
-                  h(StatCard, { label: '能力轴', value: data.status && data.status.capabilityAxis === 'on-session-only' ? '仅本会话' : '关闭', note: '不在长期记忆里保存能力判断' })),
-                data.conflicts.length > 0
-                  ? h(Section, { title: '待裁决的冲突' }, ...data.conflicts.map((conflict) => h('div', { key: `${conflict.axis}:${conflict.key}`, className: 'omb-card' },
-                    h('div', { className: 'omb-row-meta' }, h(Tag, { tone: 'warning' }, conflict.axisLabel || conflict.axis), h('span', null, conflict.key)),
-                    ...conflict.values.map((value, index) => h('p', { key: index, className: 'omb-detail-text omb-selectable' }, `${value.provenance === 'declared' ? '你说过' : '推断'}：${value.value}`)))))
-                  : null,
-                grouped.length === 0
-                  ? h(Empty, { title: '还没有个人画像', hint: '聊到你的长期偏好、习惯或协作方式后会自动出现；也可以直接告诉我。' })
-                  : h(React.Fragment, null, ...grouped.map(([axis, entries]) => h(Section, { key: axis, title: (entries[0] && entries[0].axisLabel) || axis }, ...entries.map((entry, index) => h('div', { key: `${entry.key}-${index}`, className: 'omb-card' },
-                    h('div', { className: 'omb-row-meta' }, h(Tag, { tone: entry.provenance === 'declared' ? 'success' : 'quiet' }, entry.provenance === 'declared' ? '你确认' : '推断'), h('span', { className: 'omb-code' }, entry.key), h('span', null, formatTime(entry.updated))),
-                    h('p', { className: 'omb-detail-text omb-selectable' }, entry.value),
-                    entry.evidence && entry.evidence.length > 0
-                      ? h('p', { className: 'omb-note omb-selectable' }, `依据：${entry.evidence.slice(0, 3).join('；')}`)
-                      : null))))),
-                data.text
-                  ? h(Collapsible, { icon: h(IconUserOutlineRegular, { size: 16 }), title: '画像摘要', summary: '' }, h('p', { className: 'omb-note omb-selectable' }, data.text))
-                  : null,
-                h('div', { className: 'omb-actions' },
-                  h(Button, { variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: resource.loading ? 'omb-spin' : undefined }), disabled: resource.loading, onClick: resource.reload }, '刷新'))))
+      const remove = (entry) => {
+        if (busy) return
+        setBusy(true); setNotice(null)
+        void post('/personal', { action: 'retract', axis: entry.axis, key: entry.key }).then((payload) => {
+          setNotice({ text: payload.text || '已删除', failed: false })
+          setRevision((value) => value + 1)
+        }, (failure) => setNotice({ text: messageOf(failure), failed: true }))
+          .finally(() => { setBusy(false); setConfirmDelete(null) })
+      }
+
+      const actionsRow = h('div', { className: 'omb-actions' },
+        h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), onClick: () => setForm({ record: null }) }, '新增条目'),
+        h(Button, { variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: resource.loading ? 'omb-spin' : undefined }), disabled: resource.loading, onClick: resource.reload }, '刷新'))
+      const noticeRow = notice
+        ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
+          h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
+        : null
+      const stats = data ? h('div', { className: 'omb-grid' },
+        h(StatCard, { label: '已声明', value: String(data.status ? data.status.declared : data.entries.length), note: '你明确说过的偏好' }),
+        h(StatCard, { label: '推断', value: String(data.status ? data.status.inferred : 0), note: '从对话里归纳' }),
+        h(StatCard, { label: '待裁决冲突', value: String(data.status ? data.status.conflicts : data.conflicts.length), state: data.conflicts.length > 0 ? 'warning' : 'idle', note: data.conflicts.length > 0 ? '同一条偏好有两个说法' : '没有冲突' }),
+        h(StatCard, { label: '能力轴', value: data.status && data.status.capabilityAxis === 'on-session-only' ? '仅本会话' : '关闭', note: '不在长期记忆里保存能力判断' })) : null
+      const conflicts = data && data.conflicts.length > 0
+        ? h(Section, { title: '待裁决的冲突' }, ...data.conflicts.map((conflict) => h('div', { key: `${conflict.axis}:${conflict.key}`, className: 'omb-card' },
+          h('div', { className: 'omb-row-meta' }, h(Tag, { tone: 'warning' }, conflict.axisLabel || conflict.axis), h('span', null, conflict.key)),
+          ...conflict.values.map((value, index) => h('p', { key: index, className: 'omb-detail-text omb-selectable' }, `${value.provenance === 'declared' ? '你说过' : '推断'}：${value.value}`)))))
+        : null
+      const entryCard = (entry, index) => {
+        const evidence = entry.evidence && entry.evidence.length > 0
+          ? h('p', { className: 'omb-note omb-selectable' }, `依据：${entry.evidence.slice(0, 3).join('；')}`)
+          : null
+        const actions = h('div', { className: 'omb-actions' },
+          h(Button, { variant: 'ghost', size: 'sm', icon: h(IconEditOutlineRegular, { size: 16 }), onClick: () => setForm({ record: entry }) }, entry.provenance === 'declared' ? '编辑' : '改为确认'),
+          entry.provenance === 'declared'
+            ? h(Button, { variant: 'ghost', size: 'sm', icon: h(IconTrashOutlineRegular, { size: 16 }), disabled: busy, onClick: () => setConfirmDelete(entry) }, '删除')
+            : null)
+        return h('div', { key: `${entry.key}-${index}`, className: 'omb-card' },
+          h('div', { className: 'omb-row-meta' },
+            h(Tag, { tone: entry.provenance === 'declared' ? 'success' : 'quiet' }, entry.provenance === 'declared' ? '你确认' : '推断'),
+            h('span', { className: 'omb-code' }, entry.key),
+            h('span', null, formatTime(entry.updated))),
+          h('p', { className: 'omb-detail-text omb-selectable' }, entry.value),
+          evidence,
+          actions)
+      }
+      const groups = grouped.length === 0
+        ? h(Empty, { title: '还没有个人画像', hint: '点“新增条目”写下你的长期偏好；聊到习惯后也会自动出现推断。' })
+        : h(React.Fragment, null, ...grouped.map(([axis, entries]) => h(Section, { key: axis, title: (entries[0] && entries[0].axisLabel) || axis }, ...entries.map(entryCard))))
+      const summary = data && data.text
+        ? h(Collapsible, { icon: h(IconUserOutlineRegular, { size: 16 }), title: '画像摘要', summary: '' }, h('p', { className: 'omb-note omb-selectable' }, data.text))
+        : null
+
+      const content = !data
+        ? (resource.loading ? h(Loading, { label: '读取个人画像…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
+        : !data.available
+          ? h(Empty, { title: '个人画像暂不可用', hint: data.reason || '' })
+          : h(React.Fragment, null, actionsRow, noticeRow, stats, conflicts, groups, summary)
+
+      const formModal = form
+        ? h(PersonalForm, {
+          record: form.record,
+          onClose: () => setForm(null),
+          onSaved: (text) => {
+            setForm(null)
+            setNotice({ text, failed: false })
+            setRevision((value) => value + 1)
+          },
+        })
+        : null
+
+      const deleteModal = h(Modal, {
+        open: confirmDelete !== null,
+        onClose: () => setConfirmDelete(null),
+        title: '删除这条画像条目？',
+        closeLabel: '取消',
+        description: '只删除你确认过的声明；推断条目用“改为确认”覆盖。',
+        footer: h('div', { className: 'omb-modal-actions' },
+          h(Button, { variant: 'ghost', size: 'sm', onClick: () => setConfirmDelete(null) }, '取消'),
+          h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => { if (confirmDelete) remove(confirmDelete) } }, '删除')),
+      })
+
+      return h('div', { className: 'omb-scroll' }, content, formModal, deleteModal)
     }
 
     function MemoryPanel() {

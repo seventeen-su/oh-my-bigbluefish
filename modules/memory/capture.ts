@@ -41,7 +41,15 @@
  * - 本模块：**事件驱动**，不经过 `decideAdmission`（它的输入是观测事实，不是模型自述），
  *   但同样受隐私闸门约束、同样拒绝密钥模式。
  */
-import type { Clock, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../../kernel/abi/index.js'
+import type {
+  Clock,
+  ControllerAdminEdit,
+  ControllerAdminState,
+  MemoryKind,
+  MemoryRecord,
+  MemoryScope,
+  MemoryStore,
+} from '../../kernel/abi/index.js'
 import { contentHashOf, findSimilarContent, newMemoryId } from './remember.js'
 import { hasSecret } from './secrets.js'
 import { detectProactiveCue, type ProactiveCue } from './proactive.js'
@@ -49,7 +57,10 @@ import { classifyMemoryIntent, isDurableIntent } from './intent.js'
 import { isCommandOrCode, isQuestion, PREFERENCE_MARKERS } from './message-filter.js'
 import {
   clearControllerCandidate,
+  CONTROLLER_TASK_TTL_MS,
+  derivePhase,
   EMPTY_CONTROLLER_STATE,
+  MAX_CONTROLLER_TASKS,
   reduceMemoryEvent,
   type ControllerAction,
   type ControllerCandidate,
@@ -463,6 +474,17 @@ export interface Capture {
   readonly stats: () => CaptureStats
   /** 预热会话状态（turn/start）：不清空已捕获的计数——同一会话跨回合。 */
   readonly warm: (sessionId: string) => void
+  /**
+   * v4.19.0：只读某会话的控制器状态。**不创建**不存在的会话（返回空状态）；
+   * 供设置页 `omb:memory-controller-admin` 使用；同步、绝不抛。
+   */
+  readonly controllerState: (sessionId: string) => ControllerAdminState
+  /**
+   * v4.19.0：用户手动编辑控制器状态（任务/候选增删清）。不存在的会话返回空状态、
+   * 不创建；校验失败返回原状态；改表后同步 `phase` 并清 `transition`（手动编辑
+   * 不是事件转移）；绝不抛。
+   */
+  readonly editController: (sessionId: string, edit: ControllerAdminEdit) => ControllerAdminState
 }
 
 /**
@@ -586,6 +608,117 @@ export function createCapture(ports: CapturePorts): Capture {
     const created = emptyState()
     states.set(sessionId, created)
     return created
+  }
+
+  // ── v4.19.0：控制器状态的手动读写（用户设置页；不改写入路径）────────────
+  //
+  // 边界：只改内存里的控制器表，不写库、不注入提示、不创建不存在的会话；
+  // 状态机原本只由宿主事件推进，这里给用户一个受控的编辑面（AGENTS 不变量：
+  // 接线必须有消费者、绝不抛）。
+  const toAdminState = (state: ControllerSessionState): ControllerAdminState => ({
+    candidates: state.candidates.map(candidate => ({
+      id: candidate.id,
+      text: candidate.text,
+      kind: candidate.kind,
+      scope: candidate.scope,
+      at: candidate.at,
+      reason: candidate.reason,
+    })),
+    tasks: state.tasks.map(task => ({ text: task.text, at: task.at, expiresAt: task.expiresAt })),
+    lastEventAt: state.lastEventAt,
+    phase: state.phase,
+  })
+
+  const controllerState = (sessionId: string): ControllerAdminState => {
+    try {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+      if (id.length === 0) return EMPTY_CONTROLLER_STATE
+      const existing = states.get(id)
+      return existing === undefined ? EMPTY_CONTROLLER_STATE : toAdminState(existing.controller)
+    } catch (error) {
+      ports.logger?.warn(`OMB 控制器状态读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      return EMPTY_CONTROLLER_STATE
+    }
+  }
+
+  const normalizeAdminText = (text: unknown): string =>
+    typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : ''
+
+  const editController = (sessionId: string, edit: ControllerAdminEdit): ControllerAdminState => {
+    try {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+      if (id.length === 0) return EMPTY_CONTROLLER_STATE
+      const existing = states.get(id)
+      // **不创建**不存在的会话：设置页只编辑真实存在的捕获状态。
+      if (existing === undefined) return EMPTY_CONTROLLER_STATE
+      const current = existing.controller
+      const now = ports.clock.now()
+      let candidates = current.candidates
+      let tasks = current.tasks
+      let changed = false
+      switch (edit?.kind) {
+        case 'add-task': {
+          const text = normalizeAdminText(edit.text)
+          if (text.length === 0 || text.length > 200) return toAdminState(current)
+          // 重复文本去重：同一约束不叠加（保持首次的时间/TTL）。
+          if (tasks.some(task => normalizeAdminText(task.text) === text)) return toAdminState(current)
+          tasks = [{ text, at: now, expiresAt: now + CONTROLLER_TASK_TTL_MS }, ...tasks]
+            .slice(0, MAX_CONTROLLER_TASKS)
+          changed = true
+          break
+        }
+        case 'remove-task': {
+          const text = normalizeAdminText(edit.text)
+          if (text.length === 0) return toAdminState(current)
+          const next = tasks.filter(task => normalizeAdminText(task.text) !== text)
+          if (next.length !== tasks.length) {
+            tasks = next
+            changed = true
+          }
+          break
+        }
+        case 'clear-tasks': {
+          if (tasks.length > 0) {
+            tasks = []
+            changed = true
+          }
+          break
+        }
+        case 'remove-candidate': {
+          const text = normalizeAdminText(edit.text)
+          if (text.length === 0) return toAdminState(current)
+          const next = candidates.filter(candidate => normalizeAdminText(candidate.text) !== text)
+          if (next.length !== candidates.length) {
+            candidates = next
+            changed = true
+          }
+          break
+        }
+        case 'clear-candidates': {
+          if (candidates.length > 0) {
+            candidates = []
+            changed = true
+          }
+          break
+        }
+        default:
+          return toAdminState(current)
+      }
+      if (!changed) return toAdminState(current)
+      const next: ControllerSessionState = {
+        ...current,
+        candidates,
+        tasks,
+        // 手动编辑不是事件转移：phase 由表内容重新推导，旧 transition 清掉。
+        phase: derivePhase({ candidates, tasks }),
+        transition: null,
+      }
+      existing.controller = next
+      return toAdminState(next)
+    } catch (error) {
+      ports.logger?.warn(`OMB 控制器手动编辑失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
+      return EMPTY_CONTROLLER_STATE
+    }
   }
 
   const skip = (reason: string): void => {
@@ -1254,6 +1387,8 @@ export function createCapture(ports: CapturePorts): Capture {
         ports.logger?.warn(`OMB 自主捕获（结局）失败（已隔离）：${error instanceof Error ? error.message : String(error)}`)
       }
     },
+    controllerState,
+    editController,
     stats: () => {
       // 活跃任务约束：TTL 只能在**事件到达时**判定（reducer 无时钟、无定时器）。
       // 因此这里按该会话最后一次事件时间比较，而不是另取一个墙钟：

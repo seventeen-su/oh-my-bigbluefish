@@ -1347,3 +1347,26 @@
   - 前端记忆页：单页 50、上一页/下一页、`第 N 页 · 本页 M 条`；
     过滤条件/搜索变化自动回第 1 页；
   - 分页补测试：后端两页不重叠且覆盖全部；路由解析 offset；bundle 契约钉住按钮与参数。
+
+---
+
+# OMB v4.19.0 交付记录（2026-10-24，x2）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.19.0**（`25 功能 / 113 小功能`；x2：设置台手动编辑扩展） |
+| 构建 | **g136**；`generation: 136`、`outDir: lib-gen/g136` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **123 files / 1540 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：项目页“状态机”增删任务/候选、个人画像新增/编辑/删除、记忆详情“取代…” |
+
+## 补充（用户确认“以上都要”）
+
+- **控制器状态机**：`SERVICES.memoryControllerAdmin`（ABI `controller-admin.ts`）；
+  `capture.controllerState/editController` 五动作（任务 TTL/上限/去重、候选移除/清空）；
+  `GET/POST /omb/api/controller`；项目页“状态机”区手动增删清空。
+- **个人画像**：`ProfileService.retract`（只删同轴同键显式声明、写后查回、不抛）；
+  `POST /omb/api/personal` 的 declare/retract；页面新增条目、编辑（声明先撤旧再写新）、删除、
+  推断条目“改为确认”。
+- **记忆生命周期**：详情“取代…”Modal 选目标，复用 `/resolve` supersede（非破坏）。
+
+详见 `docs/v4.19.0-manual-editing.md`。

@@ -18,6 +18,7 @@ import {
   PROFILE_SERVICE,
   type ProfileService,
 } from '../../../modules/profile/index.js'
+import type { ProfileAxis } from '../../../modules/profile/entries.js'
 import { FakeStores, fakeClock } from './fakes.js'
 
 /** 记忆模块替身：只负责提供 `stores` 服务（满足画像的 requires）。 */
@@ -359,5 +360,133 @@ describe('写入面零消费者：状态面如实标注（S3-e）', () => {
     expect(after.detail).toContain('已淘汰 8 个更早的会话')
     expect(after.metrics?.capabilitySessions).toBe(32)
     expect(after.metrics?.capabilitySessionsEvicted).toBe(8)
+  })
+})
+
+/**
+ * v4.19.0：手动删除显式条目（`retract`）。
+ *
+ * 冻结的语义（写在这里防止下次"顺手"改掉）：
+ * ① 只删 `declared`；`inferred` 只能经 `clearDeduced` 整体清空；
+ * ② 找不到 → `ok:false` + 可读原因（**不假装删成功**），且**不产生写入**；
+ * ③ 删除单位是"槽位"（同轴同键），冲突的两条一起消失；
+ * ④ 写后**查回**：存储没真的写掉时回 `ok:false`，绝不抛。
+ */
+describe('手动删除显式条目（retract，v4.19.0）', () => {
+  it('删除成功：从 entries 消失、回执为 retracted、写面计数如实增加', async () => {
+    const stores = new FakeStores()
+    const { service, health } = startProfile(stores)
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    await service.declare({ axis: 'collaboration', key: 'style', value: '直接给结论' })
+    const writesBefore = stores.puts
+
+    const mutation = await service.retract({ axis: 'stable', key: 'tone' })
+
+    expect(mutation).toMatchObject({ ok: true, outcome: 'retracted', conflict: false, error: null })
+    expect(stores.puts).toBeGreaterThan(writesBefore)
+    const left = await service.entries()
+    expect(left.map(entry => `${entry.axis}/${entry.key}`)).toEqual(['collaboration/style'])
+    // 写面文案不能把这次删除漏掉（否则"写入面 N 次"与真实动作数对不上）
+    expect((await health()).detail).toContain('retract 1')
+  })
+
+  it('删除单位是槽位：同一键上互相矛盾的显式条目一起消失', async () => {
+    const { service } = startProfile(new FakeStores())
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    const conflicted = await service.declare({ axis: 'stable', key: 'tone', value: '详尽' })
+    expect(conflicted.conflict).toBe(true)
+
+    const mutation = await service.retract({ axis: 'stable', key: 'tone' })
+
+    expect(mutation).toMatchObject({ ok: true, outcome: 'retracted', conflict: false })
+    expect(await service.entries()).toHaveLength(0)
+    expect(await service.conflicts()).toHaveLength(0)
+  })
+
+  it('找不到匹配的显式条目 → ok:false + 可读原因，且不产生写入', async () => {
+    const stores = new FakeStores()
+    const { service } = startProfile(stores)
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    const writesBefore = stores.puts
+
+    const mutation = await service.retract({ axis: 'stable', key: '不存在的键' })
+
+    expect(mutation.ok).toBe(false)
+    expect(mutation.outcome).toBe('rejected')
+    expect(mutation.error).toContain('没有匹配的显式条目')
+    expect(mutation.error).toContain('clearDeduced')
+    expect(stores.puts).toBe(writesBefore)
+    expect(await service.entries()).toHaveLength(1)
+  })
+
+  it('推断条目不被删（只有 clearDeduced 能动推断）', async () => {
+    const stores = new FakeStores()
+    const { service } = startProfile(stores)
+    const inferred = await service.infer({ axis: 'collaboration', key: 'style', value: '直接给结论' })
+    expect(inferred.ok).toBe(true)
+
+    const mutation = await service.retract({ axis: 'collaboration', key: 'style' })
+
+    expect(mutation.ok).toBe(false)
+    expect(mutation.error).toContain('没有匹配的显式条目')
+    const left = await service.entries()
+    expect(left.map(entry => entry.provenance)).toEqual(['inferred'])
+  })
+
+  it('能力轴拒绝（D4）：它没有落盘条目，清空走 clearDeduced', async () => {
+    const { service } = startProfile(new FakeStores())
+
+    const mutation = await service.retract({ axis: 'capability', key: 'codegen' })
+
+    expect(mutation).toMatchObject({ ok: false, outcome: 'rejected', conflict: false })
+    expect(mutation.error).toContain('D4')
+  })
+
+  it('空 key / 未知轴在运行期也被拒绝（可读原因，不抛）', async () => {
+    const { service } = startProfile(new FakeStores())
+
+    const blank = await service.retract({ axis: 'stable', key: '   ' })
+    expect(blank.ok).toBe(false)
+    expect(blank.error).toContain('key 不能为空')
+
+    const unknown = await service.retract({ axis: 'bogus' as unknown as ProfileAxis, key: 'k' })
+    expect(unknown.ok).toBe(false)
+    expect(unknown.error).toContain('未知画像轴')
+  })
+
+  it('写后查回：存储没有真的写掉时回 ok:false，绝不谎报成功', async () => {
+    const stores = new FakeStores()
+    const { service } = startProfile(stores)
+    await service.declare({ axis: 'stable', key: 'tone', value: '简洁' })
+    // 让用户库的 put 变成"静默丢弃"：写入返回成功，但记录没变
+    const user = stores.user as unknown as { put(record: unknown): Promise<void> }
+    user.put = async () => {}
+
+    const mutation = await service.retract({ axis: 'stable', key: 'tone' })
+
+    expect(mutation.ok).toBe(false)
+    expect(mutation.error).toContain('写入后仍存在')
+    expect((await service.entries()).map(entry => entry.key)).toEqual(['tone'])
+  })
+
+  it('项目条目的删除必须给会话：不给就只有用户库可见（不挑“最近一个会话”）', async () => {
+    const stores = new FakeStores()
+    // 真实宿主：无会话（`forSession('')`）时记忆侧降级为**仅用户库**，项目库不可见。
+    // `FakeStores` 默认不做这个降级（它总是给项目库），所以这里按真机语义打桩。
+    const withSession = stores.forSession.bind(stores)
+    stores.forSession = async (sessionId: string) => sessionId === ''
+      ? { store: (scope: string) => (scope === 'user' ? stores.user : undefined), projectScope: null }
+      : await withSession(sessionId)
+    const { service } = startProfile(stores)
+    await service.declare({ axis: 'intent', key: 'now', value: '重做记忆层' }, 's1')
+    expect(stores.project.putCalls).toHaveLength(1)
+
+    const withoutSession = await service.retract({ axis: 'intent', key: 'now' })
+    expect(withoutSession.ok).toBe(false)
+    expect(withoutSession.error).toContain('没有匹配的显式条目')
+
+    const deleted = await service.retract({ axis: 'intent', key: 'now' }, 's1')
+    expect(deleted).toMatchObject({ ok: true, outcome: 'retracted' })
+    expect(await service.entries('s1')).toHaveLength(0)
   })
 })

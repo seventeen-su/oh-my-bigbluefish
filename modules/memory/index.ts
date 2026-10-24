@@ -20,6 +20,7 @@ import type {
   ModuleHealth,
   ModuleManifest,
   ModuleRegistration,
+  ControllerAdminEdit,
   SecondaryChannelRegistry,
   SessionCatalogPort,
   StorageHostPort,
@@ -40,7 +41,7 @@ import {
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
-import { createUiService, type UiPersonalView, type UiProfile } from './ui.js'
+import { createUiService, type UiPersonalEditInput, type UiPersonalView, type UiProfile } from './ui.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
@@ -98,6 +99,22 @@ interface ProfileServiceLike {
   entries(sessionId?: string): Promise<readonly ProfileEntryLike[]>
   conflicts(sessionId?: string): Promise<readonly ProfileConflictLike[]>
   renderDeclared(limit?: number, sessionId?: string): Promise<string>
+  /** v4.19.0 用户写入口（rc2-compat 在 ProfileService 上提供；缺失时如实拒绝）。 */
+  declare?(
+    input: { readonly axis: ProfileAxisLike; readonly key: string; readonly value: string; readonly evidence?: readonly string[] },
+    sessionId?: string,
+  ): Promise<ProfileMutationLike>
+  retract?(
+    input: { readonly axis: ProfileAxisLike; readonly key: string },
+    sessionId?: string,
+  ): Promise<ProfileMutationLike>
+}
+
+interface ProfileMutationLike {
+  readonly ok: boolean
+  readonly outcome: string
+  readonly conflict: boolean
+  readonly error: string | null
 }
 
 /** 画像视图 → UI DTO（`profile()` 与 `profileForSession()` 共用同一份映射）。 */
@@ -1065,6 +1082,12 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         projectRetryMs: config.coldStartRetryMs,
       })
       captureRef = () => capture.stats()
+      // ── 控制器管理端口（v4.19.0）：用户设置页手动编辑任务/候选 ──────────
+      // 只读/写内存里的控制器状态；不写库、不注入提示、没有模型工具入口。
+      const offControllerAdmin = kernel.provide(SERVICES.memoryControllerAdmin, {
+        state: (sessionId: string) => capture.controllerState(sessionId),
+        edit: (sessionId: string, edit: ControllerAdminEdit) => capture.editController(sessionId, edit),
+      })
 
       // ── 3.7 Wave 2（R9 C1/C2/C3）：隐式效用、显式反馈、自适应下限 ──────────
       const usageTracker = createUsageTracker()
@@ -1506,6 +1529,53 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             }
           }
         },
+        // ── 个人画像写入（v4.19.0）：declare / retract；能力轴在 UI 层已被拒绝 ──
+        personalEdit: async (input: UiPersonalEditInput): Promise<{ ok: boolean; text: string }> => {
+          const profile = kernel.service<ProfileServiceLike>(SERVICES.profile)
+          if (profile === undefined) {
+            return { ok: false, text: '未执行：用户画像服务不可用（omb-profile 未挂载）。' }
+          }
+          let sessionId: string | undefined
+          try {
+            sessionId = kernel.service<{ current(): string | null }>(SERVICES.activeSession)?.current() ?? undefined
+          } catch {
+            sessionId = undefined
+          }
+          try {
+            const mutation = input.action === 'declare'
+              ? (profile.declare === undefined
+                  ? undefined
+                  : await profile.declare({
+                      axis: input.axis as ProfileAxisLike,
+                      key: input.key,
+                      value: input.value,
+                      ...(input.evidence === undefined ? {} : { evidence: input.evidence }),
+                    }, sessionId))
+              : (profile.retract === undefined
+                  ? undefined
+                  : await profile.retract({ axis: input.axis as ProfileAxisLike, key: input.key }, sessionId))
+            if (mutation === undefined) {
+              return { ok: false, text: '未执行：画像服务未提供 declare/retract（当前版本不支持手动编辑）。' }
+            }
+            if (!mutation.ok) {
+              return { ok: false, text: `未写入：${mutation.error ?? mutation.outcome ?? '画像服务拒绝'}` }
+            }
+            if (input.action === 'retract') {
+              return { ok: true, text: '已删除该槽位的显式条目（推断条目与库内容不受影响）。' }
+            }
+            return {
+              ok: true,
+              text: mutation.conflict
+                ? '已写入个人画像；仍有未裁决冲突（两条都保留，可在页面查看）。'
+                : '已写入个人画像。',
+            }
+          } catch (error) {
+            return {
+              ok: false,
+              text: `个人画像写入失败（已隔离）：${error instanceof Error ? error.message : String(error)}`,
+            }
+          }
+        },
       }))
 
       const offCaptureMessage = kernel.on('user/message/observed', payload => {
@@ -1824,6 +1894,7 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           ['工具服务', offTools],
           ['常驻提示', offPrompt],
           ['捕获·用户消息订阅', offCaptureMessage],
+          ['控制器管理端口', offControllerAdmin],
           ['反馈命令', () => feedback.dispose()],
           ['确认命令', () => confirm.dispose()],
           ['捕获·工具调用订阅', offCaptureCall],

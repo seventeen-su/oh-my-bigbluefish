@@ -393,6 +393,15 @@ export const SERVICES = {
    */
   sessionCatalog: 'omb:session-catalog',
   /**
+   * **记忆控制器管理端口**（`ControllerAdminPort`，由 `modules/memory/index.ts`
+   * provide，v4.19.0）。
+   *
+   * 用户设置页要手动增删任务约束、清候选；状态只由宿主事件推进时用户只能看着。
+   * 端口只给 `omb:ui` 用（HTTP 用户点击），**没有模型工具入口**；`edit` 只校验并
+   * 改表，不写记忆库、不注入提示。
+   */
+  memoryControllerAdmin: 'omb:memory-controller-admin',
+  /**
    * **管理侧边栏数据面**（`modules/memory/ui.ts`，v4.15.0）。
    *
    * 只读：概览/列表/详情/候选；由 `dsh/ui-route.ts` 挂在宿主 `/omb/api` 前缀路由上，

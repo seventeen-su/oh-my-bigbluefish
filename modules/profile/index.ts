@@ -29,6 +29,7 @@ import type { ProfileAxis, ProfileConflict, ProfileEntry, ProfileOutcome } from 
 import {
   applyEntry,
   listConflicts,
+  PROFILE_AXES,
   renderConflicts as renderConflictsText,
   renderDeclared as renderDeclaredText,
 } from './entries.js'
@@ -84,6 +85,17 @@ export interface ProfileDeclareInput {
   readonly evidence?: readonly string[]
 }
 
+/**
+ * 手动删除的定位键（v4.19.0）：**同轴同键**才算同一条槽位。
+ *
+ * 不给 `value`：删除是针对"这个槽位上的显式条目"的，不是针对某个取值——
+ * 用户说"别再记住我的语气偏好"时，两条矛盾的显式声明都应该一起消失。
+ */
+export interface ProfileRetractInput {
+  readonly axis: ProfileAxis
+  readonly key: string
+}
+
 /** 可推断的轴：`capability` 被类型排除（它走 `observeCapability`，只进会话内存）。 */
 export type ProfileInferAxis = Exclude<ProfileAxis, 'capability'>
 
@@ -96,7 +108,13 @@ export interface ProfileInferInput {
 
 export interface ProfileMutation {
   readonly ok: boolean
-  readonly outcome: ProfileOutcome | 'rejected'
+  /**
+   * `ProfileOutcome` 是**条目消解**的结果（写入路径的词汇）；
+   * `'rejected'` 与 `'retracted'` 是**手动操作面**的结果——删除没有"消解"这回事，
+   * 塞进 `added/merged` 里会让回执说谎。两个词都只出现在本类型上，
+   * `applyEntry` 的取值域不受影响。
+   */
+  readonly outcome: ProfileOutcome | 'rejected' | 'retracted'
   /** 此次操作后是否仍有未裁决冲突（有则调用方必须呈现）。 */
   readonly conflict: boolean
   readonly error: string | null
@@ -128,6 +146,20 @@ export interface ProfileService {
   renderDeclared(limit?: number, sessionId?: string): Promise<string>
   /** 用户可编辑路径：写入一条显式声明。 */
   declare(input: ProfileDeclareInput, sessionId?: string): Promise<ProfileMutation>
+  /**
+   * 用户可编辑路径：**删除一条显式条目**（v4.19.0，与 `declare` 对称）。
+   *
+   * 语义边界（三者刻意分开，不互相代替）：
+   * - 只删 `provenance === 'declared'` 的条目；**`inferred` 不删**——推断型由
+   *   `clearDeduced` 整体清空（`retract` 删一条推断等于"让系统悄悄忘掉一个事实"，
+   *   而用户从未声明过它，无从谈起）。
+   * - `capability` 轴拒绝（它永不落盘，D4）：清会话内存走 `clearDeduced`。
+   * - 同轴同键的**所有**显式条目一起删（冲突的两条都消失），因为删除的单位是"槽位"。
+   * - 找不到匹配 → `ok:false` + 可读 `error`（不假装删成功；调用方据此给用户回执）。
+   *
+   * 写后**查回验证**：重新 `load` 并确认该轴该键的显式条目已不存在；仍在则 `ok:false`。
+   */
+  retract(input: ProfileRetractInput, sessionId?: string): Promise<ProfileMutation>
   /** 记录一条推断（低等级来源；同键若有显式声明则进不来）。 */
   infer(input: ProfileInferInput, sessionId?: string): Promise<ProfileMutation>
   /**
@@ -212,6 +244,8 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   let declareCalls = 0
   let inferCalls = 0
   let clearCalls = 0
+  /** v4.19.0：手动删除也是写面请求——不数它会让"写入面 N 次"与真实动作数对不上。 */
+  let retractCalls = 0
   let lastError: string | null = null
   /**
    * 冲突文本缓存（同步可读）。R8 要求把冲突**摆出来**，而提示注入的渲染函数
@@ -252,7 +286,7 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
         + '——"0 条"不等于"用户没有偏好"，是**没有写入口**（observeCapability 另有自己的计数）'
     }
     return `写入面：自本模块启动以来收到 ${writeFaceCalls} 次写入请求`
-      + `（declare ${declareCalls} / infer ${inferCalls} / clearDeduced ${clearCalls}）`
+      + `（declare ${declareCalls} / infer ${inferCalls} / clearDeduced ${clearCalls} / retract ${retractCalls}）`
   }
 
   /**
@@ -398,10 +432,71 @@ export function createProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
       }, sessionId)
     },
 
+    async retract(input, sessionId?: string) {
+      writeFaceCalls += 1
+      retractCalls += 1
+      const rejected = (error: string, conflict = false): ProfileMutation =>
+        ({ ok: false, outcome: 'rejected' as const, conflict, error })
+      if (disposed) return rejected('画像模块已卸载')
+      // 能力轴**永不落盘**（D4）：没有存储条目可删；清会话内存走 clearDeduced。
+      if ((input.axis as string) === 'capability') {
+        return rejected('能力轴不接受落盘条目（D4）：它只在会话内存里，请用 clearDeduced 清空')
+      }
+      // 运行期兜底：类型层已限定，但调用方可能绕过类型（与 declare/infer 同一条口径）。
+      if (!PROFILE_AXES.includes(input.axis)) {
+        return rejected(`未知画像轴：${String(input.axis)}（可用：${PROFILE_AXES.join(' / ')}）`)
+      }
+      const key = input.key.trim()
+      if (key.length === 0) {
+        return rejected('key 不能为空：(轴 + 键) 才能定位一条显式条目')
+      }
+
+      const loaded = await storage.load(sessionId)
+      if (loaded.error !== null) {
+        lastError = loaded.error
+        report()
+        return rejected(loaded.error)
+      }
+      /** 删除单位是"槽位"：同轴同键的**所有**显式条目一起删（冲突的两条都消失）。 */
+      const matches = (entry: ProfileEntry): boolean =>
+        entry.axis === input.axis && entry.key.trim() === key && entry.provenance === 'declared'
+      const remaining = loaded.entries.filter(entry => !matches(entry))
+      if (remaining.length === loaded.entries.length) {
+        // 明确语义：找不到 → ok:false + 可读原因（**不假装删成功**）。
+        // 推断条目在同一槽位时，错误里点名 clearDeduced，避免调用方反复重试。
+        const current = refresh(loaded.entries)
+        lastError = null
+        report()
+        return rejected(
+          `没有匹配的显式条目：${input.axis}/${key}（推断条目不走 retract，请用 clearDeduced）`,
+          current.length > 0,
+        )
+      }
+
+      const saved = await storage.save(remaining, sessionId)
+      if (!saved.ok) {
+        lastError = saved.error ?? '画像写入失败'
+        report()
+        return rejected(lastError)
+      }
+      // 写后**查回验证**：存储层"内容未变则不写"，写错过滤器也会静默 ok；
+      // 只有重新 load 并确认该轴该键的显式条目已不存在，才能回 ok。
+      const readBack = await storage.load(sessionId)
+      const stillPresent = readBack.entries.some(matches)
+      const failure = combineErrors(
+        readBack.error,
+        stillPresent ? `写入后仍存在：${input.axis}/${key}` : null,
+      )
+      const found = refresh(readBack.entries)
+      lastError = failure
+      report()
+      if (failure !== null) return rejected(failure, found.length > 0)
+      return { ok: true, outcome: 'retracted' as const, conflict: found.length > 0, error: null }
+    },
+
     infer(input, sessionId?: string) {
       writeFaceCalls += 1
-      inferCalls += 1
-      // 类型层已排除 capability，但运行期调用方可能绕过类型——这里是结构性兜底。
+      inferCalls += 1      // 类型层已排除 capability，但运行期调用方可能绕过类型——这里是结构性兜底。
       if ((input.axis as string) === 'capability') {
         return Promise.resolve({
           ok: false,

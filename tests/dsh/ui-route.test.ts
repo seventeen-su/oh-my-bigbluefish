@@ -108,6 +108,20 @@ const UI = {
     conflicts: [],
     text: '个人画像文本',
   }),
+  controller: async (sessionId?: string) => ({
+    available: true,
+    sessionId: sessionId ?? 's1',
+    phase: 'tracking-tasks',
+    tasks: [{ text: '别改测试', at: 1, expiresAt: 2 }],
+    candidates: [],
+    lastEventAt: null,
+  }),
+  controllerAct: async (input: { action: string; sessionId: string; text?: string }) => (input.sessionId === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `控制器 ${input.action} 成功` }),
+  personalAct: async (input: { action: string; axis: string; key: string }) => (input.key === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `画像 ${input.action} 成功` }),
   createMemory: async (input: { scope: string; kind: string; text: string }) => (input.text === 'denied'
     ? { ok: false, text: '拒绝：测试' }
     : { ok: true, text: `新建 ${input.scope}/${input.kind}` }),
@@ -362,6 +376,62 @@ describe('installUiRoute', () => {
     })
     expect(other.status).toBe(405)
     expect(String((other.body as { error: string }).error)).toContain('/memory')
+  })
+
+  it('控制器与个人画像写入口：GET /controller、POST /controller 五动作、POST /personal、校验与 405（v4.19）', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+
+    const got = await request(route, { url: '/omb/api/controller?sessionId=s2' })
+    expect(got.status).toBe(200)
+    expect(got.body).toMatchObject({ available: true, sessionId: 's2', phase: 'tracking-tasks' })
+    const gotDefault = await request(route, { url: '/omb/api/controller' })
+    expect(gotDefault.status).toBe(200)
+    expect(gotDefault.body).toMatchObject({ sessionId: 's1' })
+
+    const post = (url: string, body: unknown) => request(route, {
+      method: 'POST', url, body, contentType: 'application/json',
+    })
+    const add = await post('/omb/api/controller', { action: 'add-task', sessionId: 's1', text: '别改测试' })
+    expect(add.status).toBe(200)
+    expect(String((add.body as { text: string }).text)).toContain('add-task 成功')
+    expect((await post('/omb/api/controller', { action: 'remove-task', sessionId: 's1', text: '别改测试' })).status).toBe(200)
+    expect((await post('/omb/api/controller', { action: 'clear-tasks', sessionId: 's1' })).status).toBe(200)
+    expect((await post('/omb/api/controller', { action: 'remove-candidate', sessionId: 's1', text: 'x' })).status).toBe(200)
+    expect((await post('/omb/api/controller', { action: 'clear-candidates', sessionId: 's1' })).status).toBe(200)
+    expect((await post('/omb/api/controller', { action: 'clear-tasks', sessionId: 'denied' })).status).toBe(409)
+
+    // 控制器 400
+    expect((await post('/omb/api/controller', { action: 'nope', sessionId: 's1' })).status).toBe(400)
+    expect((await post('/omb/api/controller', { action: 'clear-tasks' })).status).toBe(400)
+    expect((await post('/omb/api/controller', { action: 'clear-tasks', sessionId: 'x'.repeat(201) })).status).toBe(400)
+    expect((await post('/omb/api/controller', { action: 'add-task', sessionId: 's1' })).status).toBe(400)
+    expect((await post('/omb/api/controller', { action: 'add-task', sessionId: 's1', text: 'x'.repeat(201) })).status).toBe(400)
+    expect((await post('/omb/api/controller', { action: 'add-task', sessionId: 's1', text: 42 })).status).toBe(400)
+
+    // 个人画像 200 / 400 / 409
+    const declared = await post('/omb/api/personal', {
+      action: 'declare', axis: 'stable', key: 'pkg', value: 'pnpm', evidence: ['s1'],
+    })
+    expect(declared.status).toBe(200)
+    expect(String((declared.body as { text: string }).text)).toContain('declare 成功')
+    expect((await post('/omb/api/personal', { action: 'retract', axis: 'stable', key: 'pkg' })).status).toBe(200)
+    expect((await post('/omb/api/personal', { action: 'retract', axis: 'stable', key: 'denied' })).status).toBe(409)
+    expect((await post('/omb/api/personal', { action: 'nope', axis: 'stable', key: 'k' })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'declare', axis: 'capability', key: 'k', value: 'v' })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'declare', axis: 'nope', key: 'k', value: 'v' })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'retract', axis: 'stable' })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'declare', axis: 'stable', key: 'k' })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'declare', axis: 'stable', key: 'k', value: 'x'.repeat(2001) })).status).toBe(400)
+    expect((await post('/omb/api/personal', { action: 'declare', axis: 'stable', key: 'k', value: 'v', evidence: 'bad' })).status).toBe(400)
+
+    // 其它 POST 405，文案点名两个新写入口
+    const other = await post('/omb/api/overview', {})
+    expect(other.status).toBe(405)
+    const message = String((other.body as { error: string }).error)
+    expect(message).toContain('/controller')
+    expect(message).toContain('/personal')
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

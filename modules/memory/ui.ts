@@ -13,6 +13,8 @@
  * - 不返回任何密钥/正文以外的内部列（contentHash/sourceRef 可给，用于溯源）。
  */
 import type {
+  ControllerAdminEdit,
+  ControllerAdminPort,
   MemoryKind,
   MemoryRecord,
   MemoryScope,
@@ -127,6 +129,57 @@ export interface UiPersonalView {
   /** `renderDeclared(12, sessionId)` 的文本。 */
   readonly text: string
 }
+
+/** 控制器设置页的只读视图（v4.19.0）。 */
+export interface UiControllerView {
+  readonly available: boolean
+  readonly reason?: string
+  readonly sessionId?: string
+  readonly phase?: 'idle' | 'candidate-pending' | 'tracking-tasks' | 'mixed'
+  readonly tasks: readonly {
+    readonly text: string
+    readonly at: number
+    readonly expiresAt: number
+  }[]
+  readonly candidates: readonly {
+    readonly id: string
+    readonly text: string
+    readonly kind: string
+    readonly scope: string
+    readonly at: number
+    readonly reason: string
+  }[]
+  readonly lastEventAt?: number | null
+}
+
+/** 控制器手动编辑的五个动作（与 `ControllerAdminEdit.kind` 同一取值域）。 */
+export type UiControllerAction =
+  | 'add-task'
+  | 'remove-task'
+  | 'clear-tasks'
+  | 'remove-candidate'
+  | 'clear-candidates'
+
+export interface UiControllerActInput {
+  readonly action: UiControllerAction
+  readonly sessionId?: string
+  readonly text?: string
+}
+
+/** 个人画像写入动作（v4.19.0）：能力轴被排除（它只在会话内存，不落盘）。 */
+export type UiPersonalEditInput =
+  | {
+      readonly action: 'declare'
+      readonly axis: string
+      readonly key: string
+      readonly value: string
+      readonly evidence?: readonly string[]
+    }
+  | {
+      readonly action: 'retract'
+      readonly axis: string
+      readonly key: string
+    }
 
 export interface UiStoreView {
   readonly scope: MemoryScope
@@ -306,6 +359,15 @@ export interface UiService {
   /** 个人画像页：读 `SERVICES.profile`；缺失/异常如实降级。 */
   personal(): Promise<UiPersonalView>
   /**
+   * 控制器设置页（v4.19.0）：读某会话的任务约束/候选/阶段。缺省用当前会话；
+   * 无管理端口/无会话 → available:false（不猜）。
+   */
+  controller(sessionId?: string): Promise<UiControllerView>
+  /** 控制器手动编辑（v4.19.0）：add/remove task、clear tasks、remove/clear candidates。 */
+  controllerAct(input: UiControllerActInput): Promise<UiActionResult>
+  /** 个人画像写入（v4.19.0）：declare / retract；能力轴被拒绝（只存在会话内存）。 */
+  personalAct(input: UiPersonalEditInput): Promise<UiActionResult>
+  /**
    * 会话隐私页的完整视图（v4.17）。未接线/异常 → 返回**完整形状**的降级视图，
    * 不抛到 HTTP 层（页面要能显示"未接线"而不是白屏）。
    */
@@ -347,6 +409,15 @@ export interface UiServiceDeps {
   readonly personal?: () => Promise<UiPersonalView>
   /** 按会话读项目画像（memory/index 闭包解析 catalog → projectRoot → profile）；缺省 = 未接线。 */
   readonly profileForSession?: (sessionId: string) => Promise<UiProfile>
+  /** 控制器管理端口（v4.19.0；由 memory/index 把 capture 的读写包成服务）；缺省 = 未接线。 */
+  readonly controllerAdmin?: ControllerAdminPort
+  /**
+   * 个人画像写入（v4.19.0；memory/index 闭包调 `SERVICES.profile.declare/retract`）。
+   * 允许同步或异步结果：profile 服务是异步的，provider 可以 await 后再返回。
+   */
+  readonly personalEdit?: (
+    input: UiPersonalEditInput,
+  ) => UiActionResult | Promise<UiActionResult>
   /** 确认动作（`createConfirmAction(confirmDeps)`）；缺省 = 功能未启用，动作如实拒绝。 */
   readonly confirm?: (input: {
     readonly action: UiConfirmAction
@@ -1017,7 +1088,135 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
   }
 
-  return { overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct, createMemory, updateMemory, deleteMemory, markMemory, sessions, personal }
+  async function controller(sessionId?: string): Promise<UiControllerView> {
+    const admin = deps.controllerAdmin
+    if (admin === undefined) {
+      return {
+        available: false,
+        reason: '未接线：记忆控制器管理端口不可用（capture 未装配）',
+        tasks: [],
+        candidates: [],
+      }
+    }
+    const requested = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const id = requested.length > 0 ? requested : currentSessionId()
+    if (id === null || id.length === 0) {
+      return { available: false, reason: '无会话归属：拿不到当前会话 id（不猜）', tasks: [], candidates: [] }
+    }
+    try {
+      const state = admin.state(id)
+      return {
+        available: true,
+        sessionId: id,
+        phase: state.phase,
+        tasks: state.tasks.map(task => ({ text: task.text, at: task.at, expiresAt: task.expiresAt })),
+        candidates: state.candidates.map(candidate => ({
+          id: candidate.id,
+          text: candidate.text,
+          kind: candidate.kind,
+          scope: candidate.scope,
+          at: candidate.at,
+          reason: candidate.reason,
+        })),
+        lastEventAt: state.lastEventAt,
+      }
+    } catch (error) {
+      return {
+        available: false,
+        reason: `控制器状态读取失败（已隔离）：${errorMessageOf(error)}`,
+        tasks: [],
+        candidates: [],
+      }
+    }
+  }
+
+  async function controllerAct(input: UiControllerActInput): Promise<UiActionResult> {
+    const action = input?.action
+    if (action !== 'add-task' && action !== 'remove-task' && action !== 'clear-tasks'
+      && action !== 'remove-candidate' && action !== 'clear-candidates') {
+      return { ok: false, text: `未执行：未知控制器动作 ${String(action)}。` }
+    }
+    const id = typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
+    if (id.length === 0) return { ok: false, text: '未执行：控制器编辑需要 sessionId。' }
+    if (id.length > 200) return { ok: false, text: '未执行：sessionId 最多 200 个字符。' }
+    const admin = deps.controllerAdmin
+    if (admin === undefined) return { ok: false, text: '未执行：记忆控制器管理未接线（capture 未装配）。' }
+    const text = typeof input.text === 'string' ? input.text.trim() : ''
+    if ((action === 'add-task' || action === 'remove-task' || action === 'remove-candidate') && text.length === 0) {
+      return { ok: false, text: '未执行：该动作需要 text。' }
+    }
+    if (action === 'add-task' && text.length > 200) {
+      return { ok: false, text: '未执行：任务文本最多 200 个字符。' }
+    }
+    let edit: ControllerAdminEdit
+    if (action === 'clear-tasks') edit = { kind: 'clear-tasks' }
+    else if (action === 'clear-candidates') edit = { kind: 'clear-candidates' }
+    else edit = { kind: action, text }
+    try {
+      const before = admin.state(id)
+      const after = admin.edit(id, edit)
+      const changed = action === 'clear-tasks'
+        ? before.tasks.length !== after.tasks.length
+        : action === 'clear-candidates'
+          ? before.candidates.length !== after.candidates.length
+          : before.tasks.length !== after.tasks.length || before.candidates.length !== after.candidates.length
+      if (!changed) return { ok: true, text: `未找到可改动项（重复或不存在），会话 ${id} 的控制器状态未变。` }
+      return {
+        ok: true,
+        text: `已更新会话 ${id} 的控制器：任务 ${after.tasks.length} 条、候选 ${after.candidates.length} 条。`,
+      }
+    } catch (error) {
+      return { ok: false, text: `控制器编辑失败（已隔离）：${errorMessageOf(error)}` }
+    }
+  }
+
+  async function personalAct(input: UiPersonalEditInput): Promise<UiActionResult> {
+    const action = input?.action
+    if (action !== 'declare' && action !== 'retract') {
+      return { ok: false, text: `未执行：未知个人画像动作 ${String(action)}。` }
+    }
+    const axis = typeof input.axis === 'string' ? input.axis.trim() : ''
+    if (axis.length === 0) return { ok: false, text: '未执行：需要 axis。' }
+    if (axis !== 'stable' && axis !== 'intent' && axis !== 'collaboration') {
+      return { ok: false, text: '未执行：axis 只能是 stable、intent 或 collaboration（能力轴只在会话内存，不可编辑）。' }
+    }
+    const key = typeof input.key === 'string' ? input.key.trim() : ''
+    if (key.length === 0) return { ok: false, text: '未执行：需要 key。' }
+    if (key.length > 200) return { ok: false, text: '未执行：key 最多 200 个字符。' }
+    let normalized: UiPersonalEditInput
+    if (action === 'retract') {
+      normalized = { action: 'retract', axis, key }
+    } else {
+      const value = typeof input.value === 'string' ? input.value.trim() : ''
+      if (value.length === 0) return { ok: false, text: '未执行：需要 value。' }
+      if (value.length > 2000) return { ok: false, text: '未执行：value 最多 2000 个字符。' }
+      const rawEvidence = input.evidence
+      if (rawEvidence !== undefined && (!Array.isArray(rawEvidence) || rawEvidence.some(item => typeof item !== 'string'))) {
+        return { ok: false, text: '未执行：evidence 必须是字符串数组。' }
+      }
+      normalized = {
+        action: 'declare',
+        axis,
+        key,
+        value,
+        ...(rawEvidence === undefined ? {} : { evidence: rawEvidence }),
+      }
+    }
+    const provider = deps.personalEdit
+    if (provider === undefined) return { ok: false, text: '未执行：个人画像写入未接线（SERVICES.profile 未挂载或未提供 declare/retract）。' }
+    try {
+      const result = await provider(normalized)
+      return { ok: result.ok, text: result.text }
+    } catch (error) {
+      return { ok: false, text: `个人画像写入失败（已隔离）：${errorMessageOf(error)}` }
+    }
+  }
+
+  return {
+    overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct,
+    createMemory, updateMemory, deleteMemory, markMemory, sessions, personal,
+    controller, controllerAct, personalAct,
+  }
 
   async function resolve(input: UiResolveInput): Promise<UiActionResult> {
     const { action } = input

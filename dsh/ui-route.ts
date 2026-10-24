@@ -5,8 +5,9 @@
  * - 只挂在宿主 `webServer` 的 `/omb/api` 前缀上；没有 webServer（CLI/桌面载体）时
  *   本路由不注册，侧边栏自然不出现——不假装已经可用；
  * - **读**：GET 只调用 `omb:ui` 服务；**写**入口只有用户点击触发的
- *   `/confirm`、`/resolve`、`/privacy`（会话隐私设置）、`/memory`（手动新建/编辑/
- *   删除/标记，v4.18）。**没有模型工具入口**：模型不能通过这些端点放宽隐私或改记忆；
+ *   `/confirm`、`/resolve`、`/privacy`、`/memory`（v4.18）、`/controller`（v4.19
+ *   控制器手动编辑）、`/personal`（v4.19 个人画像写入）。**没有模型工具入口**：
+ *   模型不能通过这些端点放宽隐私、改记忆或改个人画像；
  * - 同源保护：浏览器跨站请求带的 `Origin` 与 `Host` 不一致时 403（GET 的简单请求本来就
  *   不发 Origin，所以这层只在异常情形生效；不是权限边界，真正的边界是本机回环监听）；
  * - 所有响应 `no-store`，JSON 编码，错误不泄漏内部异常文本（只给类别）。
@@ -122,10 +123,11 @@ export function installUiRoute(
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
       if (req.method === 'POST') {
-        // 写入口只有四个：用户点击的确认/撤销、冲突裁决、会话隐私设置、手动记忆编辑。
-        // **没有模型工具调用它们**。
-        if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy' && path !== '/memory') {
-          json(res, 405, { error: 'write endpoints are /confirm, /resolve, /privacy, and /memory' })
+        // 写入口只有六个：确认/撤销、冲突裁决、会话隐私设置、手动记忆编辑、
+        // 控制器手动编辑、个人画像写入。**没有模型工具调用它们**。
+        if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy' && path !== '/memory'
+          && path !== '/controller' && path !== '/personal') {
+          json(res, 405, { error: 'write endpoints are /confirm, /resolve, /privacy, /memory, /controller, and /personal' })
           return
         }
         const contentType = req.headers['content-type'] ?? ''
@@ -246,6 +248,94 @@ export function installUiRoute(
           json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
           return
         }
+        if (path === '/controller') {
+          const action = record?.['action']
+          if (action !== 'add-task' && action !== 'remove-task' && action !== 'clear-tasks'
+            && action !== 'remove-candidate' && action !== 'clear-candidates') {
+            json(res, 400, { error: 'action 必须是 add-task、remove-task、clear-tasks、remove-candidate 或 clear-candidates' })
+            return
+          }
+          const rawSessionId = record?.['sessionId']
+          if (typeof rawSessionId !== 'string' || rawSessionId.trim().length === 0) {
+            json(res, 400, { error: '缺少 sessionId' })
+            return
+          }
+          const sessionId = rawSessionId.trim()
+          if (sessionId.length > 200) {
+            json(res, 400, { error: 'sessionId 最多 200 个字符' })
+            return
+          }
+          const rawText = record?.['text']
+          if (rawText !== undefined && typeof rawText !== 'string') {
+            json(res, 400, { error: 'text 必须是字符串' })
+            return
+          }
+          const text = typeof rawText === 'string' ? rawText.trim() : ''
+          if (action !== 'clear-tasks' && action !== 'clear-candidates' && text.length === 0) {
+            json(res, 400, { error: '该动作需要 text' })
+            return
+          }
+          if (action === 'add-task' && text.length > 200) {
+            json(res, 400, { error: '任务文本最多 200 个字符' })
+            return
+          }
+          const outcome = await ui.controllerAct({ action, sessionId, ...(text.length === 0 ? {} : { text }) })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
+        if (path === '/personal') {
+          const action = record?.['action']
+          if (action !== 'declare' && action !== 'retract') {
+            json(res, 400, { error: 'action 必须是 declare 或 retract' })
+            return
+          }
+          const rawAxis = record?.['axis']
+          const axis = typeof rawAxis === 'string' ? rawAxis.trim() : ''
+          if (axis !== 'stable' && axis !== 'intent' && axis !== 'collaboration') {
+            json(res, 400, { error: 'axis 只能是 stable、intent 或 collaboration（能力轴不可编辑）' })
+            return
+          }
+          const rawKey = record?.['key']
+          const key = typeof rawKey === 'string' ? rawKey.trim() : ''
+          if (key.length === 0) {
+            json(res, 400, { error: '缺少 key' })
+            return
+          }
+          if (key.length > 200) {
+            json(res, 400, { error: 'key 最多 200 个字符' })
+            return
+          }
+          if (action === 'retract') {
+            const outcome = await ui.personalAct({ action, axis, key })
+            json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+            return
+          }
+          const rawValue = record?.['value']
+          const value = typeof rawValue === 'string' ? rawValue.trim() : ''
+          if (value.length === 0) {
+            json(res, 400, { error: '缺少 value' })
+            return
+          }
+          if (value.length > 2000) {
+            json(res, 400, { error: 'value 最多 2000 个字符' })
+            return
+          }
+          const rawEvidence = record?.['evidence']
+          if (rawEvidence !== undefined
+            && (!Array.isArray(rawEvidence) || rawEvidence.some(item => typeof item !== 'string'))) {
+            json(res, 400, { error: 'evidence 必须是字符串数组' })
+            return
+          }
+          const outcome = await ui.personalAct({
+            action,
+            axis,
+            key,
+            value,
+            ...(Array.isArray(rawEvidence) ? { evidence: rawEvidence as string[] } : {}),
+          })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
         if (path === '/resolve') {
           const action = record?.['action']
           const fromId = record?.['fromId']
@@ -301,6 +391,12 @@ export function installUiRoute(
       }
       if (path === '/personal') {
         json(res, 200, await ui.personal())
+        return
+      }
+      if (path === '/controller') {
+        const sessionId = url.searchParams.get('sessionId')
+        const trimmed = sessionId === null ? '' : sessionId.trim()
+        json(res, 200, await ui.controller(trimmed.length > 0 ? trimmed : undefined))
         return
       }
       if (path === '/privacy') {

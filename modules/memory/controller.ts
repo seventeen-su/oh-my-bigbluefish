@@ -138,7 +138,7 @@ function actionId(prefix: string, ...parts: readonly string[]): string {
 }
 
 /** 由表内容推导阶段（纯函数，不存影子变量）。 */
-function derivePhase(state: Pick<ControllerSessionState, 'candidates' | 'tasks'>): ControllerPhase {
+export function derivePhase(state: Pick<ControllerSessionState, 'candidates' | 'tasks'>): ControllerPhase {
   const candidates = state.candidates.length > 0
   const tasks = state.tasks.length > 0
   if (candidates && tasks) return 'mixed'

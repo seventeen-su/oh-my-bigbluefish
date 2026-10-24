@@ -3,7 +3,7 @@
  */
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
+import type { ControllerAdminPort, ControllerAdminState, MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
 import { openMemoryStore, asConfirmStore, asRecordScanner, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { createConfirmAction } from '../../../modules/memory/confirm.js'
 import { createUiService } from '../../../modules/memory/ui.js'
@@ -743,5 +743,162 @@ describe('createUiService', () => {
     const absent = await createUiService({ stores: minimalStores }).profile('s9')
     expect(absent.available).toBe(false)
     expect(absent.reason).toContain('未接线')
+  })
+
+  // ── v4.19.0：控制器手动编辑 / 个人画像写入 ─────────────────────────
+  function controllerState(): ControllerAdminState {
+    return {
+      phase: 'mixed',
+      tasks: [{ text: '别改测试', at: NOW, expiresAt: NOW + 60_000 }],
+      candidates: [{ id: 'c1', text: '项目统一 pnpm', kind: 'semantic', scope: 'project', at: NOW, reason: 'intent:stable-decision' }],
+      lastEventAt: NOW,
+    }
+  }
+
+  it('controller()：正常映射任务/候选/阶段；缺端口/缺会话/异常都降级为完整形状', async () => {
+    const admin: ControllerAdminPort = {
+      state: () => controllerState(),
+      edit: () => controllerState(),
+    }
+    const service = createUiService({
+      stores: minimalStores,
+      controllerAdmin: admin,
+      currentSession: () => 's1',
+      clock: fixedClock(),
+    })
+    const view = await service.controller()
+    expect(view).toMatchObject({
+      available: true,
+      sessionId: 's1',
+      phase: 'mixed',
+      lastEventAt: NOW,
+      tasks: [{ text: '别改测试', at: NOW, expiresAt: NOW + 60_000 }],
+      candidates: [{ id: 'c1', text: '项目统一 pnpm', kind: 'semantic', scope: 'project' }],
+    })
+    expect((await service.controller('s2')).sessionId).toBe('s2')
+
+    const absent = await createUiService({ stores: minimalStores }).controller('s1')
+    expect(absent).toMatchObject({ available: false, tasks: [], candidates: [] })
+    expect(absent.reason).toContain('未接线')
+
+    const noSession = await createUiService({ stores: minimalStores, controllerAdmin: admin }).controller()
+    expect(noSession.available).toBe(false)
+    expect(noSession.reason).toContain('无会话归属')
+
+    const broken = createUiService({
+      stores: minimalStores,
+      currentSession: () => 's1',
+      controllerAdmin: {
+        state: () => {
+          throw new Error('控制器坏了')
+        },
+        edit: () => controllerState(),
+      },
+    })
+    const degraded = await broken.controller()
+    expect(degraded.available).toBe(false)
+    expect(degraded.reason).toContain('已隔离')
+  })
+
+  it('controllerAct()：五动作透传、参数校验、admin 抛错隔离、无改动如实回执', async () => {
+    const calls: { sessionId: string; kind: string; text?: string }[] = []
+    const admin: ControllerAdminPort = {
+      state: () => ({ phase: 'idle', tasks: [], candidates: [], lastEventAt: null }),
+      edit: (sessionId, edit) => {
+        calls.push({ sessionId, kind: edit.kind, ...(('text' in edit) ? { text: edit.text } : {}) })
+        const tasks = edit.kind === 'add-task'
+          ? [{ text: edit.text, at: NOW, expiresAt: NOW + 60_000 }]
+          : []
+        return { phase: tasks.length > 0 ? 'tracking-tasks' : 'idle', tasks, candidates: [], lastEventAt: null }
+      },
+    }
+    const service = createUiService({
+      stores: minimalStores,
+      controllerAdmin: admin,
+      currentSession: () => 's1',
+      clock: fixedClock(),
+    })
+    const added = await service.controllerAct({ action: 'add-task', sessionId: 's1', text: '别改测试' })
+    expect(added.ok).toBe(true)
+    expect(added.text).toContain('已更新会话 s1')
+    expect(await service.controllerAct({ action: 'remove-task', sessionId: 's1', text: '别改测试' })).toMatchObject({ ok: true })
+    expect(await service.controllerAct({ action: 'clear-tasks', sessionId: 's1' })).toMatchObject({ ok: true })
+    expect(await service.controllerAct({ action: 'remove-candidate', sessionId: 's1', text: 'x' })).toMatchObject({ ok: true })
+    expect(await service.controllerAct({ action: 'clear-candidates', sessionId: 's1' })).toMatchObject({ ok: true })
+    expect(calls.map(call => call.kind)).toEqual(['add-task', 'remove-task', 'clear-tasks', 'remove-candidate', 'clear-candidates'])
+
+    // 非法参数：一律未执行且不触碰 admin
+    const before = calls.length
+    expect((await service.controllerAct({ action: 'nope' as never, sessionId: 's1' })).ok).toBe(false)
+    expect((await service.controllerAct({ action: 'add-task', text: 'x' })).text).toContain('sessionId')
+    expect((await service.controllerAct({ action: 'add-task', sessionId: 'x'.repeat(201), text: 'x' })).ok).toBe(false)
+    expect((await service.controllerAct({ action: 'add-task', sessionId: 's1' })).text).toContain('text')
+    expect((await service.controllerAct({ action: 'add-task', sessionId: 's1', text: 'x'.repeat(201) })).ok).toBe(false)
+    expect(calls.length).toBe(before)
+    expect((await createUiService({ stores: minimalStores }).controllerAct({ action: 'clear-tasks', sessionId: 's1' })).text).toContain('未接线')
+
+    // 无改动：ok=true，但文案说"未变"（不假装改成功）
+    const noop = await service.controllerAct({ action: 'clear-tasks', sessionId: 's1' })
+    expect(noop.ok).toBe(true)
+    expect(noop.text).toContain('未变')
+
+    const broken = createUiService({
+      stores: minimalStores,
+      controllerAdmin: {
+        ...admin,
+        edit: () => {
+          throw new Error('写失败')
+        },
+      },
+    })
+    const isolated = await broken.controllerAct({ action: 'clear-tasks', sessionId: 's1' })
+    expect(isolated.ok).toBe(false)
+    expect(isolated.text).toContain('已隔离')
+  })
+
+  it('personalAct()：declare/retract 透传；能力轴与非法参数拒绝；provider 抛出/拒绝如实返回', async () => {
+    const edits: unknown[] = []
+    const service = createUiService({
+      stores: minimalStores,
+      clock: fixedClock(),
+      personalEdit: async input => {
+        edits.push(input)
+        return { ok: true, text: input.action === 'declare' ? '已写入个人画像。' : '已删除该槽位。' }
+      },
+    })
+    expect(await service.personalAct({ action: 'declare', axis: 'stable', key: 'pkg', value: 'pnpm', evidence: ['s1'] }))
+      .toMatchObject({ ok: true, text: '已写入个人画像。' })
+    expect(await service.personalAct({ action: 'retract', axis: 'stable', key: 'pkg' }))
+      .toMatchObject({ ok: true, text: '已删除该槽位。' })
+    expect(edits).toHaveLength(2)
+
+    const before = edits.length
+    expect((await service.personalAct({ action: 'declare', axis: 'capability', key: 'x', value: 'y' })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'declare', axis: 'nope', key: 'x', value: 'y' })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'declare', axis: 'stable', key: '  ', value: 'y' })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'declare', axis: 'stable', key: 'k', value: ' ' })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'declare', axis: 'stable', key: 'k', value: 'x'.repeat(2001) })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'declare', axis: 'stable', key: 'k', value: 'v', evidence: 'bad' as never })).ok).toBe(false)
+    expect((await service.personalAct({ action: 'nope', axis: 'stable', key: 'k' } as never)).ok).toBe(false)
+    expect(edits.length).toBe(before)
+
+    expect((await createUiService({ stores: minimalStores }).personalAct({ action: 'retract', axis: 'stable', key: 'k' })).text).toContain('未接线')
+
+    const broken = createUiService({
+      stores: minimalStores,
+      personalEdit: () => {
+        throw new Error('画像写失败')
+      },
+    })
+    const isolated = await broken.personalAct({ action: 'retract', axis: 'stable', key: 'k' })
+    expect(isolated.ok).toBe(false)
+    expect(isolated.text).toContain('已隔离')
+
+    const refused = createUiService({
+      stores: minimalStores,
+      personalEdit: () => ({ ok: false, text: '未写入：槽位不存在' }),
+    })
+    expect(await refused.personalAct({ action: 'retract', axis: 'stable', key: 'k' }))
+      .toMatchObject({ ok: false, text: '未写入：槽位不存在' })
   })
 })

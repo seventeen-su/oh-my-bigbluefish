@@ -121,7 +121,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('@media (prefers-reduced-motion: reduce)')
   })
 
-  it('手动记忆操作：新建/编辑/删除/标记都在前端可达', () => {
+  it('手动记忆操作：新建/编辑/删除/标记/取代都在前端可达', () => {
     const code = source()
     expect(code).toContain("action: 'create'")
     expect(code).toContain("action: 'update'")
@@ -134,7 +134,26 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("'上一页'")
     expect(code).toContain("'下一页'")
     expect(code).toContain('h(MemoryForm')
+    expect(code).toContain("'取代…'")
+    expect(code).toContain("action: 'supersede'")
     expect(code).toContain('新建')
+  })
+
+  it('状态机与个人画像也可手动编辑（v4.19）', () => {
+    const code = source()
+    expect(code).toContain("api('/controller'")
+    expect(code).toContain("post('/controller'")
+    for (const action of ['add-task', 'remove-task', 'remove-candidate']) {
+      expect(code).toContain(`action: '${action}'`)
+    }
+    expect(code).toContain("'clear-tasks'")
+    expect(code).toContain("'clear-candidates'")
+    expect(code).toContain("title: '状态机'")
+    expect(code).toContain("action: 'declare'")
+    expect(code).toContain("action: 'retract'")
+    expect(code).toContain("post('/personal'")
+    expect(code).toContain('新增条目')
+    expect(code).toContain('改为确认')
   })
 
   it('项目页：会话目录、归档灰色不可读、深度与隐私；个人画像页', () => {
