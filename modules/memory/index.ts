@@ -21,6 +21,7 @@ import type {
   ModuleManifest,
   ModuleRegistration,
   ControllerAdminEdit,
+  ControllerAdminPort,
   SecondaryChannelRegistry,
   SessionCatalogPort,
   StorageHostPort,
@@ -1257,6 +1258,8 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
         // ── 命令并入前端（v4.20.0）：反馈/推理深度不再有斜杠命令 ──
         feedbackRun,
         setDepth: (sessionId, depth) => kernel.setFocus(sessionId, depth, '设置台手动设置'),
+        // v4.21：状态机端口必须显式注入 deps，否则 ui 永远显示“未接线”。
+        controllerAdmin: kernel.service<ControllerAdminPort>(SERVICES.memoryControllerAdmin),
         // ── 项目页（v4.18）：会话目录 / 活跃 / 根 / 深度来自各自内核服务 ──
         sessionCatalog: kernel.service<SessionCatalogPort>(SERVICES.sessionCatalog),
         sessionRuntime: kernel.service<{

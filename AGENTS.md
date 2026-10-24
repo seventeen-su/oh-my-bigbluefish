@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.20.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.21.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,11 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.20.0（当前） = 大肥鱼增强设置台（x2）**：标题改名“大肥鱼增强”；2D 无阴影卡片
+- **v4.21.0（当前） = 设置台精修（x2）**：导航与内容拼成一张 2D 大卡（同色竖线分隔）、
+  删除概览/默认空白、筛选与新建改原生 `<select>`、状态机端口注入 deps（不再永远“未接线”）、
+  工作区与母会话默认收起（箭头 + grid-rows 动效）、子会话 padding 缩进、旧 OMB 会话
+  （无 `agentPreset`）兼容、运行中会话设置禁用。契约：`docs/v4.21.0-settings-console-refine.md`。
+- **v4.20.0 = 大肥鱼增强设置台（x2）**：标题改名“大肥鱼增强”；2D 无阴影卡片
   （`settings-card-fill/stroke`）、自动跟踪刷新（无刷新按钮与右上状态）、五页导航新增
   “状态机”总页（`GET /machines`，按工作区聚合全部 OMB 会话的控制器状态）、项目页改成
   默认折叠的工作区树（`parentId` 子会话跟随）、记忆列表 30 条无限滚动、单字 `searchFuzzy`

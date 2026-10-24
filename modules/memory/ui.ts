@@ -1076,7 +1076,8 @@ export function createUiService(deps: UiServiceDeps): UiService {
       )
       const items: UiSessionItem[] = []
       for (const entry of listing.items) {
-        if (entry.agentPreset !== 'omb') continue
+        // 旧版 OMB 会话没有 agentPreset 字段：不能因此把它们整条丢掉。
+        if (entry.agentPreset !== 'omb' && entry.agentPreset !== null) continue
         let root: string | null = null
         if (deps.rootOf !== undefined && entry.cwd.length > 0) {
           try {

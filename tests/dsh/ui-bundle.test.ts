@@ -40,19 +40,21 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("post('/memory'")
     expect(code).toContain("post('/privacy'")
     expect(code).toContain("post('/resolve'")
-    for (const path of ["api('/overview')", "api('/list'", "api('/detail'", "api('/sessions')", "api('/personal')", "api('/profile'", "api('/machines')", "post('/feedback'", "post('/depth'"]) {
+    for (const path of ["api('/list'", "api('/detail'", "api('/sessions')", "api('/personal')", "api('/profile'", "api('/machines')", "post('/feedback'", "post('/depth'"]) {
       expect(code).toContain(path)
     }
   })
 
-  it('标题与五个页面（合并后的信息架构）', () => {
+  it('标题与四个页面（无概览，默认不激活）', () => {
     const code = source()
     expect(code).toContain("'大肥鱼增强'")
     expect(code).not.toContain("'OMB 设置'")
     expect(code).not.toContain('OMB 记忆')
-    for (const label of ['概览', '记忆', '项目', '状态机', '个人画像']) {
+    for (const label of ['记忆', '项目', '状态机', '个人画像']) {
       expect(code).toContain(`label: '${label}'`)
     }
+    expect(code).not.toContain("label: '概览'")
+    expect(code).toContain('const [page, setPage] = React.useState(null)')
     // 合并后的旧页签不再作为主导航
     expect(code).not.toContain("label: '候选确认'")
     expect(code).not.toContain("label: '会话隐私'")
@@ -88,7 +90,7 @@ describe('OMB 设置 bundle 发布契约', () => {
   it('排版比例尺、弹性对齐与容器查询', () => {
     const code = source()
     expect(code).toContain('container-type: inline-size')
-    expect(code).toContain('@container omb-panel (min-width: 600px)')
+    expect(code).toContain('@container omb-panel (min-width: 618px)')
     expect(code).toContain('@container omb-panel (min-width: 820px)')
     expect(code).toContain('@container omb-panel (min-width: 760px)')
     expect(code).toContain('repeat(2, minmax(0, 1fr))')
@@ -156,6 +158,42 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('改为确认')
   })
 
+  it('筛选/新建/设置使用标准下拉框，无滑块控件', () => {
+    const code = source()
+    expect(code).toContain('function Select(')
+    expect(code).toContain('className: \'omb-select\'')
+    expect(code).toContain("h(Select, { label: '库'")
+    expect(code).toContain("h(Select, { label: '类型'")
+    expect(code).toContain('推理深度')
+    expect(code).not.toContain('SegmentedControl')
+    expect(code).not.toContain('type="range"')
+    expect(code).not.toContain('Slider')
+  })
+
+  it('工作区/母会话默认收起：箭头 + 展开动效 + 子会话缩进不溢出', () => {
+    const code = source()
+    expect(code).toContain("className: 'omb-collapse'")
+    expect(code).toContain('data-open')
+    expect(code).toContain('omb-session-toggle')
+    expect(code).toContain("childOpen ? '▴' : '▾'")
+    expect(code).toContain('depth * 14')
+    expect(code).toContain('paddingLeft: `${indent}px`')
+    expect(code).toContain('grid-template-rows 200ms')
+  })
+
+  it('运行中的会话设置锁定，只读/封存状态机不可改', () => {
+    const code = source()
+    expect(code).toContain('会话运行中：设置已锁定')
+    expect(code).toContain('disabled: busy || selected.active')
+    expect(code).toContain('readOnly: selected.privacy.mode === \'read-only\'')
+    expect(code).toContain('封存会话不可读')
+  })
+
+  it('状态机管理端口已注入 UI deps（不再永远未接线）', () => {
+    const source = readFileSync(join(ROOT, 'modules', 'memory', 'index.ts'), 'utf8')
+    expect(source).toContain('controllerAdmin: kernel.service<ControllerAdminPort>(SERVICES.memoryControllerAdmin)')
+  })
+
   it('项目页：会话目录、归档灰色不可读、深度与隐私；个人画像页', () => {
     const code = source()
     expect(code).toContain('已归档会话不可读')
@@ -172,15 +210,14 @@ describe('OMB 设置 bundle 发布契约', () => {
     for (const banned of ['页面只读', '宽窗口详情', '写操作只有你点击的按钮', '扫描上限']) {
       expect(code).not.toContain(banned)
     }
-    expect(code).toContain("'记忆与运行状态'")
     expect(code).toContain("'搜索、编辑与确认记忆'")
-    expect(code).toContain('记忆库就绪')
+    expect(code).toContain("'大肥鱼增强'")
   })
 
   it('共享控件与主题 token；无十六进制色值', () => {
     const code = source()
     expect(code).toContain("require('@deepseek-ai/dsh-client-ui-primitives')")
-    for (const name of ['Button', 'Input', 'Pill', 'Tag', 'SegmentedControl', 'StateDot', 'Modal', 'TextShimmer', 'DisclosureRow']) {
+    for (const name of ['Button', 'Input', 'Modal', 'Tag', 'StateDot', 'TextShimmer', 'DisclosureRow']) {
       expect(code).toMatch(new RegExp(`\\b${name}\\b`))
     }
     expect(code).toContain('var(--dsw-alias-label-primary)')

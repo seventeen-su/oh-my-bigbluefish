@@ -1415,3 +1415,28 @@
 - 标题与侧边栏：“大肥鱼增强”。
 
 详见 `docs/v4.20.0-settings-console.md`。
+
+---
+
+# OMB v4.21.0 交付记录（2026-10-24，x2）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.21.0**（`25 功能 / 124 小功能`；x2：设置台精修） |
+| 构建 | **g139**；`generation: 139`、`outDir: lib-gen/g139` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **124 files / 1552 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：拼接单卡、空白默认页、下拉框、状态机有内容、母子会话折叠箭头/动效/缩进、运行中会话设置灰显 |
+
+## 本轮修复（用户 7 点）
+
+1. 侧边栏与主卡拼接为一张 2D 大卡，同色 0.5px 竖线分隔。
+2. 删除概览页；默认 `page=null`，右侧主卡空白，点击侧边栏才进入子页。
+3. 记忆筛选/新建/项目设置/画像轴全部改原生 `<select>`，不再用 SegmentedControl/Pill；无滑块。
+4. 状态机“未接线”根因：`createUiService` 漏传 `controllerAdmin`；已注入
+   `kernel.service<ControllerAdminPort>(SERVICES.memoryControllerAdmin)`，并有契约测试。
+5. 母子会话：只有同工作区且真实挂在母会话下才标“子会话”；旧 OMB 会话（无 agentPreset）
+   不再被过滤；无标题时用“会话 短id”不冒充 cwd；子会话 padding 缩进不溢出；
+   工作区与母会话默认收起，箭头 ▾/▴ + grid-rows 200ms 动效。
+6. 运行中的会话：推理深度/隐私下拉框禁用（灰色）+“设置已锁定”提示。
+7. 记忆库滚动加载后筛选失效：筛选变化时立即清空列表、失效分页请求并重置 seq，
+   加载中禁止 loadMore，避免旧页追加到新筛选。

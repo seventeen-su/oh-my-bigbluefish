@@ -15,9 +15,9 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const {
-      Button, Input, Modal, Pill, Tag, SegmentedControl, StateDot, TextShimmer, DisclosureRow,
+      Button, Input, Modal, Tag, StateDot, TextShimmer, DisclosureRow,
       IconCheckOutlineRegular, IconChecklistOutlineRegular, IconCloseOutlineRegular,
-      IconDatabaseOutlineRegular, IconEditOutlineRegular, IconGaugeOutlineRegular,
+      IconDatabaseOutlineRegular, IconEditOutlineRegular,
       IconPlusOutlineRegular, IconTrashOutlineRegular,
       IconUserOutlineRegular, IconWarningOutlineRegular, IconWorkspaceTreeOutlineRegular,
     } = primitives
@@ -28,14 +28,12 @@ window.__ModuleLoader__.load({
     const TITLE = '大肥鱼增强'
 
     const NAV = [
-      { value: 'overview', label: '概览', icon: IconGaugeOutlineRegular },
       { value: 'memory', label: '记忆', icon: IconDatabaseOutlineRegular },
       { value: 'project', label: '项目', icon: IconWorkspaceTreeOutlineRegular },
       { value: 'machines', label: '状态机', icon: IconChecklistOutlineRegular },
       { value: 'personal', label: '个人画像', icon: IconUserOutlineRegular },
     ]
     const PAGE_HINTS = {
-      overview: '记忆与运行状态',
       memory: '搜索、编辑与确认记忆',
       project: '按工作区展开会话',
       machines: '项目级跨会话与跨工作区状态',
@@ -89,13 +87,17 @@ window.__ModuleLoader__.load({
       .omb-title { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
       .omb-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
 
-      .omb-body { flex: 1 1 auto; min-height: 0; display: flex; gap: 12px; }
+      .omb-body {
+        flex: 1 1 auto; min-height: 0; display: flex; gap: 0; overflow: hidden;
+        background: var(--dsw-alias-bg-layer-2);
+        border: 0.5px solid var(--dsw-alias-border-l2);
+        border-radius: var(--dsw-radius-lg);
+      }
       .omb-nav {
         flex: none; width: 52px; box-sizing: border-box; padding: 6px;
         display: flex; flex-direction: column; gap: 2px; overflow-y: auto;
-        background: var(--dsw-alias-bg-layer-2);
-        border-radius: var(--dsw-radius-lg);
-        border: 0.5px solid var(--dsw-alias-border-l2);
+        background: transparent; border: none; border-right: 0.5px solid var(--dsw-alias-border-l2);
+        border-radius: 0;
         user-select: none;
         transition: width 180ms var(--ds-ease-in-out, ease-out), padding 180ms var(--ds-ease-in-out, ease-out);
       }
@@ -120,9 +122,7 @@ window.__ModuleLoader__.load({
       .omb-content {
         flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box;
         display: flex; flex-direction: column; gap: 12px; padding: 16px;
-        background: var(--dsw-alias-bg-layer-2);
-        border-radius: var(--dsw-radius-lg);
-        border: 0.5px solid var(--dsw-alias-border-l2);
+        background: transparent; border: none; border-radius: 0;
         transition: padding 180ms var(--ds-ease-in-out, ease-out);
       }
       .omb-content-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; user-select: none; }
@@ -146,6 +146,8 @@ window.__ModuleLoader__.load({
       .omb-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
       .omb-section-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; user-select: none; }
       .omb-grid { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .omb-grid > * { min-width: 0; }
+      .omb-detail .omb-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
       .omb-card {
         display: flex; flex-direction: column; gap: 4px; min-width: 0;
         padding: 16px; box-sizing: border-box;
@@ -163,9 +165,19 @@ window.__ModuleLoader__.load({
       .omb-selectable { user-select: text; }
       .omb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
       .omb-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-      .omb-search { flex: 1 1 220px; min-width: 150px; }
-      .omb-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-
+      .omb-toolbar > * { flex: 0 1 auto; min-width: 0; }
+      .omb-toolbar > .omb-search { flex: 1 1 220px; }
+      .omb-search { flex: 1 1 220px; min-width: 150px; max-width: 520px; }
+      .omb-select-field { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+      .omb-select {
+        height: 30px; max-width: 190px; box-sizing: border-box;
+        padding: 0 26px 0 8px; border: 0.5px solid var(--dsw-alias-border-l3);
+        border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-layer-1);
+        color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; line-height: 28px;
+        cursor: pointer; user-select: none;
+      }
+      .omb-select:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 1px; }
+      .omb-select:disabled { opacity: 0.5; cursor: default; }
       .omb-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 18px 16px; background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md); border: 0.5px solid var(--dsw-alias-settings-card-stroke); user-select: none; }
       .omb-empty-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; }
       .omb-empty-hint { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
@@ -191,6 +203,27 @@ window.__ModuleLoader__.load({
       .omb-row-sub { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .omb-workspace-group { display: flex; flex-direction: column; gap: 4px; }
       .omb-workspace-sessions { display: flex; flex-direction: column; gap: 4px; margin-left: 10px; padding-left: 8px; border-left: 0.5px solid var(--dsw-alias-border-l2); }
+      .omb-collapse { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 200ms var(--ds-ease-in-out, ease-out); }
+      .omb-collapse[data-open='true'] { grid-template-rows: 1fr; }
+      .omb-collapse > div { overflow: hidden; min-height: 0; }
+      .omb-row-split { flex-direction: row; align-items: center; gap: 4px; padding: 0; }
+      .omb-session-main {
+        flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px;
+        padding: 10px 12px; border: none; background: transparent; color: inherit;
+        font: inherit; text-align: left; cursor: pointer;
+      }
+      .omb-session-toggle {
+        flex: none; width: 28px; height: 28px; padding: 0; border: none; border-radius: var(--dsw-radius-md);
+        background: transparent; color: var(--dsw-alias-label-secondary);
+        font: inherit; font-size: 13px; line-height: 28px; cursor: pointer;
+        transition: background-color 120ms var(--ds-ease-in-out, ease-out);
+      }
+      .omb-session-toggle:hover { background: var(--dsw-alias-interactive-bg-hover); }
+      .omb-session-toggle:focus-visible, .omb-session-main:focus-visible {
+        outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+        outline-offset: -2px;
+      }
+      .omb-chevron { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); user-select: none; }
 
       .omb-detail-pane { position: absolute; inset: 0; z-index: 2; display: flex; min-width: 0; min-height: 0;
         transform: translateX(100%); opacity: 0; visibility: hidden;
@@ -231,7 +264,7 @@ window.__ModuleLoader__.load({
       .omb-scroll::-webkit-scrollbar, .omb-list::-webkit-scrollbar,
       .omb-detail::-webkit-scrollbar, .omb-nav::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
-      @container omb-panel (min-width: 600px) {
+      @container omb-panel (min-width: 618px) {
         .omb-page { padding: 20px 24px; gap: 16px; }
         .omb-nav { width: 190px; padding: 10px 8px; }
         .omb-nav-label { opacity: 1; }
@@ -249,12 +282,15 @@ window.__ModuleLoader__.load({
         }
         .omb-workspace[data-detail='open'] > .omb-detail-pane { flex-basis: clamp(320px, 48%, 560px); opacity: 1; transform: none; }
       }
+      @container omb-panel (max-width: 617px) {
+        .omb-nav { width: 48px; padding: 4px; }
+        .omb-nav-label { display: none; }
+        .omb-nav-cell { justify-content: center; padding: 6px; min-height: 42px; }
+      }
       @container omb-panel (max-width: 520px) {
         .omb-page { padding: 12px; gap: 10px; }
-        .omb-nav { width: 48px; padding: 4px; }
         .omb-content { padding: 12px; }
         .omb-grid { grid-template-columns: minmax(0, 1fr); }
-        .omb-nav-cell { min-height: 42px; padding: 6px; }
       }
       @media (pointer: coarse) { .omb-nav-cell, .omb-row { min-height: 44px; } }
       @media (prefers-reduced-motion: reduce) {
@@ -320,6 +356,12 @@ window.__ModuleLoader__.load({
       return parts[parts.length - 1] || String(path || '')
     }
 
+    /** 会话显示名：有标题用标题；旧日志没有标题时用短 id，不用 cwd 冒充同名。 */
+    function sessionName(item) {
+      if (item && typeof item.title === 'string' && item.title.length > 0) return item.title
+      return `会话 ${shortId(item && item.id ? item.id : '')}`
+    }
+
     function modeText(mode) { return MODE_TEXT[mode] || String(mode || '未知') }
     function originText(origin) { return ORIGIN_TEXT[origin] || String(origin || '未知') }
     function depthText(depth) { return DEPTH_TEXT[depth] || (depth ? String(depth) : '默认') }
@@ -355,8 +397,18 @@ window.__ModuleLoader__.load({
       }, children)
     }
 
-    function StatCard({ label, value, note, state }) {
-      return h('div', { className: 'omb-card' },
+    function Select({ label, value, options, onChange, disabled }) {
+      return h('label', { className: 'omb-select-field' },
+        label ? h('span', { className: 'omb-field-label' }, label) : null,
+        h('select', {
+          className: 'omb-select', value, disabled,
+          'aria-label': label || undefined,
+          onChange: (event) => onChange(event.target.value),
+        },
+        ...options.map((option) => h('option', { key: option.value, value: option.value }, option.label))))
+    }
+
+    function StatCard({ label, value, note, state }) {      return h('div', { className: 'omb-card' },
         h('span', { className: 'omb-card-label' }, label),
         state === undefined ? h('span', { className: 'omb-card-value' }, value) : h('span', { className: 'omb-meta' }, h(StateDot, { state }), value),
         note ? h('span', { className: 'omb-card-note' }, note) : null)
@@ -406,53 +458,6 @@ window.__ModuleLoader__.load({
     }
 
     // ── 概览：记忆 + 运行状态（同屏三级卡片，无折叠、无跳转按钮） ──
-    function OverviewPage({ refreshTick }) {
-      const overview = useLoad(() => api('/overview'), [refreshTick])
-      const runtime = useLoad(() => api('/runtime'), [refreshTick])
-      const data = overview.data
-      const rt = runtime.data
-      const ready = data ? data.ready : null
-      const limited = data ? data.stores.some((store) => store.scanLimited) : false
-      const statusState = overview.error ? 'warning' : ready === null ? 'ongoing' : ready ? 'done' : 'error'
-      const statusText = overview.error ? '记忆库不可用' : ready === null ? '读取中' : ready ? '记忆库就绪' : '记忆库未就绪'
-      const activity = rt && rt.activity
-      return h('div', { className: 'omb-scroll' },
-        h('div', { className: 'omb-grid' },
-          h(StatCard, { label: '记忆库', value: statusText, state: statusState, note: data && data.detail ? data.detail : '' }),
-          h(StatCard, { label: '活跃条目', value: data ? String(data.totalActive) : '—', note: limited ? '统计最近 500 条' : '全部已打开库' }),
-          h(StatCard, { label: '待确认', value: data ? String(data.totalCandidates) : '—', note: data && data.totalCandidates > 0 ? '去“记忆”里处理' : '没有待确认' }),
-          h(StatCard, { label: '项目库', value: data ? `${data.openProjects.length}/${data.maxOpenProjects}` : '—', note: data && data.openProjects.length > 0 ? data.openProjects[0] : '无' }),
-          h(StatCard, { label: '版本', value: rt ? rt.version || '未知' : '—' }),
-          h(StatCard, { label: '隐私闸门', value: rt && rt.privacy ? (rt.privacy.allowWrite ? '可写' : '禁写') : '未知', state: rt && rt.privacy ? (rt.privacy.allowWrite ? 'done' : 'warning') : 'idle', note: rt && rt.privacy ? rt.privacy.reason : '未接线' }),
-          h(StatCard, { label: '事件控制器', value: rt && rt.controller ? rt.controller.mode : '未知', note: rt && rt.controller ? `${rt.controller.events || 0} 事件 · 写入 ${rt.controller.persisted || 0}` : '' }),
-          h(StatCard, { label: '主动提示', value: rt && rt.capture ? String(rt.capture.proactiveCues || 0) : '0', note: rt && rt.capture ? `跟进 ${rt.capture.cueFollowUps || 0} 次` : '' })),
-        h(Section, {
-          title: '记忆分布',
-          aside: limited ? h('span', { className: 'omb-toolbar-note' }, '统计最近 500 条') : null,
-        }, !data
-          ? (overview.loading ? h(Loading, { label: '读取概览…' }) : overview.error ? h(ErrorLine, null, `读取失败：${overview.error}`) : h(Empty, { title: '还没有数据', hint: '在一个会话里开始对话后回来看看。' }))
-          : data.stores.length === 0
-            ? h(Empty, { title: '还没有打开记忆库', hint: '进入一个会话后会自动准备用户库和项目库。' })
-            : h('div', null, ...data.stores.map((store) => h('div', {
-              key: `${store.scope}:${store.projectScope || ''}`,
-              className: 'omb-row',
-              style: { cursor: 'default' },
-            },
-            h('div', { className: 'omb-row-meta' },
-              h(Tag, { tone: 'outline' }, store.scope === 'user' ? '用户库' : '项目库'),
-              h('span', null, store.projectScope || '用户库')),
-            h('div', { className: 'omb-row-meta' },
-              h('span', null, `行 ${store.stats.rows}`),
-              h('span', null, `活跃 ${store.active}`),
-              h('span', null, `待确认 ${store.candidates}`)))))),
-        activity
-          ? h(Section, { title: `最近活动（${activity.total} 条）` },
-            h('div', null, ...(activity.recent || []).map((entry, index) => h('div', { key: `${entry.at}-${index}`, className: 'omb-row', style: { cursor: 'default' } },
-              h('div', { className: 'omb-row-meta' }, h(Tag, { tone: 'quiet' }, entry.kind), h('span', null, formatTime(entry.at))),
-              h('p', { className: 'omb-row-text omb-selectable' }, entry.detail)))))
-          : null,
-        runtime.loading && !rt ? h(Loading, { label: '读取运行状态…' }) : runtime.error ? h(ErrorLine, null, `运行状态读取失败：${runtime.error}`) : null)
-    }
 
     // ── 记忆：列表 + 详情 + 新建/编辑/删除/标记 ─────────────────────
     function MemoryPage({ refreshTick }) {
@@ -473,10 +478,23 @@ window.__ModuleLoader__.load({
       const first = React.useRef(true)
       const loadingMoreRef = React.useRef(false)
       const hasMoreRef = React.useRef(false)
+      const loadingRef = React.useRef(true)
       const seqRef = React.useRef(0)
 
+      const resetForFilter = () => {
+        seqRef.current += 1
+        loadingRef.current = true
+        loadingMoreRef.current = false
+        hasMoreRef.current = false
+        setItems([])
+        setHasMore(false)
+        setLoading(true)
+        setError('')
+        setTick((value) => value + 1)
+      }
+
       const loadMore = React.useCallback(() => {
-        if (loadingMoreRef.current || !hasMoreRef.current) return
+        if (loadingRef.current || loadingMoreRef.current || !hasMoreRef.current) return
         loadingMoreRef.current = true
         setLoadingMore(true)
         const offset = items.length
@@ -502,6 +520,7 @@ window.__ModuleLoader__.load({
         let alive = true
         const seq = seqRef.current + 1
         seqRef.current = seq
+        loadingRef.current = true
         setLoading(true)
         setError('')
         hasMoreRef.current = false
@@ -513,14 +532,17 @@ window.__ModuleLoader__.load({
         }, (failure) => {
           if (alive && seqRef.current === seq) setError(messageOf(failure))
         }).finally(() => {
-          if (alive && seqRef.current === seq) setLoading(false)
+          if (alive && seqRef.current === seq) {
+            loadingRef.current = false
+            setLoading(false)
+          }
         })
         return () => { alive = false }
       }, [scope, status, kind, tick, refreshTick])
 
       React.useEffect(() => {
         if (first.current) { first.current = false; return undefined }
-        const timer = setTimeout(() => { queryRef.current = queryInput; setTick((value) => value + 1) }, 260)
+        const timer = setTimeout(() => { queryRef.current = queryInput; resetForFilter() }, 260)
         return () => clearTimeout(timer)
       }, [queryInput])
 
@@ -541,19 +563,17 @@ window.__ModuleLoader__.load({
               onKeyDown: (event) => {
                 if (event.key !== 'Enter') return
                 queryRef.current = queryInput
-                setTick((value) => value + 1)
+                resetForFilter()
               },
             }),
-            h(SegmentedControl, { id: 'omb-scope', label: '库', value: scope, options: SCOPES, onChange: setScope }),
-            h(SegmentedControl, { id: 'omb-status', label: '状态', value: status, options: STATUSES, onChange: setStatus }),
+            h(Select, { label: '库', value: scope, options: SCOPES, onChange: (next) => { setScope(next); resetForFilter() } }),
+            h(Select, { label: '状态', value: status, options: STATUSES, onChange: (next) => { setStatus(next); resetForFilter() } }),
             h(Button, {
               variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }),
               onClick: () => setForm({ mode: 'create' }),
             }, '新建')),
           h('div', { className: 'omb-toolbar' },
-            h('span', { className: 'omb-pills' }, ...KINDS.map((entry) => h(Pill, {
-              key: entry.value || 'all', active: kind === entry.value, onClick: () => setKind(entry.value),
-            }, entry.label))),
+            h(Select, { label: '类型', value: kind, options: KINDS, onChange: (next) => { setKind(next); resetForFilter() } }),
             h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
               loading ? h(TextShimmer, { active: true }, '读取中…') : `已加载 ${items.length} 条`)),
           notice
@@ -780,14 +800,14 @@ window.__ModuleLoader__.load({
         h('span', { className: 'omb-field-label' }, '库'),
         editing
           ? h('div', { className: 'omb-actions' }, h(Tag, { tone: 'outline' }, scope === 'user' ? '用户库' : '项目库'))
-          : h(SegmentedControl, {
-            id: 'omb-form-scope', label: '库', value: scope,
+          : h(Select, {
+            label: '库', value: scope,
             options: [{ value: 'user', label: '用户库' }, { value: 'project', label: '项目库' }],
             onChange: setScope,
           })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '类型'),
-        h(SegmentedControl, { id: 'omb-form-kind', label: '类型', value: kind, options: CREATABLE_KINDS, onChange: setKind })),
+        h(Select, { label: '类型', value: kind, options: CREATABLE_KINDS, onChange: setKind })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '内容'),
         h('textarea', {
@@ -815,6 +835,7 @@ window.__ModuleLoader__.load({
       const current = privacy.data && privacy.data.current ? privacy.data.current.sessionId : null
       const selected = list ? list.find((item) => item.id === selectedId) || null : null
       const [expanded, setExpanded] = React.useState({})
+      const [expandedSessions, setExpandedSessions] = React.useState({})
       const groups = React.useMemo(() => {
         const map = new Map()
         for (const item of list || []) {
@@ -833,6 +854,7 @@ window.__ModuleLoader__.load({
           .sort((a, b) => b.latest - a.latest)
       }, [list])
       const toggleGroup = (key) => setExpanded((value) => ({ ...value, [key]: !value[key] }))
+      const toggleSession = (id) => setExpandedSessions((value) => ({ ...value, [id]: !value[id] }))
 
       React.useEffect(() => {
         if (!selected || selected.archived) { setProfile(null); setProfileError(''); return undefined }
@@ -865,25 +887,38 @@ window.__ModuleLoader__.load({
         }).finally(() => setBusy(false))
       }
 
-      const sessionRow = (item, depth) => {
+      const sessionRow = (item, depth, hasChildren, childOpen, onToggle) => {
         const isArchived = item.archived
         const indent = typeof depth === 'number' ? depth * 14 : 0
-        return h('button', {
-          key: item.id, type: 'button', className: 'omb-row',
-          style: indent > 0 ? { marginLeft: `${indent}px` } : undefined,
+        return h('div', {
+          key: item.id, className: 'omb-row omb-row-split',
+          style: indent > 0 ? { paddingLeft: `${indent}px` } : undefined,
           'data-active': item.id === selectedId,
           'data-disabled': isArchived,
+        },
+        h('button', {
+          type: 'button', className: 'omb-session-main',
           disabled: isArchived,
           onClick: () => { if (!isArchived) setSelectedId(item.id) },
         },
-        h('span', { className: 'omb-row-title' }, item.title || baseName(item.cwd) || shortId(item.id)),
+        h('span', { className: 'omb-row-title' }, sessionName(item)),
         h('span', { className: 'omb-row-meta' },
           isArchived ? h(Tag, { tone: 'quiet' }, '已归档') : item.active ? h(Tag, { tone: 'success' }, '进行中') : h(Tag, { tone: 'outline' }, '历史'),
-          item.parentId ? h(Tag, { tone: 'quiet' }, '子会话') : null,
+          depth > 0 ? h(Tag, { tone: 'quiet' }, '子会话') : null,
+          !item.preset ? h(Tag, { tone: 'quiet' }, '旧会话') : null,
           item.id === current ? h(Tag, { tone: 'info' }, '当前') : null,
           h('span', null, depthText(item.depth)),
           item.privacy ? h(Tag, { tone: item.privacy.mode === 'normal' ? 'neutral' : 'warning' }, modeText(item.privacy.mode)) : null),
-        h('span', { className: 'omb-row-sub' }, item.cwd))
+        h('span', { className: 'omb-row-sub' }, item.cwd)),
+        hasChildren
+          ? h('button', {
+            type: 'button', className: 'omb-session-toggle',
+            title: childOpen ? '收起子会话' : '展开子会话',
+            'aria-label': childOpen ? '收起子会话' : '展开子会话',
+            'aria-expanded': childOpen,
+            onClick: onToggle,
+          }, childOpen ? '▴' : '▾')
+          : null)
       }
       const renderGroupSessions = (group) => {
         const ids = new Set(group.items.map((item) => item.id))
@@ -901,7 +936,12 @@ window.__ModuleLoader__.load({
         const render = (item, depth) => {
           if (seen.has(item.id)) return []
           seen.add(item.id)
-          return [sessionRow(item, depth), ...(children.get(item.id) || []).flatMap((child) => render(child, depth + 1))]
+          const kids = children.get(item.id) || []
+          const open = expandedSessions[item.id] === true
+          return [
+            sessionRow(item, depth, kids.length > 0, open, () => toggleSession(item.id)),
+            ...(open ? kids.flatMap((child) => render(child, depth + 1)) : []),
+          ]
         }
         return roots.flatMap((item) => render(item, 0))
       }
@@ -910,16 +950,18 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button', className: 'omb-row',
             onClick: () => toggleGroup(group.key),
+            'aria-expanded': expanded[group.key] === true,
+            title: expanded[group.key] ? '收起' : '展开',
           },
           h('span', { className: 'omb-row-title' }, group.label || group.root),
           h('span', { className: 'omb-row-meta' },
             h(Tag, { tone: group.active ? 'success' : 'outline' }, group.active ? '有进行中会话' : '历史'),
             h('span', null, `${group.items.length} 个会话`),
-            h('span', null, expanded[group.key] ? '收起' : '展开')),
+            h('span', { className: 'omb-chevron' }, expanded[group.key] ? '▴' : '▾')),
           h('span', { className: 'omb-row-sub' }, group.root)),
-          expanded[group.key]
-            ? h('div', { className: 'omb-workspace-sessions' }, ...renderGroupSessions(group))
-            : null)))
+          h('div', { className: 'omb-collapse', 'data-open': expanded[group.key] === true ? 'true' : 'false' },
+            h('div', null,
+              h('div', { className: 'omb-workspace-sessions' }, ...renderGroupSessions(group)))))))
         : null
 
       const listBody = !sessions.data
@@ -936,20 +978,21 @@ window.__ModuleLoader__.load({
         listBody)
 
       const privacySection = selected && h(Section, { title: '会话设置' },
+        selected.active ? h('p', { className: 'omb-note' }, '会话运行中：设置已锁定，结束后可修改。') : null,
         h('div', { className: 'omb-actions' },
           h('span', { className: 'omb-field-label' }, '推理深度'),
-          h(SegmentedControl, {
-            id: 'omb-session-depth', label: '推理深度', value: selected.depth || 'standard',
+          h(Select, {
+            label: '推理深度', value: selected.depth || 'standard',
             options: [{ value: 'quick', label: '快速' }, { value: 'standard', label: '标准' }, { value: 'deep', label: '深入' }],
-            disabled: busy, onChange: setDepth,
+            disabled: busy || selected.active, onChange: setDepth,
           }),
           h('span', { className: 'omb-toolbar-note' }, '写入本会话的推理档位')),
         h('div', { className: 'omb-actions' },
           h('span', { className: 'omb-field-label' }, '隐私模式'),
-          h(SegmentedControl, {
-            id: 'omb-session-privacy', label: '隐私模式',
+          h(Select, {
+            label: '隐私模式',
             value: selected.privacy ? selected.privacy.mode : 'normal',
-            options: MODE_OPTIONS, disabled: busy,
+            options: MODE_OPTIONS, disabled: busy || selected.active,
             onChange: (next) => act({ action: 'set', sessionId: selected.id, mode: next }),
           }),
           h('span', { className: 'omb-toolbar-note' }, selected.privacy ? `${originText(selected.privacy.origin)}${selected.privacy.inheritedFrom ? ' · 继承' : ''}` : '默认')))
@@ -992,7 +1035,7 @@ window.__ModuleLoader__.load({
       const detail = selected
         ? h('div', { className: 'omb-detail' },
           h('div', { className: 'omb-detail-head' },
-            h('p', { className: 'omb-detail-title' }, selected.title || baseName(selected.cwd) || '会话'),
+            h('p', { className: 'omb-detail-title' }, sessionName(selected)),
             selected.archived ? h(Tag, { tone: 'quiet' }, '已归档') : h(Tag, { tone: selected.active ? 'success' : 'outline' }, selected.active ? '进行中' : '历史')),
           h('div', { className: 'omb-meta' },
             h('span', { className: 'omb-code' }, selected.id),
@@ -1145,7 +1188,7 @@ window.__ModuleLoader__.load({
               entry.archived ? '已归档' : PHASE_TEXT[entry.phase] || '未知'),
             entry.active ? h(Tag, { tone: 'success' }, '进行中') : null,
             entry.privacy ? h(Tag, { tone: entry.privacy === 'normal' ? 'neutral' : 'warning' }, modeText(entry.privacy)) : null),
-          h('p', { className: 'omb-row-title' }, entry.title || baseName(entry.cwd) || shortId(entry.id)),
+          h('p', { className: 'omb-row-title' }, sessionName(entry)),
           h('p', { className: 'omb-row-sub omb-selectable' }, entry.cwd),
           ...taskLines,
           ...candidateLines)
@@ -1201,7 +1244,7 @@ window.__ModuleLoader__.load({
       },
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '轴'),
-        h(SegmentedControl, { id: 'omb-profile-axis', label: '轴', value: axis, options: PROFILE_AXES, onChange: setAxis })),
+        h(Select, { label: '轴', value: axis, options: PROFILE_AXES, onChange: setAxis })),
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '键'),
         h(Input, { value: key, placeholder: '例如：回答语言', 'aria-label': '画像键', onChange: (event) => setKey(event.target.value) })),
@@ -1355,11 +1398,11 @@ window.__ModuleLoader__.load({
     }
 
     function MemoryPanel() {
-      const [page, setPage] = React.useState('overview')
+      const [page, setPage] = React.useState(null)
       const [direction, setDirection] = React.useState(1)
-      const active = NAV.find((entry) => entry.value === page) || NAV[0]
+      const active = page === null ? null : NAV.find((entry) => entry.value === page) || null
       const go = (next) => {
-        const from = NAV.findIndex((entry) => entry.value === page)
+        const from = page === null ? -1 : NAV.findIndex((entry) => entry.value === page)
         const to = NAV.findIndex((entry) => entry.value === next)
         setDirection(to >= from ? 1 : -1)
         setPage(next)
@@ -1379,16 +1422,18 @@ window.__ModuleLoader__.load({
             h(entry.icon, { size: 18, className: 'omb-nav-icon', 'aria-hidden': true }),
             h('span', { className: 'omb-nav-label' }, entry.label)))),
           h('div', { className: 'omb-content' },
-            h('div', { className: 'omb-content-head' },
-              h('div', null,
-                h('h3', { className: 'omb-content-title' }, active.label),
-                h('p', { className: 'omb-content-desc' }, PAGE_HINTS[page]))),
-            h('div', { key: page, className: `omb-page-in ${direction > 0 ? 'omb-page-forward' : 'omb-page-back'}` },
-              page === 'overview' ? h(OverviewPage)
-                : page === 'memory' ? h(MemoryPage)
-                  : page === 'project' ? h(ProjectPage)
-                    : page === 'machines' ? h(MachinesPage)
-                      : h(PersonalPage)))))
+            active === null
+              ? null
+              : h(React.Fragment, null,
+                h('div', { className: 'omb-content-head' },
+                  h('div', null,
+                    h('h3', { className: 'omb-content-title' }, active.label),
+                    h('p', { className: 'omb-content-desc' }, PAGE_HINTS[page]))),
+                h('div', { key: page, className: `omb-page-in ${direction > 0 ? 'omb-page-forward' : 'omb-page-back'}` },
+                  page === 'memory' ? h(MemoryPage)
+                    : page === 'project' ? h(ProjectPage)
+                      : page === 'machines' ? h(MachinesPage)
+                        : h(PersonalPage))))))
     }
 
     function MemoryIcon({ size }) {
