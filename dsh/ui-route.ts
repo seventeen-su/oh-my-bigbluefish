@@ -32,6 +32,7 @@ function parseListQuery(search: URLSearchParams): UiListQuery {
   const status = search.get('status') as UiStatus | null
   const kind = search.get('kind') as MemoryKind | null
   const limitRaw = search.get('limit')
+  const offsetRaw = search.get('offset')
   const tagsRaw = search.get('tags')
   const tags = tagsRaw === null ? undefined : tagsRaw.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0)
   return {
@@ -41,6 +42,7 @@ function parseListQuery(search: URLSearchParams): UiListQuery {
     ...(search.get('q') === null ? {} : { q: search.get('q') as string }),
     ...(tags === undefined || tags.length === 0 ? {} : { tags }),
     ...(limitRaw === null ? {} : { limit: Number(limitRaw) }),
+    ...(offsetRaw === null ? {} : { offset: Number(offsetRaw) }),
   }
 }
 

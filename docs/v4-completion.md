@@ -1326,3 +1326,24 @@
   `modules/memory/privacy/{contract,index}.ts`、`dsh/ui-route.ts`、`kernel/abi/{index,catalog}.ts`、
   `tests/dsh/{ui-bundle,ui-route}.test.ts`、`tests/modules/memory/ui.test.ts`、
   `README.md`、`AGENTS.md`、版本文件
+
+---
+
+# OMB v4.18.1 交付记录（2026-10-24，x3）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.18.1**（`25 功能 / 110 小功能`；x3：记忆列表分页） |
+| 构建 | **g135**；`generation: 135`、`outDir: lib-gen/g135` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **122 files / 1521 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：记忆页“上一页/下一页”、页码与当前页条数、末页下一页禁用 |
+
+## 修复/补充
+
+- 用户指出“超出单页上限这种应该有换页按键或者干脆不设上限”：
+  - `UiListQuery.offset` + `GET /list?offset=`（`clampOffset` 0..4000）；
+  - 后端 `list()` 按 offset 切片，`truncated` 如实表示下一页是否还有；
+    搜索/空查询都按同一分页语义；
+  - 前端记忆页：单页 50、上一页/下一页、`第 N 页 · 本页 M 条`；
+    过滤条件/搜索变化自动回第 1 页；
+  - 分页补测试：后端两页不重叠且覆盖全部；路由解析 offset；bundle 契约钉住按钮与参数。

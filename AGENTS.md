@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.18.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.18.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,10 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.18.0（当前） = OMB 设置重做（x2）**：四页二级侧边栏（概览/记忆/项目/个人画像）；
+- **v4.18.1（当前） = 记忆列表分页（x3）**：`UiListQuery.offset` + `GET /list?offset=`
+  与前端“上一页/下一页”（单页 50，`truncated` 决定下一页是否可用）；不再用单页上限
+  卡住列表。契约同 4.18.0。
+- **v4.18.0 = OMB 设置重做（x2）**：四页二级侧边栏（概览/记忆/项目/个人画像）；
   手动记忆增删改标记（`POST /omb/api/memory`，写入经隐私闸门、写后查回）；
   项目页由 `SERVICES.sessionCatalog`（`dsh/session-catalog.ts`）列 OMB 会话，
   显示工作区/推理深度/隐私/归档，归档置灰且不可读；个人画像页读 `SERVICES.profile`；

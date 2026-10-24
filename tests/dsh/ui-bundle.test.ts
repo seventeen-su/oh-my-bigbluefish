@@ -130,6 +130,9 @@ describe('OMB 设置 bundle 发布契约', () => {
     for (const mark of ["mark: 'confirm'", "mark: 'obsolete'", "mark: 'revive'"]) {
       expect(code).toContain(mark)
     }
+    expect(code).toContain("offset: page * PAGE_SIZE")
+    expect(code).toContain("'上一页'")
+    expect(code).toContain("'下一页'")
     expect(code).toContain('h(MemoryForm')
     expect(code).toContain('新建')
   })

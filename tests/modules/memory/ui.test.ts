@@ -160,6 +160,16 @@ describe('createUiService', () => {
     const projectOnly = await f.service.list({ scope: 'project', status: 'active' })
     expect(projectOnly.items.map(item => item.id)).toEqual(['p1'])
     expect(projectOnly.items[0]?.projectScope).toBe('/work/demo')
+
+    // v4.18 分页：offset 取下一页，truncated 表示还有更多；两页不重复、合起来是全部
+    const page1 = await f.service.list({ scope: 'all', status: 'active', limit: 2, offset: 0 })
+    const page2 = await f.service.list({ scope: 'all', status: 'active', limit: 2, offset: 2 })
+    expect(page1.items).toHaveLength(2)
+    expect(page1.truncated).toBe(true)
+    expect(page2.items.length).toBeGreaterThanOrEqual(1)
+    const ids = [...page1.items, ...page2.items].map(item => item.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    expect([...ids].sort()).toEqual(['p1', 'u1', 'u3'])
     await f.close()
   })
 

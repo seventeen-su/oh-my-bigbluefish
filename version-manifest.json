@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.18.0 = OMB 设置重做：四页二级侧边栏、手动记忆管理、项目/个人画像与控件样式锁定（x2，按用户口径新界面不升 x1）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.18.1 = OMB 设置重做（x2）与记忆列表分页补充（x3，按用户口径新界面不升 x1）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -288,5 +288,5 @@
       ]
     }
   ],
-  "version": "4.18.0"
+  "version": "4.18.1"
 }

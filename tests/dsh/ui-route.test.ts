@@ -154,10 +154,10 @@ describe('installUiRoute', () => {
     expect(overview.body).toMatchObject({ ready: true, totalActive: 2 })
 
     const list = await request(route as Captured, {
-      url: '/omb/api/list?scope=user&status=stale&kind=semantic&q=8080&limit=5',
+      url: '/omb/api/list?scope=user&status=stale&kind=semantic&q=8080&limit=5&offset=10',
     })
     expect(list.status).toBe(200)
-    expect(list.body).toMatchObject({ query: { scope: 'user', status: 'stale', kind: 'semantic', q: '8080', limit: 5 } })
+    expect(list.body).toMatchObject({ query: { scope: 'user', status: 'stale', kind: 'semantic', q: '8080', limit: 5, offset: 10 } })
 
     const detail = await request(route as Captured, { url: '/omb/api/detail?id=seen' })
     expect(detail.status).toBe(200)

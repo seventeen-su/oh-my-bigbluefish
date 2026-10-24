@@ -44,6 +44,8 @@ export interface UiListQuery {
   readonly q?: string
   readonly tags?: readonly string[]
   readonly limit?: number
+  /** 分页偏移（v4.18）：第 N 页 = offset N×limit；由前端“上一页/下一页”驱动。 */
+  readonly offset?: number
 }
 
 /** 手动新建（v4.18）：用户自己的写入，`assertedBy='user'`、`sourceRef='ui:manual'`。 */
@@ -409,6 +411,12 @@ function clampLimit(value: number | undefined, fallback: number, max: number): n
   return Math.min(max, Math.max(1, Math.floor(value)))
 }
 
+/** 分页偏移：负值/非数字按 0；上限防止一次扫太多行（页面跳转由 limit 控制）。 */
+function clampOffset(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0
+  return Math.min(4000, Math.max(0, Math.floor(value)))
+}
+
 /** 手动写入的硬边界（v4.18 §2.2）。 */
 const UI_TEXT_MAX = 4000
 const UI_TAGS_MAX = 8
@@ -507,19 +515,19 @@ function collectStores(deps: UiServiceDeps, scope: UiScope): readonly StoreRef[]
  * 每个方法都只读、失败返回空/如实降级（**不抛到 HTTP 层**——页面要能显示"库未就绪"）。
  */
 export function createUiService(deps: UiServiceDeps): UiService {
-  const scanRecent = async (ref: StoreRef): Promise<readonly MemoryRecord[]> => {
+  const scanRecent = async (ref: StoreRef, limit: number): Promise<readonly MemoryRecord[]> => {
     const scanner = asRecordScanner(ref.store)
     if (scanner === undefined) return []
     try {
-      return await scanner.listRecentRecords({ limit: SCAN_MAX })
+      return await scanner.listRecentRecords({ limit })
     } catch {
       return []
     }
   }
 
-  const search = async (ref: StoreRef, query: UiListQuery): Promise<readonly MemoryRecord[]> => {
+  const search = async (ref: StoreRef, query: UiListQuery, limit: number): Promise<readonly MemoryRecord[]> => {
     const text = (query.q ?? '').trim()
-    if (text.length === 0) return scanRecent(ref)
+    if (text.length === 0) return scanRecent(ref, limit)
     // 'candidate' 不是检索状态过滤（它由 assertedBy/kind 复合判定）；词法层按 active 查。
     const lexicalStatus: MemoryStatusFilter = query.status === 'candidate' ? 'active' : query.status ?? 'active'
     const base = {
@@ -528,7 +536,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
       ...(query.kind === undefined ? {} : { kinds: [query.kind] as readonly MemoryKind[] }),
       status: lexicalStatus,
       ...(query.tags === undefined || query.tags.length === 0 ? {} : { tags: query.tags }),
-      limit: UI_LIST_MAX,
+      limit,
     }
     try {
       let hits = await ref.store.searchLexical(base)
@@ -548,10 +556,13 @@ export function createUiService(deps: UiServiceDeps): UiService {
     const scope = query.scope ?? 'all'
     const status = query.status ?? 'active'
     const limit = clampLimit(query.limit, 20, UI_LIST_MAX)
+    const offset = clampOffset(query.offset)
+    // 多取 1 条判断“下一页还有没有”；状态/候选过滤在 JS 侧，额外留 32 条余量。
+    const searchLimit = offset + limit + 33
     const refs = collectStores(deps, scope)
     const gathered: { record: MemoryRecord; projectScope: string | null }[] = []
     for (const ref of refs) {
-      const records = await search(ref, query)
+      const records = await search(ref, query, searchLimit)
       for (const record of records) {
         if (!matchesStatus(record, status)) continue
         if (query.kind !== undefined && record.kind !== query.kind) continue
@@ -564,8 +575,9 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
     gathered.sort((left, right) =>
       right.record.observedAt - left.record.observedAt || left.record.id.localeCompare(right.record.id))
-    const items = gathered.slice(0, limit).map(entry => toUiListItem(entry.record, entry.projectScope))
-    return { items, total: gathered.length, truncated: gathered.length > limit }
+    const page = gathered.slice(offset, offset + limit)
+    const items = page.map(entry => toUiListItem(entry.record, entry.projectScope))
+    return { items, total: gathered.length, truncated: gathered.length > offset + limit }
   }
 
   const overview = async (): Promise<UiOverview> => {
@@ -584,7 +596,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
         }
         let active = 0
         let candidates = 0
-        const scannedRows = await scanRecent({ projectScope: set.projectScope, store: tagged.store })
+        const scannedRows = await scanRecent({ projectScope: set.projectScope, store: tagged.store }, SCAN_MAX)
         for (const record of scannedRows) {
           if (uiRecordStatus(record) === 'active') {
             active += 1
@@ -624,7 +636,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
     const effective = clampLimit(limit, 20, UI_LIST_MAX)
     const gathered: { record: MemoryRecord; projectScope: string | null }[] = []
     for (const ref of collectStores(deps, 'all')) {
-      const scanned = await scanRecent(ref)
+      const scanned = await scanRecent(ref, SCAN_MAX)
       for (const record of scanned) {
         if (uiRecordStatus(record) !== 'active') continue
         if (record.assertedBy !== 'model') continue

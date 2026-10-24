@@ -66,6 +66,7 @@ window.__ModuleLoader__.load({
     const DEPTH_TEXT = { quick: '快速', standard: '标准', deep: '深入' }
     const ORIGIN_TEXT = { command: '手动设置', inherited: '继承', default: '默认', 'fail-closed': '兜底' }
     const AXIS_ORDER = ['stable', 'capability', 'intent', 'collaboration']
+    const PAGE_SIZE = 50
 
     const CSS = `
       .omb-page {
@@ -443,7 +444,6 @@ window.__ModuleLoader__.load({
     // ── 记忆：列表 + 详情 + 新建/编辑/删除/标记 ─────────────────────
     function MemoryPage({ refreshTick }) {
       const [items, setItems] = React.useState([])
-      const [total, setTotal] = React.useState(0)
       const [queryInput, setQueryInput] = React.useState('')
       const [scope, setScope] = React.useState('all')
       const [status, setStatus] = React.useState('active')
@@ -452,6 +452,8 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState('')
       const [tick, setTick] = React.useState(0)
+      const [page, setPage] = React.useState(0)
+      const [truncated, setTruncated] = React.useState(false)
       const [form, setForm] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
       const queryRef = React.useRef('')
@@ -461,21 +463,21 @@ window.__ModuleLoader__.load({
         let alive = true
         setLoading(true)
         setError('')
-        void api('/list', { q: queryRef.current, scope, status, kind, limit: 50 }).then((data) => {
+        void api('/list', { q: queryRef.current, scope, status, kind, limit: PAGE_SIZE, offset: page * PAGE_SIZE }).then((data) => {
           if (!alive) return
           setItems(data.items || [])
-          setTotal(data.total || 0)
+          setTruncated(data.truncated === true)
         }, (failure) => {
           if (alive) setError(messageOf(failure))
         }).finally(() => {
           if (alive) setLoading(false)
         })
         return () => { alive = false }
-      }, [scope, status, kind, tick, refreshTick])
+      }, [scope, status, kind, tick, refreshTick, page])
 
       React.useEffect(() => {
         if (first.current) { first.current = false; return undefined }
-        const timer = setTimeout(() => { queryRef.current = queryInput; setTick((value) => value + 1) }, 260)
+        const timer = setTimeout(() => { queryRef.current = queryInput; setPage(0); setTick((value) => value + 1) }, 260)
         return () => clearTimeout(timer)
       }, [queryInput])
 
@@ -496,25 +498,34 @@ window.__ModuleLoader__.load({
               onKeyDown: (event) => {
                 if (event.key !== 'Enter') return
                 queryRef.current = queryInput
+                setPage(0)
                 setTick((value) => value + 1)
               },
             }),
-            h(SegmentedControl, { id: 'omb-scope', label: '库', value: scope, options: SCOPES, onChange: setScope }),
-            h(SegmentedControl, { id: 'omb-status', label: '状态', value: status, options: STATUSES, onChange: setStatus }),
+            h(SegmentedControl, { id: 'omb-scope', label: '库', value: scope, options: SCOPES, onChange: (next) => { setScope(next); setPage(0) } }),
+            h(SegmentedControl, { id: 'omb-status', label: '状态', value: status, options: STATUSES, onChange: (next) => { setStatus(next); setPage(0) } }),
             h(Button, {
               variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }),
               onClick: () => setForm({ mode: 'create' }),
             }, '新建')),
           h('div', { className: 'omb-toolbar' },
             h('span', { className: 'omb-pills' }, ...KINDS.map((entry) => h(Pill, {
-              key: entry.value || 'all', active: kind === entry.value, onClick: () => setKind(entry.value),
+              key: entry.value || 'all', active: kind === entry.value, onClick: () => { setKind(entry.value); setPage(0) },
             }, entry.label))),
             h(Button, {
               variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: loading ? 'omb-spin' : undefined }),
               onClick: () => setTick((value) => value + 1), disabled: loading,
             }, '刷新'),
             h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-              loading ? h(TextShimmer, { active: true }, '读取中…') : `${items.length} / ${total} 条`)),
+              loading ? h(TextShimmer, { active: true }, '读取中…') : `第 ${page + 1} 页 · 本页 ${items.length} 条`),
+            h(Button, {
+              variant: 'ghost', size: 'sm', disabled: loading || page === 0,
+              onClick: () => setPage((value) => Math.max(0, value - 1)),
+            }, '上一页'),
+            h(Button, {
+              variant: 'ghost', size: 'sm', disabled: loading || !truncated,
+              onClick: () => setPage((value) => value + 1),
+            }, '下一页')),
           notice
             ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
               h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
