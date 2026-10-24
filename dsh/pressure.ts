@@ -9,26 +9,32 @@
  * 一次都不会触发，而模块健康面、工具面、状态面**全部正常**——
  * 每一层单独看都对，只是中间少了一根线。
  *
- * ## 宿主侧的真源（**stateOf 返回宿主 state，不是 wire view**）
+ * ## 宿主侧的真源（**优先 snapshot 的 wire view，旧宿主退回 stateOf 的宿主 state**）
  *
- * `packages/llm/token-meter/src/projection.ts` 注册了三个会话投影。它们各有
- * **宿主 state** 与 **client wire view** 两层形状，而 `stateOf` 返回的是前者
- * （`packages/session/session-projection/src/index.ts:313-328`）：
+ * `packages/llm/token-meter/src/projection.ts` 注册了三个会话投影，它们各有
+ * **宿主 state** 与 **client wire view** 两层形状：
  *
- * - `contextPressure` host state：`{contextWindow?, pressureTokens?,
- *   surfaceTokens, sampledSurfaceTokens?, claim?}`。`projectedTokens` 只在
- *   wire view 里由 `pressureTokens + surfaceTokens − sampledSurfaceTokens` 算出
- *   （`usage-projection.ts:210-216`）——本文件必须自己按这条公式算。
- * - `tokenUsage` host state：`{totals, last}`；`cacheReadTokens/cacheWriteTokens`
- *   在 `totals` 里（wire view 才是扁平 totals）。
- * - `contextBreakdown` host state：`{systems, surfaceTokens, breakdown:{...}}`；
- *   `systemTokens/toolsTokens/messageTokens` 在嵌套的 `breakdown` 里。
+ * - `contextPressure` state：`{contextWindow?, pressureTokens?, surfaceTokens,
+ *   sampledSurfaceTokens?, claim?}`；wire view：`{contextWindow?, pressureTokens?,
+ *   projectedTokens?}`，其中 `projectedTokens = pressureTokens + surfaceTokens −
+ *   sampledSurfaceTokens`（`usage-projection.ts` 的 `wire.view`）。
+ * - `tokenUsage` state：`{totals, last}`；wire view 是**扁平 totals**。
+ * - `contextBreakdown` state：`{systems, surfaceTokens, breakdown:{...}}`；
+ *   wire view 是嵌套的 `breakdown`。
  *
- * 读错这一层不会报错，只会**静默地永远读到 0 / undefined**——本文件的测试替身
- * 曾经也照着 wire view 写，于是整条链路在测试里全绿、在真机上从未生效。
+ * DSH 0.2.1-rc.3 之后 `sessionProjections.stateOf(session, key)` 被标记 deprecated
+ * （仍返回宿主 state，但每个键打一次警告），正路是注册句柄的 `stateOf` 或所属域服务。
+ * 第三方插件没有注册句柄，所以本文件**优先**走非弃用的
+ * `ctx.sessionProjections.snapshot(session, [key]).values[key]`（wire view），
+ * 没有 `snapshot` 的旧宿主才退回 `stateOf`（宿主 state）。下面两种形状都吃：
+ * 压力优先用 wire 的 `projectedTokens`，缺了再按同一条公式用 state 三个字段算；
+ * 用量先看 `totals`、缺了就当扁平 view；构成先看嵌套 `breakdown`、缺了就当扁平 view。
  *
- * 三者都经 `ctx.sessionProjections.stateOf(session, key)` 读取，而 `stateOf`
- * 要的是 **Session 对象**、不是 sessionId —— 本模块负责那个映射。
+ * 读错形状不会报错，只会**静默地永远读到 0 / undefined**——本文件的测试替身曾经
+ * 照着 wire view 写，于是整条链路在测试里全绿、在真机上从未生效。所以两种形状现在
+ * 各有一条测试钉住（`tests/dsh/pressure.test.ts`）。
+ *
+ * 两者都要求传 **Session 对象**、不是 sessionId —— 本模块负责那个映射。
  *
  * ## 映射怎么来
  *
@@ -69,12 +75,19 @@ const PROJECTIONS_SERVICE = 'sessionProjections'
  */
 const MAX_REMEMBERED = 256
 
-/** 宿主 Session 对象的最小形状（只要 `stateOf` 认它是同一个对象）。 */
+/** 宿主 Session 对象的最小形状（投影读取认它是同一个对象）。 */
 type HostSession = object
 
-/** 有 `stateOf` 的投影注册表。 */
+/**
+ * 会话投影注册表：两种读法都收。
+ *
+ * - `snapshot(session, [key])`：DSH 0.2.1-rc.3 之后的**非弃用**读法，返回
+ *   `{asOfSeq, values}`，`values[key]` 是 **client wire view**；
+ * - `stateOf(session, key)`：旧读法（rc.3 起 deprecated），返回 **宿主 state**。
+ */
 interface ProjectionRegistry {
-  stateOf(session: unknown, key: string): unknown
+  snapshot?(session: unknown, keys?: readonly string[]): unknown
+  stateOf?(session: unknown, key: string): unknown
 }
 
 /** 有 `get` 的会话注册表。 */
@@ -179,10 +192,20 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
     return found
   }
 
-  /** 读一个投影；注册表缺失、键未注册、单元抛错都返回 undefined。 */
+  /**
+   * 读一个投影；注册表缺失、键未注册、单元抛错都返回 undefined。
+   *
+   * 优先 `snapshot`（非弃用，wire view），没有才退回 `stateOf`（宿主 state）。
+   * 两种形状的字段差异由下面的解析按"优先 view、退回 state"兼容（见文件头）。
+   */
   const projectionOf = (registry: ProjectionRegistry, session: HostSession, key: string): Record<string, unknown> | undefined => {
     try {
-      return asRecord(registry.stateOf(session, key))
+      if (typeof registry.snapshot === 'function') {
+        const snapshot = asRecord(registry.snapshot(session, [key]))
+        const values = asRecord(snapshot?.['values'])
+        return asRecord(values?.[key])
+      }
+      return typeof registry.stateOf === 'function' ? asRecord(registry.stateOf(session, key)) : undefined
     } catch {
       return undefined
     }
@@ -218,7 +241,8 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
         return undefined
       }
       const registry = service<ProjectionRegistry>(PROJECTIONS_SERVICE)
-      if (registry === undefined || typeof registry.stateOf !== 'function') {
+      if (registry === undefined
+        || (typeof registry.snapshot !== 'function' && typeof registry.stateOf !== 'function')) {
         lastReason = `宿主没有提供 ${PROJECTIONS_SERVICE} 服务（拿不到上下文投影；宿主缺 token-meter 一类组件时会这样）`
         unmetered += 1
         return undefined
@@ -236,20 +260,19 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
         unmetered += 1
         return undefined
       }
-      // **下一次请求的压力**：`stateOf` 返回的是**宿主 state**（不是 client
-      // wire view）——host state 里没有 `projectedTokens`，只有
-      // `{pressureTokens, surfaceTokens, sampledSurfaceTokens}`。
-      // 因此这里自己算 view 的同一条公式（`usage-projection.ts` 的 wire.view）：
+      // **下一次请求的压力**：优先用 wire view 的 `projectedTokens`（非弃用读法）；
+      // 旧宿主/旧替身给的是宿主 state，没有 `projectedTokens`，只有
+      // `{pressureTokens, surfaceTokens, sampledSurfaceTokens}`——那就按 view 的同一条公式算：
       //   projected = pressureTokens + surfaceTokens − sampledSurfaceTokens
       // 它随 compaction 立即下降（surface 被遮蔽），而 pressureTokens 只跟 provider
-      // 上报走、压缩后仍是旧值。`projectedTokens` 仍保留为兼容旧替身/旧宿主的退路。
+      // 上报走、压缩后仍是旧值。两条路的结果是同一个数，不需要知道读的是哪一层。
       const pressureTokens = finite(pressure['pressureTokens'])
       const surfaceTokens = finite(pressure['surfaceTokens'])
       const sampledSurfaceTokens = finite(pressure['sampledSurfaceTokens'])
-      const legacyProjected = finite(pressure['projectedTokens'])
+      const projected = finite(pressure['projectedTokens'])
       const total = pressureTokens !== undefined && surfaceTokens !== undefined && sampledSurfaceTokens !== undefined
         ? Math.max(0, Math.round(pressureTokens + surfaceTokens - sampledSurfaceTokens))
-        : firstFinite(legacyProjected, pressureTokens)
+        : firstFinite(projected, pressureTokens)
       if (total === undefined) {
         lastReason = '宿主尚未上报过一次 provider usage（投影里还没有压力读数）'
         unmetered += 1
@@ -259,11 +282,12 @@ export function createPressureBridge(options: { readonly ctx: HostContextLike })
       const window = finite(pressure['contextWindow'])
       const usableWindow = window !== undefined && window > 0 ? window : undefined
       const usage = projectionOf(registry, session, KEY_USAGE)
-      // `tokenUsage` 的宿主 state 是 `{totals,last}`；client view 才是扁平 totals。
-      // 读错一层就会永远得到 0（这正是本次修复前的实测症状）。
+      // `tokenUsage` 的宿主 state 是 `{totals,last}`；client wire view 是扁平 totals。
+      // 旧宿主读错一层会永远得到 0（这正是某次修复前的实测症状），所以两种都收。
       const usageTotals = asRecord(usage?.['totals']) ?? usage
       const breakdownRoot = projectionOf(registry, session, KEY_BREAKDOWN)
-      // `contextBreakdown` 的宿主 state 是 `{systems,surfaceTokens,breakdown:{...}}`。
+      // `contextBreakdown` 的宿主 state 是 `{systems,surfaceTokens,breakdown:{...}}`；
+      // client wire view 就是嵌套的 `breakdown`。两种都收：有嵌套取嵌套、没有就当扁平。
       const breakdown = asRecord(breakdownRoot?.['breakdown']) ?? breakdownRoot
 
       measured += 1

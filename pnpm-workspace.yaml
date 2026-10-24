@@ -5,6 +5,15 @@
 # 而那条路只对**裸包名**生效（`packages/boot/app-boot/src/package-meta.ts:148`）；
 # 「裸包名 + 子路径」宿主又解析不了（实测 8 行 failed to import）。
 # 详见 kernel/display.ts。
+#
+# **组件只能写在 `devDependencies`（`workspace:*`），不能写进 `dependencies`。**
+# `workspace:` 协议只在"当前 workspace 里存在该包"时可解析。把 `@omb/plugin` 作为
+# `file:`/git 依赖装进 DSH profile 时，pnpm 会解析插件的 dependencies；`workspace:*`
+# 在那边解析不到，直接抛 `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`，而插件管理器每次
+# 装/卸/切换都会重跑 `pnpm install` —— 于是该 profile 的所有插件操作一起失败。
+# devDependencies 在消费方安装时被忽略，但仓库内仍会生成 `node_modules/@omb/*`
+# 链接（部署副本正是靠这些链接解析组件行）。护栏：tests/dsh/installable-manifest.test.ts
+# 与 scripts/build.mjs 的依赖核对。
 packages:
   - 'packages/*'
 
@@ -13,8 +22,8 @@ packages:
 # ## 为什么
 #
 # 本仓库把 36 个 `@deepseek-ai/*` 声明为 peer，用途是**兼容性契约**——声明"我在哪个宿主
-# 版本上验证过"。另有一条 `engines.dsh`（`>=0.2.0-rc.2 <=0.2.1-rc.2`，上限钉在最后一次核过的
-# 构建）：DSH 的兼容门一旦看到
+# 版本上验证过"。另有一条 `engines.dsh`（`=0.2.1-rc.3`，精确钉在最后一次核过的构建；
+# 0.2.1 正式版与后续预发布都未核过）：DSH 的兼容门一旦看到
 # `engines.dsh` 就**只用它、完全忽略 peer**（`plugin-compatibility.ts:57-61`），所以版本
 # 契约是一条可读的声明，peer 清单退化为"复核过的宿主包"文档。它们**不是运行期依赖**：
 # 全仓库对这些包零 import，`dsh/` 一律经结构化接口访问宿主（见 `dsh/plugin.ts` 顶部的三条硬约束）。

@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.22.0 = 大肥鱼增强设置台打磨：极窄布局、标准控件、历史标题、状态机总页管理与 Toast（x2）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.22.1 = 适配 DSH 0.2.1-rc.3 并修复发布依赖（x3）：engines.dsh 精确钉到 =0.2.1-rc.3；子会话判据改用 origin=subagent（普通 fork 不再误标）；删除已移除主题 token 改用 --dsw-alias-interactive-bg-hover；投影改走非弃用 snapshot(wire view) 并保留 stateOf 退路；把 7 个 @omb/* 组件从 dependencies 移到 devDependencies，修掉外部 profile 的 ERR_PNPM_WORKSPACE_PKG_NOT_FOUND。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -307,5 +307,5 @@
       ]
     }
   ],
-  "version": "4.22.0"
+  "version": "4.22.1"
 }

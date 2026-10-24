@@ -48,8 +48,13 @@ interface HostSessionHeaderLike {
   readonly cwd?: unknown
   readonly createdAt?: unknown
   readonly agentPreset?: unknown
-  /** 子代理会话的父会话 id（v4.20.0）；缺省 = 顶层会话。 */
+  /** 子代理会话的父会话 id（v4.20.0）。**单独看它不算子会话**——判据见 `parentIdOf`。 */
   readonly parentSession?: unknown
+  /**
+   * 粗粒度来源（DSH 0.2.1-rc.3 之后）：子代理子会话是 `'subagent'`，其余缺省。
+   * 只有它与 `parentSession` 同时成立，才把一条会话算作"子会话"。
+   */
+  readonly origin?: unknown
 }
 
 /** `sessionPersistence.list()` 的元素：`{ header, formatStatus? }`。 */
@@ -119,6 +124,21 @@ interface MergedEntry {
 
 function textOf(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * 子会话的父 id（v4.22.1；对齐 DSH 0.2.1-rc.3 之后的会话头语义）。
+ *
+ * 宿主收窄了 `parentSession` 的含义：**普通 fork 不再写它**，只有子代理会话写；
+ * 而"是不是子会话"的唯一判据是 `origin === 'subagent'`
+ * （宿主同一条判据：`session-controller/src/archived-session-gate.ts:50`、
+ * `client/sessions/lineage.ts:64`）。历史日志里的普通 fork 可能仍残留父 id，
+ * **残留不算父子**——否则项目页会把普通 fork 错标成"子会话"，折叠到并不存在的
+ * 母会话下，并且右侧缩进错位。缺 `origin` 的旧子代理会话也按宿主的规则不再缩进。
+ */
+function parentIdOf(header: HostSessionHeaderLike | undefined): string | null {
+  if (header?.origin !== 'subagent') return null
+  return textOf(header.parentSession) ?? null
 }
 
 /** 创建时间缺失/畸形时给 0（而不是 NaN）：排序仍稳定，UI 不至于显示 NaN。 */
@@ -344,7 +364,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
           cwd: textOf(header?.cwd) ?? '',
           createdAt: numberOrZero(header?.createdAt),
           agentPreset: textOf(header?.agentPreset) ?? null,
-          parentId: textOf(header?.parentSession) ?? null,
+          parentId: parentIdOf(header),
           live: false,
         })
       }
@@ -368,7 +388,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
             cwd: textOf(live?.header?.cwd) ?? '',
             createdAt: numberOrZero(live?.header?.createdAt),
             agentPreset: textOf(live?.header?.agentPreset) ?? null,
-            parentId: textOf(live?.header?.parentSession) ?? null,
+            parentId: parentIdOf(live?.header),
             live: true,
           })
           continue
@@ -379,7 +399,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
         if (existing.cwd.length === 0) existing.cwd = textOf(live?.header?.cwd) ?? ''
         if (existing.createdAt === 0) existing.createdAt = numberOrZero(live?.header?.createdAt)
         if (existing.agentPreset === null) existing.agentPreset = textOf(live?.header?.agentPreset) ?? null
-        if (existing.parentId === null) existing.parentId = textOf(live?.header?.parentSession) ?? null
+        if (existing.parentId === null) existing.parentId = parentIdOf(live?.header)
       }
     }
   }

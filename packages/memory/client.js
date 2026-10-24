@@ -111,7 +111,9 @@ window.__ModuleLoader__.load({
         text-align: left; cursor: pointer; justify-content: flex-start;
         transition: background-color 120ms var(--ds-ease-in-out, ease-out);
       }
-      .omb-nav-cell:hover { background: var(--dsw-specific-sidebar-nav-item-hover); }
+      /* 0.2.1-rc.3 之后 DSH 移除了 --dsw-specific-sidebar-nav-item-hover，
+         它自己的导航 hover 也改用 --dsw-alias-interactive-bg-hover（ui-settings-general 的 .navCell）。 */
+      .omb-nav-cell:hover { background: var(--dsw-alias-interactive-bg-hover); }
       .omb-nav-cell[aria-current='page'] { background: var(--dsw-specific-sidebar-nav-item-active); }
       .omb-nav-cell:focus-visible {
         outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));

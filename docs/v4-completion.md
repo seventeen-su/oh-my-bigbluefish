@@ -1468,3 +1468,40 @@
 11. 弹窗表单包 `.omb-form`，统一 12px 间距。
 12. `omb-meta` 与 `omb-row-meta` 统一 4×8 间距与字级。
 13. 新增/编辑/删除/反馈/隐私/深度/状态机等写操作统一 Toast，不再堆内联回执。
+
+---
+
+# OMB v4.22.1 交付记录（2026-10-25，x3）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.22.1**（`25 功能 / 129 小功能`；x3：DSH rc.3 适配 + 发布依赖修复） |
+| 构建 | 见下方交付时的 `build-generation.json`（本轮起一次构建） |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **125 files / 1570 passed | 1 skipped**；`version.mjs` 一致 |
+| 契约 | `docs/v4.22.1-host-rc3-and-install-fix.md` |
+
+## 背景
+
+1. 用户把 DSH 升到 `0.2.1-rc.3`（源码运行，实际 HEAD 在 tag 之后 1533 个提交），
+   紧急修了阻塞性的两处（`tool-subagent-control/list-agents` 子路径、`modelSelectionSettings`）。
+2. 另有插件报告：`@omb/plugin@4.22.0` 的 `@omb/artifact@workspace:*` 让该 profile 的
+   **所有插件装/卸/切换**以 `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND` 失败。
+
+## 本轮处置
+
+1. `engines.dsh` 精确钉到 **`=0.2.1-rc.3`**；36 条 peer 同步 `^0.2.1-rc.3`。
+2. 母子会话判据改 `origin === 'subagent'`（`dsh/session-catalog.ts` 的 `parentIdOf`）：
+   普通 fork 不再被误标/缩进，历史残留父 id 也不算父子（与宿主同一条规则）。
+3. 导航 hover 改用 `--dsw-alias-interactive-bg-hover`（旧 token 已被宿主删除）。
+4. 投影读取优先 `sessionProjections.snapshot()`（非弃用、wire view），`stateOf` 留旧宿主退路；
+   两种形状都解析（pressure/usage/breakdown）。
+5. 7 个 `@omb/*` 从 `dependencies` 移到 `devDependencies`（仍 `workspace:*`）：
+   外部 profile 的 pnpm 不再看到 `workspace:`；仓库与部署副本靠 `node_modules/@omb/*`
+   链接解析组件行不变。构建脚本新增"dependencies 不得含组件"的失败项。
+6. 新增护栏 `tests/dsh/installable-manifest.test.ts`；补 rc.3 语义/主题/预设断言。
+
+## 未验证 / 边界
+
+- 外部 profile 的 pnpm 操作只做了最小复现与修法验证，未在别人机器上实跑。
+- UI 视觉（hover、子会话缩进、极窄宽度）需重启 `dsh web` 后实际复核。
+- `engines.dsh` 是精确钉版：宿主升到未核验构建时 bundle 会被跳过（启动会打印一行）。

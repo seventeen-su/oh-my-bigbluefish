@@ -1,5 +1,11 @@
 # DSH `0.2.1-rc.2` 接触面逐条复核（task-2 证据档）
 
+> ⚠️ **历史档**：本档的宿主结论针对 `0.2.1-rc.2`。当前核过的宿主是 **`0.2.1-rc.3`**
+> （实际源码线在 tag 之后 1533 个提交），差异与处置见
+> [`docs/v4.22.1-host-rc3-and-install-fix.md`](./v4.22.1-host-rc3-and-install-fix.md)。
+> 本档中"投影用 `stateOf` 读宿主 state"的做法在 rc.3 起已标记 deprecated，
+> 现在的实现是优先 `snapshot()` 的 wire view。
+
 > 目标宿主：**DSH `0.2.1-rc.2`**（`D:\Program\deepseek-harness`，`git describe` = `dsh-v0.2.1-rc.2`，HEAD `687f282e86`）
 > 被核对象：**OMB `3.6.0`**（`D:\Program\Oh-My-BigBlueFish`，HEAD `cdf6f47`，工作树干净）
 > 上一版基线：`docs/dsh-compatibility.md`（针对 `0.2.0-rc.2`）

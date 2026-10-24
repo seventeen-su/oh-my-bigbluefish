@@ -334,7 +334,13 @@ function readComponentDisplay() {
  * 校验项（全部通过才会进第二趟；任何一条失败都发生在磁盘被改动之前）：
  *   - `packages/<目录>/package.json` 存在，且 `name` 与显示表一致
  *   - `packages/<目录>/index.ts` 存在
- *   - 根 `package.json` 的 `dependencies` 里有 `workspace:*`
+ *   - 根 `package.json` 的 `devDependencies` 里有 `workspace:*`
+ *     （**不能放 `dependencies`**：`workspace:` 协议只在 OMB 自己的 pnpm workspace 内可解析。
+ *     一旦出现在发布依赖里，任何把 `@omb/plugin` 当 `file:`/git 依赖装进 DSH profile 的安装
+ *     都会在 pnpm 解析阶段以 `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND` 失败；而插件管理器每次
+ *     装/卸/切换都会重跑 `pnpm install`，于是该 profile 的所有插件操作一起挂。
+ *     `devDependencies` 在消费方安装时被忽略；仓库内仍会生成 `node_modules/@omb/*` 链接，
+ *     部署副本正是靠这些链接解析 7 个组件行。契约：docs/v4.22.1-host-rc3-and-install-fix.md。）
  *   （"`lib-gen/g<N>/packages/<目录>/index.js` 存在"依赖 tsc 产出，
  *     只能在编译之后查——见 `assertCompiledEntries`。）
  *
@@ -348,8 +354,12 @@ function readComponentDisplay() {
 function planComponentPackages(entries, generation) {
   const pointer = `./${outDirFor(generation)}/index.js`
   const rootManifest = readJson(ROOT_MANIFEST)
-  const rootDeps = rootManifest.dependencies ?? {}
+  // **只看 devDependencies**：组件是仓库内开发链接与部署副本的解析来源，不是发布依赖。
+  // 发布依赖里出现 `workspace:` 会让 profile 的 `pnpm install` 直接失败（见函数头注释）。
+  const rootDevDeps = rootManifest.devDependencies ?? {}
+  const publishedDeps = rootManifest.dependencies ?? {}
   const missingDeps = []
+  const leakedDeps = []
   const files = []
 
   for (const entry of entries) {
@@ -368,10 +378,11 @@ function planComponentPackages(entries, generation) {
     const sourceEntry = join(pkgDir, 'index.ts')
     if (!existsSync(sourceEntry)) throw new Error(`[build] 组件包 ${entry.packageName} 缺入口 ${sourceEntry}`)
 
-    // 三条**会失败**的核对里最后一条：根包 dependencies 必须挂着它们
-    // （profile 只装装配包时，`@omb/<组件>` 正是经装配包自己的 `node_modules`
-    // 解析到的——少了依赖就解析不到，8 行全 failed to import）。
-    if (rootDeps[entry.packageName] !== 'workspace:*') missingDeps.push(entry.packageName)
+    // 两条**会失败**的核对里最后两条：devDependencies 必须挂着它们（仓库/部署副本的
+    // 解析来源），而 dependencies 里**不准**出现（发布依赖一旦带 workspace: 协议，
+    // 外部 profile 的 pnpm 解析就整体失败）。
+    if (rootDevDeps[entry.packageName] !== 'workspace:*') missingDeps.push(entry.packageName)
+    if (Object.hasOwn(publishedDeps, entry.packageName)) leakedDeps.push(entry.packageName)
 
     const localeDir = join(pkgDir, 'locale')
     files.push(
@@ -404,8 +415,15 @@ function planComponentPackages(entries, generation) {
 
   if (missingDeps.length > 0) {
     throw new Error(
-      `[build] 根 package.json 的 dependencies 缺少这些组件包（写 "workspace:*"）：\n  ${missingDeps.join('\n  ')}\n`
-      + 'profile 只装装配包时，行名 `@omb/<组件>` 正是经装配包自己的 node_modules 解析到的；缺了就是 8 行解析失败。',
+      `[build] 根 package.json 的 devDependencies 缺少这些组件包（写 "workspace:*"）：\n  ${missingDeps.join('\n  ')}\n`
+      + '仓库内与部署副本都靠 node_modules/@omb/* 链接解析组件行；缺了就是 7 行 failed to import。',
+    )
+  }
+  if (leakedDeps.length > 0) {
+    throw new Error(
+      `[build] 根 package.json 的 dependencies 里出现了组件包：\n  ${leakedDeps.join('\n  ')}\n`
+      + '组件只能放 devDependencies：workspace: 协议在外部 profile 的 pnpm 里无法解析，'
+      + '会让该 profile 的所有插件装/卸/切换以 ERR_PNPM_WORKSPACE_PKG_NOT_FOUND 失败。',
     )
   }
   return { files }

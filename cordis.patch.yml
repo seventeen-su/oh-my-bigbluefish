@@ -123,6 +123,14 @@
           #  schemastery 的 `strict` 默认为 false，未知键会被**静默合并**，永不生效）。
           # 本列表已逐行跟上；护栏是 `tests/dsh/preset-composition.test.ts`。
           #
+          # **0.2.1-rc.3 对齐（2026-10-25）**：宿主线又改了两处委派行，已逐字跟上：
+          # ① `@deepseek-ai/dsh-tool-subagent-control/list-agents` 子路径导出被移除，
+          #    `list_agents` 改由主插件注册——再写那一行会让**整个预设 broken**
+          #    （所有 `agentPreset=omb` 的旧会话打开时显示"会话不可用"）；
+          # ② `tool-subagent` 的配置键 `modelSelectionSettings` 改名为
+          #    `modelSelection` + `modelDiscovery`，旧键被静默合并、永不生效。
+          # 这两条由上面的注释行与测试 `preset-composition.test.ts` 同时钉住。
+          #
           # **为什么抄创造模式而不是标准模式**：创造模式才是全的那一份——
           # standard 少了 `tool-cordis`、少了 `skill-filesystem` 的 customSkillDirs、
           # 少了 `present`，而且它的 `tool-plugin-manager` 是**禁用**的；
@@ -224,14 +232,20 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              # 0.2.1-rc.3 的宿主线（commit 4df09d37d5，2026-10-23 之后）移除了
+              # `./list-agents` 子路径导出，`list_agents` 改由本行主插件一起注册。
+              # **不要再加回子路径行**：一行导入失败会让整个大肥鱼预设变成 broken，
+              # 所有 agentPreset=omb 的旧会话打开时显示"会话不可用"
+              # （OMB 自身模块不报错，所以很难定位）。护栏：preset-composition.test.ts。
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
+                  # rc.3 起的字段名：modelSelection + modelDiscovery。
+                  # 旧 modelSelectionSettings 会被 schemastery 静默合并、永不生效。
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:

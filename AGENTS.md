@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.22.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.22.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -39,6 +39,12 @@
     进 epoch）。三者都只用于"读后是否已被改/规则是否已变"的事实提示与无法核验时的保守拒绝，
     **不得**据此声称知道完整写集；shell 的未知写必须显式计数。
 
+12. **发布依赖不得出现 `workspace:` 协议（v4.22.1）**：`@omb/plugin` 会被外部 profile 当作
+    `file:`/git 依赖安装，消费方 pnpm 解析的是 `dependencies`；`workspace:` 只在 OMB 自己的
+    workspace 内可解析，出现在发布依赖里会让该 profile 的**所有**插件装/卸/切换以
+    `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND` 失败。7 个组件只能放 `devDependencies`（`workspace:*`）；
+    护栏：`tests/dsh/installable-manifest.test.ts`、`scripts/build.mjs` 的依赖核对。
+
 ## 3. 命令
 
 ```powershell
@@ -55,7 +61,7 @@ node scripts/check-resolution.mjs
 ## 4. 高频坑（都踩过）
 
 - 宿主会话事件边界是 `step/start`/`step/end`，不是 `turn/start`；`tool/call.arguments` 是未解析 JSON 字符串。
-- 投影 `stateOf()` 返回 **host state**：`contextPressure` 没有 `projectedTokens`（自己算 `pressureTokens+surfaceTokens−sampledSurfaceTokens`）；`tokenUsage` 是 `{totals,last}`；`contextBreakdown` 是嵌套 `breakdown.*`。
+- 投影优先读 `sessionProjections.snapshot(session,[key]).values[key]`（wire view）；旧宿主才退回 `stateOf()`（host state）：`contextPressure` wire 有 `projectedTokens`、旧 state 要自己算 `pressureTokens+surfaceTokens−sampledSurfaceTokens`；`tokenUsage` wire 是扁平 totals、旧 state 是 `{totals,last}`；`contextBreakdown` wire 是扁平、旧 state 嵌套 `breakdown.*`。两种形状都要吃（`dsh/pressure.ts`）。
 - `systemPrompt.context()` 是尾部快照；`systemPrompt.section` 才是系统提示段。
 - 预设内组可能 `isolate`（compaction/toolResultPruner/sessionQuery）：根 realm 拿不到；`ctx.get` 与 `ctx.<name>` 语义不同（后者需 inject）。
 - 会话搜索 `fts5(unicode61)` 中文子串不可用；OMB 的 bigram FTS 是中文唯一通道。
@@ -64,7 +70,16 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.22.0（当前） = 设置台打磨（x2）**：极窄布局与侧栏 56px、历史会话标题端口
+- **v4.22.1（当前） = DSH 0.2.1-rc.3 适配 + 发布依赖修复（x3）**：
+  `engines.dsh` 精确钉到 `=0.2.1-rc.3`（36 条 peer 同步写 `^0.2.1-rc.3`）；
+  子会话判据从"有 `parentSession`"改为 `origin === 'subagent'`（rc.3 之后普通 fork
+  不再写父 id，历史残留也不算父子）；导航 hover 改用 `--dsw-alias-interactive-bg-hover`
+  （旧 `--dsw-specific-sidebar-nav-item-hover` 已被宿主删除）；投影读取优先
+  `sessionProjections.snapshot()`（非弃用、wire view），`stateOf` 留作旧宿主退路；
+  7 个 `@omb/*` 组件从 `dependencies` 移到 `devDependencies`，修掉外部 profile 的
+  `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`（插件管理器每次操作都会重跑 pnpm install）。
+  契约：`docs/v4.22.1-host-rc3-and-install-fix.md`。
+- **v4.22.0 = 设置台打磨（x2）**：极窄布局与侧栏 56px、历史会话标题端口
   （`get /session-title?id=`，读持久化最后一个 `session/title`）、子会话宽度削减、
   去掉重复 cwd、状态机总页搜索/筛选/增删管理、窄屏列表遮罩动效、二级卡 `#232324`、
   仿 dsh-desktop-notify 的填充式控件、弹窗 `.omb-form` 间距、操作结果统一 Toast。

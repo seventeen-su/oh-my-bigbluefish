@@ -4,15 +4,20 @@
  * 这一层的存在理由就是"`band` 恒为 relaxed 时没人会发现"，所以每个用例都同时断言
  * **读数**与**原因**：只断言"返回 undefined"会放过"四种成因混成一种"的退化。
  *
- * ## v3.7：投影替身必须按**宿主 state** 写，不能按 client wire view 写
+ * ## 两种读法都要有替身：snapshot 的 wire view（rc.3+）与 stateOf 的宿主 state（旧宿主）
  *
- * `ctx.sessionProjections.stateOf()` 返回 host state：
+ * 0.2.1-rc.3 之后 `sessionProjections.stateOf()` 被标记 deprecated；非弃用读法是
+ * `snapshot(session, [key]).values[key]`，返回 **client wire view**：
+ * - `contextPressure`：`{pressureTokens, projectedTokens, contextWindow}`
+ * - `tokenUsage`：扁平 totals（不再是 `{totals, last}`）
+ * - `contextBreakdown`：扁平 `{systemTokens, toolsTokens, messageTokens}`
+ *
+ * 旧宿主没有 `snapshot`，退回 `stateOf` 的宿主 state：
  * - `contextPressure`：`{pressureTokens, surfaceTokens, sampledSurfaceTokens, contextWindow}`
- *   （`projectedTokens` 只在 wire view 里，由前三个算出来）
  * - `tokenUsage`：`{totals:{...}, last}`
  * - `contextBreakdown`：`{systems, surfaceTokens, breakdown:{...}}`
  *
- * 旧测试替身照着 wire view 扁平写，于是"读错一层"在测试里永远绿、在真机上永远 0。
+ * 两条路**各有测试**，因为"读错一层"在测试里永远绿、在真机上永远 0。
  */
 import { describe, expect, it } from 'vitest'
 import { createPressureBridge } from '../../dsh/pressure.js'
@@ -43,6 +48,23 @@ function registry(states: Record<string, unknown>, options: { throwing?: readonl
 }
 
 const SESSION = { id: 's1', header: { cwd: 'D:/p' } }
+
+/**
+ * 0.2.1-rc.3 之后的**非弃用**读法：`snapshot(session, [key])` 给 client wire view。
+ * 只实现 snapshot、不实现 stateOf —— 证明桥确实优先走新路径。
+ */
+function snapshotRegistry(values: Record<string, unknown>): unknown {
+  return {
+    snapshot: (_session: unknown, keys?: readonly string[]) => ({
+      asOfSeq: 0,
+      values: Object.fromEntries(
+        (keys ?? Object.keys(values))
+          .filter(key => Object.hasOwn(values, key))
+          .map(key => [key, values[key]]),
+      ),
+    }),
+  }
+}
 
 /** 一个可算出 projectedTokens = 1000 + 2000 − 1500 = 1500 的宿主 state。 */
 const FULL = {
@@ -79,6 +101,26 @@ describe('度量桥：读数', () => {
     expect(reading?.nodes.map(n => n.tokens)).toEqual([300, 200, 900])
     // 名字必须自带「估算」：这三个数用固定密度估计，不与 totalTokens 相加对齐
     expect(reading?.nodes.every(n => n.name.includes('估算'))).toBe(true)
+  })
+
+  it('rc.3 非弃用读法：snapshot 的 wire view（projectedTokens + 扁平 totals + 扁平 breakdown）', () => {
+    const bridge = createPressureBridge({
+      ctx: fakeCtx({
+        sessionProjections: snapshotRegistry({
+          contextPressure: { pressureTokens: 1000, projectedTokens: 1500, contextWindow: 5000 },
+          tokenUsage: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 400, cacheWriteTokens: 100 },
+          contextBreakdown: { systemTokens: 300, toolsTokens: 200, messageTokens: 900 },
+        }),
+      }),
+    })
+    bridge.remember('s1', SESSION)
+    const reading = bridge.measure('s1')
+    expect(reading).toBeDefined()
+    expect(reading?.totalTokens).toBe(1500)
+    expect(reading?.fillRatio).toBeCloseTo(0.3, 6)
+    expect(reading?.cacheReadTokens).toBe(400)
+    expect(reading?.cacheWriteTokens).toBe(100)
+    expect(reading?.nodes.map(n => n.tokens)).toEqual([300, 200, 900])
   })
 
   it('compaction 之后：pressureTokens 仍是旧值，但 surface 已被遮蔽 → projected 立刻下降', () => {

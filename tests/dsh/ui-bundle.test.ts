@@ -80,7 +80,10 @@ describe('OMB 设置 bundle 发布契约', () => {
   it('控件锁定：选中用填充、焦点环只在 focus-visible、禁止蓝色描边', () => {
     const code = source()
     expect(code).toContain('var(--dsw-specific-sidebar-nav-item-active)')
-    expect(code).toContain('var(--dsw-specific-sidebar-nav-item-hover)')
+    // 0.2.1-rc.3 之后宿主删除了 --dsw-specific-sidebar-nav-item-hover；
+    // 它自己的导航 hover 也改用 --dsw-alias-interactive-bg-hover。
+    expect(code).not.toContain('var(--dsw-specific-sidebar-nav-item-hover)')
+    expect(code).toContain('var(--dsw-alias-interactive-bg-hover)')
     expect(code).toContain(':focus-visible')
     expect(code).toContain('var(--dsw-focus-ring-color')
     expect(code).not.toContain('border-color: var(--dsw-alias-state-business-primary)')

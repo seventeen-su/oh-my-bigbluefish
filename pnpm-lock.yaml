@@ -8,6 +8,10 @@ importers:
 
   .:
     dependencies:
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
       '@omb/artifact':
         specifier: workspace:*
         version: link:packages/artifact
@@ -29,10 +33,6 @@ importers:
       '@omb/reasoning':
         specifier: workspace:*
         version: link:packages/reasoning
-      zod:
-        specifier: ^4.4.3
-        version: 4.4.3
-    devDependencies:
       '@types/node':
         specifier: ^22.20.1
         version: 22.20.1
@@ -57,12 +57,6 @@ importers:
         version: 1.29.0
 
   packages/artifact:
-    dependencies:
-      zod:
-        specifier: ^4.4.3
-        version: 4.4.3
-
-  packages/context:
     dependencies:
       zod:
         specifier: ^4.4.3

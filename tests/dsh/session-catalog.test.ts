@@ -28,12 +28,16 @@ function fakeCtx(
   }
 }
 
-/** 造一个会话头；`agentPreset` 省略时模拟旧日志（字段不存在）。 */
+/** 造一个会话头；`agentPreset` 省略时模拟旧日志（字段不存在）。
+ *
+ * `origin: 'subagent'` 是 DSH 0.2.1-rc.3 之后"子代理子会话"的唯一判据；
+ * `parentSession` 单独出现**不算**子会话（普通 fork 历史上可能残留父 id）。 */
 function header(
   id: string,
   cwd: string,
   createdAt: number,
   agentPreset?: string,
+  origin?: 'subagent',
   parentSession?: string,
 ): Record<string, unknown> {
   return {
@@ -41,6 +45,7 @@ function header(
     cwd,
     createdAt,
     ...(agentPreset === undefined ? {} : { agentPreset }),
+    ...(origin === undefined ? {} : { origin }),
     ...(parentSession === undefined ? {} : { parentSession }),
   }
 }
@@ -97,17 +102,17 @@ describe('installSessionCatalog', () => {
     catalog.dispose()
   })
 
-  it('parentId：持久化/活会话 header 的 parentSession 都读，缺省 null，合并时补缺', async () => {
+  it('parentId：只有 origin=subagent 才认父；持久化/活会话都读，缺省 null，合并时补缺', async () => {
     const catalog = installSessionCatalog(fakeCtx({
       sessionPersistence: persistence([
-        { header: header('child', 'D:/c', 1, 'omb', 'parent-a') },
+        { header: header('child', 'D:/c', 1, 'omb', 'subagent', 'parent-a') },
         { header: header('top', 'D:/t', 2, 'omb') },
         // 持久化头缺 parentSession，活会话头有 → 合并时补上
         { header: header('merged', 'D:/m', 3, 'omb') },
       ]),
       sessions: sessions([
-        { id: 'merged', header: header('merged', 'D:/m', 3, 'omb', 'parent-b') },
-        { id: 'livechild', header: header('livechild', 'D:/l', 4, 'omb', 'parent-c') },
+        { id: 'merged', header: header('merged', 'D:/m', 3, 'omb', 'subagent', 'parent-b') },
+        { id: 'livechild', header: header('livechild', 'D:/l', 4, 'omb', 'subagent', 'parent-c') },
       ]),
     }))
     const listing = await catalog.port.list()
@@ -116,6 +121,26 @@ describe('installSessionCatalog', () => {
     expect(byId.get('top')).toMatchObject({ parentId: null })
     expect(byId.get('merged')).toMatchObject({ parentId: 'parent-b' })
     expect(byId.get('livechild')).toMatchObject({ parentId: 'parent-c' })
+    catalog.dispose()
+  })
+
+  it('rc.3 语义：普通 fork 残留 parentSession 但无 origin → 不算子会话（不被误标/缩进）', async () => {
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: persistence([
+        // 历史日志里的普通 fork：宿主当时也写 parentSession
+        { header: header('fork-old', 'D:/f', 1, 'omb', undefined, 'source-old') },
+        // 历史子代理会话：同样没有 origin —— 宿主自己的规则也不再把它当子会话
+        { header: header('sub-old', 'D:/s', 2, 'omb', undefined, 'parent-old') },
+      ]),
+      sessions: sessions([
+        { id: 'fork-live', header: header('fork-live', 'D:/lf', 3, 'omb', undefined, 'source-live') },
+      ]),
+    }))
+    const listing = await catalog.port.list()
+    const byId = new Map(listing.items.map(item => [item.id, item]))
+    expect(byId.get('fork-old')).toMatchObject({ parentId: null })
+    expect(byId.get('sub-old')).toMatchObject({ parentId: null })
+    expect(byId.get('fork-live')).toMatchObject({ parentId: null })
     catalog.dispose()
   })
 
