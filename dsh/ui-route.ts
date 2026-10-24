@@ -5,8 +5,8 @@
  * - 只挂在宿主 `webServer` 的 `/omb/api` 前缀上；没有 webServer（CLI/桌面载体）时
  *   本路由不注册，侧边栏自然不出现——不假装已经可用；
  * - **读**：GET 只调用 `omb:ui` 服务；**写**入口只有用户点击触发的
- *   `/confirm`、`/resolve`、`/privacy`（v4.17 会话隐私设置）。**没有模型工具入口**：
- *   模型不能通过这些端点放开自己的隐私限制；
+ *   `/confirm`、`/resolve`、`/privacy`（会话隐私设置）、`/memory`（手动新建/编辑/
+ *   删除/标记，v4.18）。**没有模型工具入口**：模型不能通过这些端点放宽隐私或改记忆；
  * - 同源保护：浏览器跨站请求带的 `Origin` 与 `Host` 不一致时 403（GET 的简单请求本来就
  *   不发 Origin，所以这层只在异常情形生效；不是权限边界，真正的边界是本机回环监听）；
  * - 所有响应 `no-store`，JSON 编码，错误不泄漏内部异常文本（只给类别）。
@@ -15,7 +15,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Kernel } from '../kernel/abi/index.js'
 import { SERVICES } from '../kernel/abi/index.js'
 import type { MemoryKind } from '../kernel/abi/index.js'
-import type { UiListQuery, UiScope, UiStatus, UiService } from '../modules/memory/ui.js'
+import type { UiListQuery, UiMemoryMark, UiScope, UiStatus, UiService } from '../modules/memory/ui.js'
 import type { PrivacyMode } from '../modules/memory/privacy/modes.js'
 
 /** 路由前缀（与 `cordis.patch.yml` 的组件行无关，纯宿主 URL 命名空间）。 */
@@ -24,7 +24,8 @@ export const UI_ROUTE_PREFIX = '/omb/api'
 /** 允许的类型/状态取值（解析用；未知值忽略而不是 400——前端可以渐进增强）。 */
 const KINDS: readonly MemoryKind[] = ['semantic', 'procedural', 'episodic']
 const SCOPES: readonly UiScope[] = ['user', 'project', 'all']
-const STATUSES: readonly UiStatus[] = ['active', 'stale', 'superseded', 'all']
+const STATUSES: readonly UiStatus[] = ['active', 'stale', 'superseded', 'candidate', 'all']
+const MARKS: readonly UiMemoryMark[] = ['confirm', 'obsolete', 'revive']
 
 function parseListQuery(search: URLSearchParams): UiListQuery {
   const scope = search.get('scope') as UiScope | null
@@ -119,10 +120,10 @@ export function installUiRoute(
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
       if (req.method === 'POST') {
-        // 写入口只有三个：用户点击的确认/撤销、冲突裁决、会话隐私设置。
+        // 写入口只有四个：用户点击的确认/撤销、冲突裁决、会话隐私设置、手动记忆编辑。
         // **没有模型工具调用它们**。
-        if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy') {
-          json(res, 405, { error: 'write endpoints are /confirm, /resolve, and /privacy' })
+        if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy' && path !== '/memory') {
+          json(res, 405, { error: 'write endpoints are /confirm, /resolve, /privacy, and /memory' })
           return
         }
         const contentType = req.headers['content-type'] ?? ''
@@ -160,6 +161,85 @@ export function installUiRoute(
             action,
             ...(sessionId === undefined ? {} : { sessionId }),
             ...(mode === undefined ? {} : { mode }),
+          })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
+        if (path === '/memory') {
+          const action = record?.['action']
+          if (action !== 'create' && action !== 'update' && action !== 'delete' && action !== 'mark') {
+            json(res, 400, { error: 'action 必须是 create、update、delete 或 mark' })
+            return
+          }
+          const rawId = record?.['id']
+          const id = typeof rawId === 'string' ? rawId.trim() : ''
+          const requireId = (): boolean => {
+            if (id.length > 0) return true
+            json(res, 400, { error: '缺少 id' })
+            return false
+          }
+          const rawTags = record?.['tags']
+          if (rawTags !== undefined && (!Array.isArray(rawTags) || rawTags.some(tag => typeof tag !== 'string'))) {
+            json(res, 400, { error: 'tags 必须是字符串数组' })
+            return
+          }
+          const tags = Array.isArray(rawTags) ? rawTags as string[] : undefined
+          if (action === 'create') {
+            const scope = record?.['scope']
+            const kind = record?.['kind']
+            const text = record?.['text']
+            if (scope !== 'user' && scope !== 'project') {
+              json(res, 400, { error: 'scope 必须是 user 或 project' })
+              return
+            }
+            if (typeof kind !== 'string' || !KINDS.includes(kind as MemoryKind)) {
+              json(res, 400, { error: 'kind 必须是 semantic、procedural 或 episodic' })
+              return
+            }
+            if (typeof text !== 'string') {
+              json(res, 400, { error: '缺少 text' })
+              return
+            }
+            const outcome = await ui.createMemory({
+              scope,
+              kind: kind as MemoryKind,
+              text,
+              ...(tags === undefined ? {} : { tags }),
+            })
+            json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+            return
+          }
+          if (!requireId()) return
+          if (action === 'delete') {
+            const outcome = await ui.deleteMemory(id)
+            json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+            return
+          }
+          if (action === 'mark') {
+            const mark = record?.['mark']
+            if (typeof mark !== 'string' || !MARKS.includes(mark as UiMemoryMark)) {
+              json(res, 400, { error: 'mark 必须是 confirm、obsolete 或 revive' })
+              return
+            }
+            const outcome = await ui.markMemory(id, mark as UiMemoryMark)
+            json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+            return
+          }
+          const text = record?.['text']
+          const kind = record?.['kind']
+          if (text !== undefined && typeof text !== 'string') {
+            json(res, 400, { error: 'text 必须是字符串' })
+            return
+          }
+          if (kind !== undefined && (typeof kind !== 'string' || !KINDS.includes(kind as MemoryKind))) {
+            json(res, 400, { error: 'kind 必须是 semantic、procedural 或 episodic' })
+            return
+          }
+          const outcome = await ui.updateMemory({
+            id,
+            ...(typeof text === 'string' ? { text } : {}),
+            ...(typeof kind === 'string' ? { kind: kind as MemoryKind } : {}),
+            ...(tags === undefined ? {} : { tags }),
           })
           json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
           return
@@ -208,7 +288,17 @@ export function installUiRoute(
         return
       }
       if (path === '/profile') {
-        json(res, 200, await ui.profile())
+        const sessionId = url.searchParams.get('sessionId')
+        const trimmed = sessionId === null ? '' : sessionId.trim()
+        json(res, 200, await ui.profile(trimmed.length > 0 ? trimmed : undefined))
+        return
+      }
+      if (path === '/sessions') {
+        json(res, 200, await ui.sessions())
+        return
+      }
+      if (path === '/personal') {
+        json(res, 200, await ui.personal())
         return
       }
       if (path === '/privacy') {

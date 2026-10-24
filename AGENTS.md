@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.17.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.18.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,16 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.17.1（当前） = 隐私设置页降级态如实标注（x3）**：隐私视图不可用/读取失败时
+- **v4.18.0（当前） = OMB 设置重做（x2）**：四页二级侧边栏（概览/记忆/项目/个人画像）；
+  手动记忆增删改标记（`POST /omb/api/memory`，写入经隐私闸门、写后查回）；
+  项目页由 `SERVICES.sessionCatalog`（`dsh/session-catalog.ts`）列 OMB 会话，
+  显示工作区/推理深度/隐私/归档，归档置灰且不可读；个人画像页读 `SERVICES.profile`；
+  二级卡/三级卡用 `--dsw-elevation-panel`/`--dsw-elevation-soft`（亮色主题层色相同，
+  不能只靠底色差），控件选中用填充、焦点环仅 `:focus-visible`；方向感子页浮动
+  （`omb-page-forward/back`）、子页滚动条隐藏、文本选择分层（骨架不可选/内容可选）。
+  契约：`docs/v4.18.0-ui-contract.md`、交付：`docs/v4.18.0-settings-redesign.md`、
+  设计理由：`DESIGN.md`。
+- **v4.17.1** = 隐私设置页降级态如实标注（x3）：隐私视图不可用/读取失败时
   不再把占位值画成"基线 normal/状态文件可读写"；卡片与命令面状态写"未接线/读取失败"，
   命令面状态取真实的 `commandState`。契约同下一条。
 - **v4.17.0 = OMB 设置：二级侧边栏、动效、会话隐私页（x2）**：面板标题

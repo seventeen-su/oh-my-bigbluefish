@@ -384,6 +384,15 @@ export const SERVICES = {
    */
   sessionState: 'omb:session-state',
   /**
+   * **会话目录**（`SessionCatalogPort`，由 `dsh/session-catalog.ts` provide，v4.18.0）。
+   *
+   * 「项目」页要按会话列出工作区、推理深度、隐私档位与归档状态。会话持久化、
+   * 归档集合与标题投影都只有宿主知道，模块层拿不到——因此由 `dsh/` 读宿主服务，
+   * 以结构最小面 `{ id,title,cwd,createdAt,agentPreset,archived,live }` 提供。
+   * 取不到时 `list()` 返回 `available:false` 与原因，**不拿空列表冒充"没有会话"**。
+   */
+  sessionCatalog: 'omb:session-catalog',
+  /**
    * **管理侧边栏数据面**（`modules/memory/ui.ts`，v4.15.0）。
    *
    * 只读：概览/列表/详情/候选；由 `dsh/ui-route.ts` 挂在宿主 `/omb/api` 前缀路由上，

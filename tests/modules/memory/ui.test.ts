@@ -4,7 +4,7 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { MemoryRecord, MemoryScope } from '../../../kernel/abi/index.js'
-import { openMemoryStore, asConfirmStore, type SqliteMemoryStore } from '../../../modules/memory/store.js'
+import { openMemoryStore, asConfirmStore, asRecordScanner, type SqliteMemoryStore } from '../../../modules/memory/store.js'
 import { createConfirmAction } from '../../../modules/memory/confirm.js'
 import { createUiService } from '../../../modules/memory/ui.js'
 import type { PrivacyAdminPort, UiPrivacyView } from '../../../modules/memory/privacy/contract.js'
@@ -78,6 +78,38 @@ function recordOf(overrides: Partial<MemoryRecord> & { id: string; text: string 
     sourceRef: 'test:ui',
     ...overrides,
   })
+}
+
+/**
+ * v4.18 手动写入用的服务：有当前会话 + `forSession`（出口过隐私闸门），
+ * 快照库也给出同样的两个库（无会话路径用）。
+ */
+function writableFor(f: Fixture): ReturnType<typeof createUiService> {
+  const clock = fixedClock()
+  const stores = [
+    { scope: 'user' as const, store: f.user },
+    { scope: 'project' as const, store: f.project },
+  ]
+  return createUiService({
+    stores: {
+      status: () => ({ ready: true, detail: '测试库', openProjects: ['/work/demo'], maxOpenProjects: 8 }),
+      snapshot: () => ({
+        user: { stores: [{ scope: 'user', store: f.user }] },
+        projects: [{ projectScope: '/work/demo', stores }],
+      }),
+      forSession: async () => ({
+        projectScope: '/work/demo',
+        stores,
+        store: (scope: MemoryScope) => (scope === 'user' ? f.user : f.project),
+      }),
+    },
+    currentSession: () => 's1',
+    clock,
+  })
+}
+
+async function recentRecords(store: SqliteMemoryStore, limit = 20): Promise<readonly MemoryRecord[]> {
+  return await asRecordScanner(store)?.listRecentRecords({ limit }) ?? []
 }
 
 describe('createUiService', () => {
@@ -349,6 +381,7 @@ describe('createUiService', () => {
           clear: () => ({ ok: true, text: 'ok' }),
           clearInactive: () => ({ ok: true, text: 'ok' }),
           trust: () => ({ ok: true, text: 'ok' }),
+          modeOf: () => ({ mode: 'normal', origin: 'default', inheritedFrom: null }),
         },
       },
     })
@@ -384,6 +417,7 @@ describe('createUiService', () => {
           clear: () => ({ ok: true, text: 'ok' }),
           clearInactive: () => ({ ok: true, text: 'ok' }),
           trust: () => ({ ok: true, text: 'ok' }),
+          modeOf: () => ({ mode: 'normal', origin: 'default', inheritedFrom: null }),
         },
       },
     })
@@ -405,6 +439,7 @@ describe('createUiService', () => {
           clear: () => ({ ok: true, text: 'ok' }),
           clearInactive: () => ({ ok: true, text: 'ok' }),
           trust: () => ({ ok: true, text: 'ok' }),
+          modeOf: () => ({ mode: 'normal', origin: 'default', inheritedFrom: null }),
         },
       },
     })
@@ -431,6 +466,7 @@ describe('createUiService', () => {
         calls.push('trust')
         return { ok: true, text: '已解除 fail-closed' }
       },
+      modeOf: () => ({ mode: 'normal', origin: 'default', inheritedFrom: null }),
     }
     const service = createUiService({ stores: minimalStores, privacy: { current: () => 's1', admin } })
 
@@ -473,5 +509,229 @@ describe('createUiService', () => {
     expect(isolated.ok).toBe(false)
     expect(isolated.text).toContain('已隔离')
     expect(isolated.text).toContain('持久化失败')
+  })
+
+  // ── v4.18 手动增删改标记 / 项目页 / 个人画像 ─────────────────────
+  it('手动新建：用户库/项目库、字段与隐私归属；非法参数与缺会话拒绝（v4.18）', async () => {
+    const f = fixture()
+    const service = writableFor(f)
+
+    const created = await service.createMemory({
+      scope: 'user', kind: 'semantic', text: '  用户手动写入的偏好  ', tags: ['ui', '手动', 'ui'],
+    })
+    expect(created.ok).toBe(true)
+    expect(created.text).toContain('已新建记忆')
+    const userRecord = (await recentRecords(f.user)).find(record => record.text === '用户手动写入的偏好')
+    expect(userRecord).toBeDefined()
+    expect(userRecord).toMatchObject({
+      scope: 'user', kind: 'semantic', assertedBy: 'user', sourceRef: 'ui:manual',
+      validTo: null, supersededBy: null, useCount: 0, project: null,
+    })
+    expect(userRecord?.tags).toEqual(['ui', '手动'])
+    expect(userRecord?.contentHash).toBeTruthy()
+
+    const projectCreated = await service.createMemory({ scope: 'project', kind: 'procedural', text: '项目手动写入' })
+    expect(projectCreated.ok).toBe(true)
+    const projectRecord = (await recentRecords(f.project)).find(record => record.text === '项目手动写入')
+    expect(projectRecord).toMatchObject({ scope: 'project', project: '/work/demo' })
+
+    // 项目作用域必须有当前会话
+    const noSession = createUiService({ stores: minimalStores, clock: fixedClock() })
+    const rejected = await noSession.createMemory({ scope: 'project', kind: 'semantic', text: '没有会话' })
+    expect(rejected.ok).toBe(false)
+    expect(rejected.text).toContain('项目作用域需要当前会话')
+
+    expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '   ' })).ok).toBe(false)
+    expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: 'x'.repeat(4001) })).ok).toBe(false)
+    expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太多', tags: Array.from({ length: 9 }, (_, i) => `t${i}`) })).ok).toBe(false)
+    expect((await service.createMemory({ scope: 'user', kind: 'semantic', text: '标签太长', tags: ['x'.repeat(25)] })).ok).toBe(false)
+    await f.close()
+  })
+
+  it('手动编辑：保留 id/observedAt/sourceRef/assertedBy/useCount；文本变则重算 contentHash；非活跃拒绝', async () => {
+    const f = fixture()
+    const service = writableFor(f)
+    const created = await service.createMemory({ scope: 'user', kind: 'semantic', text: '旧正文' })
+    expect(created.ok).toBe(true)
+    const before = (await recentRecords(f.user)).find(record => record.text === '旧正文')
+    expect(before).toBeDefined()
+    const id = before!.id
+
+    const updated = await service.updateMemory({ id, text: '新正文', kind: 'procedural', tags: ['编辑'] })
+    expect(updated.ok).toBe(true)
+    const after = await f.user.get(id)
+    expect(after).toMatchObject({
+      id, text: '新正文', kind: 'procedural', observedAt: before!.observedAt,
+      sourceRef: 'ui:manual', assertedBy: 'user', useCount: 0, project: null,
+    })
+    expect(after?.tags).toEqual(['编辑'])
+    expect(after?.contentHash).not.toBe(before!.contentHash)
+
+    await f.put('user', recordOf({ id: 'u-stale', scope: 'user', kind: 'semantic', text: '失效条目', validTo: NOW - 1 }))
+    expect((await service.updateMemory({ id: 'u-stale', text: '改不动' })).ok).toBe(false)
+    await f.close()
+  })
+
+  it('手动删除：真删后查回不存在；store 不支持 forget 时如实拒绝', async () => {
+    const f = fixture()
+    const service = writableFor(f)
+    await f.put('user', recordOf({ id: 'd1', scope: 'user', kind: 'semantic', text: '要删的条目' }))
+    const deleted = await service.deleteMemory('d1')
+    expect(deleted.ok).toBe(true)
+    expect(deleted.text).toContain('已删除')
+    expect(await f.user.get('d1')).toBeUndefined()
+    expect((await service.deleteMemory('d1')).ok).toBe(false)
+
+    // 结构化探测：store 没有 forget → 拒绝，不改任何数据
+    const record = recordOf({ id: 'no-forget', scope: 'user', kind: 'semantic', text: '不能删' })
+    const fakeStore = {
+      scope: 'user' as const,
+      get: async (id: string) => (id === record.id ? record : undefined),
+      put: async () => {},
+      getMany: async () => [record],
+      forget: undefined as unknown as (ids: readonly string[]) => Promise<number>,
+    }
+    const noForget = createUiService({
+      stores: {
+        status: () => ({ ready: true, detail: 'fake', openProjects: [], maxOpenProjects: 8 }),
+        snapshot: () => ({ user: { stores: [{ scope: 'user', store: fakeStore as never }] }, projects: [] }),
+      },
+      currentSession: () => 's1',
+      clock: fixedClock(),
+    })
+    const refused = await noForget.deleteMemory('no-forget')
+    expect(refused.ok).toBe(false)
+    expect(refused.text).toContain('forget')
+    await f.close()
+  })
+
+  it('手动标记：obsolete 写 validTo、revive 清 validTo、被取代不可复活；confirm 复用 deps.confirm', async () => {
+    const f = fixture()
+    const service = writableFor(f)
+    await f.put('user', recordOf({ id: 'ob1', scope: 'user', kind: 'semantic', text: '待失效条目' }))
+    const obsolete = await service.markMemory('ob1', 'obsolete')
+    expect(obsolete.ok).toBe(true)
+    const marked = await f.user.get('ob1')
+    expect(marked?.validTo).not.toBeNull()
+    expect(marked?.supersededBy).toBeNull()
+
+    const revived = await service.markMemory('ob1', 'revive')
+    expect(revived.ok).toBe(true)
+    expect((await f.user.get('ob1'))?.validTo).toBeNull()
+
+    await f.put('user', recordOf({
+      id: 'sup1', scope: 'user', kind: 'semantic', text: '已被取代', validTo: NOW - 1, supersededBy: 'other',
+    }))
+    const reviveSuperseded = await service.markMemory('sup1', 'revive')
+    expect(reviveSuperseded.ok).toBe(false)
+    expect(reviveSuperseded.text).toContain('取代')
+
+    const calls: string[] = []
+    const confirmService = createUiService({
+      stores: minimalStores,
+      currentSession: () => 's1',
+      confirm: async input => {
+        calls.push(`${input.action}:${input.id}:${String(input.sessionId)}`)
+        return { ok: true, text: '已确认' }
+      },
+      clock: fixedClock(),
+    })
+    expect((await confirmService.markMemory('c1', 'confirm')).ok).toBe(true)
+    expect(calls).toEqual(['confirm:c1:s1'])
+    expect((await confirmService.markMemory('c1', 'nope' as never)).ok).toBe(false)
+    await f.close()
+  })
+
+  it('list 支持 status=candidate（active + model + semantic/procedural）', async () => {
+    const f = fixture()
+    await f.put('user', recordOf({ id: 'c-sem', scope: 'user', kind: 'semantic', assertedBy: 'model', text: '候选语义' }))
+    await f.put('user', recordOf({ id: 'c-pro', scope: 'user', kind: 'procedural', assertedBy: 'model', text: '候选过程' }))
+    await f.put('user', recordOf({ id: 'c-epi', scope: 'user', kind: 'episodic', assertedBy: 'model', text: '事件不算候选' }))
+    await f.put('user', recordOf({ id: 'c-user', scope: 'user', kind: 'semantic', assertedBy: 'user', text: '用户确认过' }))
+    await f.put('user', recordOf({
+      id: 'c-old', scope: 'user', kind: 'semantic', assertedBy: 'model', text: '已失效候选', validTo: NOW - 1,
+    }))
+    const candidates = await f.service.list({ scope: 'user', status: 'candidate' })
+    expect(candidates.items.map(item => item.id).sort()).toEqual(['c-pro', 'c-sem'])
+    await f.close()
+  })
+
+  it('sessions：只列 agentPreset=omb；归档保留；active/depth/root/privacy 按内核服务；目录不可用如实降级', async () => {
+    const sessionCatalog = {
+      list: async () => ({
+        available: true,
+        items: [
+          { id: 's1', title: '会话一', cwd: '/work/demo/sub', createdAt: 3, agentPreset: 'omb', archived: false, live: true },
+          { id: 's2', title: null, cwd: '/work/old', createdAt: 2, agentPreset: 'omb', archived: true, live: false },
+          { id: 's3', title: '别家', cwd: '/x', createdAt: 1, agentPreset: 'standard', archived: false, live: true },
+        ],
+      }),
+    }
+    const admin: PrivacyAdminPort = {
+      view: () => privacyView(),
+      setMode: () => ({ ok: true, text: 'ok' }),
+      clear: () => ({ ok: true, text: 'ok' }),
+      clearInactive: () => ({ ok: true, text: 'ok' }),
+      trust: () => ({ ok: true, text: 'ok' }),
+      modeOf: (sessionId: string) => sessionId === 's1'
+        ? { mode: 'sealed', origin: 'command', inheritedFrom: null }
+        : { mode: 'normal', origin: 'default', inheritedFrom: null },
+    }
+    const service = createUiService({
+      stores: minimalStores,
+      sessionCatalog: sessionCatalog as never,
+      sessionRuntime: { list: () => [{ sessionId: 's1', observations: 2 }, { sessionId: 's2', observations: 0 }] },
+      rootOf: cwd => (cwd.startsWith('/work') ? '/work/demo' : null),
+      focusOf: sessionId => (sessionId === 's1' ? 'deep' : null),
+      privacy: { current: () => 's1', admin },
+      clock: fixedClock(),
+    })
+    const listing = await service.sessions()
+    expect(listing.available).toBe(true)
+    expect(listing.items.map(item => item.id)).toEqual(['s1', 's2'])
+    expect(listing.items[0]).toMatchObject({
+      title: '会话一', cwd: '/work/demo/sub', root: '/work/demo', preset: 'omb',
+      archived: false, active: true, depth: 'deep', createdAt: 3,
+      privacy: { mode: 'sealed', origin: 'command', inheritedFrom: null },
+    })
+    expect(listing.items[1]).toMatchObject({ id: 's2', archived: true, active: false })
+
+    const unavailable = await createUiService({ stores: minimalStores }).sessions()
+    expect(unavailable.available).toBe(false)
+    expect(unavailable.items).toEqual([])
+    expect(unavailable.reason).toContain('未接线')
+  })
+
+  it('personal：正常透传；未接线降级为完整形状', async () => {
+    const personal = {
+      available: true,
+      status: {
+        available: true, detail: '显式 1 条', declared: 1, inferred: 0, conflicts: 0, capabilityAxis: 'off' as const,
+      },
+      entries: [{ axis: 'stable', axisLabel: '稳定偏好', key: 'pkg', value: 'pnpm', provenance: 'declared' as const, evidence: ['s1'], updated: NOW }],
+      conflicts: [],
+      text: '· 稳定偏好「pkg」= pnpm',
+    }
+    const wired = createUiService({ stores: minimalStores, personal: async () => personal, clock: fixedClock() })
+    expect(await wired.personal()).toEqual(personal)
+
+    const absent = await createUiService({ stores: minimalStores }).personal()
+    expect(absent.available).toBe(false)
+    expect(absent.entries).toEqual([])
+    expect(absent.conflicts).toEqual([])
+    expect(absent.text).toBe('')
+    expect(absent.reason).toContain('未接线')
+  })
+
+  it('profile(sessionId)：按会话透传；未接线如实拒绝', async () => {
+    const service = createUiService({
+      stores: minimalStores,
+      profileForSession: async sessionId => ({ available: true, root: `/root/${sessionId}` }),
+      clock: fixedClock(),
+    })
+    expect(await service.profile('s9')).toMatchObject({ available: true, root: '/root/s9' })
+    const absent = await createUiService({ stores: minimalStores }).profile('s9')
+    expect(absent.available).toBe(false)
+    expect(absent.reason).toContain('未接线')
   })
 })

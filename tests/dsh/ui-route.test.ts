@@ -90,7 +90,36 @@ const UI = {
     ? { ok: true, text: `${action} 成功` }
     : { ok: false, text: `未确认：${id}` }),
   runtime: async () => ({ version: '4.15.2', stores: { ready: true, detail: 'ok', openProjects: [], maxOpenProjects: 8 } }),
-  profile: async () => ({ available: false, reason: '测试未接线' }),
+  profile: async (sessionId?: string) => (sessionId === undefined
+    ? { available: false, reason: '测试未接线' }
+    : { available: true, root: `/root/${sessionId}` }),
+  sessions: async () => ({
+    available: true,
+    items: [{
+      id: 's1', title: '会话一', cwd: '/work/demo', root: '/work/demo', preset: 'omb',
+      archived: false, active: true, depth: 'deep',
+      privacy: { mode: 'sealed', origin: 'command', inheritedFrom: null }, createdAt: 1,
+    }],
+  }),
+  personal: async () => ({
+    available: true,
+    status: { available: true, detail: 'ok', declared: 1, inferred: 0, conflicts: 0, capabilityAxis: 'off' },
+    entries: [],
+    conflicts: [],
+    text: '个人画像文本',
+  }),
+  createMemory: async (input: { scope: string; kind: string; text: string }) => (input.text === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `新建 ${input.scope}/${input.kind}` }),
+  updateMemory: async (input: { id: string }) => (input.id === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `保存 ${input.id}` }),
+  deleteMemory: async (id: string) => (id === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `删除 ${id}` }),
+  markMemory: async (id: string, mark: string) => (id === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `标记 ${mark} ${id}` }),
   resolve: async (input: { action: string; fromId: string; toId: string }) => (input.fromId === 'a' && input.toId === 'b'
     ? { ok: true, text: `${input.action} 成功` }
     : { ok: false, text: '未执行：测试拒绝' }),
@@ -274,6 +303,65 @@ describe('installUiRoute', () => {
 
     const crossGet = await request(route, { url: '/omb/api/privacy', origin: 'http://evil.example' })
     expect(crossGet.status).toBe(403)
+  })
+
+  it('项目页/个人画像/手动记忆：新 GET 与 POST /memory 四动作、参数校验、405 文案（v4.18）', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+
+    const sessions = await request(route, { url: '/omb/api/sessions' })
+    expect(sessions.status).toBe(200)
+    expect(sessions.body).toMatchObject({ available: true, items: [{ id: 's1', privacy: { mode: 'sealed' } }] })
+
+    const personal = await request(route, { url: '/omb/api/personal' })
+    expect(personal.status).toBe(200)
+    expect(personal.body).toMatchObject({ available: true, text: '个人画像文本' })
+
+    const profileBySession = await request(route, { url: '/omb/api/profile?sessionId=s1' })
+    expect(profileBySession.status).toBe(200)
+    expect(profileBySession.body).toMatchObject({ available: true, root: '/root/s1' })
+    const profileEmpty = await request(route, { url: '/omb/api/profile?sessionId=%20' })
+    expect(profileEmpty.status).toBe(200)
+    expect(profileEmpty.body).toMatchObject({ available: false })
+
+    const listCandidate = await request(route, { url: '/omb/api/list?scope=user&status=candidate' })
+    expect(listCandidate.status).toBe(200)
+    expect(listCandidate.body).toMatchObject({ query: { status: 'candidate' } })
+
+    const post = (body: unknown) => request(route, {
+      method: 'POST', url: '/omb/api/memory', body, contentType: 'application/json',
+    })
+    const created = await post({ action: 'create', scope: 'user', kind: 'semantic', text: '手动内容', tags: ['a'] })
+    expect(created.status).toBe(200)
+    expect(String((created.body as { text: string }).text)).toContain('新建 user/semantic')
+    expect((await post({ action: 'update', id: 'm1', text: '新内容' })).status).toBe(200)
+    expect((await post({ action: 'delete', id: 'm1' })).status).toBe(200)
+    expect((await post({ action: 'mark', id: 'm1', mark: 'obsolete' })).status).toBe(200)
+
+    // 拒绝路径 409
+    expect((await post({ action: 'delete', id: 'denied' })).status).toBe(409)
+    expect((await post({ action: 'create', scope: 'user', kind: 'semantic', text: 'denied' })).status).toBe(409)
+
+    // 参数校验 400
+    expect((await post({ action: 'nope' })).status).toBe(400)
+    expect((await post({ action: 'create', kind: 'semantic', text: 'x' })).status).toBe(400)
+    expect((await post({ action: 'create', scope: 'user', kind: 'nope', text: 'x' })).status).toBe(400)
+    expect((await post({ action: 'create', scope: 'user', kind: 'semantic' })).status).toBe(400)
+    expect((await post({ action: 'create', scope: 'user', kind: 'semantic', text: 'x', tags: 'not-array' })).status).toBe(400)
+    expect((await post({ action: 'update', text: '缺 id' })).status).toBe(400)
+    expect((await post({ action: 'update', id: 'm1', kind: 'nope' })).status).toBe(400)
+    expect((await post({ action: 'update', id: 'm1', text: 42 })).status).toBe(400)
+    expect((await post({ action: 'delete' })).status).toBe(400)
+    expect((await post({ action: 'mark', id: 'm1' })).status).toBe(400)
+    expect((await post({ action: 'mark', id: 'm1', mark: 'nope' })).status).toBe(400)
+
+    // 其它 POST 路径 405，文案点名 /memory
+    const other = await request(route, {
+      method: 'POST', url: '/omb/api/overview', body: {}, contentType: 'application/json',
+    })
+    expect(other.status).toBe(405)
+    expect(String((other.body as { error: string }).error)).toContain('/memory')
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

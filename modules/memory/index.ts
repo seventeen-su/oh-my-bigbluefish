@@ -21,6 +21,7 @@ import type {
   ModuleManifest,
   ModuleRegistration,
   SecondaryChannelRegistry,
+  SessionCatalogPort,
   StorageHostPort,
   TaggedStore,
   ToolDefinition,
@@ -39,14 +40,14 @@ import {
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
-import { createUiService } from './ui.js'
+import { createUiService, type UiPersonalView, type UiProfile } from './ui.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
 import { createConfirmAction, installConfirm, type ConfirmDeps } from './confirm.js'
 import { autoLinkRelated, findRelatedRecords, findSemanticRelated, type RelatedRecord } from './link.js'
 import { cosineFloorFor } from './vector.js'
-import { createProjectTool, type ProjectProfilePort, type SessionSituationView } from './project.js'
+import { createProjectTool, type ProjectProfilePort, type ProjectProfileView, type SessionSituationView } from './project.js'
 import { createUsageTracker, installFeedback } from './feedback.js'
 import { AdaptiveFloorCalibrator } from './utility.js'
 import { asUtilityStore } from './store.js'
@@ -57,6 +58,79 @@ import type { RetrievalChannel } from './retrieve.js'
 import { readSessionWitness } from './witness.js'
 import { createActivityLog, renderActivityNote, type ActivityKind, type ActivitySummary } from './activity.js'
 import { toHostPlugin } from '../../kernel/hostEntry.js'
+
+/** v4.18：用户画像服务的最小结构面（只读；不在本文件依赖 profile 模块的运行时）。 */
+type ProfileAxisLike = 'stable' | 'capability' | 'intent' | 'collaboration'
+
+/**
+ * 轴的中文标签。与 `modules/profile/entries.ts` 的 `AXIS_LABELS` 同一份文案，
+ * 但**不能**跨模块 import（ESLint `omb/no-layer-violation`：模块间只经 Kernel 服务/事件通信）。
+ * 改文案时两处一起改；这里有测试覆盖四种轴。
+ */
+const PROFILE_AXIS_LABELS: Readonly<Record<ProfileAxisLike, string>> = {
+  stable: '稳定偏好',
+  capability: '能力（仅当前会话）',
+  intent: '当前意图',
+  collaboration: '协作方式',
+}
+interface ProfileEntryLike {
+  readonly axis: ProfileAxisLike
+  readonly key: string
+  readonly value: string
+  readonly provenance: 'declared' | 'inferred'
+  readonly evidence: readonly string[]
+  readonly updated: number
+}
+interface ProfileConflictLike {
+  readonly axis: ProfileAxisLike
+  readonly key: string
+  readonly values: readonly { readonly value: string; readonly provenance: 'declared' | 'inferred'; readonly updated: number }[]
+}
+interface ProfileServiceLike {
+  status(): {
+    readonly available: boolean
+    readonly detail: string
+    readonly capabilityAxis: 'off' | 'on-session-only'
+    readonly declared: number
+    readonly inferred: number
+    readonly conflicts: number
+  }
+  entries(sessionId?: string): Promise<readonly ProfileEntryLike[]>
+  conflicts(sessionId?: string): Promise<readonly ProfileConflictLike[]>
+  renderDeclared(limit?: number, sessionId?: string): Promise<string>
+}
+
+/** 画像视图 → UI DTO（`profile()` 与 `profileForSession()` 共用同一份映射）。 */
+function toUiProfile(view: ProjectProfileView): UiProfile {
+  const structure = view.structure
+  return {
+    available: true,
+    ...(view.root === undefined ? {} : { root: view.root }),
+    ...(view.cwdRel === undefined ? {} : { cwdRel: view.cwdRel }),
+    branch: view.identity?.branch ?? null,
+    head: view.identity?.head ?? view.gitHead ?? null,
+    ...(view.text === undefined ? {} : { text: view.text.slice(0, 1500) }),
+    ...(structure === undefined
+      ? {}
+      : {
+          structure: {
+            topDirs: (structure.topDirs ?? []).slice(0, 12).map(dir => ({ name: dir.name, files: dir.files })),
+            sources: (structure.sources ?? []).slice(0, 8).map(source => ({
+              dir: source.dir,
+              files: source.files,
+              lines: source.lines,
+              tests: source.tests,
+            })),
+            files: (structure.files ?? []).slice(0, 12).map(file => ({
+              path: file.path,
+              lines: file.lines,
+              symbols: file.symbols,
+              imports: file.imports,
+            })),
+          },
+        }),
+  }
+}
 
 /** 模块 id。必须与 `MODULE_CATALOG` 和 `cordis.patch.yml` 完全一致。 */
 export const MODULE_ID = 'omb-memory'
@@ -1141,7 +1215,38 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
       // 与 `/omb-confirm` 复用同一个 `createConfirmAction`：UI 不另写写逻辑。
       const confirmAction = createConfirmAction(confirmDeps)
       const offUi = kernel.provide(SERVICES.ui, createUiService({
-        stores: service,
+        stores: {
+          status: () => service.status(),
+          snapshot: () => service.snapshot(),
+          // 有会话时经 `forSession`（出口过隐私闸门）；无会话时退回快照库。
+          forSession: sessionId => service.forSession(sessionId),
+        },
+        currentSession: () => {
+          try {
+            return kernel.service<{ current(): string | null }>(SERVICES.activeSession)?.current() ?? null
+          } catch {
+            return null
+          }
+        },
+        // ── 项目页（v4.18）：会话目录 / 活跃 / 根 / 深度来自各自内核服务 ──
+        sessionCatalog: kernel.service<SessionCatalogPort>(SERVICES.sessionCatalog),
+        sessionRuntime: kernel.service<{
+          list(): readonly { readonly sessionId: string; readonly observations: number }[]
+        }>(SERVICES.sessionRuntime),
+        rootOf: cwd => {
+          try {
+            return kernel.service<{ resolve(cwd: string): string }>(SERVICES.projectRoot)?.resolve(cwd) ?? null
+          } catch {
+            return null
+          }
+        },
+        focusOf: sessionId => {
+          try {
+            return kernel.focus(sessionId) ?? null
+          } catch {
+            return null
+          }
+        },
         // ── 会话隐私页（v4.17）：用户点击 → HTTP → ui.privacyAct → admin ──
         // current 只取「这次是谁在问」；取不到就 null（页面显示"无会话归属"，不猜）。
         privacy: {
@@ -1291,33 +1396,114 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           if (view === undefined) {
             return { available: false, reason: '画像暂不可用：读取返回空（非 git 目录或尚未构建）' }
           }
-          const structure = view.structure
-          return {
-            available: true,
-            ...(view.root === undefined ? {} : { root: view.root }),
-            ...(view.cwdRel === undefined ? {} : { cwdRel: view.cwdRel }),
-            branch: view.identity?.branch ?? null,
-            head: view.identity?.head ?? view.gitHead ?? null,
-            ...(view.text === undefined ? {} : { text: view.text.slice(0, 1500) }),
-            ...(structure === undefined
-              ? {}
-              : {
-                  structure: {
-                    topDirs: (structure.topDirs ?? []).slice(0, 12).map(dir => ({ name: dir.name, files: dir.files })),
-                    sources: (structure.sources ?? []).slice(0, 8).map(source => ({
-                      dir: source.dir,
-                      files: source.files,
-                      lines: source.lines,
-                      tests: source.tests,
-                    })),
-                    files: (structure.files ?? []).slice(0, 12).map(file => ({
-                      path: file.path,
-                      lines: file.lines,
-                      symbols: file.symbols,
-                      imports: file.imports,
-                    })),
-                  },
-                }),
+          return toUiProfile(view)
+        },
+        // ── 项目页选中会话的画像（v4.18）：catalog 找 cwd，归档会话不可读 ──
+        profileForSession: async (sessionId: string): Promise<UiProfile> => {
+          let cwd: string | undefined
+          let archived = false
+          const catalog = kernel.service<SessionCatalogPort>(SERVICES.sessionCatalog)
+          if (catalog !== undefined) {
+            try {
+              const listing = await catalog.list()
+              const entry = listing.available ? listing.items.find(item => item.id === sessionId) : undefined
+              if (entry !== undefined) {
+                cwd = entry.cwd
+                archived = entry.archived
+              }
+            } catch {
+              // 目录失败不拦：还能从活跃会话表取 cwd
+            }
+          }
+          if (archived) return { available: false, reason: '已归档会话不可读' }
+          if (cwd === undefined || cwd.length === 0) {
+            try {
+              cwd = kernel.service<{ cwd(session?: string): string | null }>(SERVICES.activeSession)?.cwd(sessionId) ?? undefined
+            } catch {
+              cwd = undefined
+            }
+          }
+          if (cwd === undefined || cwd.length === 0) {
+            return { available: false, reason: '找不到该会话的 cwd（目录与活跃会话都没有，不猜路径）' }
+          }
+          const port = kernel.service<ProjectProfilePort>(SERVICES.projectProfile)
+          if (port === undefined) {
+            return { available: false, reason: '未接线：项目画像服务不可用（dsh/project-profile 未挂载）' }
+          }
+          let root = cwd
+          try {
+            root = kernel.service<{ resolve(cwd: string): string }>(SERVICES.projectRoot)?.resolve(cwd) ?? cwd
+          } catch {
+            root = cwd
+          }
+          const view = port.read(root)
+          if (view === undefined) {
+            return { available: false, reason: '画像暂不可用：读取返回空（非 git 目录或尚未构建）' }
+          }
+          return toUiProfile(view)
+        },
+        // ── 个人画像页（v4.18）：读 SERVICES.profile 的只读面；异常如实降级 ──
+        personal: async (): Promise<UiPersonalView> => {
+          const profile = kernel.service<ProfileServiceLike>(SERVICES.profile)
+          if (profile === undefined) {
+            return {
+              available: false,
+              reason: '未接线：用户画像服务不可用（omb-profile 未挂载）',
+              entries: [],
+              conflicts: [],
+              text: '',
+            }
+          }
+          try {
+            let sessionId: string | undefined
+            try {
+              sessionId = kernel.service<{ current(): string | null }>(SERVICES.activeSession)?.current() ?? undefined
+            } catch {
+              sessionId = undefined
+            }
+            const status = profile.status()
+            const entries = await profile.entries(sessionId)
+            const conflicts = await profile.conflicts(sessionId)
+            const text = await profile.renderDeclared(12, sessionId)
+            return {
+              available: true,
+              status: {
+                available: status.available,
+                detail: status.detail,
+                declared: status.declared,
+                inferred: status.inferred,
+                conflicts: status.conflicts,
+                capabilityAxis: status.capabilityAxis,
+              },
+              entries: entries.map(entry => ({
+                axis: entry.axis,
+                axisLabel: PROFILE_AXIS_LABELS[entry.axis],
+                key: entry.key,
+                value: entry.value,
+                provenance: entry.provenance,
+                evidence: entry.evidence,
+                updated: entry.updated,
+              })),
+              conflicts: conflicts.map(conflict => ({
+                axis: conflict.axis,
+                axisLabel: PROFILE_AXIS_LABELS[conflict.axis],
+                key: conflict.key,
+                values: conflict.values.map(value => ({
+                  value: value.value,
+                  provenance: value.provenance,
+                  updated: value.updated,
+                })),
+              })),
+              text,
+            }
+          } catch (error) {
+            return {
+              available: false,
+              reason: `个人画像读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}`,
+              entries: [],
+              conflicts: [],
+              text: '',
+            }
           }
         },
       }))

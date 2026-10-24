@@ -1,4 +1,4 @@
-# Oh-My-BigBlueFish (OMB v4.17.1)
+# Oh-My-BigBlueFish (OMB v4.18.0)
 
 DSH 的**通用认知增强插件**：让模型记得住、看得懂项目、按需思考，而不是每轮往上下文里塞提示。
 
@@ -36,7 +36,10 @@ v4.15.4 运行状态页补**会话状态机**读数并加 bundle 发布契约测
 v4.16.0 侧边栏改用**共享控件 + 主题 token + 弹性排版**，并修复未选条目误报 400；
 v4.17.0 把侧边栏重构成 **OMB 设置**：二级侧边栏导航、容器查询弹性排版、克制动效
 （未选中时详情栏收起）与**会话隐私管理页**，并定位"部分会话命令消失"的客户端菜单规则；
-v4.17.1 修复隐私设置页降级态的标注（未接线/读取失败不再显示成"默认 normal"）。
+v4.17.1 修复隐私设置页降级态的标注（未接线/读取失败不再显示成"默认 normal"）；
+v4.18.0 把 OMB 设置重做为**四页二级侧边栏**（概览/记忆/项目/个人画像）、补**手动记忆
+增删改标记**、**项目页会话×工作区×归档**与**个人画像页**，统一多级卡片/控件样式/
+间距与方向感动效。
 详见
 [`docs/v4-architecture.md`](docs/v4-architecture.md)、
 [`docs/v4.1-spacetime.md`](docs/v4.1-spacetime.md)、
@@ -68,11 +71,13 @@ v4.17.1 修复隐私设置页降级态的标注（未接线/读取失败不再�
 [`docs/v4.15.3-sidebar-conflict-resolution.md`](docs/v4.15.3-sidebar-conflict-resolution.md)、
 [`docs/v4.15.4-runtime-situation-and-bundle-contract.md`](docs/v4.15.4-runtime-situation-and-bundle-contract.md)、
 [`docs/v4.16.0-sidebar-ui-standardization.md`](docs/v4.16.0-sidebar-ui-standardization.md)、
-[`docs/v4.17.0-settings-navigation-and-privacy.md`](docs/v4.17.0-settings-navigation-and-privacy.md) 与
+[`docs/v4.17.0-settings-navigation-and-privacy.md`](docs/v4.17.0-settings-navigation-and-privacy.md)、
+[`docs/v4.18.0-settings-redesign.md`](docs/v4.18.0-settings-redesign.md)、
+[`DESIGN.md`](DESIGN.md) 与
 [`docs/v4-remaining-closure.md`](docs/v4-remaining-closure.md)。
 
 > 版本规则：`x1.x2.x3`（大版本 / 功能更新 / 修复）。单一真源 `version-manifest.json`，
-> 生成器 `scripts/version.mjs`；当前 **24 功能 / 104 小功能 → 4.17.1**。
+> 生成器 `scripts/version.mjs`；当前 **25 功能 / 110 小功能 → 4.18.0**。
 
 ## v4.4 结构（2026-10）
 

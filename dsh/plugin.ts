@@ -58,6 +58,7 @@ import { createPressureBridge } from './pressure.js'
 import { createProjectRootResolver } from './project-root.js'
 import { createProjectProfile } from './project-profile.js'
 import { createProjectEvidence } from './project-evidence.js'
+import { installSessionCatalog } from './session-catalog.js'
 import { registerDepthCommand } from './depth-command.js'
 import { registerHeapCommand } from './heap-command.js'
 import { wireReasoningEffort } from './reasoning-effort.js'
@@ -172,6 +173,16 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
     handle.kernel.provide(SERVICES.projectProfile, projectProfile.port)
   } catch (error) {
     logger.warn(`OMB：项目画像服务注册失败——${String(error)}（omb_project 将只给记忆、无画像）`)
+  }
+  // ── 会话目录端口（v4.18.0）：「项目」页列出宿主里真实存在的会话 ──────────
+  // 每次 `list()` 现读宿主服务表（持久化/活会话/标题/归档），不在安装时快照：
+  // 宿主服务可能晚于本插件就绪，也可能被中途开关。读不到时端口自己返回
+  // `available:false` + 原因，**不拿空列表冒充"没有会话"**。
+  const sessionCatalog = installSessionCatalog(ctx)
+  try {
+    handle.kernel.provide(SERVICES.sessionCatalog, sessionCatalog.port)
+  } catch (error) {
+    logger.warn(`OMB：会话目录服务注册失败——${String(error)}（「项目」页将显示目录不可用）`)
   }
   /**
    * 项目证据账本（v4.5.3 审查第 5 点）：把"最近一次构建/测试过没过"接进 `omb_project`。
@@ -486,6 +497,7 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       },
       () => projectRoot.dispose(),
       () => projectProfile.dispose(),
+      () => sessionCatalog.dispose(),
       disposeArtifactIndex,
       disposeToolResync,
       disposePrompt,

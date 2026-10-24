@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.17.1 = OMB 设置页（x2）与隐私降级态如实标注修复（x3，按用户口径新界面不升 x1）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.18.0 = OMB 设置重做：四页二级侧边栏、手动记忆管理、项目/个人画像与控件样式锁定（x2，按用户口径新界面不升 x1）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -273,7 +273,20 @@
         "heap snapshot 启动脚本",
         "归属结论（OMB 事件驱动表排除）"
       ]
+    },
+    {
+      "id": "settings-console",
+      "name": "OMB 设置台",
+      "since": "4.18",
+      "subfeatures": [
+        "四页二级侧边栏",
+        "手动记忆增删改标记",
+        "项目页会话×工作区×归档",
+        "个人画像页",
+        "多级卡片与控件样式锁定",
+        "方向感子页动效与文本选择"
+      ]
     }
   ],
-  "version": "4.17.1"
+  "version": "4.18.0"
 }

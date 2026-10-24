@@ -50,6 +50,8 @@ export type {
 } from './storage.js'
 export { STORES_SERVICE, SCHEMA_VERSION } from './storage.js'
 
+export type { SessionCatalogEntry, SessionCatalogListing, SessionCatalogPort } from './session-catalog.js'
+
 export type {
   ModuleId,
   CatalogEntry,

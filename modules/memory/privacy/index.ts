@@ -671,6 +671,21 @@ export function installPrivacy(
     trust(): PrivacyActionResult {
       return isolateAction('解除 fail-closed 失败', () => asActionResult(api.trust()))
     },
+
+    modeOf(sessionId: string): { mode: PrivacyMode; origin: string; inheritedFrom: string | null } {
+      try {
+        const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+        const resolved = created.resolve(id)
+        return {
+          mode: resolved.mode,
+          origin: resolved.origin,
+          inheritedFrom: resolved.inheritedFrom,
+        }
+      } catch {
+        // 解析失败按最严兜底（只读方法也绝不抛；安全方向是不放宽）。
+        return { mode: 'sealed', origin: 'fail-closed', inheritedFrom: null }
+      }
+    },
   }
 
   // ── 4) 命令注册（宿主能力；缺失时如实说明，不抛）──────────────────

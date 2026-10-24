@@ -1283,3 +1283,46 @@
 - `omb:ui` 读取失败时命令面状态写"读取失败"（不冒充"未接线"）；
 - 隐私管理端口在视图异常时保留真实 `commandState`（视图坏了不等于命令没注册）。
 - 契约详情见 `docs/v4.17.0-settings-navigation-and-privacy.md` §6。
+
+---
+
+# OMB v4.18.0 交付记录（2026-10-24，x2）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.18.0**（`25 功能 / 110 小功能`；x2：OMB 设置重做） |
+| 构建 | **g134**；`generation: 134`、`outDir: lib-gen/g134` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **122 files / 1521 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：四页二级侧边栏、二级/三级卡片、方向感子页动效、手动记忆增删改标记、项目页归档灰显、个人画像、子页无滚动条、控件无蓝色描边 |
+
+## 用户 15 点对应
+
+1. **手动记忆操作**：新建/编辑/删除/标记（确认/过时/恢复）全部前端可达，
+   `POST /omb/api/memory`，经隐私闸门、写后查回。
+2. **合并重叠页**：概览+运行状态 → 概览；记忆库+候选确认 → 记忆；隐私+项目画像 → 项目。
+3. **项目页**：只列 `agentPreset==='omb'` 的会话；工作区/推理深度/隐私/归档；
+   归档灰显不可读；新增 `SERVICES.sessionCatalog`（宿主持久化/活会话/标题/归档集合）。
+4. **个人画像页**：读 `SERVICES.profile`，按轴分组、冲突并列、状态卡片。
+5. **多级卡片**：二级卡 `bg-layer-2`+`elevation-panel`，三级卡 `bg-layer-3`+`elevation-soft`；
+   不再“同底色 + 边框”，亮色主题层色相同时靠阴影立住。
+6. **控件锁定**：选中用填充、焦点环仅 `:focus-visible`、不覆盖 primitive 边框/圆角，
+   逐控件矩阵见 `DESIGN.md` §5。
+7. **间距/字号**：20/15/13/14/12、行高 28/22/20/22/18、字重 400/500/600、间距 4/8/12/16/24。
+8. **弹性对齐**：概览 4 卡 2×2、网格 `minmax(0,1fr)`+stretch，无 flex-wrap 3+1 孤行。
+9. **动效**：刷新旋转、hover、详情 220ms、页面方向浮动；reduced-motion 去运动。
+10. **短文案**：页头只留一句短语；技术信息折叠进运行状态/说明。
+11. **文本选择**：骨架不可选、内容可选。
+12. **二级卡一致**：导航与内容都是同样的圆角卡片。
+13. **层级修正**：二级卡有表面+阴影，不再只剩框。
+14. **子页滚动条隐藏**：滚动仍可用。
+15. **方向感子页浮动**：按导航顺序左右浮入（220ms），不再单纯淡入。
+
+## 文件
+
+- 新增：`dsh/session-catalog.ts`、`kernel/abi/session-catalog.ts`、
+  `tests/dsh/session-catalog.test.ts`、`docs/v4.18.0-ui-contract.md`、
+  `docs/v4.18.0-settings-redesign.md`、`DESIGN.md`
+- 修改：`packages/memory/client.js`、`modules/memory/ui.ts`、`modules/memory/index.ts`、
+  `modules/memory/privacy/{contract,index}.ts`、`dsh/ui-route.ts`、`kernel/abi/{index,catalog}.ts`、
+  `tests/dsh/{ui-bundle,ui-route}.test.ts`、`tests/modules/memory/ui.test.ts`、
+  `README.md`、`AGENTS.md`、版本文件

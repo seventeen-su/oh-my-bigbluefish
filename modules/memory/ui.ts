@@ -17,6 +17,7 @@ import type {
   MemoryRecord,
   MemoryScope,
   MemoryStatusFilter,
+  SessionCatalogPort,
   StoreStats,
   TaggedStore,
 } from '../../kernel/abi/index.js'
@@ -24,6 +25,7 @@ import { OMB_VERSION } from '../../kernel/version.js'
 import { asConfirmStore, asRecordScanner, type ConfirmAuditEntry } from './store.js'
 import { findRelatedRecords, type RelatedRecord } from './link.js'
 import { stageLabel, stageOfMemory, type LifecycleStage } from './lifecycle.js'
+import { contentHashOf, newMemoryId } from './remember.js'
 import { isPrivacyMode, type PrivacyMode } from './privacy/modes.js'
 import type { PrivacyActionName, PrivacyAdminPort, UiPrivacyView } from './privacy/contract.js'
 
@@ -33,7 +35,7 @@ export const UI_LIST_MAX = 50
 export const UI_CANDIDATE_MAX = 20
 
 export type UiScope = 'user' | 'project' | 'all'
-export type UiStatus = 'active' | 'stale' | 'superseded' | 'all'
+export type UiStatus = 'active' | 'stale' | 'superseded' | 'candidate' | 'all'
 
 export interface UiListQuery {
   readonly scope?: UiScope
@@ -42,6 +44,86 @@ export interface UiListQuery {
   readonly q?: string
   readonly tags?: readonly string[]
   readonly limit?: number
+}
+
+/** 手动新建（v4.18）：用户自己的写入，`assertedBy='user'`、`sourceRef='ui:manual'`。 */
+export interface UiMemoryCreateInput {
+  readonly scope: MemoryScope
+  readonly kind: MemoryKind
+  readonly text: string
+  readonly tags?: readonly string[]
+}
+
+/** 手动编辑（v4.18）：只允许活跃记录；保留 id/observedAt/sourceRef/assertedBy/useCount。 */
+export interface UiMemoryUpdateInput {
+  readonly id: string
+  readonly text?: string
+  readonly kind?: MemoryKind
+  readonly tags?: readonly string[]
+}
+
+/** 手动标记：确认（复用 /omb-confirm）/ 标失效 / 复活。 */
+export type UiMemoryMark = 'confirm' | 'obsolete' | 'revive'
+
+/** 项目页的一行会话（v4.18）。归档会话保留在列表里（灰色），但不可读。 */
+export interface UiSessionItem {
+  readonly id: string
+  readonly title: string | null
+  readonly cwd: string
+  readonly root: string | null
+  readonly preset: string | null
+  readonly archived: boolean
+  readonly active: boolean
+  /** `kernel.focus(sessionId)`；拿不到为 null。 */
+  readonly depth: string | null
+  readonly privacy: {
+    readonly mode: 'normal' | 'read-only' | 'sealed'
+    readonly origin: string
+    readonly inheritedFrom: string | null
+  } | null
+  readonly createdAt: number
+}
+
+export interface UiSessionList {
+  readonly available: boolean
+  readonly reason?: string
+  readonly items: readonly UiSessionItem[]
+}
+
+export interface UiPersonalEntry {
+  readonly axis: string
+  readonly axisLabel: string
+  readonly key: string
+  readonly value: string
+  readonly provenance: 'declared' | 'inferred'
+  readonly evidence: readonly string[]
+  readonly updated: number
+}
+
+export interface UiPersonalView {
+  readonly available: boolean
+  readonly reason?: string
+  readonly status?: {
+    readonly available: boolean
+    readonly detail: string
+    readonly declared: number
+    readonly inferred: number
+    readonly conflicts: number
+    readonly capabilityAxis: 'off' | 'on-session-only'
+  }
+  readonly entries: readonly UiPersonalEntry[]
+  readonly conflicts: readonly {
+    readonly axis: string
+    readonly axisLabel: string
+    readonly key: string
+    readonly values: readonly {
+      readonly value: string
+      readonly provenance: 'declared' | 'inferred'
+      readonly updated: number
+    }[]
+  }[]
+  /** `renderDeclared(12, sessionId)` 的文本。 */
+  readonly text: string
 }
 
 export interface UiStoreView {
@@ -204,8 +286,23 @@ export interface UiService {
   resolve(input: UiResolveInput): Promise<UiActionResult>
   /** 运行时读数（v4.15.2）；缺省 = 未接线，返回最小事实。 */
   runtime(): Promise<UiRuntime>
-  /** 项目画像（v4.15.2）；缺省/未知 → 如实说明原因。 */
-  profile(): Promise<UiProfile>
+  /** 项目画像（v4.15.2）：给 sessionId 时按该会话（归档会话不可读）。 */
+  profile(sessionId?: string): Promise<UiProfile>
+  /**
+   * 手动新建一条记忆（v4.18）。project 作用域必须有当前会话；文本 1..4000、
+   * 标签 ≤8×≤24；写入后查回验证。隐私拒绝原样返回文本。
+   */
+  createMemory(input: UiMemoryCreateInput): Promise<UiActionResult>
+  /** 手动编辑（只允许活跃记录）；写后查回验证。 */
+  updateMemory(input: UiMemoryUpdateInput): Promise<UiActionResult>
+  /** 手动删除（结构化探测 store 的 `forget`；删后查回不存在）。 */
+  deleteMemory(id: string): Promise<UiActionResult>
+  /** 手动标记：confirm 复用 `/omb-confirm`；obsolete 写 validTo；revive 只清 validTo。 */
+  markMemory(id: string, mark: UiMemoryMark): Promise<UiActionResult>
+  /** 项目页：只列 `agentPreset === 'omb'` 的会话；目录不可用如实说明。 */
+  sessions(): Promise<UiSessionList>
+  /** 个人画像页：读 `SERVICES.profile`；缺失/异常如实降级。 */
+  personal(): Promise<UiPersonalView>
   /**
    * 会话隐私页的完整视图（v4.17）。未接线/异常 → 返回**完整形状**的降级视图，
    * 不抛到 HTTP 层（页面要能显示"未接线"而不是白屏）。
@@ -226,7 +323,28 @@ export interface UiServiceDeps {
   readonly stores: {
     status(): { readonly ready: boolean; readonly detail: string; readonly openProjects: readonly string[]; readonly maxOpenProjects: number }
     snapshot(): { readonly user: { readonly stores: readonly TaggedStore[] } | undefined; readonly projects: readonly { readonly projectScope: string | null; readonly stores: readonly TaggedStore[] }[] }
+    /**
+     * 按会话取**过隐私闸门**的库套件（v4.18 手动写入用）。缺失 = 退回快照库
+     * （归属未知：读可以、写会被拒——拒绝原因原样返回给页面）。
+     */
+    forSession?(sessionId: string): Promise<{
+      readonly projectScope: string | null
+      readonly stores: readonly TaggedStore[]
+      store(scope: MemoryScope): TaggedStore['store'] | undefined
+    } | undefined>
   }
+  /** 当前会话 id（页面写操作的归属）；缺省回退 `privacy.current`。 */
+  readonly currentSession?: () => string | null
+  /** 会话目录（项目页）；缺失 → `sessions()` 返回 available:false。 */
+  readonly sessionCatalog?: SessionCatalogPort
+  /** 会话目录的补充读数（由 memory/index 闭包从内核服务解析）。 */
+  readonly sessionRuntime?: { list(): readonly { readonly sessionId: string; readonly observations: number }[] }
+  readonly rootOf?: (cwd: string) => string | null
+  readonly focusOf?: (sessionId: string) => string | null
+  /** 个人画像视图装配（经 `SERVICES.profile`）；缺省 = 未接线。 */
+  readonly personal?: () => Promise<UiPersonalView>
+  /** 按会话读项目画像（memory/index 闭包解析 catalog → projectRoot → profile）；缺省 = 未接线。 */
+  readonly profileForSession?: (sessionId: string) => Promise<UiProfile>
   /** 确认动作（`createConfirmAction(confirmDeps)`）；缺省 = 功能未启用，动作如实拒绝。 */
   readonly confirm?: (input: {
     readonly action: UiConfirmAction
@@ -278,12 +396,52 @@ export function toUiListItem(record: MemoryRecord, projectScope: string | null):
 
 function matchesStatus(record: MemoryRecord, status: UiStatus): boolean {
   if (status === 'all') return true
+  if (status === 'candidate') {
+    return uiRecordStatus(record) === 'active'
+      && record.assertedBy === 'model'
+      && (record.kind === 'semantic' || record.kind === 'procedural')
+  }
   return uiRecordStatus(record) === status
 }
 
 function clampLimit(value: number | undefined, fallback: number, max: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(1, Math.floor(value)))
+}
+
+/** 手动写入的硬边界（v4.18 §2.2）。 */
+const UI_TEXT_MAX = 4000
+const UI_TAGS_MAX = 8
+const UI_TAG_CHARS_MAX = 24
+
+function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function normalizeUiText(raw: unknown): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly text: string } {
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (text.length === 0) return { ok: false, text: '未执行：正文不能为空。' }
+  if (text.length > UI_TEXT_MAX) return { ok: false, text: `未执行：正文最多 ${UI_TEXT_MAX} 个字符。` }
+  return { ok: true, text }
+}
+
+function normalizeUiTags(raw: unknown): { readonly ok: true; readonly tags: readonly string[] } | { readonly ok: false; readonly text: string } {
+  if (raw === undefined) return { ok: true, tags: [] }
+  if (!Array.isArray(raw)) return { ok: false, text: '未执行：标签必须是字符串数组。' }
+  const tags: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') return { ok: false, text: '未执行：标签必须是字符串数组。' }
+    const tag = item.trim()
+    if (tag.length === 0) continue
+    if (tag.length > UI_TAG_CHARS_MAX) return { ok: false, text: `未执行：单个标签最多 ${UI_TAG_CHARS_MAX} 个字符。` }
+    if (!tags.includes(tag)) tags.push(tag)
+  }
+  if (tags.length > UI_TAGS_MAX) return { ok: false, text: `未执行：标签最多 ${UI_TAGS_MAX} 个。` }
+  return { ok: true, tags }
+}
+
+function isActiveRecord(record: Pick<MemoryRecord, 'validTo' | 'supersededBy'>): boolean {
+  return record.validTo === null && record.supersededBy === null
 }
 
 /** 有界扫描（`listRecentRecords` 没有状态/类型过滤；在 JS 里裁剪，但先限总量）。 */
@@ -362,12 +520,13 @@ export function createUiService(deps: UiServiceDeps): UiService {
   const search = async (ref: StoreRef, query: UiListQuery): Promise<readonly MemoryRecord[]> => {
     const text = (query.q ?? '').trim()
     if (text.length === 0) return scanRecent(ref)
-    const status: MemoryStatusFilter = query.status ?? 'active'
+    // 'candidate' 不是检索状态过滤（它由 assertedBy/kind 复合判定）；词法层按 active 查。
+    const lexicalStatus: MemoryStatusFilter = query.status === 'candidate' ? 'active' : query.status ?? 'active'
     const base = {
       text,
       scope: ref.store.scope,
       ...(query.kind === undefined ? {} : { kinds: [query.kind] as readonly MemoryKind[] }),
-      status,
+      status: lexicalStatus,
       ...(query.tags === undefined || query.tags.length === 0 ? {} : { tags: query.tags }),
       limit: UI_LIST_MAX,
     }
@@ -522,7 +681,331 @@ export function createUiService(deps: UiServiceDeps): UiService {
     return undefined
   }
 
-  return { overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct }
+  // ── v4.18 手动写入的库访问：有会话走隐私闸门，无会话退回快照库 ──────
+  const currentSessionId = (): string | null => {
+    try {
+      const id = deps.currentSession?.() ?? deps.privacy?.current?.() ?? null
+      return typeof id === 'string' && id.trim().length > 0 ? id.trim() : null
+    } catch {
+      return null
+    }
+  }
+
+  const sessionRefs = async (): Promise<readonly StoreRef[] | undefined> => {
+    const sessionId = currentSessionId()
+    if (sessionId === null || deps.stores.forSession === undefined) return undefined
+    try {
+      const set = await deps.stores.forSession(sessionId)
+      if (set === undefined) return undefined
+      return set.stores.map(tagged => ({
+        projectScope: tagged.scope === 'project' ? set.projectScope : null,
+        store: tagged.store,
+      }))
+    } catch {
+      return undefined
+    }
+  }
+
+  const accessRefs = async (): Promise<readonly StoreRef[]> =>
+    (await sessionRefs()) ?? collectStores(deps, 'all')
+
+  const findAccessibleRef = async (
+    id: string,
+  ): Promise<{ readonly ref: StoreRef; readonly record: MemoryRecord } | undefined> => {
+    for (const ref of await accessRefs()) {
+      try {
+        const record = await ref.store.get(id)
+        if (record !== undefined) return { ref, record }
+      } catch {
+        // 单个库读取被隐私拒绝/故障不拦另一个库
+      }
+    }
+    return undefined
+  }
+
+  const storeForScope = async (scope: MemoryScope): Promise<StoreRef | undefined> =>
+    (await accessRefs()).find(ref => ref.store.scope === scope)
+
+  async function createMemory(input: UiMemoryCreateInput): Promise<UiActionResult> {
+    const clock = deps.clock
+    if (clock === undefined) return { ok: false, text: '未执行：时钟未接线（新建需要时间戳）。' }
+    if (input.scope !== 'user' && input.scope !== 'project') {
+      return { ok: false, text: `未执行：未知作用域 ${String(input.scope)}。` }
+    }
+    if (input.kind !== 'semantic' && input.kind !== 'procedural' && input.kind !== 'episodic') {
+      return { ok: false, text: `未执行：未知记忆类型 ${String(input.kind)}。` }
+    }
+    const textCheck = normalizeUiText(input.text)
+    if (!textCheck.ok) return { ok: false, text: textCheck.text }
+    const tagsCheck = normalizeUiTags(input.tags)
+    if (!tagsCheck.ok) return { ok: false, text: tagsCheck.text }
+    if (input.scope === 'project' && currentSessionId() === null) {
+      return { ok: false, text: '未执行：项目作用域需要当前会话（拿不到会话归属，不猜项目库）。' }
+    }
+    const ref = await storeForScope(input.scope)
+    if (ref === undefined) {
+      return { ok: false, text: `未执行：${input.scope === 'user' ? '用户库' : '项目库'}不可用（未打开或未接线）。` }
+    }
+    const hash = contentHashOf(textCheck.text)
+    const id = newMemoryId(clock, hash)
+    const now = clock.now()
+    const record: MemoryRecord = {
+      id,
+      scope: input.scope,
+      kind: input.kind,
+      text: textCheck.text,
+      contentHash: hash,
+      sourceRef: 'ui:manual',
+      assertedBy: 'user',
+      observedAt: now,
+      validTo: null,
+      supersededBy: null,
+      lastUsedAt: now,
+      useCount: 0,
+      project: input.scope === 'project' ? ref.projectScope ?? null : null,
+      tags: tagsCheck.tags,
+    }
+    try {
+      await ref.store.put(record)
+    } catch (error) {
+      return { ok: false, text: `新建失败：${errorMessageOf(error)}` }
+    }
+    try {
+      const back = await ref.store.get(id)
+      if (back === undefined || back.text !== textCheck.text) {
+        return { ok: false, text: '新建后查回失败：记录未确认写入，请重试。' }
+      }
+    } catch (error) {
+      return { ok: false, text: `新建后查回失败（已隔离）：${errorMessageOf(error)}` }
+    }
+    deps.activity?.('write', `ui:create ${id}`)
+    return { ok: true, text: `已新建记忆 ${id}（${input.scope}/${input.kind}）。` }
+  }
+
+  async function updateMemory(input: UiMemoryUpdateInput): Promise<UiActionResult> {
+    const id = typeof input.id === 'string' ? input.id.trim() : ''
+    if (id.length === 0) return { ok: false, text: '未执行：id 不能为空。' }
+    const hasText = input.text !== undefined
+    const hasKind = input.kind !== undefined
+    const hasTags = input.tags !== undefined
+    if (!hasText && !hasKind && !hasTags) return { ok: false, text: '未执行：没有要修改的字段。' }
+    let nextText: string | undefined
+    if (hasText) {
+      const textCheck = normalizeUiText(input.text)
+      if (!textCheck.ok) return { ok: false, text: textCheck.text }
+      nextText = textCheck.text
+    }
+    if (hasKind && input.kind !== 'semantic' && input.kind !== 'procedural' && input.kind !== 'episodic') {
+      return { ok: false, text: `未执行：未知记忆类型 ${String(input.kind)}。` }
+    }
+    let nextTags: readonly string[] | undefined
+    if (hasTags) {
+      const tagsCheck = normalizeUiTags(input.tags)
+      if (!tagsCheck.ok) return { ok: false, text: tagsCheck.text }
+      nextTags = tagsCheck.tags
+    }
+    const found = await findAccessibleRef(id)
+    if (found === undefined) return { ok: false, text: `未执行：找不到这条记忆（id=${id}；用户库/项目库都查过，或隐私拒绝）。` }
+    if (!isActiveRecord(found.record)) {
+      return { ok: false, text: '未执行：只能编辑活跃记录（已失效/被取代的条目不可改）。' }
+    }
+    const next: MemoryRecord = {
+      ...found.record,
+      ...(nextText === undefined ? {} : { text: nextText }),
+      ...(input.kind === undefined ? {} : { kind: input.kind }),
+      ...(nextTags === undefined ? {} : { tags: nextTags }),
+      ...(nextText === undefined || nextText === found.record.text ? {} : { contentHash: contentHashOf(nextText) }),
+    }
+    try {
+      await found.ref.store.put(next)
+    } catch (error) {
+      return { ok: false, text: `保存失败：${errorMessageOf(error)}` }
+    }
+    try {
+      const back = await found.ref.store.get(id)
+      const expectedText = nextText ?? found.record.text
+      if (back === undefined || back.text !== expectedText) {
+        return { ok: false, text: '保存后查回失败：内容未确认，请重试。' }
+      }
+    } catch (error) {
+      return { ok: false, text: `保存后查回失败（已隔离）：${errorMessageOf(error)}` }
+    }
+    deps.activity?.('write', `ui:update ${id}`)
+    return { ok: true, text: `已保存记忆 ${id}。` }
+  }
+
+  async function deleteMemory(id: string): Promise<UiActionResult> {
+    const trimmed = typeof id === 'string' ? id.trim() : ''
+    if (trimmed.length === 0) return { ok: false, text: '未执行：id 不能为空。' }
+    const found = await findAccessibleRef(trimmed)
+    if (found === undefined) return { ok: false, text: `未执行：找不到这条记忆（id=${trimmed}；用户库/项目库都查过，或隐私拒绝）。` }
+    const forget = (found.ref.store as { forget?(ids: readonly string[]): Promise<number> }).forget
+    if (typeof forget !== 'function') {
+      return { ok: false, text: '未执行：当前库不支持删除（forget 不可用），没有改动任何数据。' }
+    }
+    try {
+      await forget.call(found.ref.store, [trimmed])
+    } catch (error) {
+      return { ok: false, text: `删除失败：${errorMessageOf(error)}` }
+    }
+    let back: MemoryRecord | undefined
+    try {
+      back = await found.ref.store.get(trimmed)
+    } catch {
+      back = undefined
+    }
+    if (back !== undefined) return { ok: false, text: '删除后查回仍存在：未确认删除，请重试。' }
+    deps.activity?.('write', `ui:delete ${trimmed}`)
+    return { ok: true, text: `已删除记忆 ${trimmed}（不可撤销）。` }
+  }
+
+  async function markMemory(id: string, mark: UiMemoryMark): Promise<UiActionResult> {
+    const trimmed = typeof id === 'string' ? id.trim() : ''
+    if (trimmed.length === 0) return { ok: false, text: '未执行：id 不能为空。' }
+    if (mark !== 'confirm' && mark !== 'obsolete' && mark !== 'revive') {
+      return { ok: false, text: `未执行：未知标记动作 ${String(mark)}。` }
+    }
+    if (mark === 'confirm') {
+      const confirm = deps.confirm
+      if (confirm === undefined) return { ok: false, text: '确认功能未启用（config.confirmCommand=false）。' }
+      try {
+        return await confirm({ action: 'confirm', id: trimmed, sessionId: currentSessionId() })
+      } catch (error) {
+        return { ok: false, text: `确认失败（已隔离）：${errorMessageOf(error)}` }
+      }
+    }
+    const clock = deps.clock
+    if (clock === undefined) return { ok: false, text: '未执行：时钟未接线（标记需要时间戳）。' }
+    const found = await findAccessibleRef(trimmed)
+    if (found === undefined) return { ok: false, text: `未执行：找不到这条记忆（id=${trimmed}；用户库/项目库都查过，或隐私拒绝）。` }
+    const record = found.record
+    if (mark === 'obsolete') {
+      if (!isActiveRecord(record)) return { ok: false, text: '未执行：该条目已经失效或被取代，无需再次标记。' }
+      const next: MemoryRecord = { ...record, validTo: Math.max(clock.now(), record.observedAt) }
+      try {
+        await found.ref.store.put(next)
+      } catch (error) {
+        return { ok: false, text: `标记失效失败：${errorMessageOf(error)}` }
+      }
+      try {
+        const back = await found.ref.store.get(trimmed)
+        if (back === undefined || back.validTo === null) {
+          return { ok: false, text: '标记失效后查回失败：状态未确认，请重试。' }
+        }
+      } catch (error) {
+        return { ok: false, text: `标记失效后查回失败（已隔离）：${errorMessageOf(error)}` }
+      }
+      deps.activity?.('write', `ui:obsolete ${trimmed}`)
+      return { ok: true, text: `已把 ${trimmed} 标为失效（正文与来源保留，可追溯）。` }
+    }
+    // revive：只对未被取代的记录清 validTo
+    if (record.supersededBy !== null) {
+      return { ok: false, text: '未执行：被其他条目取代的记录不能复活（请新建一条或在库层面处理）。' }
+    }
+    if (record.validTo === null) return { ok: true, text: `记忆 ${trimmed} 本来就是活跃的，无需复活。` }
+    const revived: MemoryRecord = { ...record, validTo: null }
+    try {
+      await found.ref.store.put(revived)
+    } catch (error) {
+      return { ok: false, text: `复活失败：${errorMessageOf(error)}` }
+    }
+    try {
+      const back = await found.ref.store.get(trimmed)
+      if (back === undefined || back.validTo !== null) {
+        return { ok: false, text: '复活后查回失败：状态未确认，请重试。' }
+      }
+    } catch (error) {
+      return { ok: false, text: `复活后查回失败（已隔离）：${errorMessageOf(error)}` }
+    }
+    deps.activity?.('write', `ui:revive ${trimmed}`)
+    return { ok: true, text: `已复活记忆 ${trimmed}。` }
+  }
+
+  async function sessions(): Promise<UiSessionList> {
+    const catalog = deps.sessionCatalog
+    if (catalog === undefined) {
+      return { available: false, reason: '会话目录未接线（宿主 sessionCatalog 服务不可用）', items: [] }
+    }
+    try {
+      const listing = await catalog.list()
+      if (!listing.available) {
+        return { available: false, reason: listing.reason ?? '会话目录不可用（宿主未提供原因）', items: [] }
+      }
+      const activeIds = new Set(
+        (deps.sessionRuntime?.list() ?? [])
+          .filter(runtime => runtime.observations > 0)
+          .map(runtime => runtime.sessionId),
+      )
+      const items: UiSessionItem[] = []
+      for (const entry of listing.items) {
+        if (entry.agentPreset !== 'omb') continue
+        let root: string | null = null
+        if (deps.rootOf !== undefined && entry.cwd.length > 0) {
+          try {
+            root = deps.rootOf(entry.cwd)
+          } catch {
+            root = null
+          }
+        }
+        let depth: string | null = null
+        try {
+          depth = deps.focusOf?.(entry.id) ?? null
+        } catch {
+          depth = null
+        }
+        let privacy: UiSessionItem['privacy'] = null
+        try {
+          const mode = deps.privacy?.admin.modeOf(entry.id)
+          privacy = mode === undefined
+            ? null
+            : { mode: mode.mode, origin: mode.origin, inheritedFrom: mode.inheritedFrom }
+        } catch {
+          privacy = null
+        }
+        items.push({
+          id: entry.id,
+          title: entry.title,
+          cwd: entry.cwd,
+          root,
+          preset: entry.agentPreset,
+          archived: entry.archived,
+          active: activeIds.has(entry.id),
+          depth,
+          privacy,
+          createdAt: entry.createdAt,
+        })
+      }
+      return { available: true, items }
+    } catch (error) {
+      return { available: false, reason: `会话目录读取失败（已隔离）：${errorMessageOf(error)}`, items: [] }
+    }
+  }
+
+  async function personal(): Promise<UiPersonalView> {
+    const provider = deps.personal
+    if (provider === undefined) {
+      return {
+        available: false,
+        reason: '未接线：用户画像服务不可用（omb-profile 未挂载）',
+        entries: [],
+        conflicts: [],
+        text: '',
+      }
+    }
+    try {
+      return await provider()
+    } catch (error) {
+      return {
+        available: false,
+        reason: `个人画像读取失败（已隔离）：${errorMessageOf(error)}`,
+        entries: [],
+        conflicts: [],
+        text: '',
+      }
+    }
+  }
+
+  return { overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct, createMemory, updateMemory, deleteMemory, markMemory, sessions, personal }
 
   async function resolve(input: UiResolveInput): Promise<UiActionResult> {
     const { action } = input
@@ -619,14 +1102,26 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
   }
 
-  async function profile(): Promise<UiProfile> {
+  async function profile(sessionId?: string): Promise<UiProfile> {
+    const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+    if (id.length > 0) {
+      const bySession = deps.profileForSession
+      if (bySession === undefined) {
+        return { available: false, reason: '未接线：按会话画像不可用（memory/index 未提供 profileForSession）' }
+      }
+      try {
+        return await bySession(id)
+      } catch (error) {
+        return { available: false, reason: `画像读取失败（已隔离）：${errorMessageOf(error)}` }
+      }
+    }
     if (deps.profile === undefined) {
       return { available: false, reason: '未接线：项目画像服务不可用（dsh/project-profile 未挂载）' }
     }
     try {
       return await deps.profile()
     } catch (error) {
-      return { available: false, reason: `画像读取失败（已隔离）：${error instanceof Error ? error.message : String(error)}` }
+      return { available: false, reason: `画像读取失败（已隔离）：${errorMessageOf(error)}` }
     }
   }
 

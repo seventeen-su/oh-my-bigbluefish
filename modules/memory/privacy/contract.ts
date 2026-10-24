@@ -71,4 +71,14 @@ export interface PrivacyAdminPort {
   clear(sessionId: string): PrivacyActionResult
   clearInactive(): PrivacyActionResult
   trust(): PrivacyActionResult
+  /**
+   * 只读：某会话**当前生效**的隐私档位（v4.18）。项目页要列出每个会话的档位，
+   * 不需要构造整份 `UiPrivacyView`。同步、绝不抛；异常按 sealed/fail-closed 兜底
+   * （安全方向，不静默放宽）。
+   */
+  modeOf(sessionId: string): {
+    readonly mode: PrivacyMode
+    readonly origin: string
+    readonly inheritedFrom: string | null
+  }
 }
