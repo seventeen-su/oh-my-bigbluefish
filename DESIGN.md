@@ -45,18 +45,19 @@ offset 1px；鼠标点击不出现环。primitive 自带焦点环的不再覆盖
 - 中文换行：`line-break: strict; word-break: normal; overflow-wrap: anywhere;`
   （长 id/路径才允许任意断行）。禁止 `word-break: break-all`。
 
-## 3. 间距、圆角、阴影比例尺
+## 3. 间距、圆角、表面比例尺
 
 - 间距（px）：`4 / 8 / 12 / 16 / 24 / 32`。组内间距 8，组间 24；卡片 padding 16；
   工具栏行高 36；导航单元格 40。
 - 圆角：`--dsw-radius-md`（12）用于行/按钮底座，`--dsw-radius-lg`（16）用于卡片/面板；
   **不出现未引用 token 的圆角**（圆点/头像例外）。
-- 阴影：卡片的层级由**表面 + 阴影**表达。注意 DSH 亮色主题的 `bg-layer-1/2/3`
-  可能同色（`design-platform.css` 亮色三者都是 neutral-bluish-00），所以**不能只靠底色差**：
-  - 二级卡（导航轨、内容卡）：`bg-layer-2` + `--dsw-elevation-panel`（带 0.5px 描边与柔和阴影），
-    **不要只留一个框、也不要干脆没有框**；
-  - 三级卡（详情、组内卡片、空态、通知）：`bg-layer-3` + `--dsw-elevation-soft`；
-  - 0.5px 发丝线只用于区段分隔或列表行之间的分界，不用于卡片外框。
+- 表面（v4.20 用户第 1 点）：**2D 卡片，全部不用 `box-shadow`**。DSH 亮色主题的
+  `bg-layer-1/2/3` 可能同色，因此用设置卡 token 而不是阴影：
+  - 二级卡（导航轨、内容卡）：`--dsw-alias-bg-layer-2` + `0.5px solid --dsw-alias-border-l2`；
+  - 三级卡（详情、组内卡片、空态、通知）：`--dsw-alias-settings-card-fill`
+    + `0.5px solid --dsw-alias-settings-card-stroke`；
+  - 列表条目也带 `--dsw-radius-md` 圆角、细边框与 4px 间距（不再是通栏下划线）；
+  - 0.5px 发丝线可用于卡片外框（2D 风格），但不再出现任何高光/投影。
 
 ## 3.1 滚动条（用户第 14 点）
 
@@ -90,10 +91,10 @@ offset 1px；鼠标点击不出现环。primitive 自带焦点环的不再覆盖
   必要时 4 个卡片 = 2×2，**不允许 flex-wrap 产生 3+1 孤行**。
 - 工具条：`flex-wrap` + 一致的 `gap`；搜索框 `flex:1 1 220px`；控件不拉伸变形；
   换行后整行左对齐，最后一颗按钮不单独悬在右侧。
-- 详情：宽容器列表 1fr + 详情 1.1fr（详情打开时）；未选中详情**收起为 0 宽**，
+- 详情：宽容器列表 1fr + 详情 `clamp(320px, 48%, 560px)`；未选中详情**收起为 0 宽**，
   不留下空卡片/边框；窄容器详情为覆盖在列表上的滑入卡（同 r16），有关闭按钮。
-- 导航与内容**都**是 layer-2 圆角卡（用户要求 12：要么都卡片，要么都不要）；
-  两者同 radius、同 padding 节奏、同 elevation token。
+- 导航与内容**都**是二级卡（layer-2 + 细边框，无阴影）；两者同 radius、同 padding 节奏、
+  同表面规则。
 
 ## 5. 控件样式矩阵（最终态，逐控件锁定）
 
@@ -128,8 +129,8 @@ offset 1px；鼠标点击不出现环。primitive 自带焦点环的不再覆盖
 
 | 场景 | 属性 | 时长/曲线 | 传达 |
 | --- | --- | --- | --- |
-| 页面切换 | opacity + translateY(4px) | 180ms `cubic-bezier(.4,0,.2,1)` | 视图替换 |
-| 刷新 | 图标 360° 旋转（loading 时） | 900ms linear 循环 | 正在读取 |
+| 页面切换 | opacity + translateX(±14px) + scale(.995) | 220ms `cubic-bezier(.22,.61,.36,1)` | 方向感视图替换 |
+| 响应式变化 | 侧边栏宽/内边距、页面间距 | 180ms `ease-out` | 窗口缩放跟随 |
 | 详情展开/收起 | flex-basis/transform/opacity | 220ms / 180ms | 层级与状态转移 |
 | 行/导航 hover | background-color | 120ms | 指针反馈 |
 | 输入/按钮按下 | primitive 自带 | 100ms | 反馈 |
@@ -170,4 +171,4 @@ offset 1px；鼠标点击不出现环。primitive 自带焦点环的不再覆盖
 
 - 不使用图表/迷你折线（数据量小，文字更准确）。
 - 不使用渐变/玻璃拟态（设置面板需要稳定对比）。
-- 不用“卡片外框 + 阴影”双强调；层级只由表面差 + 单一阴影表达。
+- 不用“卡片外框 + 阴影”双强调；本版按用户要求**完全不用阴影**，层级只由表面 token 表达。
