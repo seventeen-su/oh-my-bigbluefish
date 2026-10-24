@@ -57,6 +57,9 @@ node scripts/check-resolution.mjs
 
 部署：宿主加载的是 `C:\Users\SuSeventeen\.dsh\profiles\web\node_modules\@omb\*` 的真实副本，
 不是本仓库。同步流程：`git pull` → `node scripts/build.mjs` → 同步 `lib-gen`/组件目录 → relink → 重启 `dsh web` → `omb_status` 核对代数。
+**v4.23.0 起**：profile 的 `@omb/*` 可能被 pnpm 改建成指向仓库的符号链接（此时 relink 会写穿到仓库，
+不要跑）；部署必须同时复制**根 `lib-gen/g<N>`** 和**每个 `packages/*/lib-gen/g<N>` 转发桩**
+（后者 gitignored，`git reset` 不恢复；缺了会 `@omb/memory: import failed`）。
 
 ## 4. 高频坑（都踩过）
 
