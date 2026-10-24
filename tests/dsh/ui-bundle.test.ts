@@ -167,18 +167,41 @@ describe('OMB 设置 bundle 发布契约', () => {
   it('列表间距、收起留白、加载文案、下拉间距与对齐基准（v4.23.x 反馈）', () => {
     const code = source()
     expect(code).toMatch(/\.omb-list \{[^}]*gap: 8px/)
+    // 列表栏内部间距 12px
+    expect(code).toMatch(/\.omb-list-pane \{[^}]*gap: 12px/)
     // 收起时高度 0，但 flex gap 仍留一份间距：用等量负 margin 抵消
     expect(code).toMatch(/\.omb-collapse\[data-open='false'\] \{[^}]*margin-top: -4px/)
-    // 所有子页统一一行加载文案
+    // 所有子页统一一行加载文案；工具栏说明行加载时不再重复一行
     expect(code).toContain("label = '正在加载中...'")
     expect(code).not.toContain('h(Loading, { label:')
+    expect(code).toContain("sessions.loading ? ''")
     // 选项之间留 2px，避免选中高亮与相邻 hover 底重叠
     expect(code).toMatch(/\.omb-select-menu \{[^}]*gap: 2px/)
-    // 下拉左右对齐的基准是面板中心，不是窗口中心（要扣掉 DSH 一级侧边栏）
+    // 玻璃透明：只保留 backdrop-filter，不再用 filter（会破坏 backdrop 采样）
+    expect(code).toContain('backdrop-filter: blur(20px)')
+    expect(code).not.toContain('filter: drop-shadow')
+    // 下拉左右对齐：面板内按剩余空间判断，不再依赖窗口中心
     expect(code).toContain("closest('.omb-page')")
+    expect(code).toContain('roomRight')
     // 表单外层已有 label 时不再给 Select 传 label（否则「轴」显示两遍）
     expect(code).not.toContain("h(Select, { label: '轴'")
     expect(code).not.toContain("h(Select, { label: '类型', value: kind, options: CREATABLE_KINDS")
+  })
+
+  it('检索/筛选行：搜索行永不换行、筛选行动态填满且有上限（v4.23.x 反馈）', () => {
+    const code = source()
+    expect(code).toContain("className: 'omb-toolbar omb-toolbar-search'")
+    expect(code).toContain("className: 'omb-toolbar omb-toolbar-filters'")
+    expect(code).toMatch(/\.omb-toolbar-search \{[^}]*flex-wrap: nowrap/)
+    expect(code).toMatch(/\.omb-toolbar-filters \{[^}]*flex-wrap: nowrap/)
+    expect(code).toMatch(/\.omb-toolbar-filters > \.omb-select-field \{[^}]*flex: 1 1 0;[^}]*max-width: 180px/)
+    expect(code).toMatch(/\.omb-toolbar-search > \.omb-search \{[^}]*flex: 1 1 auto/)
+    // 极窄时新建文案隐藏，只剩图标
+    expect(code).toContain("className: 'omb-btn-label'")
+    expect(code).toMatch(/@container omb-panel \(max-width: 380px\) \{[\s\S]*?\.omb-btn-label \{ display: none/)
+    // 二级侧栏展开/收起的宽度动画恢复（不是瞬切）
+    expect(code).toMatch(/\.omb-nav \{[^}]*transition: width 180ms/)
+    expect(code).toMatch(/\.omb-nav-label \{[^}]*max-width: 0;[^}]*transition: opacity/)
   })
 
   it('检索栏：搜索+新建在上、筛选在下、搜索弹性填充不设上限', () => {

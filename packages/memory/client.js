@@ -101,8 +101,7 @@ window.__ModuleLoader__.load({
         background: transparent; border: none; border-right: 0.5px solid var(--dsw-alias-border-l2);
         border-radius: 0;
         user-select: none;
-        /* 不用 width/padding 过渡：容器宽度是宿主实时改的，过渡会"追"着指针走。 */
-        transition: none;
+        transition: width 180ms var(--ds-ease-in-out, ease-out), padding 180ms var(--ds-ease-in-out, ease-out);
       }
       /* 首次出现只做淡入：位置/高度先无过渡地就位，再打开滑动过渡。
          滑动过渡用**内联样式**给（见 MemoryPanel）：CSS 里任何后置规则（减弱动效等）
@@ -133,7 +132,7 @@ window.__ModuleLoader__.load({
         outline-offset: 1px;
       }
       .omb-nav-icon { flex: none; }
-      .omb-nav-label { display: none; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+      .omb-nav-label { display: block; flex: 1 1 auto; min-width: 0; max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; transition: opacity 160ms var(--ds-ease-in-out, ease-out), max-width 180ms var(--ds-ease-in-out, ease-out); }
 
       .omb-content {
         flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box; overflow: hidden;
@@ -188,7 +187,18 @@ window.__ModuleLoader__.load({
       .omb-toolbar > .omb-search { flex: 1 1 220px; }
       /* 搜索框是**弹性填充**，不设上限：窄容器里让它自己收缩，而不是换行 */
       .omb-search { flex: 1 1 220px; min-width: 0; max-width: none; }
-      .omb-select-field { position: relative; display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+      /* 检索+新建行：永不换行，搜索占满剩余；极窄时新建只剩图标 */
+      .omb-toolbar-search { flex-wrap: nowrap; }
+      .omb-toolbar-search > .omb-search { flex: 1 1 auto; min-width: 0; max-width: none; }
+      .omb-toolbar-search > button { flex: 0 0 auto; }
+      /* 筛选行：不换行；宽时每个下拉有上限，窄时一起收缩填满整行 */
+      .omb-toolbar-filters { flex-wrap: nowrap; }
+      .omb-toolbar-filters > .omb-search { flex: 1 1 auto; min-width: 0; }
+      .omb-toolbar-filters > .omb-select-field { flex: 1 1 0; min-width: 0; max-width: 180px; }
+      .omb-toolbar-filters .omb-select-anchor { flex: 1 1 auto; min-width: 0; }
+      .omb-toolbar-filters .omb-select-trigger { width: 100%; min-width: 0; max-width: none; }
+      .omb-select-field { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; }
+      .omb-select-anchor { position: relative; display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 100%; }
       .omb-select-trigger {
         display: inline-flex; align-items: center; justify-content: space-between; gap: 6px;
         min-width: 96px; max-width: 190px; height: 32px; box-sizing: border-box;
@@ -211,10 +221,9 @@ window.__ModuleLoader__.load({
         box-sizing: border-box; min-width: 132px; max-width: 240px; max-height: 280px; overflow-y: auto;
         padding: 4px; display: flex; flex-direction: column; gap: 2px;
         border: none; border-radius: var(--dsw-radius-lg, 14px);
-        background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 74%, transparent);
+        background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 66%, transparent);
         color: var(--dsw-alias-label-primary);
         backdrop-filter: blur(20px) saturate(1.4); -webkit-backdrop-filter: blur(20px) saturate(1.4);
-        filter: drop-shadow(0 10px 22px rgb(0 0 0 / 28%));
         animation: omb-menu-in 130ms cubic-bezier(.2,.8,.2,1);
       }
       .omb-select-menu[data-align='left'] { left: 0; right: auto; }
@@ -240,7 +249,7 @@ window.__ModuleLoader__.load({
       .omb-loading { display: inline-flex; align-items: center; gap: 6px; }
 
       .omb-workspace { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
-      .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; transition: opacity 180ms var(--ds-ease-in-out, ease-out), transform 180ms var(--ds-ease-in-out, ease-out); }
+      .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; transition: opacity 180ms var(--ds-ease-in-out, ease-out), transform 180ms var(--ds-ease-in-out, ease-out); }
       .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px; }
       .omb-row {
         display: flex; flex-direction: column; gap: 4px; width: 100%; min-width: 0;
@@ -350,7 +359,7 @@ window.__ModuleLoader__.load({
       @container omb-panel (min-width: 980px) {
         .omb-nav { width: 190px; padding: 10px 8px; }
         .omb-nav-indicator { left: 8px; right: 8px; }
-        .omb-nav-label { display: block; }
+        .omb-nav-label { display: block; max-width: 160px; opacity: 1; }
         .omb-nav-cell { justify-content: flex-start; padding: 8px 9px; }
       }
       /*
@@ -385,6 +394,7 @@ window.__ModuleLoader__.load({
       @container omb-panel (max-width: 380px) {
         .omb-content { padding: 8px; }
         .omb-toolbar { gap: 6px; }
+        .omb-btn-label { display: none; }
       }
       @media (pointer: coarse) { .omb-nav-cell, .omb-row { min-height: 44px; } }
       @media (prefers-reduced-motion: reduce) {
@@ -561,39 +571,44 @@ window.__ModuleLoader__.load({
         if (disabled) return
         if (!open && anchor.current && typeof anchor.current.getBoundingClientRect === 'function') {
           const rect = anchor.current.getBoundingClientRect()
-          // 对齐基准是**大肥鱼增强面板**的中心（不是画面中心）：
-          // 面板左边还有 DSH 一级侧边栏，用 window.innerWidth/2 会让整页偏右。
+          // 对齐基准是**面板**（.omb-page）而不是画面：宿主左边还有一级侧边栏。
+          // 判据用"触发器右侧还剩多少空间"：放得下菜单（约 150px）就左对齐，
+          // 否则右对齐 —— 比"窗口中心"稳，左侧的控件不会再被算成右对齐。
           const page = typeof anchor.current.closest === 'function' ? anchor.current.closest('.omb-page') : null
           const pageRect = page && typeof page.getBoundingClientRect === 'function' ? page.getBoundingClientRect() : null
-          const middle = pageRect && pageRect.width > 0
-            ? pageRect.left + pageRect.width / 2
-            : (window.innerWidth || document.documentElement.clientWidth || 0) / 2
-          setAlign(rect.left + rect.width / 2 <= middle ? 'left' : 'right')
+          const leftEdge = pageRect && pageRect.width > 0 ? pageRect.left : 0
+          const rightEdge = pageRect && pageRect.width > 0
+            ? pageRect.right
+            : (window.innerWidth || document.documentElement.clientWidth || 0)
+          const roomRight = rightEdge - rect.left
+          const roomLeft = rect.right - leftEdge
+          setAlign(roomRight >= 150 || roomRight >= roomLeft ? 'left' : 'right')
         }
         setOpen((value) => !value)
       }
-      return h('div', { className: 'omb-select-field', ref: anchor },
+      return h('div', { className: 'omb-select-field' },
         label ? h('span', { className: 'omb-field-label' }, label) : null,
-        h('button', {
-          type: 'button', className: 'omb-select-trigger', disabled,
-          'aria-haspopup': 'listbox', 'aria-expanded': open ? 'true' : 'false',
-          'aria-label': label || undefined,
-          onClick: toggle,
-        },
-        h('span', { className: 'omb-select-value' }, current.label),
-        h('span', { className: 'omb-select-chevron', 'aria-hidden': true },
-          open ? h(IconChevronUpOutlineRegular, { size: 12 }) : h(IconChevronDownOutlineRegular, { size: 12 }))),
-        open
-          ? h('div', { className: 'omb-select-menu', role: 'listbox', 'aria-label': label || '选项', 'data-align': align },
-            ...options.map((option) => h('button', {
-              key: option.value, type: 'button', role: 'option',
-              'aria-selected': option.value === value ? 'true' : 'false',
-              className: 'omb-select-item',
-              onClick: () => { setOpen(false); onChange(option.value) },
-            },
-            h('span', { className: 'omb-select-item-label' }, option.label),
-            option.value === value ? h('span', { className: 'omb-select-check', 'aria-hidden': true }, h(IconCheckOutlineRegular, { size: 12 })) : null)))
-          : null)
+        h('div', { className: 'omb-select-anchor', ref: anchor },
+          h('button', {
+            type: 'button', className: 'omb-select-trigger', disabled,
+            'aria-haspopup': 'listbox', 'aria-expanded': open ? 'true' : 'false',
+            'aria-label': label || undefined,
+            onClick: toggle,
+          },
+          h('span', { className: 'omb-select-value' }, current.label),
+          h('span', { className: 'omb-select-chevron', 'aria-hidden': true },
+            open ? h(IconChevronUpOutlineRegular, { size: 12 }) : h(IconChevronDownOutlineRegular, { size: 12 }))),
+          open
+            ? h('div', { className: 'omb-select-menu', role: 'listbox', 'aria-label': label || '选项', 'data-align': align },
+              ...options.map((option) => h('button', {
+                key: option.value, type: 'button', role: 'option',
+                'aria-selected': option.value === value ? 'true' : 'false',
+                className: 'omb-select-item',
+                onClick: () => { setOpen(false); onChange(option.value) },
+              },
+              h('span', { className: 'omb-select-item-label' }, option.label),
+              option.value === value ? h('span', { className: 'omb-select-check', 'aria-hidden': true }, h(IconCheckOutlineRegular, { size: 12 })) : null)))
+            : null))
     }
 
     function StatCard({ label, value, note, state }) {
@@ -749,8 +764,8 @@ window.__ModuleLoader__.load({
       const open = selectedId !== null
       return h('div', { className: 'omb-workspace', 'data-detail': open ? 'open' : 'closed' },
         h('div', { className: 'omb-list-pane' },
-          // 第一行：搜索（弹性填充）+ 新建；不设固定上限，窄容器里搜索自己收缩
-          h('div', { className: 'omb-toolbar' },
+          // 第一行：搜索（弹性填充）+ 新建；整行不换行，极窄时新建只剩加号
+          h('div', { className: 'omb-toolbar omb-toolbar-search' },
             h(Input, {
               className: 'omb-search', value: queryInput, placeholder: '搜索记忆', 'aria-label': '搜索记忆',
               onChange: (event) => setQueryInput(event.target.value),
@@ -763,9 +778,9 @@ window.__ModuleLoader__.load({
             h(Button, {
               variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }),
               onClick: () => setForm({ mode: 'create' }),
-            }, '新建')),
-          // 第二行：库 / 状态 / 类型（v4.22.2：筛选在检索与新建下方，三个下拉同一行）
-          h('div', { className: 'omb-toolbar' },
+            }, h('span', { className: 'omb-btn-label' }, '新建'))),
+          // 第二行：库 / 状态 / 类型（三个下拉同一行；宽时有上限，窄时一起收缩填满）
+          h('div', { className: 'omb-toolbar omb-toolbar-filters' },
             h(Select, { label: '库', value: scope, options: SCOPES, onChange: (next) => { setScope(next); resetForFilter() } }),
             h(Select, { label: '状态', value: status, options: STATUSES, onChange: (next) => { setStatus(next); resetForFilter() } }),
             h(Select, { label: '类型', value: kind, options: KINDS, onChange: (next) => { setKind(next); resetForFilter() } })),
@@ -1179,7 +1194,7 @@ window.__ModuleLoader__.load({
       const listPane = h('div', { className: 'omb-list-pane' },
         h('div', { className: 'omb-toolbar' },
           h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-            sessions.loading ? h(TextShimmer, { active: true }, '正在加载中...') : groups.length > 0 ? `${groups.length} 个工作区` : '')),
+            sessions.loading ? '' : groups.length > 0 ? `${groups.length} 个工作区` : '')),
         sessions.error ? h(ErrorLine, null, `读取失败：${sessions.error}`) : null,
         listBody)
 
@@ -1480,7 +1495,7 @@ window.__ModuleLoader__.load({
       }
       const groupView = filteredGroups.map((group) => h(Section, { key: group.root, title: group.label || group.root },
         h('div', { className: 'omb-stack' }, ...group.sessions.map(sessionCard))))
-      const filters = h('div', { className: 'omb-toolbar' },
+      const filters = h('div', { className: 'omb-toolbar omb-toolbar-filters' },
         h(Input, { className: 'omb-search', value: query, placeholder: '搜索会话 / 路径 / 上次结束原因', onChange: (event) => setQuery(event.target.value) }),
         h(Select, {
           label: '状态', value: stateFilter,
