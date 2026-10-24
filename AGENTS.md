@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.19.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.19.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,9 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.19.0（当前） = 设置台手动编辑扩展（x2）**：控制器状态机（`SERVICES.memoryControllerAdmin`，
+- **v4.19.1（当前） = 状态机隐私保护（x3）**：封存会话不展示状态机（不读控制器状态），
+  只读会话可看不可编辑；隐私档位不可读时也不展示。其余同 4.19.0。
+- **v4.19.0 = 设置台手动编辑扩展（x2）**：控制器状态机（`SERVICES.memoryControllerAdmin`，
   `GET/POST /omb/api/controller`，任务/候选增删清空，`capture.editController` 同步 phase、transition 清空）；
   个人画像 `POST /omb/api/personal`（declare/retract，`ProfileService.retract` 只删同轴同键显式声明）；
   记忆详情“取代…”选择目标走既有 `/resolve` supersede。契约：`docs/v4.19.0-manual-editing.md`。

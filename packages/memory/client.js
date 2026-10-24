@@ -858,7 +858,13 @@ window.__ModuleLoader__.load({
         ? h(Empty, { title: '已归档会话不可读', hint: '归档是保护状态：不会读取工作区画像，也不能改隐私。' })
         : h(React.Fragment, null,
           privacySection,
-          selected ? h(ControllerSection, { sessionId: selected.id }) : null,
+          selected
+            ? (!selected.privacy
+              ? h(Section, { title: '状态机' }, h(Empty, { title: '隐私状态不可读', hint: '无法确认会话隐私档位，先不展示状态机。' }))
+              : selected.privacy.mode === 'sealed'
+                ? h(Section, { title: '状态机' }, h(Empty, { title: '封存会话不可读', hint: '解除封存后再查看控制器状态。' }))
+                : h(ControllerSection, { sessionId: selected.id, readOnly: selected.privacy.mode === 'read-only' }))
+            : null,
           profileSection,
           privacyMaintenance)
 
@@ -914,7 +920,7 @@ window.__ModuleLoader__.load({
     ]
 
     // ── 控制器状态机：手动查看/增删任务与候选（v4.19） ─────────────
-    function ControllerSection({ sessionId }) {
+    function ControllerSection({ sessionId, readOnly }) {
       const [tick, setTick] = React.useState(0)
       const resource = useLoad(() => api('/controller', { sessionId }), [sessionId, tick])
       const [task, setTask] = React.useState('')
@@ -941,6 +947,7 @@ window.__ModuleLoader__.load({
       }
       return h(Section, { title: '状态机' },
         h('p', { className: 'omb-note' }, '会话内的任务约束与候选；手改立即生效，任务在回合结束失效。'),
+        readOnly ? h('p', { className: 'omb-note' }, '只读会话：可以查看，不能编辑状态机。') : null,
         notice
           ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
             h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
@@ -957,27 +964,28 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'omb-toolbar' },
                   h(Input, {
                     className: 'omb-search', value: task, placeholder: '添加一条任务约束', 'aria-label': '添加任务约束',
+                    disabled: readOnly,
                     onChange: (event) => setTask(event.target.value),
                     onKeyDown: (event) => { if (event.key === 'Enter') addTask() },
                   }),
-                  h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), disabled: busy || task.trim().length === 0, onClick: addTask }, '添加任务')),
+                  h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), disabled: readOnly || busy || task.trim().length === 0, onClick: addTask }, '添加任务')),
                 state && state.tasks.length > 0
                   ? h('div', null, ...state.tasks.map((entry, index) => h('div', { key: `${entry.text}-${index}`, className: 'omb-card' },
                     h('p', { className: 'omb-row-text omb-selectable' }, entry.text),
                     h('div', { className: 'omb-meta' }, h('span', null, `到期 ${formatTime(entry.expiresAt)}`)),
                     h('div', { className: 'omb-actions' },
-                      h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act({ action: 'remove-task', text: entry.text }) }, '移除')))))
+                      h(Button, { variant: 'ghost', size: 'sm', disabled: readOnly || busy, onClick: () => act({ action: 'remove-task', text: entry.text }) }, '移除')))))
                   : h('p', { className: 'omb-note' }, '没有任务约束。'),
                 state && state.candidates.length > 0
                   ? h('div', null, ...state.candidates.map((entry) => h('div', { key: entry.id, className: 'omb-card' },
                     h('p', { className: 'omb-row-text omb-selectable' }, entry.text),
                     h('div', { className: 'omb-meta' }, h(Tag, { tone: 'outline' }, entry.kind), h('span', null, entry.reason)),
                     h('div', { className: 'omb-actions' },
-                      h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act({ action: 'remove-candidate', text: entry.text }) }, '移除')))))
+                      h(Button, { variant: 'ghost', size: 'sm', disabled: readOnly || busy, onClick: () => act({ action: 'remove-candidate', text: entry.text }) }, '移除')))))
                   : h('p', { className: 'omb-note' }, '没有待确认候选。'),
                 h('div', { className: 'omb-actions' },
-                  h(Button, { variant: 'ghost', size: 'sm', disabled: busy || !state || state.tasks.length === 0, onClick: () => setConfirm('tasks') }, '清空任务'),
-                  h(Button, { variant: 'ghost', size: 'sm', disabled: busy || !state || state.candidates.length === 0, onClick: () => setConfirm('candidates') }, '清空候选'))),
+                  h(Button, { variant: 'ghost', size: 'sm', disabled: readOnly || busy || !state || state.tasks.length === 0, onClick: () => setConfirm('tasks') }, '清空任务'),
+                  h(Button, { variant: 'ghost', size: 'sm', disabled: readOnly || busy || !state || state.candidates.length === 0, onClick: () => setConfirm('candidates') }, '清空候选'))),
         h(Modal, {
           open: confirm !== '',
           onClose: () => setConfirm(''),
