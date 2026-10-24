@@ -1731,7 +1731,8 @@ window.__ModuleLoader__.load({
        */
       const indicatorTransition = reducedMotion || !indicator.animate
         ? 'opacity 220ms var(--ds-ease-in-out, ease-out)'
-        : 'transform 440ms cubic-bezier(.2, 1.32, .3, 1), height 440ms cubic-bezier(.2, 1.32, .3, 1), opacity 220ms var(--ds-ease-in-out, ease-out)'
+        // 起步慢、中后段加速、末尾小幅过冲再收束：Q 弹感来自 y2>1，但不拉开两端差距。
+        : 'transform 460ms cubic-bezier(.42, .04, .2, 1.24), height 460ms cubic-bezier(.42, .04, .2, 1.24), opacity 220ms var(--ds-ease-in-out, ease-out)'
       return h('div', { className: 'omb-page' },
         h('style', null, CSS),
         h('div', { className: 'omb-head' },

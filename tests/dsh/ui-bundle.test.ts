@@ -133,7 +133,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("data-ready")
     expect(code).toContain("data-animate")
     // 小回弹 + 优雅曲线；**内联** transition（CSS 后置规则曾把回弹覆盖掉）
-    expect(code).toContain('cubic-bezier(.2, 1.32, .3, 1)')
+    expect(code).toContain('cubic-bezier(.42, .04, .2, 1.24)')
     expect(code).toContain('transition: indicatorTransition')
     expect(code).toContain('translateY(${indicator.top}px)')
     expect(code).toContain('ResizeObserver')
