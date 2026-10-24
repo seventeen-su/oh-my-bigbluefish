@@ -69,7 +69,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("className: 'omb-content'")
     expect(code).not.toContain('box-shadow')
     expect(code).toContain('var(--dsw-alias-settings-card-stroke)')
-    expect(code).toContain('var(--dsw-alias-bg-layer-2)')
+    expect(code).toContain('#232324')
     expect(code).toContain('border-radius: var(--dsw-radius-lg)')
     const card = /\.omb-card \{([\s\S]*?)\}/.exec(code)
     expect(card).not.toBeNull()
@@ -175,9 +175,10 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("className: 'omb-collapse'")
     expect(code).toContain('data-open')
     expect(code).toContain('omb-session-toggle')
-    expect(code).toContain("childOpen ? '▴' : '▾'")
+    expect(code).toContain('IconChevronUpOutlineRegular')
+    expect(code).toContain('IconChevronDownOutlineRegular')
     expect(code).toContain('depth * 14')
-    expect(code).toContain('paddingLeft: `${indent}px`')
+    expect(code).toContain('width: `calc(100% - ${indent}px)`')
     expect(code).toContain('grid-template-rows 200ms')
   })
 
@@ -214,7 +215,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("'大肥鱼增强'")
   })
 
-  it('共享控件与主题 token；无十六进制色值', () => {
+  it('共享控件与主题 token；只允许用户指定的 #232324 表面色', () => {
     const code = source()
     expect(code).toContain("require('@deepseek-ai/dsh-client-ui-primitives')")
     for (const name of ['Button', 'Input', 'Modal', 'Tag', 'StateDot', 'TextShimmer', 'DisclosureRow']) {
@@ -222,7 +223,8 @@ describe('OMB 设置 bundle 发布契约', () => {
     }
     expect(code).toContain('var(--dsw-alias-label-primary)')
     expect(code).toContain('var(--dsw-alias-label-tertiary)')
-    expect(code).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    const hexes = [...code.matchAll(/#[0-9a-fA-F]{3,8}\b/g)].map((item) => item[0].toLowerCase())
+    expect([...new Set(hexes)]).toEqual(['#232324'])
   })
 
   it('未选中条目时不请求详情（HTTP 400 missing id 回归）', () => {

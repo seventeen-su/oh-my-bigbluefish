@@ -215,3 +215,135 @@ describe('installSessionCatalog', () => {
     expect(listing.reason).toContain('已卸载')
   })
 })
+
+describe('SessionCatalogPort.title（v4.21.0 历史会话真实标题）', () => {
+  function readHandle(events: unknown, control: { closed?: boolean; readThrows?: boolean } = {}): unknown {
+    return {
+      read: () => {
+        if (control.readThrows === true) throw new Error('事件日志损坏')
+        return Promise.resolve(events)
+      },
+      close: () => {
+        control.closed = true
+      },
+    }
+  }
+
+  it('取最后一个 session/title 事件；读完关闭句柄；第二次走缓存不再 open', async () => {
+    let opened = 0
+    const control: { closed?: boolean } = {}
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: (id: string, mode: string) => {
+          opened += 1
+          expect(id).toBe('hist')
+          expect(mode).toBe('read')
+          return readHandle([
+            { type: 'session/title', data: { title: '旧标题' } },
+            { type: 'message', data: { title: '不是标题事件' } },
+            { type: 'session/title', data: { title: '最后标题' } },
+            { type: 'session/title', data: { title: '   ' } },
+          ], control)
+        },
+      },
+    }))
+    await expect(catalog.port.title('  hist  ')).resolves.toBe('最后标题')
+    expect(control.closed).toBe(true)
+    // 缓存命中（含 null 也缓存）：第二次不再 open
+    await expect(catalog.port.title('hist')).resolves.toBe('最后标题')
+    expect(opened).toBe(1)
+    catalog.dispose()
+  })
+
+  it('没有标题事件/事件形状不符 → null，并缓存 null 不反复 open', async () => {
+    let opened = 0
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: () => {
+          opened += 1
+          return readHandle([{ type: 'session/title', data: { title: 42 } }, null, 'bad'])
+        },
+      },
+    }))
+    await expect(catalog.port.title('none')).resolves.toBeNull()
+    await expect(catalog.port.title('none')).resolves.toBeNull()
+    expect(opened).toBe(1)
+    catalog.dispose()
+  })
+
+  it('open 抛错 → null（绝不抛），失败也缓存', async () => {
+    let opened = 0
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: () => {
+          opened += 1
+          throw new Error('会话文件被占用')
+        },
+      },
+    }))
+    await expect(catalog.port.title('broken')).resolves.toBeNull()
+    await expect(catalog.port.title('broken')).resolves.toBeNull()
+    expect(opened).toBe(1)
+    catalog.dispose()
+  })
+
+  it('read() 抛错 → null，句柄仍然关闭', async () => {
+    const control: { closed?: boolean; readThrows?: boolean } = { readThrows: true }
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: () => readHandle('ignored', control),
+      },
+    }))
+    await expect(catalog.port.title('read-broken')).resolves.toBeNull()
+    expect(control.closed).toBe(true)
+    catalog.dispose()
+  })
+
+  it('活会话优先 sessionTitle；活会话没标题时回退持久化历史标题', async () => {
+    let opened = 0
+    const live = { id: 'live', header: header('live', 'D:/live', 1, 'omb') }
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: () => {
+          opened += 1
+          return readHandle([{ type: 'session/title', data: { title: '历史标题' } }])
+        },
+      },
+      sessions: sessions([live]),
+      sessionTitle: { get: (session: unknown) => (session === live ? { title: '活标题' } : undefined) },
+    }))
+    await expect(catalog.port.title('live')).resolves.toBe('活标题')
+    expect(opened).toBe(0)
+
+    // 同一目录实例里再加一个没有活标题的 id：走持久化回退
+    const fallback = installSessionCatalog(fakeCtx({
+      sessionPersistence: {
+        list: async () => [],
+        open: () => {
+          opened += 1
+          return readHandle([{ type: 'session/title', data: { title: '历史标题' } }])
+        },
+      },
+      sessions: sessions([live]),
+      sessionTitle: { get: () => ({ title: null }) },
+    }))
+    await expect(fallback.port.title('live')).resolves.toBe('历史标题')
+    expect(opened).toBeGreaterThanOrEqual(1)
+    catalog.dispose()
+    fallback.dispose()
+  })
+
+  it('unavailable 服务/卸载后 → null，不抛', async () => {
+    const catalog = installSessionCatalog(fakeCtx({}, {
+      throwing: ['sessionPersistence', 'sessions', 'sessionTitle'],
+    }))
+    await expect(catalog.port.title('x')).resolves.toBeNull()
+    catalog.dispose()
+    await expect(catalog.port.title('x')).resolves.toBeNull()
+  })
+})

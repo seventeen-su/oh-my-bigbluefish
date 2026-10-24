@@ -1052,4 +1052,34 @@ describe('createUiService', () => {
     expect(isolated.ok).toBe(false)
     expect(isolated.text).toContain('已隔离')
   })
+
+  // ── v4.21.0：历史会话真实标题 ─────────────────────────────────────
+  it('sessionTitle()：trim/长度校验、端口透传、未接线与异常都回退 null', async () => {
+    const calls: string[] = []
+    const catalog = {
+      list: async () => ({ available: true, items: [] }),
+      title: async (id: string) => {
+        calls.push(id)
+        return id === 'known' ? '真标题' : null
+      },
+    }
+    const service = createUiService({ stores: minimalStores, sessionCatalog: catalog as never, clock: fixedClock() })
+    await expect(service.sessionTitle('  known  ')).resolves.toEqual({ title: '真标题' })
+    await expect(service.sessionTitle('')).resolves.toEqual({ title: null })
+    await expect(service.sessionTitle('x'.repeat(201))).resolves.toEqual({ title: null })
+    expect(calls).toEqual(['known'])
+
+    const absent = await createUiService({ stores: minimalStores }).sessionTitle('known')
+    expect(absent.title).toBeNull()
+    const broken = createUiService({
+      stores: minimalStores,
+      sessionCatalog: {
+        list: async () => ({ available: true, items: [] }),
+        title: async () => {
+          throw new Error('会话文件坏了')
+        },
+      } as never,
+    })
+    expect((await broken.sessionTitle('known')).title).toBeNull()
+  })
 })

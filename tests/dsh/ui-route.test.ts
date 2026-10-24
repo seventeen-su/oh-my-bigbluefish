@@ -151,6 +151,7 @@ const UI = {
   markMemory: async (id: string, mark: string) => (id === 'denied'
     ? { ok: false, text: '拒绝：测试' }
     : { ok: true, text: `标记 ${mark} ${id}` }),
+  sessionTitle: async (id: string) => ({ title: id === 'known' ? '真标题' : null }),
   resolve: async (input: { action: string; fromId: string; toId: string }) => (input.fromId === 'a' && input.toId === 'b'
     ? { ok: true, text: `${input.action} 成功` }
     : { ok: false, text: '未执行：测试拒绝' }),
@@ -485,6 +486,21 @@ describe('installUiRoute', () => {
     const message = String((other.body as { error: string }).error)
     expect(message).toContain('/feedback')
     expect(message).toContain('/depth')
+  })
+
+  it('会话标题：GET /session-title?id= 200；缺 id 400（v4.21）', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+
+    const known = await request(route, { url: '/omb/api/session-title?id=known' })
+    expect(known.status).toBe(200)
+    expect(known.body).toEqual({ title: '真标题' })
+    const unknown = await request(route, { url: '/omb/api/session-title?id=missing' })
+    expect(unknown.status).toBe(200)
+    expect(unknown.body).toEqual({ title: null })
+    expect((await request(route, { url: '/omb/api/session-title' })).status).toBe(400)
+    expect((await request(route, { url: '/omb/api/session-title?id=%20' })).status).toBe(400)
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

@@ -1,15 +1,15 @@
 {
   "name": "@omb/kernel",
-  "version": "4.21.0",
+  "version": "4.22.0",
   "private": true,
   "type": "module",
   "description": "OMB v3 component — microkernel: service bus, event bus, health, status surface, tool registration gateway.",
   "dependencies": {
     "zod": "^4.4.3"
   },
-  "main": "./lib-gen/g139/index.js",
+  "main": "./lib-gen/g140/index.js",
   "exports": {
-    ".": "./lib-gen/g139/index.js",
+    ".": "./lib-gen/g140/index.js",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"

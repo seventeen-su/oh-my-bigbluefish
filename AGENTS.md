@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.21.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.22.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,12 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.21.0（当前） = 设置台精修（x2）**：导航与内容拼成一张 2D 大卡（同色竖线分隔）、
+- **v4.22.0（当前） = 设置台打磨（x2）**：极窄布局与侧栏 56px、历史会话标题端口
+  （`get /session-title?id=`，读持久化最后一个 `session/title`）、子会话宽度削减、
+  去掉重复 cwd、状态机总页搜索/筛选/增删管理、窄屏列表遮罩动效、二级卡 `#232324`、
+  仿 dsh-desktop-notify 的填充式控件、弹窗 `.omb-form` 间距、操作结果统一 Toast。
+  契约：`docs/v4.22.0-settings-console-polish.md`。
+- **v4.21.0 = 设置台精修（x2）**：导航与内容拼成一张 2D 大卡（同色竖线分隔）、
   删除概览/默认空白、筛选与新建改原生 `<select>`、状态机端口注入 deps（不再永远“未接线”）、
   工作区与母会话默认收起（箭头 + grid-rows 动效）、子会话 padding 缩进、旧 OMB 会话
   （无 `agentPreset`）兼容、运行中会话设置禁用。契约：`docs/v4.21.0-settings-console-refine.md`。

@@ -43,4 +43,12 @@ export interface SessionCatalogListing {
 /** 会话目录端口（内核服务 `SERVICES.sessionCatalog`）。 */
 export interface SessionCatalogPort {
   list(): Promise<SessionCatalogListing>
+  /**
+   * 按 id 取**真实标题**（v4.21.0）：活会话先走宿主 `sessionTitle`，
+   * 历史会话再从持久化事件里的最后一个 `session/title` 读取。
+   *
+   * 失败 / 无此会话 / 无标题一律 `null`（页面回退短 id，不猜）；`dsh/` 侧有
+   * 有界 FIFO 缓存（≤200，含 null），重复查询不反复打开会话。
+   */
+  title(id: string): Promise<string | null>
 }

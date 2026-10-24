@@ -401,6 +401,11 @@ export interface UiService {
   markMemory(id: string, mark: UiMemoryMark): Promise<UiActionResult>
   /** 项目页：只列 `agentPreset === 'omb'` 的会话；目录不可用如实说明。 */
   sessions(): Promise<UiSessionList>
+  /**
+   * 按 id 取真实标题（v4.21.0）：缺失/超长/未接线/异常一律 `{title:null}`，
+   * 页面据此回退短 id（不猜、不拿 cwd 冒充）。
+   */
+  sessionTitle(id: string): Promise<{ readonly title: string | null }>
   /** 个人画像页：读 `SERVICES.profile`；缺失/异常如实降级。 */
   personal(): Promise<UiPersonalView>
   /**
@@ -1121,6 +1126,18 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
   }
 
+  async function sessionTitle(rawId: string): Promise<{ readonly title: string | null }> {
+    const id = typeof rawId === 'string' ? rawId.trim() : ''
+    if (id.length === 0 || id.length > 200) return { title: null }
+    const catalog = deps.sessionCatalog
+    if (catalog === undefined) return { title: null }
+    try {
+      return { title: await catalog.title(id) }
+    } catch {
+      return { title: null }
+    }
+  }
+
   async function personal(): Promise<UiPersonalView> {
     const provider = deps.personal
     if (provider === undefined) {
@@ -1369,7 +1386,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
   return {
     overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct,
     createMemory, updateMemory, deleteMemory, markMemory, sessions, personal,
-    controller, controllerAct, personalAct, machines, feedbackAct, depthAct,
+    controller, controllerAct, personalAct, machines, feedbackAct, depthAct, sessionTitle,
   }
 
   async function resolve(input: UiResolveInput): Promise<UiActionResult> {

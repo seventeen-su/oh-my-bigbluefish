@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.21.0 = 大肥鱼增强设置台精修：拼接侧边栏、无概览默认空页、标准下拉框、状态机接线与母子会话折叠（x2）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.22.0 = 大肥鱼增强设置台打磨：极窄布局、标准控件、历史标题、状态机总页管理与 Toast（x2）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -298,9 +298,14 @@
         "默认空白页与标准下拉框",
         "运行中会话设置锁定",
         "旧会话兼容与母子会话折叠",
-        "状态机端口接线"
+        "状态机端口接线",
+        "极窄溢出与侧栏尺寸",
+        "标准控件与选择器箭头",
+        "状态机总页检索与管理",
+        "历史会话标题端口",
+        "操作结果 Toast 推送"
       ]
     }
   ],
-  "version": "4.21.0"
+  "version": "4.22.0"
 }

@@ -15,8 +15,9 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const {
-      Button, Input, Modal, Tag, StateDot, TextShimmer, DisclosureRow,
-      IconCheckOutlineRegular, IconChecklistOutlineRegular, IconCloseOutlineRegular,
+      Button, Input, Modal, Tag, StateDot, TextShimmer, DisclosureRow, Toast,
+      IconCheckOutlineRegular, IconChecklistOutlineRegular, IconChevronDownOutlineRegular,
+      IconChevronUpOutlineRegular, IconCloseOutlineRegular,
       IconDatabaseOutlineRegular, IconEditOutlineRegular,
       IconPlusOutlineRegular, IconTrashOutlineRegular,
       IconUserOutlineRegular, IconWarningOutlineRegular, IconWorkspaceTreeOutlineRegular,
@@ -72,7 +73,7 @@ window.__ModuleLoader__.load({
       .omb-page {
         container-type: inline-size; container-name: omb-panel;
         display: flex; flex-direction: column; box-sizing: border-box;
-        height: 100%; min-height: 0; overflow: hidden;
+        height: 100%; min-height: 0; min-width: 0; overflow: hidden;
         padding: 16px 20px; gap: 12px;
         background: var(--dsw-alias-bg-layer-1);
         color: var(--dsw-alias-label-primary);
@@ -88,8 +89,8 @@ window.__ModuleLoader__.load({
       .omb-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
 
       .omb-body {
-        flex: 1 1 auto; min-height: 0; display: flex; gap: 0; overflow: hidden;
-        background: var(--dsw-alias-bg-layer-2);
+        flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; gap: 0; overflow: hidden;
+        background: #232324;
         border: 0.5px solid var(--dsw-alias-border-l2);
         border-radius: var(--dsw-radius-lg);
       }
@@ -120,12 +121,12 @@ window.__ModuleLoader__.load({
       .omb-nav-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; opacity: 0; transition: opacity 120ms var(--ds-ease-in-out, ease-out); }
 
       .omb-content {
-        flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box;
+        flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box; overflow: hidden;
         display: flex; flex-direction: column; gap: 12px; padding: 16px;
         background: transparent; border: none; border-radius: 0;
         transition: padding 180ms var(--ds-ease-in-out, ease-out);
       }
-      .omb-content-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; user-select: none; }
+      .omb-content-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; min-width: 0; user-select: none; }
       .omb-content-title { margin: 0; font-size: 15px; line-height: 22px; font-weight: 600; }
       .omb-content-desc { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
       .omb-content-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
@@ -143,14 +144,15 @@ window.__ModuleLoader__.load({
       .omb-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; padding-right: 4px; }
 
       .omb-section { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+      .omb-stack { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
       .omb-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
       .omb-section-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; user-select: none; }
       .omb-grid { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .omb-grid > * { min-width: 0; }
       .omb-detail .omb-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
       .omb-card {
-        display: flex; flex-direction: column; gap: 4px; min-width: 0;
-        padding: 16px; box-sizing: border-box;
+        display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 100%;
+        padding: 16px; box-sizing: border-box; overflow-wrap: anywhere;
         background: var(--dsw-alias-settings-card-fill);
         border-radius: var(--dsw-radius-md);
         border: 0.5px solid var(--dsw-alias-settings-card-stroke);
@@ -158,7 +160,7 @@ window.__ModuleLoader__.load({
       .omb-card-label { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
       .omb-card-value { font-size: 17px; line-height: 26px; font-weight: 600; overflow-wrap: anywhere; }
       .omb-card-note { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
-      .omb-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-width: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
+      .omb-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; max-width: 100%; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
       .omb-note { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); overflow-wrap: anywhere; }
       .omb-error { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-error-primary); }
       .omb-code { font-family: var(--ds-font-family-code, monospace); font-size: 11px; line-height: 16px; user-select: text; }
@@ -168,23 +170,31 @@ window.__ModuleLoader__.load({
       .omb-toolbar > * { flex: 0 1 auto; min-width: 0; }
       .omb-toolbar > .omb-search { flex: 1 1 220px; }
       .omb-search { flex: 1 1 220px; min-width: 150px; max-width: 520px; }
-      .omb-select-field { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-      .omb-select {
-        height: 30px; max-width: 190px; box-sizing: border-box;
-        padding: 0 26px 0 8px; border: 0.5px solid var(--dsw-alias-border-l3);
-        border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-layer-1);
-        color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; line-height: 28px;
-        cursor: pointer; user-select: none;
+      .omb-select-field { position: relative; display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+      .omb-select-field::after {
+        content: ''; position: absolute; right: 10px; top: 50%; width: 0; height: 0;
+        border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
+        border-top: 4px solid var(--dsw-alias-label-secondary);
+        transform: translateY(-20%); pointer-events: none;
       }
-      .omb-select:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 1px; }
+      .omb-select {
+        height: 32px; max-width: 190px; box-sizing: border-box;
+        padding: 0 26px 0 8px; border: none;
+        border-radius: var(--dsw-radius-sm, 8px); background: var(--dsw-alias-bg-module-platform);
+        color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; line-height: 32px;
+        cursor: pointer; user-select: none; appearance: none; -webkit-appearance: none;
+        outline: none;
+      }
+      .omb-select option { background: var(--dsw-alias-bg-module-platform); color: var(--dsw-alias-label-primary); }
+      .omb-select:focus-visible { outline: none; }
       .omb-select:disabled { opacity: 0.5; cursor: default; }
       .omb-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 18px 16px; background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md); border: 0.5px solid var(--dsw-alias-settings-card-stroke); user-select: none; }
       .omb-empty-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; }
       .omb-empty-hint { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
       .omb-loading { display: inline-flex; align-items: center; gap: 6px; }
 
-      .omb-workspace { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
-      .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+      .omb-workspace { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+      .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; transition: opacity 180ms var(--ds-ease-in-out, ease-out); }
       .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 2px; }
       .omb-row {
         display: flex; flex-direction: column; gap: 4px; width: 100%; min-width: 0;
@@ -197,10 +207,10 @@ window.__ModuleLoader__.load({
       .omb-row[data-active='true'] { background: var(--dsw-specific-sidebar-nav-item-active); }
       .omb-row:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: -2px; }
       .omb-row[data-disabled='true'] { opacity: 0.5; cursor: default; }
-      .omb-row-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .omb-row-text { margin: 0; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
-      .omb-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
-      .omb-row-sub { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .omb-row-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .omb-row-text { margin: 0; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; max-width: 100%; }
+      .omb-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; max-width: 100%; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
+      .omb-row-sub { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .omb-workspace-group { display: flex; flex-direction: column; gap: 4px; }
       .omb-workspace-sessions { display: flex; flex-direction: column; gap: 4px; margin-left: 10px; padding-left: 8px; border-left: 0.5px solid var(--dsw-alias-border-l2); }
       .omb-collapse { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 200ms var(--ds-ease-in-out, ease-out); }
@@ -214,16 +224,16 @@ window.__ModuleLoader__.load({
       }
       .omb-session-toggle {
         flex: none; width: 28px; height: 28px; padding: 0; border: none; border-radius: var(--dsw-radius-md);
+        display: inline-flex; align-items: center; justify-content: center;
         background: transparent; color: var(--dsw-alias-label-secondary);
-        font: inherit; font-size: 13px; line-height: 28px; cursor: pointer;
-        transition: background-color 120ms var(--ds-ease-in-out, ease-out);
+        cursor: pointer; transition: background-color 120ms var(--ds-ease-in-out, ease-out);
       }
       .omb-session-toggle:hover { background: var(--dsw-alias-interactive-bg-hover); }
       .omb-session-toggle:focus-visible, .omb-session-main:focus-visible {
         outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
         outline-offset: -2px;
       }
-      .omb-chevron { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); user-select: none; }
+      .omb-chevron { display: inline-flex; align-items: center; justify-content: center; color: var(--dsw-alias-label-secondary); user-select: none; }
 
       .omb-detail-pane { position: absolute; inset: 0; z-index: 2; display: flex; min-width: 0; min-height: 0;
         transform: translateX(100%); opacity: 0; visibility: hidden;
@@ -238,16 +248,17 @@ window.__ModuleLoader__.load({
       .omb-detail-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; user-select: none; }
       .omb-detail-text { margin: 0; font-size: 14px; line-height: 22px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
       .omb-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-      .omb-field { display: flex; flex-direction: column; gap: 6px; }
+      .omb-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+      .omb-form { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
       .omb-field-label { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); user-select: none; }
       .omb-textarea {
         width: 100%; min-height: 108px; box-sizing: border-box; resize: vertical;
-        padding: 10px 12px; border: 0.5px solid var(--dsw-alias-border-l3);
-        border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-layer-1);
+        padding: 8px; border: none; border-radius: var(--dsw-radius-sm, 8px);
+        background: var(--dsw-alias-bg-module-platform);
         color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; line-height: 20px;
-        user-select: text;
+        user-select: text; outline: none;
       }
-      .omb-textarea:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 1px; }
+      .omb-textarea:focus-visible { outline: none; }
       .omb-modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
       .omb-notice { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; box-sizing: border-box;
         background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md); border: 0.5px solid var(--dsw-alias-settings-card-stroke); user-select: none;
@@ -282,15 +293,24 @@ window.__ModuleLoader__.load({
         }
         .omb-workspace[data-detail='open'] > .omb-detail-pane { flex-basis: clamp(320px, 48%, 560px); opacity: 1; transform: none; }
       }
+      @container omb-panel (max-width: 819px) {
+        .omb-workspace[data-detail='open'] > .omb-list-pane { opacity: 0; pointer-events: none; }
+      }
       @container omb-panel (max-width: 617px) {
-        .omb-nav { width: 48px; padding: 4px; }
+        .omb-nav { width: 56px; padding: 6px; }
         .omb-nav-label { display: none; }
-        .omb-nav-cell { justify-content: center; padding: 6px; min-height: 42px; }
+        .omb-nav-cell { justify-content: center; padding: 8px; min-height: 42px; }
       }
       @container omb-panel (max-width: 520px) {
         .omb-page { padding: 12px; gap: 10px; }
         .omb-content { padding: 12px; }
         .omb-grid { grid-template-columns: minmax(0, 1fr); }
+      }
+      @container omb-panel (max-width: 380px) {
+        .omb-page { padding: 8px; gap: 8px; }
+        .omb-content { padding: 8px; }
+        .omb-toolbar { gap: 6px; }
+        .omb-select { max-width: 100%; }
       }
       @media (pointer: coarse) { .omb-nav-cell, .omb-row { min-height: 44px; } }
       @media (prefers-reduced-motion: reduce) {
@@ -356,10 +376,33 @@ window.__ModuleLoader__.load({
       return parts[parts.length - 1] || String(path || '')
     }
 
-    /** 会话显示名：有标题用标题；旧日志没有标题时用短 id，不用 cwd 冒充同名。 */
-    function sessionName(item) {
+    /** 会话显示名：有标题用标题；标题晚到/缺失时先用短 id，绝不拿 cwd 冒充。 */
+    function sessionName(item, titles) {
       if (item && typeof item.title === 'string' && item.title.length > 0) return item.title
+      const late = titles && item ? titles[item.id] : undefined
+      if (typeof late === 'string' && late.length > 0) return late
       return `会话 ${shortId(item && item.id ? item.id : '')}`
+    }
+
+    /** 历史会话标题按需补读（每个 id 只请求一次；最多并发 20）。 */
+    function useSessionTitles(items) {
+      const [titles, setTitles] = React.useState({})
+      const pendingRef = React.useRef(new Set())
+      const mountedRef = React.useRef(true)
+      React.useEffect(() => () => { mountedRef.current = false }, [])
+      React.useEffect(() => {
+        const pending = (items || []).filter((item) => item && item.title === null && titles[item.id] === undefined && !pendingRef.current.has(item.id))
+        for (const item of pending.slice(0, 20)) {
+          pendingRef.current.add(item.id)
+          void api('/session-title', { id: item.id }).then((data) => {
+            if (!mountedRef.current) return
+            setTitles((value) => ({ ...value, [item.id]: typeof data.title === 'string' ? data.title : '' }))
+          }, () => {
+            if (mountedRef.current) setTitles((value) => ({ ...value, [item.id]: '' }))
+          })
+        }
+      }, [items, titles])
+      return titles
     }
 
     function modeText(mode) { return MODE_TEXT[mode] || String(mode || '未知') }
@@ -395,6 +438,15 @@ window.__ModuleLoader__.load({
         onToggle: () => setOpen((value) => !value),
         collapsedContent: summary ? h('span', { className: 'omb-row-meta' }, summary) : undefined,
       }, children)
+    }
+
+    function useToast() {
+      const [toast, setToast] = React.useState(null)
+      const show = (text, tone) => setToast({ text, tone, key: `${Date.now()}-${Math.random()}` })
+      const node = toast === null
+        ? null
+        : h(Toast, { key: toast.key, text: toast.text, tone: toast.tone, onDone: () => setToast(null) })
+      return [node, show]
     }
 
     function Select({ label, value, options, onChange, disabled }) {
@@ -473,7 +525,7 @@ window.__ModuleLoader__.load({
       const [hasMore, setHasMore] = React.useState(false)
       const [loadingMore, setLoadingMore] = React.useState(false)
       const [form, setForm] = React.useState(null)
-      const [notice, setNotice] = React.useState(null)
+      const [toastNode, showToast] = useToast()
       const queryRef = React.useRef('')
       const first = React.useRef(true)
       const loadingMoreRef = React.useRef(false)
@@ -576,10 +628,6 @@ window.__ModuleLoader__.load({
             h(Select, { label: '类型', value: kind, options: KINDS, onChange: (next) => { setKind(next); resetForFilter() } }),
             h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
               loading ? h(TextShimmer, { active: true }, '读取中…') : `已加载 ${items.length} 条`)),
-          notice
-            ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
-              h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
-            : null,
           error ? h(ErrorLine, null, `读取失败：${error}`) : null,
           h('div', {
             className: 'omb-list',
@@ -625,11 +673,12 @@ window.__ModuleLoader__.load({
             onClose: () => setForm(null),
             onSaved: (text) => {
               setForm(null)
-              setNotice({ text, failed: false })
+              showToast(text, 'success')
               setTick((value) => value + 1)
             },
           })
-          : null)
+          : null,
+        toastNode)
     }
 
     function MemoryDetail({ id, onClose, onEdit, onChanged }) {
@@ -637,7 +686,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [loading, setLoading] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
-      const [notice, setNotice] = React.useState(null)
+      const [toastNode, showToast] = useToast()
       const [revision, setRevision] = React.useState(0)
       const [confirmDelete, setConfirmDelete] = React.useState(false)
       const [supersedeOpen, setSupersedeOpen] = React.useState(false)
@@ -673,25 +722,25 @@ window.__ModuleLoader__.load({
       const active = record.validTo === null && record.supersededBy === null
       const act = (body, closeAfter) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/memory', body).then((payload) => {
-          setNotice({ text: payload.text || '完成', failed: false })
+          showToast(payload.text || '完成', 'success')
           setRevision((value) => value + 1)
           onChanged()
           if (closeAfter) onClose()
         }, (failure) => {
-          setNotice({ text: messageOf(failure), failed: true })
+          showToast(messageOf(failure))
         }).finally(() => setBusy(false))
       }
       const feedback = (action) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/feedback', { id, action }).then((payload) => {
-          setNotice({ text: payload.text || '反馈已记录', failed: false })
+          showToast(payload.text || '反馈已记录', 'success')
           setRevision((value) => value + 1)
           onChanged()
         }, (failure) => {
-          setNotice({ text: messageOf(failure), failed: true })
+          showToast(messageOf(failure))
         }).finally(() => setBusy(false))
       }
       return h('div', { className: 'omb-detail' },
@@ -718,8 +767,6 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('wrong') }, '错误'),
           h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('stale') }, '过时'),
           h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('noise') }, '噪声')),
-        notice ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
-          h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text)) : null,
         h(Collapsible, {
           icon: h(IconChecklistOutlineRegular, { size: 16 }),
           title: `确认记录（${data.auditAvailable ? data.audit.length : '不可读'}）`,
@@ -738,8 +785,8 @@ window.__ModuleLoader__.load({
             h('p', { className: 'omb-row-text omb-selectable' }, item.record.text),
             h('div', { className: 'omb-meta' }, h('span', { className: 'omb-code' }, item.record.id)),
             h('div', { className: 'omb-actions' },
-              h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => post('/resolve', { action: 'relate', fromId: id, toId: item.record.id }).then(() => { setNotice({ text: '已建立关联', failed: false }); onChanged() }, (failure) => setNotice({ text: messageOf(failure), failed: true })) }, '建立关联'),
-              h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => post('/resolve', { action: 'supersede', fromId: id, toId: item.record.id }).then(() => { setNotice({ text: '已标注取代', failed: false }); onChanged() }, (failure) => setNotice({ text: messageOf(failure), failed: true })) }, '本条取代该条')))))),
+              h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => post('/resolve', { action: 'relate', fromId: id, toId: item.record.id }).then(() => { showToast('已建立关联', 'success'); onChanged() }, (failure) => showToast(messageOf(failure))) }, '建立关联'),
+              h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => post('/resolve', { action: 'supersede', fromId: id, toId: item.record.id }).then(() => { showToast('已标注取代', 'success'); onChanged() }, (failure) => showToast(messageOf(failure))) }, '本条取代该条')))))),
         h(Modal, {
           open: confirmDelete,
           onClose: () => setConfirmDelete(false),
@@ -756,12 +803,13 @@ window.__ModuleLoader__.load({
             onClose: () => setSupersedeOpen(false),
             onDone: (target) => {
               setSupersedeOpen(false)
-              setNotice({ text: `已用「${target.text.slice(0, 24)}…」取代这条`, failed: false })
+              showToast(`已用「${target.text.slice(0, 24)}…」取代这条`, 'success')
               setRevision((value) => value + 1)
               onChanged()
             },
           })
-          : null)
+          : null,
+        toastNode)
     }
 
     function MemoryForm({ form, onClose, onSaved }) {
@@ -796,6 +844,7 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, '取消'),
           h(Button, { variant: 'primary', size: 'sm', disabled: busy || text.trim().length === 0, onClick: submit }, editing ? '保存' : '添加')),
       },
+      h('div', { className: 'omb-form' },
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '库'),
         editing
@@ -817,7 +866,7 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '标签（可选）'),
         h(Input, { value: tags, placeholder: '用逗号分隔，最多 8 个', onChange: (event) => setTags(event.target.value) })),
-      error ? h(ErrorLine, null, error) : null)
+      error ? h(ErrorLine, null, error) : null))
     }
 
     // ── 项目：会话 × 工作区 × 深度 × 隐私 ───────────────────────────
@@ -829,7 +878,7 @@ window.__ModuleLoader__.load({
       const [profileError, setProfileError] = React.useState('')
       const [profileLoading, setProfileLoading] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
-      const [notice, setNotice] = React.useState(null)
+      const [toastNode, showToast] = useToast()
       const [confirm, setConfirm] = React.useState('')
       const list = sessions.data && sessions.data.available ? sessions.data.items : null
       const current = privacy.data && privacy.data.current ? privacy.data.current.sessionId : null
@@ -855,6 +904,8 @@ window.__ModuleLoader__.load({
       }, [list])
       const toggleGroup = (key) => setExpanded((value) => ({ ...value, [key]: !value[key] }))
       const toggleSession = (id) => setExpandedSessions((value) => ({ ...value, [id]: !value[id] }))
+      const visibleSessions = groups.filter((group) => expanded[group.key] === true).flatMap((group) => group.items)
+      const titles = useSessionTitles(visibleSessions)
 
       React.useEffect(() => {
         if (!selected || selected.archived) { setProfile(null); setProfileError(''); return undefined }
@@ -868,22 +919,22 @@ window.__ModuleLoader__.load({
 
       const act = (body) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/privacy', body).then((payload) => {
-          setNotice({ text: payload.text || '完成', failed: false })
+          showToast(payload.text || '完成', 'success')
           privacy.reload(); sessions.reload()
         }, (failure) => {
-          setNotice({ text: messageOf(failure), failed: true })
+          showToast(messageOf(failure))
         }).finally(() => setBusy(false))
       }
       const setDepth = (depth) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/depth', { sessionId: selected.id, depth }).then((payload) => {
-          setNotice({ text: payload.text || '已更新推理深度', failed: false })
+          showToast(payload.text || '已更新推理深度', 'success')
           sessions.reload()
         }, (failure) => {
-          setNotice({ text: messageOf(failure), failed: true })
+          showToast(messageOf(failure))
         }).finally(() => setBusy(false))
       }
 
@@ -892,7 +943,7 @@ window.__ModuleLoader__.load({
         const indent = typeof depth === 'number' ? depth * 14 : 0
         return h('div', {
           key: item.id, className: 'omb-row omb-row-split',
-          style: indent > 0 ? { paddingLeft: `${indent}px` } : undefined,
+          style: indent > 0 ? { width: `calc(100% - ${indent}px)`, marginLeft: `${indent}px` } : undefined,
           'data-active': item.id === selectedId,
           'data-disabled': isArchived,
         },
@@ -901,15 +952,14 @@ window.__ModuleLoader__.load({
           disabled: isArchived,
           onClick: () => { if (!isArchived) setSelectedId(item.id) },
         },
-        h('span', { className: 'omb-row-title' }, sessionName(item)),
+        h('span', { className: 'omb-row-title' }, sessionName(item, titles)),
         h('span', { className: 'omb-row-meta' },
           isArchived ? h(Tag, { tone: 'quiet' }, '已归档') : item.active ? h(Tag, { tone: 'success' }, '进行中') : h(Tag, { tone: 'outline' }, '历史'),
           depth > 0 ? h(Tag, { tone: 'quiet' }, '子会话') : null,
           !item.preset ? h(Tag, { tone: 'quiet' }, '旧会话') : null,
           item.id === current ? h(Tag, { tone: 'info' }, '当前') : null,
           h('span', null, depthText(item.depth)),
-          item.privacy ? h(Tag, { tone: item.privacy.mode === 'normal' ? 'neutral' : 'warning' }, modeText(item.privacy.mode)) : null),
-        h('span', { className: 'omb-row-sub' }, item.cwd)),
+          item.privacy ? h(Tag, { tone: item.privacy.mode === 'normal' ? 'neutral' : 'warning' }, modeText(item.privacy.mode)) : null)),
         hasChildren
           ? h('button', {
             type: 'button', className: 'omb-session-toggle',
@@ -917,7 +967,7 @@ window.__ModuleLoader__.load({
             'aria-label': childOpen ? '收起子会话' : '展开子会话',
             'aria-expanded': childOpen,
             onClick: onToggle,
-          }, childOpen ? '▴' : '▾')
+          }, childOpen ? h(IconChevronUpOutlineRegular, { size: 14 }) : h(IconChevronDownOutlineRegular, { size: 14 }))
           : null)
       }
       const renderGroupSessions = (group) => {
@@ -957,7 +1007,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'omb-row-meta' },
             h(Tag, { tone: group.active ? 'success' : 'outline' }, group.active ? '有进行中会话' : '历史'),
             h('span', null, `${group.items.length} 个会话`),
-            h('span', { className: 'omb-chevron' }, expanded[group.key] ? '▴' : '▾')),
+            h('span', { className: 'omb-chevron' }, expanded[group.key] ? h(IconChevronUpOutlineRegular, { size: 12 }) : h(IconChevronDownOutlineRegular, { size: 12 }))),
           h('span', { className: 'omb-row-sub' }, group.root)),
           h('div', { className: 'omb-collapse', 'data-open': expanded[group.key] === true ? 'true' : 'false' },
             h('div', null,
@@ -1035,14 +1085,12 @@ window.__ModuleLoader__.load({
       const detail = selected
         ? h('div', { className: 'omb-detail' },
           h('div', { className: 'omb-detail-head' },
-            h('p', { className: 'omb-detail-title' }, sessionName(selected)),
+            h('p', { className: 'omb-detail-title' }, sessionName(selected, titles)),
             selected.archived ? h(Tag, { tone: 'quiet' }, '已归档') : h(Tag, { tone: selected.active ? 'success' : 'outline' }, selected.active ? '进行中' : '历史')),
           h('div', { className: 'omb-meta' },
             h('span', { className: 'omb-code' }, selected.id),
             h('span', { className: 'omb-selectable' }, selected.root || selected.cwd),
             h('span', null, formatTime(selected.createdAt))),
-          notice ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
-            h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text)) : null,
           detailBody)
         : h('div', { className: 'omb-detail' },
           h('p', { className: 'omb-detail-title' }, '会话详情'),
@@ -1067,7 +1115,7 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => act({ action: confirm === 'trust' ? 'trust' : 'clear-inactive' }) }, '确认')),
       })
 
-      return h('div', { className: 'omb-workspace', 'data-detail': selected ? 'open' : 'closed' }, listPane, aside, modal)
+      return h('div', { className: 'omb-workspace', 'data-detail': selected ? 'open' : 'closed' }, listPane, aside, modal, toastNode)
     }
 
     // ── 个人画像 ────────────────────────────────────────────────────
@@ -1089,18 +1137,18 @@ window.__ModuleLoader__.load({
       const resource = useLoad(() => api('/controller', { sessionId }), [sessionId, tick])
       const [task, setTask] = React.useState('')
       const [busy, setBusy] = React.useState(false)
-      const [notice, setNotice] = React.useState(null)
+      const [toastNode, showToast] = useToast()
       const [confirm, setConfirm] = React.useState('')
       const view = resource.data
       const state = view && view.available ? view : null
       const act = (body) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/controller', { sessionId, ...body }).then((payload) => {
-          setNotice({ text: payload.text || '已更新', failed: false })
+          showToast(payload.text || '已更新', 'success')
           setTick((value) => value + 1)
         }, (failure) => {
-          setNotice({ text: messageOf(failure), failed: true })
+          showToast(messageOf(failure))
         }).finally(() => setBusy(false))
       }
       const addTask = () => {
@@ -1112,10 +1160,6 @@ window.__ModuleLoader__.load({
       return h(Section, { title: '状态机' },
         h('p', { className: 'omb-note' }, '会话内的任务约束与候选；手改立即生效，任务在回合结束失效。'),
         readOnly ? h('p', { className: 'omb-note' }, '只读会话：可以查看，不能编辑状态机。') : null,
-        notice
-          ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
-            h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
-          : null,
         resource.loading && !view ? h(Loading, { label: '读取状态机…' })
           : resource.error ? h(ErrorLine, null, `状态机读取失败：${resource.error}`)
             : !view || !view.available
@@ -1159,51 +1203,101 @@ window.__ModuleLoader__.load({
           footer: h('div', { className: 'omb-modal-actions' },
             h(Button, { variant: 'ghost', size: 'sm', onClick: () => setConfirm('') }, '取消'),
             h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => { setConfirm(''); act({ action: confirm === 'tasks' ? 'clear-tasks' : 'clear-candidates' }) } }, '清空')),
-        }))
+        }),
+        toastNode)
     }
 
     // ── 状态机总览：项目级跨会话 + 跨工作区（v4.20） ────────────────
     function MachinesPage({ refreshTick }) {
       const resource = useLoad(() => api('/machines'), [refreshTick])
+      const [query, setQuery] = React.useState('')
+      const [phase, setPhase] = React.useState('all')
+      const [busyId, setBusyId] = React.useState(null)
+      const [drafts, setDrafts] = React.useState({})
+      const [toastNode, showToast] = useToast()
       const data = resource.data
       const groups = data && data.groups ? data.groups : []
-      const sessions = groups.flatMap((group) => group.sessions)
+      const filteredGroups = groups.map((group) => ({
+        ...group,
+        sessions: group.sessions.filter((entry) => {
+          if (phase !== 'all' && entry.phase !== phase) return false
+          const needle = query.trim().toLowerCase()
+          if (needle.length === 0) return true
+          const haystack = [sessionName(entry), entry.cwd, entry.title || '', ...(entry.tasks || []).map((task) => task.text), ...(entry.candidates || []).map((candidate) => candidate.text)].join(' ').toLowerCase()
+          return haystack.includes(needle)
+        }),
+      })).filter((group) => group.sessions.length > 0)
+      const sessions = filteredGroups.flatMap((group) => group.sessions)
+      const titles = useSessionTitles(sessions)
       const tasks = sessions.reduce((sum, entry) => sum + (entry.tasks ? entry.tasks.length : 0), 0)
       const candidates = sessions.reduce((sum, entry) => sum + (entry.candidates ? entry.candidates.length : 0), 0)
+      const act = (sessionId, body) => {
+        if (busyId !== null) return
+        setBusyId(sessionId)
+        void post('/controller', { sessionId, ...body }).then((payload) => {
+          showToast(payload.text || '已更新', 'success')
+          resource.reload()
+        }, (failure) => showToast(messageOf(failure))).finally(() => setBusyId(null))
+      }
+      const addTask = (sessionId) => {
+        const text = (drafts[sessionId] || '').trim()
+        if (text.length === 0) return
+        act(sessionId, { action: 'add-task', text })
+        setDrafts((value) => ({ ...value, [sessionId]: '' }))
+      }
       const stats = h('div', { className: 'omb-grid' },
-        h(StatCard, { label: '工作区', value: String(groups.length), note: '按项目根聚合' }),
+        h(StatCard, { label: '工作区', value: String(filteredGroups.length), note: '按项目根聚合' }),
         h(StatCard, { label: '会话状态机', value: String(sessions.length), note: '仅大肥鱼会话' }),
         h(StatCard, { label: '跟踪任务', value: String(tasks), note: '回合结束失效' }),
         h(StatCard, { label: '待确认候选', value: String(candidates), note: '去记忆页确认' }))
       const sessionCard = (entry) => {
-        const taskLines = entry.tasks && entry.tasks.length > 0
-          ? entry.tasks.map((task, index) => h('p', { key: `t${index}`, className: 'omb-note omb-selectable' }, `任务：${task.text}`))
-          : [h('p', { key: 'none', className: 'omb-note' }, '没有任务约束。')]
-        const candidateLines = entry.candidates && entry.candidates.length > 0
-          ? entry.candidates.map((candidate) => h('p', { key: candidate.id, className: 'omb-note omb-selectable' }, `候选：${candidate.text}`))
-          : []
+        const locked = entry.archived === true || entry.privacy === 'sealed'
+        const busy = busyId === entry.id
+        const taskRows = (entry.tasks || []).map((task, index) => h('div', { key: `t${index}`, className: 'omb-actions' },
+          h('span', { className: 'omb-note omb-selectable' }, `任务：${task.text}`),
+          locked ? null : h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act(entry.id, { action: 'remove-task', text: task.text }) }, '移除')))
+        const candidateRows = (entry.candidates || []).map((candidate) => h('div', { key: candidate.id, className: 'omb-actions' },
+          h('span', { className: 'omb-note omb-selectable' }, `候选：${candidate.text}`),
+          locked ? null : h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => act(entry.id, { action: 'remove-candidate', text: candidate.text }) }, '移除')))
         return h('div', { key: entry.id, className: 'omb-card' },
           h('div', { className: 'omb-row-meta' },
             h(Tag, { tone: entry.archived ? 'quiet' : entry.phase === 'idle' ? 'outline' : 'warning' },
               entry.archived ? '已归档' : PHASE_TEXT[entry.phase] || '未知'),
             entry.active ? h(Tag, { tone: 'success' }, '进行中') : null,
-            entry.privacy ? h(Tag, { tone: entry.privacy === 'normal' ? 'neutral' : 'warning' }, modeText(entry.privacy)) : null),
-          h('p', { className: 'omb-row-title' }, sessionName(entry)),
-          h('p', { className: 'omb-row-sub omb-selectable' }, entry.cwd),
-          ...taskLines,
-          ...candidateLines)
+            entry.privacy ? h(Tag, { tone: entry.privacy === 'normal' ? 'neutral' : 'warning' }, modeText(entry.privacy)) : null,
+            h('span', null, entry.id)),
+          h('p', { className: 'omb-row-title' }, sessionName(entry, titles)),
+          locked ? h('p', { className: 'omb-note' }, '归档/封存会话不可读写状态机。') : null,
+          ...taskRows,
+          ...candidateRows,
+          locked ? null : h('div', { className: 'omb-toolbar' },
+            h(Input, {
+              className: 'omb-search', value: drafts[entry.id] || '', placeholder: '添加任务约束', 'aria-label': '添加任务约束',
+              onChange: (event) => setDrafts((value) => ({ ...value, [entry.id]: event.target.value })),
+              onKeyDown: (event) => { if (event.key === 'Enter') addTask(entry.id) },
+            }),
+            h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), disabled: busy || (drafts[entry.id] || '').trim().length === 0, onClick: () => addTask(entry.id) }, '添加'),
+            h(Button, { variant: 'ghost', size: 'sm', disabled: busy || (entry.tasks || []).length === 0, onClick: () => act(entry.id, { action: 'clear-tasks' }) }, '清空任务'),
+            h(Button, { variant: 'ghost', size: 'sm', disabled: busy || (entry.candidates || []).length === 0, onClick: () => act(entry.id, { action: 'clear-candidates' }) }, '清空候选')))
       }
-      const groupView = groups.map((group) => h(Section, { key: group.root, title: group.label || group.root },
-        h('div', null, ...group.sessions.map(sessionCard))))
+      const groupView = filteredGroups.map((group) => h(Section, { key: group.root, title: group.label || group.root },
+        h('div', { className: 'omb-stack' }, ...group.sessions.map(sessionCard))))
+      const filters = h('div', { className: 'omb-toolbar' },
+        h(Input, { className: 'omb-search', value: query, placeholder: '搜索会话/任务/候选', onChange: (event) => setQuery(event.target.value) }),
+        h(Select, {
+          label: '阶段', value: phase,
+          options: [{ value: 'all', label: '全部' }, { value: 'idle', label: '空闲' }, { value: 'candidate-pending', label: '待确认候选' }, { value: 'tracking-tasks', label: '跟踪任务' }, { value: 'mixed', label: '混合' }, { value: 'unknown', label: '未知' }],
+          onChange: setPhase,
+        }))
       const content = !data
         ? (resource.loading ? h(Loading, { label: '读取状态机…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
         : !data.available
           ? h(Empty, { title: '状态机暂不可用', hint: data.reason || '' })
-          : h(React.Fragment, null, stats,
-            groups.length === 0
-              ? h(Empty, { title: '还没有可读的状态机', hint: '进入一个会话后会自动建立状态。' })
+          : h(React.Fragment, null, filters, stats,
+            filteredGroups.length === 0
+              ? h(Empty, { title: '没有匹配的状态机', hint: '换个关键词或阶段试试。' })
               : h(React.Fragment, null, ...groupView))
-      return h('div', { className: 'omb-scroll' }, content)
+      return h('div', { className: 'omb-scroll' }, content, toastNode)
     }
 
     // ── 个人画像手动编辑（v4.19） ─────────────────────────────────
@@ -1242,6 +1336,7 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, '取消'),
           h(Button, { variant: 'primary', size: 'sm', disabled: busy || key.trim().length === 0 || value.trim().length === 0, onClick: submit }, '保存')),
       },
+      h('div', { className: 'omb-form' },
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '轴'),
         h(Select, { label: '轴', value: axis, options: PROFILE_AXES, onChange: setAxis })),
@@ -1254,7 +1349,7 @@ window.__ModuleLoader__.load({
       h('div', { className: 'omb-field' },
         h('span', { className: 'omb-field-label' }, '依据（可选）'),
         h(Input, { value: evidence, placeholder: '用；分隔', onChange: (event) => setEvidence(event.target.value) })),
-      error ? h(ErrorLine, null, error) : null)
+      error ? h(ErrorLine, null, error) : null))
     }
 
     // ── 记忆生命周期：手动指定取代目标（v4.19） ───────────────────
@@ -1302,7 +1397,7 @@ window.__ModuleLoader__.load({
       const [form, setForm] = React.useState(null)
       const [confirmDelete, setConfirmDelete] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
-      const [notice, setNotice] = React.useState(null)
+      const [toastNode, showToast] = useToast()
       const resource = useLoad(() => api('/personal'), [refreshTick, revision])
       const data = resource.data
       const grouped = React.useMemo(() => {
@@ -1316,20 +1411,16 @@ window.__ModuleLoader__.load({
       }, [data])
       const remove = (entry) => {
         if (busy) return
-        setBusy(true); setNotice(null)
+        setBusy(true)
         void post('/personal', { action: 'retract', axis: entry.axis, key: entry.key }).then((payload) => {
-          setNotice({ text: payload.text || '已删除', failed: false })
+          showToast(payload.text || '已删除', 'success')
           setRevision((value) => value + 1)
-        }, (failure) => setNotice({ text: messageOf(failure), failed: true }))
+        }, (failure) => showToast(messageOf(failure)))
           .finally(() => { setBusy(false); setConfirmDelete(null) })
       }
 
       const actionsRow = h('div', { className: 'omb-actions' },
         h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), onClick: () => setForm({ record: null }) }, '新增条目'))
-      const noticeRow = notice
-        ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
-          h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
-        : null
       const stats = data ? h('div', { className: 'omb-grid' },
         h(StatCard, { label: '已声明', value: String(data.status ? data.status.declared : data.entries.length), note: '你明确说过的偏好' }),
         h(StatCard, { label: '推断', value: String(data.status ? data.status.inferred : 0), note: '从对话里归纳' }),
@@ -1369,7 +1460,7 @@ window.__ModuleLoader__.load({
         ? (resource.loading ? h(Loading, { label: '读取个人画像…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
         : !data.available
           ? h(Empty, { title: '个人画像暂不可用', hint: data.reason || '' })
-          : h(React.Fragment, null, actionsRow, noticeRow, stats, conflicts, groups, summary)
+          : h(React.Fragment, null, actionsRow, stats, conflicts, groups, summary)
 
       const formModal = form
         ? h(PersonalForm, {
@@ -1377,7 +1468,7 @@ window.__ModuleLoader__.load({
           onClose: () => setForm(null),
           onSaved: (text) => {
             setForm(null)
-            setNotice({ text, failed: false })
+            showToast(text, 'success')
             setRevision((value) => value + 1)
           },
         })
@@ -1394,7 +1485,7 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'primary', size: 'sm', disabled: busy, onClick: () => { if (confirmDelete) remove(confirmDelete) } }, '删除')),
       })
 
-      return h('div', { className: 'omb-scroll' }, content, formModal, deleteModal)
+      return h('div', { className: 'omb-scroll' }, content, formModal, deleteModal, toastNode)
     }
 
     function MemoryPanel() {

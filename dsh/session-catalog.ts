@@ -35,6 +35,10 @@ import { readService, type HostContextLike } from './host.js'
 
 /** 目录条数上限（契约 §3：不一次把几万个会话搬进面板）。 */
 const MAX_ITEMS = 200
+/** 标题缓存条数（v4.21.0）：含 null，FIFO 淘汰；避免每次刷新都重读历史会话。 */
+const TITLE_CACHE_MAX = 200
+/** 单次历史标题读取上限：超时按"没有标题"处理，绝不阻塞列表/页面。 */
+const TITLE_TIMEOUT_MS = 1_500
 
 /* ── 宿主形状的结构最小面（字段全可选：旧日志缺 agentPreset，异常头可能缺更多）── */
 
@@ -56,6 +60,23 @@ interface PersistenceSnapshotLike {
 /** 持久化服务（`list()` 在宿主实现里是 Promise）。 */
 interface SessionPersistenceLike {
   list?(options?: unknown): unknown
+  /**
+   * v4.21.0：按 id 打开会话（`open(id, 'read')`）。宿主返回读句柄；
+   * 这里只取标题事件，**不读正文、不长期持有**。
+   */
+  open?(id: string, mode: 'read'): unknown
+}
+
+/** 持久化读句柄的最小面：`read()` 给事件数组，`close()` 释放。 */
+interface PersistenceReadHandleLike {
+  read?(): unknown
+  close?(): unknown
+}
+
+/** 会话事件的最小面：标题事件是 `{ type: 'session/title', data: { title } }`。 */
+interface SessionTitleEventLike {
+  readonly type?: unknown
+  readonly data?: { readonly title?: unknown }
 }
 
 /** 活会话（`sessions.list()` 的元素）：`Session` 对象，标题投影要的是对象本身。 */
@@ -226,6 +247,72 @@ function titleOf(titles: SessionTitleLike | undefined, session: unknown): string
   }
 }
 
+/** 从事件数组取**最后一个**标题事件的非空标题；形状不符返回 null。 */
+function lastTitleOf(events: unknown): string | null {
+  if (!Array.isArray(events)) return null
+  let title: string | null = null
+  for (const event of events) {
+    const candidate = event as SessionTitleEventLike | null | undefined
+    if (candidate?.type !== 'session/title') continue
+    const value = candidate.data?.title
+    if (typeof value !== 'string' || value.trim().length === 0) continue
+    title = value
+  }
+  return title
+}
+
+/** 超时兜底：历史标题读不出来时不阻塞页面（超时值返回 null）。 */
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<null>(resolve => {
+        timer = setTimeout(() => resolve(null), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * 读历史标题：打开持久化会话 → 取事件里最后一个 `session/title` → 关闭。
+ *
+ * 任何异常/句柄缺失/事件形状不符都返回 null（页面回退短 id）；**绝不抛**。
+ */
+async function persistedTitle(
+  persistence: SessionPersistenceLike | undefined,
+  id: string,
+): Promise<string | null> {
+  if (persistence === undefined || typeof persistence.open !== 'function') return null
+  let opened: unknown
+  try {
+    opened = persistence.open(id, 'read')
+  } catch {
+    return null
+  }
+  const handle = await settle(opened) as PersistenceReadHandleLike | null | undefined
+  if (handle === null || handle === undefined || typeof handle.read !== 'function') return null
+  try {
+    const events = await settle(handle.read())
+    return lastTitleOf(events)
+  } catch {
+    return null
+  } finally {
+    try {
+      const closed = handle.close?.()
+      // close() 若返回 Promise，拒绝不得变成 unhandledRejection（读已结束，标题照用）。
+      if (closed !== null && typeof closed === 'object'
+        && typeof (closed as { then?: unknown }).then === 'function') {
+        void (closed as Promise<unknown>).catch(() => {})
+      }
+    } catch {
+      // 关闭失败不影响已读到的标题；句柄由宿主自行回收
+    }
+  }
+}
+
 /** 排序：未归档在前；同组 createdAt 降序；再按 id 定序（同毫秒时结果确定）。 */
 function compareEntries(left: SessionCatalogEntry, right: SessionCatalogEntry): number {
   if (left.archived !== right.archived) return left.archived ? 1 : -1
@@ -344,8 +431,61 @@ export function installSessionCatalog(ctx: HostContextLike): SessionCatalogInsta
       return unavailable(`会话目录读取失败：${describeError(error)}`)
     }
   }
+  /**
+   * 标题缓存（v4.21.0）：键 id，值 string|null；≤200 条、FIFO 淘汰。
+   * 失败也缓存 null，避免页面每次刷新都反复打开同一个损坏/无标题的会话。
+   */
+  const titleCache = new Map<string, string | null>()
+
+  const rememberTitle = (id: string, title: string | null): void => {
+    if (titleCache.size >= TITLE_CACHE_MAX) {
+      const oldest = titleCache.keys().next().value
+      if (oldest !== undefined) titleCache.delete(oldest)
+    }
+    titleCache.set(id, title)
+  }
+
+  /**
+   * 按 id 取真实标题：活会话优先宿主 `sessionTitle`；历史会话读持久化事件
+   * 里最后一个 `session/title`。失败/超时/无句柄一律 null，绝不抛、不阻塞。
+   */
+  const title = async (rawId: string): Promise<string | null> => {
+    const id = typeof rawId === 'string' ? rawId.trim() : ''
+    if (id.length === 0 || disposed) return null
+    if (titleCache.has(id)) return titleCache.get(id) ?? null
+    let resolved: string | null = null
+    try {
+      resolved = await withTimeout((async (): Promise<string | null> => {
+        const liveService = withMethod<SessionsLike>(readService(ctx, 'sessions'), 'list')
+        const titles = withMethod<SessionTitleLike>(readService(ctx, 'sessionTitle'), 'get')
+        if (liveService !== undefined) {
+          const liveSessions = await settle(callList(liveService.list, liveService))
+          if (Array.isArray(liveSessions)) {
+            const match = liveSessions.find(session => {
+              const candidate = session as LiveSessionLike | null | undefined
+              return (textOf(candidate?.id) ?? textOf(candidate?.header?.id)) === id
+            })
+            if (match !== undefined) {
+              const liveTitle = titleOf(titles, match)
+              if (liveTitle !== null) return liveTitle
+            }
+          }
+        }
+        const persistence = withMethod<SessionPersistenceLike>(
+          readService(ctx, 'sessionPersistence'),
+          'open',
+        )
+        return await persistedTitle(persistence, id)
+      })(), TITLE_TIMEOUT_MS)
+    } catch {
+      resolved = null
+    }
+    rememberTitle(id, resolved)
+    return resolved
+  }
+
   return {
-    port: Object.freeze({ list }),
+    port: Object.freeze({ list, title }),
     dispose(): void {
       disposed = true
     },

@@ -1440,3 +1440,31 @@
 6. 运行中的会话：推理深度/隐私下拉框禁用（灰色）+“设置已锁定”提示。
 7. 记忆库滚动加载后筛选失效：筛选变化时立即清空列表、失效分页请求并重置 seq，
    加载中禁止 loadMore，避免旧页追加到新筛选。
+
+---
+
+# OMB v4.22.0 交付记录（2026-10-24，x2）
+
+| 项 | 结果 |
+| --- | --- |
+| 版本 | **4.22.0**（`25 功能 / 129 小功能`；x2：设置台打磨） |
+| 构建 | **g140**；`generation: 140`、`outDir: lib-gen/g140` |
+| 门禁 | `tsc --noEmit` **0**；`eslint .` **0**；`vitest run` **124 files / 1560 passed | 1 skipped**；`node scripts/version.mjs` 一致 |
+| 真机验收 | **待重启 `dsh web` 后核对**：极窄宽度、侧栏 56px、历史标题、状态机卡片间距/搜索/编辑、Toast、弹窗与控件样式 |
+
+## 本轮 13 点
+
+1. 极窄宽度：min-width/max-width/overflow-wrap 全面收敛，新增 ≤380px 紧凑断点。
+2. ≤617px 侧栏宽 56px、padding 6，图标居中。
+3. 历史会话标题：`SessionCatalogPort.title(id)` 读持久化最后一个 `session/title`，
+   `GET /session-title?id=`，项目页/状态机页按需补读，失败才短 id。
+4. 子会话宽度按缩进削减（calc + margin），右侧对齐不溢出。
+5. 会话行去掉重复 cwd，工作区只显示一次路径。
+6. 工作区/母会话右侧统一 DSH 上下 chevron，垂直居中；选择器小三角用 `::after`。
+7. 状态机总页：卡片 8px 间距、搜索 + 阶段筛选、任务/候选增删与清空。
+8. 窄屏详情打开时列表 opacity 归零 + 180ms 过渡，圆角缝隙不再透出。
+9. 二级卡背景 #232324。
+10. 选择框/文本域仿 dsh-desktop-notify CONTROL（32px、无边框、填充面、8px 圆角）。
+11. 弹窗表单包 `.omb-form`，统一 12px 间距。
+12. `omb-meta` 与 `omb-row-meta` 统一 4×8 间距与字级。
+13. 新增/编辑/删除/反馈/隐私/深度/状态机等写操作统一 Toast，不再堆内联回执。

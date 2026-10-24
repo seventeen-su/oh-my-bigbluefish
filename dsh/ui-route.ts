@@ -430,6 +430,16 @@ export function installUiRoute(
         json(res, 200, await ui.sessions())
         return
       }
+      if (path === '/session-title') {
+        const rawId = url.searchParams.get('id')
+        const id = rawId === null ? '' : rawId.trim()
+        if (id.length === 0) {
+          json(res, 400, { error: 'missing id' })
+          return
+        }
+        json(res, 200, await ui.sessionTitle(id))
+        return
+      }
       if (path === '/personal') {
         json(res, 200, await ui.personal())
         return
