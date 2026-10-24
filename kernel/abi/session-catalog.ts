@@ -24,6 +24,13 @@ export interface SessionCatalogEntry {
   readonly archived: boolean
   /** 本进程内是否活着（宿主 sessions 里存在）。 */
   readonly live: boolean
+  /**
+   * 父会话 id（v4.20.0，子代理会话的 `header.parentSession`）；没有就是 null。
+   *
+   * 只用于「所有状态机」/项目页显示子会话归属与跟随母会话；不是血缘的权威来源
+   * （隐私继承仍由隐私模块从宿主会话头自己登记）。
+   */
+  readonly parentId: string | null
 }
 
 /** 一次目录读取的结果；`available:false` 时 `items` 必为空且带原因。 */

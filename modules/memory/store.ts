@@ -1730,13 +1730,20 @@ class SqliteStore implements SqliteMemoryStore {
    * 边界：`LIKE` 无法走 FTS 索引，因此只在**词法通道 0 命中**时由检索侧调用；
    * 查询串截到 120 字符、按状态/类型/标签过滤、`LIMIT` 有界。分数只用于排序
    * （长度差越小越靠前），通道标记 `fuzzy`，与词法分不混算。
+   *
+   * **最小长度 1（v4.20.0）**：FTS 索引按 `tokenizeForFts` 切成**二元组**
+   * （`长期记忆系统` → `长期 期记 记忆 忆系 系统`），裸单字在中文正文里**没有对应 token**，
+   * 所以单字查询在词法通道**必然 0 命中**——这条 `LIKE` 回退是它的**唯一**通道。
+   * 下限从 2 放宽到 1 正是修"单字永远查不到"（例如"猫"）。
+   * 0 长度仍然拒绝：空 `LIKE '%%'` 会命中全部行，那是"列全表"而不是检索。
    */
   async searchFuzzy(query: FuzzyQuery): Promise<readonly ScoredHit[]> {
     this.#assertUsable()
     if (query.scope !== this.scope) return []
     const limit = Number.isFinite(query.limit) ? Math.max(0, Math.floor(query.limit)) : 0
     const needle = typeof query.text === 'string' ? query.text.trim().slice(0, 120) : ''
-    if (limit === 0 || needle.length < 2) return []
+    // 1 是下限（单字可查），0 必须拒绝（见上面的注释：空针等于列全表）
+    if (limit === 0 || needle.length === 0) return []
 
     const kinds = query.kinds === undefined ? [] : [...new Set(query.kinds)]
     for (const kind of kinds) enumOf(kind, MEMORY_KINDS, 'kinds')

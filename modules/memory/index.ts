@@ -41,15 +41,15 @@ import {
 // 准入判据要**真的核验工件存在**。核验本身在 `./artifacts.ts`（用 git 索引，
 // 不做文件系统遍历——理由见那个文件）。这里只负责把会话 cwd 交给它。
 import { createStoresService, type MemoryStoresService, type PrivacyGatePort } from './store.js'
-import { createUiService, type UiPersonalEditInput, type UiPersonalView, type UiProfile } from './ui.js'
+import { createUiService, type UiActionResult, type UiFeedbackAction, type UiPersonalEditInput, type UiPersonalView, type UiProfile } from './ui.js'
 import { createRelateTool } from './graph.js'
 import { createMemoryTools } from './recall.js'
 import { createCapture, type Capture, type CaptureStats, type ControllerStats } from './capture.js'
-import { createConfirmAction, installConfirm, type ConfirmDeps } from './confirm.js'
+import { createConfirmAction, type ConfirmDeps } from './confirm.js'
 import { autoLinkRelated, findRelatedRecords, findSemanticRelated, type RelatedRecord } from './link.js'
 import { cosineFloorFor } from './vector.js'
 import { createProjectTool, type ProjectProfilePort, type ProjectProfileView, type SessionSituationView } from './project.js'
-import { createUsageTracker, installFeedback } from './feedback.js'
+import { createUsageTracker, runFeedbackCommand, type FeedbackDeps } from './feedback.js'
 import { AdaptiveFloorCalibrator } from './utility.js'
 import { asUtilityStore } from './store.js'
 import type { AbstentionCategory, ArtifactKind } from './remember.js'
@@ -1181,32 +1181,41 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           kernel.logger.warn(`OMB：隐式使用记账失败（已隔离）——${messageOf(error)}`)
         }
       }
-      const feedback = config.feedbackCommand
-        ? installFeedback(kernel, {
-            clock: kernel.clock,
-            resolveStores: sessionId => resolveStores(sessionId),
-            privacy: () => kernel.service(SERVICES.privacy),
-            logger: kernel.logger,
-            onFeedback: info => {
-              feedbackLedger.commands += 1
-              feedbackLedger.lastChange = `${info.action}→${info.change}`
-              if (info.change === 'useful' || info.change === 'revive') feedbackLedger.useful += 1
-              if (info.change === 'wrong-pending') feedbackLedger.wrongPending += 1
-              if (info.change === 'wrong-confirmed') feedbackLedger.wrongConfirmed += 1
-              if (info.change === 'stale-archived') feedbackLedger.archived += 1
-              if (info.change === 'revive') feedbackLedger.revived += 1
-            },
-          })
-        : {
-            commandState: () => '未启用（config.feedbackCommand=false）',
-            dispose: (): void => {},
-          }
+      // ── 反馈/确认：v4.20.0 起**不再注册用户命令**，能力经 `omb:ui` 的前端端点提供 ──
+      const sessionIdOfActive = (): string | null => {
+        try {
+          return kernel.service<{ current(): string | null }>(SERVICES.activeSession)?.current() ?? null
+        } catch {
+          return null
+        }
+      }
+      const feedbackDeps: FeedbackDeps = {
+        clock: kernel.clock,
+        resolveStores: sessionId => resolveStores(sessionId),
+        privacy: () => kernel.service(SERVICES.privacy),
+        logger: kernel.logger,
+        onFeedback: info => {
+          feedbackLedger.commands += 1
+          feedbackLedger.lastChange = `${info.action}→${info.change}`
+          if (info.change === 'useful' || info.change === 'revive') feedbackLedger.useful += 1
+          if (info.change === 'wrong-pending') feedbackLedger.wrongPending += 1
+          if (info.change === 'wrong-confirmed') feedbackLedger.wrongConfirmed += 1
+          if (info.change === 'stale-archived') feedbackLedger.archived += 1
+          if (info.change === 'revive') feedbackLedger.revived += 1
+        },
+      }
+      /** 前端「反馈」动作：与旧 `/omb-feedback` 同一实现，只是入口从命令换成用户点击。 */
+      const feedbackRun = async (id: string, action: UiFeedbackAction): Promise<UiActionResult> => {
+        if (!config.feedbackCommand) return { ok: false, text: '反馈未启用（config.feedbackCommand=false）。' }
+        const result = await runFeedbackCommand(`${id} ${action}`, sessionIdOfActive(), feedbackDeps)
+        return { ok: result.kind === 'success', text: result.text }
+      }
 
       /**
-       * `/omb-confirm`（v4.8.0）：候选记忆的**用户**确认入口。
+       * 候选确认（v4.8.0）的前端动作。
        *
-       * 与 `/omb-feedback` 同一条原则：确认改变证据等级，只有用户有权做，
-       * 所以模型工具面一个字都不加。命令不可用不影响记忆写入/召回。
+       * 与 `/omb-confirm` 同一条原则：确认改变证据等级，只有用户有权做，
+       * 所以模型工具面一个字都不加。v4.20.0 起命令注册已删除，能力只经 `omb:ui`。
        */
       const confirmDeps: ConfirmDeps = {
         clock: kernel.clock,
@@ -1227,15 +1236,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           noteActivity('confirm', `${info.action}${info.changed ? '✓' : '×'}×${count}`)
         },
       }
-      const confirm = config.confirmCommand
-        ? installConfirm(kernel, confirmDeps)
-        : {
-            commandState: () => '未启用（config.confirmCommand=false）',
-            dispose: (): void => {},
-          }
 
       // ── 管理侧边栏数据面（v4.15.0/v4.15.1）──
-      // 与 `/omb-confirm` 复用同一个 `createConfirmAction`：UI 不另写写逻辑。
+      // 与已删除的 `/omb-confirm` 复用同一个 `createConfirmAction`：UI 不另写写逻辑。
       const confirmAction = createConfirmAction(confirmDeps)
       const offUi = kernel.provide(SERVICES.ui, createUiService({
         stores: {
@@ -1251,6 +1254,9 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
             return null
           }
         },
+        // ── 命令并入前端（v4.20.0）：反馈/推理深度不再有斜杠命令 ──
+        feedbackRun,
+        setDepth: (sessionId, depth) => kernel.setFocus(sessionId, depth, '设置台手动设置'),
         // ── 项目页（v4.18）：会话目录 / 活跃 / 根 / 深度来自各自内核服务 ──
         sessionCatalog: kernel.service<SessionCatalogPort>(SERVICES.sessionCatalog),
         sessionRuntime: kernel.service<{
@@ -1895,8 +1901,6 @@ export function createMemoryRegistration(options: MemoryModuleOptions = {}): Mod
           ['常驻提示', offPrompt],
           ['捕获·用户消息订阅', offCaptureMessage],
           ['控制器管理端口', offControllerAdmin],
-          ['反馈命令', () => feedback.dispose()],
-          ['确认命令', () => confirm.dispose()],
           ['捕获·工具调用订阅', offCaptureCall],
           ['捕获·工具结果订阅', offCaptureResult],
           ['捕获·回合结局订阅', offCaptureOutcome],

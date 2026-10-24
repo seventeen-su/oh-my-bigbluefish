@@ -44,6 +44,8 @@ interface HostSessionHeaderLike {
   readonly cwd?: unknown
   readonly createdAt?: unknown
   readonly agentPreset?: unknown
+  /** 子代理会话的父会话 id（v4.20.0）；缺省 = 顶层会话。 */
+  readonly parentSession?: unknown
 }
 
 /** `sessionPersistence.list()` 的元素：`{ header, formatStatus? }`。 */
@@ -90,6 +92,7 @@ interface MergedEntry {
   cwd: string
   createdAt: number
   agentPreset: string | null
+  parentId: string | null
   live: boolean
 }
 
@@ -254,6 +257,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
           cwd: textOf(header?.cwd) ?? '',
           createdAt: numberOrZero(header?.createdAt),
           agentPreset: textOf(header?.agentPreset) ?? null,
+          parentId: textOf(header?.parentSession) ?? null,
           live: false,
         })
       }
@@ -277,6 +281,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
             cwd: textOf(live?.header?.cwd) ?? '',
             createdAt: numberOrZero(live?.header?.createdAt),
             agentPreset: textOf(live?.header?.agentPreset) ?? null,
+            parentId: textOf(live?.header?.parentSession) ?? null,
             live: true,
           })
           continue
@@ -287,6 +292,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
         if (existing.cwd.length === 0) existing.cwd = textOf(live?.header?.cwd) ?? ''
         if (existing.createdAt === 0) existing.createdAt = numberOrZero(live?.header?.createdAt)
         if (existing.agentPreset === null) existing.agentPreset = textOf(live?.header?.agentPreset) ?? null
+        if (existing.parentId === null) existing.parentId = textOf(live?.header?.parentSession) ?? null
       }
     }
   }
@@ -299,6 +305,7 @@ async function collect(ctx: HostContextLike): Promise<SessionCatalogListing> {
       cwd: entry.cwd,
       createdAt: entry.createdAt,
       agentPreset: entry.agentPreset,
+      parentId: entry.parentId,
       archived: archived.has(entry.id),
       live: entry.live,
     }))

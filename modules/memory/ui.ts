@@ -78,6 +78,8 @@ export interface UiSessionItem {
   readonly preset: string | null
   readonly archived: boolean
   readonly active: boolean
+  /** 父会话 id（v4.20）：子代理会话跟随母会话显示；顶层为 null。 */
+  readonly parentId: string | null
   /** `kernel.focus(sessionId)`；拿不到为 null。 */
   readonly depth: string | null
   readonly privacy: {
@@ -180,6 +182,49 @@ export type UiPersonalEditInput =
       readonly axis: string
       readonly key: string
     }
+
+/** 「所有状态机」页的单个会话（v4.20.0）：只有 phase/两张表/时间，不含正文。 */
+export interface UiMachineSession {
+  readonly id: string
+  readonly title: string | null
+  readonly cwd: string
+  readonly archived: boolean
+  readonly active: boolean
+  readonly phase: 'idle' | 'candidate-pending' | 'tracking-tasks' | 'mixed' | 'unknown'
+  readonly tasks: readonly { readonly text: string; readonly expiresAt: number }[]
+  readonly candidates: readonly { readonly id: string; readonly text: string; readonly kind: string }[]
+  readonly lastEventAt: number | null
+  readonly privacy: 'normal' | 'read-only' | 'sealed' | null
+}
+
+export interface UiMachineGroup {
+  /** 分组键：`root ?? cwd`（workspace 级）。 */
+  readonly root: string
+  readonly label: string
+  readonly sessions: readonly UiMachineSession[]
+}
+
+export interface UiMachinesView {
+  readonly available: boolean
+  readonly reason?: string
+  readonly groups: readonly UiMachineGroup[]
+}
+
+/** 反馈动作白名单（v4.20.0）：能力从 `/omb-feedback` 命令并入前端。 */
+export type UiFeedbackAction = 'useful' | 'wrong' | 'stale' | 'noise' | 'revive'
+
+export interface UiFeedbackActInput {
+  readonly id: string
+  readonly action: UiFeedbackAction
+}
+
+/** 推理深度（v4.20.0）：能力从 `/omb-depth` 命令并入前端。 */
+export type UiDepth = 'quick' | 'standard' | 'deep'
+
+export interface UiDepthActInput {
+  readonly sessionId?: string
+  readonly depth: UiDepth
+}
 
 export interface UiStoreView {
   readonly scope: MemoryScope
@@ -367,6 +412,12 @@ export interface UiService {
   controllerAct(input: UiControllerActInput): Promise<UiActionResult>
   /** 个人画像写入（v4.19.0）：declare / retract；能力轴被拒绝（只存在会话内存）。 */
   personalAct(input: UiPersonalEditInput): Promise<UiActionResult>
+  /** 「所有状态机」聚合页（v4.20.0）：按 workspace 分组；sealed/归档不读状态。 */
+  machines(): Promise<UiMachinesView>
+  /** 反馈并入前端（v4.20.0）：替代 `/omb-feedback` 命令。 */
+  feedbackAct(input: UiFeedbackActInput): Promise<UiActionResult>
+  /** 推理深度并入前端（v4.20.0）：替代 `/omb-depth` 命令。 */
+  depthAct(input: UiDepthActInput): Promise<UiActionResult>
   /**
    * 会话隐私页的完整视图（v4.17）。未接线/异常 → 返回**完整形状**的降级视图，
    * 不抛到 HTTP 层（页面要能显示"未接线"而不是白屏）。
@@ -418,6 +469,10 @@ export interface UiServiceDeps {
   readonly personalEdit?: (
     input: UiPersonalEditInput,
   ) => UiActionResult | Promise<UiActionResult>
+  /** 反馈执行（v4.20.0；memory/index 把 `runFeedbackCommand` 包成当前会话的动作）。 */
+  readonly feedbackRun?: (id: string, action: UiFeedbackAction) => Promise<UiActionResult>
+  /** 设置推理深度（v4.20.0；memory/index 传 `kernel.setFocus`）。 */
+  readonly setDepth?: (sessionId: string, depth: UiDepth) => void
   /** 确认动作（`createConfirmAction(confirmDeps)`）；缺省 = 功能未启用，动作如实拒绝。 */
   readonly confirm?: (input: {
     readonly action: UiConfirmAction
@@ -1053,6 +1108,7 @@ export function createUiService(deps: UiServiceDeps): UiService {
           preset: entry.agentPreset,
           archived: entry.archived,
           active: activeIds.has(entry.id),
+          parentId: entry.parentId ?? null,
           depth,
           privacy,
           createdAt: entry.createdAt,
@@ -1212,10 +1268,107 @@ export function createUiService(deps: UiServiceDeps): UiService {
     }
   }
 
+  async function machines(): Promise<UiMachinesView> {
+    const admin = deps.controllerAdmin
+    if (admin === undefined) {
+      return { available: false, reason: '未接线：记忆控制器管理端口不可用（capture 未装配）', groups: [] }
+    }
+    const listing = await sessions()
+    if (!listing.available) {
+      return { available: false, reason: listing.reason ?? '会话目录不可用（宿主未提供原因）', groups: [] }
+    }
+    const buckets = new Map<string, { readonly createdAt: number; readonly session: UiMachineSession }[]>()
+    for (const item of listing.items) {
+      const key = (item.root ?? item.cwd).trim().length > 0 ? (item.root ?? item.cwd).trim() : item.cwd
+      // sealed 不读状态；归档保留在列表里（灰色）但也不读状态。
+      const skip = item.archived || item.privacy?.mode === 'sealed'
+      let phase: UiMachineSession['phase'] = 'unknown'
+      let tasks: UiMachineSession['tasks'] = []
+      let candidates: UiMachineSession['candidates'] = []
+      let lastEventAt: number | null = null
+      if (!skip) {
+        try {
+          const state = admin.state(item.id)
+          phase = state.phase
+          tasks = state.tasks.map(task => ({ text: task.text, expiresAt: task.expiresAt }))
+          candidates = state.candidates.map(candidate => ({
+            id: candidate.id,
+            text: candidate.text,
+            kind: candidate.kind,
+          }))
+          lastEventAt = state.lastEventAt
+        } catch {
+          phase = 'unknown'
+        }
+      }
+      const session: UiMachineSession = {
+        id: item.id,
+        title: item.title,
+        cwd: item.cwd,
+        archived: item.archived,
+        active: item.active,
+        phase,
+        tasks,
+        candidates,
+        lastEventAt,
+        privacy: item.privacy?.mode ?? null,
+      }
+      const bucket = buckets.get(key)
+      if (bucket === undefined) buckets.set(key, [{ createdAt: item.createdAt, session }])
+      else bucket.push({ createdAt: item.createdAt, session })
+    }
+    const groups: UiMachineGroup[] = [...buckets.entries()]
+      .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+      .map(([root, entries]) => ({
+        root,
+        label: root,
+        sessions: [...entries]
+          .sort((left, right) => right.createdAt - left.createdAt)
+          .map(entry => entry.session),
+      }))
+    return { available: true, groups }
+  }
+
+  async function feedbackAct(input: UiFeedbackActInput): Promise<UiActionResult> {
+    const action = input?.action
+    if (action !== 'useful' && action !== 'wrong' && action !== 'stale' && action !== 'noise' && action !== 'revive') {
+      return { ok: false, text: `未执行：未知反馈动作 ${String(action)}。` }
+    }
+    const id = typeof input.id === 'string' ? input.id.trim() : ''
+    if (id.length === 0) return { ok: false, text: '未执行：反馈需要记忆 id。' }
+    if (id.length > 200) return { ok: false, text: '未执行：id 最多 200 个字符。' }
+    const run = deps.feedbackRun
+    if (run === undefined) return { ok: false, text: '未执行：反馈能力未接线（runFeedbackCommand 未装配）。' }
+    try {
+      return await run(id, action)
+    } catch (error) {
+      return { ok: false, text: `反馈执行失败（已隔离）：${errorMessageOf(error)}` }
+    }
+  }
+
+  async function depthAct(input: UiDepthActInput): Promise<UiActionResult> {
+    const depth = input?.depth
+    if (depth !== 'quick' && depth !== 'standard' && depth !== 'deep') {
+      return { ok: false, text: `未执行：depth 只能是 quick、standard 或 deep（收到 ${String(depth)}）。` }
+    }
+    const explicit = typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
+    const id = explicit.length > 0 ? explicit : currentSessionId()
+    if (id === null || id.length === 0) return { ok: false, text: '未执行：拿不到会话归属（请给 sessionId）。' }
+    if (id.length > 200) return { ok: false, text: '未执行：sessionId 最多 200 个字符。' }
+    const setter = deps.setDepth
+    if (setter === undefined) return { ok: false, text: '未执行：推理深度设置未接线（kernel.setFocus 未装配）。' }
+    try {
+      setter(id, depth)
+      return { ok: true, text: `已将会话 ${id} 的推理深度设为 ${depth}（下一请求生效）。` }
+    } catch (error) {
+      return { ok: false, text: `设置推理深度失败（已隔离）：${errorMessageOf(error)}` }
+    }
+  }
+
   return {
     overview, list, candidates, detail, act, resolve, runtime, profile, privacy, privacyAct,
     createMemory, updateMemory, deleteMemory, markMemory, sessions, personal,
-    controller, controllerAct, personalAct,
+    controller, controllerAct, personalAct, machines, feedbackAct, depthAct,
   }
 
   async function resolve(input: UiResolveInput): Promise<UiActionResult> {

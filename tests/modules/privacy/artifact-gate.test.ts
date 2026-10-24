@@ -233,26 +233,23 @@ describe('并入验收：删掉 omb-privacy 行之后，制品写入仍受闸门
       service?.record('src/plan.md', undefined, 's1')
       expect(service?.topFor('plan', 3, 's1')).toHaveLength(1)
 
-      // ② 命令仍在（名字没变；注册从记忆库的 apply 走）。
-      // v4：forget/clear 已拆到 /omb-privacy-clean，主命令 hint 只讲档位。
-      const command = definitions.find(item => item.name === 'omb-privacy')
-      expect(command, '命令没注册——并入之后用户就没有改档位的入口了').toBeDefined()
-      expect(command?.input?.hint).not.toContain('forget')
-      expect(command?.input?.hint).not.toContain('clear')
-      const clean = definitions.find(item => item.name === 'omb-privacy-clean')
-      expect(clean, '独立清除命令必须注册').toBeDefined()
-      expect(clean?.input?.hint).toContain('会话id')
+      // ② v4.20.0：用户命令已全部删除；改档位走设置页的 UI 隐私动作。
+      expect(definitions, '启动不应再注册任何 OMB 用户命令').toEqual([])
+      const ui = handle.kernel.service<{
+        privacyAct(input: { action: 'set' | 'clear'; sessionId: string; mode?: 'sealed' }): Promise<{ ok: boolean; text: string }>
+      }>('omb:ui')
+      expect(ui, '设置页数据面（omb:ui）不可用——那就真的没有改档位的入口了').toBeDefined()
 
-      // ③ 真命令改档位 → 制品的写与读立刻被拒（闸门没丢）
-      const sealed = await command?.handler({ rawInput: 'sealed', agent: { id: 's1' } })
-      expect(sealed?.kind).toBe('success')
+      // ③ UI 动作改档位 → 制品的写与读立刻被拒（闸门没丢）
+      const sealed = await ui?.privacyAct({ action: 'set', sessionId: 's1', mode: 'sealed' })
+      expect(sealed?.ok).toBe(true)
       expect(() => service?.record('src/new.md', undefined, 's1')).toThrow(/sealed/)
       expect(() => service?.topFor('plan', 3, 's1')).toThrow(/sealed/)
       expect(() => service?.list('s1')).toThrow(/sealed/)
 
-      // ④ 逃生口仍在：独立清除命令把该会话清回基线，写入恢复
-      const forgotten = await clean?.handler({ rawInput: 's1', agent: { id: 's1' } })
-      expect(forgotten?.kind).toBe('success')
+      // ④ 逃生口仍在：设置页清除该会话，写入恢复
+      const forgotten = await ui?.privacyAct({ action: 'clear', sessionId: 's1' })
+      expect(forgotten?.ok).toBe(true)
       expect(service?.record('src/new.md', undefined, 's1')).toBeDefined()
 
       // 卸载后不留服务（H-1）

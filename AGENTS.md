@@ -1,6 +1,6 @@
 # AGENTS.md — 给在此仓库工作的 agent
 
-本仓库是 **OMB v4.19.1**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
+本仓库是 **OMB v4.20.0**：DSH（DeepSeek Harness）的通用认知增强插件。先读这一段，再读代码。
 
 ## 1. 分层（不要跨层）
 
@@ -64,7 +64,13 @@ node scripts/check-resolution.mjs
 
 ## 5. 当前方向（2026-10）
 
-- **v4.19.1（当前） = 状态机隐私保护（x3）**：封存会话不展示状态机（不读控制器状态），
+- **v4.20.0（当前） = 大肥鱼增强设置台（x2）**：标题改名“大肥鱼增强”；2D 无阴影卡片
+  （`settings-card-fill/stroke`）、自动跟踪刷新（无刷新按钮与右上状态）、五页导航新增
+  “状态机”总页（`GET /machines`，按工作区聚合全部 OMB 会话的控制器状态）、项目页改成
+  默认折叠的工作区树（`parentId` 子会话跟随）、记忆列表 30 条无限滚动、单字 `searchFuzzy`
+  回退；删除全部 OMB 用户命令（depth/heap/confirm/feedback/privacy/privacy-clean），
+  能力改走 `/depth`、`/feedback` 与既有 UI 端点。契约：`docs/v4.20.0-settings-console.md`。
+- **v4.19.1** = 状态机隐私保护（x3）：封存会话不展示状态机（不读控制器状态），
   只读会话可看不可编辑；隐私档位不可读时也不展示。其余同 4.19.0。
 - **v4.19.0 = 设置台手动编辑扩展（x2）**：控制器状态机（`SERVICES.memoryControllerAdmin`，
   `GET/POST /omb/api/controller`，任务/候选增删清空，`capture.editController` 同步 phase、transition 清空）；

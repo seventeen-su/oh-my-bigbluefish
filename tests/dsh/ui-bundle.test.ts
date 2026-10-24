@@ -40,16 +40,17 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain("post('/memory'")
     expect(code).toContain("post('/privacy'")
     expect(code).toContain("post('/resolve'")
-    for (const path of ["api('/overview')", "api('/list'", "api('/detail'", "api('/sessions')", "api('/personal')", "api('/profile'"]) {
+    for (const path of ["api('/overview')", "api('/list'", "api('/detail'", "api('/sessions')", "api('/personal')", "api('/profile'", "api('/machines')", "post('/feedback'", "post('/depth'"]) {
       expect(code).toContain(path)
     }
   })
 
-  it('标题与四个页面（合并后的信息架构）', () => {
+  it('标题与五个页面（合并后的信息架构）', () => {
     const code = source()
-    expect(code).toContain("'OMB 设置'")
+    expect(code).toContain("'大肥鱼增强'")
+    expect(code).not.toContain("'OMB 设置'")
     expect(code).not.toContain('OMB 记忆')
-    for (const label of ['概览', '记忆', '项目', '个人画像']) {
+    for (const label of ['概览', '记忆', '项目', '状态机', '个人画像']) {
       expect(code).toContain(`label: '${label}'`)
     }
     // 合并后的旧页签不再作为主导航
@@ -60,20 +61,18 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).not.toContain('SegmentedTabs')
   })
 
-  it('二级侧边栏 + 二级/三级卡片：有表面与阴影，不是“只剩框”', () => {
+  it('二级侧边栏 + 二级/三级卡片：2D 表面，无阴影', () => {
     const code = source()
     expect(code).toContain("className: 'omb-nav'")
     expect(code).toContain("className: 'omb-content'")
-    expect(code).toContain('var(--dsw-elevation-panel)')
-    expect(code).toContain('var(--dsw-elevation-soft)')
+    expect(code).not.toContain('box-shadow')
+    expect(code).toContain('var(--dsw-alias-settings-card-stroke)')
     expect(code).toContain('var(--dsw-alias-bg-layer-2)')
-    expect(code).toContain('var(--dsw-alias-bg-layer-3)')
     expect(code).toContain('border-radius: var(--dsw-radius-lg)')
     const card = /\.omb-card \{([\s\S]*?)\}/.exec(code)
     expect(card).not.toBeNull()
     const cardBody = card?.[1] ?? ''
-    expect(cardBody).not.toContain('border:')
-    expect(cardBody).not.toContain('border-color')
+    expect(cardBody).toContain('border: 0.5px solid var(--dsw-alias-settings-card-stroke)')
   })
 
   it('控件锁定：选中用填充、焦点环只在 focus-visible、禁止蓝色描边', () => {
@@ -91,6 +90,7 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('container-type: inline-size')
     expect(code).toContain('@container omb-panel (min-width: 600px)')
     expect(code).toContain('@container omb-panel (min-width: 820px)')
+    expect(code).toContain('@container omb-panel (min-width: 760px)')
     expect(code).toContain('repeat(2, minmax(0, 1fr))')
     expect(code).toContain('repeat(4, minmax(0, 1fr))')
     expect(code).toContain('font-size: 20px')
@@ -110,13 +110,12 @@ describe('OMB 设置 bundle 发布契约', () => {
     expect(code).toContain('.omb-scroll, .omb-list, .omb-detail, .omb-nav')
   })
 
-  it('动效：方向感子页浮动、详情、刷新、减弱动效', () => {
+  it('动效：方向感子页浮动、详情、减弱动效；没有手动刷新按钮', () => {
     const code = source()
     expect(code).toContain('@keyframes omb-slide-forward')
     expect(code).toContain('@keyframes omb-slide-back')
     expect(code).toContain("direction > 0 ? 'omb-page-forward' : 'omb-page-back'")
-    expect(code).toContain('@keyframes omb-spin')
-    expect(code).toContain("className: loading ? 'omb-spin'")
+    expect(code).not.toContain("'刷新'")
     expect(code).toContain('flex-basis 220ms var(--ds-ease-in-out')
     expect(code).toContain('@media (prefers-reduced-motion: reduce)')
   })
@@ -130,9 +129,10 @@ describe('OMB 设置 bundle 发布契约', () => {
     for (const mark of ["mark: 'confirm'", "mark: 'obsolete'", "mark: 'revive'"]) {
       expect(code).toContain(mark)
     }
-    expect(code).toContain("offset: page * PAGE_SIZE")
-    expect(code).toContain("'上一页'")
-    expect(code).toContain("'下一页'")
+    expect(code).toContain('已加载')
+    expect(code).toContain('继续向下滚动加载')
+    expect(code).not.toContain("'上一页'")
+    expect(code).not.toContain("'下一页'")
     expect(code).toContain('h(MemoryForm')
     expect(code).toContain("'取代…'")
     expect(code).toContain("action: 'supersede'")

@@ -1155,4 +1155,41 @@ describe('MemoryStore：标签（v4.10.0）', () => {
     expect(filtered.map(hit => hit.id)).toEqual(['f2'])
     ws.cleanup()
   })
+
+  /**
+   * v4.20.0：单字检索。
+   *
+   * 缺陷现场：`searchFuzzy` 曾把 `needle.length < 2` 当空查询，于是"猫"这种单字
+   * **两条通道都 0 命中**——词法通道是因为 bigram 索引里没有裸单字 token，
+   * 回退通道是因为被长度下限直接挡掉。这里同时钉住两件事：
+   * ① 词法仍然是 0（**不改 FTS 行为**，回退路径保留）；
+   * ② 回退能命中，且 `limit` 依然有界。
+   */
+  it('单字检索：词法仍 0 命中，由 searchFuzzy 兜住，并遵守 limit', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'c1', text: '我养了一只猫，喜欢它趴在窗台' }))
+    await store.put(makeRecord({ id: 'c2', text: '邻居家的猫总来蹭饭' }))
+    await store.put(makeRecord({ id: 'c3', text: '无关条目' }))
+
+    // 词法通道保持原样：中文正文按二元组索引，"猫"没有对应 token
+    expect(await store.searchLexical({ text: '猫', scope: 'user', limit: 10 })).toEqual([])
+
+    const fuzzy = await store.searchFuzzy!({ text: '猫', scope: 'user', limit: 10 })
+    expect(fuzzy.map(hit => hit.id).sort()).toEqual(['c1', 'c2'])
+    expect(fuzzy.every(hit => hit.channel === 'fuzzy')).toBe(true)
+
+    // 单字 LIKE 命中面比多字宽，上限必须仍然生效（不是"匹配到多少返多少"）
+    expect(await store.searchFuzzy!({ text: '猫', scope: 'user', limit: 1 })).toHaveLength(1)
+    ws.cleanup()
+  })
+
+  it('单字不存在 → 空；空串/纯空白仍被拒（下限是 1，不是 0）', async () => {
+    const { store, ws } = fixtureOf()
+    await store.put(makeRecord({ id: 'c1', text: '我养了一只猫' }))
+
+    expect(await store.searchFuzzy!({ text: '狗', scope: 'user', limit: 10 })).toEqual([])
+    expect(await store.searchFuzzy!({ text: '', scope: 'user', limit: 10 })).toEqual([])
+    expect(await store.searchFuzzy!({ text: '   ', scope: 'user', limit: 10 })).toEqual([])
+    ws.cleanup()
+  })
 })

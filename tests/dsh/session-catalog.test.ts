@@ -34,8 +34,15 @@ function header(
   cwd: string,
   createdAt: number,
   agentPreset?: string,
+  parentSession?: string,
 ): Record<string, unknown> {
-  return agentPreset === undefined ? { id, cwd, createdAt } : { id, cwd, createdAt, agentPreset }
+  return {
+    id,
+    cwd,
+    createdAt,
+    ...(agentPreset === undefined ? {} : { agentPreset }),
+    ...(parentSession === undefined ? {} : { parentSession }),
+  }
 }
 
 /** 持久化服务替身：`list()` 返回 Promise（与宿主实现同形）。 */
@@ -87,6 +94,28 @@ describe('installSessionCatalog', () => {
     const listing = await catalog.port.list()
     expect(listing.items.map(item => item.id)).toEqual(['fresh'])
     expect(listing.items[0]).toMatchObject({ live: true, title: null })
+    catalog.dispose()
+  })
+
+  it('parentId：持久化/活会话 header 的 parentSession 都读，缺省 null，合并时补缺', async () => {
+    const catalog = installSessionCatalog(fakeCtx({
+      sessionPersistence: persistence([
+        { header: header('child', 'D:/c', 1, 'omb', 'parent-a') },
+        { header: header('top', 'D:/t', 2, 'omb') },
+        // 持久化头缺 parentSession，活会话头有 → 合并时补上
+        { header: header('merged', 'D:/m', 3, 'omb') },
+      ]),
+      sessions: sessions([
+        { id: 'merged', header: header('merged', 'D:/m', 3, 'omb', 'parent-b') },
+        { id: 'livechild', header: header('livechild', 'D:/l', 4, 'omb', 'parent-c') },
+      ]),
+    }))
+    const listing = await catalog.port.list()
+    const byId = new Map(listing.items.map(item => [item.id, item]))
+    expect(byId.get('child')).toMatchObject({ parentId: 'parent-a' })
+    expect(byId.get('top')).toMatchObject({ parentId: null })
+    expect(byId.get('merged')).toMatchObject({ parentId: 'parent-b' })
+    expect(byId.get('livechild')).toMatchObject({ parentId: 'parent-c' })
     catalog.dispose()
   })
 

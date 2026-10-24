@@ -124,15 +124,55 @@ function boot(options: {
   return { kernel: handle.kernel, dispose: () => handle.dispose(), commands, registration }
 }
 
+interface UiPrivacyPort {
+  privacyAct(input: {
+    readonly action: 'set' | 'clear' | 'clear-inactive' | 'trust'
+    readonly sessionId?: string
+    readonly mode?: 'normal' | 'read-only' | 'sealed'
+  }): Promise<{ readonly ok: boolean; readonly text: string }>
+}
+
+/**
+ * v4.20.0 起用户命令已删除，能力只经 `omb:ui` 的隐私动作（前端隐私页）提供。
+ * 测试沿用原 helper 名字与调用形状，走的就是生产路径（admin → gate/durable）。
+ */
 async function runCommand(
-  commands: FakeCommands,
+  booted: { kernel: Kernel },
   rawInput: string,
   agent?: unknown,
   name = 'omb-privacy',
 ): Promise<CommandResultLike> {
-  const definition = commands.definitions.find(item => item.name === name)
-  if (definition === undefined) throw new Error(`命令未注册：${name}`)
-  return await definition.handler({ rawInput, agent: agent ?? { id: 's1' } })
+  const ui = booted.kernel.service<UiPrivacyPort>(SERVICES.ui)
+  if (ui === undefined) throw new Error('ui 服务未接线')
+  const toResult = (result: { readonly ok: boolean; readonly text: string }): CommandResultLike =>
+    ({ kind: result.ok ? 'success' : 'error', text: result.text })
+  const sessionId = typeof (agent as { id?: unknown } | undefined)?.id === 'string'
+    ? (agent as { id: string }).id
+    : 's1'
+  if (name === 'omb-privacy-clean') {
+    const raw = rawInput.trim()
+    if (raw.length === 0) return toResult(await ui.privacyAct({ action: 'clear', sessionId }))
+    if (raw === 'clear') return toResult(await ui.privacyAct({ action: 'clear-inactive' }))
+    return toResult(await ui.privacyAct({ action: 'clear', sessionId: raw }))
+  }
+  const head = (rawInput.trim().split(/\s+/)[0] ?? 'status').toLowerCase()
+  if (head === 'status' || head === '') {
+    const registry = booted.kernel.service<StatusRegistry>(SERVICES.statusContributor)
+    const contributor = registry?.list().find(entry => entry.name === '隐私')
+    return { kind: 'success', text: contributor?.render() ?? '' }
+  }
+  if (head === 'trust') return toResult(await ui.privacyAct({ action: 'trust' }))
+  return toResult(await ui.privacyAct({
+    action: 'set',
+    sessionId,
+    mode: head as 'normal' | 'read-only' | 'sealed',
+  }))
+}
+
+/** 模拟宿主 `session/event`：该会话在本进程内真的活跃（`isActive()` 为真）。 */
+function markActive(booted: { kernel: Kernel }, sessionId: string): void {
+  const emit = booted.kernel.emit as unknown as (event: string, payload: unknown) => void
+  emit('session/event', { header: { id: sessionId } })
 }
 
 describe('注册面', () => {
@@ -164,55 +204,36 @@ describe('注册面', () => {
     expect(memoryConfigSchema.parse(undefined).privacy).toEqual({ failClosedMode: 'sealed', path: null })
   })
 
-  it('装配后：判定端口、会话运行态、命令、状态面贡献都在；卸载后服务清空', () => {
+  it('装配后：判定端口、会话运行态、状态面贡献都在；不再注册用户命令；卸载后服务清空', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'session-modes.json') })
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeDefined()
       expect(booted.kernel.service(SESSION_RUNTIME_SERVICE)).toBeDefined()
-      expect(booted.commands.definitions.map(d => d.name)).toContain('omb-privacy')
-      /**
-       * **必须声明 `input`——否则带参数的命令用不了。**
-       *
-       * 实测症状（用户报告，2026-09-30）：`/omb-privacy`（不带参数）正常，
-       * `/omb-privacy read-only`（带参数）被当成普通文本送进模型。
-       *
-       * 根因在 DSH 客户端 `ui-commands` 的判定表
-       * （`packages/client/ui-commands/src/client/service.ts:269` 与 `:282`）：
-       * 只有 `desc.input !== undefined` 时前端才"认领"命令后面的参数；
-       * 决策表注释写的是 `host input → claim; host bare → detached execute`。
-       *
-       * 这条断言看着琐碎，但它挡的是一个**只影响带参数路径**的静默回退——
-       * 不带参数的测试全都会通过，只有真去用参数才会发现。
-       */
-      const privacyCommand = booted.commands.definitions.find(d => d.name === 'omb-privacy')
-      expect(
-        privacyCommand?.input,
-        '未声明 input → 前端不认领参数 → /omb-privacy read-only 会被当文本送给模型',
-      ).toBeDefined()
-      expect(privacyCommand?.input?.hint, 'hint 要在输入框里提示参数怎么给').toContain('read-only')
+      // v4.20.0：用户命令全部删除（能力并入前端隐私页），启动不再注册任何命令。
+      expect(booted.commands.definitions).toEqual([])
+      const health = await booted.registration.manifest.health()
+      expect(health.detail).toContain('命令面：已删除')
       const registry = booted.kernel.service<StatusRegistry>(SERVICES.statusContributor)
       expect(registry?.list().map(c => c.name)).toContain('隐私')
 
       expect(() => booted.dispose()).not.toThrow()
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeUndefined()
-      // 隐私两条 + /omb-feedback + v4.8.0 的 /omb-confirm（记忆模块现在共注册 4 条命令）
-      expect(booted.commands.disposed()).toBe(4)
+      expect(booted.commands.disposed()).toBe(0)
     } finally {
       ws.cleanup()
     }
   })
 
-  it('宿主没有 commands 服务时：闸门照常生效，只是命令缺席（不抛，且如实说"未注册"）', async () => {
+  it('宿主没有 commands 服务也不影响闸门与状态面（命令已删除，不再依赖 commands）', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     const path = join(ws.dir, 'session-modes.json')
     try {
       const booted = boot({ path, withCommands: false })
       expect(booted.kernel.service(PRIVACY_SERVICE)).toBeDefined()
-      // 命令面缺席**必须可读**：健康面写明未注册与原因，而不是静默少一条命令
       const health = await booted.registration.manifest.health()
-      expect(health.detail).toContain('命令面：omb-privacy、omb-privacy-clean **未注册**')
-      expect(health.detail).toContain('commands')
+      expect(health.detail).toContain('命令面：已删除')
+      expect(health.detail).not.toContain('未注册')
       expect(() => booted.dispose()).not.toThrow()
     } finally {
       ws.cleanup()
@@ -229,7 +250,7 @@ describe('命令 → 生效 → 持久化', () => {
       const gate = booted.kernel.service<PrivacyGatePort>(PRIVACY_SERVICE)
       expect(gate?.decide('s1')).toMatchObject({ allowRead: true, allowWrite: true })
 
-      const result = await runCommand(booted.commands, 'sealed')
+      const result = await runCommand(booted, 'sealed')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('sealed')
       expect(result.text).toContain('已持久化')
@@ -248,7 +269,7 @@ describe('命令 → 生效 → 持久化', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'read-only')
+      await runCommand(first, 'read-only')
       first.dispose()
 
       // 模拟 dsh 重启：全新内核 + 全新模块实例，只有磁盘上的文件是共享的
@@ -265,7 +286,7 @@ describe('命令 → 生效 → 持久化', () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      await runCommand(booted.commands, 'read-only')
+      await runCommand(booted, 'read-only')
       const gate = booted.kernel.service<PrivacyGatePort>(PRIVACY_SERVICE)
       const decision = gate?.decide('s1')
       expect(decision?.allowRead).toBe(true)
@@ -298,8 +319,9 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'A' })
-      // 反向断言之一：A 在**本进程内**设过模式（命令走 noteLineage → note）→ 仍然拒
+      await runCommand(first, 'sealed', { id: 'A' })
+      markActive(first, 'A')
+      // 反向断言之一：A 在**本进程内**设过模式且真的活跃 → 仍然拒
       expect(gateOf(first)?.decideUnattributed()).toMatchObject({ allowRead: true, allowWrite: false })
       expect(readFileSync(path, 'utf8')).toContain('"A": "sealed"')
       first.dispose()
@@ -326,7 +348,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'read-only', { id: 'A' })
+      await runCommand(first, 'read-only', { id: 'A' })
       first.dispose()
 
       const second = boot({ path })
@@ -350,7 +372,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'parent' })
+      await runCommand(first, 'sealed', { id: 'parent' })
       first.dispose()
 
       const second = boot({ path })
@@ -376,10 +398,10 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const booted = boot({ path })
-      await runCommand(booted.commands, 'sealed', { id: 'A' })
+      await runCommand(booted, 'sealed', { id: 'A' })
       expect(gateOf(booted)?.decide('A')).toMatchObject({ allowWrite: false })
 
-      const result = await runCommand(booted.commands, 'A', undefined, 'omb-privacy-clean')
+      const result = await runCommand(booted, 'A', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('A')
       expect(gateOf(booted)?.decide('A')).toMatchObject({ allowRead: true, allowWrite: true })
@@ -399,7 +421,7 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const ws = tempWorkspace('omb-privacy-forget-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      const result = await runCommand(booted.commands, '查无此会话', undefined, 'omb-privacy-clean')
+      const result = await runCommand(booted, '查无此会话', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('没有显式隐私设置')
       booted.dispose()
@@ -413,12 +435,13 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'dead' })
+      await runCommand(first, 'sealed', { id: 'dead' })
       first.dispose()
 
       const second = boot({ path })
-      await runCommand(second.commands, 'read-only', { id: 'live' }) // 本进程内活跃
-      const result = await runCommand(second.commands, 'clear', undefined, 'omb-privacy-clean')
+      await runCommand(second, 'read-only', { id: 'live' })
+      markActive(second, 'live') // 本进程内活跃
+      const result = await runCommand(second, 'clear', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('已清除 1 个已结束会话')
 
@@ -437,12 +460,12 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'blank' })
+      await runCommand(first, 'sealed', { id: 'blank' })
       first.dispose()
 
       // 重启后：记录从文件重放（无任何观测 = isActive false），但宿主告诉我它是当前会话
       const second = boot({ path, currentSession: 'blank' })
-      const result = await runCommand(second.commands, 'clear', undefined, 'omb-privacy-clean')
+      const result = await runCommand(second, 'clear', undefined, 'omb-privacy-clean')
       expect(result.kind).toBe('success')
       expect(result.text).toContain('已清除 0 个已结束会话')
       expect(result.text).toContain('活跃的 1 个会话')
@@ -460,17 +483,18 @@ describe('受限记录不再永久粘性（G1 / P0）', () => {
     const path = join(ws.dir, 'session-modes.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'old' })
+      await runCommand(first, 'sealed', { id: 'old' })
       first.dispose()
 
       const second = boot({ path })
-      await runCommand(second.commands, 'sealed', { id: 'live' })
-      const text = (await runCommand(second.commands, 'status')).text
+      await runCommand(second, 'sealed', { id: 'live' })
+      markActive(second, 'live')
+      const text = (await runCommand(second, 'status')).text
       expect(text).toContain('历史受限记录 2 条（其中本进程活跃 1 条）')
       expect(text).toContain('old=sealed（已结束）')
       expect(text).toContain('live=sealed（活跃）')
-      // 出口本身也要在状态面里点得到名，否则用户不知道有这条命令
-      expect(text).toContain('/omb-privacy-clean')
+      // 清除出口改成前端隐私页，状态面要点得到名
+      expect(text).toContain('设置页隐私卡片')
 
       const registry = second.kernel.service<StatusRegistry>(SERVICES.statusContributor)
       const rendered = registry?.list().find(c => c.name === '隐私')?.render() ?? ''
@@ -487,7 +511,7 @@ describe('子代理继承（血缘来自宿主会话头）', () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      await runCommand(booted.commands, 'sealed', { id: 'parent' })
+      await runCommand(booted, 'sealed', { id: 'parent' })
 
       // 宿主会话事件：会话头里带 parentSession（生产路径由 adopt 的 on 路由到宿主事件面）
       const emitSessionEvent = booted.kernel.emit as unknown as (event: string, payload: unknown) => void
@@ -499,7 +523,7 @@ describe('子代理继承（血缘来自宿主会话头）', () => {
       expect(childDecision?.writeReason).toContain('继承自 parent')
 
       // 父会话改回 normal → 子会话立刻跟着变
-      await runCommand(booted.commands, 'normal', { id: 'parent' })
+      await runCommand(booted, 'normal', { id: 'parent' })
       expect(gate?.decide('child')).toMatchObject({ allowRead: true, allowWrite: true })
       booted.dispose()
     } finally {
@@ -507,23 +531,8 @@ describe('子代理继承（血缘来自宿主会话头）', () => {
     }
   })
 
-  it('命令 invocation 的血统也会被登记（两条来源都算数）', async () => {
-    const ws = tempWorkspace('omb-privacy-mod-')
-    try {
-      const booted = boot({ path: join(ws.dir, 'm.json') })
-      await runCommand(booted.commands, 'sealed', { id: 'p2' })
-      // 子代理里执行的命令：agent.session.header.parentSession
-      await runCommand(booted.commands, 'status', {
-        id: 'c2',
-        session: { header: { parentSession: 'p2', delegationDepth: 1 } },
-      })
-      const gate = booted.kernel.service<PrivacyGatePort>(PRIVACY_SERVICE)
-      expect(gate?.decide('c2')).toMatchObject({ allowRead: false, allowWrite: false })
-      booted.dispose()
-    } finally {
-      ws.cleanup()
-    }
-  })
+  // v4.20.0：命令注册已删除，命令 invocation 的血缘来源随之消失；
+  // 子代理继承只保留宿主 `session/event` 一条来源（上一条测试覆盖）。
 })
 
 describe('fail-closed（读不出状态时按最严）', () => {
@@ -574,7 +583,7 @@ describe('fail-closed（读不出状态时按最严）', () => {
       const gate = booted.kernel.service<PrivacyGatePort>(PRIVACY_SERVICE)
       expect(gate?.decide('x').allowWrite).toBe(false)
 
-      const trusted = await runCommand(booted.commands, 'trust')
+      const trusted = await runCommand(booted, 'trust')
       expect(trusted.kind).toBe('success')
       expect(trusted.text).toContain('已清除 fail-closed')
       expect(gate?.decide('x')).toMatchObject({ allowRead: true, allowWrite: true })
@@ -609,7 +618,7 @@ describe('健康面与状态面', () => {
       expect(health.detail).toContain('隐私闸门（/omb-privacy）')
       expect(health.detail).toContain('基线=normal（从未配置过）')
       expect(health.detail).toContain(path)
-      expect(health.detail).toContain('命令面：omb-privacy、omb-privacy-clean 已注册')
+      expect(health.detail).toContain('命令面：已删除')
       expect(health.metrics?.['privacy.sessionsWithMode']).toBeTypeOf('number')
       booted.dispose()
     } finally {
@@ -622,7 +631,7 @@ describe('健康面与状态面', () => {
     const path = join(ws.dir, 'm.json')
     try {
       const first = boot({ path })
-      await runCommand(first.commands, 'sealed', { id: 'old' })
+      await runCommand(first, 'sealed', { id: 'old' })
       first.dispose()
 
       // 重启后：文件里还有 old，但本进程里它从未活跃
@@ -637,16 +646,15 @@ describe('健康面与状态面', () => {
     }
   })
 
-  it('status 文本包含用法与状态文件位置', async () => {
+  it('状态面文本包含状态文件位置与"命令面已删除"', async () => {
     const ws = tempWorkspace('omb-privacy-mod-')
     try {
       const booted = boot({ path: join(ws.dir, 'm.json') })
-      const text = (await runCommand(booted.commands, 'status')).text
-      // 标题里写清"它是记忆库的东西"——用户看到 /omb-privacy 却找不到 omb-privacy 那一行时，
-      // 这行字就是唯一的解释
-      expect(text).toContain('隐私模式（记忆库的隐私闸门，命令 /omb-privacy）')
-      expect(text).toContain('/omb-privacy')
+      const text = (await runCommand(booted, 'status')).text
+      // v4.20.0：命令删除后，状态面必须说清清理入口在设置页，而不是继续指向不存在的命令。
       expect(text).toContain('状态文件')
+      expect(text).toContain('命令面：已删除')
+      expect(text).toContain('设置页隐私卡片')
       booted.dispose()
     } finally {
       ws.cleanup()

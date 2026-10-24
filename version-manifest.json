@@ -1,6 +1,6 @@
 {
   "major": 4,
-  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.19.1 = 设置台手动编辑扩展（x2）与封存/只读会话的状态机保护（x3）。",
+  "description": "OMB 版本号 = x1.x2.x3：x1 革命式大版本 / x2 单个功能更新 / x3 该版单个修复。features/subfeatures 仅统计展示；改 version 后运行 node scripts/version.mjs --write。当前 4.20.0 = 大肥鱼增强设置台：2D 无阴影、自动刷新、状态机总页、工作区折叠、无限滚动与命令并入前端（x2）。",
   "features": [
     {
       "id": "memory-autonomy",
@@ -287,9 +287,15 @@
         "方向感子页动效与文本选择",
         "状态机手动编辑",
         "个人画像手动编辑",
-        "记忆取代目标选择"
+        "记忆取代目标选择",
+        "五页导航与状态机总页",
+        "项目工作区折叠与子会话",
+        "记忆无限滚动与单字检索",
+        "2D 无阴影卡片与响应式动效",
+        "自动跟踪刷新（无刷新按钮）",
+        "用户命令并入前端"
       ]
     }
   ],
-  "version": "4.19.1"
+  "version": "4.20.0"
 }

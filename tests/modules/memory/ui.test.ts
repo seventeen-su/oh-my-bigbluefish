@@ -671,8 +671,8 @@ describe('createUiService', () => {
       list: async () => ({
         available: true,
         items: [
-          { id: 's1', title: '会话一', cwd: '/work/demo/sub', createdAt: 3, agentPreset: 'omb', archived: false, live: true },
-          { id: 's2', title: null, cwd: '/work/old', createdAt: 2, agentPreset: 'omb', archived: true, live: false },
+          { id: 's1', title: '会话一', cwd: '/work/demo/sub', createdAt: 3, agentPreset: 'omb', archived: false, live: true, parentId: 'parent-1' },
+          { id: 's2', title: null, cwd: '/work/old', createdAt: 2, agentPreset: 'omb', archived: true, live: false, parentId: null },
           { id: 's3', title: '别家', cwd: '/x', createdAt: 1, agentPreset: 'standard', archived: false, live: true },
         ],
       }),
@@ -701,10 +701,10 @@ describe('createUiService', () => {
     expect(listing.items.map(item => item.id)).toEqual(['s1', 's2'])
     expect(listing.items[0]).toMatchObject({
       title: '会话一', cwd: '/work/demo/sub', root: '/work/demo', preset: 'omb',
-      archived: false, active: true, depth: 'deep', createdAt: 3,
+      archived: false, active: true, depth: 'deep', createdAt: 3, parentId: 'parent-1',
       privacy: { mode: 'sealed', origin: 'command', inheritedFrom: null },
     })
-    expect(listing.items[1]).toMatchObject({ id: 's2', archived: true, active: false })
+    expect(listing.items[1]).toMatchObject({ id: 's2', archived: true, active: false, parentId: null })
 
     const unavailable = await createUiService({ stores: minimalStores }).sessions()
     expect(unavailable.available).toBe(false)
@@ -900,5 +900,156 @@ describe('createUiService', () => {
     })
     expect(await refused.personalAct({ action: 'retract', axis: 'stable', key: 'k' }))
       .toMatchObject({ ok: false, text: '未写入：槽位不存在' })
+  })
+
+  // ── v4.20.0：所有状态机聚合 / 反馈 / 推理深度 ─────────────────────
+  function machinesService(options: { readonly withAdmin?: boolean; readonly withCatalog?: boolean } = {}) {
+    const calls: string[] = []
+    const catalog = {
+      list: async () => ({
+        available: true,
+        items: [
+          { id: 's1', title: '一', cwd: '/work/a/sub', createdAt: 1, agentPreset: 'omb', archived: false, live: true },
+          { id: 's2', title: '二', cwd: '/work/a/sub2', createdAt: 2, agentPreset: 'omb', archived: false, live: true },
+          { id: 's3', title: '三', cwd: '/work/b', createdAt: 3, agentPreset: 'omb', archived: false, live: true },
+          { id: 's4', title: '归档', cwd: '/work/a/old', createdAt: 4, agentPreset: 'omb', archived: true, live: false },
+          { id: 's5', title: '封存', cwd: '/work/a/secret', createdAt: 5, agentPreset: 'omb', archived: false, live: true },
+        ],
+      }),
+    }
+    const admin: ControllerAdminPort = {
+      state: sessionId => {
+        calls.push(sessionId)
+        if (sessionId === 's2') {
+          return {
+            phase: 'mixed',
+            tasks: [{ text: '别改测试', at: NOW, expiresAt: NOW + 60_000 }],
+            candidates: [{ id: 'c1', text: '项目统一 pnpm', kind: 'procedural', scope: 'project', at: NOW, reason: 'intent' }],
+            lastEventAt: NOW,
+          }
+        }
+        if (sessionId === 's3') {
+          return { phase: 'tracking-tasks', tasks: [{ text: '临时', at: NOW, expiresAt: NOW + 1 }], candidates: [], lastEventAt: NOW - 1 }
+        }
+        return { phase: 'idle', tasks: [], candidates: [], lastEventAt: null }
+      },
+      edit: () => ({ phase: 'idle', tasks: [], candidates: [], lastEventAt: null }),
+    }
+    const service = createUiService({
+      stores: minimalStores,
+      currentSession: () => 's1',
+      ...(options.withCatalog === false ? {} : { sessionCatalog: catalog as never }),
+      sessionRuntime: { list: () => [{ sessionId: 's1', observations: 2 }] },
+      rootOf: cwd => (cwd.startsWith('/work/a') ? '/work/a' : '/work/b'),
+      focusOf: () => 'standard',
+      ...(options.withAdmin === false ? {} : { controllerAdmin: admin }),
+      privacy: {
+        current: () => 's1',
+        admin: {
+          view: () => privacyView(),
+          setMode: () => ({ ok: true, text: 'ok' }),
+          clear: () => ({ ok: true, text: 'ok' }),
+          clearInactive: () => ({ ok: true, text: 'ok' }),
+          trust: () => ({ ok: true, text: 'ok' }),
+          modeOf: sessionId => ({
+            mode: sessionId === 's5' ? 'sealed' : 'normal',
+            origin: 'default',
+            inheritedFrom: null,
+          }),
+        },
+      },
+      clock: fixedClock(),
+    })
+    return { service, calls }
+  }
+
+  it('machines()：按 root 分组、组内 createdAt 降序；sealed/归档不读状态；未接线降级', async () => {
+    const { service, calls } = machinesService()
+    const view = await service.machines()
+    expect(view.available).toBe(true)
+    expect(view.groups.map(group => group.root)).toEqual(['/work/a', '/work/b'])
+    const groupA = view.groups[0]!
+    expect(groupA.sessions.map(session => session.id)).toEqual(['s5', 's4', 's2', 's1'])
+    const sealed = groupA.sessions.find(session => session.id === 's5')!
+    expect(sealed).toMatchObject({ archived: false, phase: 'unknown', tasks: [], candidates: [], privacy: 'sealed', lastEventAt: null })
+    const archived = groupA.sessions.find(session => session.id === 's4')!
+    expect(archived).toMatchObject({ archived: true, phase: 'unknown', tasks: [], candidates: [] })
+    const mixed = groupA.sessions.find(session => session.id === 's2')!
+    expect(mixed).toMatchObject({
+      phase: 'mixed',
+      tasks: [{ text: '别改测试', expiresAt: NOW + 60_000 }],
+      candidates: [{ id: 'c1', text: '项目统一 pnpm', kind: 'procedural' }],
+      lastEventAt: NOW,
+      privacy: 'normal',
+    })
+    expect(view.groups[1]?.sessions[0]).toMatchObject({ id: 's3', phase: 'tracking-tasks' })
+    // sealed 与归档不读状态：只读了 s1/s2/s3
+    expect(calls.sort()).toEqual(['s1', 's2', 's3'])
+
+    const noAdmin = await machinesService({ withAdmin: false }).service.machines()
+    expect(noAdmin).toMatchObject({ available: false, groups: [] })
+    expect(noAdmin.reason).toContain('未接线')
+    const noCatalog = await machinesService({ withCatalog: false }).service.machines()
+    expect(noCatalog).toMatchObject({ available: false, groups: [] })
+    expect(noCatalog.reason).toContain('未接线')
+  })
+
+  it('feedbackAct()：动作白名单、id 校验、provider 透传与异常隔离', async () => {
+    const calls: string[] = []
+    const service = createUiService({
+      stores: minimalStores,
+      feedbackRun: async (id, action) => {
+        calls.push(`${id}:${action}`)
+        return { ok: action !== 'wrong', text: `${action} 回执` }
+      },
+      clock: fixedClock(),
+    })
+    expect(await service.feedbackAct({ id: ' m1 ', action: 'useful' })).toMatchObject({ ok: true, text: 'useful 回执' })
+    expect(await service.feedbackAct({ id: 'm2', action: 'wrong' })).toMatchObject({ ok: false })
+    expect(calls).toEqual(['m1:useful', 'm2:wrong'])
+    expect((await service.feedbackAct({ id: '', action: 'useful' })).ok).toBe(false)
+    expect((await service.feedbackAct({ id: 'm1', action: 'nope' as never })).ok).toBe(false)
+    expect((await service.feedbackAct({ id: 'x'.repeat(201), action: 'useful' })).ok).toBe(false)
+    expect((await createUiService({ stores: minimalStores }).feedbackAct({ id: 'm1', action: 'useful' })).text).toContain('未接线')
+    const broken = createUiService({
+      stores: minimalStores,
+      feedbackRun: async () => {
+        throw new Error('账本坏了')
+      },
+    })
+    const isolated = await broken.feedbackAct({ id: 'm1', action: 'useful' })
+    expect(isolated.ok).toBe(false)
+    expect(isolated.text).toContain('已隔离')
+  })
+
+  it('depthAct()：合法深度/显式会话、缺省当前会话、非法与未接线拒绝、setter 异常隔离', async () => {
+    const calls: string[] = []
+    const service = createUiService({
+      stores: minimalStores,
+      currentSession: () => 's1',
+      setDepth: (sessionId, depth) => {
+        calls.push(`${sessionId}:${depth}`)
+      },
+      clock: fixedClock(),
+    })
+    expect(await service.depthAct({ sessionId: 's9', depth: 'quick' })).toMatchObject({ ok: true })
+    expect(await service.depthAct({ depth: 'standard' })).toMatchObject({ ok: true })
+    expect(calls).toEqual(['s9:quick', 's1:standard'])
+    expect((await service.depthAct({ depth: 'max' as never })).ok).toBe(false)
+    expect((await service.depthAct({ sessionId: 'x'.repeat(201), depth: 'deep' })).ok).toBe(false)
+    const noSession = createUiService({ stores: minimalStores, setDepth: () => {} })
+    expect((await noSession.depthAct({ depth: 'deep' })).ok).toBe(false)
+    expect((await createUiService({ stores: minimalStores, currentSession: () => 's1' }).depthAct({ depth: 'deep' })).text)
+      .toContain('未接线')
+    const broken = createUiService({
+      stores: minimalStores,
+      currentSession: () => 's1',
+      setDepth: () => {
+        throw new Error('focus 坏了')
+      },
+    })
+    const isolated = await broken.depthAct({ depth: 'deep' })
+    expect(isolated.ok).toBe(false)
+    expect(isolated.text).toContain('已隔离')
   })
 })

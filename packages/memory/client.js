@@ -1,4 +1,4 @@
-// OMB 设置面板（v4.18.0）——手写浏览器 bundle，不需要打包器。
+// 大肥鱼增强（v4.20.0）——手写浏览器 bundle，不需要打包器。
 //
 // 设计约定（契约与理由见 DESIGN.md）：
 // - 二级侧边栏导航 + 右侧内容，两者都是同 radius 的表面卡；页面底 layer-1；
@@ -6,7 +6,7 @@
 // - 控件只用共享 primitives；只有导航/行/卡片三类自定义表面；
 // - 选中用填充、不用蓝色描边；焦点环只出现在 :focus-visible；
 // - 字号 20/15/13/14/12，间距 4/8/12/16/24，卡片 padding 16；
-// - 页面 180ms、详情 220ms、刷新旋转、hover 120ms；reduced-motion 取消运动；
+// - 页面 180ms、详情 220ms、hover 120ms；reduced-motion 取消运动；
 // - 文本选择：界面骨架不可选，记忆正文/id/路径/画像/审计可选；
 // - 面向用户的短文案，技术细节折叠进“说明”。
 window.__ModuleLoader__.load({
@@ -18,25 +18,27 @@ window.__ModuleLoader__.load({
       Button, Input, Modal, Pill, Tag, SegmentedControl, StateDot, TextShimmer, DisclosureRow,
       IconCheckOutlineRegular, IconChecklistOutlineRegular, IconCloseOutlineRegular,
       IconDatabaseOutlineRegular, IconEditOutlineRegular, IconGaugeOutlineRegular,
-      IconPlusOutlineRegular, IconRefreshOutlineRegular, IconTrashOutlineRegular,
+      IconPlusOutlineRegular, IconTrashOutlineRegular,
       IconUserOutlineRegular, IconWarningOutlineRegular, IconWorkspaceTreeOutlineRegular,
     } = primitives
     const h = React.createElement
 
     const PANEL_ID = 'omb-memory'
     const API = '/omb/api'
-    const TITLE = 'OMB 设置'
+    const TITLE = '大肥鱼增强'
 
     const NAV = [
       { value: 'overview', label: '概览', icon: IconGaugeOutlineRegular },
       { value: 'memory', label: '记忆', icon: IconDatabaseOutlineRegular },
       { value: 'project', label: '项目', icon: IconWorkspaceTreeOutlineRegular },
+      { value: 'machines', label: '状态机', icon: IconChecklistOutlineRegular },
       { value: 'personal', label: '个人画像', icon: IconUserOutlineRegular },
     ]
     const PAGE_HINTS = {
       overview: '记忆与运行状态',
       memory: '搜索、编辑与确认记忆',
-      project: '按会话看工作区、深度与隐私',
+      project: '按工作区展开会话',
+      machines: '项目级跨会话与跨工作区状态',
       personal: '你的长期偏好与协作方式',
     }
     const SCOPES = [
@@ -66,7 +68,7 @@ window.__ModuleLoader__.load({
     const DEPTH_TEXT = { quick: '快速', standard: '标准', deep: '深入' }
     const ORIGIN_TEXT = { command: '手动设置', inherited: '继承', default: '默认', 'fail-closed': '兜底' }
     const AXIS_ORDER = ['stable', 'capability', 'intent', 'collaboration']
-    const PAGE_SIZE = 50
+    const PAGE_SIZE = 30
 
     const CSS = `
       .omb-page {
@@ -77,6 +79,7 @@ window.__ModuleLoader__.load({
         background: var(--dsw-alias-bg-layer-1);
         color: var(--dsw-alias-label-primary);
         font-family: var(--dsw-font-family, inherit);
+        transition: padding 180ms var(--ds-ease-in-out, ease-out), gap 180ms var(--ds-ease-in-out, ease-out);
       }
       .omb-head {
         flex: none; display: flex; flex-wrap: wrap; align-items: center;
@@ -92,8 +95,9 @@ window.__ModuleLoader__.load({
         display: flex; flex-direction: column; gap: 2px; overflow-y: auto;
         background: var(--dsw-alias-bg-layer-2);
         border-radius: var(--dsw-radius-lg);
-        box-shadow: var(--dsw-elevation-panel);
+        border: 0.5px solid var(--dsw-alias-border-l2);
         user-select: none;
+        transition: width 180ms var(--ds-ease-in-out, ease-out), padding 180ms var(--ds-ease-in-out, ease-out);
       }
       .omb-nav-cell {
         display: flex; align-items: center; gap: 10px; min-height: 40px; width: 100%;
@@ -101,7 +105,7 @@ window.__ModuleLoader__.load({
         border: none; border-radius: var(--dsw-radius-md); background: transparent;
         color: var(--dsw-alias-label-primary);
         font: inherit; font-size: 13px; line-height: 20px; font-weight: 500;
-        text-align: left; cursor: pointer;
+        text-align: left; cursor: pointer; justify-content: flex-start;
         transition: background-color 120ms var(--ds-ease-in-out, ease-out);
       }
       .omb-nav-cell:hover { background: var(--dsw-specific-sidebar-nav-item-hover); }
@@ -111,14 +115,15 @@ window.__ModuleLoader__.load({
         outline-offset: 1px;
       }
       .omb-nav-icon { flex: none; }
-      .omb-nav-label { display: none; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+      .omb-nav-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; opacity: 0; transition: opacity 120ms var(--ds-ease-in-out, ease-out); }
 
       .omb-content {
         flex: 1 1 auto; min-width: 0; min-height: 0; box-sizing: border-box;
         display: flex; flex-direction: column; gap: 12px; padding: 16px;
         background: var(--dsw-alias-bg-layer-2);
         border-radius: var(--dsw-radius-lg);
-        box-shadow: var(--dsw-elevation-panel);
+        border: 0.5px solid var(--dsw-alias-border-l2);
+        transition: padding 180ms var(--ds-ease-in-out, ease-out);
       }
       .omb-content-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; user-select: none; }
       .omb-content-title { margin: 0; font-size: 15px; line-height: 22px; font-weight: 600; }
@@ -144,9 +149,9 @@ window.__ModuleLoader__.load({
       .omb-card {
         display: flex; flex-direction: column; gap: 4px; min-width: 0;
         padding: 16px; box-sizing: border-box;
-        background: var(--dsw-alias-bg-layer-3);
+        background: var(--dsw-alias-settings-card-fill);
         border-radius: var(--dsw-radius-md);
-        box-shadow: var(--dsw-elevation-soft);
+        border: 0.5px solid var(--dsw-alias-settings-card-stroke);
       }
       .omb-card-label { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
       .omb-card-value { font-size: 17px; line-height: 26px; font-weight: 600; overflow-wrap: anywhere; }
@@ -161,22 +166,21 @@ window.__ModuleLoader__.load({
       .omb-search { flex: 1 1 220px; min-width: 150px; }
       .omb-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 
-      .omb-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 18px 16px; background: var(--dsw-alias-bg-layer-3); border-radius: var(--dsw-radius-md); box-shadow: var(--dsw-elevation-soft); user-select: none; }
+      .omb-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 18px 16px; background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md); border: 0.5px solid var(--dsw-alias-settings-card-stroke); user-select: none; }
       .omb-empty-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; }
       .omb-empty-hint { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
       .omb-loading { display: inline-flex; align-items: center; gap: 6px; }
 
       .omb-workspace { position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
       .omb-list-pane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
-      .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+      .omb-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 2px; }
       .omb-row {
         display: flex; flex-direction: column; gap: 4px; width: 100%; min-width: 0;
         padding: 10px 12px; box-sizing: border-box;
-        border: none; border-bottom: 0.5px solid var(--dsw-alias-border-l2);
-        background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
-        transition: background-color 120ms var(--ds-ease-in-out, ease-out);
+        border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-md);
+        background: var(--dsw-alias-settings-card-fill); color: inherit; font: inherit; text-align: left; cursor: pointer;
+        transition: background-color 120ms var(--ds-ease-in-out, ease-out), border-color 120ms var(--ds-ease-in-out, ease-out);
       }
-      .omb-row:last-child { border-bottom: none; }
       .omb-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
       .omb-row[data-active='true'] { background: var(--dsw-specific-sidebar-nav-item-active); }
       .omb-row:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: -2px; }
@@ -185,6 +189,8 @@ window.__ModuleLoader__.load({
       .omb-row-text { margin: 0; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
       .omb-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); user-select: none; }
       .omb-row-sub { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .omb-workspace-group { display: flex; flex-direction: column; gap: 4px; }
+      .omb-workspace-sessions { display: flex; flex-direction: column; gap: 4px; margin-left: 10px; padding-left: 8px; border-left: 0.5px solid var(--dsw-alias-border-l2); }
 
       .omb-detail-pane { position: absolute; inset: 0; z-index: 2; display: flex; min-width: 0; min-height: 0;
         transform: translateX(100%); opacity: 0; visibility: hidden;
@@ -192,8 +198,8 @@ window.__ModuleLoader__.load({
       }
       .omb-workspace[data-detail='open'] > .omb-detail-pane { transform: none; opacity: 1; visibility: visible; transition-delay: 0s; }
       .omb-detail { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 16px;
-        padding: 16px; box-sizing: border-box; background: var(--dsw-alias-bg-layer-3); border-radius: var(--dsw-radius-md);
-        box-shadow: var(--dsw-elevation-soft);
+        padding: 16px; box-sizing: border-box; background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md);
+        border: 0.5px solid var(--dsw-alias-settings-card-stroke);
       }
       .omb-detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
       .omb-detail-title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 600; user-select: none; }
@@ -211,7 +217,7 @@ window.__ModuleLoader__.load({
       .omb-textarea:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 1px; }
       .omb-modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
       .omb-notice { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; box-sizing: border-box;
-        background: var(--dsw-alias-bg-layer-3); border-radius: var(--dsw-radius-md); box-shadow: var(--dsw-elevation-soft); user-select: none;
+        background: var(--dsw-alias-settings-card-fill); border-radius: var(--dsw-radius-md); border: 0.5px solid var(--dsw-alias-settings-card-stroke); user-select: none;
       }
       .omb-notice > .omb-note { color: var(--dsw-alias-label-secondary); }
       .omb-spin { animation: omb-spin 900ms linear infinite; }
@@ -228,25 +234,27 @@ window.__ModuleLoader__.load({
       @container omb-panel (min-width: 600px) {
         .omb-page { padding: 20px 24px; gap: 16px; }
         .omb-nav { width: 190px; padding: 10px 8px; }
-        .omb-nav-label { display: block; }
+        .omb-nav-label { opacity: 1; }
         .omb-content { padding: 20px; gap: 16px; }
+      }
+      @container omb-panel (min-width: 760px) {
         .omb-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       }
       @container omb-panel (min-width: 820px) {
         .omb-workspace { flex-direction: row; align-items: stretch; gap: 16px; }
-        .omb-list-pane { flex: 1 1 auto; }
+        .omb-list-pane { flex: 1 1 auto; min-width: 0; }
         .omb-detail-pane { position: static; inset: auto; z-index: auto;
           flex: 0 0 0; opacity: 0; visibility: visible; transform: translateX(8px);
           transition: flex-basis 220ms var(--ds-ease-in-out, ease-out), opacity 180ms var(--ds-ease-in-out, ease-out), transform 220ms var(--ds-ease-in-out, ease-out);
         }
-        .omb-workspace[data-detail='open'] > .omb-detail-pane { flex-basis: 52%; opacity: 1; transform: none; }
+        .omb-workspace[data-detail='open'] > .omb-detail-pane { flex-basis: clamp(320px, 48%, 560px); opacity: 1; transform: none; }
       }
       @container omb-panel (max-width: 520px) {
         .omb-page { padding: 12px; gap: 10px; }
         .omb-nav { width: 48px; padding: 4px; }
         .omb-content { padding: 12px; }
         .omb-grid { grid-template-columns: minmax(0, 1fr); }
-        .omb-nav-cell { min-height: 42px; padding: 6px; justify-content: center; }
+        .omb-nav-cell { min-height: 42px; padding: 6px; }
       }
       @media (pointer: coarse) { .omb-nav-cell, .omb-row { min-height: 44px; } }
       @media (prefers-reduced-motion: reduce) {
@@ -369,22 +377,36 @@ window.__ModuleLoader__.load({
       const [tick, setTick] = React.useState(0)
       React.useEffect(() => {
         let alive = true
-        setLoading(true)
-        setError('')
-        void Promise.resolve().then(loader).then((value) => {
-          if (alive) setData(value)
-        }, (failure) => {
-          if (alive) setError(messageOf(failure))
-        }).finally(() => {
-          if (alive) setLoading(false)
-        })
-        return () => { alive = false }
+        const run = (initial) => {
+          if (initial) setLoading(true)
+          void Promise.resolve().then(loader).then((value) => {
+            if (!alive) return
+            setData(value)
+            setError('')
+          }, (failure) => {
+            if (alive) setError(messageOf(failure))
+          }).finally(() => {
+            if (alive) setLoading(false)
+          })
+        }
+        run(true)
+        // 无刷新按钮：可见时每 8 秒自动跟踪，窗口重新聚焦时立即更新。
+        const timer = setInterval(() => {
+          if (document.visibilityState === 'visible') run(false)
+        }, 8000)
+        const onFocus = () => run(false)
+        window.addEventListener('focus', onFocus)
+        return () => {
+          alive = false
+          clearInterval(timer)
+          window.removeEventListener('focus', onFocus)
+        }
       }, [...deps, tick])
       return { data, error, loading, reload: () => setTick((value) => value + 1) }
     }
 
-    // ── 概览：记忆 + 运行状态 ────────────────────────────────────────
-    function OverviewPage({ onNavigate, refreshTick }) {
+    // ── 概览：记忆 + 运行状态（同屏三级卡片，无折叠、无跳转按钮） ──
+    function OverviewPage({ refreshTick }) {
       const overview = useLoad(() => api('/overview'), [refreshTick])
       const runtime = useLoad(() => api('/runtime'), [refreshTick])
       const data = overview.data
@@ -394,15 +416,16 @@ window.__ModuleLoader__.load({
       const statusState = overview.error ? 'warning' : ready === null ? 'ongoing' : ready ? 'done' : 'error'
       const statusText = overview.error ? '记忆库不可用' : ready === null ? '读取中' : ready ? '记忆库就绪' : '记忆库未就绪'
       const activity = rt && rt.activity
-      const runtimeSummary = rt
-        ? `${rt.version} · 控制器 ${rt.controller ? rt.controller.mode : '未知'}${activity ? ` · 活动 ${activity.total} 条` : ''}`
-        : '读取中'
       return h('div', { className: 'omb-scroll' },
         h('div', { className: 'omb-grid' },
           h(StatCard, { label: '记忆库', value: statusText, state: statusState, note: data && data.detail ? data.detail : '' }),
           h(StatCard, { label: '活跃条目', value: data ? String(data.totalActive) : '—', note: limited ? '统计最近 500 条' : '全部已打开库' }),
           h(StatCard, { label: '待确认', value: data ? String(data.totalCandidates) : '—', note: data && data.totalCandidates > 0 ? '去“记忆”里处理' : '没有待确认' }),
-          h(StatCard, { label: '项目库', value: data ? `${data.openProjects.length}/${data.maxOpenProjects}` : '—', note: data && data.openProjects.length > 0 ? data.openProjects[0] : '无' })),
+          h(StatCard, { label: '项目库', value: data ? `${data.openProjects.length}/${data.maxOpenProjects}` : '—', note: data && data.openProjects.length > 0 ? data.openProjects[0] : '无' }),
+          h(StatCard, { label: '版本', value: rt ? rt.version || '未知' : '—' }),
+          h(StatCard, { label: '隐私闸门', value: rt && rt.privacy ? (rt.privacy.allowWrite ? '可写' : '禁写') : '未知', state: rt && rt.privacy ? (rt.privacy.allowWrite ? 'done' : 'warning') : 'idle', note: rt && rt.privacy ? rt.privacy.reason : '未接线' }),
+          h(StatCard, { label: '事件控制器', value: rt && rt.controller ? rt.controller.mode : '未知', note: rt && rt.controller ? `${rt.controller.events || 0} 事件 · 写入 ${rt.controller.persisted || 0}` : '' }),
+          h(StatCard, { label: '主动提示', value: rt && rt.capture ? String(rt.capture.proactiveCues || 0) : '0', note: rt && rt.capture ? `跟进 ${rt.capture.cueFollowUps || 0} 次` : '' })),
         h(Section, {
           title: '记忆分布',
           aside: limited ? h('span', { className: 'omb-toolbar-note' }, '统计最近 500 条') : null,
@@ -422,23 +445,13 @@ window.__ModuleLoader__.load({
               h('span', null, `行 ${store.stats.rows}`),
               h('span', null, `活跃 ${store.active}`),
               h('span', null, `待确认 ${store.candidates}`)))))),
-        h(Collapsible, { icon: h(IconGaugeOutlineRegular, { size: 16 }), title: '运行状态', summary: runtimeSummary },
-          rt
-            ? h('div', { className: 'omb-grid' },
-              h(StatCard, { label: '版本', value: rt.version || '未知' }),
-              h(StatCard, { label: '隐私闸门', value: rt.privacy ? (rt.privacy.allowWrite ? '可写' : '禁写') : '未知', state: rt.privacy ? (rt.privacy.allowWrite ? 'done' : 'warning') : 'idle', note: rt.privacy ? rt.privacy.reason : '未接线' }),
-              h(StatCard, { label: '事件控制器', value: rt.controller ? rt.controller.mode : '未知', note: rt.controller ? `${rt.controller.events || 0} 事件 · 写入 ${rt.controller.persisted || 0}` : '' }),
-              h(StatCard, { label: '主动提示', value: rt.capture ? String(rt.capture.proactiveCues || 0) : '0', note: rt.capture ? `跟进 ${rt.capture.cueFollowUps || 0} 次` : '' }))
-            : runtime.loading ? h(Loading, { label: '读取运行状态…' }) : runtime.error ? h(ErrorLine, null, `运行状态读取失败：${runtime.error}`) : null),
         activity
           ? h(Section, { title: `最近活动（${activity.total} 条）` },
             h('div', null, ...(activity.recent || []).map((entry, index) => h('div', { key: `${entry.at}-${index}`, className: 'omb-row', style: { cursor: 'default' } },
               h('div', { className: 'omb-row-meta' }, h(Tag, { tone: 'quiet' }, entry.kind), h('span', null, formatTime(entry.at))),
               h('p', { className: 'omb-row-text omb-selectable' }, entry.detail)))))
           : null,
-        h('div', { className: 'omb-actions' },
-          h(Button, { variant: 'ghost', size: 'sm', icon: h(IconDatabaseOutlineRegular, { size: 16 }), onClick: () => onNavigate('memory') }, '去记忆'),
-          h(Button, { variant: 'ghost', size: 'sm', icon: h(IconWorkspaceTreeOutlineRegular, { size: 16 }), onClick: () => onNavigate('project') }, '去项目')))
+        runtime.loading && !rt ? h(Loading, { label: '读取运行状态…' }) : runtime.error ? h(ErrorLine, null, `运行状态读取失败：${runtime.error}`) : null)
     }
 
     // ── 记忆：列表 + 详情 + 新建/编辑/删除/标记 ─────────────────────
@@ -452,32 +465,62 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState('')
       const [tick, setTick] = React.useState(0)
-      const [page, setPage] = React.useState(0)
-      const [truncated, setTruncated] = React.useState(false)
+      const [hasMore, setHasMore] = React.useState(false)
+      const [loadingMore, setLoadingMore] = React.useState(false)
       const [form, setForm] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
       const queryRef = React.useRef('')
       const first = React.useRef(true)
+      const loadingMoreRef = React.useRef(false)
+      const hasMoreRef = React.useRef(false)
+      const seqRef = React.useRef(0)
+
+      const loadMore = React.useCallback(() => {
+        if (loadingMoreRef.current || !hasMoreRef.current) return
+        loadingMoreRef.current = true
+        setLoadingMore(true)
+        const offset = items.length
+        const seq = seqRef.current
+        void api('/list', { q: queryRef.current, scope, status, kind, limit: PAGE_SIZE, offset }).then((data) => {
+          if (seqRef.current !== seq) return
+          const next = data.items || []
+          setItems((current) => {
+            const seen = new Set(current.map((item) => item.id))
+            return [...current, ...next.filter((item) => !seen.has(item.id))]
+          })
+          hasMoreRef.current = data.truncated === true
+          setHasMore(data.truncated === true)
+        }, (failure) => {
+          setError(messageOf(failure))
+        }).finally(() => {
+          loadingMoreRef.current = false
+          setLoadingMore(false)
+        })
+      }, [items.length, scope, status, kind])
 
       React.useEffect(() => {
         let alive = true
+        const seq = seqRef.current + 1
+        seqRef.current = seq
         setLoading(true)
         setError('')
-        void api('/list', { q: queryRef.current, scope, status, kind, limit: PAGE_SIZE, offset: page * PAGE_SIZE }).then((data) => {
-          if (!alive) return
+        hasMoreRef.current = false
+        void api('/list', { q: queryRef.current, scope, status, kind, limit: PAGE_SIZE, offset: 0 }).then((data) => {
+          if (!alive || seqRef.current !== seq) return
           setItems(data.items || [])
-          setTruncated(data.truncated === true)
+          hasMoreRef.current = data.truncated === true
+          setHasMore(data.truncated === true)
         }, (failure) => {
-          if (alive) setError(messageOf(failure))
+          if (alive && seqRef.current === seq) setError(messageOf(failure))
         }).finally(() => {
-          if (alive) setLoading(false)
+          if (alive && seqRef.current === seq) setLoading(false)
         })
         return () => { alive = false }
-      }, [scope, status, kind, tick, refreshTick, page])
+      }, [scope, status, kind, tick, refreshTick])
 
       React.useEffect(() => {
         if (first.current) { first.current = false; return undefined }
-        const timer = setTimeout(() => { queryRef.current = queryInput; setPage(0); setTick((value) => value + 1) }, 260)
+        const timer = setTimeout(() => { queryRef.current = queryInput; setTick((value) => value + 1) }, 260)
         return () => clearTimeout(timer)
       }, [queryInput])
 
@@ -498,40 +541,33 @@ window.__ModuleLoader__.load({
               onKeyDown: (event) => {
                 if (event.key !== 'Enter') return
                 queryRef.current = queryInput
-                setPage(0)
                 setTick((value) => value + 1)
               },
             }),
-            h(SegmentedControl, { id: 'omb-scope', label: '库', value: scope, options: SCOPES, onChange: (next) => { setScope(next); setPage(0) } }),
-            h(SegmentedControl, { id: 'omb-status', label: '状态', value: status, options: STATUSES, onChange: (next) => { setStatus(next); setPage(0) } }),
+            h(SegmentedControl, { id: 'omb-scope', label: '库', value: scope, options: SCOPES, onChange: setScope }),
+            h(SegmentedControl, { id: 'omb-status', label: '状态', value: status, options: STATUSES, onChange: setStatus }),
             h(Button, {
               variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }),
               onClick: () => setForm({ mode: 'create' }),
             }, '新建')),
           h('div', { className: 'omb-toolbar' },
             h('span', { className: 'omb-pills' }, ...KINDS.map((entry) => h(Pill, {
-              key: entry.value || 'all', active: kind === entry.value, onClick: () => { setKind(entry.value); setPage(0) },
+              key: entry.value || 'all', active: kind === entry.value, onClick: () => setKind(entry.value),
             }, entry.label))),
-            h(Button, {
-              variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: loading ? 'omb-spin' : undefined }),
-              onClick: () => setTick((value) => value + 1), disabled: loading,
-            }, '刷新'),
             h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-              loading ? h(TextShimmer, { active: true }, '读取中…') : `第 ${page + 1} 页 · 本页 ${items.length} 条`),
-            h(Button, {
-              variant: 'ghost', size: 'sm', disabled: loading || page === 0,
-              onClick: () => setPage((value) => Math.max(0, value - 1)),
-            }, '上一页'),
-            h(Button, {
-              variant: 'ghost', size: 'sm', disabled: loading || !truncated,
-              onClick: () => setPage((value) => value + 1),
-            }, '下一页')),
+              loading ? h(TextShimmer, { active: true }, '读取中…') : `已加载 ${items.length} 条`)),
           notice
             ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
               h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
             : null,
           error ? h(ErrorLine, null, `读取失败：${error}`) : null,
-          h('div', { className: 'omb-list' },
+          h('div', {
+            className: 'omb-list',
+            onScroll: (event) => {
+              const el = event.currentTarget
+              if (el.scrollHeight - el.scrollTop - el.clientHeight < 160) loadMore()
+            },
+          },
             items.length === 0 && !loading
               ? h(Empty, {
                 title: status === 'candidate' ? '没有待确认的记忆' : '没有匹配的记忆',
@@ -547,7 +583,12 @@ window.__ModuleLoader__.load({
             h('span', { className: 'omb-row-text' }, item.text.length > 200 ? `${item.text.slice(0, 200)}…` : item.text),
             h('span', { className: 'omb-row-meta' },
               ...StageTags({ item }),
-              h('span', null, formatTime(item.observedAt))))))),
+              h('span', null, formatTime(item.observedAt))))),
+            loadingMore
+              ? h('span', { className: 'omb-toolbar-note' }, h(TextShimmer, { active: true }, '加载更多…'))
+              : hasMore
+                ? h('span', { className: 'omb-toolbar-note' }, '继续向下滚动加载')
+                : items.length > 0 ? h('span', { className: 'omb-toolbar-note' }, '已全部加载') : null)),
         h('aside', {
           className: 'omb-detail-pane', 'aria-label': '记忆详情',
           'aria-hidden': open ? undefined : true,
@@ -622,6 +663,17 @@ window.__ModuleLoader__.load({
           setNotice({ text: messageOf(failure), failed: true })
         }).finally(() => setBusy(false))
       }
+      const feedback = (action) => {
+        if (busy) return
+        setBusy(true); setNotice(null)
+        void post('/feedback', { id, action }).then((payload) => {
+          setNotice({ text: payload.text || '反馈已记录', failed: false })
+          setRevision((value) => value + 1)
+          onChanged()
+        }, (failure) => {
+          setNotice({ text: messageOf(failure), failed: true })
+        }).finally(() => setBusy(false))
+      }
       return h('div', { className: 'omb-detail' },
         head,
         h('div', { className: 'omb-row-meta' }, ...StageTags({ item: record })),
@@ -640,6 +692,12 @@ window.__ModuleLoader__.load({
           record.validTo !== null && record.supersededBy === null ? h(Button, { variant: 'outline', size: 'sm', disabled: busy, onClick: () => act({ action: 'mark', id, mark: 'revive' }) }, '恢复') : null,
           onEdit ? h(Button, { variant: 'ghost', size: 'sm', icon: h(IconEditOutlineRegular, { size: 16 }), disabled: busy, onClick: () => onEdit(record) }, '编辑') : null,
           h(Button, { variant: 'ghost', size: 'sm', icon: h(IconTrashOutlineRegular, { size: 16 }), disabled: busy, onClick: () => setConfirmDelete(true) }, '删除')),
+        h('div', { className: 'omb-detail-actions' },
+          h('span', { className: 'omb-field-label' }, '反馈'),
+          h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('useful') }, '有用'),
+          h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('wrong') }, '错误'),
+          h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('stale') }, '过时'),
+          h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => feedback('noise') }, '噪声')),
         notice ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
           h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text)) : null,
         h(Collapsible, {
@@ -756,12 +814,25 @@ window.__ModuleLoader__.load({
       const list = sessions.data && sessions.data.available ? sessions.data.items : null
       const current = privacy.data && privacy.data.current ? privacy.data.current.sessionId : null
       const selected = list ? list.find((item) => item.id === selectedId) || null : null
-
-      React.useEffect(() => {
-        if (selectedId !== null || list === null) return
-        const preferred = list.find((item) => item.active && !item.archived) || list.find((item) => !item.archived) || list[0]
-        if (preferred) setSelectedId(preferred.id)
-      }, [list, selectedId])
+      const [expanded, setExpanded] = React.useState({})
+      const groups = React.useMemo(() => {
+        const map = new Map()
+        for (const item of list || []) {
+          const key = item.root || item.cwd || 'unknown'
+          if (!map.has(key)) map.set(key, { key, label: baseName(key) || key, root: key, items: [], latest: 0, active: false })
+          const group = map.get(key)
+          group.items.push(item)
+          group.latest = Math.max(group.latest, item.createdAt || 0)
+          group.active = group.active || item.active === true
+        }
+        return [...map.values()]
+          .map((group) => ({
+            ...group,
+            items: group.items.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)),
+          }))
+          .sort((a, b) => b.latest - a.latest)
+      }, [list])
+      const toggleGroup = (key) => setExpanded((value) => ({ ...value, [key]: !value[key] }))
 
       React.useEffect(() => {
         if (!selected || selected.archived) { setProfile(null); setProfileError(''); return undefined }
@@ -783,25 +854,72 @@ window.__ModuleLoader__.load({
           setNotice({ text: messageOf(failure), failed: true })
         }).finally(() => setBusy(false))
       }
+      const setDepth = (depth) => {
+        if (busy) return
+        setBusy(true); setNotice(null)
+        void post('/depth', { sessionId: selected.id, depth }).then((payload) => {
+          setNotice({ text: payload.text || '已更新推理深度', failed: false })
+          sessions.reload()
+        }, (failure) => {
+          setNotice({ text: messageOf(failure), failed: true })
+        }).finally(() => setBusy(false))
+      }
 
-      const listRows = list && list.length > 0
-        ? h('div', { className: 'omb-list' }, ...list.map((item) => {
-          const isArchived = item.archived
-          return h('button', {
-            key: item.id, type: 'button', className: 'omb-row',
-            'data-active': item.id === selectedId,
-            'data-disabled': isArchived,
-            disabled: isArchived,
-            onClick: () => { if (!isArchived) setSelectedId(item.id) },
+      const sessionRow = (item, depth) => {
+        const isArchived = item.archived
+        const indent = typeof depth === 'number' ? depth * 14 : 0
+        return h('button', {
+          key: item.id, type: 'button', className: 'omb-row',
+          style: indent > 0 ? { marginLeft: `${indent}px` } : undefined,
+          'data-active': item.id === selectedId,
+          'data-disabled': isArchived,
+          disabled: isArchived,
+          onClick: () => { if (!isArchived) setSelectedId(item.id) },
+        },
+        h('span', { className: 'omb-row-title' }, item.title || baseName(item.cwd) || shortId(item.id)),
+        h('span', { className: 'omb-row-meta' },
+          isArchived ? h(Tag, { tone: 'quiet' }, '已归档') : item.active ? h(Tag, { tone: 'success' }, '进行中') : h(Tag, { tone: 'outline' }, '历史'),
+          item.parentId ? h(Tag, { tone: 'quiet' }, '子会话') : null,
+          item.id === current ? h(Tag, { tone: 'info' }, '当前') : null,
+          h('span', null, depthText(item.depth)),
+          item.privacy ? h(Tag, { tone: item.privacy.mode === 'normal' ? 'neutral' : 'warning' }, modeText(item.privacy.mode)) : null),
+        h('span', { className: 'omb-row-sub' }, item.cwd))
+      }
+      const renderGroupSessions = (group) => {
+        const ids = new Set(group.items.map((item) => item.id))
+        const children = new Map()
+        const roots = []
+        for (const item of group.items) {
+          const parent = item.parentId && ids.has(item.parentId) ? item.parentId : null
+          if (parent === null) roots.push(item)
+          else {
+            if (!children.has(parent)) children.set(parent, [])
+            children.get(parent).push(item)
+          }
+        }
+        const seen = new Set()
+        const render = (item, depth) => {
+          if (seen.has(item.id)) return []
+          seen.add(item.id)
+          return [sessionRow(item, depth), ...(children.get(item.id) || []).flatMap((child) => render(child, depth + 1))]
+        }
+        return roots.flatMap((item) => render(item, 0))
+      }
+      const listRows = groups.length > 0
+        ? h('div', { className: 'omb-list' }, ...groups.map((group) => h('div', { key: group.key, className: 'omb-workspace-group' },
+          h('button', {
+            type: 'button', className: 'omb-row',
+            onClick: () => toggleGroup(group.key),
           },
-          h('span', { className: 'omb-row-title' }, item.title || baseName(item.cwd) || shortId(item.id)),
+          h('span', { className: 'omb-row-title' }, group.label || group.root),
           h('span', { className: 'omb-row-meta' },
-            isArchived ? h(Tag, { tone: 'quiet' }, '已归档') : item.active ? h(Tag, { tone: 'success' }, '进行中') : h(Tag, { tone: 'outline' }, '历史'),
-            item.id === current ? h(Tag, { tone: 'info' }, '当前') : null,
-            h('span', null, depthText(item.depth)),
-            item.privacy ? h(Tag, { tone: item.privacy.mode === 'normal' ? 'neutral' : 'warning' }, modeText(item.privacy.mode)) : null),
-          h('span', { className: 'omb-row-sub' }, item.root || item.cwd))
-        }))
+            h(Tag, { tone: group.active ? 'success' : 'outline' }, group.active ? '有进行中会话' : '历史'),
+            h('span', null, `${group.items.length} 个会话`),
+            h('span', null, expanded[group.key] ? '收起' : '展开')),
+          h('span', { className: 'omb-row-sub' }, group.root)),
+          expanded[group.key]
+            ? h('div', { className: 'omb-workspace-sessions' }, ...renderGroupSessions(group))
+            : null)))
         : null
 
       const listBody = !sessions.data
@@ -813,16 +931,19 @@ window.__ModuleLoader__.load({
       const listPane = h('div', { className: 'omb-list-pane' },
         h('div', { className: 'omb-toolbar' },
           h('span', { className: 'omb-toolbar-note', 'aria-live': 'polite' },
-            sessions.loading ? h(TextShimmer, { active: true }, '读取中…') : list ? `${list.length} 个会话` : ''),
-          h(Button, { variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: sessions.loading ? 'omb-spin' : undefined }), disabled: sessions.loading, onClick: sessions.reload }, '刷新')),
+            sessions.loading ? h(TextShimmer, { active: true }, '读取中…') : groups.length > 0 ? `${groups.length} 个工作区` : '')),
         sessions.error ? h(ErrorLine, null, `读取失败：${sessions.error}`) : null,
         listBody)
 
       const privacySection = selected && h(Section, { title: '会话设置' },
         h('div', { className: 'omb-actions' },
           h('span', { className: 'omb-field-label' }, '推理深度'),
-          h(Tag, { tone: 'outline' }, depthText(selected.depth)),
-          h('span', { className: 'omb-toolbar-note' }, '在会话里用 /omb-depth 修改')),
+          h(SegmentedControl, {
+            id: 'omb-session-depth', label: '推理深度', value: selected.depth || 'standard',
+            options: [{ value: 'quick', label: '快速' }, { value: 'standard', label: '标准' }, { value: 'deep', label: '深入' }],
+            disabled: busy, onChange: setDepth,
+          }),
+          h('span', { className: 'omb-toolbar-note' }, '写入本会话的推理档位')),
         h('div', { className: 'omb-actions' },
           h('span', { className: 'omb-field-label' }, '隐私模式'),
           h(SegmentedControl, {
@@ -998,6 +1119,50 @@ window.__ModuleLoader__.load({
         }))
     }
 
+    // ── 状态机总览：项目级跨会话 + 跨工作区（v4.20） ────────────────
+    function MachinesPage({ refreshTick }) {
+      const resource = useLoad(() => api('/machines'), [refreshTick])
+      const data = resource.data
+      const groups = data && data.groups ? data.groups : []
+      const sessions = groups.flatMap((group) => group.sessions)
+      const tasks = sessions.reduce((sum, entry) => sum + (entry.tasks ? entry.tasks.length : 0), 0)
+      const candidates = sessions.reduce((sum, entry) => sum + (entry.candidates ? entry.candidates.length : 0), 0)
+      const stats = h('div', { className: 'omb-grid' },
+        h(StatCard, { label: '工作区', value: String(groups.length), note: '按项目根聚合' }),
+        h(StatCard, { label: '会话状态机', value: String(sessions.length), note: '仅大肥鱼会话' }),
+        h(StatCard, { label: '跟踪任务', value: String(tasks), note: '回合结束失效' }),
+        h(StatCard, { label: '待确认候选', value: String(candidates), note: '去记忆页确认' }))
+      const sessionCard = (entry) => {
+        const taskLines = entry.tasks && entry.tasks.length > 0
+          ? entry.tasks.map((task, index) => h('p', { key: `t${index}`, className: 'omb-note omb-selectable' }, `任务：${task.text}`))
+          : [h('p', { key: 'none', className: 'omb-note' }, '没有任务约束。')]
+        const candidateLines = entry.candidates && entry.candidates.length > 0
+          ? entry.candidates.map((candidate) => h('p', { key: candidate.id, className: 'omb-note omb-selectable' }, `候选：${candidate.text}`))
+          : []
+        return h('div', { key: entry.id, className: 'omb-card' },
+          h('div', { className: 'omb-row-meta' },
+            h(Tag, { tone: entry.archived ? 'quiet' : entry.phase === 'idle' ? 'outline' : 'warning' },
+              entry.archived ? '已归档' : PHASE_TEXT[entry.phase] || '未知'),
+            entry.active ? h(Tag, { tone: 'success' }, '进行中') : null,
+            entry.privacy ? h(Tag, { tone: entry.privacy === 'normal' ? 'neutral' : 'warning' }, modeText(entry.privacy)) : null),
+          h('p', { className: 'omb-row-title' }, entry.title || baseName(entry.cwd) || shortId(entry.id)),
+          h('p', { className: 'omb-row-sub omb-selectable' }, entry.cwd),
+          ...taskLines,
+          ...candidateLines)
+      }
+      const groupView = groups.map((group) => h(Section, { key: group.root, title: group.label || group.root },
+        h('div', null, ...group.sessions.map(sessionCard))))
+      const content = !data
+        ? (resource.loading ? h(Loading, { label: '读取状态机…' }) : resource.error ? h(ErrorLine, null, `读取失败：${resource.error}`) : null)
+        : !data.available
+          ? h(Empty, { title: '状态机暂不可用', hint: data.reason || '' })
+          : h(React.Fragment, null, stats,
+            groups.length === 0
+              ? h(Empty, { title: '还没有可读的状态机', hint: '进入一个会话后会自动建立状态。' })
+              : h(React.Fragment, null, ...groupView))
+      return h('div', { className: 'omb-scroll' }, content)
+    }
+
     // ── 个人画像手动编辑（v4.19） ─────────────────────────────────
     function PersonalForm({ record, onClose, onSaved }) {
       const editing = record !== null
@@ -1117,8 +1282,7 @@ window.__ModuleLoader__.load({
       }
 
       const actionsRow = h('div', { className: 'omb-actions' },
-        h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), onClick: () => setForm({ record: null }) }, '新增条目'),
-        h(Button, { variant: 'ghost', size: 'sm', icon: h(IconRefreshOutlineRegular, { size: 16, className: resource.loading ? 'omb-spin' : undefined }), disabled: resource.loading, onClick: resource.reload }, '刷新'))
+        h(Button, { variant: 'primary', size: 'sm', icon: h(IconPlusOutlineRegular, { size: 16 }), onClick: () => setForm({ record: null }) }, '新增条目'))
       const noticeRow = notice
         ? h('div', { className: 'omb-notice', role: 'status', 'aria-live': 'polite' },
           h(StateDot, { state: notice.failed ? 'error' : 'done' }), h('span', { className: 'omb-note' }, notice.text))
@@ -1193,8 +1357,6 @@ window.__ModuleLoader__.load({
     function MemoryPanel() {
       const [page, setPage] = React.useState('overview')
       const [direction, setDirection] = React.useState(1)
-      const [refreshTick, setRefreshTick] = React.useState(0)
-      const overview = useLoad(() => api('/overview'), [page === 'overview'])
       const active = NAV.find((entry) => entry.value === page) || NAV[0]
       const go = (next) => {
         const from = NAV.findIndex((entry) => entry.value === page)
@@ -1202,14 +1364,10 @@ window.__ModuleLoader__.load({
         setDirection(to >= from ? 1 : -1)
         setPage(next)
       }
-      const ready = overview.data ? overview.data.ready : null
-      const statusState = overview.error ? 'warning' : ready === null ? 'ongoing' : ready ? 'done' : 'error'
-      const statusText = overview.error ? '记忆库不可用' : ready === null ? '读取中' : ready ? '记忆库就绪' : '记忆库未就绪'
       return h('div', { className: 'omb-page' },
         h('style', null, CSS),
         h('div', { className: 'omb-head' },
-          h('h2', { className: 'omb-title' }, TITLE),
-          h('span', { className: 'omb-status' }, h(StateDot, { state: statusState }), statusText)),
+          h('h2', { className: 'omb-title' }, TITLE)),
         h('div', { className: 'omb-body' },
           h('nav', { className: 'omb-nav', 'aria-label': `${TITLE}导航` },
             ...NAV.map((entry) => h('button', {
@@ -1224,18 +1382,13 @@ window.__ModuleLoader__.load({
             h('div', { className: 'omb-content-head' },
               h('div', null,
                 h('h3', { className: 'omb-content-title' }, active.label),
-                h('p', { className: 'omb-content-desc' }, PAGE_HINTS[page])),
-              h('div', { className: 'omb-content-actions' },
-                h(Button, {
-                  variant: 'ghost', size: 'sm',
-                  icon: h(IconRefreshOutlineRegular, { size: 16, className: overview.loading ? 'omb-spin' : undefined }),
-                  disabled: overview.loading, onClick: () => { setRefreshTick((value) => value + 1); overview.reload() }, 'aria-label': '刷新',
-                }, '刷新'))),
+                h('p', { className: 'omb-content-desc' }, PAGE_HINTS[page]))),
             h('div', { key: page, className: `omb-page-in ${direction > 0 ? 'omb-page-forward' : 'omb-page-back'}` },
-              page === 'overview' ? h(OverviewPage, { onNavigate: go, refreshTick })
-                : page === 'memory' ? h(MemoryPage, { refreshTick })
-                  : page === 'project' ? h(ProjectPage, { refreshTick })
-                    : h(PersonalPage, { refreshTick })))))
+              page === 'overview' ? h(OverviewPage)
+                : page === 'memory' ? h(MemoryPage)
+                  : page === 'project' ? h(ProjectPage)
+                    : page === 'machines' ? h(MachinesPage)
+                      : h(PersonalPage)))))
     }
 
     function MemoryIcon({ size }) {

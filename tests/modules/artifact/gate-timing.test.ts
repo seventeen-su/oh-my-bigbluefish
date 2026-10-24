@@ -168,7 +168,7 @@ describe('时序：闸门未就绪期间的写入必须留声', () => {
   it('memory 后到（真实提供者）：先放行并计数，装上后同一实例立刻受约束、计数不再涨', async () => {
     const ws = tempWorkspace('omb-gate-timing-')
     try {
-      const { handle, module, service, commands } = artifactOnly()
+      const { handle, module, service } = artifactOnly()
       service.record('src/early.ts', { kind: 'file' }, 's1')
       expect((await module.manifest.health()).metrics?.ungatedWrites).toBe(1)
 
@@ -183,10 +183,13 @@ describe('时序：闸门未就绪期间的写入必须留声', () => {
       expect(handle.kernel.service(SERVICES.privacy)).toBeDefined()
       expect(handle.moduleGraph().missingDependencies).not.toContain('omb-artifact ← omb-memory')
 
-      // 用真命令把本会话设为 sealed（命令面也随记忆库一起到位）
-      const command = commands.definitions.find(item => item.name === 'omb-privacy')
-      expect(command, '命令没注册：并入之后用户改不了档位').toBeDefined()
-      await command?.handler({ rawInput: 'sealed', agent: { id: 's1' } })
+      // 用设置页的隐私动作把本会话设为 sealed（命令已删除，能力经 omb:ui）
+      const ui = handle.kernel.service<{
+        privacyAct(input: { action: 'set'; sessionId: string; mode: 'sealed' }): Promise<{ ok: boolean; text: string }>
+      }>('omb:ui')
+      expect(ui, '设置页数据面未接线——那就真的没有改档位的入口了').toBeDefined()
+      const sealed = await ui?.privacyAct({ action: 'set', sessionId: 's1', mode: 'sealed' })
+      expect(sealed?.ok).toBe(true)
 
       expect(() => service.record('src/late.ts', { kind: 'file' }, 's1')).toThrow(/sealed/)
       const health = await module.manifest.health()

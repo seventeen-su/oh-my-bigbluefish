@@ -59,8 +59,6 @@ import { createProjectRootResolver } from './project-root.js'
 import { createProjectProfile } from './project-profile.js'
 import { createProjectEvidence } from './project-evidence.js'
 import { installSessionCatalog } from './session-catalog.js'
-import { registerDepthCommand } from './depth-command.js'
-import { registerHeapCommand } from './heap-command.js'
 import { wireReasoningEffort } from './reasoning-effort.js'
 import { wireArtifactIndex } from './hooks.js'
 import { buildStatusTool } from './status-tool.js'
@@ -76,7 +74,10 @@ export interface PluginConfig {
 }
 
 export const name = 'omb'
-/** 只注入 commands；其余服务一律 `ctx.get` 可选读取，缺失即降级（H-3）。 */
+/**
+ * 保留 `commands` 注入（宿主兼容；v4.20.0 起插件不再注册任何用户命令，
+ * 也不读取该服务）。其余服务一律 `ctx.get` 可选读取，缺失即降级（H-3）。
+ */
 export const inject = ['commands']
 
 /**
@@ -421,15 +422,10 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
   // 校验与宿主真正写入之间仍有非原子窗口（守卫不是权限边界），守卫自身异常一律放行。
   const disposeGuard = wireEditGuard({ ctx, machine: sessionState, logger })
   /**
-   * 用户命令 + 真实 effort 映射。
-   *
-   * 两者必须一起装：命令只写内核 focus 表，映射器在根 `agent/request` 瀑布上
-   * 把显式档位落到请求头；**同步注册顺序决定映射器在外层**（晚注册会被
-   * agent 作用域的 model-selection 覆盖，症状是"设了 quick 但请求头仍是 max"）。
+   * 真实 effort 映射（v4.20.0 起 `/omb-depth` 命令已删除，深度由设置页
+   * `POST /omb/api/depth` 写内核 focus 表；映射器仍在根 `agent/request`
+   * 瀑布上把显式档位落到请求头。映射器注册顺序仍是外层。
    */
-  const disposeDepth = registerDepthCommand({ ctx, kernel: handle.kernel, logger })
-  // v4.4：OOM 取证命令（/omb-heap）。只在用户显式取证时同步写快照。
-  const disposeHeap = registerHeapCommand({ ctx, kernel: handle.kernel, logger })
   const disposeEffort = wireReasoningEffort({ ctx, kernel: handle.kernel })
   /**
    * 制品索引的**生产者**。
@@ -486,8 +482,6 @@ export function apply(ctx: HostContextLike, config: PluginConfig = {}): () => vo
       },
       () => sessionState.dispose(),
       disposeEffort,
-      disposeDepth,
-      disposeHeap,
       () => {
         try {
           disposeProjectRoot?.()

@@ -123,11 +123,12 @@ export function installUiRoute(
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname.slice(UI_ROUTE_PREFIX.length) || '/'
       if (req.method === 'POST') {
-        // 写入口只有六个：确认/撤销、冲突裁决、会话隐私设置、手动记忆编辑、
-        // 控制器手动编辑、个人画像写入。**没有模型工具调用它们**。
+        // 写入口：确认/撤销、冲突裁决、会话隐私、手动记忆、控制器、个人画像、
+        // 反馈、推理深度（v4.20 起命令删除，能力并入前端）。**没有模型工具调用它们**。
         if (path !== '/confirm' && path !== '/resolve' && path !== '/privacy' && path !== '/memory'
-          && path !== '/controller' && path !== '/personal') {
-          json(res, 405, { error: 'write endpoints are /confirm, /resolve, /privacy, /memory, /controller, and /personal' })
+          && path !== '/controller' && path !== '/personal'
+          && path !== '/feedback' && path !== '/depth') {
+          json(res, 405, { error: 'write endpoints are /confirm, /resolve, /privacy, /memory, /controller, /personal, /feedback, and /depth' })
           return
         }
         const contentType = req.headers['content-type'] ?? ''
@@ -336,6 +337,46 @@ export function installUiRoute(
           json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
           return
         }
+        if (path === '/feedback') {
+          const action = record?.['action']
+          if (action !== 'useful' && action !== 'wrong' && action !== 'stale' && action !== 'noise' && action !== 'revive') {
+            json(res, 400, { error: 'action 必须是 useful、wrong、stale、noise 或 revive' })
+            return
+          }
+          const rawId = record?.['id']
+          const id = typeof rawId === 'string' ? rawId.trim() : ''
+          if (id.length === 0) {
+            json(res, 400, { error: '缺少 id' })
+            return
+          }
+          if (id.length > 200) {
+            json(res, 400, { error: 'id 最多 200 个字符' })
+            return
+          }
+          const outcome = await ui.feedbackAct({ id, action })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
+        if (path === '/depth') {
+          const depth = record?.['depth']
+          if (depth !== 'quick' && depth !== 'standard' && depth !== 'deep') {
+            json(res, 400, { error: 'depth 必须是 quick、standard 或 deep' })
+            return
+          }
+          const rawSessionId = record?.['sessionId']
+          const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : ''
+          if (sessionId.length === 0) {
+            json(res, 400, { error: '缺少 sessionId' })
+            return
+          }
+          if (sessionId.length > 200) {
+            json(res, 400, { error: 'sessionId 最多 200 个字符' })
+            return
+          }
+          const outcome = await ui.depthAct({ sessionId, depth })
+          json(res, outcome.ok ? 200 : 409, { ok: outcome.ok, text: outcome.text })
+          return
+        }
         if (path === '/resolve') {
           const action = record?.['action']
           const fromId = record?.['fromId']
@@ -397,6 +438,10 @@ export function installUiRoute(
         const sessionId = url.searchParams.get('sessionId')
         const trimmed = sessionId === null ? '' : sessionId.trim()
         json(res, 200, await ui.controller(trimmed.length > 0 ? trimmed : undefined))
+        return
+      }
+      if (path === '/machines') {
+        json(res, 200, await ui.machines())
         return
       }
       if (path === '/privacy') {

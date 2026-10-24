@@ -97,7 +97,7 @@ const UI = {
     available: true,
     items: [{
       id: 's1', title: '会话一', cwd: '/work/demo', root: '/work/demo', preset: 'omb',
-      archived: false, active: true, depth: 'deep',
+      archived: false, active: true, depth: 'deep', parentId: null,
       privacy: { mode: 'sealed', origin: 'command', inheritedFrom: null }, createdAt: 1,
     }],
   }),
@@ -122,6 +122,23 @@ const UI = {
   personalAct: async (input: { action: string; axis: string; key: string }) => (input.key === 'denied'
     ? { ok: false, text: '拒绝：测试' }
     : { ok: true, text: `画像 ${input.action} 成功` }),
+  machines: async () => ({
+    available: true,
+    groups: [{
+      root: '/work/a',
+      label: '/work/a',
+      sessions: [{
+        id: 's1', title: '一', cwd: '/work/a', archived: false, active: true,
+        phase: 'mixed', tasks: [], candidates: [], lastEventAt: null, privacy: 'normal',
+      }],
+    }],
+  }),
+  feedbackAct: async (input: { id: string; action: string }) => (input.id === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `反馈 ${input.action} 成功` }),
+  depthAct: async (input: { sessionId?: string; depth: string }) => (input.sessionId === 'denied'
+    ? { ok: false, text: '拒绝：测试' }
+    : { ok: true, text: `深度 ${input.depth} 成功` }),
   createMemory: async (input: { scope: string; kind: string; text: string }) => (input.text === 'denied'
     ? { ok: false, text: '拒绝：测试' }
     : { ok: true, text: `新建 ${input.scope}/${input.kind}` }),
@@ -144,7 +161,7 @@ const UI = {
     sessions: [],
     restricted: null,
     durable: { path: '/tmp/session-modes.json', ok: true, detail: '状态文件可读写', savedAt: null },
-    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '已注册' },
+    commands: { privacy: '/omb-privacy', clean: '/omb-privacy-clean', state: '已删除（v4.20）' },
     stats: {
       decisions: 0, readDenials: 0, writeDenials: 0, unattributedWriteDenials: 0,
       lastDeniedSession: null, lastDeniedReason: null,
@@ -326,7 +343,7 @@ describe('installUiRoute', () => {
 
     const sessions = await request(route, { url: '/omb/api/sessions' })
     expect(sessions.status).toBe(200)
-    expect(sessions.body).toMatchObject({ available: true, items: [{ id: 's1', privacy: { mode: 'sealed' } }] })
+    expect(sessions.body).toMatchObject({ available: true, items: [{ id: 's1', privacy: { mode: 'sealed' }, parentId: null }] })
 
     const personal = await request(route, { url: '/omb/api/personal' })
     expect(personal.status).toBe(200)
@@ -432,6 +449,42 @@ describe('installUiRoute', () => {
     const message = String((other.body as { error: string }).error)
     expect(message).toContain('/controller')
     expect(message).toContain('/personal')
+  })
+
+  it('所有状态机/反馈/深度：GET /machines、POST /feedback、POST /depth、校验与 405（v4.20）', async () => {
+    const fake = fakeWeb(null)
+    installUiRoute(fake.webCtx, () => fakeKernel(UI))
+    const route = fake.captured() as Captured
+
+    const machines = await request(route, { url: '/omb/api/machines' })
+    expect(machines.status).toBe(200)
+    expect(machines.body).toMatchObject({ available: true, groups: [{ root: '/work/a', sessions: [{ id: 's1', phase: 'mixed' }] }] })
+
+    const post = (url: string, body: unknown) => request(route, {
+      method: 'POST', url, body, contentType: 'application/json',
+    })
+    const feedback = await post('/omb/api/feedback', { id: 'm1', action: 'useful' })
+    expect(feedback.status).toBe(200)
+    expect(String((feedback.body as { text: string }).text)).toContain('useful 成功')
+    expect((await post('/omb/api/feedback', { id: 'denied', action: 'stale' })).status).toBe(409)
+    expect((await post('/omb/api/feedback', { id: 'm1', action: 'nope' })).status).toBe(400)
+    expect((await post('/omb/api/feedback', { action: 'useful' })).status).toBe(400)
+    expect((await post('/omb/api/feedback', { id: 'x'.repeat(201), action: 'useful' })).status).toBe(400)
+    expect((await post('/omb/api/feedback', { id: 42, action: 'useful' })).status).toBe(400)
+
+    const depth = await post('/omb/api/depth', { sessionId: 's1', depth: 'deep' })
+    expect(depth.status).toBe(200)
+    expect(String((depth.body as { text: string }).text)).toContain('deep 成功')
+    expect((await post('/omb/api/depth', { sessionId: 'denied', depth: 'quick' })).status).toBe(409)
+    expect((await post('/omb/api/depth', { sessionId: 's1', depth: 'max' })).status).toBe(400)
+    expect((await post('/omb/api/depth', { depth: 'quick' })).status).toBe(400)
+    expect((await post('/omb/api/depth', { sessionId: 'x'.repeat(201), depth: 'quick' })).status).toBe(400)
+
+    const other = await post('/omb/api/overview', {})
+    expect(other.status).toBe(405)
+    const message = String((other.body as { error: string }).error)
+    expect(message).toContain('/feedback')
+    expect(message).toContain('/depth')
   })
 
   it('ui 服务缺席 → 503（不假装已就绪）', async () => {

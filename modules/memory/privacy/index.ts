@@ -58,7 +58,6 @@ import type {
   StatusRegistry,
 } from '../../../kernel/abi/index.js'
 import { SERVICES } from '../../../kernel/abi/index.js'
-import { heartbeat } from '../../../kernel/hostEntry.js'
 import { SessionRuntimeTable } from '../../../kernel/sessionRuntime.js'
 import type { PrivacyMode } from './modes.js'
 import { isPrivacyMode, modeTitle, originTitle, type ResolvedPrivacy } from './modes.js'
@@ -67,17 +66,8 @@ import { PrivacyState } from './state.js'
 import { PrivacyGate } from './gate.js'
 import type { PrivacyDoc } from './codec.js'
 import { createPrivacyDurable, resolvePrivacyPath, type StoragePortLike } from './durable.js'
-import type { CommandInvocationLike, CommandResultLike, PrivacyCommandApi } from './command.js'
-import {
-  PRIVACY_CLEAN_COMMAND_ID,
-  PRIVACY_CLEAN_COMMAND_NAME,
-  PRIVACY_COMMAND_ID,
-  PRIVACY_COMMAND_NAME,
-  PRIVACY_USAGE,
-  runPrivacyCleanCommand,
-  runPrivacyCommand,
-  sessionOfInvocation,
-} from './command.js'
+import type { CommandResultLike, PrivacyCommandApi } from './command.js'
+import { PRIVACY_CLEAN_COMMAND_NAME, PRIVACY_COMMAND_NAME } from './command.js'
 
 /** 对外服务名（判定端口；记忆库与制品索引在数据边界惰性解析它）。 */
 export const PRIVACY_SERVICE = SERVICES.privacy
@@ -90,9 +80,6 @@ export const PRIVACY_SERVICE = SERVICES.privacy
  * "内核没装"的隔离测试里走到，不能删）。
  */
 export const SESSION_RUNTIME_SERVICE = SERVICES.sessionRuntime
-
-/** 宿主命令服务名。 */
-export const COMMANDS_SERVICE = 'commands'
 
 export interface PrivacyConfig {
   /**
@@ -112,27 +99,6 @@ export const privacyConfigSchema = z
     path: z.string().min(1).nullable().default(null),
   })
   .default(PRIVACY_DEFAULT_CONFIG)
-
-/** 宿主 commands 服务的最小结构面。 */
-interface CommandsLike {
-  register(definition: {
-    readonly definitionId: string
-    readonly name: string
-    readonly description: string
-    /**
-     * **可选，但"带参数的命令能用"必须声明它。**
-     *
-     * 形状取 DSH 的 `CommandInputDescriptor`（`packages/interaction/commands/src/types.ts:20`）：
-     * `{ hint: string; attachments?: boolean }`。只要 `hint`。
-     *
-     * 为什么必须有：DSH 客户端 `ui-commands` 只在 `desc.input !== undefined` 时
-     * 才认领命令后面的参数（`client/service.ts:269` 与 `:282`）。
-     * 没声明时，`/omb-privacy read-only` 会被当成普通文本送进模型。
-     */
-    readonly input?: { readonly hint: string; readonly attachments?: boolean }
-    readonly handler: (invocation: CommandInvocationLike) => CommandResultLike | Promise<CommandResultLike>
-  }): unknown
-}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -180,7 +146,7 @@ export interface PrivacyInstallation {
   health(): ModuleHealth
   /** 状态段贡献者（记忆库的 `apply` 注册它；段落名保持 `隐私`）。 */
   readonly statusContributor: StatusContributor
-  /** 命令面读数（`已注册/未注册 + 原因`，进 `/omb-privacy status`）。 */
+  /** 命令面状态（v4.20 起固定为"已删除"，仍进健康面与设置页视图）。 */
   readonly commandState: () => string
   /**
    * 设置页的**管理端口**（v4.17）：只供 `omb:ui` 的 `privacy/privacyAct` 调用。
@@ -222,7 +188,7 @@ export function installPrivacy(
    *
    * 这个字段把"假设"变成界面上一行可读文本。
    */
-  let commandState = '（尚未尝试注册）'
+  const commandState = '已删除（v4.20：命令并入前端隐私页）'
 
   // ── 1) 会话运行态容器（复用别人的，没有才自己建）──────────────────
   let sessions = kernel.service<SessionRuntimeTable>(SESSION_RUNTIME_SERVICE)
@@ -321,7 +287,7 @@ export function installPrivacy(
       : '基线=normal（从未配置过）'
     const detail =
       `${entries.length} 个会话有显式设置；${describeRestrictedCounts(counts)}；${baselineTitle}；${fileState}；`
-      + `命令面：${PRIVACY_COMMAND_NAME}、${PRIVACY_CLEAN_COMMAND_NAME} ${commandState}；`
+      + `命令面：已删除（v4.20：能力并入前端隐私页）；`
       + `拒绝计数：读 ${stats.readDenials}、写 ${stats.writeDenials}、`
       + `归属未知写 ${stats.unattributedWriteDenials}`
     return {
@@ -388,8 +354,8 @@ export function installPrivacy(
     lines.push(` ${describeRestrictedCounts(counts)}`)
     if (counts !== null && counts.history > counts.active) {
       lines.push(
-        ' 已结束会话的记录不再掐住新会话；要清掉它们：'
-        + '/omb-privacy-clean clear（全部已结束的）或 /omb-privacy-clean <会话id>（单条）。',
+        ' 已结束会话的记录不再掐住新会话；在设置页隐私卡片清理'
+        + '（POST /omb/api/privacy：clear-inactive 或 clear <会话id>）。',
       )
     }
     lines.push(
@@ -406,8 +372,7 @@ export function installPrivacy(
       ` 拒绝计数：判定 ${stats.decisions} 次、读 ${stats.readDenials}、写 ${stats.writeDenials}、`
       + `归属未知写 ${stats.unattributedWriteDenials}`,
     )
-    lines.push(` 命令面：/omb-privacy —— ${commandState}`)
-    lines.push(` ${PRIVACY_USAGE}`)
+    lines.push(' 命令面：已删除（v4.20 并入前端隐私页）')
     return lines.join('\n')
   }
 
@@ -569,7 +534,8 @@ export function installPrivacy(
 
   /**
    * 完整形状的降级视图（缺字段会让前端拿不到键、把"未接线"渲染成空）。
-   * 命令面状态用**真实** `commandState`：视图读取失败不代表命令没注册。
+   * 命令面状态用**真实** `commandState`（v4.20 起固定为"已删除"）：视图读取失败
+   * 不代表命令仍在注册。
    */
   const emptyPrivacyView = (reason: string): UiPrivacyView => ({
     available: false,
@@ -688,109 +654,12 @@ export function installPrivacy(
     },
   }
 
-  // ── 4) 命令注册（宿主能力；缺失时如实说明，不抛）──────────────────
+  // ── 4) 用户命令：v4.20.0 起**不再注册**（能力并入前端隐私页）──────────
   //
-  // ⚠️ 实测（2026-09-30，真实 Web GUI）：**这条命令在 Web 界面里够不着**——
-  // 在会话里发出 `/omb-privacy normal` 后，`omb_status` 显示
-  // `显式设置 0 个会话`、状态文件从未被创建；grep 整个 DSH Web 客户端
-  // **没有任何斜杠命令处理**。后来查清根因是注册时没声明 `input` 描述符
-  // （见下面 `input` 的注释），补上后带参数的命令可用。工具面**始终没有**
-  // 隐私入口（隐私是用户的决定，模型不能自己解除限制）。
-  try {
-    const commands = kernel.service<CommandsLike>(COMMANDS_SERVICE)
-    if (commands === undefined || typeof commands.register !== 'function') {
-      commandState = '**未注册**：宿主 commands 服务不可用（行缺 inject: commands？）'
-      logger.warn(
-        'OMB 隐私：宿主 commands 服务不可用（omb-memory 行缺 inject: commands？）——'
-        + '隐私模式仍会被强制，用户无法用 /omb-privacy 切换（工具面不受影响）。',
-      )
-    } else {
-      const returned = commands.register({
-        definitionId: PRIVACY_COMMAND_ID,
-        name: PRIVACY_COMMAND_NAME,
-        description: '设置当前对话的记忆隐私模式',
-        /**
-         * ⚠️ **声明 `input` 是"带参数的命令能用"的前提**——这一行是缺了它才出的 bug。
-         *
-         * ## 实测症状（用户报告，2026-09-30）
-         *
-         * `/omb-privacy`（不带参数）**可用**，回执正常显示；
-         * `/omb-privacy read-only`（带参数）**不可用**——被当成普通文本送进模型，没有回执。
-         *
-         * ## 根因（DSH 客户端 `ui-commands` 的判定表）
-         *
-         * `packages/client/ui-commands/src/client/service.ts`：
-         * ```ts
-         * if (desc.input !== undefined) return { claim: this.leadingClaim(…) }   // 认领参数
-         * …
-         * if (desc === undefined || desc.input === undefined) return undefined    // 空格不认领
-         * ```
-         * 以及注释写明的决策表：
-         * `host input → claim; host bare → detached execute`。
-         *
-         * **不带参数走 `host bare`（直接执行），带参数走 `host input → claim`——
-         * 而 claim 只在命令声明了 `input` 时才成立。** 没声明时，
-         * 带参数的行**不被认领为命令**，于是照常作为文本提交给模型。
-         *
-         * 这也解释了为什么我之前扫会话日志找不到 `command/run`：
-         * 我试的那几条**恰好都带参数**（`status` / `normal` / `read-only`），
-         * 全都没进命令执行器；而不带参数的那次进了。
-         *
-         * `hint` 会在输入框里作为占位提示显示，也顺便告诉用户参数怎么给。
-         */
-        input: { hint: '[status | normal | read-only | sealed | trust]' },
-        handler: (invocation: CommandInvocationLike): CommandResultLike => {
-          // 用户手打的命令：先把血缘登记下来（子代理的父链），再执行。
-          const session = sessionOfInvocation(invocation)
-          if (session.sessionId !== null) {
-            created.noteLineage({
-              sessionId: session.sessionId,
-              parentSessionId: session.parentSessionId,
-              delegationDepth: session.delegationDepth,
-              source: 'explicit',
-            })
-          }
-          const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
-          return runPrivacyCommand(raw, session, api)
-        },
-      })
-      if (typeof returned === 'function') disposers.push(returned as () => void)
-      // 第二个命令：只做"清除当前或指定会话残留的受限记录"这一件事。
-      const returnedClean = commands.register({
-        definitionId: PRIVACY_CLEAN_COMMAND_ID,
-        name: PRIVACY_CLEAN_COMMAND_NAME,
-        description: '清理对话的隐私限制记录',
-        input: { hint: '[会话id | clear]（缺省=当前会话）' },
-        handler: (invocation: CommandInvocationLike): CommandResultLike => {
-          const session = sessionOfInvocation(invocation)
-          const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
-          return runPrivacyCleanCommand(raw, session, api)
-        },
-      })
-      if (typeof returnedClean === 'function') disposers.push(returnedClean as () => void)
-      heartbeat('privacy-clean-command', {
-        name: PRIVACY_CLEAN_COMMAND_NAME,
-        registered: true,
-        returned: typeof returnedClean,
-      })
-      /**
-       * **命令注册结果必须留痕。**
-       *
-       * 这条心跳把假设变成可读事实：`registered: true/false` +
-       * 宿主返回了什么。若为 false，说明 `/omb-privacy` 在界面里不可能出现。
-       */
-      heartbeat('privacy-command', {
-        name: PRIVACY_COMMAND_NAME,
-        registered: true,
-        returned: typeof returned,
-      })
-      commandState = `已注册（宿主返回 ${typeof returned}）`
-    }
-  } catch (error) {
-    commandState = `**未注册**：注册抛错——${messageOf(error)}`
-    heartbeat('privacy-command', { name: PRIVACY_COMMAND_NAME, registered: false, error: messageOf(error) })
-    logger.warn(`OMB 隐私：命令注册失败（已隔离）——${messageOf(error)}`)
-  }
+  // 用户要求"删除所有用户命令并把能力并入前端"：`/omb-privacy` 与
+  // `/omb-privacy-clean` 的注册已删除；隐私服务、状态面与 UI 的
+  // `privacy()`/`privacyAct()`（POST /omb/api/privacy）保持不变。
+  // `commandState` 已在上方初始化为"已删除"，不冒充已注册。
 
   // ── 5) 血缘登记：宿主会话头是 `parentSession` 的唯一来源 ──────────
   //
@@ -856,8 +725,9 @@ export function installPrivacy(
           durablePath === null
             ? '状态文件不可用（**未持久化**）'
             : `状态文件 ${durablePath}${durableError === null ? '（正常）' : `（降级：${durableError}）`}`,
-          '当前会话的模式：用 /omb-privacy status 查看（状态面拿不到"这次是谁在问"）',
-          '清理受限记录：/omb-privacy-clean（当前会话）、/omb-privacy-clean <会话id> 或 /omb-privacy-clean clear（全部已结束）',
+          '当前会话的模式：在设置页隐私卡片查看（状态面拿不到"这次是谁在问"）',
+          '清理受限记录：设置页隐私卡片（清除单条 / 清理已结束会话）',
+          '命令面：已删除（v4.20 并入前端隐私页）',
         ].join('；')
       } catch (error) {
         return `隐私状态渲染失败：${messageOf(error)}`
