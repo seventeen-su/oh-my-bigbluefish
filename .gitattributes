@@ -1,0 +1,41 @@
+# 行尾与文本规范化
+#
+# 为什么需要这个文件：仓库此前没有 .gitattributes，于是「谁在什么平台上提交」决定了入库的行尾——
+# `skills/omb-runtime/SKILL.md` 的 blob 就是 CRLF，导致只认 `\n` 的 frontmatter 正则在
+# **所有平台的所有克隆**上恒失败（不是环境差异，是入库内容差异）。把文本文件钉成 LF，
+# 让"仓库内容"成为唯一事实源，跨平台行为一致。
+#
+# 注意：只对**文本**生效，二进制文件（模型词表虽是大文本但按行解析，仍归文本；
+# 图片/权重/数据库一律走 binary）必须显式声明，否则 git 可能尝试转换而损坏内容。
+
+* text=auto eol=lf
+
+# 明确按二进制处理（不做任何行尾转换、不做 diff）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.7z binary
+*.exe binary
+*.dll binary
+*.node binary
+*.so binary
+*.dylib binary
+*.onnx binary
+*.onnx_data binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.wasm binary
+
+# 词表是逐行文本（WordPiece 按行号 = id 解析），行尾必须稳定
+memory/bge-small-zh/vocab.txt text eol=lf
+
+# 锁文件由包管理器生成：不要参与 diff 噪声（仍按文本存储）
+pnpm-lock.yaml text eol=lf -diff

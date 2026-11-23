@@ -1,0 +1,32 @@
+# 依赖与构建产物
+node_modules/
+lib/
+dist/
+*.tsbuildinfo
+lib-gen/
+
+# 运行时数据与日志
+.omb/
+*.log
+.omb-heartbeat.jsonl
+test-results/
+
+# BGE 权重约 24MB；不进 git，用 `node scripts/v7-fetch-model.mjs` 获取
+models/
+
+# 本地临时探针
+.tmp/
+.tmp-*
+
+# 历史资料与本地研究证据不纳入版本库（文件保留在工作区，仅不提交）
+docs/legacy/
+.research/
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 系统垃圾
+Thumbs.db
+.DS_Store

@@ -1,0 +1,12 @@
+packages:
+  - 'packages/*'
+
+# 宿主 peer 不物理装入本仓库：v7 只通过结构化 ctx.get 访问宿主。
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  onnxruntime-node: false
+
+minimumReleaseAgeExclude:
+  - pg-boss@12.39.0

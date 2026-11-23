@@ -1,0 +1,25 @@
+{
+  "major": 7,
+  "description": "OMB 7.0.0 = 单库属性化认知存储重构：PostgreSQL + pgvector、属性化记忆/状态机/思维链、引用与链接、两阶段检索、T0-T2 召回、后台巩固与审计回滚；删除旧前端、画像、隐私门控与画板。",
+  "features": [
+    {
+      "id": "v7-single-store",
+      "name": "v7 单库属性化重构",
+      "since": "7.0",
+      "subfeatures": [
+        "单 PostgreSQL 库与属性表真源",
+        "同事务派生 entity_view",
+        "记忆/状态机/思维链/历史版本",
+        "引用与方向链接",
+        "中文 bigram 全文与 chars 单字回退",
+        "pgvector HNSW 与迭代扫描",
+        "六通道两阶段检索 + RRF + 原始分门控",
+        "T0/T1/T2 召回与采用率",
+        "动态属性与 QuickJS 沙箱",
+        "pg-boss 后台巩固与审计回滚",
+        "无前端/无画像/无隐私门控"
+      ]
+    }
+  ],
+  "version": "7.0.0"
+}

@@ -1,0 +1,6 @@
+# OMB v7 挂载补丁：单行插件，无 HTTP / 无浏览器 bundle。
+# 必须 inject tools：否则 apply 在 tools 服务就绪前跑完，7 个 omb_* 工具不会注册。
+- insert:
+    - id: omb-v7
+      name: 'oh-my-bigbluefish/v7'
+      inject: ['tools']

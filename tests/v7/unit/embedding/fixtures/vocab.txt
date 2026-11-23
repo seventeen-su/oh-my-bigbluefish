@@ -1,0 +1,10 @@
+[PAD]
+[UNK]
+[CLS]
+[SEP]
+你
+好
+hello
+wor
+##ld
+，

@@ -1,0 +1,74 @@
+{
+  "name": "oh-my-bigbluefish",
+  "version": "7.0.0",
+  "private": true,
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <=0.2.3"
+  },
+  "type": "module",
+  "icon": "./icon.svg",
+  "description": "OMB v7：DSH 的单库属性化认知增强插件（PostgreSQL + pgvector）。",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.v7.yml"
+    }
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg",
+    "./v7": "./lib-gen/v7-g31/plugin/v7/index.js",
+    "./v7/icon": "./icon.svg"
+  },
+  "scripts": {
+    "test": "vitest run --config vitest.v7.config.ts",
+    "test:unit": "vitest run --config vitest.v7.config.ts tests/v7/unit",
+    "test:pg": "vitest run --config vitest.v7.config.ts tests/v7/integration",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint --config eslint.v7.config.mjs --no-error-on-unmatched-pattern packages/v7 plugin/v7 tests/v7",
+    "build": "node scripts/build-v7.mjs",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test:unit && pnpm test:pg && pnpm build",
+    "db:setup": "node scripts/v7-db-setup.mjs",
+    "model:fetch": "node scripts/v7-fetch-model.mjs",
+    "version:check": "node scripts/version.mjs",
+    "version:sync": "node scripts/version.mjs --write",
+    "v7:typecheck": "tsc --noEmit -p tsconfig.json",
+    "v7:lint": "eslint --config eslint.v7.config.mjs --no-error-on-unmatched-pattern packages/v7 plugin/v7 tests/v7",
+    "v7:test": "vitest run --config vitest.v7.config.ts tests/v7/unit",
+    "v7:test:pg": "vitest run --config vitest.v7.config.ts tests/v7/integration",
+    "v7:build": "node scripts/build-v7.mjs",
+    "v7:bench": "tsx scripts/v7-bench.ts",
+    "v7:deploy": "node scripts/v7-deploy.mjs",
+    "v7:db:setup": "node scripts/v7-db-setup.mjs",
+    "v7:verify": "pnpm v7:typecheck && pnpm v7:lint && pnpm v7:test && pnpm v7:test:pg && pnpm v7:build"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "pg": "8.23.1",
+    "pg-boss": "12.39.0",
+    "quickjs-emscripten": "0.32.0",
+    "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node": "1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/pg": "^8.23.1",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.39.5",
+    "tsx": "^4.23.12",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^3.2.7"
+  },
+  "files": [
+    "lib-gen",
+    "packages/v7",
+    "plugin/v7",
+    "skills",
+    "icon.svg",
+    "cordis.patch.v7.yml",
+    "models"
+  ],
+  "main": "./lib-gen/v7-g31/plugin/v7/index.js"
+}
