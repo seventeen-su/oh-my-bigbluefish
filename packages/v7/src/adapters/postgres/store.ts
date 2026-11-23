@@ -94,6 +94,52 @@ function mapPgError(error: unknown): OmbFailure {
   return new OmbFailure(internal(message))
 }
 
+/** 单次全文检索最多拼多少个 OR 词：长工具输出 tokenize 后动辄上百词，全量会撑大 tsquery。 */
+export const FULLTEXT_MAX_QUERY_TERMS = 48
+
+/** tsquery 词面白名单：元字符（& | ! ( ) : * < > ' \）与空白一律丢弃，避免语法错误。 */
+const TSQUERY_TERM = /^[\p{L}\p{N}][\p{L}\p{N}_.\-/]*$/u
+/** 单词长度上限：sha/uuid/base64 片段仍保留，超长无分隔 blob 不塞进 tsquery 撑大查询。 */
+const TSQUERY_TERM_MAX_LENGTH = 256
+
+/**
+ * 词形优先级：路径 > 错误码/带数字标识符 > 英文长词 > CJK bigram > 单字。
+ * 只在超过上限时用于挑保留哪 48 个词；最终输出顺序始终是原 token 顺序。
+ */
+function fulltextTermPriority(term: string): number {
+  const latin = /[A-Za-z]/.test(term)
+  const digit = /\d/.test(term)
+  let priority = term.length >= 2 ? 1 : 0
+  if (latin && term.length >= 3) priority += 2
+  if (latin && digit) priority += 4
+  if (/[\\/]/.test(term)) priority += 8
+  return priority
+}
+
+/**
+ * 把 tokenizer 输出收敛成有界 OR 查询词：去重、过滤 tsquery 元字符与超长词，
+ * 超过 48 个时优先保留路径/错误码/标识符/长词，最后按原顺序返回（确定性）。
+ * SQL 仍用参数化 `to_tsquery('simple', $1)`，词面白名单只防语法错误，不是注入防线。
+ */
+export function fulltextQueryTerms(tokens: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const candidates: { term: string; index: number; priority: number }[] = []
+  tokens.forEach((raw, index) => {
+    const term = raw.trim()
+    if (term.length === 0 || term.length > TSQUERY_TERM_MAX_LENGTH) return
+    if (!TSQUERY_TERM.test(term)) return
+    if (seen.has(term)) return
+    seen.add(term)
+    candidates.push({ term, index, priority: fulltextTermPriority(term) })
+  })
+  const selected = candidates
+    .sort((left, right) => right.priority - left.priority
+      || right.term.length - left.term.length
+      || left.index - right.index)
+    .slice(0, FULLTEXT_MAX_QUERY_TERMS)
+  return selected.sort((left, right) => left.index - right.index).map(item => item.term)
+}
+
 async function insertAttributes(client: PoolClient, entityId: string, attributes: readonly Attribute[]): Promise<void> {
   for (const attribute of attributes) {
     const value = attribute.value
@@ -1441,16 +1487,21 @@ export class PostgresStore implements Store {
   }
 
   private async searchFulltext(spec: TextSearchSpec): Promise<ChannelHit[]> {
-    if (spec.tokens.length === 0) return []
-    const query = spec.tokens.join(' & ')
-    const params: unknown[] = [query]
+    // 全 AND（tokens.join(' & ')）会让长工具输出/自然语言几乎恒零命中（RET-02）：
+    // 改成有界 OR；短查询用 ts_rank_cd 保留邻近度，长查询用 ts_rank 控成本。
+    const terms = fulltextQueryTerms(spec.tokens)
+    if (terms.length === 0) return []
+    const params: unknown[] = [terms.join(' | ')]
     const filter = this.scopeClause(spec, params)
     params.push(Math.max(1, Math.min(100, spec.limit)))
+    // ts_rank_cd 的 cover-density 成本随 OR 词数超线性增长；短查询仍用它保留邻近度，
+    // 长查询（>8 词）改用线性成本的 ts_rank，避免 10 万级候选把 T1 拖过预算。
+    const rank = terms.length <= 8 ? 'ts_rank_cd' : 'ts_rank'
     const rows = await this.db.query<{ entity_id: string; raw: number }>(
-      `select v.entity_id, ts_rank_cd(v.search_tsv, q) as raw
+      `select v.entity_id, ${rank}(v.search_tsv, q) as raw
        from omb.entity_view v, to_tsquery('simple', $1) q
        where v.search_tsv @@ q ${filter}
-       order by raw desc, v.updated_at desc
+       order by raw desc, v.updated_at desc, v.entity_id asc
        limit $${params.length}`,
       params,
     )
@@ -1464,13 +1515,13 @@ export class PostgresStore implements Store {
     params.push(Math.max(1, Math.min(20, spec.limit)))
     const rows = await this.db.query<{ entity_id: string; raw: number }>(
       // datctype=C 的库里 similarity('中文','中') 恒为 0，不能拿它当 rawScore；
-      // 单/双字查询按字符集合做 GIN 候选，再用 snippet 子串命中给确定分数。
+      // chars GIN 给出覆盖全文的候选（不再用 240 字 snippet 复核，否则尾部字符必漏，RET-01）；
+      // search_text 是 tokenize 后以空格分隔的词，去空格近似原文，用于给连续子串更高 raw。
       `select v.entity_id,
-              case when v.snippet ilike '%' || $1 || '%' then 1.0 else 0.8 end as raw
+              case when strpos(replace(v.search_text, ' ', ''), $1) > 0 then 1.0 else 0.5 end as raw
        from omb.entity_view v
-       where v.chars @> string_to_array($1, NULL)
-         and v.snippet ilike '%' || $1 || '%' ${filter}
-       order by raw desc, v.updated_at desc
+       where v.chars @> string_to_array($1, NULL) ${filter}
+       order by raw desc, v.updated_at desc, v.entity_id asc
        limit $${params.length}`,
       params,
     )

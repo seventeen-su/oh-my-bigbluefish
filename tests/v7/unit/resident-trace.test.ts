@@ -89,6 +89,39 @@ describe('T0 常驻 trace', () => {
     expect(built.trace.sections.every(section => section.tokens === 0 || section.text.length > 0)).toBe(true)
   })
 
+  it('给定预算只够常驻 header 当构建常驻文本则返回空串且 trace 记为未注入', async () => {
+    const engine = {
+      async recall() {
+        return stateResult()
+      },
+    } as unknown as RecallEngine
+    const built = await buildResident(
+      engine,
+      { sessionId: 'session-trace-header-only', cwd: '/workspace', projectKey: '/workspace' },
+      5,
+      async () => ({
+        memory: 1,
+        state: 1,
+        chain: 0,
+        archived: 0,
+        attrNames: ['title'],
+        categories: { fact: 1, clue: 0, event: 0 },
+        scopes: { global: 0, project: 1 },
+        recentStates: [{ id: stateHit.entityId, title: '状态标题', status: 'in_progress' }],
+      }),
+      undefined,
+      async () => [preference],
+    )
+
+    expect(built.text).toBe('')
+    expect(built.trace.text).toBe('')
+    expect(built.trace.usedTokens).toBe(0)
+    expect(built.trace.sections.find(section => section.name === 'header')?.kept).toBe(false)
+    expect(built.trace.sections.every(section => section.kept === false)).toBe(true)
+    expect(built.trace.droppedSections).toContain('header')
+    expect(built.preferenceHits).toEqual([])
+  })
+
   it('给定预算充足当构建常驻文本则保留三段内容且 trace 完整', async () => {
     const engine = {
       async recall() {

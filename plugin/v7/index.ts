@@ -17,7 +17,7 @@ import { PgBossQueue, describeJobHealth } from '../../packages/v7/src/adapters/p
 import type { JobFinalFailureSummary } from '../../packages/v7/src/ports/jobs.js'
 import { createEventCapture } from '../../packages/v7/src/adapters/dsh/events.js'
 import { createDshTaskReader } from '../../packages/v7/src/adapters/dsh/tasks.js'
-import { asRecord, createLogger, createPromptSink, type HostContextLike, type ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
+import { asRecord, createLogger, createPromptSink, sessionFromExec, type HostContextLike, type ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
 import {
   registerTools,
   resolveToolContext,
@@ -38,6 +38,15 @@ import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import { buildEventRecallText, buildResident } from '../../packages/v7/src/recall/resident.js'
 import { LazyInitializer } from './startup.js'
+import {
+  hasStrongSignal,
+  isRecallTriggerEvent,
+  recallContentFingerprint,
+  shouldRecallOnPreStep,
+  shouldRecallToolResult,
+  stepKeyOf,
+  toolFailed,
+} from './t1.js'
 
 export interface V7Config {
   readonly databaseUrl: string
@@ -224,6 +233,19 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | und
   })
 }
 
+const SESSION_STATE_LIMIT = 256
+
+/** 会话级 Map 的 LRU 上限：长会话/多会话运行时不能无限增长（RET-13）。 */
+function rememberSessionState<T>(map: Map<string, T>, sessionId: string, value: T): void {
+  map.delete(sessionId)
+  map.set(sessionId, value)
+  while (map.size > SESSION_STATE_LIMIT) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
+}
+
 function formatWrite(result: Awaited<ReturnType<RememberService['remember']>>): string {
   if (!result.ok) return ''
   const written = result.value
@@ -321,13 +343,19 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     taskReader: createDshTaskReader(ctx),
   })
   const engine = new RecallEngine({ store, embedder, clock })
+  // 会话级 T1 状态：全部按 sessionId 键控，session/disposed 与插件卸载时清理（RET-13/RUN-05）。
   const pendingRecall = new Map<string, RecallInjection[]>()
   // T1 由 session/event 触发；pre-step 消费后清空，避免重复注入。
   const pendingT1 = new Map<string, { readonly scenario: RecallScenario; readonly query: string }>()
   // tools/post-execute 已经即时注入的 T1 文本；下一次 pre-step 直接复用，避免同一次工具结果重复召回。
   const immediateT1 = new Map<string, string>()
   // tools/pre-execute 在派发前启动的召回；post-execute 有结果后优先复用，避免重复查库。
-  const prefetchedT1 = new Map<string, Promise<string>>()
+  // 带上 sessionId 才能在 session/disposed 时清掉未消费的预取。
+  const prefetchedT1 = new Map<string, { readonly sessionId: string; readonly promise: Promise<string> }>()
+  // 最近一次 pre-step 的 turn/step：post-execute 没有步号，只能沿用它判断「本步是否已投递 T1」。
+  const currentStep = new Map<string, { readonly turn: number; readonly step: number; readonly key: string }>()
+  // 已经消费过 T1 的步键（pre-step 或工具结果）。
+  const t1Step = new Map<string, string>()
   const recallService = new RecallService(engine, dynamicService, injection => {
     const list = pendingRecall.get(injection.sessionId) ?? []
     list.push(injection)
@@ -545,10 +573,28 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   if (!promptSink.available) logger.warn(`提示注入未接线：${promptSink.reason ?? '未知原因'}`)
 
   const residentCache = new Map<string, { readonly turn: number | undefined; readonly text: string }>()
-  const lastEvent = new Map<string, string>()
+  // 已投递 T1 的跨 step 内容指纹（session+query+result，不含 turn/step）；
+  // 同一步的配额由 t1Step 负责，这里挡住「步号变了、内容没变」的重复注入。
+  const lastT1 = new Map<string, string>()
   let preStepOff: (() => void) | undefined
   let toolContextOff: (() => void) | undefined
   let toolPreExecuteOff: (() => void) | undefined
+  let sessionDisposedOff: (() => void) | undefined
+
+  /** 清掉一个 session 的全部 T0/T1 会话态，并清空它的 system prompt 文本。 */
+  const clearSessionState = (sessionId: string): void => {
+    pendingRecall.delete(sessionId)
+    pendingT1.delete(sessionId)
+    immediateT1.delete(sessionId)
+    residentCache.delete(sessionId)
+    lastT1.delete(sessionId)
+    currentStep.delete(sessionId)
+    t1Step.delete(sessionId)
+    for (const [callId, entry] of prefetchedT1) {
+      if (entry.sessionId === sessionId) prefetchedT1.delete(callId)
+    }
+    promptSink.write(sessionId, '')
+  }
 
   const rememberInjection = (sessionId: string, notice: { traceId: string; hits: readonly { id: string; title?: string }[] }): void => {
     if (notice.hits.length === 0) return
@@ -597,11 +643,16 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
     if (type.startsWith('compaction/')) {
       residentCache.delete(sessionId)
+      // 压缩后旧工具结果的 T1 已经过期；丢掉 immediateT1 与指纹，让待消费事件重新召回。
+      immediateT1.delete(sessionId)
+      lastT1.delete(sessionId)
       pendingT1.set(sessionId, { scenario: 'session-start', query: text.slice(0, 4_000) })
       return
     }
-    if (type.startsWith('subagent/') || type.startsWith('team/') || type.startsWith('task/')) {
+    if (isRecallTriggerEvent(type)) {
       residentCache.delete(sessionId)
+      immediateT1.delete(sessionId)
+      lastT1.delete(sessionId)
       pendingT1.set(sessionId, { scenario: 'session-start', query: text.slice(0, 4_000) })
     }
   }
@@ -609,13 +660,18 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   const capture = createEventCapture({ ctx, store, logger, onEvent: observeEvent })
 
   /** 在工具派发前启动 T1 召回；不阻塞 dispatch，结果由 post-execute 复用。 */
-  const prefetchToolRecall = (exec: unknown): void => {
+  const prefetchToolRecall = (exec: unknown, sessionId: string | undefined): void => {
     const record = asRecord(exec)
     const callId = typeof record?.['callId'] === 'string' ? record['callId'] : undefined
     const name = typeof record?.['name'] === 'string' ? record['name'] : ''
     if (callId === undefined || name.length === 0 || name.startsWith('omb_')) return
     const raw = [name, eventText(record?.['arguments'])].filter(part => part.length > 0).join('\n').slice(0, 8_000)
     if (raw.trim().length === 0) return
+    // 只有路径/错误码/代码样式标识符才值得在派发前先查一次；普通成功工具不预取。
+    if (!hasStrongSignal(raw)) return
+    // 本步已经投递过 T1（pre-step 或前一个工具结果），不再为第二个工具预取。
+    const position = sessionId === undefined ? undefined : currentStep.get(sessionId)
+    if (sessionId !== undefined && position !== undefined && t1Step.get(sessionId) === position.key) return
     const query = (() => {
       const signals = extractQuerySignals(raw)
       return [raw, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
@@ -637,12 +693,12 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       const oldest = prefetchedT1.keys().next().value
       if (oldest !== undefined) prefetchedT1.delete(oldest)
     }
-    prefetchedT1.set(callId, promise)
+    prefetchedT1.set(callId, { sessionId: sessionId ?? '', promise })
   }
 
   const preExecuteTool = async (exec: unknown, next?: () => unknown): Promise<unknown> => {
     const decision = typeof next === 'function' ? await next() : { kind: 'allow' }
-    if (asRecord(decision)?.['kind'] === 'allow') prefetchToolRecall(exec)
+    if (asRecord(decision)?.['kind'] === 'allow') prefetchToolRecall(exec, sessionFromExec(exec)?.sessionId)
     return decision
   }
 
@@ -664,18 +720,33 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       if (name.length === 0 || name.startsWith('omb_')) return decision
       const context = await resolveToolContext(exec)
       if (context === undefined) return decision
-      const raw = [
-        name,
-        eventText(execRecord?.['arguments']),
-        toolResultText(result),
-      ].filter(part => part.length > 0).join('\n').slice(0, 8_000)
+      const sessionId = context.sessionId
+      const argumentsText = eventText(execRecord?.['arguments'])
+      const resultText = toolResultText(result)
+      const raw = [name, argumentsText, resultText].filter(part => part.length > 0).join('\n').slice(0, 8_000)
       if (raw.trim().length === 0) return decision
+      const resultRecord = asRecord(result)
+      const failed = toolFailed(resultRecord?.['isError'] === true, resultText)
+      // 普通成功工具不召回：只有失败，或参数/结果带路径、错误码、代码样式标识符才进入 T1。
+      if (!shouldRecallToolResult({ failed, argumentsText, resultText })) {
+        if (callId !== undefined) prefetchedT1.delete(callId)
+        return decision
+      }
+      const position = currentStep.get(sessionId)
+      if (position !== undefined && t1Step.get(sessionId) === position.key) {
+        // 本步的 T1 已由 pre-step 或前一个工具结果投递；第二个工具不再追加一段。
+        if (callId !== undefined) prefetchedT1.delete(callId)
+        return decision
+      }
       const signals = extractQuerySignals(raw)
       const query = [raw, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
-      const resultRecord = asRecord(result)
-      const failed = resultRecord?.['isError'] === true
-        || /(?:error|failed|failure|exception|exit code|失败|报错)/i.test(raw)
-      const prefetched = callId === undefined ? undefined : prefetchedT1.get(callId)
+      // 跨 step 内容指纹：同一个工具结果重复出现时不重复注入；步内配额由 t1Step 负责。
+      const fingerprint = recallContentFingerprint({ sessionId, query, result: resultText })
+      if (lastT1.get(sessionId) === fingerprint) {
+        if (callId !== undefined) prefetchedT1.delete(callId)
+        return decision
+      }
+      const prefetched = callId === undefined ? undefined : prefetchedT1.get(callId)?.promise
       if (callId !== undefined) prefetchedT1.delete(callId)
       // 成功的工具优先复用派发前的召回；报错时结果里的错误码更有价值，重新查一次。
       let injected = !failed && prefetched !== undefined
@@ -689,13 +760,16 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             query,
             failed ? 'tool-error' : 'tool-before',
             400,
-            notice => rememberInjection(context.sessionId, notice),
+            notice => rememberInjection(sessionId, notice),
           ),
           1_500,
         ) ?? ''
       }
       if (injected.length === 0) return decision
-      immediateT1.set(context.sessionId, injected)
+      // 只登记真正投递出去的 T1：下一轮 pre-step 认领它，本步配额同时记为已用。
+      rememberSessionState(immediateT1, sessionId, injected)
+      rememberSessionState(lastT1, sessionId, fingerprint)
+      if (position !== undefined) rememberSessionState(t1Step, sessionId, position.key)
       const additional = {
         id: `msg_omb_${randomUUID()}`,
         role: 'user',
@@ -719,14 +793,21 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       const context = await resolveToolContext(payload)
       const record = typeof payload === 'object' && payload !== null ? payload as Record<string, unknown> : undefined
       if (context !== undefined && record !== undefined) {
-        const triggered = pendingT1.get(context.sessionId)
-        if (triggered !== undefined) {
-          pendingT1.delete(context.sessionId)
-          // 压缩/子任务切换后常驻层必须重建，不能吃同一 turn 的旧文本。
-          residentCache.delete(context.sessionId)
-        }
+        const sessionId = context.sessionId
         const turn = typeof record['turn'] === 'number' ? record['turn'] : undefined
-        const cached = residentCache.get(context.sessionId)
+        const step = typeof record['step'] === 'number' ? record['step'] : undefined
+        const stepKey = stepKeyOf({ turn, step })
+        // post-execute 拿不到步号，只能沿用最近一次 pre-step 的 turn/step 判断本步配额。
+        if (turn !== undefined && step !== undefined && stepKey !== undefined) {
+          rememberSessionState(currentStep, sessionId, { turn, step, key: stepKey })
+        }
+        const triggered = pendingT1.get(sessionId)
+        if (triggered !== undefined) {
+          pendingT1.delete(sessionId)
+          // 压缩/子任务切换后常驻层必须重建，不能吃同一 turn 的旧文本。
+          residentCache.delete(sessionId)
+        }
+        const cached = residentCache.get(sessionId)
         let resident = cached !== undefined && cached.turn === turn ? cached.text : ''
         if (resident.length === 0) {
           const built = await withTimeout(
@@ -735,7 +816,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
               context,
               config.residentBudget,
               () => store.stats(),
-              notice => rememberInjection(context.sessionId, notice),
+              notice => rememberInjection(sessionId, notice),
               () => store.preferenceSummaries?.(5) ?? Promise.resolve([]),
             ),
             1_500,
@@ -755,7 +836,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
               // 偏好不走 engine.recall；必须单独写 recall_event，后续才能记录 adopted。
               void store.recordRecall(preferenceHits.map((hit, index) => ({
                 traceId: preferenceTraceId,
-                sessionId: context.sessionId,
+                sessionId,
                 ...(turn === undefined ? {} : { turnId: String(turn) }),
                 query: 'T0 常驻偏好',
                 trigger: 't0',
@@ -765,7 +846,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
                 injected: true,
               }))).then(() => {
                 // 只有 recall_event 已落库后才登记采用等待，避免 adopted 更新不到行。
-                rememberInjection(context.sessionId, {
+                rememberInjection(sessionId, {
                   traceId: preferenceTraceId,
                   hits: preferenceHits,
                 })
@@ -774,7 +855,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
               })
             }
           }
-          residentCache.set(context.sessionId, { turn, text: resident })
+          rememberSessionState(residentCache, sessionId, { turn, text: resident })
         }
         const userText = lastUserText(record['messages'])
         const toolText = lastToolText(record['messages'])
@@ -782,25 +863,28 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         const eventSource = [triggered?.query, recentText, userText, toolText]
           .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
           .join('\n')
+        // 工具结果已经通过 additionalContexts 进入下一步：本步不再把同一段文本写回
+        // system prompt，但仍记为本步已消费 T1，避免同一步的后续工具结果再挂一段。
+        // 跨 step 的内容指纹不含 turn/step：同一段事件源在下一步不能因步号变化重复召回。
+        // 注意 Map.delete 返回 boolean，不是旧文本。
+        const contentFingerprint = recallContentFingerprint({ sessionId, query: eventSource })
+        const consumedImmediate = immediateT1.delete(sessionId)
         let injected = ''
-        const immediate = immediateT1.delete(context.sessionId)
-        if (immediate) {
-          // 工具结果已经通过 additionalContexts 进入下一步；pre-step 不再把同一段
-          // 文本重复放进 system prompt，只记下本事件，避免后续 pre-step 再召回。
-          lastEvent.set(context.sessionId, `${turn ?? '?'}\u0000${eventSource}`)
-        } else if (eventSource.length > 0) {
-          const key = `${turn ?? '?'}\u0000${eventSource}`
-          if (lastEvent.get(context.sessionId) !== key) {
+        if (consumedImmediate) {
+          if (stepKey !== undefined) rememberSessionState(t1Step, sessionId, stepKey)
+          // 工具结果已经把这批内容送进上下文；下一步事件源不变时 pre-step 不再重复召回。
+          if (eventSource.length > 0) rememberSessionState(lastT1, sessionId, contentFingerprint)
+        } else if (shouldRecallOnPreStep({ pending: triggered !== undefined, text: eventSource })) {
+          const alreadyRecalled = stepKey !== undefined && t1Step.get(sessionId) === stepKey
+          if (!alreadyRecalled && lastT1.get(sessionId) !== contentFingerprint) {
             const signals = extractQuerySignals(eventSource)
             const query = [eventSource, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
             const scenario: RecallScenario = triggered?.scenario
-              ?? (userText !== undefined
-                ? recallScenarioForQuery(userText) === 'last-time'
-                  ? 'last-time'
-                  : turn === 1 ? 'session-start' : 'manual'
-                : /(?:error|failed|failure|exception|exit code|失败|报错)/i.test(eventSource)
+              ?? (userText !== undefined && recallScenarioForQuery(userText) === 'last-time'
+                ? 'last-time'
+                : toolFailed(false, eventSource)
                   ? 'tool-error'
-                  : 'tool-before')
+                  : turn === 1 ? 'session-start' : 'manual')
             injected = await withTimeout(
               buildEventRecallText(
                 engine,
@@ -808,15 +892,20 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
                 query,
                 scenario,
                 400,
-                notice => rememberInjection(context.sessionId, notice),
+                notice => rememberInjection(sessionId, notice),
               ),
               1_500,
             ) ?? ''
-            lastEvent.set(context.sessionId, key)
+            if (injected.length > 0) {
+              // 只有真正进入 system prompt 的召回才占用本步配额与去重指纹。
+              rememberSessionState(lastT1, sessionId, contentFingerprint)
+              if (stepKey !== undefined) rememberSessionState(t1Step, sessionId, stepKey)
+            }
           }
         }
         const text = [resident, injected].filter(part => part.length > 0).join('\n\n')
-        if (text.length > 0) promptSink.write(context.sessionId, text)
+        // RUN-04：本次没有 T1（甚至 T0 也为空）时也要覆盖写空串，清掉上一轮旧文本。
+        promptSink.write(sessionId, text)
       }
     } catch (error) {
       logger.warn('pre-step 注入失败', messageOf(error))
@@ -860,6 +949,27 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     logger.warn('注册 tools/post-execute 失败', messageOf(error))
   }
 
+  // 会话结束必须清掉该 session 的 T0/T1 会话态与 system prompt 文本，
+  // 否则长会话/多会话运行时会一直增长并看到已结束会话的旧记忆（RET-13/RUN-05）。
+  try {
+    if (typeof ctx.on === 'function') {
+      const returned = ctx.on('session/disposed', ((session: unknown) => {
+        const record = asRecord(session)
+        const id = typeof record?.['id'] === 'string'
+          ? record['id']
+          : typeof record?.['sessionId'] === 'string'
+            ? record['sessionId']
+            : undefined
+        if (id !== undefined && id.trim().length > 0) clearSessionState(id)
+      }) as never)
+      if (typeof returned === 'function') sessionDisposedOff = returned as () => void
+    } else {
+      logger.warn('宿主没有 on()，session/disposed 清理未接线')
+    }
+  } catch (error) {
+    logger.warn('注册 session/disposed 清理失败', messageOf(error))
+  }
+
   let disposed = false
   return () => {
     if (disposed) return
@@ -894,6 +1004,20 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     } catch {
       // 同上。
     }
+    try {
+      sessionDisposedOff?.()
+    } catch {
+      // 同上。
+    }
+    // 卸载后没有任何调用者会再读这些会话态；显式清空，避免热重载时旧缓存跨实例存活。
+    pendingRecall.clear()
+    pendingT1.clear()
+    immediateT1.clear()
+    prefetchedT1.clear()
+    residentCache.clear()
+    lastT1.clear()
+    currentStep.clear()
+    t1Step.clear()
     stopConsolidation?.()
     // 先让 worker 停掉，再关业务连接池，最后才停便携 PostgreSQL；三个动作不能并发，
     // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。

@@ -1,10 +1,12 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { apply } from '../../../plugin/v7/index.js'
-import type { HostContextLike, HostToolDefinition } from '../../../packages/v7/src/adapters/dsh/host.js'
+import { createPromptSink, type HostContextLike, type HostToolDefinition } from '../../../packages/v7/src/adapters/dsh/host.js'
 import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { prepareDatabase, resetDatabase, TEST_DATABASE_URL } from './helpers.js'
 
 function wait(ms: number): Promise<void> {
+  // 既有 adoption/异步落库等待，T1 改动未新增此模式；后续改条件轮询时一并处理。
+  // check:ignore-next-line test-sleep
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
@@ -380,7 +382,7 @@ describe('v7 plugin entry', () => {
       kind: 'memory',
       category: 'fact',
       scope: 'project',
-      attrs: { title: '工具预取命中记忆', body: '调用前预取' },
+      attrs: { title: '工具预取命中记忆', body: '调用前预取', tools: ['bash'] },
     }, exec)
     expect(remembered?.ok).toBe(true)
 
@@ -391,7 +393,8 @@ describe('v7 plugin entry', () => {
     const toolExec = {
       callId: 'call-prefetch-1',
       name: 'bash',
-      arguments: { command: 'cat 工具预取命中记忆' },
+      // 成功工具只在参数含路径/代码样式标识符时才预取并注入；普通调用不再召回。
+      arguments: { command: 'cat 工具预取命中记忆 spec.md' },
       agent: { session: { id: 'tool-prefetch-session', header: { cwd: PROJECT } } },
     }
     await expect(preExecute?.(toolExec, async () => ({ kind: 'allow' }))).resolves.toEqual({ kind: 'allow' })
@@ -403,5 +406,313 @@ describe('v7 plugin entry', () => {
     const injected = decision?.additionalContexts?.[0]?.content?.[0]?.text ?? ''
     expect(injected).toContain('工具预取命中记忆')
     dispose()
+  })
+
+  it('compaction 事件在下一步强制 T1，不依赖回忆意图', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'compaction-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '压缩后重建记忆', body: 'compaction probe' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const event = host.listeners.get('session/event')
+    expect(event).toBeDefined()
+    // 事件文本与记忆标题共享全文词，但没有回忆意图/强信号：只有 pendingT1 能触发召回。
+    event?.(
+      { id: 'compaction-session', header: { cwd: PROJECT } },
+      { type: 'compaction/start', seq: 1, data: { summary: '压缩后重建记忆' } },
+    )
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.(
+      {
+        agent: { session: { id: 'compaction-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: '你好' }],
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(host.provider?.({ agent: { session: { id: 'compaction-session' } } })).toContain('[OMB 事件召回]')
+
+    await preStep?.(
+      {
+        agent: { session: { id: 'compaction-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: '你好' }],
+        turn: 1,
+        step: 2,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    // 待消费事件只用一次：下一步没有新触发就不再召回。
+    expect(host.provider?.({ agent: { session: { id: 'compaction-session' } } })).not.toContain('[OMB 事件召回]')
+    dispose()
+  })
+
+  it('同一 step 连续两次 post-execute 只挂一段 additionalContexts', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'step-dedupe-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '单步去重召回', body: 'ENOENT 失败 排查', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.(
+      {
+        agent: { session: { id: 'step-dedupe-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: '列出当前目录' }],
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    // 没有强触发：pre-step 本身不该注入 T1，本步的 T1 配额留给工具结果。
+    expect(host.provider?.({ agent: { session: { id: 'step-dedupe-session' } } })).not.toContain('[OMB 事件召回]')
+
+    const postExecute = host.listeners.get('tools/post-execute')
+    const first = await postExecute?.(
+      {
+        callId: 'call-step-1',
+        name: 'bash',
+        arguments: { command: 'cat missing-file-1' },
+        agent: { session: { id: 'step-dedupe-session', header: { cwd: PROJECT } } },
+      },
+      { isError: true, content: [{ type: 'text', text: 'ENOENT 单步去重召回 失败' }] },
+      async () => ({ kind: 'accept' }),
+    ) as { additionalContexts?: { content?: { text?: string }[] }[] } | undefined
+    expect(first?.additionalContexts).toHaveLength(1)
+
+    const second = await postExecute?.(
+      {
+        callId: 'call-step-2',
+        name: 'bash',
+        arguments: { command: 'cat missing-file-2' },
+        agent: { session: { id: 'step-dedupe-session', header: { cwd: PROJECT } } },
+      },
+      { isError: true, content: [{ type: 'text', text: 'EACCES 单步去重召回 失败' }] },
+      async () => ({ kind: 'accept' }),
+    ) as { additionalContexts?: unknown[] } | undefined
+    // 同一 turn:step 已经投递过 T1，第二个工具结果不再追加。
+    expect(second?.additionalContexts).toBeUndefined()
+    dispose()
+  })
+
+  it('无关成功工具不触发 T1 注入', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'plain-tool-session', header: { cwd: PROJECT } } } }
+    // 这条记忆与工具输出共享 bash/total/0，且触发器命中 bash：若没有闸门会被召回。
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '普通命令输出探针', body: 'total 0 command ls', tools: ['bash'] },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.(
+      {
+        agent: { session: { id: 'plain-tool-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: '你好' }],
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    const postExecute = host.listeners.get('tools/post-execute')
+    const decision = await postExecute?.(
+      {
+        callId: 'call-ls',
+        name: 'bash',
+        arguments: { command: 'ls' },
+        agent: { session: { id: 'plain-tool-session', header: { cwd: PROJECT } } },
+      },
+      { isError: false, content: [{ type: 'text', text: 'total 0' }] },
+      async () => ({ kind: 'accept' }),
+    ) as { additionalContexts?: unknown[] } | undefined
+    expect(decision?.additionalContexts).toBeUndefined()
+    dispose()
+  })
+
+  it('空 T1 的 pre-step 清除上一轮 system prompt 旧文本', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'stale-clear-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '清旧命中记忆', body: '上次失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.(
+      {
+        agent: { session: { id: 'stale-clear-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' }],
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(host.provider?.({ agent: { session: { id: 'stale-clear-session' } } })).toContain('[OMB 事件召回]')
+
+    await preStep?.(
+      {
+        agent: { session: { id: 'stale-clear-session', header: { cwd: PROJECT } } },
+        // 与记忆共享全文词，但没有回忆意图/强信号：新 T1 必须为空。
+        messages: [{ source: { kind: 'user' }, content: '清旧命中记忆的标题是什么' }],
+        turn: 1,
+        step: 2,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    const prompt = host.provider?.({ agent: { session: { id: 'stale-clear-session' } } }) ?? ''
+    // RUN-04：T1 为空也必须覆盖写入，上一轮的 [OMB 事件召回] 不能留在 system prompt。
+    expect(prompt).not.toContain('[OMB 事件召回]')
+    expect(prompt).toContain('[OMB 常驻]')
+    dispose()
+  })
+
+  it('同一错误工具结果连续两个 pre-step 只注入一次 T1', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'repeat-pre-step-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '重复错误召回', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: { session: { id: 'repeat-pre-step-session', header: { cwd: PROJECT } } },
+      messages: [
+        { source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'ENOENT 重复错误召回 失败' },
+      ],
+      turn: 1,
+      step: 1,
+    }
+    await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    expect(host.provider?.({ agent: { session: { id: 'repeat-pre-step-session' } } })).toContain('[OMB 事件召回]')
+
+    // 只有步号变化、事件源内容完全一致：跨 step 内容指纹必须挡住第二次召回。
+    await preStep?.(
+      { ...payload, step: 2 },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    const prompt = host.provider?.({ agent: { session: { id: 'repeat-pre-step-session' } } }) ?? ''
+    expect(prompt).not.toContain('[OMB 事件召回]')
+    expect(prompt).toContain('[OMB 常驻]')
+    dispose()
+  })
+
+  it('session/disposed 清理该 session 的 T1 缓存与提示文本', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'disposed-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '处置清理记忆', body: 'ENOENT 失败', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.(
+      {
+        agent: { session: { id: 'disposed-session', header: { cwd: PROJECT } } },
+        messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次的报错' }],
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(host.provider?.({ agent: { session: { id: 'disposed-session' } } })).toContain('[OMB 事件召回]')
+
+    const postExecute = host.listeners.get('tools/post-execute')
+    const toolExec = {
+      callId: 'call-disposed-1',
+      name: 'bash',
+      arguments: { command: 'cat missing-file' },
+      agent: { session: { id: 'disposed-session', header: { cwd: PROJECT } } },
+    }
+    const toolResult = { isError: true, content: [{ type: 'text', text: 'ENOENT 处置清理记忆 失败' }] }
+    const skipped = await postExecute?.(toolExec, toolResult, async () => ({ kind: 'accept' })) as {
+      additionalContexts?: unknown[]
+    } | undefined
+    // 本步的 T1 已由 pre-step 消费。
+    expect(skipped?.additionalContexts).toBeUndefined()
+
+    const dismissed = host.listeners.get('session/disposed')
+    expect(dismissed).toBeDefined()
+    dismissed?.({ id: 'disposed-session' })
+    expect(host.provider?.({ agent: { session: { id: 'disposed-session' } } })).toBe('')
+
+    const again = await postExecute?.(
+      { ...toolExec, callId: 'call-disposed-2' },
+      toolResult,
+      async () => ({ kind: 'accept' }),
+    ) as { additionalContexts?: unknown[] } | undefined
+    // 步键与指纹缓存都已清空：同一片段可以重新投递，不会命中残留去重。
+    expect(again?.additionalContexts).toHaveLength(1)
+    dispose()
+  })
+
+  it('promptSink 写空串后该 session 读取为空串', () => {
+    const host = fakeHost()
+    const sink = createPromptSink(host.ctx)
+    expect(sink.available).toBe(true)
+    expect(sink.write('sink-session', '[OMB 事件召回]\n相关：旧文本')).toBe(true)
+    expect(host.provider?.({ agent: { session: { id: 'sink-session' } } })).toContain('[OMB 事件召回]')
+    expect(sink.write('sink-session', '')).toBe(true)
+    expect(host.provider?.({ agent: { session: { id: 'sink-session' } } })).toBe('')
+    sink.dispose()
   })
 })
