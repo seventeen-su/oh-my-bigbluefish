@@ -37,6 +37,7 @@
     "v7:test:pg": "vitest run --config vitest.v7.config.ts tests/v7/integration",
     "v7:build": "node scripts/build-v7.mjs",
     "v7:bench": "tsx scripts/v7-bench.ts",
+    "v7:shadow": "tsx scripts/v7-shadow-compare.ts",
     "v7:deploy": "node scripts/v7-deploy.mjs",
     "v7:db:setup": "node scripts/v7-db-setup.mjs",
     "v7:verify": "pnpm v7:typecheck && pnpm v7:lint && pnpm v7:test && pnpm v7:test:pg && pnpm v7:build"
