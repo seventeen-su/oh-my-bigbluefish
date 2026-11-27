@@ -16,7 +16,7 @@
   "exports": {
     "./package.json": "./package.json",
     "./icon.svg": "./icon.svg",
-    "./v7": "./lib-gen/v7-g42/plugin/v7/index.js",
+    "./v7": "./lib-gen/v7-g43/plugin/v7/index.js",
     "./v7/icon": "./icon.svg"
   },
   "scripts": {
@@ -70,5 +70,5 @@
     "cordis.patch.v7.yml",
     "models"
   ],
-  "main": "./lib-gen/v7-g42/plugin/v7/index.js"
+  "main": "./lib-gen/v7-g43/plugin/v7/index.js"
 }
