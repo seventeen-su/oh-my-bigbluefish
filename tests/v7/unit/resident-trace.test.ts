@@ -155,4 +155,38 @@ describe('T0 常驻 trace', () => {
     expect(built.preferenceHits).toEqual([{ id: preference.id, title: '偏好实际标题' }])
     expect(built.trace.sections.filter(section => section.kept)).toHaveLength(built.trace.sections.length)
   })
+
+  it('给定不注入 boards 读取器当构建常驻文本则来源标写模型且无回退原因', async () => {
+    const engine = {
+      async recall() {
+        return stateResult()
+      },
+    } as unknown as RecallEngine
+    const built = await buildResident(
+      engine,
+      { sessionId: 'session-trace-no-boards', cwd: '/workspace', projectKey: '/workspace' },
+      600,
+      async () => ({
+        memory: 1,
+        state: 1,
+        chain: 0,
+        archived: 0,
+        attrNames: ['title'],
+        categories: { fact: 1, clue: 0, event: 0 },
+        scopes: { global: 0, project: 1 },
+        recentStates: [{ id: stateHit.entityId, title: '状态标题', status: 'in_progress' }],
+      }),
+      undefined,
+      async () => [{ ...preference, title: '偏好实际标题', snippet: '偏好实际摘要' }],
+    )
+
+    const preferenceSection = built.trace.sections.find(section => section.name === 'preferences')
+    const stateSection = built.trace.sections.find(section => section.name === 'states')
+    expect(preferenceSection).toMatchObject({ kept: true, source: 'write-model' })
+    expect(stateSection).toMatchObject({ kept: true, source: 'write-model' })
+    // 没有读模型读取器就不是“回退”，trace 不该声称尝试过读模型。
+    expect(preferenceSection?.fallbackReason).toBeUndefined()
+    expect(stateSection?.fallbackReason).toBeUndefined()
+    expect(built.stateHits).toEqual([])
+  })
 })

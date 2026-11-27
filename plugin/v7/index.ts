@@ -741,6 +741,38 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     pendingRecall.set(sessionId, list)
   }
 
+  /**
+   * T0 实际注入的偏好/状态写 recall_event（injected=true），落库成功后再登记采用等待。
+   *
+   * 读模型路径没有 engine 的 recall_event；不补写就会让 T0 注入在账本里消失，
+   * 采用率分母失真。回退路径的偏好仍走这里（与旧行为一致），状态由 engine 自己写。
+   */
+  const recordResidentHits = (
+    sessionId: string,
+    turn: number | undefined,
+    traceId: string,
+    query: string,
+    hits: readonly { readonly id: string; readonly title?: string }[],
+  ): void => {
+    if (hits.length === 0) return
+    void store.recordRecall(hits.map((hit, index) => ({
+      traceId,
+      sessionId,
+      ...(turn === undefined ? {} : { turnId: String(turn) }),
+      query,
+      trigger: 't0',
+      entityId: hit.id,
+      channel: 'resident',
+      rank: index + 1,
+      injected: true,
+    }))).then(() => {
+      // 只有 recall_event 已落库后才登记采用等待，避免 adopted 更新不到行。
+      rememberInjection(sessionId, { traceId, hits })
+    }).catch(error => {
+      logger.warn('T0 常驻 recall_event 写入失败', messageOf(error))
+    })
+  }
+
   const adoptPending = (sessionId: string, text: string, kind: 'text' | 'tool'): void => {
     const pending = pendingRecall.get(sessionId)
     if (pending === undefined || pending.length === 0 || text.length === 0) return
@@ -964,6 +996,11 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           () => store.stats(),
           notice => rememberInjection(sessionId, notice),
           () => store.preferenceSummaries?.(5) ?? Promise.resolve([]),
+          // T0 优先读投影看板（preference/state 各一条 SQL）；投影未启动（DB 未就绪/
+          // 启动失败）时保持旧的 engine/stats 路径，行为与没有读模型前一致。
+          projectionStarted && projectionReadApi !== undefined
+            ? { reader: projectionReadApi }
+            : undefined,
         ),
         1_500,
       )
@@ -972,34 +1009,21 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         const trace = turn === undefined
           ? built.trace
           : { ...built.trace, turnId: String(turn) }
+        // 回退不是静默降级：原因已写进 trace 的 section.fallbackReason；错误/超时再落日志。
+        // “读模型为空”在首次回填前是正常状态，不当错误刷日志。
+        const fallback = built.trace.sections.find(section => (
+          section.fallbackReason !== undefined && section.fallbackReason !== 'read-model-empty'
+        ))
+        if (fallback?.fallbackReason !== undefined) {
+          logger.warn(`T0 读模型回退写模型：${fallback.fallbackReason}`, { sessionId, turn })
+        }
         // trace 是 T0 的预算/裁剪证据；写失败不能阻断本轮注入。
         void store.recordResidentTrace(trace).catch(error => {
           logger.warn('T0 常驻 trace 写入失败', messageOf(error))
         })
-        const preferenceHits = built.preferenceHits
-        if (preferenceHits.length > 0) {
-          const preferenceTraceId = built.trace.traceId
-          // 偏好不走 engine.recall；必须单独写 recall_event，后续才能记录 adopted。
-          void store.recordRecall(preferenceHits.map((hit, index) => ({
-            traceId: preferenceTraceId,
-            sessionId,
-            ...(turn === undefined ? {} : { turnId: String(turn) }),
-            query: 'T0 常驻偏好',
-            trigger: 't0',
-            entityId: hit.id,
-            channel: 'resident',
-            rank: index + 1,
-            injected: true,
-          }))).then(() => {
-            // 只有 recall_event 已落库后才登记采用等待，避免 adopted 更新不到行。
-            rememberInjection(sessionId, {
-              traceId: preferenceTraceId,
-              hits: preferenceHits,
-            })
-          }).catch(error => {
-            logger.warn('T0 偏好 recall_event 写入失败', messageOf(error))
-          })
-        }
+        // 偏好与（读模型路径的）状态都必须写 recall_event，后续才能记录 adopted。
+        recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻偏好', built.preferenceHits)
+        recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻状态', built.stateHits)
       }
       rememberSessionState(residentCache, sessionId, { turn, text: resident })
     }

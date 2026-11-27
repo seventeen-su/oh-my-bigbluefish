@@ -30,6 +30,25 @@ export interface BoardQuery {
   readonly limit: number
 }
 
+/**
+ * T0 常驻层的一次性取数：偏好看板 + 状态看板各一条 SQL。
+ *
+ * 与 `boards()` 的区别：不带 lag 查询、不等 token、不按 onTimeout 回退。T0 的读预算
+ * 是 ≤5 条 SQL（用读模型时 ≤2 条），lag/token 等待与回退决策留给调用方
+ * （`recall/resident.ts` 的 buildResident 决定回退并写 trace）。
+ */
+export interface ResidentBoardPairQuery {
+  readonly projectKey?: string
+  readonly preferenceLimit?: number
+  readonly stateLimit?: number
+}
+
+/** 两块看板的行；`state` 在调用方没有 projectKey 时为空（状态板只按项目读）。 */
+export interface ResidentBoardPair {
+  readonly preference: readonly BoardItem[]
+  readonly state: readonly BoardItem[]
+}
+
 export interface BoardReader {
   readBoard(query: BoardQuery): Promise<readonly BoardItem[]>
   readBoardRow(kind: BoardKind, entityId: string): Promise<BoardItem | undefined>
@@ -118,6 +137,36 @@ export class ProjectionReadApi {
     const lag = await this.lagOf(projection)
     const waitedMs = this.deps.clock.now().getTime() - startedAt
     return this.snapshot(kind, projection, scope, items, 'read-model', false, lag, waitedMs, options.token)
+  }
+
+  /**
+   * T0 常驻层专用：一次读偏好/状态两块看板，每块恰好一条 SQL，不查 lag、不等 token。
+   *
+   * 空结果/读取失败不在这里判断（也不静默）——调用方拿到异常或空行后自行决定
+   * 回退写模型并把来源写进 trace；这样一来 RYOW（read-your-writes）的等待语义
+   * 不会被 T0 误用成"每 turn 多查一次 lag"。
+   *
+   * `ProjectionReadApi` 结构性满足 `recall/resident.ts` 的 `ResidentBoardsReader`
+   * （消费方定义的窄端口，不必 import 本模块的完整类型）。
+   */
+  async readResidentBoards(query: ResidentBoardPairQuery = {}): Promise<ResidentBoardPair> {
+    const preferenceLimit = clamp(query.preferenceLimit ?? 5, 1, MAX_BOARD_LIMIT)
+    const stateLimit = clamp(query.stateLimit ?? 5, 1, MAX_BOARD_LIMIT)
+    const preference = this.deps.boards.readBoard({
+      kind: 'preference',
+      scope: { kind: 'global' },
+      limit: preferenceLimit,
+    })
+    // 没有项目键就没有"当前项目状态"可读：不发第二条无谓查询。
+    const state = query.projectKey === undefined
+      ? Promise.resolve<readonly BoardItem[]>([])
+      : this.deps.boards.readBoard({
+          kind: 'state',
+          scope: { kind: 'project', projectKey: query.projectKey },
+          limit: stateLimit,
+        })
+    const [preferenceItems, stateItems] = await Promise.all([preference, state])
+    return { preference: preferenceItems, state: stateItems }
   }
 
   /**

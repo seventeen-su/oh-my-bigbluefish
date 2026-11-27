@@ -366,8 +366,213 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('工具结果即时召回挂到 additionalContexts，且下一步不重复召回', async () => {
+  it('T0 读投影看板：偏好与当前项目状态命中，trace 来源是 read-model', async () => {
+    // 清掉没有 FK 的投影状态：上一个用例遗留的 done/水位不能让本用例的读模型来源断言含糊。
+    const prep = new PostgresStore(TEST_DATABASE_URL)
+    await prep.db.query(
+      `truncate table omb.projection_watermark, omb.projection_task,
+                      omb.preference_board, omb.state_board
+         restart identity cascade`,
+    )
+    await prep.close()
+
     const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const session = { id: 't0-boards-session', header: { cwd: PROJECT } }
+    const exec = { agent: { session } }
+
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'global',
+      attrs: { title: 'T0 看板偏好', tags: ['偏好'] },
+    }, exec)
+    const preferenceId = /mem_[0-9a-f-]{36}/.exec(remembered?.text ?? '')?.[0]
+    expect(preferenceId).toBeDefined()
+
+    const state = await host.tools.get('omb_remember')?.execute({
+      kind: 'state',
+      title: 'T0 看板进行中状态',
+      status: 'in_progress',
+      time: new Date().toISOString(),
+    }, exec)
+    const stateId = /st_[0-9a-f-]{36}/.exec(state?.text ?? '')?.[0]
+    expect(stateId).toBeDefined()
+
+    const db = new PostgresStore(TEST_DATABASE_URL)
+    // 等 plugin 自己的 worker 把两块看板都投影出来（写入事务里的 NOTIFY 唤醒，不显式 tick）。
+    let boardsReady = false
+    for (let attempt = 0; attempt < 200 && !boardsReady; attempt += 1) {
+      const rows = await db.db.query<{ preference: number; state: number }>(
+        `select
+           (select count(*) from omb.preference_board where entity_id = $1)::int as preference,
+           (select count(*) from omb.state_board where entity_id = $2)::int as state`,
+        [preferenceId, stateId],
+      )
+      const row = rows.rows[0]
+      boardsReady = row?.preference === 1 && row?.state === 1
+      if (!boardsReady) await wait(25)
+    }
+    expect(boardsReady).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.({
+      agent: { session },
+      messages: [{ source: { kind: 'user' }, content: '继续' }],
+      turn: 1,
+      step: 1,
+    }, async () => ({ kind: 'enter', messages: [] }))
+
+    const resident = host.provider?.({ agent: { session } }) ?? ''
+    expect(resident).toContain('[OMB 常驻]')
+    expect(resident).toContain('T0 看板偏好')
+    expect(resident).toContain('T0 看板进行中状态')
+    // 读模型路径不查 stats：库索引段是写模型回退才有的内容。
+    expect(resident).not.toContain('库索引')
+
+    interface StoredSection {
+      name: string
+      kept: boolean
+      source?: string
+      fallbackReason?: string
+      entityIds: string[]
+    }
+    let sections: StoredSection[] | undefined
+    for (let attempt = 0; attempt < 100 && sections === undefined; attempt += 1) {
+      const rows = await db.db.query<{ sections: StoredSection[] }>(
+        'select sections from omb.resident_trace where session_id = $1 order by id desc limit 1',
+        [session.id],
+      )
+      sections = rows.rows[0]?.sections
+      if (sections === undefined) await wait(25)
+    }
+    expect(sections).toBeDefined()
+    const preferenceSection = sections?.find(section => section.name === 'preferences')
+    const stateSection = sections?.find(section => section.name === 'states')
+    expect(preferenceSection).toMatchObject({ kept: true, source: 'read-model' })
+    expect(stateSection).toMatchObject({ kept: true, source: 'read-model' })
+    expect(stateSection?.entityIds).toContain(stateId)
+    expect(sections?.some(section => section.fallbackReason !== undefined)).toBe(false)
+
+    // 读模型路径没有 engine 的 recall_event；T0 状态命中必须自己写账本。
+    let stateEvent: { injected: boolean } | undefined
+    for (let attempt = 0; attempt < 100 && stateEvent === undefined; attempt += 1) {
+      const rows = await db.db.query<{ injected: boolean }>(
+        `select injected from omb.recall_event
+         where entity_id = $1 and channel = 'resident' order by id desc limit 1`,
+        [stateId],
+      )
+      stateEvent = rows.rows[0]
+      if (stateEvent === undefined) await wait(25)
+    }
+    expect(stateEvent?.injected).toBe(true)
+    await db.close()
+    dispose()
+  })
+
+  it('T0 读模型为空时回退写模型，偏好仍注入且 trace 标回退原因', async () => {
+    const prep = new PostgresStore(TEST_DATABASE_URL)
+    await prep.db.query(
+      `truncate table omb.projection_watermark, omb.projection_task,
+                      omb.preference_board, omb.state_board
+         restart identity cascade`,
+    )
+    await prep.close()
+
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const session = { id: 't0-fallback-session', header: { cwd: PROJECT } }
+    const exec = { agent: { session } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'global',
+      attrs: { title: 'T0 回退偏好', tags: ['偏好'] },
+    }, exec)
+    const preferenceId = /mem_[0-9a-f-]{36}/.exec(remembered?.text ?? '')?.[0]
+    expect(preferenceId).toBeDefined()
+
+    const db = new PostgresStore(TEST_DATABASE_URL)
+    // 先等这次写入的投影真正完成，再清空读模型/队列：让“读模型为空”是稳定状态而不是竞态。
+    let projected = false
+    for (let attempt = 0; attempt < 200 && !projected; attempt += 1) {
+      const rows = await db.db.query<{ status: string }>(
+        `select status from omb.projection_task
+         where entity_id = $1 and projection = 'preference_board'`,
+        [preferenceId],
+      )
+      projected = rows.rows[0]?.status === 'done'
+      if (!projected) await wait(25)
+    }
+    expect(projected).toBe(true)
+    await db.db.query(
+      `truncate table omb.projection_watermark, omb.projection_task,
+                      omb.preference_board, omb.state_board
+         restart identity cascade`,
+    )
+
+    const preStep = host.listeners.get('agent/pre-step')
+    await preStep?.({
+      agent: { session },
+      messages: [{ source: { kind: 'user' }, content: '继续' }],
+      turn: 1,
+      step: 1,
+    }, async () => ({ kind: 'enter', messages: [] }))
+
+    const resident = host.provider?.({ agent: { session } }) ?? ''
+    expect(resident).toContain('T0 回退偏好')
+    // 写模型回退才有 stats 段；这条断言同时证明回退真的发生。
+    expect(resident).toContain('库索引')
+
+    interface StoredSection {
+      name: string
+      kept: boolean
+      source?: string
+      fallbackReason?: string
+    }
+    let sections: StoredSection[] | undefined
+    for (let attempt = 0; attempt < 100 && sections === undefined; attempt += 1) {
+      const rows = await db.db.query<{ sections: StoredSection[] }>(
+        'select sections from omb.resident_trace where session_id = $1 order by id desc limit 1',
+        [session.id],
+      )
+      sections = rows.rows[0]?.sections
+      if (sections === undefined) await wait(25)
+    }
+    expect(sections).toBeDefined()
+    expect(sections?.find(section => section.name === 'preferences')).toMatchObject({
+      kept: true,
+      source: 'write-model',
+      fallbackReason: 'read-model-empty',
+    })
+
+    // 回退路径的偏好仍要写 recall_event（旧行为不变）。
+    let preferenceEvent: { injected: boolean } | undefined
+    for (let attempt = 0; attempt < 100 && preferenceEvent === undefined; attempt += 1) {
+      const rows = await db.db.query<{ injected: boolean }>(
+        `select injected from omb.recall_event
+         where entity_id = $1 and channel = 'resident' order by id desc limit 1`,
+        [preferenceId],
+      )
+      preferenceEvent = rows.rows[0]
+      if (preferenceEvent === undefined) await wait(25)
+    }
+    expect(preferenceEvent?.injected).toBe(true)
+    await db.close()
+    dispose()
+  })
+
+  it('工具结果即时召回挂到 additionalContexts，且下一步不重复召回', async () => {    const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
       autoMigrate: true,

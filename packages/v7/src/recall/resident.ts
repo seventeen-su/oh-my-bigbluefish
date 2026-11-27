@@ -1,4 +1,5 @@
 import { newId } from '../domain/ids.js'
+import type { StateStatus } from '../domain/entity.js'
 import { estimateTokens } from '../domain/text.js'
 import type { RecallEngine } from '../retrieval/engine.js'
 import type { RecallHit, RecallResult, RecallScenario } from '../retrieval/types.js'
@@ -11,26 +12,102 @@ import type {
 } from '../ports/store.js'
 
 export const DEFAULT_RESIDENT_BUDGET = 600
+/** 读模型等待预算：超时立即回退写模型，不把整个 T0 预算耗在读模型上。 */
+const DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS = 250
+/** T0 偏好/状态的条数上限；预算裁剪仍由 token 预算决定。 */
+const RESIDENT_PREFERENCE_LIMIT = 5
+const RESIDENT_STATE_LIMIT = 5
+
+/** 一条被实际注入的命中；用于 recall_event + 采用判定。 */
+interface ResidentHit {
+  readonly id: string
+  readonly title?: string
+}
 
 export interface RecallNotice {
   readonly traceId: string
-  readonly hits: readonly { readonly id: string; readonly title?: string }[]
+  readonly hits: readonly ResidentHit[]
 }
 
 export type RecallNoticeSink = (notice: RecallNotice) => void
 
+/**
+ * T0 需要的最小看板行形状。`app/projections` 的 `BoardItem` 是它的超集；
+ * recall 层不 import 上层类型，`ProjectionReadApi` 在组合根按结构满足。
+ */
+interface ResidentBoardItem {
+  readonly entityId: string
+  readonly title?: string
+  readonly summary?: string
+  readonly status?: StateStatus
+}
+
+interface ResidentBoardsQuery {
+  readonly projectKey?: string
+  readonly preferenceLimit?: number
+  readonly stateLimit?: number
+}
+
+interface ResidentBoardsSnapshot {
+  readonly preference: readonly ResidentBoardItem[]
+  readonly state: readonly ResidentBoardItem[]
+}
+
+/**
+ * T0 优先读取的投影看板（消费方定义的窄端口）。
+ *
+ * 实现方是 plugin 组合根里的 `ProjectionReadApi.readResidentBoards`：每个看板一条
+ * SQL，不带 lag/token 等待。失败、超时或两块都为空时由 buildResident 回退到
+ * engine/stats 旧路径并在 trace 里标来源，绝不静默返回读模型空结果。
+ */
+interface ResidentBoardsReader {
+  readResidentBoards(query: ResidentBoardsQuery): Promise<ResidentBoardsSnapshot>
+}
+
+export interface ResidentBoardsOptions {
+  readonly reader: ResidentBoardsReader
+  readonly timeoutMs?: number
+}
+
+/** trace 里一段内容的来源：读模型，或读模型不可用时的写模型回退。 */
+type ResidentSectionSource = 'read-model' | 'write-model'
+
+/** persisted 在 `resident_trace.sections`（JSONB）里的来源/回退证据。 */
+interface ResidentTraceSectionDetail extends ResidentTraceSection {
+  readonly source?: ResidentSectionSource
+  /** 已尝试读模型但回退时的原因；读模型命中或未注入读取器时缺省。 */
+  readonly fallbackReason?: string
+}
+
+/** 带来源标注的 T0 trace；结构上仍是 `ResidentTraceInput`（多出的字段随 sections 落库）。 */
+export interface ResidentTrace extends Omit<ResidentTraceInput, 'sections'> {
+  readonly sections: readonly ResidentTraceSectionDetail[]
+}
+
 /** T0 构建结果：注入文本与可落库的 trace。 */
 export interface ResidentBuild {
   readonly text: string
-  readonly trace: ResidentTraceInput
+  readonly trace: ResidentTrace
   /** 真正进入文本的偏好命中；用于 recall_event + 采用判定（可带标题）。 */
-  readonly preferenceHits: readonly { readonly id: string; readonly title?: string }[]
+  readonly preferenceHits: readonly ResidentHit[]
+  /** boards 路径真正进入文本的状态命中；回退路径为空（engine 已自行写 recall_event）。 */
+  readonly stateHits: readonly ResidentHit[]
 }
 
 interface ResidentCandidate {
   readonly name: string
   readonly text: string
   readonly entityIds: readonly string[]
+  readonly source?: ResidentSectionSource
+  readonly fallbackReason?: string
+  /** 本条候选里可登记为注入命中的条目（偏好/状态）。 */
+  readonly hits?: readonly ResidentHit[]
+}
+
+interface BoardsReadOutcome {
+  readonly snapshot?: ResidentBoardsSnapshot
+  readonly reason?: 'empty' | 'error' | 'timeout'
+  readonly message?: string
 }
 
 function notifyHits(
@@ -102,6 +179,116 @@ function compactHits(result: RecallResult | undefined, prefix: string, max: numb
   }
 }
 
+/** 看板偏好段：与旧 `compactSummaries` 同格式；行来自 `preference_board`，无 snippet 时用 summary。 */
+function compactBoardSummaries(
+  items: readonly ResidentBoardItem[],
+  prefix: string,
+  max: number,
+): ResidentCandidate | undefined {
+  const kept: ResidentHit[] = []
+  const parts: string[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (seen.has(item.entityId)) continue
+    const label = (item.title ?? item.summary ?? '').replace(/\s+/g, ' ').trim()
+    // 标题/摘要都为空的行没有可辨识内容，注入只会浪费预算。
+    if (label.length === 0) continue
+    seen.add(item.entityId)
+    const title = item.title?.trim()
+    kept.push({ id: item.entityId, ...(title !== undefined && title.length > 0 ? { title } : {}) })
+    parts.push(`${label}（${item.entityId}）`)
+    if (kept.length >= max) break
+  }
+  if (kept.length === 0) return undefined
+  return {
+    name: 'preferences',
+    text: `${prefix}${parts.join('；')}`,
+    entityIds: kept.map(hit => hit.id),
+    hits: kept,
+  }
+}
+
+/** 看板状态段：只保留当前项目的 in_progress/blocked/waiting（看板行的状态谓词由投影保证，这里再兜一层）。 */
+function compactBoardStates(
+  items: readonly ResidentBoardItem[],
+  prefix: string,
+  max: number,
+): ResidentCandidate | undefined {
+  const kept: { readonly text: string; readonly id: string; readonly title?: string }[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (seen.has(item.entityId)) continue
+    const status = item.status
+    if (status !== 'in_progress' && status !== 'blocked' && status !== 'waiting') continue
+    const title = item.title?.trim()
+    // 看板行没有 snippet 兜底：没有标题就没有可注入内容。
+    const head = compactHitText(title ?? '')
+    if (head.length === 0) continue
+    seen.add(item.entityId)
+    kept.push({ text: `[${status}] ${head}（${item.entityId}）`, id: item.entityId, ...(title !== undefined ? { title } : {}) })
+    if (kept.length >= max) break
+  }
+  if (kept.length === 0) return undefined
+  return {
+    name: 'states',
+    text: `${prefix}${kept.map(item => item.text).join('；')}`,
+    entityIds: kept.map(item => item.id),
+    hits: kept.map(item => ({ id: item.id, ...(item.title !== undefined ? { title: item.title } : {}) })),
+  }
+}
+
+/** 错误信息压成一行并限长：trace 要能定位回退原因，但不能塞进整段驱动错误。 */
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const text = message.replace(/\s+/g, ' ').trim()
+  return text.length <= 160 ? text : `${text.slice(0, 160)}…`
+}
+
+/**
+ * 读投影看板，带独立超时：失败/超时/两块都为空都换算成可写进 trace 的回退原因。
+ *
+ * 空结果不能直接当“没有偏好/状态”：投影未回填或 worker 未处理时两块都是空的，
+ * 那正是必须回退写模型的时刻（不是静默注入空 T0）。
+ */
+async function readBoardsWithTimeout(
+  reader: ResidentBoardsReader,
+  query: ResidentBoardsQuery,
+  timeoutMs: number,
+): Promise<BoardsReadOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const timeout = new Promise<{ readonly kind: 'timeout' }>(resolve => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), clampTimeout(timeoutMs))
+    })
+    const result = await Promise.race([
+      reader.readResidentBoards(query).then(
+        snapshot => ({ kind: 'ok' as const, snapshot }),
+        error => ({ kind: 'error' as const, error }),
+      ),
+      timeout,
+    ])
+    if (result.kind === 'timeout') return { reason: 'timeout' }
+    if (result.kind === 'error') return { reason: 'error', message: errorText(result.error) }
+    const { snapshot } = result
+    if (snapshot.preference.length === 0 && snapshot.state.length === 0) return { reason: 'empty' }
+    return { snapshot }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+function clampTimeout(value: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.trunc(value)) : DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS
+}
+
+function fallbackReasonOf(outcome: BoardsReadOutcome): string {
+  if (outcome.reason === 'error') {
+    return outcome.message === undefined ? 'read-model-error' : `read-model-error: ${outcome.message}`
+  }
+  if (outcome.reason === 'timeout') return 'read-model-timeout'
+  return 'read-model-empty'
+}
+
 function indexCandidates(index: StoreStats | undefined): ResidentCandidate[] {
   if (index === undefined) return []
   const candidates: ResidentCandidate[] = [{
@@ -140,18 +327,24 @@ function indexCandidates(index: StoreStats | undefined): ResidentCandidate[] {
   return candidates
 }
 
-function toTraceSection(candidate: ResidentCandidate, kept: boolean, tokens: number): ResidentTraceSection {
+function toTraceSection(candidate: ResidentCandidate, kept: boolean, tokens: number): ResidentTraceSectionDetail {
   return {
     name: candidate.name,
     tokens,
     kept,
     text: candidate.text,
     entityIds: candidate.entityIds,
+    ...(candidate.source === undefined ? {} : { source: candidate.source }),
+    ...(candidate.fallbackReason === undefined ? {} : { fallbackReason: candidate.fallbackReason }),
   }
 }
 
 /**
- * T0 常驻层：固定预算内注入偏好、当前项目进行中/阻塞状态与一行索引提示。
+ * T0 常驻层：固定预算内注入偏好、当前项目进行中/阻塞/等待状态与一行工具提示。
+ *
+ * 有 `boards` 读取器时优先读投影读模型（两块看板各一条 SQL，不跑六通道）；
+ * 读模型失败/超时/两块都为空则回退 engine/stats 的写模型路径，并在 trace 的
+ * section.source/fallbackReason 里标出来源，不静默把空读模型当成“没有内容”。
  *
  * 返回值同时包含文本和 trace：trace 记录每个候选段落是否被预算裁掉，调用方负责
  * 落库；只读，不写 recall_event 的 adopted 字段。
@@ -163,40 +356,97 @@ export async function buildResident(
   stats?: () => Promise<StoreStats>,
   onRecall?: RecallNoticeSink,
   preferences?: () => Promise<EntitySummary[]>,
+  boards?: ResidentBoardsOptions,
 ): Promise<ResidentBuild> {
   const projectKey = context.projectKey ?? context.cwd
-  const [preferenceItems, states, index] = await Promise.all([
-    preferences === undefined ? Promise.resolve(undefined) : preferences().catch(() => undefined),
-    projectKey === undefined ? Promise.resolve(undefined) : engine.recall({
-      query: '当前项目 进行中 阻塞中',
-      scenario: 'session-start',
-      scope: 'project',
-      projectKey,
-      kind: 'state',
-      status: ['in_progress', 'blocked'],
-      limit: 5,
-      sessionId: context.sessionId,
-      injected: true,
-    }).catch(() => undefined),
-    stats === undefined ? Promise.resolve(undefined) : stats().catch(() => undefined),
-  ])
+  const toolHint: ResidentCandidate = {
+    name: 'tool-hint',
+    text: '需要细节用 omb_recall；长期结论用 omb_remember；状态更新用 omb_update。',
+    entityIds: [],
+  }
+
+  let candidates: ResidentCandidate[]
+  let recalledStates: RecallResult | undefined
+  let fallbackReason: string | undefined
+  let usedBoards = false
+  let boardPreferenceHits: readonly ResidentHit[] = []
+  let boardStateHits: readonly ResidentHit[] = []
+  let fallbackPreferences: readonly EntitySummary[] | undefined
+
+  const boardOutcome = boards === undefined
+    ? undefined
+    : await readBoardsWithTimeout(
+        boards.reader,
+        {
+          ...(projectKey === undefined ? {} : { projectKey }),
+          preferenceLimit: RESIDENT_PREFERENCE_LIMIT,
+          stateLimit: RESIDENT_STATE_LIMIT,
+        },
+        boards.timeoutMs ?? DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS,
+      )
+
+  if (boardOutcome?.snapshot !== undefined) {
+    usedBoards = true
+    const preferenceCandidate = compactBoardSummaries(
+      boardOutcome.snapshot.preference,
+      '偏好：',
+      RESIDENT_PREFERENCE_LIMIT,
+    )
+    const stateCandidate = compactBoardStates(
+      boardOutcome.snapshot.state,
+      '当前状态：',
+      RESIDENT_STATE_LIMIT,
+    )
+    boardPreferenceHits = preferenceCandidate?.hits ?? []
+    boardStateHits = stateCandidate?.hits ?? []
+    // 读模型路径不查 stats：T0 的 SQL 预算就是两块看板各一条。
+    candidates = [
+      ...(preferenceCandidate === undefined ? [] : [{ ...preferenceCandidate, source: 'read-model' as const }]),
+      ...(stateCandidate === undefined ? [] : [{ ...stateCandidate, source: 'read-model' as const }]),
+      toolHint,
+    ]
+  } else {
+    if (boardOutcome !== undefined) fallbackReason = fallbackReasonOf(boardOutcome)
+    const [preferenceItems, states, index] = await Promise.all([
+      preferences === undefined ? Promise.resolve(undefined) : preferences().catch(() => undefined),
+      projectKey === undefined ? Promise.resolve(undefined) : engine.recall({
+        query: '当前项目 进行中 阻塞中',
+        scenario: 'session-start',
+        scope: 'project',
+        projectKey,
+        kind: 'state',
+        status: ['in_progress', 'blocked'],
+        limit: RESIDENT_STATE_LIMIT,
+        sessionId: context.sessionId,
+        injected: true,
+      }).catch(() => undefined),
+      stats === undefined ? Promise.resolve(undefined) : stats().catch(() => undefined),
+    ])
+    recalledStates = states
+    fallbackPreferences = preferenceItems
+    candidates = [
+      ...(preferenceItems === undefined ? [] : [compactSummaries(preferenceItems, '偏好：', RESIDENT_PREFERENCE_LIMIT)]),
+      compactHits(states, '当前状态：', RESIDENT_STATE_LIMIT),
+      ...indexCandidates(index),
+      toolHint,
+    ]
+      .filter((candidate): candidate is ResidentCandidate => candidate !== undefined)
+      // 回退路径的每一段都来自写模型；fallbackReason 只在真的尝试过读模型时出现。
+      // tool-hint 是静态提示，不是数据来源，保持 source 缺省。
+      .map(candidate => candidate.name === 'tool-hint'
+        ? candidate
+        : {
+            ...candidate,
+            source: 'write-model' as const,
+            ...(fallbackReason === undefined ? {} : { fallbackReason }),
+          })
+  }
 
   const header: ResidentCandidate = { name: 'header', text: '[OMB 常驻]', entityIds: [] }
-  const candidates: ResidentCandidate[] = [
-    ...(preferenceItems === undefined ? [] : [compactSummaries(preferenceItems, '偏好：', 5)]),
-    compactHits(states, '当前状态：', 5),
-    ...indexCandidates(index),
-    {
-      name: 'tool-hint',
-      text: '需要细节用 omb_recall；长期结论用 omb_remember；状态更新用 omb_update。',
-      entityIds: [],
-    },
-  ].filter((candidate): candidate is ResidentCandidate => candidate !== undefined)
-
   const headerTokens = estimateTokens(header.text)
   // header 先占预算：内容必须和 header 一起放得下才算注入。
   const contentBudget = budgetTokens - headerTokens
-  const sections: ResidentTraceSection[] = [toTraceSection(header, false, headerTokens)]
+  const sections: ResidentTraceSectionDetail[] = [toTraceSection(header, false, headerTokens)]
   const keptLines: string[] = []
   const droppedSections: string[] = []
   let used = 0
@@ -227,22 +477,28 @@ export async function buildResident(
         droppedSections,
       },
       preferenceHits: [],
+      stateHits: [],
     }
   }
 
   sections[0] = toTraceSection(header, true, headerTokens)
   keptLines.unshift(header.text)
   used += headerTokens
-  // 只有状态段真正进入文本时才登记召回（adoption 只认实际注入的命中）。
-  if (sections.some(section => section.name === 'states' && section.kept)) notify(states, onRecall)
+  const statesSection = sections.find(section => section.name === 'states')
+  // 只有状态段真正进入文本时才登记召回（adoption 只认实际注入的命中）；读模型路径
+  // 没有 engine trace，由 plugin 用 build 结果里的 stateHits 写 recall_event。
+  if (recalledStates !== undefined && statesSection?.kept === true) notify(recalledStates, onRecall)
 
   const preferenceSection = sections.find(section => section.name === 'preferences')
   const preferenceHits = preferenceSection?.kept === true
-    ? (preferenceItems ?? []).slice(0, 5).map(item => ({
-        id: item.id,
-        ...(item.title !== undefined && item.title.length > 0 ? { title: item.title } : {}),
-      }))
+    ? usedBoards
+      ? boardPreferenceHits
+      : (fallbackPreferences ?? []).slice(0, RESIDENT_PREFERENCE_LIMIT).map(item => ({
+          id: item.id,
+          ...(item.title !== undefined && item.title.length > 0 ? { title: item.title } : {}),
+        }))
     : []
+  const stateHits = usedBoards && statesSection?.kept === true ? boardStateHits : []
 
   return {
     text: keptLines.join('\n'),
@@ -257,6 +513,7 @@ export async function buildResident(
       droppedSections,
     },
     preferenceHits,
+    stateHits,
   }
 }
 
@@ -268,8 +525,9 @@ export async function buildResidentText(
   stats?: () => Promise<StoreStats>,
   onRecall?: RecallNoticeSink,
   preferences?: () => Promise<EntitySummary[]>,
+  boards?: ResidentBoardsOptions,
 ): Promise<string> {
-  return (await buildResident(engine, context, budgetTokens, stats, onRecall, preferences)).text
+  return (await buildResident(engine, context, budgetTokens, stats, onRecall, preferences, boards)).text
 }
 
 const EVENT_RECALL_HEADER = '[OMB 事件召回]'
