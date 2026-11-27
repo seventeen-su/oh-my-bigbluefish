@@ -1265,4 +1265,30 @@ describe('v7 plugin entry', () => {
     expect(host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
     await db.close()
   })
+
+  it('给定 jobs=false 当 status 则 outbox/timer/workflow 报 unknown 与原因，不伪报 0', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'runtime-disabled-session', header: { cwd: PROJECT } } } }
+    // 事件运行时与后台任务同开关：关闭时没有 relay/timer/workflow 消费者，
+    // status 必须显式 unknown + 原因，不能把“没运行”显示成 0 pending/0 lag。
+    const status = await host.tools.get('omb_status')?.execute({}, exec)
+    expect(status?.ok).toBe(true)
+    expect(status?.text).toContain('outbox=unknown')
+    expect(status?.text).toContain('outboxReason=jobs-disabled')
+    expect(status?.text).toContain('timer=unknown')
+    expect(status?.text).toContain('timerReason=jobs-disabled')
+    expect(status?.text).toContain('workflow=unknown')
+    expect(status?.text).toContain('workflowReason=jobs-disabled')
+    expect(status?.text).not.toContain('outbox=ok')
+    expect(status?.text).not.toContain('timer=ok')
+    expect(status?.text).not.toContain('workflow=ok')
+    dispose()
+    await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
+  })
 })

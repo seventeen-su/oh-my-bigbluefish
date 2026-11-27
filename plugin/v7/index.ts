@@ -21,7 +21,10 @@ import {
   REGISTERED_PROJECTIONS,
 } from '../../packages/v7/src/adapters/postgres/projection.js'
 import { PgBossQueue, describeJobHealth } from '../../packages/v7/src/adapters/pg-boss/index.js'
-import type { JobFinalFailureSummary } from '../../packages/v7/src/ports/jobs.js'
+import { PostgresOutboxNotifier, PostgresOutboxStore } from '../../packages/v7/src/adapters/postgres/outbox.js'
+import { PostgresTimerNotifier, PostgresTimerStore } from '../../packages/v7/src/adapters/postgres/timer.js'
+import { PostgresWorkflowStore } from '../../packages/v7/src/adapters/postgres/workflow.js'
+import type { JobFinalFailureSummary, JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import { createEventCapture } from '../../packages/v7/src/adapters/dsh/events.js'
 import { createDshTaskReader } from '../../packages/v7/src/adapters/dsh/tasks.js'
 import { asRecord, createLogger, createPromptSink, sessionFromExec, type HostContextLike, type ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
@@ -33,12 +36,16 @@ import {
   type ToolRuntime,
 } from '../../packages/v7/src/adapters/dsh/tools.js'
 import { DynamicService } from '../../packages/v7/src/app/dynamic.js'
+import { embeddingText } from '../../packages/v7/src/app/embedding.js'
+import { OutboxRelay, ReactionRegistry, type Reaction } from '../../packages/v7/src/app/outbox/index.js'
+import { TimerWorker, WorkflowRuntime, type TimerHandler } from '../../packages/v7/src/app/workflow/index.js'
 import { ProjectionReadApi, ProjectionWorker } from '../../packages/v7/src/app/projections/index.js'
 import { RecallService, recallScenarioForQuery, type RecallInjection } from '../../packages/v7/src/app/recall.js'
 import { RememberService } from '../../packages/v7/src/app/remember.js'
 import { UpdateService } from '../../packages/v7/src/app/update.js'
 import { OmbFailure, err, ok, type Result } from '../../packages/v7/src/domain/errors.js'
 import type { PatchEntityInput, WriteEntityInput } from '../../packages/v7/src/domain/entity.js'
+import type { JsonValue } from '../../packages/v7/src/domain/json.js'
 import { extractQuerySignals } from '../../packages/v7/src/domain/text.js'
 import type { LinkInput } from '../../packages/v7/src/domain/link.js'
 import { registerConsolidationJobs, registerEmbedJob, startConsolidationLoop } from '../../packages/v7/src/jobs/index.js'
@@ -46,7 +53,7 @@ import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import { buildEventRecallText, buildResident } from '../../packages/v7/src/recall/resident.js'
 import { LazyInitializer } from './startup.js'
-import { Supervisor, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
+import { Supervisor, TEARDOWN_STEP_TIMEOUT_MS, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
 import { registerSkills } from './skills.js'
 import {
   hasStrongSignal,
@@ -84,6 +91,94 @@ export interface ParsedV7Config {
 }
 
 const DEFAULT_DATABASE_URL = 'postgres://omb:omb@127.0.0.1:5432/omb'
+
+/**
+ * outbox 里注册了真实 reaction 的 topic。writer 的 `event_type` 就是 outbox `topic`
+ * （`adapters/postgres/writer.ts` insertEvent），这里只接实体写入两条；
+ * 其余 topic（归档/链接/改名）暂未接线：relay 的 `unknownTopic='dead'` 让它们进死信
+ * 并在 status 里可见，而不是静默丢弃。
+ */
+const EMBED_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'EntityPatched']
+
+/**
+ * timer 只桥接“到点唤醒 workflow runtime”。Phase 3 还没有 workflow 生产者，
+ * 该 handler 是真实的 timer 消费者（不是空实现）：到期后叫醒循环领取已到期的 run，
+ * 不用固定轮询扫 workflow_run。业务 timer（衰减/提醒）由后续任务接入同一 worker。
+ */
+const WORKFLOW_WAKE_TIMER_TOPIC = 'omb.workflow.wake'
+
+/**
+ * outbox payload 是完整的 DomainEvent（writer 的 insertEvent）：实体事件优先读
+ * `payload.entityId`，回退 `streamId`。两者都没有时不是实体事件，交给调用方报错。
+ */
+function entityIdFromOutboxPayload(payload: JsonValue): string | undefined {
+  const event = asRecord(payload)
+  const data = asRecord(event?.['payload'])
+  const fromPayload = data?.['entityId']
+  if (typeof fromPayload === 'string' && fromPayload.length > 0) return fromPayload
+  const streamId = event?.['streamId']
+  return typeof streamId === 'string' && streamId.length > 0 ? streamId : undefined
+}
+
+/**
+ * EntityCreated / EntityPatched → 入队 `omb.embed`。
+ *
+ * 幂等：`singletonKey = embed:<entityId>` 让同一实体在已有一个未完成任务时不再建第二个；
+ * relay 是 at-least-once（租约过期会重投），重复投递最多重建一次同文本向量，
+ * `upsertEmbedding` 按实体覆盖，不会产生第二行。
+ *
+ * 嵌入器不可用时与 remember/update 同策略：不入队注定失败的任务（由 `omb.embed-sweep`
+ * 在嵌入恢复后补齐），并只提示一次，避免每个事件刷日志。
+ */
+function createEmbedReaction(deps: {
+  readonly store: PostgresStore
+  readonly queue: JobQueue
+  readonly embedder: OnnxEmbedder
+  readonly logger: Logger
+}): Reaction {
+  let unavailableLogged = false
+  return {
+    name: 'enqueue-embed',
+    async run(event): Promise<void> {
+      const entityId = entityIdFromOutboxPayload(event.payload)
+      if (entityId === undefined) {
+        // 不是实体事件却注册到了实体 topic：抛错让 relay 走退避/死信，问题在 status 可见。
+        throw new Error(`outbox ${event.topic} 事件缺少 entityId（event_id=${event.eventId}）`)
+      }
+      const entity = await deps.store.get(entityId, { includeArchived: true })
+      if (entity === undefined) return
+      const text = embeddingText(entity.attributes)
+      if (text.trim().length === 0) return
+      if (!(await deps.embedder.available().catch(() => false))) {
+        if (!unavailableLogged) {
+          unavailableLogged = true
+          deps.logger.warn('嵌入器不可用：事件驱动嵌入暂不入队，等 omb.embed-sweep 补齐')
+        }
+        return
+      }
+      await deps.queue.enqueue('omb.embed', { entityId, text }, { singletonKey: `embed:${entityId}`, retryLimit: 3 })
+    },
+  }
+}
+
+/** 半启动清理：失败/original 错误优先，收尾失败只吞掉，不掩盖启动错误。 */
+async function stopQuietly(target: { stop(): Promise<void> } | undefined): Promise<void> {
+  if (target === undefined) return
+  try {
+    await target.stop()
+  } catch {
+    // 启动失败路径的清理失败没有调用方可处理；下一次真实调用会重建。
+  }
+}
+
+async function closeQuietly(target: { close(): Promise<void> } | undefined): Promise<void> {
+  if (target === undefined) return
+  try {
+    await target.close()
+  } catch {
+    // 同上。
+  }
+}
 
 export function parseConfig(raw: unknown): ParsedV7Config {
   const record = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
@@ -419,6 +514,18 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   let projectionWorker: ProjectionWorker | undefined
   let projectionReadApi: ProjectionReadApi | undefined
   let projectionNotifier: PostgresProjectionNotifier | undefined
+  // 事件运行时：DB ready 且投影启动之后才构造/启动（task-42 的顺序要求）。
+  // relay/timer/workflow 都依赖连接池，必须早于 store.close 停止。
+  let runtimeStarted = false
+  let outboxNotifier: PostgresOutboxNotifier | undefined
+  let outboxRelay: OutboxRelay | undefined
+  let reactionRegistry: ReactionRegistry | undefined
+  let timerNotifier: PostgresTimerNotifier | undefined
+  let timerWorker: TimerWorker | undefined
+  let workflowRuntime: WorkflowRuntime | undefined
+  // runtime.stats() 的 dead/completed 是**本进程累计**；status 里的 workflow 状态计数
+  // 要读 DB 行状态，所以单独保留 workflow store 的实时读数入口。
+  let workflowStoreRef: PostgresWorkflowStore | undefined
 
   /**
    * 构造并启动投影链路。顺序固定：
@@ -495,6 +602,183 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
   }
 
+  /**
+   * 构造并启动事件运行时（outbox relay / timer worker / workflow runtime）。
+   *
+   * 顺序固定：
+   * 1. 两个 notifier 先 `ready()`：LISTEN 建立后才能保证“事务提交后的 NOTIFY”不丢；
+   *    漏通知仍由 relay 首次 drain 与 timer 的 `nextDueAt` 单次定时器兜底。
+   * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed`）与 timer handler
+   *    （到期唤醒 workflow runtime）。未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
+   * 3. 启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的 running 回
+   *    pending 并唤醒循环（启动恢复）。
+   *
+   * 没有固定轮询：relay 空闲时等 NOTIFY，timer/workflow 只在有未来到期行时 arm 一个
+   * 单次定时器；本函数不新增 setInterval。`OutboxRelay.reconcile()` 的兜底扫描也没有接线：
+   * 它需要一个固定节拍，与“不新增固定轮询”冲突；漏掉的唤醒由下一次 NOTIFY、relay 首次
+   * drain 与重启后的恢复投递兜底（未接线的安全网不冒充已启用）。
+   *
+   * 已知边界（与投影 notifier 同款适配器行为）：LISTEN 连接断开后适配器不自动重连。
+   * 数据库重启后 outbox pending/lag 仍在 status 实测可见，插件/D SH 重启会重新 LISTEN
+   * 并在首次 drain 投递；本次不引入固定轮询去补这个缺口。
+   *
+   * 失败时把已启动的循环停掉、LISTEN 连接关掉再抛出，由 LazyInitializer 的下一次真实
+   * 调用整体重试，不留半启动的 worker/连接。
+   */
+  async function startRuntime(): Promise<void> {
+    if (runtimeStarted) return
+    const outboxListen = new PostgresOutboxNotifier({ connectionString: config.databaseUrl })
+    const timerListen = new PostgresTimerNotifier({ connectionString: config.databaseUrl })
+    const registry = new ReactionRegistry()
+    let relay: OutboxRelay | undefined
+    let timer: TimerWorker | undefined
+    let workflow: WorkflowRuntime | undefined
+    try {
+      await outboxListen.ready()
+      await timerListen.ready()
+      const embedReaction = createEmbedReaction({ store, queue, embedder, logger })
+      for (const topic of EMBED_REACTION_TOPICS) registry.register(topic, embedReaction)
+      relay = new OutboxRelay(
+        {
+          store: new PostgresOutboxStore(store.db),
+          registry,
+          clock,
+          wake: outboxListen,
+          logger,
+        },
+        { batchSize: 25, leaseMs: 30_000, unknownTopic: 'dead' },
+      )
+      const workflowStore = new PostgresWorkflowStore(store.db)
+      workflow = new WorkflowRuntime(
+        { store: workflowStore, clock, logger },
+        { batchSize: 10, leaseMs: 30_000 },
+      )
+      const workflowWake: TimerHandler = {
+        topic: WORKFLOW_WAKE_TIMER_TOPIC,
+        async run(): Promise<void> {
+          workflow?.wake()
+        },
+      }
+      timer = new TimerWorker(
+        {
+          store: new PostgresTimerStore(store.db),
+          handlers: [workflowWake],
+          clock,
+          wake: timerListen,
+          logger,
+        },
+        { batchSize: 25, leaseMs: 30_000 },
+      )
+      relay.start()
+      timer.start()
+      workflow.start()
+      const recovered = await workflow.recover()
+      // 全部成功后才回写状态：失败时不留“看起来在跑”的引用。
+      outboxNotifier = outboxListen
+      timerNotifier = timerListen
+      reactionRegistry = registry
+      outboxRelay = relay
+      timerWorker = timer
+      workflowRuntime = workflow
+      workflowStoreRef = workflowStore
+      runtimeStarted = true
+      logger.info('事件运行时已启动', {
+        order: 'projection→outbox→timer→workflow',
+        outboxTopics: registry.topics(),
+        timerTopics: timer.topics(),
+        workflowDefinitions: workflow.names(),
+        unknownTopic: 'dead',
+        recovered,
+      })
+    } catch (error) {
+      runtimeStarted = false
+      // 先停循环再关 LISTEN：反过来会让仍在跑的循环失去唤醒通道/连接。
+      await stopQuietly(workflow)
+      await stopQuietly(timer)
+      await stopQuietly(relay)
+      await closeQuietly(timerListen)
+      await closeQuietly(outboxListen)
+      throw error
+    }
+  }
+
+  /** 运行时未启动/未测量时的统一读数：显式 unknown + 原因，不把“没跑”报成 0。 */
+  function runtimeUnknownLines(reason: string): string[] {
+    // 后台任务关闭时，真正原因不是 DB/启动错误：如实说是配置关掉的。
+    const detail = config.jobs ? reason : 'jobs-disabled'
+    return [
+      'outbox=unknown',
+      `outboxReason=${detail}`,
+      'timer=unknown',
+      `timerReason=${detail}`,
+      'workflow=unknown',
+      `workflowReason=${detail}`,
+    ]
+  }
+
+  /**
+   * `omb_status` 的事件运行时读数：outbox lag/pending/dead、timer due、workflow 状态。
+   *
+   * 口径说明：relay/timer/workflow 的 dead/delivered/fired 是**本进程累计**（端口只暴露
+   * 内存 totals，没有跨进程 dead 聚合查询），这里按进程口径如实输出，不冒充全局总数；
+   * pending/claimed/lag 来自各自 store 的实时 SQL。任一查询失败只把对应段落标 unknown，
+   * 不影响其它段落的实测读数。
+   */
+  async function runtimeStatusLines(): Promise<string[]> {
+    if (!config.jobs) return runtimeUnknownLines('jobs-disabled')
+    if (!runtimeStarted
+      || outboxRelay === undefined
+      || timerWorker === undefined
+      || workflowRuntime === undefined
+      || workflowStoreRef === undefined
+      || reactionRegistry === undefined) {
+      return runtimeUnknownLines(startup.error ?? 'not-started')
+    }
+    const lines: string[] = []
+    try {
+      const stats = await outboxRelay.stats()
+      lines.push(
+        'outbox=ok',
+        // pending/claimed/lag 是实时 SQL；dead 是本进程累计（OutboxStore 端口没有跨进程
+        // dead 计数），用 outboxDeadScope 标清口径，不把它当成全局死信总数。
+        `outboxLagMs=${stats.oldestAgeMs} outboxPending=${stats.pending} outboxClaimed=${stats.claimed} outboxDead=${stats.dead} outboxDeadScope=process`,
+        `outboxDelivered=${stats.delivered} outboxSkipped=${stats.skipped} outboxRetried=${stats.retried} outboxLost=${stats.lost}`,
+        `outboxTopics=${reactionRegistry.topics().join(',') || 'none'} outboxUnknownTopic=dead`,
+      )
+      if (stats.lastError !== undefined) lines.push(`outboxLastError=${stats.lastError}`)
+    } catch (error) {
+      lines.push('outbox=unknown', `outboxReason=${messageOf(error)}`)
+    }
+    try {
+      const stats = await timerWorker.stats()
+      lines.push(
+        'timer=ok',
+        `timerPending=${stats.pending} timerClaimed=${stats.claimed} timerDueAgeMs=${stats.oldestDueAgeMs} timerDead=${stats.deadTimers}`,
+        `timerFired=${stats.fired} timerRetried=${stats.retried} timerTopics=${timerWorker.topics().join(',') || 'none'}`,
+      )
+      if (stats.lastError !== undefined) lines.push(`timerLastError=${stats.lastError}`)
+    } catch (error) {
+      lines.push('timer=unknown', `timerReason=${messageOf(error)}`)
+    }
+    try {
+      // run 状态计数读 DB（pending/running/waiting/completed/failed/dead/cancelled），
+      // 进程累计（本进程领取/推进/死信）另列，避免把 totals 当成全局死信数。
+      const storeStats = await workflowStoreRef.stats()
+      const processStats = await workflowRuntime.stats()
+      lines.push(
+        'workflow=ok',
+        `workflowPending=${storeStats.pending} workflowRunning=${storeStats.running} workflowWaiting=${storeStats.waiting} workflowDead=${storeStats.dead}`,
+        `workflowCompleted=${storeStats.completed} workflowFailed=${storeStats.failed} workflowDueAgeMs=${storeStats.oldestDueAgeMs}`,
+        `workflowDeadLettered=${processStats.dead} workflowRetried=${processStats.retried} workflowSteps=${processStats.steps}`,
+        `workflowDefinitions=${workflowRuntime.names().join(',') || 'none'}`,
+      )
+      if (processStats.lastError !== undefined) lines.push(`workflowLastError=${processStats.lastError}`)
+    } catch (error) {
+      lines.push('workflow=unknown', `workflowReason=${messageOf(error)}`)
+    }
+    return lines
+  }
+
   const startup = new LazyInitializer({
     cooldownMs: 1_000,
     onError: error => logger.error(`v7 启动失败（下次调用会重试）：${messageOf(error)}`),
@@ -529,7 +813,11 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         await queue.start()
         queueStarted = true
       }
+      // 事件运行时必须在投影之后（task-42）且在队列启动之后：reaction 要往已启动的队列入队。
+      if (!runtimeStarted) await startRuntime()
       if (!consolidationStarted) {
+        // 现有 10 分钟巩固循环保留（Task 16 迁移到 workflow/timer 时再删）；
+        // 本次只新增事件驱动路径，不新增任何固定轮询。
         stopConsolidation = startConsolidationLoop(queue, logger)
         consolidationStarted = true
       }
@@ -633,6 +921,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           `reason=${messageOf(error)}`,
           'projection=unknown',
           'projectionReason=db-down',
+          ...runtimeUnknownLines('db-down'),
           ...describeJobHealth({
             enabled: config.jobs,
             initialized: false,
@@ -660,6 +949,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             ...finalFailureHealth,
           }),
           ...(await projectionStatusLines()),
+          ...(await runtimeStatusLines()),
           ...surfaceLines,
         ]
         if (!initialized && startup.error !== undefined) {
@@ -672,6 +962,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           `reason=${messageOf(error)}`,
           'projection=unknown',
           'projectionReason=status-query-failed',
+          ...runtimeUnknownLines('status-query-failed'),
           ...describeJobHealth({
             enabled: config.jobs,
             initialized,
@@ -1194,9 +1485,15 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     // 先让 worker 停掉，再关业务连接池，最后才停便携 PostgreSQL；三个动作不能并发，
     // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。每步独立 5s 超时，
     // 超时/失败只记日志并继续，绝不把异常抛回宿主。
-    // 投影链路必须早于 store.close：worker/read API 在跑时连接池不能先关；
-    // worker 与 notifier 分成两步，worker 卡住超时也不会让 LISTEN 连接泄漏到进程退出。
+    // 顺序：事件运行时（relay/timer/workflow）→ 各自的 LISTEN 连接 → 队列 → 投影链路 →
+    // store.close → 便携 PostgreSQL。relay/timer/workflow 还在跑时不能先关连接池；
+    // 每个 worker 与它的 notifier 分成两步，worker 卡住超时也不会让 LISTEN 连接泄漏。
     const teardownSteps: TeardownStep[] = [
+      { name: 'outbox.relay.stop', run: () => outboxRelay?.stop() },
+      { name: 'timer.worker.stop', run: () => timerWorker?.stop() },
+      { name: 'workflow.runtime.stop', run: () => workflowRuntime?.stop() },
+      { name: 'outbox.notifier.close', run: () => outboxNotifier?.close() },
+      { name: 'timer.notifier.close', run: () => timerNotifier?.close() },
       { name: 'queue.stop', run: () => queue.stop() },
       { name: 'projection.worker.stop', run: () => projectionWorker?.stop() },
       { name: 'projection.read.close', run: () => projectionReadApi?.close() },
@@ -1204,7 +1501,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       { name: 'store.close', run: () => store.close() },
       ...(lifecycle === undefined ? [] : [{ name: 'lifecycle.stop', run: () => lifecycle.stop() }]),
     ]
-    void runTeardownSteps(teardownSteps, { logger })
+    void runTeardownSteps(teardownSteps, { logger, timeoutMs: TEARDOWN_STEP_TIMEOUT_MS })
       .then(report => {
         logger.info('teardown 收尾完成', report)
       })
