@@ -10,10 +10,10 @@ import type {
   StateVersion,
 } from '../../domain/entity.js'
 import { scopeOf } from '../../domain/entity.js'
-import type { JsonValue } from '../../domain/json.js'
+import { isPlainObject, type JsonValue } from '../../domain/json.js'
 import type { Expansion, Link } from '../../domain/link.js'
 import { OmbFailure, conflict, internal, notFound } from '../../domain/errors.js'
-import { deriveReferences, deriveSearchText, deriveTriggers, type NormalizedWrite } from '../../domain/validation.js'
+import { deriveReferences, deriveSearchText, deriveTriggers, decodeRegexTriggerKey, type NormalizedWrite } from '../../domain/validation.js'
 import type {
   ArtifactInput,
   ArtifactRecord,
@@ -39,6 +39,7 @@ import type {
 } from '../../ports/store.js'
 import { asNumber, asString, iso, PostgresDb } from './db.js'
 import {
+  autoArchivedAt,
   buildViewValues,
   mapAttribute,
   mapEntity,
@@ -96,6 +97,12 @@ function mapPgError(error: unknown): OmbFailure {
 
 /** 单次全文检索最多拼多少个 OR 词：长工具输出 tokenize 后动辄上百词，全量会撑大 tsquery。 */
 export const FULLTEXT_MAX_QUERY_TERMS = 48
+
+/**
+ * 每次召回最多加载多少个 regex 触发键候选。正则只在应用层执行，
+ * 候选必须按 kind 索引收窄并有确定序上限，不能退化成无界全表扫描。
+ */
+export const TRIGGER_REGEX_CANDIDATE_LIMIT = 500
 
 /** tsquery 词面白名单：元字符（& | ! ( ) : * < > ' \）与空白一律丢弃，避免语法错误。 */
 const TSQUERY_TERM = /^[\p{L}\p{N}][\p{L}\p{N}_.\-/]*$/u
@@ -248,6 +255,18 @@ async function replaceChainMembers(client: PoolClient, chainId: string, members:
   await insertChainMembers(client, chainId, members, source)
 }
 
+/**
+ * 动态 spec 的规范 JSON。`jsonb` 会按 key 长度重排对象键，
+ * 不能用 `JSON.stringify` 的插入顺序比较（否则同 spec 永远被当成变化，patch 丢缓存）。
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
 /** patch 重新插入属性时保留同名、同 spec 动态属性的缓存；spec 变了才丢弃。 */
 async function preserveDynamicCaches(
   client: PoolClient,
@@ -260,7 +279,7 @@ async function preserveDynamicCaches(
     if (attribute.value.kind !== 'dynamic') continue
     const old = oldByName.get(attribute.name)
     if (old?.value.kind !== 'dynamic') continue
-    if (JSON.stringify(old.value.spec) !== JSON.stringify(attribute.value.spec)) continue
+    if (canonicalJson(old.value.spec) !== canonicalJson(attribute.value.spec)) continue
     if (old.value.cachedValue === undefined && old.value.lastError === undefined) continue
     await client.query(
       `update omb.attribute
@@ -353,6 +372,66 @@ async function selectAttributes(queryable: AttributeQuery, entityId: string): Pr
   return rows.rows.map(mapAttribute)
 }
 
+interface ViewBuild {
+  readonly view: ViewValues
+  readonly triggers: ReturnType<typeof deriveTriggers>
+  readonly references: ReturnType<typeof deriveReferences>
+}
+
+/**
+ * 视图/触发键/引用的唯一派生入口：只读属性行（唯一真源），在写事务内调用。
+ *
+ * 不能从内存里的 `NormalizedWrite.attributes` 派生——patch 前的动态 cachedValue
+ * 只存在于属性表里；从属性行派生才能保证 `entity_view` 可由属性表完整重建。
+ */
+function buildViewFromRows(
+  row: EntityRow,
+  attributes: readonly Attribute[],
+  now: string,
+  archivedAt?: string | null,
+): ViewBuild {
+  const entity = mapEntity(row, attributes)
+  const input: NormalizedWrite = {
+    id: row.id,
+    kind: row.kind === 'state_version' ? 'state' : row.kind,
+    scope: scopeOf(entity),
+    origin: row.origin,
+    ...(row.confidence !== null ? { confidence: row.confidence } : {}),
+    pinned: row.pinned,
+    attributes,
+  }
+  const triggers = deriveTriggers(attributes)
+  const references = deriveReferences(attributes)
+  const view = buildViewValues(
+    input,
+    { searchText: deriveSearchText(attributes), triggers },
+    {
+      now,
+      attributes,
+      isCurrent: row.is_current,
+      revision: Number(row.revision),
+      kindOverride: row.kind,
+      archivedAt,
+    },
+  )
+  return { view, triggers, references }
+}
+
+/**
+ * 动态缓存值写回后重建视图与触发键（同事务）。引用只由 spec 决定，缓存变化不影响，
+ * 因此这里不重写 reference；触发器则可能来自缓存文本里的路径/错误签名，必须重建。
+ */
+async function rebuildViewFromRows(client: PoolClient, entityId: string, now: string): Promise<void> {
+  const entityResult = await client.query<EntityRow>('select * from omb.entity where id = $1', [entityId])
+  const row = entityResult.rows[0]
+  if (row === undefined) return
+  const attributes = await selectAttributes(asAttributeQuery(client), entityId)
+  const { view, triggers } = buildViewFromRows(row, attributes, now, iso(row.archived_at) ?? null)
+  await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
+  await insertTriggers(client, entityId, triggers)
+  await upsertView(client, view)
+}
+
 async function insertAudit(client: PoolClient, entry: AuditEntry): Promise<number> {
   const result = await client.query<{ id: string }>(
     `insert into omb.audit_log (actor, action, target_ids, before, after, inverse, job_id)
@@ -394,29 +473,33 @@ export class PostgresStore implements Store {
     }
   }
 
-  async write(input: NormalizedWrite, derived: DerivedWrite): Promise<WriteResult> {
+  async write(input: NormalizedWrite, _derived: DerivedWrite): Promise<WriteResult> {
     return this.run(async () => {
       const now = nowIso()
-      const view = buildViewValues(input, derived, { now })
+      // attribute 有 entity 外键，entity 必须先插入；归档时间只由属性行里的 status 决定。
+      const archivedAt = autoArchivedAt(input.kind, input.attributes, now)
       return this.db.transaction(async client => {
-        const archived = view.archivedAt !== null
+        const archived = archivedAt !== null
         const entityResult = await client.query<EntityRow>(
           `insert into omb.entity (
              id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason, is_current
            ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true)
            returning *`,
-          [input.id, input.kind, input.origin, input.confidence ?? null, input.pinned, view.archivedAt, archived ? 'auto-status' : null],
+          [input.id, input.kind, input.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null],
         )
         const entityRow = entityResult.rows[0]
         if (entityRow === undefined) throw new OmbFailure(internal('实体写入没有返回行'))
         await insertAttributes(client, input.id, input.attributes)
         await upsertRegistry(client, input.attributes)
-        await replaceReferences(client, input.id, derived.references ?? deriveReferences(input.attributes))
-        await insertTriggers(client, input.id, derived.triggers)
+        // trigger_key/reference/entity_view 都从同一事务内读回的属性行派生（唯一真源）。
+        const persisted = await selectAttributes(asAttributeQuery(client), input.id)
+        await replaceReferences(client, input.id, deriveReferences(persisted))
+        await insertTriggers(client, input.id, deriveTriggers(persisted))
         if (input.kind === 'chain' && input.group !== undefined) {
           await assertChainMemberKinds(client, input.group)
           await insertChainMembers(client, input.id, input.group, input.origin)
         }
+        const { view } = buildViewFromRows(entityRow, persisted, now, archivedAt)
         await upsertView(client, view)
         const similar = await this.findSimilar(client, input, view)
         await insertAudit(client, {
@@ -427,7 +510,7 @@ export class PostgresStore implements Store {
           inverse: toJson({ action: 'remove_written', entityId: input.id }),
         })
         return {
-          entity: mapEntity(entityRow, input.attributes),
+          entity: mapEntity(entityRow, persisted),
           ...similar,
         }
       })
@@ -466,7 +549,7 @@ export class PostgresStore implements Store {
     })
   }
 
-  async patch(input: NormalizedWrite, patch: PatchEntityInput, derived: DerivedWrite): Promise<PatchResult> {
+  async patch(input: NormalizedWrite, patch: PatchEntityInput, _derived: DerivedWrite): Promise<PatchResult> {
     return this.run(async () => {
       const now = nowIso()
       return this.db.transaction(async client => {
@@ -495,15 +578,18 @@ export class PostgresStore implements Store {
         await client.query('delete from omb.attribute where entity_id = $1', [input.id])
         await insertAttributes(client, input.id, input.attributes)
         await preserveDynamicCaches(client, input.id, oldAttributes, input.attributes)
-        await replaceReferences(client, input.id, derived.references ?? deriveReferences(input.attributes))
+        // 唯一真源是属性行：preserveDynamicCaches 写回缓存后再读回，视图/触发键/引用都从这里派生。
+        const persisted = await selectAttributes(asAttributeQuery(client), input.id)
+        await replaceReferences(client, input.id, deriveReferences(persisted))
         // trigger_key 也是派生数据；patch 必须整体替换，否则旧路径/错误签名会残留。
         await client.query('delete from omb.trigger_key where entity_id = $1', [input.id])
-        await insertTriggers(client, input.id, derived.triggers)
+        await insertTriggers(client, input.id, deriveTriggers(persisted))
         if (input.kind === 'chain' && input.group !== undefined) {
           await assertChainMemberKinds(client, input.group)
           await replaceChainMembers(client, input.id, input.group, input.origin)
         }
-        const view = buildViewValues(input, derived, { now, revision: Number(current.revision) + 1 })
+        // 自动归档由状态机 status 决定；先落 entity 再按最终行派生视图，版本号与归档列保持一致。
+        const archivedAt = autoArchivedAt(input.kind, persisted, now)
         const updatedResult = await client.query<EntityRow>(
           `update omb.entity
            set revision = revision + 1,
@@ -519,13 +605,14 @@ export class PostgresStore implements Store {
             input.id,
             input.confidence ?? current.confidence,
             input.pinned,
-            view.archivedAt,
-            view.archivedAt === null ? null : 'auto-status',
+            archivedAt,
+            archivedAt === null ? null : 'auto-status',
             input.origin,
           ],
         )
         const updated = updatedResult.rows[0]
         if (updated === undefined) throw new OmbFailure(internal('实体更新没有返回行'))
+        const { view } = buildViewFromRows(updated, persisted, now, archivedAt)
         await upsertView(client, view)
         await insertAudit(client, {
           actor: input.origin,
@@ -947,12 +1034,8 @@ export class PostgresStore implements Store {
         )
         if (updated.rowCount === 0) return
         if (value !== undefined && error === undefined) {
-          await client.query(
-            `update omb.entity_view
-             set attrs = jsonb_set(attrs, array[$2]::text[], $3::jsonb, true), updated_at = now()
-             where entity_id = $1`,
-            [entityId, name, JSON.stringify(value)],
-          )
+          // 动态缓存值是检索文本的一部分：与属性行同事务重建 search_text/chars/snippet 与触发键。
+          await rebuildViewFromRows(client, entityId, cachedAt)
         } else {
           await client.query('update omb.entity_view set updated_at = now() where entity_id = $1', [entityId])
         }
@@ -962,37 +1045,18 @@ export class PostgresStore implements Store {
 
   async rebuildView(id: string): Promise<void> {
     await this.run(async () => {
-      const entityResult = await this.db.query<EntityRow>('select * from omb.entity where id = $1', [id])
-      const row = entityResult.rows[0]
-      if (row === undefined) return
-      const attributes = await selectAttributes(this.db, id)
-      const entity = mapEntity(row, attributes)
-      const input: NormalizedWrite = {
-        id,
-        kind: entity.kind === 'state_version' ? 'state' : entity.kind,
-        scope: scopeOf(entity),
-        origin: entity.origin,
-        ...(entity.confidence !== undefined ? { confidence: entity.confidence } : {}),
-        pinned: entity.pinned,
-        attributes,
-      }
-      const derived = {
-        searchText: deriveSearchText(attributes),
-        triggers: deriveTriggers(attributes),
-        references: deriveReferences(attributes),
-      }
-      const view = buildViewValues(input, derived, {
-        now: new Date().toISOString(),
-        isCurrent: entity.isCurrent,
-        revision: entity.revision,
-        archivedAt: entity.archivedAt ?? null,
-        kindOverride: entity.kind,
-      })
+      const now = nowIso()
       await this.db.transaction(async client => {
-        await upsertView(client, view)
-        await replaceReferences(client, id, derived.references)
+        // 行锁 + 同一事务读属性行，避免重建窗口里读到半更新状态（VIEW 必须可由属性表重建）。
+        const entityResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+        const row = entityResult.rows[0]
+        if (row === undefined) return
+        const attributes = await selectAttributes(asAttributeQuery(client), id)
+        const { view, triggers, references } = buildViewFromRows(row, attributes, now, iso(row.archived_at) ?? null)
         await client.query('delete from omb.trigger_key where entity_id = $1', [id])
-        await insertTriggers(client, id, derived.triggers)
+        await insertTriggers(client, id, triggers)
+        await replaceReferences(client, id, references)
+        await upsertView(client, view)
       })
     })
   }
@@ -1587,11 +1651,16 @@ export class PostgresStore implements Store {
     if (spec.keys.length > 0) {
       const params: unknown[] = [spec.keys]
       const filter = this.scopeClause(spec, params)
+      // 不能写成 `where t.key = any($1)`：trigger_key 现有索引是 (kind, key)，
+      // 没有 key 前导列时会退化成全表扫描。把候选键展开成 (kind,key) 等值探针后，
+      // 走 trigger_key_lookup 索引；仍是单条参数化查询，无 N+1。
       const rows = await this.db.query<{ entity_id: string; raw: number }>(
         `select t.entity_id, sum(t.weight) as raw
-         from omb.trigger_key t
+         from (select distinct key from unnest($1::text[]) as input(key)) as cand
+         cross join (values ('path'),('tool'),('error'),('entity'),('text')) as k(kind)
+         join omb.trigger_key t on t.kind = k.kind and t.key = cand.key
          join omb.entity_view v on v.entity_id = t.entity_id
-         where t.key = any($1::text[]) ${filter}
+         where true ${filter}
          group by t.entity_id
          order by raw desc
          limit 50`,
@@ -1600,21 +1669,24 @@ export class PostgresStore implements Store {
       for (const row of rows.rows) scores.set(row.entity_id, Math.max(scores.get(row.entity_id) ?? 0, Number(row.raw)))
     }
     if (spec.regexText !== undefined && spec.regexText.trim().length > 0) {
-      const params: unknown[] = [spec.regexText]
-      void params
       const filterParams: unknown[] = []
       const filter = this.scopeClause(spec, filterParams)
+      // 正则只在应用层执行（SPEC §7.1）；候选先按 trigger_key(kind,key) 索引收窄到 regex 类，
+      // 并且只取 scope/kind 过滤后的实体。固定上限 + 确定序，避免无 order by 时按物理顺序静默截断。
       const rows = await this.db.query<{ entity_id: string; key: string; weight: number }>(
         `select t.entity_id, t.key, t.weight
          from omb.trigger_key t
          join omb.entity_view v on v.entity_id = t.entity_id
          where t.kind = 'regex' ${filter}
-         limit 500`,
+         order by t.entity_id asc, t.key asc
+         limit ${TRIGGER_REGEX_CANDIDATE_LIMIT}`,
         filterParams,
       )
       for (const row of rows.rows) {
+        const { source, flags } = decodeRegexTriggerKey(row.key)
         try {
-          if (new RegExp(row.key).test(spec.regexText)) {
+          const pattern = flags === undefined ? new RegExp(source) : new RegExp(source, flags)
+          if (pattern.test(spec.regexText)) {
             scores.set(row.entity_id, Math.max(scores.get(row.entity_id) ?? 0, Number(row.weight) * 1.2))
           }
         } catch {

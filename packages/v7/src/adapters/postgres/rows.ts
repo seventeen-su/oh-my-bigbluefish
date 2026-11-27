@@ -195,11 +195,28 @@ function collectPreview(value: JsonValue, out: string[], depth = 0): void {
   }
 }
 
+/**
+ * 状态机 completed/discarded 自动归档时间；从属性行读取 status，其余实体返回 null。
+ *
+ * 写入路径需要在插入 attribute 之前就拿到 entity.archived_at（外键顺序），
+ * 视图重建则通常由调用方显式传 archivedAt；两条路径共用这一条规则。
+ */
+export function autoArchivedAt(kind: EntityKind, attributes: readonly Attribute[], now: string): string | null {
+  if (kind !== 'state') return null
+  const status = attributeValue(attributes, 'status')
+  return typeof status === 'string' && isStateStatus(status) && shouldAutoArchive(status) ? now : null
+}
+
 export function buildViewValues(
   input: NormalizedWrite,
   derived: DerivedWrite,
   options: {
     now: string
+    /**
+     * 派生源：同一事务内读回的属性行。缺省用写入入参（纯函数单测），
+     * 事务路径必须传属性行，否则动态 cachedValue 进不了 search_text/chars/snippet。
+     */
+    attributes?: readonly Attribute[]
     isCurrent?: boolean
     revision?: number
     archivedAt?: string | null
@@ -208,10 +225,12 @@ export function buildViewValues(
 ): ViewValues {
   const scope = input.scope
   const projectKey = scope.kind === 'global' ? '' : scope.projectKey
-  const categoryValue = attributeValue(input.attributes, 'category')
-  const statusValue = attributeValue(input.attributes, 'status')
-  const timeValue = attributeValue(input.attributes, 'time')
-  const titleValue = attributeValue(input.attributes, 'title')
+  const attributes = options.attributes ?? input.attributes
+  const kind = options.kindOverride ?? input.kind
+  const categoryValue = attributeValue(attributes, 'category')
+  const statusValue = attributeValue(attributes, 'status')
+  const timeValue = attributeValue(attributes, 'time')
+  const titleValue = attributeValue(attributes, 'title')
   const category = typeof categoryValue === 'string' && isCategory(categoryValue) ? categoryValue : null
   const status = typeof statusValue === 'string' && isStateStatus(statusValue) ? statusValue : null
   const eventTime = typeof timeValue === 'string' && Number.isFinite(Date.parse(timeValue))
@@ -221,7 +240,7 @@ export function buildViewValues(
 
   const attrs: Record<string, JsonValue> = {}
   const attrNames: string[] = []
-  for (const attribute of input.attributes) {
+  for (const attribute of attributes) {
     if (attribute.required) continue
     attrNames.push(attribute.name)
     if (attribute.value.kind === 'static') {
@@ -232,12 +251,13 @@ export function buildViewValues(
   }
 
   // 自动归档是状态机的规则；记忆/思维链即使带同名自定义属性也不能被误归档。
-  const autoArchive = input.kind === 'state' && status !== null && shouldAutoArchive(status)
-  const archivedAt = options.archivedAt !== undefined ? options.archivedAt : autoArchive ? options.now : null
+  const archivedAt = options.archivedAt !== undefined ? options.archivedAt : autoArchivedAt(kind, attributes, options.now)
+  const derivedText = deriveSearchText(attributes)
+  const preview = previewOf(attributes, title)
 
   return {
     entityId: input.id,
-    kind: options.kindOverride ?? input.kind,
+    kind,
     category,
     scope: scope.kind,
     projectKey,
@@ -246,9 +266,9 @@ export function buildViewValues(
     eventTime,
     attrs,
     attrNames,
-    searchText: tokenizeForSearch(deriveSearchText(input.attributes)),
-    snippet: previewOf(input.attributes, title),
-    chars: charSet(`${previewOf(input.attributes, title)} ${deriveSearchText(input.attributes)}`),
+    searchText: tokenizeForSearch(derivedText),
+    snippet: preview,
+    chars: charSet(`${preview} ${derivedText}`),
     triggers: derived.triggers.map(trigger => `${trigger.kind}:${trigger.key}`),
     isCurrent: options.isCurrent ?? true,
     archivedAt,

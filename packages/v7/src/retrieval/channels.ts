@@ -170,13 +170,16 @@ export async function runStageOne(deps: StageOneDeps, input: StageOneInput): Pro
       channel: 'trigger',
       execute: async () => {
         const keys = triggerKeys(request.query)
-        if (keys.length === 0) {
-          return { status: 'skipped', hits: [], reason: '查询里没有路径/标识符/错误码等可匹配触发键' }
+        // 动态 regex 触发键由应用层执行，任意查询文本都可能是候选；
+        // 没有路径/标识符/错误码时不能直接跳过，否则带 flags 的正则触发永远无候选。
+        const regexText = normalizedQuery.length > 0 ? request.query : undefined
+        if (keys.length === 0 && regexText === undefined) {
+          return { status: 'skipped', hits: [], reason: '查询为空，没有可匹配的触发键或正则文本' }
         }
         const hits = await store.triggers({
           ...base,
           keys,
-          ...(normalizedQuery.length > 0 ? { regexText: request.query } : {}),
+          ...(regexText === undefined ? {} : { regexText }),
         })
         return toExecution(hits, config.channelLimit)
       },

@@ -534,6 +534,38 @@ export function deriveReferences(attributes: readonly Attribute[]): DerivedRefer
   return result
 }
 
+/**
+ * 正则触发键的存储编码。`trigger_key.key` 是文本列，flags 必须随 source 一起落库：
+ * - 无 flags 时 key 就是 source（兼容既有行，保持可读）；
+ * - 有 flags 时存两元素 JSON 数组，避免 source 里出现分隔符时无法还原。
+ * 正则只在应用层执行，由 store 用 `decodeRegexTriggerKey` 还原后编译（SPEC §7.1）。
+ */
+export interface RegexTriggerKey {
+  readonly source: string
+  readonly flags?: string
+}
+
+const REGEX_KEY_ENCODED_PREFIX = '["'
+
+export function encodeRegexTriggerKey(source: string, flags?: string): string {
+  return flags === undefined || flags.length === 0 ? source : JSON.stringify([source, flags])
+}
+
+export function decodeRegexTriggerKey(key: string): RegexTriggerKey {
+  if (!key.startsWith(REGEX_KEY_ENCODED_PREFIX)) return { source: key }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(key)
+  } catch {
+    // 旧格式：整串就是 source（例如以 `["` 开头的字符类正则）。
+    return { source: key }
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 2) return { source: key }
+  const [source, flags] = parsed as unknown[]
+  if (typeof source !== 'string' || source.length === 0 || typeof flags !== 'string') return { source: key }
+  return flags.length === 0 ? { source } : { source, flags }
+}
+
 export function deriveTriggers(attributes: readonly Attribute[]): Array<{ kind: 'path' | 'regex' | 'tool' | 'error' | 'entity' | 'text'; key: string; weight: number }> {
   const result: Array<{ kind: 'path' | 'regex' | 'tool' | 'error' | 'entity' | 'text'; key: string; weight: number }> = []
   const seen = new Set<string>()
@@ -547,15 +579,19 @@ export function deriveTriggers(attributes: readonly Attribute[]): Array<{ kind: 
   }
 
   for (const attribute of attributes) {
+    // 动态 spec 的 regex/entity 触发键来自 spec 本身，写入时动态属性还没有 cachedValue；
+    // 必须在按值判空之前派生，否则 trigger_key 永远为空（CORE-02）。
+    if (attribute.value.kind === 'dynamic') {
+      if (attribute.value.spec.kind === 'regex') {
+        push('regex', encodeRegexTriggerKey(attribute.value.spec.source, attribute.value.spec.flags), 1.2)
+      }
+      if (attribute.value.spec.kind === 'ref') push('entity', attribute.value.spec.entityId, 1)
+    }
     const value = attribute.value.kind === 'static' ? attribute.value.value : attribute.value.cachedValue
     if (value === undefined) continue
     if (attribute.name === 'triggers' || attribute.name === 'trigger') {
       if (Array.isArray(value)) for (const item of value) if (typeof item === 'string') push('text', item, 1)
       if (typeof value === 'string') push('text', value, 1)
-    }
-    if (attribute.value.kind === 'dynamic') {
-      if (attribute.value.spec.kind === 'regex') push('regex', attribute.value.spec.source, 1.2)
-      if (attribute.value.spec.kind === 'ref') push('entity', attribute.value.spec.entityId, 1)
     }
     if (typeof value === 'string') {
       for (const match of value.matchAll(PATH_PATTERN)) push('path', match[0], 1.3)
@@ -571,5 +607,8 @@ export function deriveTriggers(attributes: readonly Attribute[]): Array<{ kind: 
       }
     }
   }
+  // ref/template/code/regex-input 的引用目标统一落 entity 键；与 deriveReferences 同源，
+  // 避免触发通道只认识 `ref` 一种动态引用。
+  for (const reference of deriveReferences(attributes)) push('entity', reference.targetEntityId, 1)
   return result
 }

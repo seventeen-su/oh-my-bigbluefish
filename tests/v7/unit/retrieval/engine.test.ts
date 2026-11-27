@@ -131,6 +131,21 @@ describe('RecallEngine 阶段一与融合', () => {
     expect(result.hits.map(entry => entry.entityId)).toEqual(['mem_c'])
   })
 
+  it('给定查询没有路径/标识符/错误码当 regex 文本存在则 trigger 通道仍执行并带 regexText', async () => {
+    const store = new FakeStore()
+    store.channelHits.trigger = [hit('mem_b', 1, 1.2, 'trigger')]
+    seedMemory(store, ['mem_b'])
+
+    const result = await makeEngine(store).recall({ query: '服务报错了，请看看', now: FIXED_NOW })
+
+    // 动态 regex 触发键在应用层执行；没有显式 key 时不能直接 skip，否则正则触发永远无候选。
+    expect(store.calls.trigger).toHaveLength(1)
+    expect(store.calls.trigger[0]?.keys).toEqual([])
+    expect(store.calls.trigger[0]?.regexText).toBe('服务报错了，请看看')
+    expect(result.channels.find(report => report.channel === 'trigger')?.status).toBe('ok')
+    expect(result.hits.map(entry => entry.entityId)).toEqual(['mem_b'])
+  })
+
   it('给定全文零命中但查询很长当召回则不跑单字回退', async () => {
     const store = new FakeStore()
 
