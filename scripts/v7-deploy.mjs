@@ -94,8 +94,15 @@ function ensureProfileDeps() {
   }
   backup(manifestPath)
   writeFileSync(manifestPath, `${JSON.stringify({ ...manifest, dependencies }, null, 2)}\n`, 'utf8')
-  const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
-  const result = spawnSync(pnpm, ['install', '--ignore-scripts'], { cwd: PROFILE, stdio: 'inherit', shell: false })
+  // Windows 下 .cmd 不能被 spawn 直接执行；经 cmd /d /s /c 调用，命令与参数都是固定字面量，
+  // 不使用 shell:true（避免 Node 的参数拼接告警与注入面）。
+  const result = process.platform === 'win32'
+    ? spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm install --ignore-scripts'], {
+      cwd: PROFILE,
+      stdio: 'inherit',
+      shell: false,
+    })
+    : spawnSync('pnpm', ['install', '--ignore-scripts'], { cwd: PROFILE, stdio: 'inherit', shell: false })
   if (result.status !== 0) throw new Error(`profile pnpm install 失败：${result.status ?? 'unknown'}`)
 }
 
