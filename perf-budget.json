@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "updated": "2026-11-27",
+  "gates": ["stage1_p95_ms", "total_p95_ms", "write_txn_p95_ms", "write_p95_ms"],
+  "metrics": {
+    "stage1_p95_ms": { "budget": 150, "kind": "p95", "where": "server", "runs": 3 },
+    "total_p95_ms": { "budget": 300, "kind": "p95", "where": "server", "runs": 3 },
+    "write_txn_p95_ms": { "budget": 20, "kind": "p95", "where": "server", "runs": 3 },
+    "write_p95_ms": { "budget": 50, "kind": "p95", "where": "server", "runs": 3 },
+    "outbox_lag_ms": { "budget": 1000, "kind": "p95", "where": "server", "runs": 1 },
+    "projection_lag_ms": { "budget": 1000, "kind": "p95", "where": "server", "runs": 1 }
+  }
+}
