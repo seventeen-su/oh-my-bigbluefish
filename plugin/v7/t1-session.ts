@@ -63,9 +63,21 @@ export interface T1Session {
   /** 已投递 T1 的跨 step 内容指纹（session+query+result，不含 turn/step）。 */
   readonly lastT1: Map<string, string>
   /** 同一段注入文本在 90 步/7 轮窗口内不重复注入；压缩事件会清空重计。 */
-  isDuplicateT1Content(sessionId: string, text: string, position?: StepPosition): boolean
-  rememberT1Content(sessionId: string, text: string, position?: StepPosition): void
+  isDuplicateT1Content(
+    sessionId: string,
+    text: string,
+    position?: StepPosition,
+    entityIds?: readonly string[],
+  ): boolean
+  rememberT1Content(
+    sessionId: string,
+    text: string,
+    position?: StepPosition,
+    entityIds?: readonly string[],
+  ): void
   clearT1Content(sessionId: string): void
+  /** 窗口内已展示的实体 id，T1 装配时过滤，避免换顺序/换子集重复出现。 */
+  recentT1EntityIds(sessionId: string): ReadonlySet<string>
   /** RecallService 的注入回调：只进采用等待集合，不写 receipt（T2 由 engine 自己写）。 */
   rememberPendingRecall(injection: RecallInjection): void
   /** 记录一次注入：receipt 落库，命中进采用等待集合。 */
@@ -235,9 +247,12 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     t1Step,
     residentCache,
     lastT1,
-    isDuplicateT1Content: (sessionId, text, position) => contentWindow.isDuplicate(sessionId, text, position),
-    rememberT1Content: (sessionId, text, position) => contentWindow.remember(sessionId, text, position),
+    isDuplicateT1Content: (sessionId, text, position, entityIds) =>
+      contentWindow.isDuplicate(sessionId, text, position, entityIds),
+    rememberT1Content: (sessionId, text, position, entityIds) =>
+      contentWindow.remember(sessionId, text, position, entityIds),
     clearT1Content: sessionId => contentWindow.clear(sessionId),
+    recentT1EntityIds: sessionId => contentWindow.recentEntityIds(sessionId),
     rememberPendingRecall,
     rememberInjection,
     recordResidentHits,

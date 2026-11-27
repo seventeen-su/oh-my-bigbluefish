@@ -161,6 +161,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         'tool-before',
         400,
         captured => { notice = captured },
+        session.recentT1EntityIds(context.sessionId),
       )
       // 预取可能被丢弃（报错时重新查、本步已有 T1、工具取消）：不在这里登记 receipt，
       // 只有 post-execute 真正把 text 挂到 additionalContexts 时才登记。
@@ -241,24 +242,25 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
             failed ? 'tool-error' : 'tool-before',
             400,
             notice => { generatedNotice = notice },
+            session.recentT1EntityIds(sessionId),
           ),
           1_500,
         ) ?? ''
       }
       if (injected.length === 0) return decision
-      // 90 步/7 轮窗口内同一段文本已投递过：不再重复追加，也不登记新的 receipt。
-      if (session.isDuplicateT1Content(sessionId, injected, position)) {
+      const deliveredNotice = reused?.notice ?? generatedNotice
+      // 90 步/7 轮窗口内同一段文本或基本同一批实体已投递过：不再重复追加，也不登记新的 receipt。
+      if (session.isDuplicateT1Content(sessionId, injected, position, deliveredNotice?.receipt?.keptIds)) {
         if (callId !== undefined) session.prefetchedT1.delete(callId)
         return decision
       }
-      const deliveredNotice = reused?.notice ?? generatedNotice
       if (deliveredNotice !== undefined) {
         session.rememberInjection(sessionId, deliveredNotice)
         // 文本真正挂到 additionalContexts 后才把 recall_event 标成 injected。
         await store.markRecallInjected?.(deliveredNotice.traceId)
       }
       // 只登记真正投递出去的 T1：下一轮 pre-step 认领它，本步配额同时记为已用。
-      session.rememberT1Content(sessionId, injected, position)
+      session.rememberT1Content(sessionId, injected, position, deliveredNotice?.receipt?.keptIds)
       rememberSessionState(session.immediateT1, sessionId, injected)
       rememberSessionState(session.lastT1, sessionId, fingerprint)
       if (position !== undefined) rememberSessionState(session.t1Step, sessionId, position.key)
@@ -384,10 +386,12 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
             400,
             // 先捕获 notice：宿主 reject 的 step 不会追加消息，那时不该登记 receipt/采用等待。
             captured => { notice = captured },
+            session.recentT1EntityIds(sessionId),
           ),
           1_500,
         ) ?? ''
-        if (injected.length > 0 && session.isDuplicateT1Content(sessionId, injected, { turn, step })) {
+        if (injected.length > 0
+          && session.isDuplicateT1Content(sessionId, injected, { turn, step }, notice?.receipt?.keptIds)) {
           // 同一段内容在 90 步/7 轮内已经投递；不要因中间插入了别的召回而再次注入。
           injected = ''
           notice = undefined
@@ -439,7 +443,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       session.rememberT1Content(prepared.sessionId, prepared.text, {
         ...(prepared.turn === undefined ? {} : { turn: prepared.turn }),
         ...(prepared.step === undefined ? {} : { step: prepared.step }),
-      })
+      }, prepared.notice?.receipt?.keptIds)
       if (prepared.stepKey !== undefined) rememberSessionState(session.t1Step, prepared.sessionId, prepared.stepKey)
       if (prepared.fingerprint !== undefined) rememberSessionState(session.lastT1, prepared.sessionId, prepared.fingerprint)
     }

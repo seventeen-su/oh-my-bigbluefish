@@ -105,9 +105,20 @@ const T1_DEDUP_WINDOW_TURNS = 7
 
 interface T1ContentEntry {
   readonly hash: string
+  readonly entityIds: readonly string[]
   readonly turn?: number
   readonly step?: number
   readonly seq: number
+}
+
+/** 两个命中集合是否“基本是同一批内容”：Jaccard ≥ 0.5 且共享 ≥2。 */
+function overlapsRecent(previous: readonly string[], next: readonly string[]): boolean {
+  if (previous.length === 0 || next.length === 0) return false
+  const previousSet = new Set(previous)
+  const shared = next.filter(id => previousSet.has(id)).length
+  if (shared < 2) return false
+  const union = new Set([...previous, ...next]).size
+  return shared / union >= 0.5
 }
 
 /** 注入文本的稳定哈希；只看内容，不把本步查询/工具结果差异带进键。 */
@@ -126,20 +137,32 @@ export class T1ContentWindow {
   private readonly entries = new Map<string, T1ContentEntry[]>()
   private seq = 0
 
-  isDuplicate(sessionId: string, text: string, position: StepPosition = {}): boolean {
+  isDuplicate(
+    sessionId: string,
+    text: string,
+    position: StepPosition = {},
+    entityIds: readonly string[] = [],
+  ): boolean {
     if (text.trim().length === 0) return false
     const hash = t1TextHash(text)
     const list = this.entries.get(sessionId)
     if (list === undefined) return false
-    return list.some(entry => entry.hash === hash && this.withinWindow(entry, position))
+    return list.some(entry => this.withinWindow(entry, position)
+      && (entry.hash === hash || overlapsRecent(entry.entityIds, entityIds)))
   }
 
-  remember(sessionId: string, text: string, position: StepPosition = {}): void {
+  remember(
+    sessionId: string,
+    text: string,
+    position: StepPosition = {},
+    entityIds: readonly string[] = [],
+  ): void {
     if (text.trim().length === 0) return
     this.seq += 1
     const list = this.entries.get(sessionId) ?? []
     list.push({
       hash: t1TextHash(text),
+      entityIds: [...new Set(entityIds)],
       ...(position.turn === undefined ? {} : { turn: position.turn }),
       ...(position.step === undefined ? {} : { step: position.step }),
       seq: this.seq,
@@ -152,6 +175,12 @@ export class T1ContentWindow {
       if (oldest === undefined) break
       this.entries.delete(oldest)
     }
+  }
+
+  /** 窗口内已经展示过的实体 id；召回装配时过滤掉，避免同一批记忆换顺序重复出现。 */
+  recentEntityIds(sessionId: string): ReadonlySet<string> {
+    const list = this.entries.get(sessionId) ?? []
+    return new Set(list.flatMap(entry => entry.entityIds))
   }
 
   clear(sessionId: string): void {

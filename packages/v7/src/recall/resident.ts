@@ -683,6 +683,7 @@ export async function buildEventRecallText(
   scenario: RecallScenario,
   budgetTokens = 400,
   onRecall?: RecallNoticeSink,
+  excludeEntityIds?: ReadonlySet<string>,
 ): Promise<string> {
   if (query.trim().length === 0) return ''
   const projectKey = context.projectKey ?? context.cwd
@@ -699,7 +700,7 @@ export async function buildEventRecallText(
     injected: false,
   })
   if (result.hits.length === 0) return ''
-  const compacted = compact(result, EVENT_RECALL_MAX_HITS)
+  const compacted = compact(result, EVENT_RECALL_MAX_HITS, excludeEntityIds)
   if (compacted.length === 0) return ''
   const blocks = compacted.map(entry => dataBlock({
     id: entry.hit.entityId,
@@ -737,11 +738,16 @@ interface CompactedEventRecallHit {
 }
 
 /** 单行 `相关：...` 的条目：按 entityId 去重、跳过空标题、条数封顶，保持预算可预测。 */
-function compact(result: RecallResult, max: number): CompactedEventRecallHit[] {
+function compact(
+  result: RecallResult,
+  max: number,
+  excludeEntityIds?: ReadonlySet<string>,
+): CompactedEventRecallHit[] {
   const seen = new Set<string>()
   const entries: CompactedEventRecallHit[] = []
   for (const hit of result.hits) {
     if (seen.has(hit.entityId)) continue
+    if (excludeEntityIds?.has(hit.entityId) === true) continue
     const text = compactHit(hit)
     if (text.length === 0) continue
     seen.add(hit.entityId)

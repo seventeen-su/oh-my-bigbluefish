@@ -25,6 +25,29 @@ describe('T1ContentWindow: 跨步/跨轮内容去重', () => {
     expect(window.isDuplicate(session, content, { turn: 2, step: 3 })).toBe(true)
   })
 
+  it('文本不同但命中集合基本重叠时也去重（窗口内同一批记忆换顺序/少一条不算新信息）', () => {
+    const window = new T1ContentWindow()
+    window.remember(session, content, { turn: 1, step: 1 }, ['a', 'b', 'c'])
+    expect(window.isDuplicate(
+      session,
+      `${content}\n顺序变化`,
+      { turn: 1, step: 2 },
+      ['b', 'c', 'd'],
+    )).toBe(true)
+    expect(window.isDuplicate(
+      session,
+      `${content}\n只有一条重叠`,
+      { turn: 1, step: 2 },
+      ['a', 'd', 'e'],
+    )).toBe(false)
+    expect(window.isDuplicate(
+      session,
+      `${content}\n单条候选`,
+      { turn: 1, step: 2 },
+      ['b'],
+    )).toBe(false)
+  })
+
   it('不同内容不互相抑制', () => {
     const window = new T1ContentWindow()
     window.remember(session, content, { turn: 1, step: 1 })
