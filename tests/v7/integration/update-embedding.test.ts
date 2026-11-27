@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { HASH_MODEL, HashEmbedder, hashEmbed } from '../../../packages/v7/src/adapters/embedding/index.js'
+import { HASH_DIMS, HASH_MODEL, HashEmbedder, hashEmbed } from '../../../packages/v7/src/adapters/embedding/index.js'
 import type { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import { deriveSearchText } from '../../../packages/v7/src/domain/validation.js'
 import { handleEmbedJob } from '../../../packages/v7/src/jobs/embed.js'
+import type { Embedder } from '../../../packages/v7/src/ports/embedding.js'
 import type { JobOptions, JobQueue, Logger } from '../../../packages/v7/src/ports/jobs.js'
 import { derived, normalized, prepareDatabase, resetDatabase, store } from './helpers.js'
 
@@ -60,6 +61,20 @@ function vec(values: readonly number[]): string {
   return `[${values.join(',')}]`
 }
 
+/** 真实 PG 下模拟 ONNX 模型缺失：available() 明确报 false，绝不产向量。 */
+class UnavailableEmbedder implements Embedder {
+  readonly model = HASH_MODEL
+  readonly dims = HASH_DIMS
+
+  async available(): Promise<boolean> {
+    return false
+  }
+
+  async embed(): Promise<number[][]> {
+    throw new Error('嵌入器不可用')
+  }
+}
+
 describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
   let db: PostgresStore
   let embedder: HashEmbedder
@@ -72,12 +87,10 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     embedder = new HashEmbedder()
   })
 
-  beforeEach(async () => {
-    await resetDatabase()
-    queue = new RecordingQueue()
-    service = new UpdateService({
+  function serviceFor(activeEmbedder: Embedder): UpdateService {
+    return new UpdateService({
       store: db,
-      embedder,
+      embedder: activeEmbedder,
       jobs: queue,
       clock: FIXED_CLOCK,
       logger: NOOP_LOGGER,
@@ -87,6 +100,12 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
         await db.db.query('delete from omb.embedding where entity_id = $1', [entityId])
       },
     })
+  }
+
+  beforeEach(async () => {
+    await resetDatabase()
+    queue = new RecordingQueue()
+    service = serviceFor(embedder)
   })
 
   afterAll(async () => {
@@ -167,6 +186,23 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     expect(await similarityTo(id, oldVector)).toBeLessThan(0.999)
     const newHits = await db.vector({ embedding: newVector, limit: 10 })
     expect(newHits.find(hit => hit.entityId === id)?.rawScore).toBeGreaterThan(0.999)
+  })
+
+  it('给定嵌入器不可用当 update 正文变化则删除旧向量并返回 unavailable', async () => {
+    const id = await writeMemory({ title: OLD_TITLE, body: OLD_BODY })
+    const before = await db.get(id)
+    const oldVector = hashEmbed(deriveSearchText(before?.attributes ?? []))
+    await db.upsertEmbedding(id, embedder.model, embedder.dims, oldVector)
+    expect(await embeddingCount(id)).toBe(1)
+
+    const result = await serviceFor(new UnavailableEmbedder()).update({ id, attrs: { body: NEW_BODY } })
+
+    expect(result.ok).toBe(true)
+    expect(result.ok ? result.value.embedding : undefined).toBe('unavailable')
+    // 旧行已删且没有重建任务：vector 通道不能再召回旧正文的语义向量。
+    expect(await embeddingCount(id)).toBe(0)
+    expect((await db.vector({ embedding: oldVector, limit: 10 })).map(hit => hit.entityId)).not.toContain(id)
+    expect(queue.enqueued).toHaveLength(0)
   })
 
   it('给定正文未变当 update 则不重复入队且旧向量保留', async () => {

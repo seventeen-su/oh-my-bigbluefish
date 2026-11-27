@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { populateEmbedding } from '../../../packages/v7/src/app/embedding.js'
 import { RememberService } from '../../../packages/v7/src/app/remember.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { Attribute, Entity, PatchEntityInput, StateStatus, WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
@@ -147,7 +148,7 @@ class WriteFakeStore extends EmbeddingFakeStore {
 function updateService(
   store: UpdateFakeStore,
   path: FakeWritePath,
-  options: { readonly embedder?: FakeEmbedder; readonly jobs?: boolean } = {},
+  options: { readonly embedder?: FakeEmbedder; readonly jobs?: boolean; readonly invalidateError?: Error } = {},
 ): UpdateService {
   const queue = options.jobs === false ? undefined : new RecordingQueue(path)
   return new UpdateService({
@@ -158,6 +159,7 @@ function updateService(
     logger: NOOP_LOGGER,
     invalidateEmbedding: async entityId => {
       path.events.push('invalidate')
+      if (options.invalidateError !== undefined) throw options.invalidateError
       path.invalidated.push(entityId)
     },
   })
@@ -286,7 +288,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     expect(store.embeddingUpserts[0]).toMatchObject({ entityId: MEMORY_ID, model: embedder.model, dims: embedder.dims })
   })
 
-  it('给定嵌入器不可用当更新则既不失效也不入队', async () => {
+  it('给定正文变化且嵌入器不可用当更新则先删旧向量再返回 unavailable', async () => {
     const store = new UpdateFakeStore()
     const path = new FakeWritePath()
     const embedder = new FakeEmbedder()
@@ -300,7 +302,33 @@ describe('UpdateService 嵌入失效与重建', () => {
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('unavailable')
-    expect(path.events).toEqual([])
+    // 正文已经变化、当前正文又产不出向量：旧向量必须先失效，否则 vector 通道继续召回旧语义。
+    expect(path.events).toEqual(['invalidate'])
+    expect(path.invalidated).toEqual([MEMORY_ID])
+    // 不伪造新向量：不入队、不同步 upsert、不调用 embed()。
+    expect(path.enqueued).toHaveLength(0)
+    expect(store.embeddingUpserts).toHaveLength(0)
+    expect(embedder.embedCalls).toHaveLength(0)
+  })
+
+  it('给定正文变化且嵌入器不可用当旧向量删除失败则更新仍成功返回 unavailable', async () => {
+    const store = new UpdateFakeStore()
+    const path = new FakeWritePath()
+    const embedder = new FakeEmbedder()
+    embedder.availableResult = false
+    const before = memoryEntity(MEMORY_ID, OLD_BODY)
+    store.entitiesById.set(MEMORY_ID, before)
+    store.patchResult = { entity: { ...before, revision: 2, attributes: before.attributes.map(item => item.name === 'body' ? attr(item.ordinal, 'body', NEW_BODY) : item) } }
+    const service = updateService(store, path, { embedder, invalidateError: new Error('db blip') })
+
+    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+
+    // 删除失败只降级：更新已经落库，不能因此把 update 改判成失败。
+    expect(result.ok).toBe(true)
+    expect(result.ok ? result.value.embedding : undefined).toBe('unavailable')
+    expect(path.events).toEqual(['invalidate'])
+    expect(path.invalidated).toEqual([])
+    expect(path.enqueued).toHaveLength(0)
     expect(store.embeddingUpserts).toHaveLength(0)
   })
 
@@ -319,6 +347,26 @@ describe('UpdateService 嵌入失效与重建', () => {
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()
     expect(path.events).toEqual([])
+  })
+})
+
+describe('populateEmbedding 空文本边界', () => {
+  it('给定文本为空当刷新嵌入则只失效旧向量且返回 unavailable', async () => {
+    const store = new EmbeddingFakeStore()
+    const embedder = new FakeEmbedder()
+    const invalidated: string[] = []
+
+    const status = await populateEmbedding(
+      { store, embedder, logger: NOOP_LOGGER },
+      MEMORY_ID,
+      '   ',
+      { invalidate: async entityId => { invalidated.push(entityId) } },
+    )
+
+    expect(status).toBe('unavailable')
+    expect(invalidated).toEqual([MEMORY_ID])
+    expect(embedder.embedCalls).toHaveLength(0)
+    expect(store.embeddingUpserts).toHaveLength(0)
   })
 })
 

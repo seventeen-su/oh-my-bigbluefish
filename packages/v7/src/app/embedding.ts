@@ -30,11 +30,30 @@ export function embeddingBody(kind: EntityKind, attributes: readonly Attribute[]
 }
 
 /**
+ * 正文变化但当前正文产不出向量（嵌入器不可用 / 文本为空）时，旧向量必须失效：
+ * schema 没有 stale 列，装配层用「删除旧向量行」表达失效，保证 vector 通道不再召回旧语义。
+ * 删除失败只降级——更新已经落库，不能因为清理旧向量失败把 update 改判为失败。
+ */
+async function invalidateQuietly(
+  deps: EmbeddingDeps,
+  entityId: string,
+  invalidate: ((entityId: string) => Promise<void>) | undefined,
+): Promise<void> {
+  if (invalidate === undefined) return
+  try {
+    await invalidate(entityId)
+  } catch (error) {
+    deps.logger?.warn('旧向量失效失败', error)
+  }
+}
+
+/**
  * remember 与 update 共用的嵌入写入路径：队列可用时入队 `omb.embed`（singletonKey 按实体去重），
  * 队列不可用或入队失败时降级同步嵌入；失败只记录，后续由 `omb.embed-sweep` 补齐。
  *
- * `invalidate` 只在队列路径调用：schema 没有 stale 列，装配层用「删除旧向量行」表达失效，
- * 保证重建完成前 vector 通道拿不到旧文本的向量。同步路径原地覆盖，不需要失效窗口。
+ * `invalidate` 在「当前正文没有对应向量」的两条路径都要调用：队列重建前，以及嵌入器不可用或
+ * 文本为空时。schema 没有 stale 列，装配层用「删除旧向量行」表达失效，保证 rebuild 完成前
+ * vector 通道拿不到旧文本的向量。同步路径原地覆盖，不需要失效窗口。
  */
 export async function populateEmbedding(
   deps: EmbeddingDeps,
@@ -42,19 +61,20 @@ export async function populateEmbedding(
   text: string,
   options: { readonly invalidate?: (entityId: string) => Promise<void> } = {},
 ): Promise<EmbeddingStatus> {
-  if (deps.embedder === undefined || text.trim().length === 0) return 'unavailable'
-  const available = await deps.embedder.available().catch(() => false)
-  if (!available) return 'unavailable'
+  const embedder = deps.embedder
+  if (embedder === undefined) return 'unavailable'
+  // 产不出当前正文的向量时不能留着旧行：先失效再报 unavailable，不写新向量、不入队，
+  // 等 `omb.embed-sweep` 在嵌入恢复后按最新正文补齐。
+  const unavailable = async (): Promise<EmbeddingStatus> => {
+    await invalidateQuietly(deps, entityId, options.invalidate)
+    return 'unavailable'
+  }
+  if (text.trim().length === 0) return unavailable()
+  const available = await embedder.available().catch(() => false)
+  if (!available) return unavailable()
   if (deps.jobs !== undefined) {
     try {
-      if (options.invalidate !== undefined) {
-        try {
-          await options.invalidate(entityId)
-        } catch (error) {
-          // 失效失败不阻断重建：任务会用最新正文覆盖旧行，最坏是旧向量多存活到消费完成。
-          deps.logger?.warn('旧向量失效失败，继续入队重建', error)
-        }
-      }
+      await invalidateQuietly(deps, entityId, options.invalidate)
       await deps.jobs.enqueue('omb.embed', { entityId, text }, { singletonKey: `embed:${entityId}`, retryLimit: 3 })
       return 'queued'
     } catch (error) {
@@ -62,10 +82,10 @@ export async function populateEmbedding(
     }
   }
   try {
-    const vectors = await deps.embedder.embed([text])
+    const vectors = await embedder.embed([text])
     const vector = vectors[0]
     if (vector === undefined) return 'failed'
-    await deps.store.upsertEmbedding(entityId, deps.embedder.model, deps.embedder.dims, vector)
+    await deps.store.upsertEmbedding(entityId, embedder.model, embedder.dims, vector)
     return 'done'
   } catch (error) {
     deps.logger?.warn('同步嵌入失败', error)

@@ -16,6 +16,7 @@ import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { describeDenied, ensureDeployAllowed } from './lib/deploy-guard.mjs'
+import { pruneStaleSkills } from './lib/skill-cleanup.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PROFILE = process.env.OMB_PROFILE_DIR ?? 'C:\\Users\\<user>\\.dsh\\profiles\\web'
@@ -144,6 +145,9 @@ async function main() {
   for (const skill of ['omb-memory', 'omb-recall', 'omb-state', 'omb-consolidate']) {
     copyIfExists(join(ROOT, 'skills', skill), join(TARGET, 'skills', skill))
   }
+  // v7 只分发上面 4 个技能；v6 及更早的 8 张过程卡留在 profile 会让 DSH 继续注册旧技能，
+  // 所以复制后清掉。只认精确目录名，未知目录/用户自建技能一律保留。
+  pruneStaleSkills({ skillsDir: join(TARGET, 'skills'), apply: APPLY, log })
   copyIfExists(join(ROOT, 'models', 'bge-small-zh-v1.5'), join(TARGET, 'models', 'bge-small-zh-v1.5'))
   copyIfExists(join(ROOT, 'cordis.patch.v7.yml'), join(TARGET, 'cordis.patch.v7.yml'))
   copyIfExists(join(ROOT, 'icon.svg'), join(TARGET, 'icon.svg'))
