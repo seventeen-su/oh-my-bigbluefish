@@ -96,7 +96,17 @@ export type PreparedCommand =
   | { readonly type: 'UnarchiveEntity'; readonly id: string; readonly reason: string }
   | { readonly type: 'Link'; readonly input: LinkInput }
   | { readonly type: 'Unlink'; readonly linkId: string }
-  | { readonly type: 'RenameAttribute'; readonly from: string; readonly to: string; readonly reason: string }
+  | {
+    readonly type: 'RenameAttribute'
+    readonly from: string
+    readonly to: string
+    readonly reason: string
+    /**
+     * 审计 `action` 标签；事件类型与 outbox topic 始终是 `AttributeRenamed`。
+     * 维护入口（后台 attr-alias 归并）沿用历史标签 `attr-alias`，既有审计查询/回滚定位不变。
+     */
+    readonly auditAction?: 'rename-attr' | 'attr-alias'
+  }
 
 /**
  * 一次写事务的完整结果。

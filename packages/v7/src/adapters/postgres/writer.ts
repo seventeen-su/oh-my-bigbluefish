@@ -23,6 +23,7 @@ import {
   type ProjectionToken,
 } from '../../app/commands/index.js'
 import { asNumber, asString, iso, PostgresDb } from './db.js'
+import { notifyOutbox } from './outbox.js'
 import {
   autoArchivedAt,
   buildViewValues,
@@ -43,6 +44,14 @@ import {
  *
  * 事务内不做相似查询、不嵌入、不调用 LLM；相似建议/嵌入/看板由 outbox 之后的异步投影负责。
  * `Store` 只保留读路径与计数器，写方法全部委托到这里。
+ *
+ * 唯一的业务表写入例外（review Task 7b 的直写点清单，均不写 attribute/entity_view/link/chain_member）：
+ * - `Store.markAccessed`/`markAdopted`：只自增 `entity.access_count/adoption_count` 与
+ *   `last_accessed_at`（遥测计数器，不派生属性/视图、不 bump revision）。走命令路径会让每次召回都
+ *   写审计+事件并推进版本，制造 CAS 冲突与 outbox 噪声，故保留为显式例外。
+ * - `PostgresJobFailureLog`（jobs.ts）：任务最终失败/恢复的运维审计（无 inverse、非业务变更）。
+ * - `PostgresOutboxStore.append`：outbox 端口自身的写入入口；writer 的 insertEvent 在同一事务里
+ *   写 outbox 并 `pg_notify`。
  */
 
 interface LinkRow {
@@ -458,12 +467,16 @@ async function insertEvent(client: PoolClient, input: EventInput): Promise<Domai
     ...(input.inverse !== undefined ? { inverse: input.inverse } : {}),
   }
   // outbox.event_id 唯一：事务内一次事件只入队一次，reconciliation 重复扫描不会产生第二行。
-  await client.query(
+  const outbox = await client.query<{ id: string }>(
     `insert into omb.outbox (event_id, topic, payload)
      values ($1,$2,$3::jsonb)
-     on conflict (event_id) do nothing`,
+     on conflict (event_id) do nothing
+     returning id`,
     [id, input.eventType, JSON.stringify(event)],
   )
+  // 只有真正插入 outbox 行时才通知：NOTIFY 与 outbox 行在同一事务里，PG 在提交时才投递、
+  // 回滚则提示一起消失；同一 event_id 的重复入队（对账/重放）不会重复唤醒 relay。
+  if (outbox.rows[0] !== undefined) await notifyOutbox(client, id)
   return event
 }
 
@@ -583,7 +596,7 @@ export class AttributeWriter implements CommandWriter {
       case 'Unlink':
         return this.unlink(client, command.linkId, meta)
       case 'RenameAttribute':
-        return this.renameAttribute(client, command.from, command.to, command.reason, meta)
+        return this.renameAttribute(client, command, meta)
     }
   }
 
@@ -997,18 +1010,18 @@ export class AttributeWriter implements CommandWriter {
   }
 
   /**
-   * 属性改名（CommandBus 路径；`maintenance.renameAttribute` 在 7b 前仍保留）。
+   * 属性改名（CommandBus / 维护入口共用的唯一事务路径）。
    *
    * 同事务：属性行 → attr_registry → 引用 → 每个受影响实体的 view/触发键（版本 +1）。
    * 改名不产生新的必填属性；`from`/`to` 必须是非必填名。
+   * 维护入口（attr-alias 归并）沿用历史审计标签 `attr-alias`，见 `PreparedCommand.RenameAttribute`。
    */
   private async renameAttribute(
     client: PoolClient,
-    from: string,
-    to: string,
-    reason: string,
+    command: { readonly from: string; readonly to: string; readonly reason: string; readonly auditAction?: 'rename-attr' | 'attr-alias' },
     meta: CommandMeta,
   ): Promise<CommandOutcome> {
+    const { from, to, reason } = command
     // 同一个 from→to 的并发改名必须串行，否则两边会算出同一个 stream_version。
     await client.query('select pg_advisory_xact_lock(hashtext($1))', [`omb:rename-attr:${from}->${to}`])
     const affected = await client.query<{ entity_id: string }>(
@@ -1074,7 +1087,7 @@ export class AttributeWriter implements CommandWriter {
     }
     const event = await insertEvent(client, {
       meta,
-      action: 'rename-attr',
+      action: command.auditAction ?? 'rename-attr',
       eventType: 'AttributeRenamed',
       streamId,
       streamVersion,

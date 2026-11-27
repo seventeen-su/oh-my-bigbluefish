@@ -1,5 +1,6 @@
 import type { Category, EntityKind, StateStatus } from '../../domain/entity.js'
 import type { JsonValue } from '../../domain/json.js'
+import { systemCommandMeta } from '../../app/commands/index.js'
 import type {
   AttrAliasCandidate,
   BrokenReference,
@@ -9,6 +10,7 @@ import type {
   RecentEntity,
 } from '../../ports/maintenance.js'
 import { iso, PostgresDb } from './db.js'
+import { AttributeWriter } from './writer.js'
 
 interface RecentRow {
   entity_id: string
@@ -28,7 +30,12 @@ interface RecentRow {
 }
 
 export class PostgresMaintenance implements MaintenanceQueries {
-  constructor(private readonly db: PostgresDb) {}
+  /** 属性改名的唯一写者；维护查询本身只读。 */
+  private readonly writer: AttributeWriter
+
+  constructor(private readonly db: PostgresDb) {
+    this.writer = new AttributeWriter(db)
+  }
 
   async staleDynamic(limit: number): Promise<string[]> {
     const rows = await this.db.query<{ entity_id: string }>(
@@ -206,59 +213,23 @@ export class PostgresMaintenance implements MaintenanceQueries {
     return rows.rowCount !== 0
   }
 
+  /**
+   * 属性名归并（后台 attr-alias 任务的入口）。
+   *
+   * 不再直写属性表/视图：交给 `AttributeWriter` 的 RenameAttribute 单事务，
+   * 同一事务内完成属性行、attr_registry、reference、受影响实体的 view/触发键、
+   * 审计（action 沿用历史标签 `attr-alias`）与 outbox 追加；失败整体回滚。
+   * 返回受影响实体 id（顺序与 writer 的确定性排序一致）。
+   */
   async renameAttribute(from: string, to: string): Promise<string[]> {
     if (from === to || from.trim().length === 0 || to.trim().length === 0) return []
     // 必填属性改名会直接破坏 entity_view 的列语义；即使相似度命中也不允许。
     const required = new Set(['id', 'category', 'scope', 'title', 'status', 'time', 'group'])
     if (required.has(from) || required.has(to)) return []
-    return this.db.transaction(async client => {
-      const affected = await client.query<{ entity_id: string }>(
-        'select entity_id from omb.attribute where name = $1',
-        [from],
-      )
-      const before = await client.query<Record<string, unknown>>(
-        `select entity_id, name, ordinal, value_kind, value, expr, cached_value, cached_at,
-                stale_after_ms, last_error, is_required, confidence, source
-         from omb.attribute where name in ($1, $2) order by entity_id, name, ordinal`,
-        [from, to],
-      )
-      await client.query(
-        `delete from omb.attribute f
-         using omb.attribute t
-         where f.entity_id = t.entity_id and f.name = $1 and t.name = $2`,
-        [from, to],
-      )
-      await client.query('update omb.attribute set name = $2 where name = $1', [from, to])
-      const canonical = await client.query('select 1 from omb.attr_registry where name = $1', [to])
-      if (canonical.rowCount === 0) {
-        await client.query('update omb.attr_registry set name = $2 where name = $1', [from, to])
-        await client.query(
-          `update omb.attr_registry set aliases = array_append(aliases, $1) where name = $2`,
-          [from, to],
-        )
-      } else {
-        await client.query(
-          `update omb.attr_registry
-           set aliases = array_append(aliases, $1),
-               usage_count = usage_count + coalesce((select usage_count from omb.attr_registry where name = $1), 0),
-               last_seen = now()
-           where name = $2`,
-          [from, to],
-        )
-        await client.query('delete from omb.attr_registry where name = $1', [from])
-      }
-      const ids = affected.rows.map(row => row.entity_id)
-      await client.query(
-        `insert into omb.audit_log (actor, action, target_ids, before, after, inverse)
-         values ('job:attr-alias', 'attr-alias', $1, $2::jsonb, $3::jsonb, $4::jsonb)`,
-        [
-          ids,
-          JSON.stringify({ from, to, rows: before.rows }),
-          JSON.stringify({ from, to, affected: ids.length }),
-          JSON.stringify({ action: 'restore_attr_rows', from, to, rows: before.rows }),
-        ],
-      )
-      return ids
-    })
+    const outcome = await this.writer.execute(
+      { type: 'RenameAttribute', from, to, reason: 'attr-alias', auditAction: 'attr-alias' },
+      systemCommandMeta('job:attr-alias', 'job:attr-alias'),
+    )
+    return [...(outcome.entityIds ?? [])]
   }
 }
