@@ -97,6 +97,83 @@ export function recallContentFingerprint(input: RecallFingerprintInput): string 
   return digest.digest('hex').slice(0, 32)
 }
 
+/** 同一段注入文本在该步数/轮数窗口内不再重复进入上下文。 */
+export const T1_DEDUP_WINDOW_STEPS = 12
+export const T1_DEDUP_WINDOW_TURNS = 3
+
+interface T1ContentEntry {
+  readonly hash: string
+  readonly turn?: number
+  readonly step?: number
+  readonly seq: number
+}
+
+/** 注入文本的稳定哈希；只看内容，不把本步查询/工具结果差异带进键。 */
+export function t1TextHash(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 32)
+}
+
+/**
+ * 最近注入内容的窗口（按会话键控）。
+ *
+ * 只记“已经投递出去”的文本哈希；同一内容在 T1_DEDUP_WINDOW_STEPS 步或
+ * T1_DEDUP_WINDOW_TURNS 轮内再次出现时不注入。模型有上下文记忆，重复注入
+ * 只会挤占预算；窗口过后上下文可能已压缩，再允许一次。
+ */
+export class T1ContentWindow {
+  private readonly entries = new Map<string, T1ContentEntry[]>()
+  private seq = 0
+
+  isDuplicate(sessionId: string, text: string, position: StepPosition = {}): boolean {
+    if (text.trim().length === 0) return false
+    const hash = t1TextHash(text)
+    const list = this.entries.get(sessionId)
+    if (list === undefined) return false
+    return list.some(entry => entry.hash === hash && this.withinWindow(entry, position))
+  }
+
+  remember(sessionId: string, text: string, position: StepPosition = {}): void {
+    if (text.trim().length === 0) return
+    this.seq += 1
+    const list = this.entries.get(sessionId) ?? []
+    list.push({
+      hash: t1TextHash(text),
+      ...(position.turn === undefined ? {} : { turn: position.turn }),
+      ...(position.step === undefined ? {} : { step: position.step }),
+      seq: this.seq,
+    })
+    // 只保留窗口内条目；即使 turn/step 缺失，也最多留 32 条。
+    const pruned = list.filter(entry => this.withinWindow(entry, position)).slice(-32)
+    this.entries.set(sessionId, pruned)
+    while (this.entries.size > 256) {
+      const oldest = this.entries.keys().next().value
+      if (oldest === undefined) break
+      this.entries.delete(oldest)
+    }
+  }
+
+  clear(sessionId: string): void {
+    this.entries.delete(sessionId)
+  }
+
+  clearAll(): void {
+    this.entries.clear()
+  }
+
+  private withinWindow(entry: T1ContentEntry, position: StepPosition): boolean {
+    const turn = position.turn
+    const step = position.step
+    if (turn === undefined || entry.turn === undefined) {
+      return this.seq - entry.seq <= T1_DEDUP_WINDOW_STEPS
+    }
+    if (turn === entry.turn) {
+      if (step === undefined || entry.step === undefined) return true
+      return step - entry.step <= T1_DEDUP_WINDOW_STEPS
+    }
+    return turn - entry.turn <= T1_DEDUP_WINDOW_TURNS
+  }
+}
+
 export interface PreStepGateInput {
   /** compaction/subagent/team/task 等事件排队的召回。 */
   readonly pending: boolean

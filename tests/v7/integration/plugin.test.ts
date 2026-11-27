@@ -1027,6 +1027,64 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
+  it('A-B-A 召回在 12 步窗口内不重复注入 A', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'aba-window-session', header: { cwd: PROJECT } } } }
+    await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: 'A 段重复召回', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: 'B 段另一条召回', body: 'EACCES 权限失败 处理方式', error: 'EACCES' },
+    }, exec)
+    const preStep = host.listeners.get('agent/pre-step')
+    const base = {
+      agent: { session: { id: 'aba-window-session', header: { cwd: PROJECT } } },
+      turn: 1,
+    }
+    const first = await preStep?.({
+      ...base,
+      messages: [
+        { source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'ENOENT A 段重复召回 失败' },
+      ],
+      step: 1,
+    }, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(first)).toHaveLength(1)
+
+    const second = await preStep?.({
+      ...base,
+      messages: [
+        { source: { kind: 'user' }, content: 'EACCES 上次权限失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'EACCES B 段另一条召回 失败' },
+      ],
+      step: 2,
+    }, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(second)).toHaveLength(1)
+
+    const third = await preStep?.({
+      ...base,
+      messages: [
+        { source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'ENOENT A 段重复召回 失败' },
+      ],
+      step: 3,
+    }, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(third)).toHaveLength(0)
+    dispose()
+  })
+
   it('pre-step 在 next() 之后追加 T1：宿主认领的消息原样保留在前', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
