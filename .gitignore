@@ -1,6 +1,6 @@
 # 依赖与构建产物
 node_modules/
-lib/
+/lib/
 dist/
 *.tsbuildinfo
 lib-gen/

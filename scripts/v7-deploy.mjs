@@ -6,16 +6,22 @@
  * 用法：
  *   node scripts/v7-deploy.mjs            # dry-run，列出会改什么
  *   node scripts/v7-deploy.mjs --apply    # 复制 + 安装 profile 运行期依赖 + smoke import
+ *
+ * 运行中热写 profile 会触发 HMR recompose 并可能让插件工具失挂载，所以
+ * `--apply` 默认先探测 DSH（127.0.0.1:3080，一次 TCP connect）并拒绝；只有
+ * `--force` 或 `OMB_DEPLOY_ALLOW_RUNNING=1` 才放行。dry-run 不探测也不写盘。
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { describeDenied, ensureDeployAllowed } from './lib/deploy-guard.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PROFILE = process.env.OMB_PROFILE_DIR ?? 'C:\\Users\\<user>\\.dsh\\profiles\\web'
 const TARGET = join(PROFILE, 'node_modules', 'oh-my-bigbluefish')
 const APPLY = process.argv.includes('--apply')
+const FORCE = process.argv.includes('--force')
 const RUNTIME_DEPS = {
   '@opentelemetry/api': '1.9.0',
   pg: '8.23.1',
@@ -107,7 +113,21 @@ function smoke(build) {
   if (result.status !== 0) throw new Error(`bundle smoke 失败：${result.status ?? 'unknown'}`)
 }
 
-function main() {
+async function main() {
+  const guard = await ensureDeployAllowed({ apply: APPLY, force: FORCE, env: process.env })
+  if (!guard.allowed) {
+    process.stderr.write(`[v7:deploy] ${describeDenied(guard)}\n`)
+    process.exitCode = 1
+    return
+  }
+  if (guard.reason === 'force' || guard.reason === 'env') {
+    log(`警告：已通过 ${guard.reason === 'force' ? '--force' : 'OMB_DEPLOY_ALLOW_RUNNING=1'} 跳过运行中守卫；热写 profile 可能让插件工具失挂载。`)
+  }
+  if (guard.reason === 'dry-run') {
+    log('dry-run：不探测 DSH 端口、不写 profile。')
+  } else if (guard.reason === 'offline') {
+    log(`DSH 未在 ${guard.host}:${guard.port} 监听，允许写 profile。`)
+  }
   const build = currentBuild()
   log(`${APPLY ? 'APPLY' : 'DRY-RUN'} generation=${build.generation} target=${TARGET}`)
   ensureProfileDeps()
@@ -139,9 +159,7 @@ function main() {
   }
 }
 
-try {
-  main()
-} catch (error) {
+main().catch(error => {
   process.stderr.write(`[v7:deploy] 失败：${error instanceof Error ? error.message : String(error)}\n`)
   process.exitCode = 1
-}
+})

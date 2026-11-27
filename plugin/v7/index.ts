@@ -38,6 +38,7 @@ import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import { buildEventRecallText, buildResident } from '../../packages/v7/src/recall/resident.js'
 import { LazyInitializer } from './startup.js'
+import { Supervisor, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
 import {
   hasStrongSignal,
   isRecallTriggerEvent,
@@ -296,6 +297,8 @@ function toolResultText(result: unknown): string {
 export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   const parsed = parseConfig(rawConfig)
   const logger = createLogger(ctx)
+  // 宿主面自检：记录承诺注册的 7 个工具 / 4 个钩子与真实结果，供 omb_status 报读数。
+  const supervisor = new Supervisor({ ctx, logger })
   for (const problem of parsed.problems) logger.warn(`配置问题：${problem}`)
   const config = parsed.config
   const clock = { now: () => new Date(), iso: () => new Date().toISOString() }
@@ -478,6 +481,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       }
     },
     async status(): Promise<Result<string>> {
+      // 宿主面读数：每次状态调用做一次真实自检（tools.get），不轮询、不缓存成 7/7。
+      const surfaceLines = supervisor.statusLines()
       // 持久最终失败与连接探测分开：数据库不可达时也要如实报“查不到”，
       // 不能因为 db=down 就把跨进程的失败显示成 0。
       let finalFailureHealth: {
@@ -507,6 +512,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             failures: queue.handlerFailures(),
             ...finalFailureHealth,
           }),
+          ...surfaceLines,
         ].join('\n'))
       }
       const initialized = await startup.ensureReady({ force: true })
@@ -526,6 +532,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             failures: queue.handlerFailures(),
             ...finalFailureHealth,
           }),
+          ...surfaceLines,
         ]
         if (!initialized && startup.error !== undefined) {
           lines.push(`startup=degraded`, `reason=${startup.error}`)
@@ -541,6 +548,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             failures: queue.handlerFailures(),
             ...finalFailureHealth,
           }),
+          ...surfaceLines,
         ].join('\n'))
       }
     },
@@ -569,6 +577,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   }
 
   const tools = registerTools(ctx, runtime, logger)
+  supervisor.recordToolRegistration(tools)
   const promptSink = createPromptSink(ctx)
   if (!promptSink.available) logger.warn(`提示注入未接线：${promptSink.reason ?? '未知原因'}`)
 
@@ -576,10 +585,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   // 已投递 T1 的跨 step 内容指纹（session+query+result，不含 turn/step）；
   // 同一步的配额由 t1Step 负责，这里挡住「步号变了、内容没变」的重复注入。
   const lastT1 = new Map<string, string>()
-  let preStepOff: (() => void) | undefined
-  let toolContextOff: (() => void) | undefined
-  let toolPreExecuteOff: (() => void) | undefined
-  let sessionDisposedOff: (() => void) | undefined
+  // 钩子 disposer 在接线处一次性取得；卸载时逐个调用，任一失败不阻断后续。
 
   /** 清掉一个 session 的全部 T0/T1 会话态，并清空它的 system prompt 文本。 */
   const clearSessionState = (sessionId: string): void => {
@@ -916,59 +922,40 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     return next()
   }
 
-  try {
-    if (typeof ctx.on === 'function') {
-      const returned = ctx.on('agent/pre-step', preStep as never)
-      if (typeof returned === 'function') preStepOff = returned as () => void
-    } else {
-      logger.warn('宿主没有 on()，pre-step 注入未接线')
-    }
-  } catch (error) {
-    logger.warn('注册 agent/pre-step 失败', messageOf(error))
-  }
+  const preStepOff = wireHostHook({ ctx, supervisor, name: 'agent/pre-step', handler: preStep }).off
 
-  try {
-    if (typeof ctx.on === 'function') {
-      const returned = ctx.on('tools/pre-execute', preExecuteTool as never)
-      if (typeof returned === 'function') toolPreExecuteOff = returned as () => void
-    } else {
-      logger.warn('宿主没有 on()，tools/pre-execute 预取未接线')
-    }
-  } catch (error) {
-    logger.warn('注册 tools/pre-execute 失败', messageOf(error))
-  }
+  const toolPreExecuteOff = wireHostHook({
+    ctx,
+    supervisor,
+    name: 'tools/pre-execute',
+    handler: preExecuteTool,
+  }).off
 
-  try {
-    if (typeof ctx.on === 'function') {
-      const returned = ctx.on('tools/post-execute', postExecuteTool as never)
-      if (typeof returned === 'function') toolContextOff = returned as () => void
-    } else {
-      logger.warn('宿主没有 on()，tools/post-execute 即时召回未接线')
-    }
-  } catch (error) {
-    logger.warn('注册 tools/post-execute 失败', messageOf(error))
-  }
+  const toolContextOff = wireHostHook({
+    ctx,
+    supervisor,
+    name: 'tools/post-execute',
+    handler: postExecuteTool,
+  }).off
 
   // 会话结束必须清掉该 session 的 T0/T1 会话态与 system prompt 文本，
   // 否则长会话/多会话运行时会一直增长并看到已结束会话的旧记忆（RET-13/RUN-05）。
-  try {
-    if (typeof ctx.on === 'function') {
-      const returned = ctx.on('session/disposed', ((session: unknown) => {
-        const record = asRecord(session)
-        const id = typeof record?.['id'] === 'string'
-          ? record['id']
-          : typeof record?.['sessionId'] === 'string'
-            ? record['sessionId']
-            : undefined
-        if (id !== undefined && id.trim().length > 0) clearSessionState(id)
-      }) as never)
-      if (typeof returned === 'function') sessionDisposedOff = returned as () => void
-    } else {
-      logger.warn('宿主没有 on()，session/disposed 清理未接线')
-    }
-  } catch (error) {
-    logger.warn('注册 session/disposed 清理失败', messageOf(error))
-  }
+  const sessionDisposedOff = wireHostHook({
+    ctx,
+    supervisor,
+    name: 'session/disposed',
+    handler: ((session: unknown) => {
+      const record = asRecord(session)
+      const id = typeof record?.['id'] === 'string'
+        ? record['id']
+        : typeof record?.['sessionId'] === 'string'
+          ? record['sessionId']
+          : undefined
+      if (id !== undefined && id.trim().length > 0) clearSessionState(id)
+    }),
+  }).off
+  // 注册期事实落一条摘要日志：工具数/钩子数 + 未接线原因（audit R01）。
+  supervisor.logWiringSummary()
 
   let disposed = false
   return () => {
@@ -1018,26 +1005,28 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     lastT1.clear()
     currentStep.clear()
     t1Step.clear()
-    stopConsolidation?.()
+    try {
+      stopConsolidation?.()
+    } catch (error) {
+      // 巩固循环停不下来不能阻断后面的队列/连接/PG 收尾。
+      logger.warn('巩固循环停止失败', messageOf(error))
+    }
     // 先让 worker 停掉，再关业务连接池，最后才停便携 PostgreSQL；三个动作不能并发，
-    // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。
-    void (async () => {
-      try {
-        await queue.stop()
-      } catch (error) {
-        logger.warn('后台队列停止失败', messageOf(error))
-      }
-      try {
-        await store.close()
-      } catch (error) {
-        logger.warn('数据库连接池关闭失败', messageOf(error))
-      }
-      try {
-        await lifecycle?.stop()
-      } catch (error) {
-        logger.warn('PostgreSQL 停止失败', messageOf(error))
-      }
-    })()
+    // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。每步独立 5s 超时，
+    // 超时/失败只记日志并继续，绝不把异常抛回宿主。
+    const teardownSteps: TeardownStep[] = [
+      { name: 'queue.stop', run: () => queue.stop() },
+      { name: 'store.close', run: () => store.close() },
+      ...(lifecycle === undefined ? [] : [{ name: 'lifecycle.stop', run: () => lifecycle.stop() }]),
+    ]
+    void runTeardownSteps(teardownSteps, { logger })
+      .then(report => {
+        logger.info('teardown 收尾完成', report)
+      })
+      .catch(error => {
+        // runTeardownSteps 约定不 reject；这里只是最后一道保险。
+        logger.warn('teardown 收尾异常', messageOf(error))
+      })
   }
 }
 

@@ -17,6 +17,7 @@ interface FakeHost {
   readonly tools: Map<string, HostToolDefinition>
   readonly promptText: Map<string, string>
   readonly listeners: Map<string, (...args: unknown[]) => unknown>
+  readonly logs: string[]
   provider: ((input: unknown) => string) | undefined
 }
 
@@ -24,7 +25,9 @@ function fakeHost(): FakeHost {
   const tools = new Map<string, HostToolDefinition>()
   const promptText = new Map<string, string>()
   const listeners = new Map<string, (...args: unknown[]) => unknown>()
-  const host: FakeHost = { ctx: undefined as unknown as HostContextLike, tools, promptText, listeners, provider: undefined }
+  const logs: string[] = []
+  const push = (level: string, message: unknown) => { logs.push(`${level} ${typeof message === 'string' ? message : JSON.stringify(message)}`) }
+  const host: FakeHost = { ctx: undefined as unknown as HostContextLike, tools, promptText, listeners, logs, provider: undefined }
   const ctx = {
     get: (name: string) => {
       if (name === 'tools') {
@@ -33,6 +36,8 @@ function fakeHost(): FakeHost {
             tools.set(definition.name, definition)
             return () => tools.delete(definition.name)
           },
+          // DSH ToolsService.get 的形状：omb_status 的宿主面自检通过它实测注册可见性。
+          get: (toolName: string) => tools.get(toolName),
         }
       }
       if (name === 'systemPrompt') {
@@ -51,10 +56,24 @@ function fakeHost(): FakeHost {
       listeners.set(event, listener)
       return () => listeners.delete(event)
     },
-    logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+    logger: {
+      warn: (message: unknown) => push('warn', message),
+      error: (message: unknown) => push('error', message),
+      info: (message: unknown) => push('info', message),
+      debug: () => {},
+    },
   }
   host.ctx = ctx as unknown as HostContextLike
   return host
+}
+
+/** 有界条件等待；不用固定 sleep 断言异步完成。 */
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('等待条件超时')
+    await wait(10)
+  }
 }
 
 describe('v7 plugin entry', () => {
@@ -126,6 +145,9 @@ describe('v7 plugin entry', () => {
     expect(status?.ok).toBe(true)
     expect(status?.text).toContain('db=ok')
     expect(status?.text).toContain('jobFailures=0')
+    // 宿主面自检：7 个工具与 4 个钩子都真实接线。
+    expect(status?.text).toContain('tools=7/7')
+    expect(status?.text).toContain('hooks=4/4')
 
     const preStep = host.listeners.get('agent/pre-step')
     expect(preStep).toBeDefined()
@@ -714,5 +736,28 @@ describe('v7 plugin entry', () => {
     expect(sink.write('sink-session', '')).toBe(true)
     expect(host.provider?.({ agent: { session: { id: 'sink-session' } } })).toBe('')
     sink.dispose()
+  })
+
+  it('disposer 顺序收尾 queue.stop → store.close，重复调用不重复收尾', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    expect(host.tools.size).toBe(7)
+    // 卸载：disposer 同步返回，队列/连接池在后台按序收尾；任何一步都不许抛回宿主。
+    expect(() => dispose()).not.toThrow()
+    await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
+    expect(() => dispose()).not.toThrow()
+
+    const infoLines = host.logs.filter(line => line.startsWith('info '))
+    const queueIndex = infoLines.findIndex(line => line.includes('teardown queue.stop 完成'))
+    const storeIndex = infoLines.findIndex(line => line.includes('teardown store.close 完成'))
+    expect(queueIndex).toBeGreaterThanOrEqual(0)
+    expect(storeIndex).toBeGreaterThan(queueIndex)
+    expect(host.logs.filter(line => line.includes('teardown 收尾完成'))).toHaveLength(1)
+    expect(host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
   })
 })

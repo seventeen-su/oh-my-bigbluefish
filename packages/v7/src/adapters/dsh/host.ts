@@ -24,6 +24,11 @@ export interface HostToolDefinition {
 
 export interface HostToolsLike {
   register(definition: HostToolDefinition): unknown
+  /**
+   * DSH `ToolsService.get(name)`：运行期自检用。老宿主/测试替身可能没有，
+   * 调用方必须退回注册记录而不是把“查不到”当成“已注册”。
+   */
+  readonly get?: (name: string, scope?: unknown, toolSet?: unknown) => unknown
 }
 
 export interface HostSystemPromptLike {
