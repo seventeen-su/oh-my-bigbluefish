@@ -9,8 +9,9 @@ import type { ContextSource, InjectionRisk } from '../security/trust.js'
  * 不变量：
  * - 输出永远是数据：没有任何一块记忆/工件/工具输出能被渲染成系统指令。块自称
  *   `kind:'instruction'` 时降级为 data，并把降级记录进 receipt（`demotedIds`）。
- * - 每块都有明确边界 `<<<OMB_DATA ...>>> ... <<<END_OMB_DATA>>>`；块内容里的边界标记
- *   会被替换成不可闭合的字符，内容无法提前结束自己的边界去冒充新的“系统段”。
+ * - 默认 `envelope` 布局给每块明确边界 `<<<OMB_DATA ...>>> ... <<<END_OMB_DATA>>>`；
+ *   块内容里的边界标记会被替换成不可闭合的字符，内容无法提前结束自己的边界去冒充
+ *   新的“系统段”。`inline` 布局（T0/T1）同样先转义/隔离，只是不再加边界标记。
  * - 高风险块默认隔离：只注入一行隔离说明，原文不进入提示词（`quarantinedIds`）。
  * - 预算、逐块截断、丢块、隔离、降级全部在 `InjectionReceipt` 里可见；`textHash`
  *   绑定最终文本，供采用率/注入审计对账。
@@ -26,6 +27,15 @@ export const DEFAULT_CONTEXT_BUDGET_TOKENS = 600
 /** 单块默认上限：一条记忆不能吃掉整个注入预算。 */
 export const DEFAULT_MAX_BLOCK_TOKENS = 200
 
+/**
+ * 块布局：
+ * - `envelope`（默认）：每块带边界标记，内容不可能闭合/伪造新段；适合系统提示等长文本。
+ * - `inline`：把块内容按 `separator` 连成一段，可用 `prefix` 起头，**不**加边界标记。
+ *   只给已有可见头/单行格式的调用方（T0/T1）使用；内容仍由装配器转义、隔离与裁剪，
+ *   调用方只能决定「怎么排」，不能决定「什么能进」。
+ */
+export type AssembleLayout = 'envelope' | 'inline'
+
 export interface AssembleOptions {
   readonly budgetTokens?: number
   readonly maxBlockTokens?: number
@@ -33,14 +43,34 @@ export interface AssembleOptions {
   readonly receiptId?: string
   /** 默认 true：high 风险块只注入隔离说明，原文不注入。 */
   readonly quarantineHighRisk?: boolean
+  /**
+   * 可见头（计入预算）。缺省 `CONTEXT_HEADER`。
+   * T0/T1 传自己的可见头 + `CONTEXT_HEADER`，既保留旧可见头，也保留“数据非指令”声明。
+   */
+  readonly header?: string
+  /** 块布局；默认 `envelope`。 */
+  readonly layout?: AssembleLayout
+  /** inline 布局的正文前缀（如 `相关：`），计入预算；缺省空。 */
+  readonly prefix?: string
+  /** inline 布局的块分隔符；缺省换行（envelope 固定换行）。 */
+  readonly separator?: string
+  /**
+   * true（默认）：块内容超预算时截断到剩余预算。
+   * false：整块放不下就丢弃（T0 常驻层的旧预算语义：一段要么整段进、要么不进）。
+   */
+  readonly truncateBlocks?: boolean
 }
 
 export interface BlockReceipt {
   readonly id: string
   readonly source: ContextSource
+  /** 写入者来源（`provenance.origin`）；审计用，不参与文本渲染。 */
+  readonly origin: string
   readonly kind: ContextBlockKind
   readonly trust: number
   readonly risk: InjectionRisk
+  /** 命中的风险模式 id（不含原文），隔离块也留证据。 */
+  readonly riskReasons: readonly string[]
   /** 该块在装配文本里占的估算 token（被丢弃时为 0）。 */
   readonly tokens: number
   readonly kept: boolean
@@ -134,10 +164,19 @@ function uniqueList(values: readonly string[]): string[] {
 export function createPromptAssembler(): PromptAssembler {
   return {
     assemble(blocks, options = {}) {
+      const layout = options.layout ?? 'envelope'
       const budgetTokens = Math.max(0, Math.trunc(options.budgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS))
       const maxBlockTokens = Math.max(1, Math.trunc(options.maxBlockTokens ?? DEFAULT_MAX_BLOCK_TOKENS))
       const quarantineHighRisk = options.quarantineHighRisk !== false
-      const headerTokens = estimateTokens(CONTEXT_HEADER)
+      const truncateBlocks = options.truncateBlocks !== false
+      const header = options.header ?? CONTEXT_HEADER
+      const prefix = options.prefix ?? ''
+      const separator = layout === 'inline' ? (options.separator ?? '\n') : '\n'
+      // 头与前缀只花一次；+1 是头与正文之间的换行（估算按 4 字符/token，一行最多 1）。
+      const headerTokens = header.length === 0 ? 0 : estimateTokens(header) + 1
+      const prefixTokens = prefix.length === 0 ? 0 : estimateTokens(prefix)
+      const fixedTokens = headerTokens + prefixTokens
+      const separatorTokens = layout === 'inline' ? estimateTokens(separator) : 1
 
       const blockReceipts: BlockReceipt[] = []
       const fragments: string[] = []
@@ -152,9 +191,11 @@ export function createPromptAssembler(): PromptAssembler {
         const base = {
           id: block.id,
           source: block.source,
+          origin: block.provenance.origin,
           kind: block.kind,
           trust: block.trust,
           risk: block.risk,
+          riskReasons: block.riskReasons,
           demoted,
           quarantined,
         }
@@ -165,36 +206,52 @@ export function createPromptAssembler(): PromptAssembler {
         }
         seen.add(block.id)
 
-        const begin = beginMarker(block)
-        // 预留：尚未放 header 时给它和换行留位置；边界标记本身也要算。
-        const envelopeTokens = estimateTokens(begin) + estimateTokens(CONTEXT_DATA_END) + 2
-        const reserved = (headerPlaced ? 0 : headerTokens + 1) + envelopeTokens
+        const begin = layout === 'envelope' ? beginMarker(block) : ''
+        // 预留：尚未放 header 时给它、前缀和换行留位置；envelope 还要算边界标记本身。
+        const envelopeTokens = layout === 'envelope'
+          ? estimateTokens(begin) + estimateTokens(CONTEXT_DATA_END) + 2
+          : 0
+        const reserved = (headerPlaced ? 0 : fixedTokens) + envelopeTokens
         const contentBudget = Math.min(maxBlockTokens, budgetTokens - used - reserved)
         if (contentBudget < 1) {
           blockReceipts.push({ ...base, quarantined: false, tokens: 0, kept: false, truncated: false, reason: 'budget' })
           continue
         }
-        const truncated = truncateToTokens(content, contentBudget)
+        // truncateBlocks=false：整块要么全进、要么丢弃（T0 常驻段的旧语义）。
+        if (!truncateBlocks && estimateTokens(content) > contentBudget) {
+          blockReceipts.push({ ...base, quarantined: false, tokens: 0, kept: false, truncated: false, reason: 'budget' })
+          continue
+        }
+        const truncated = truncateBlocks
+          ? truncateToTokens(content, contentBudget)
+          : { text: content, truncated: false }
         if (truncated.text.length === 0) {
           blockReceipts.push({ ...base, quarantined: false, tokens: 0, kept: false, truncated: true, reason: 'empty' })
           continue
         }
-        const chunk = `${begin}\n${truncated.text}\n${CONTEXT_DATA_END}`
+        const chunk = layout === 'envelope'
+          ? `${begin}\n${truncated.text}\n${CONTEXT_DATA_END}`
+          : truncated.text
         const chunkTokens = estimateTokens(chunk)
-        const headerCost = headerPlaced ? 0 : headerTokens + 1
-        // 块之间还有换行：计入后再判断，避免 sum(逐块) 低估整段预算。
-        const separatorTokens = fragments.length === 0 ? 0 : 1
-        if (used + headerCost + chunkTokens + separatorTokens > budgetTokens) {
+        const headerCost = headerPlaced ? 0 : fixedTokens
+        // 块之间还有分隔符：计入后再判断，避免 sum(逐块) 低估整段预算。
+        const separatorCost = fragments.length === 0 ? 0 : separatorTokens
+        if (used + headerCost + separatorCost + chunkTokens > budgetTokens) {
           blockReceipts.push({ ...base, quarantined: false, tokens: 0, kept: false, truncated: truncated.truncated, reason: 'budget' })
           continue
         }
-        used += headerCost + chunkTokens + separatorTokens
+        used += headerCost + separatorCost + chunkTokens
         headerPlaced = true
         fragments.push(chunk)
         blockReceipts.push({ ...base, tokens: chunkTokens, kept: true, truncated: truncated.truncated })
       }
 
-      const text = headerPlaced ? `${CONTEXT_HEADER}\n${fragments.join('\n')}` : ''
+      const body = layout === 'envelope'
+        ? fragments.join('\n')
+        : `${prefix}${fragments.join(separator)}`
+      const text = headerPlaced
+        ? (header.length === 0 ? body : `${header}\n${body}`)
+        : ''
       const keptReceipts = blockReceipts.filter(item => item.kept)
       return {
         kind: 'data',

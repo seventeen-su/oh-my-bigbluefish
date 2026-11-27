@@ -41,7 +41,7 @@ import { embeddingText } from '../../packages/v7/src/app/embedding.js'
 import { OutboxRelay, ReactionRegistry, type Reaction } from '../../packages/v7/src/app/outbox/index.js'
 import { TimerWorker, WorkflowRuntime, type TimerHandler } from '../../packages/v7/src/app/workflow/index.js'
 import { ProjectionReadApi, ProjectionWorker } from '../../packages/v7/src/app/projections/index.js'
-import { RecallService, recallScenarioForQuery, type RecallInjection } from '../../packages/v7/src/app/recall.js'
+import { RecallService, recallScenarioForQuery } from '../../packages/v7/src/app/recall.js'
 import { RememberService } from '../../packages/v7/src/app/remember.js'
 import { UpdateService } from '../../packages/v7/src/app/update.js'
 import { OmbFailure, err, ok, type Result } from '../../packages/v7/src/domain/errors.js'
@@ -56,7 +56,8 @@ import {
 } from '../../packages/v7/src/jobs/index.js'
 import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
-import { buildEventRecallText, buildResident, type ResidentBoardsOptions, type ResidentBoardsQuery } from '../../packages/v7/src/recall/resident.js'
+import { buildEventRecallText, buildResident, type RecallNotice, type ResidentBoardsOptions, type ResidentBoardsQuery } from '../../packages/v7/src/recall/resident.js'
+import type { InjectionReceipt } from '../../packages/v7/src/prompt/assembler.js'
 import { LazyInitializer } from './startup.js'
 import { Supervisor, TEARDOWN_STEP_TIMEOUT_MS, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
 import { registerSkills } from './skills.js'
@@ -410,6 +411,14 @@ interface PreparedT1Injection {
   /** 跨 step 内容指纹；只有真正投递/消费时才登记。 */
   readonly fingerprint: string | undefined
   readonly stepKey: string | undefined
+  /** 本次装配的 receipt/命中；只有文本真的追加进 decision.messages 时才登记采用。 */
+  readonly notice?: RecallNotice
+}
+
+/** tools/pre-execute 预取的 T1：文本真正挂到结果上时，用它携带的 notice 登记 receipt 与采用等待。 */
+interface PrefetchedT1 {
+  readonly text: string
+  readonly notice?: RecallNotice
 }
 
 /** 宿主 waterfall 没有 next（老宿主/测试替身）时的 enter 复合：与 DSH 基线 decision 同形。 */
@@ -526,15 +535,27 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     taskReader: createDshTaskReader(ctx),
   })
   const engine = new RecallEngine({ store, embedder, clock })
-  // 会话级 T1 状态：全部按 sessionId 键控，session/disposed 与插件卸载时清理（RET-13/RUN-05）。
-  const pendingRecall = new Map<string, RecallInjection[]>()
+  /**
+   * 一次等待采用的注入：hits 必须来自这次注入的（T1）receipt，而不是检索候选全集。
+   * T0 的偏好/状态命中没有逐实体 receipt（常驻段是整段块），由 recall 层按 receipt
+   * 的 kept/隔离先过滤；T1 在 adoptPending 里再按 receipt 复核一次。
+   */
+  interface PendingInjection {
+    readonly sessionId: string
+    readonly traceId: string
+    readonly hits: readonly { readonly id: string; readonly title?: string }[]
+    readonly receipt?: InjectionReceipt
+  }
+
+  /** 会话级 T1 状态：全部按 sessionId 键控，session/disposed 与插件卸载时清理（RET-13/RUN-05）。 */
+  const pendingRecall = new Map<string, PendingInjection[]>()
   // T1 由 session/event 触发；pre-step 消费后清空，避免重复注入。
   const pendingT1 = new Map<string, { readonly scenario: RecallScenario; readonly query: string }>()
   // tools/post-execute 已经即时注入的 T1 文本；下一次 pre-step 直接复用，避免同一次工具结果重复召回。
   const immediateT1 = new Map<string, string>()
   // tools/pre-execute 在派发前启动的召回；post-execute 有结果后优先复用，避免重复查库。
-  // 带上 sessionId 才能在 session/disposed 时清掉未消费的预取。
-  const prefetchedT1 = new Map<string, { readonly sessionId: string; readonly promise: Promise<string> }>()
+  // 带上 sessionId 才能在 session/disposed 时清掉未消费的预取；notice 只在真正复用时登记。
+  const prefetchedT1 = new Map<string, { readonly sessionId: string; readonly promise: Promise<PrefetchedT1> }>()
   // 最近一次 pre-step 的 turn/step：post-execute 没有步号，只能沿用它判断「本步是否已投递 T1」。
   const currentStep = new Map<string, { readonly turn: number; readonly step: number; readonly key: string }>()
   // 已经消费过 T1 的步键（pre-step 或工具结果）。
@@ -1352,10 +1373,47 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     promptSink.write(sessionId, '')
   }
 
-  const rememberInjection = (sessionId: string, notice: { traceId: string; hits: readonly { id: string; title?: string }[] }): void => {
+  /**
+   * 记录一次注入：T1 的 receipt 落 `omb.resident_trace` 作为注入证据（与 recall_event
+   * 共享 traceId）；hits 只进采用等待集合。
+   *
+   * 为什么仍写 resident_trace：schema 里没有独立的 injection_receipt 表，本任务不允许改
+   * 迁移；resident_trace 是现有唯一的注入证据表，`sections` 是 JSONB，可放 receipt 而
+   * 不动表结构。T1 行不带 session_id：T0 的“该 session 最新 trace”查询按 session 取最新
+   * 一行，T1 receipt 若带 session 会把它顶成 T0 证据；按 trace_id 查 T1 receipt 即可。
+   */
+  const persistInjectionReceipt = (notice: RecallNotice): void => {
+    const receipt = notice.receipt
+    if (receipt === undefined) return
+    void store.recordResidentTrace({
+      traceId: notice.traceId,
+      budgetTokens: Math.max(1, receipt.budgetTokens),
+      usedTokens: Math.max(0, receipt.usedTokens),
+      text: notice.text ?? '',
+      sections: [{
+        name: 'injection-receipt',
+        tokens: receipt.usedTokens,
+        kept: receipt.injected,
+        text: JSON.stringify(receipt),
+        entityIds: receipt.keptIds,
+      }],
+      droppedSections: [],
+    }).catch(error => {
+      logger.warn('T1 注入 receipt 写入失败', messageOf(error))
+    })
+  }
+
+  const rememberInjection = (sessionId: string, notice: RecallNotice): void => {
+    // receipt 与“有没有可采用的命中”无关：隔离块不进hits，但这次的隔离证据必须可查。
+    persistInjectionReceipt(notice)
     if (notice.hits.length === 0) return
     const list = pendingRecall.get(sessionId) ?? []
-    list.push({ sessionId, traceId: notice.traceId, hits: notice.hits })
+    list.push({
+      sessionId,
+      traceId: notice.traceId,
+      hits: notice.hits,
+      ...(notice.receipt === undefined ? {} : { receipt: notice.receipt }),
+    })
     pendingRecall.set(sessionId, list)
   }
 
@@ -1396,7 +1454,12 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     if (pending === undefined || pending.length === 0 || text.length === 0) return
     const adopted = new Map<string, { traceId: string; id: string }>()
     for (const injection of pending) {
+      const kept = injection.receipt === undefined ? undefined : new Set(injection.receipt.keptIds)
+      const quarantined = injection.receipt === undefined ? undefined : new Set(injection.receipt.quarantinedIds)
       for (const hit of injection.hits) {
+        // adoption 只认这次注入的 receipt：没进 kept 或原文被隔离的命中不算采用。
+        if (kept !== undefined && !kept.has(hit.id)) continue
+        if (quarantined !== undefined && quarantined.has(hit.id)) continue
         const matched = text.includes(hit.id)
           || (hit.title !== undefined && hit.title.length >= 4 && text.includes(hit.title))
         if (matched) adopted.set(`${injection.traceId}\u0000${hit.id}`, { traceId: injection.traceId, id: hit.id })
@@ -1464,18 +1527,22 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       const signals = extractQuerySignals(raw)
       return [raw, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
     })()
-    const promise = (async (): Promise<string> => {
+    const promise = (async (): Promise<PrefetchedT1> => {
       const context = await resolveToolContext(exec)
-      if (context === undefined) return ''
-      return await buildEventRecallText(
+      if (context === undefined) return { text: '' }
+      let notice: RecallNotice | undefined
+      const text = await buildEventRecallText(
         engine,
         context,
         query,
         'tool-before',
         400,
-        notice => rememberInjection(context.sessionId, notice),
+        captured => { notice = captured },
       )
-    })().catch(() => '')
+      // 预取可能被丢弃（报错时重新查、本步已有 T1、工具取消）：不在这里登记 receipt，
+      // 只有 post-execute 真正把 text 挂到 additionalContexts 时才登记。
+      return { text, ...(notice === undefined ? {} : { notice }) }
+    })().catch(() => ({ text: '' }))
     // 工具被取消时不会走到 post-execute，限制缓存条目避免长期泄漏。
     if (prefetchedT1.size >= 64) {
       const oldest = prefetchedT1.keys().next().value
@@ -1537,9 +1604,10 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       const prefetched = callId === undefined ? undefined : prefetchedT1.get(callId)?.promise
       if (callId !== undefined) prefetchedT1.delete(callId)
       // 成功的工具优先复用派发前的召回；报错时结果里的错误码更有价值，重新查一次。
-      let injected = !failed && prefetched !== undefined
-        ? await withTimeout(prefetched, 500) ?? ''
-        : ''
+      const reused = !failed && prefetched !== undefined
+        ? await withTimeout(prefetched, 500)
+        : undefined
+      let injected = reused?.text ?? ''
       if (injected.length === 0) {
         injected = await withTimeout(
           buildEventRecallText(
@@ -1552,6 +1620,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           ),
           1_500,
         ) ?? ''
+      } else if (reused?.notice !== undefined) {
+        // 复用的预取文本此刻才真正挂到 additionalContexts：这时才登记 receipt 与采用等待。
+        rememberInjection(sessionId, reused.notice)
       }
       if (injected.length === 0) return decision
       // 只登记真正投递出去的 T1：下一轮 pre-step 认领它，本步配额同时记为已用。
@@ -1683,6 +1754,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     const pendingImmediate = immediateT1.get(sessionId)
     let injected = ''
     let fingerprint: string | undefined
+    let notice: RecallNotice | undefined
     if (pendingImmediate !== undefined) {
       // 工具结果已经把这批内容送进上下文；下一步事件源不变时 pre-step 不再重复召回。
       if (eventSource.length > 0) fingerprint = contentFingerprint
@@ -1704,7 +1776,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             query,
             scenario,
             400,
-            notice => rememberInjection(sessionId, notice),
+            // 先捕获 notice：宿主 reject 的 step 不会追加消息，那时不该登记 receipt/采用等待。
+            captured => { notice = captured },
           ),
           1_500,
         ) ?? ''
@@ -1713,7 +1786,14 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
     // T0 仍走 promptSink；RUN-04：本轮没有 T0 时也要覆盖写空串，清掉上一轮旧文本。
     promptSink.write(sessionId, resident)
-    return { sessionId, text: injected, immediate: pendingImmediate !== undefined, fingerprint, stepKey }
+    return {
+      sessionId,
+      text: injected,
+      immediate: pendingImmediate !== undefined,
+      fingerprint,
+      stepKey,
+      ...(notice === undefined ? {} : { notice }),
+    }
   }
 
   const preStep = async (payload: unknown, next?: () => unknown): Promise<unknown> => {
@@ -1733,7 +1813,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       if (prepared.stepKey !== undefined) rememberSessionState(t1Step, prepared.sessionId, prepared.stepKey)
       if (prepared.fingerprint !== undefined) rememberSessionState(lastT1, prepared.sessionId, prepared.fingerprint)
     } else if (prepared.text.length > 0) {
-      // 只有真正追加进 decision.messages 的召回才占用本步配额与去重指纹。
+      // 只有真正追加进 decision.messages 的召回才占用本步配额与去重指纹；
+      // receipt/采用等待也在这一刻登记（reject/未追加都不该留下“已注入”证据）。
+      if (prepared.notice !== undefined) rememberInjection(prepared.sessionId, prepared.notice)
       if (prepared.stepKey !== undefined) rememberSessionState(t1Step, prepared.sessionId, prepared.stepKey)
       if (prepared.fingerprint !== undefined) rememberSessionState(lastT1, prepared.sessionId, prepared.fingerprint)
     }
