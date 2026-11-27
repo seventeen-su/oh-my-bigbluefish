@@ -1016,6 +1016,12 @@ export class PostgresStore implements Store {
     })
   }
 
+  async deleteEmbedding(entityId: string): Promise<void> {
+    await this.run(async () => {
+      await this.db.query('delete from omb.embedding where entity_id = $1', [entityId])
+    })
+  }
+
   async setAttributeCache(
     entityId: string,
     name: string,

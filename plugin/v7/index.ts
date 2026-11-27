@@ -324,7 +324,16 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     clock,
     logger,
   })
-  const updateService = new UpdateService({ store })
+  // schema 没有 stale 列（001_init.sql 的 omb.embedding 只有 model/dims/embedding）：
+  // 更新正文后先删旧向量行，让 vector 通道在 omb.embed 重建完成前拿不到旧文本的向量。
+  const updateService = new UpdateService({
+    store,
+    embedder,
+    ...(config.jobs ? { jobs: queue } : {}),
+    clock,
+    logger,
+    invalidateEmbedding: entityId => store.deleteEmbedding(entityId),
+  })
   const dynamicService = new DynamicService({
     store,
     resolver: new DefaultDynamicResolver({

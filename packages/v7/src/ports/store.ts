@@ -237,6 +237,8 @@ export interface Store {
   /** T0 偏好：全局、标签=偏好、未归档，按显著度排序。 */
   preferenceSummaries?(limit: number): Promise<EntitySummary[]>
   upsertEmbedding(entityId: string, model: string, dims: number, embedding: readonly number[]): Promise<void>
+  /** 正文变化后先删旧向量，避免重建完成前检索到过期语义。 */
+  deleteEmbedding(entityId: string): Promise<void>
   setAttributeCache(
     entityId: string,
     name: string,

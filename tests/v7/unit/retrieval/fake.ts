@@ -237,6 +237,10 @@ export class FakeStore implements Store {
     throw new Error('fake store 未实现 upsertEmbedding')
   }
 
+  async deleteEmbedding(_entityId: string): Promise<void> {
+    throw new Error('fake store 未实现 deleteEmbedding')
+  }
+
   async setAttributeCache(
     _entityId: string,
     _name: string,
