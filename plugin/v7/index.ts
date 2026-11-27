@@ -39,6 +39,7 @@ import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import { buildEventRecallText, buildResident } from '../../packages/v7/src/recall/resident.js'
 import { LazyInitializer } from './startup.js'
 import { Supervisor, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
+import { registerSkills } from './skills.js'
 import {
   hasStrongSignal,
   isRecallTriggerEvent,
@@ -587,6 +588,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
 
   const tools = registerTools(ctx, runtime, logger)
   supervisor.recordToolRegistration(tools)
+  // 4 篇功能说明走宿主 skills provider；加载期不读盘，由 provider 惰性读取。
+  const skillsOff = registerSkills(ctx, logger)
   const promptSink = createPromptSink(ctx)
   if (!promptSink.available) logger.warn(`提示注入未接线：${promptSink.reason ?? '未知原因'}`)
 
@@ -979,6 +982,11 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       capture.dispose()
     } catch {
       // 同上。
+    }
+    try {
+      skillsOff()
+    } catch {
+      // 注销失败不阻断卸载。
     }
     try {
       promptSink.dispose()

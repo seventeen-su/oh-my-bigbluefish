@@ -1,6 +1,9 @@
 # OMB v7 挂载补丁：单行插件，无 HTTP / 无浏览器 bundle。
-# 必须 inject tools：否则 apply 在 tools 服务就绪前跑完，7 个 omb_* 工具不会注册。
+# inject tools：否则 apply 在 tools 服务就绪前跑完，7 个 omb_* 工具不会注册。
+# inject skills：registerSkills 在 apply 期调用 ctx.skills.registerProvider；未注入时
+# cordis 拒绝访问 skills 服务，4 篇功能说明会静默缺失。skills 注册表由宿主
+# base 组合（@deepseek-ai/dsh-skill）提供，Web profile 常驻。
 - insert:
     - id: omb-v7
       name: 'oh-my-bigbluefish/v7'
-      inject: ['tools']
+      inject: ['tools', 'skills']
