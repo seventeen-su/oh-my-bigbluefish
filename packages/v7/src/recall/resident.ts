@@ -694,7 +694,9 @@ export async function buildEventRecallText(
     ...(projectKey !== undefined ? { projectKey } : {}),
     limit: 6,
     sessionId: context.sessionId,
-    injected: true,
+    // T1 先检索、后由宿主实际追加消息；injected 由投递点 markRecallInjected 置 true，
+    // 避免 pre-step reject/去重时把候选误记为已注入。
+    injected: false,
   })
   if (result.hits.length === 0) return ''
   const compacted = compact(result, EVENT_RECALL_MAX_HITS)

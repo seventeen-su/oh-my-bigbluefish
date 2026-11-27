@@ -1294,10 +1294,27 @@ describe('v7 plugin entry', () => {
     const rejected = await preStep?.(payload, async () => ({ kind: 'reject' }))
     // reject 没有 messages：OMB 不能往它上面追加任何东西。
     expect(rejected).toEqual({ kind: 'reject' })
+    const ledger = new PostgresStore(TEST_DATABASE_URL)
+    const rejectedEvents = await ledger.db.query<{ injected: boolean }>(
+      'select injected from omb.recall_event where session_id = $1',
+      ['reject-step-session'],
+    )
+    // 检索发生了，但消息没有真正追加：账本必须保留 injected=false，不能提前算投递。
+    expect(rejectedEvents.rows.length).toBeGreaterThan(0)
+    expect(rejectedEvents.rows.every(row => row.injected === false)).toBe(true)
 
-    // 同一步重新进入时配额没有被白占：T1 仍然要追加一次。
+    // 同一步重新进入时配额没有被白占：T1 仍然要追加一次；此时才把账本置 true。
     const entered = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
     expect(t1Messages(entered)).toHaveLength(1)
+    const deliveredEvents = await ledger.db.query<{ injected: boolean }>(
+      'select injected from omb.recall_event where session_id = $1',
+      ['reject-step-session'],
+    )
+    expect(deliveredEvents.rows.length).toBeGreaterThan(0)
+    // 被 reject 的旧 trace 保持 false；重新 enter 产生的新 trace 才是 true。
+    expect(deliveredEvents.rows.some(row => row.injected === true)).toBe(true)
+    expect(deliveredEvents.rows.some(row => row.injected === false)).toBe(true)
+    await ledger.close()
     dispose()
   })
 

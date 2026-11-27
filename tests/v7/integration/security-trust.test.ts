@@ -289,7 +289,14 @@ describe('记忆投毒与提示注入不能越权（真实 PostgreSQL + 真实�
     )
     expect(events.rows.length).toBeGreaterThan(0)
     expect(new Set(events.rows.map(row => row.trace_id))).toEqual(new Set([receipt?.traceId]))
-    expect(events.rows.some(row => row.entity_id === normalId && row.injected)).toBe(true)
+    // 构建文本本身不等于投递：候选先记 injected=false，宿主实际追加后才置 true。
+    expect(events.rows.some(row => row.entity_id === normalId && row.injected === false)).toBe(true)
+    await store.markRecallInjected(receipt?.traceId ?? '')
+    const delivered = await store.db.query<{ injected: boolean }>(
+      'select injected from omb.recall_event where trace_id = $1 and entity_id = $2',
+      [receipt?.traceId, normalId],
+    )
+    expect(delivered.rows.some(row => row.injected)).toBe(true)
   })
 
   it('给定投毒偏好当构建 T0 文本则偏好段被隔离且不登记注入命中', async () => {

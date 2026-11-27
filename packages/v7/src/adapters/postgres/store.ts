@@ -467,6 +467,16 @@ export class PostgresStore implements Store {
     await this.run(() => this.writer.rebuildView(id))
   }
 
+  async markRecallInjected(traceId: string): Promise<void> {
+    if (traceId.trim().length === 0) return
+    await this.run(() => this.db.query(
+      `update omb.recall_event
+       set injected = true, injected_at = now()
+       where trace_id = $1 and injected = false`,
+      [traceId],
+    ))
+  }
+
   async recordRecall(events: readonly RecallEventInput[]): Promise<void> {
     if (events.length === 0) return
     await this.run(async () => {

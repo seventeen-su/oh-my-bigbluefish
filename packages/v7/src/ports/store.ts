@@ -123,6 +123,8 @@ export interface Store {
   ): Promise<void>
   rebuildView(id: string): Promise<void>
   recordRecall(events: readonly RecallEventInput[]): Promise<void>
+  /** T1 真正投递后把该 trace 的候选从 injected=false 置为 true（不提前记账）。 */
+  markRecallInjected?(traceId: string): Promise<void>
   /** 记录一次 T0 常驻构建（预算、段落、裁剪），不参与 adopted 统计。 */
   recordResidentTrace(trace: ResidentTraceInput): Promise<void>
   /** 检索命中即记一次访问；旧 fake 可不实现。 */

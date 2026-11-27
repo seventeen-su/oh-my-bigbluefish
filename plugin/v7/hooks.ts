@@ -252,7 +252,11 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         return decision
       }
       const deliveredNotice = reused?.notice ?? generatedNotice
-      if (deliveredNotice !== undefined) session.rememberInjection(sessionId, deliveredNotice)
+      if (deliveredNotice !== undefined) {
+        session.rememberInjection(sessionId, deliveredNotice)
+        // 文本真正挂到 additionalContexts 后才把 recall_event 标成 injected。
+        await store.markRecallInjected?.(deliveredNotice.traceId)
+      }
       // 只登记真正投递出去的 T1：下一轮 pre-step 认领它，本步配额同时记为已用。
       session.rememberT1Content(sessionId, injected, position)
       rememberSessionState(session.immediateT1, sessionId, injected)
@@ -427,7 +431,11 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     } else if (prepared.text.length > 0) {
       // 只有真正追加进 decision.messages 的召回才占用本步配额与去重指纹；
       // receipt/采用等待也在这一刻登记（reject/未追加都不该留下“已注入”证据）。
-      if (prepared.notice !== undefined) session.rememberInjection(prepared.sessionId, prepared.notice)
+      if (prepared.notice !== undefined) {
+        session.rememberInjection(prepared.sessionId, prepared.notice)
+        // 只有消息真的追加进 decision.messages 才把 recall_event 标成 injected。
+        await store.markRecallInjected?.(prepared.notice.traceId)
+      }
       session.rememberT1Content(prepared.sessionId, prepared.text, {
         ...(prepared.turn === undefined ? {} : { turn: prepared.turn }),
         ...(prepared.step === undefined ? {} : { step: prepared.step }),
