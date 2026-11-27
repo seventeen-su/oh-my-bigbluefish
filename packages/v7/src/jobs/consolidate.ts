@@ -9,6 +9,7 @@ import type { JobQueue, Logger } from '../ports/jobs.js'
 import type { MaintenanceQueries } from '../ports/maintenance.js'
 import type { SimilarEntity, Store, WriteResult } from '../ports/store.js'
 import { UpdateService } from '../app/update.js'
+import type { TimerHandler, TimerScheduleInput, TimerTask } from '../app/workflow/index.js'
 import type { DynamicService } from '../app/dynamic.js'
 import type { Embedder } from '../ports/embedding.js'
 
@@ -694,48 +695,199 @@ const CONSOLIDATION_JOBS = [
   'omb.embed-sweep',
 ] as const
 
-/** 轻量轮询：按固定周期把任务投进 pg-boss；不依赖 cron 扩展。 */
-export function startConsolidationLoop(queue: JobQueue, logger?: Logger, intervalMs = 10 * 60 * 1000): () => void {
-  let stopped = false
-  let running = false
-  const tick = async (): Promise<void> => {
-    if (stopped || running) return
-    running = true
-    try {
-      const bucket = Math.floor(Date.now() / intervalMs)
-      for (const name of CONSOLIDATION_JOBS) {
-        await queue.enqueue(name, {}, { singletonKey: `${name}:${bucket}`, retryLimit: 3 })
-      }
-    } catch (error) {
-      logger?.warn('后台巩固任务入队失败', error)
-    } finally {
-      running = false
-    }
-  }
-  const timer = setInterval(() => {
-    void tick()
-  }, intervalMs)
-  timer.unref?.()
-  void tick()
-  return () => {
-    stopped = true
-    clearInterval(timer)
+type ConsolidationJobName = (typeof CONSOLIDATION_JOBS)[number]
+
+/**
+ * 巩固任务的 durable schedule（ADR-0011）。
+ *
+ * 调度只落三样东西：稳定的 `dedupeKey`、`due_at` 网格、以及“到期把哪个任务入队”。
+ * 重试/死信由 pg-boss 负责；到期只入队一次。对外只暴露一个窄接口
+ * `createConsolidationScheduler`，排期/续期/触发标记都是模块内部细节。
+ */
+const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'
+const CONSOLIDATION_INTERVAL_MS = 10 * 60 * 1000
+/** timer 入队时写入的触发标记：只有调度驱动的执行才续期。 */
+const CONSOLIDATION_TRIGGER = 'omb.consolidation'
+
+interface ConsolidationSchedule {
+  readonly job: ConsolidationJobName
+  readonly dedupeKey: string
+  readonly intervalMs: number
+}
+
+const CONSOLIDATION_SCHEDULES: readonly ConsolidationSchedule[] = CONSOLIDATION_JOBS.map(job => ({
+  job,
+  dedupeKey: `consolidation:${job}`,
+  intervalMs: CONSOLIDATION_INTERVAL_MS,
+}))
+
+/** 组合根注入的 timer 能力（不 import pg、不认识表结构）。 */
+interface ConsolidationTimerPort {
+  /** 同 dedupeKey 是重排期（覆盖 due_at），不是新增行。 */
+  schedule(input: TimerScheduleInput): Promise<unknown>
+  /** 已有 pending/claimed timer 的 dedupeKey 集合（一次查询）。 */
+  armed(keys: readonly string[]): Promise<ReadonlySet<string>>
+}
+
+interface ConsolidationScheduleResult {
+  /** 本次真正补排的任务；空数组表示全部已 armed（幂等重入）。 */
+  readonly scheduled: readonly string[]
+  /** 已有 pending/claimed 行、本次没有改动的任务数。 */
+  readonly armed: number
+}
+
+/** 巩固调度的窄接口：调用方只需要“排期/续期/一个 timer handler”。 */
+interface ConsolidationScheduler {
+  /** 全部任务的调度描述（dedupeKey/周期）；调用方可以按已注册 handler 过滤。 */
+  readonly schedules: readonly ConsolidationSchedule[]
+  /**
+   * 启动/断链恢复的幂等排期：
+   * - 已有 pending/claimed 行（armed）完全不动：不把 due_at 往后推，崩溃期间到期的
+   *   timer 保持逾期、恢复后立刻执行（at-least-once），也不会产生第二行；
+   * - 没有行（首次启动、或链路断了）才补一条**立即到期**的 timer，等价旧 loop 的启动
+   *   首轮，但只有一行且到期即入队一次。
+   */
+  ensure(jobs?: readonly string[]): Promise<ConsolidationScheduleResult>
+  /** 调度驱动的任务执行完：把下一期排到网格点（同 dedupeKey 覆盖，行数恒定）。 */
+  rearm(job: string): Promise<void>
+  /** 到期只把对应任务入队 pg-boss 一次；重试/死信交给 pg-boss。 */
+  readonly timerHandler: TimerHandler
+}
+
+interface ConsolidationSchedulerDeps {
+  readonly timers: ConsolidationTimerPort
+  readonly queue: JobQueue
+  readonly clock: Clock
+  readonly logger?: Logger
+}
+
+function scheduleOf(job: string): ConsolidationSchedule {
+  const schedule = CONSOLIDATION_SCHEDULES.find(item => item.job === job)
+  if (schedule === undefined) throw new Error(`没有注册巩固任务：${job}`)
+  return schedule
+}
+
+/**
+ * 下一次到期：严格晚于 `now` 的 interval 网格点。
+ *
+ * 用网格而不是 `now + interval`：同一个 `now` 算出的 due_at 确定，重启/重复 rearm
+ * 不会让下一期漂移；`+1ms` 保证永远在未来，避免“到期即再到期”的自激循环。
+ */
+function nextDue(now: Date, intervalMs: number): Date {
+  const interval = Math.max(1, Math.trunc(intervalMs))
+  return new Date(Math.ceil((now.getTime() + 1) / interval) * interval)
+}
+
+function timerInput(schedule: ConsolidationSchedule, dueAt: Date): TimerScheduleInput {
+  return {
+    topic: CONSOLIDATION_TIMER_TOPIC,
+    payload: { job: schedule.job },
+    dueAt,
+    dedupeKey: schedule.dedupeKey,
   }
 }
 
-export async function registerConsolidationJobs(queue: JobQueue, deps: ConsolidationDeps): Promise<void> {
-  await queue.work('omb.extract', () => handleExtract(deps).then(() => undefined))
-  await queue.work('omb.dedupe', () => handleDedupe(deps).then(() => undefined))
-  await queue.work('omb.conflict', () => handleConflict(deps).then(() => undefined))
-  await queue.work('omb.clue-promote', () => handleCluePromote(deps).then(() => undefined))
-  await queue.work('omb.link-suggest', () => handleLinkSuggest(deps).then(() => undefined))
-  await queue.work('omb.forget', () => handleForget(deps).then(() => undefined))
-  await queue.work('omb.attr-alias', () => handleAttrAlias(deps).then(() => undefined))
-  await queue.work('omb.reference-rot', () => handleReferenceRot(deps).then(() => undefined))
+/** timer 载荷里的任务名；不合法时抛错让 timer 退避/死信，而不是静默空转。 */
+function jobOfPayload(payload: JsonValue): ConsolidationJobName {
+  const job = isPlainObject(payload) ? payload['job'] : undefined
+  if (typeof job === 'string' && (CONSOLIDATION_JOBS as readonly string[]).includes(job)) {
+    return job as ConsolidationJobName
+  }
+  throw new Error(`omb.consolidation timer 载荷非法：${JSON.stringify(payload)}`)
+}
+
+/** 该 pg-boss 任务是不是 consolidation timer 到期入队的（只有它执行完才续期）。 */
+function isTriggered(payload: unknown): boolean {
+  return isPlainObject(payload) && payload['trigger'] === CONSOLIDATION_TRIGGER
+}
+
+/**
+ * 构造巩固任务调度器（组合根调用一次）。
+ *
+ * timer 只负责“到点入队一次”；续期跟着**调度驱动**的任务真实执行走，所以删除 loop 后
+ * 调度仍然连续。被 outbox reaction 或人工提前入队的同名任务不续期——它没有“这一期结束”
+ * 的语义，也不能在 timer 已被 claim 的瞬间把行重排成 pending（会破坏 complete 的 CAS）。
+ */
+export function createConsolidationScheduler(deps: ConsolidationSchedulerDeps): ConsolidationScheduler {
+  const schedules = CONSOLIDATION_SCHEDULES
+  return {
+    schedules,
+    async ensure(jobs) {
+      const selected = jobs === undefined ? schedules : schedules.filter(schedule => jobs.includes(schedule.job))
+      const armedKeys = await deps.timers.armed(selected.map(schedule => schedule.dedupeKey))
+      const scheduled: string[] = []
+      for (const schedule of selected) {
+        if (armedKeys.has(schedule.dedupeKey)) continue
+        await deps.timers.schedule(timerInput(schedule, deps.clock.now()))
+        scheduled.push(schedule.job)
+      }
+      return { scheduled, armed: selected.length - scheduled.length }
+    },
+    async rearm(job) {
+      const schedule = scheduleOf(job)
+      await deps.timers.schedule(timerInput(schedule, nextDue(deps.clock.now(), schedule.intervalMs)))
+    },
+    timerHandler: {
+      topic: CONSOLIDATION_TIMER_TOPIC,
+      async run(task: TimerTask): Promise<void> {
+        const job = jobOfPayload(task.payload)
+        const intervalMs = scheduleOf(job).intervalMs
+        const bucket = Math.floor(deps.clock.now().getTime() / intervalMs)
+        await deps.queue.enqueue(job, { trigger: CONSOLIDATION_TRIGGER, job }, {
+          singletonKey: `${job}:${bucket}`,
+          retryLimit: 3,
+        })
+      },
+    },
+  }
+}
+
+interface ConsolidationJobOptions {
+  /** 有 scheduler 时，调度驱动的任务执行完把下一期排进 timer；缺省只注册 handler。 */
+  readonly scheduler?: ConsolidationScheduler
+}
+
+/**
+ * 注册巩固任务的 pg-boss handler，返回真实注册成功的任务名。
+ *
+ * 传了 `scheduler` 时，只有**调度驱动**的任务（载荷带触发标记）执行完才在 finally 里
+ * rearm 下一期；rearm 失败只记日志，不影响本次任务结果。
+ */
+export async function registerConsolidationJobs(
+  queue: JobQueue,
+  deps: ConsolidationDeps,
+  options: ConsolidationJobOptions = {},
+): Promise<readonly string[]> {
+  const registered: string[] = []
+  const work = async (job: ConsolidationJobName, run: () => Promise<void>): Promise<void> => {
+    await queue.work(job, async payload => {
+      try {
+        await run()
+      } finally {
+        if (isTriggered(payload) && options.scheduler !== undefined) {
+          try {
+            await options.scheduler.rearm(job)
+          } catch (error) {
+            deps.logger?.warn(`巩固任务续期失败：${job}`, error)
+          }
+        }
+      }
+    })
+    registered.push(job)
+  }
+  await work('omb.extract', () => handleExtract(deps).then(() => undefined))
+  await work('omb.dedupe', () => handleDedupe(deps).then(() => undefined))
+  await work('omb.conflict', () => handleConflict(deps).then(() => undefined))
+  await work('omb.clue-promote', () => handleCluePromote(deps).then(() => undefined))
+  await work('omb.link-suggest', () => handleLinkSuggest(deps).then(() => undefined))
+  await work('omb.forget', () => handleForget(deps).then(() => undefined))
+  await work('omb.attr-alias', () => handleAttrAlias(deps).then(() => undefined))
+  await work('omb.reference-rot', () => handleReferenceRot(deps).then(() => undefined))
   if (deps.dynamic !== undefined) {
-    await queue.work('omb.refresh', () => handleRefresh(deps).then(() => undefined))
+    await work('omb.refresh', () => handleRefresh(deps).then(() => undefined))
   }
   if (deps.embedder !== undefined) {
-    await queue.work('omb.embed-sweep', () => handleEmbedSweep(deps).then(() => undefined))
+    await work('omb.embed-sweep', () => handleEmbedSweep(deps).then(() => undefined))
   }
+  return registered
 }

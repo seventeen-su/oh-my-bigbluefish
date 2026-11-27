@@ -23,6 +23,8 @@ const DATABASE_URL = process.env.OMB_RUNTIME_TEST_DATABASE_URL
 
 const PROJECT = 'D:\\Program\\Oh-My-BigBlueFish'
 const EXEC = { agent: { session: { id: 'runtime-wiring-session', header: { cwd: PROJECT } } } }
+/** Task 16a：10 个巩固任务各一条 durable timer（合法 pending），业务 timer 空闲时聚合数应等于它。 */
+const EXPECTED_CONSOLIDATION_TIMERS = 10
 /** outbox relay 从 writer 的 NOTIFY 被唤醒；这里显式再发一次只用于 at-least-once 重放。 */
 const OUTBOX_CHANNEL = 'omb_outbox'
 
@@ -105,6 +107,19 @@ interface RunningRuntime {
   readonly host: FakeHost
   readonly dispose: () => void
   stop(): Promise<void>
+}
+
+/**
+ * 读 status 里的整数字段（如 `timerPending=3`）。
+ *
+ * timer 段是**全部** timer 的聚合：Task 16a 删除 10 分钟 loop 后，巩固任务的
+ * durable schedule 也落在 omb.timer 里，是合法 pending。所以“业务 timer 空闲”
+ * 用「聚合数 − consolidation 份额 = 0」表达，不用硬编码 0 掩盖它。
+ */
+function metric(text: string, name: string): number {
+  const match = new RegExp(`${name}=(\\d+)`).exec(text)
+  if (match?.[1] === undefined) throw new Error(`status 缺少字段 ${name}：\n${text}`)
+  return Number(match[1])
 }
 
 function startRuntime(overrides: Record<string, unknown> = {}): RunningRuntime {
@@ -246,15 +261,29 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
   it('给定 jobs=true 当 plugin 就绪则 status 报 outbox/timer/workflow 实测读数，且启动在投影之后', async () => {
     const runtime = startRuntime()
     try {
-      const text = await statusText(runtime)
+      // 启动首轮巩固任务会立刻到期并执行：等它们都 rearm 成 pending 再读聚合数。
+      // 否则 timer 统计与 consolidation 快照是两条 SQL，正常在途也会出现“差值”。
+      const text = await waitFor(
+        async () => {
+          const current = await statusText(runtime)
+          return metric(current, 'consolidationPending') === EXPECTED_CONSOLIDATION_TIMERS ? current : undefined
+        },
+        '巩固任务全部 rearm 成 pending',
+      )
       expect(text).toContain('projection=ok')
       expect(text).toContain('outbox=ok')
       expect(text).toContain('outboxLagMs=0 outboxPending=0 outboxClaimed=0 outboxDead=0')
       expect(text).toContain('outboxTopics=EntityCreated,EntityPatched')
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('timer=ok')
-      expect(text).toMatch(/timerPending=0 timerClaimed=0 timerDueAgeMs=0 timerDead=0/)
+      // 业务 timer（workflow wake）空闲；consolidation 的 durable schedule 是合法 pending。
+      expect(text).toMatch(/timerPending=\d+ timerClaimed=\d+ timerDueAgeMs=\d+ timerDead=\d+/)
+      expect(metric(text, 'timerPending') - metric(text, 'consolidationPending')).toBe(0)
+      expect(metric(text, 'timerClaimed') - metric(text, 'consolidationClaimed')).toBe(0)
+      expect(metric(text, 'timerDead') - metric(text, 'consolidationDead')).toBe(0)
       expect(text).toContain('timerTopics=omb.workflow.wake')
+      expect(text).toContain('consolidation=ok')
+      expect(text).toMatch(/consolidationJobs=omb\.[a-z-]+(,omb\.[a-z-]+)*/)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=0 workflowRunning=0 workflowWaiting=0 workflowDead=0/)
       expect(text).toContain('workflowDefinitions=none')
@@ -448,11 +477,18 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       const text = await waitFor(
         async () => {
           const current = await statusText(runtime)
-          return current.includes('timerFired=1') ? current : undefined
+          // timerFired 是本进程累计，含 consolidation 的启动首轮，所以只断言 >=1；
+          // 同时等 consolidation 全部 rearm，避免两条 SQL 之间正常在途造成差值。
+          return /timerFired=[1-9]\d*/.test(current)
+            && metric(current, 'consolidationPending') === EXPECTED_CONSOLIDATION_TIMERS
+            ? current
+            : undefined
         },
-        'status 报 timerFired=1',
+        'status 报 timerFired>=1 且巩固任务已 rearm',
       )
-      expect(text).toMatch(/timerPending=0 timerClaimed=0 timerDueAgeMs=0 timerDead=0/)
+      // probe timer 已 done；剩下的 timer 只应来自 consolidation 的 durable schedule。
+      expect(metric(text, 'timerPending') - metric(text, 'consolidationPending')).toBe(0)
+      expect(metric(text, 'timerClaimed') - metric(text, 'consolidationClaimed')).toBe(0)
     } finally {
       await runtime.stop()
     }

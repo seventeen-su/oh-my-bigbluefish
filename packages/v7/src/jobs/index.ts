@@ -1,5 +1,6 @@
 export { handleEmbedJob, registerEmbedJob, isEmbedJob, type EmbedJob } from './embed.js'
 export {
+  createConsolidationScheduler,
   handleAttrAlias,
   handleCluePromote,
   handleConflict,
@@ -9,6 +10,5 @@ export {
   handleLinkSuggest,
   handleReferenceRot,
   registerConsolidationJobs,
-  startConsolidationLoop,
   type ConsolidationDeps,
 } from './consolidate.js'

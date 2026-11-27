@@ -1285,9 +1285,13 @@ describe('v7 plugin entry', () => {
     expect(status?.text).toContain('timerReason=jobs-disabled')
     expect(status?.text).toContain('workflow=unknown')
     expect(status?.text).toContain('workflowReason=jobs-disabled')
+    // 巩固调度也挂在 jobs 开关上：关闭时必须显式 unknown，不能把“没跑”报成 0。
+    expect(status?.text).toContain('consolidation=unknown')
+    expect(status?.text).toContain('consolidationReason=jobs-disabled')
     expect(status?.text).not.toContain('outbox=ok')
     expect(status?.text).not.toContain('timer=ok')
     expect(status?.text).not.toContain('workflow=ok')
+    expect(status?.text).not.toContain('consolidation=ok')
     dispose()
     await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
   })

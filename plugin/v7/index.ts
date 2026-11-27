@@ -49,7 +49,11 @@ import type { PatchEntityInput, WriteEntityInput } from '../../packages/v7/src/d
 import type { JsonValue } from '../../packages/v7/src/domain/json.js'
 import { extractQuerySignals } from '../../packages/v7/src/domain/text.js'
 import type { LinkInput } from '../../packages/v7/src/domain/link.js'
-import { registerConsolidationJobs, registerEmbedJob, startConsolidationLoop } from '../../packages/v7/src/jobs/index.js'
+import {
+  createConsolidationScheduler,
+  registerConsolidationJobs,
+  registerEmbedJob,
+} from '../../packages/v7/src/jobs/index.js'
 import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import { buildEventRecallText, buildResident, type ResidentBoardsOptions, type ResidentBoardsQuery } from '../../packages/v7/src/recall/resident.js'
@@ -102,9 +106,17 @@ const DEFAULT_DATABASE_URL = 'postgres://omb:omb@127.0.0.1:5432/omb'
 const EMBED_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'EntityPatched']
 
 /**
- * timer 只桥接“到点唤醒 workflow runtime”。Phase 3 还没有 workflow 生产者，
- * 该 handler 是真实的 timer 消费者（不是空实现）：到期后叫醒循环领取已到期的 run，
- * 不用固定轮询扫 workflow_run。业务 timer（衰减/提醒）由后续任务接入同一 worker。
+ * 事件触发优先：实体写入后动态属性可能已过期（新建时还没有缓存、patch 改了 ref 目标），
+ * 所以 Created/Patched 也触发一次合并的 `omb.refresh`。链接/归档不改动态值，仍由 timer 巩固。
+ */
+const REFRESH_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'EntityPatched']
+
+/**
+ * timer 的两类真实消费者：
+ * 1. `omb.workflow.wake`：到点唤醒 workflow runtime；
+ * 2. `omb.consolidation`：每个巩固任务的 durable schedule 到期，把该任务入队 pg-boss 一次
+ *    （见 `jobs/consolidate.ts` 的 `createConsolidationTimerHandler`）。
+ * 两者都不是空实现；timer worker 只由 NOTIFY/到期单次唤醒，没有固定轮询。
  */
 const WORKFLOW_WAKE_TIMER_TOPIC = 'omb.workflow.wake'
 
@@ -158,6 +170,36 @@ function createEmbedReaction(deps: {
         return
       }
       await deps.queue.enqueue('omb.embed', { entityId, text }, { singletonKey: `embed:${entityId}`, retryLimit: 3 })
+    },
+  }
+}
+
+/**
+ * EntityCreated / EntityPatched → 合并入队一次 `omb.refresh`（事件触发优先）。
+ *
+ * 只有实体真的带动态属性才入队：`omb.refresh` 是“扫 staleDynamic”的聚合任务，
+ * 普通记忆入队只会空跑一次全表查询。`singletonKey` 固定为 `refresh:event`，
+ * 所以一次事件风暴最多留下一个待跑任务，不按事件放大。
+ *
+ * 与 embed reaction 同款：载荷不是实体事件时抛错让 relay 进死信（status 可见），
+ * 不静默丢弃。
+ */
+function createRefreshReaction(deps: {
+  readonly store: PostgresStore
+  readonly queue: JobQueue
+  readonly logger: Logger
+}): Reaction {
+  return {
+    name: 'enqueue-refresh',
+    async run(event): Promise<void> {
+      const entityId = entityIdFromOutboxPayload(event.payload)
+      if (entityId === undefined) {
+        throw new Error(`outbox ${event.topic} 事件缺少 entityId（event_id=${event.eventId}）`)
+      }
+      const entity = await deps.store.get(entityId, { includeArchived: true })
+      if (entity === undefined) return
+      if (!entity.attributes.some(attribute => attribute.value.kind === 'dynamic')) return
+      await deps.queue.enqueue('omb.refresh', { entityId }, { singletonKey: 'refresh:event', retryLimit: 3 })
     },
   }
 }
@@ -504,11 +546,30 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   })
 
   const maintenance = new PostgresMaintenance(store.db)
-  let stopConsolidation: (() => void) | undefined
+  // timer 适配器无状态：worker 与 durable 调度共用一个实例，避免两套连接/两套语义。
+  const timerStore = new PostgresTimerStore(store.db)
+  /**
+   * 巩固任务的 durable 调度器（jobs 层窄接口的唯一入口）：
+   * - `schedule` 直接走 timer 适配器（同 dedupeKey 是重排期，不是新增行）；
+   * - `armed` 一次查询判断“该任务是否已有 pending/claimed 行”；
+   * - timer handler 到期只把对应任务入队 pg-boss 一次。
+   * 不引入新表/迁移，只读现有的 omb.timer。
+   */
+  const consolidationScheduler = createConsolidationScheduler({
+    timers: {
+      schedule: input => timerStore.schedule(input),
+      armed: keys => readArmedConsolidationKeys(keys),
+    },
+    queue,
+    clock,
+    logger,
+  })
   let migrated = false
   let embedJobRegistered = false
   let consolidationJobsRegistered = false
   let queueStarted = false
+  /** 真实注册成功的巩固任务名：只给它们排期，没 handler 的任务不建空跑 timer。 */
+  let consolidationJobs: readonly string[] = []
   let consolidationStarted = false
   // 投影读模型：DB ready 后由组合根构造 task store / LISTEN notifier / worker / 读 API。
   let projectionStarted = false
@@ -699,8 +760,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
    * 顺序固定：
    * 1. 两个 notifier 先 `ready()`：LISTEN 建立后才能保证“事务提交后的 NOTIFY”不丢；
    *    漏通知仍由 relay 首次 drain 与 timer 的 `nextDueAt` 单次定时器兜底。
-   * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed`）与 timer handler
-   *    （到期唤醒 workflow runtime）。未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
+   * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed` + 合并 `omb.refresh`）与
+   *    两个 timer handler（到期唤醒 workflow runtime；巩固任务的 durable schedule 到期入队）。
+   *    未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
    * 3. 启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的 running 回
    *    pending 并唤醒循环（启动恢复）。
    *
@@ -728,6 +790,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       await timerListen.ready()
       const embedReaction = createEmbedReaction({ store, queue, embedder, logger })
       for (const topic of EMBED_REACTION_TOPICS) registry.register(topic, embedReaction)
+      const refreshReaction = createRefreshReaction({ store, queue, logger })
+      for (const topic of REFRESH_REACTION_TOPICS) registry.register(topic, refreshReaction)
       relay = new OutboxRelay(
         {
           store: new PostgresOutboxStore(store.db),
@@ -751,8 +815,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       }
       timer = new TimerWorker(
         {
-          store: new PostgresTimerStore(store.db),
-          handlers: [workflowWake],
+          store: timerStore,
+          // 顺序有含义：status 里 timerTopics 先报 workflow wake，再报巩固任务 schedule。
+          handlers: [workflowWake, consolidationScheduler.timerHandler],
           clock,
           wake: timerListen,
           logger,
@@ -801,6 +866,147 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
   }
 
+  /**
+   * 只给真实注册了 handler 的任务排期：没有 handler 的 timer 到期只会入队一个
+   * 没人消费的 pg-boss 任务（看起来在跑，实际空转）。
+   */
+  function consolidationSchedules() {
+    return consolidationScheduler.schedules.filter(schedule => consolidationJobs.includes(schedule.job))
+  }
+
+  /**
+   * 已有 pending/claimed timer 的 dedupeKey（一次查询）。
+   *
+   * 同时给调度器的排期和 status 的自愈判据用：armed 的任务不动，缺失的才补。
+   */
+  async function readArmedConsolidationKeys(keys: readonly string[]): Promise<ReadonlySet<string>> {
+    if (keys.length === 0) return new Set<string>()
+    const rows = await store.db.query<{ dedupe_key: string }>(
+      `select distinct dedupe_key
+         from omb.timer
+        where dedupe_key = any($1::text[]) and status in ('pending', 'claimed')`,
+      [keys],
+    )
+    return new Set(rows.rows.map(row => row.dedupe_key))
+  }
+
+  interface ConsolidationTimerSnapshot {
+    readonly pending: number
+    readonly claimed: number
+    readonly done: number
+    readonly dead: number
+    readonly dueAgeMs: number
+    readonly nextDueAt?: string
+  }
+
+  /** 巩固调度的 timer 行读数：只认 `consolidation:` 前缀，业务 timer 不混进来。 */
+  async function readConsolidationTimers(): Promise<ConsolidationTimerSnapshot> {
+    const result = await store.db.query<{
+      pending: number
+      claimed: number
+      done: number
+      dead: number
+      due_age_ms: number
+      next_due: Date | string | null
+    }>(
+      `select
+         count(*) filter (where status = 'pending')::int as pending,
+         count(*) filter (where status = 'claimed')::int as claimed,
+         count(*) filter (where status = 'done')::int as done,
+         count(*) filter (where status = 'dead')::int as dead,
+         coalesce(
+           (extract(epoch from (
+             now() - min(due_at) filter (where status in ('pending', 'claimed') and due_at <= now())
+           )) * 1000)::int,
+           0
+         ) as due_age_ms,
+         min(due_at) filter (where status in ('pending', 'claimed')) as next_due
+       from omb.timer
+      where dedupe_key like 'consolidation:%'`,
+    )
+    const row = result.rows[0]
+    if (row === undefined) return { pending: 0, claimed: 0, done: 0, dead: 0, dueAgeMs: 0 }
+    return {
+      pending: row.pending,
+      claimed: row.claimed,
+      done: row.done,
+      dead: row.dead,
+      dueAgeMs: Math.max(0, Number(row.due_age_ms ?? 0)),
+      ...(row.next_due === null ? {} : { nextDueAt: new Date(row.next_due).toISOString() }),
+    }
+  }
+
+  /** 巩固任务在 pg-boss 里还没跑完的行（created/retry/active），按任务名聚合。 */
+  async function readConsolidationQueued(
+    schedules: readonly { readonly job: string }[],
+  ): Promise<{ readonly total: number; readonly names: ReadonlySet<string> }> {
+    if (schedules.length === 0) return { total: 0, names: new Set<string>() }
+    const result = await store.db.query<{ name: string; queued: number }>(
+      `select name, count(*)::int as queued
+         from pgboss.job
+        where name = any($1::text[]) and state in ('created', 'retry', 'active')
+        group by name`,
+      [schedules.map(schedule => schedule.job)],
+    )
+    let total = 0
+    for (const row of result.rows) total += row.queued
+    return { total, names: new Set(result.rows.map(row => row.name)) }
+  }
+
+  /**
+   * `omb_status` 的巩固调度读数：必须与业务 timer 分开看。
+   *
+   * `timerPending/Claimed/...` 是 **全部** timer 的聚合，包含 consolidation 的 durable
+   * schedule 行（合法 pending，不是泄漏）；这里的 consolidation* 给出其中属于巩固调度的
+   * 份额，两者相减才是 workflow wake / 提醒等业务 timer 的空闲读数。
+   *
+   * 有界自愈：status 是一次真实观测，按任务判断“没有 armed timer 且队列里也没有在跑的
+   * 同名任务”就补排一次。它不是轮询——只有 omb_status 被调用时才发生；也不会把正常在途
+   * 误判成断链（timer handler 先入队再 complete，任务先 rearm 再 complete）。
+   */
+  async function consolidationStatusLines(): Promise<string[]> {
+    if (!consolidationStarted) {
+      return ['consolidation=unknown', `consolidationReason=${startup.error ?? 'not-started'}`]
+    }
+    const schedules = consolidationSchedules()
+    try {
+      const armed = await readArmedConsolidationKeys(schedules.map(schedule => schedule.dedupeKey))
+      const queued = await readConsolidationQueued(schedules).catch(error => {
+        logger.warn('巩固任务队列计数失败', messageOf(error))
+        return undefined
+      })
+      let repaired = false
+      if (queued !== undefined) {
+        // 断链判据按任务看：没有 armed timer，队列里也没有同名在跑的任务。
+        const missing = schedules.filter(schedule => (
+          !armed.has(schedule.dedupeKey) && !queued.names.has(schedule.job)
+        ))
+        if (missing.length > 0) {
+          const ensured = await consolidationScheduler.ensure(missing.map(schedule => schedule.job))
+          if (ensured.scheduled.length > 0) {
+            logger.warn('巩固任务的 timer 链路缺失，已按 durable schedule 补排', { jobs: ensured.scheduled })
+            repaired = true
+          }
+        }
+      }
+      const snapshot = await readConsolidationTimers()
+      const queuedAfter = repaired
+        ? await readConsolidationQueued(schedules).catch(() => undefined)
+        : queued
+      const nextDueMs = snapshot.nextDueAt === undefined
+        ? 'none'
+        : String(Math.max(0, Date.parse(snapshot.nextDueAt) - clock.now().getTime()))
+      return [
+        'consolidation=ok',
+        `consolidationJobs=${schedules.map(schedule => schedule.job).join(',') || 'none'}`,
+        `consolidationPending=${snapshot.pending} consolidationClaimed=${snapshot.claimed} consolidationDone=${snapshot.done} consolidationDead=${snapshot.dead}`,
+        `consolidationDueAgeMs=${snapshot.dueAgeMs} consolidationNextDueMs=${nextDueMs} consolidationQueued=${queuedAfter?.total ?? 'unknown'}`,
+      ]
+    } catch (error) {
+      return ['consolidation=unknown', `consolidationReason=${messageOf(error)}`]
+    }
+  }
+
   /** 运行时未启动/未测量时的统一读数：显式 unknown + 原因，不把“没跑”报成 0。 */
   function runtimeUnknownLines(reason: string): string[] {
     // 后台任务关闭时，真正原因不是 DB/启动错误：如实说是配置关掉的。
@@ -812,6 +1018,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       `timerReason=${detail}`,
       'workflow=unknown',
       `workflowReason=${detail}`,
+      'consolidation=unknown',
+      `consolidationReason=${detail}`,
     ]
   }
 
@@ -880,6 +1088,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     } catch (error) {
       lines.push('workflow=unknown', `workflowReason=${messageOf(error)}`)
     }
+    lines.push(...(await consolidationStatusLines()))
     return lines
   }
 
@@ -902,7 +1111,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         embedJobRegistered = true
       }
       if (!consolidationJobsRegistered) {
-        await registerConsolidationJobs(queue, {
+        consolidationJobs = await registerConsolidationJobs(queue, {
           store,
           queries: maintenance,
           updateService,
@@ -910,7 +1119,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           logger,
           dynamic: dynamicService,
           embedder,
-        })
+        }, { scheduler: consolidationScheduler })
         consolidationJobsRegistered = true
       }
       if (!queueStarted) {
@@ -920,10 +1129,19 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       // 事件运行时必须在投影之后（task-42）且在队列启动之后：reaction 要往已启动的队列入队。
       if (!runtimeStarted) await startRuntime()
       if (!consolidationStarted) {
-        // 现有 10 分钟巩固循环保留（Task 16 迁移到 workflow/timer 时再删）；
-        // 本次只新增事件驱动路径，不新增任何固定轮询。
-        stopConsolidation = startConsolidationLoop(queue, logger)
+        // 没有固定 loop：启动只做一次**幂等**排期——已 armed 的 timer 原样保留（崩溃期间
+        // 逾期的到期后立刻执行），缺失的才补一条立即到期的。之后由 timer 到期 + 任务
+        // 执行完的 rearm 续期；不再有 setInterval/固定节拍。
+        const schedules = consolidationSchedules()
+        const ensured = await consolidationScheduler.ensure(schedules.map(schedule => schedule.job))
         consolidationStarted = true
+        logger.info('巩固任务 durable 调度已就绪', {
+          jobs: schedules.map(schedule => schedule.job),
+          dedupeKeys: schedules.map(schedule => schedule.dedupeKey),
+          scheduledNow: ensured.scheduled,
+          armed: ensured.armed,
+          driver: 'timer/omb.consolidation',
+        })
       }
     },
   })
@@ -1610,12 +1828,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     lastT1.clear()
     currentStep.clear()
     t1Step.clear()
-    try {
-      stopConsolidation?.()
-    } catch (error) {
-      // 巩固循环停不下来不能阻断后面的队列/连接/PG 收尾。
-      logger.warn('巩固循环停止失败', messageOf(error))
-    }
+    // 没有可停的巩固循环了：durable schedule 是 omb.timer 里的行，进程退出后仍保留，
+    // 下一个进程启动时靠幂等 ensure 接管；这里不需要（也不应该）取消它们。
     // 先让 worker 停掉，再关业务连接池，最后才停便携 PostgreSQL；三个动作不能并发，
     // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。每步独立 5s 超时，
     // 超时/失败只记日志并继续，绝不把异常抛回宿主。
