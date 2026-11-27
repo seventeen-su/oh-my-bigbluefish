@@ -4,7 +4,6 @@ import type {
   Category,
   Entity,
   EntityKind,
-  Scope,
   StateStatus,
 } from '../../domain/entity.js'
 import { isCategory, isStateStatus } from '../../domain/entity.js'
@@ -280,11 +279,4 @@ export function buildViewValues(
     adoptionCount: 0,
     updatedAt: options.now,
   }
-}
-
-export function scopeOfRow(row: ViewRow | EntityRow): Scope {
-  if ('project_key' in row) {
-    return row.scope === 'global' ? { kind: 'global' } : { kind: 'project', projectKey: row.project_key }
-  }
-  return { kind: 'global' }
 }

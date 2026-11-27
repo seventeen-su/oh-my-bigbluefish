@@ -31,12 +31,3 @@ export interface Expansion {
   readonly relation: string
   readonly chainId?: string
 }
-
-export interface ChainMember {
-  readonly chainId: string
-  readonly memberId: string
-  readonly role?: string
-  readonly position: number
-  readonly source: string
-  readonly addedAt: string
-}

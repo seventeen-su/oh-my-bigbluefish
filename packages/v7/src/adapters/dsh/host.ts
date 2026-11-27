@@ -77,9 +77,7 @@ export function sessionFromExec(exec: unknown): ToolContext | undefined {
     ? session['id']
     : typeof agent?.['id'] === 'string' && agent['id'].trim().length > 0
       ? agent['id']
-      : typeof record?.['sessionId'] === 'string' && record['sessionId'].trim().length > 0
-        ? record['sessionId']
-        : undefined
+      : undefined
   if (sessionId === undefined) return undefined
   const header = asRecord(session?.['header'])
   const cwd = typeof header?.['cwd'] === 'string' && header['cwd'].trim().length > 0 ? header['cwd'] : undefined
@@ -142,23 +140,6 @@ export function createPromptSink(ctx: HostContextLike | undefined): PromptSink {
   if (service === undefined || context === undefined) {
     return { available: false, reason: '宿主没有 systemPrompt.context', write: () => false, dispose: () => {} }
   }
-  const registerStyle = methodOf(service, 'getContextOrder') !== undefined
-
-  if (!registerStyle) {
-    return {
-      available: true,
-      write: (_sessionId, text) => {
-        try {
-          ;(context as (arg: unknown) => unknown)(text)
-          return true
-        } catch {
-          return false
-        }
-      },
-      dispose: () => {},
-    }
-  }
-
   const texts = new Map<string, string>()
   let order = 210
   try {

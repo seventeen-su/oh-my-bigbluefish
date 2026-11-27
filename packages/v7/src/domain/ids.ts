@@ -19,8 +19,3 @@ export function newId(kind: IdKind): string {
 export function isId(value: string): boolean {
   return ID_PATTERN.test(value)
 }
-
-export function assertId(value: string, field = 'id'): string {
-  if (!isId(value)) throw new Error(`${field} 不是合法的 OMB id：${value}`)
-  return value
-}

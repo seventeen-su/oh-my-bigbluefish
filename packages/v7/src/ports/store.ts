@@ -6,7 +6,6 @@ import type {
   Scope,
   StateStatus,
   StateVersion,
-  WriteEntityInput,
 } from '../domain/entity.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
@@ -263,5 +262,3 @@ export interface Store {
   markArtifactProcessed(id: string): Promise<void>
   stats(): Promise<StoreStats>
 }
-
-export type StoreWriteInput = WriteEntityInput

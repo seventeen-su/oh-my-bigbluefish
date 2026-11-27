@@ -6,7 +6,6 @@ import {
   isCategory,
   isStateStatus,
   type Attribute,
-  type Category,
   type DynamicSpec,
   type RawAttributeValue,
   type Scope,
@@ -429,14 +428,6 @@ export function normalizeWrite(input: WriteEntityInput, generatedId?: string): V
 /** 状态是已完成/已丢弃时自动归档；其余状态不自动归档。 */
 export function shouldAutoArchive(status: StateStatus): boolean {
   return status === 'completed' || status === 'discarded'
-}
-
-export function labelForStatus(status: StateStatus): string {
-  return STATUS_LABELS[status]
-}
-
-export function labelForCategory(category: Category): string {
-  return CATEGORY_LABELS[category]
 }
 
 /** 从属性值派生全文检索文本；排除 id/scope/group 等噪声。 */

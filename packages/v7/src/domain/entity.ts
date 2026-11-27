@@ -31,10 +31,6 @@ export function scopeKey(scope: Scope): string {
   return scope.kind === 'global' ? '' : scope.projectKey
 }
 
-export function isGlobalScope(scope: Scope): boolean {
-  return scope.kind === 'global'
-}
-
 export interface RefSpec {
   readonly kind: 'ref'
   readonly entityId: string
@@ -210,10 +206,6 @@ export function validationError(errors: readonly ValidationIssue[]): OmbError {
   }
 }
 
-export function isEntityKind(value: unknown): value is EntityKind {
-  return typeof value === 'string' && (ENTITY_KINDS as readonly string[]).includes(value)
-}
-
 export function isCategory(value: unknown): value is Category {
   return typeof value === 'string' && (CATEGORIES as readonly string[]).includes(value)
 }
@@ -233,14 +225,6 @@ export function attributeValue(entity: Entity, name: string): JsonValue | undefi
   return attribute.value.kind === 'static' ? attribute.value.value : attribute.value.cachedValue
 }
 
-export function requiredAttribute(entity: Entity, name: string): Attribute {
-  const attribute = getAttribute(entity, name)
-  if (attribute === undefined || !attribute.required) {
-    throw new Error(`实体 ${entity.id} 缺少必填属性 ${name}`)
-  }
-  return attribute
-}
-
 export function statusOf(entity: Entity): StateStatus | undefined {
   const value = attributeValue(entity, 'status')
   return typeof value === 'string' && isStateStatus(value) ? value : undefined
@@ -249,11 +233,6 @@ export function statusOf(entity: Entity): StateStatus | undefined {
 export function titleOf(entity: Entity): string | undefined {
   const value = attributeValue(entity, 'title')
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined
-}
-
-export function categoryOf(entity: Entity): Category | undefined {
-  const value = attributeValue(entity, 'category')
-  return typeof value === 'string' && isCategory(value) ? value : undefined
 }
 
 export function scopeOf(entity: Entity): Scope {
@@ -269,8 +248,4 @@ export function scopeOf(entity: Entity): Scope {
 
 export function isArchived(entity: Entity): boolean {
   return entity.archivedAt !== undefined
-}
-
-export function isRetrievable(entity: Entity): boolean {
-  return entity.isCurrent && entity.archivedAt === undefined
 }

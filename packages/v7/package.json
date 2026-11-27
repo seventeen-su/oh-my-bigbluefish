@@ -4,10 +4,6 @@
   "private": true,
   "type": "module",
   "description": "OMB v7 core: single PostgreSQL attribute store, two-stage retrieval, recall, consolidation.",
-  "main": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
-  },
   "dependencies": {
     "pg": "^8.23.1",
     "pg-boss": "^12.39.0",

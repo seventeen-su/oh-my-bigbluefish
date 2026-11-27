@@ -23,31 +23,6 @@ export function isNonEmptyJson(value: JsonValue): boolean {
   return true
 }
 
-/** 把 JSON 拆成可检索的纯文本片段；不改变原值。 */
-export function flattenText(value: JsonValue, out: string[] = [], depth = 0): string[] {
-  if (depth > 16) return out
-  if (typeof value === 'string') {
-    if (value.trim().length > 0) out.push(value)
-    return out
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    out.push(String(value))
-    return out
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) flattenText(item, out, depth + 1)
-    return out
-  }
-  if (isPlainObject(value)) {
-    for (const [key, item] of Object.entries(value)) {
-      if (key === '$dynamic') continue
-      out.push(key)
-      flattenText(item as JsonValue, out, depth + 1)
-    }
-  }
-  return out
-}
-
 export function jsonSize(value: JsonValue): number {
   return new TextEncoder().encode(JSON.stringify(value)).length
 }

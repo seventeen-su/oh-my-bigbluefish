@@ -421,12 +421,6 @@ interface PrefetchedT1 {
   readonly notice?: RecallNotice
 }
 
-/** 宿主 waterfall 没有 next（老宿主/测试替身）时的 enter 复合：与 DSH 基线 decision 同形。 */
-function enterDecisionFor(payload: unknown): { readonly kind: 'enter'; readonly messages: readonly unknown[] } {
-  const record = typeof payload === 'object' && payload !== null ? payload as { messages?: unknown } : undefined
-  return { kind: 'enter', messages: Array.isArray(record?.messages) ? record.messages : [] }
-}
-
 function formatWrite(result: Awaited<ReturnType<RememberService['remember']>>): string {
   if (!result.ok) return ''
   const written = result.value
@@ -1796,7 +1790,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
   }
 
-  const preStep = async (payload: unknown, next?: () => unknown): Promise<unknown> => {
+  const preStep = async (payload: unknown, next: () => unknown): Promise<unknown> => {
     let prepared: PreparedT1Injection | undefined
     try {
       prepared = await prepareT1Injection(payload)
@@ -1804,7 +1798,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       logger.warn('pre-step 注入失败', messageOf(error))
     }
     // next() 必须在 try 之外：其它 pre-step 监听器抛错要原样上抛，不能被 OMB 吞成放行。
-    const decision = typeof next === 'function' ? await next() : enterDecisionFor(payload)
+    // 宿主契约要求 next 必传（DSH `packages/core/agent/src/runtime-types.ts:351`）。
+    const decision = await next()
     if (!isEnterDecisionLike(decision)) return decision
     if (prepared === undefined) return decision
     if (prepared.immediate) {
