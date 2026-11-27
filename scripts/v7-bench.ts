@@ -23,6 +23,7 @@ import { PostgresStore } from '../packages/v7/src/adapters/postgres/store.js'
 import { AttributeWriter } from '../packages/v7/src/adapters/postgres/writer.js'
 import { RecallEngine } from '../packages/v7/src/retrieval/engine.js'
 import type { Clock } from '../packages/v7/src/ports/clock.js'
+import type { Store } from '../packages/v7/src/ports/store.js'
 
 const URL = process.env.OMB_BENCH_DATABASE_URL ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_bench'
 // 显式声明破坏性用途（truncateAll 守卫，ADR-0010）：只有库名命中 test/bench 段才允许；
@@ -36,6 +37,8 @@ const LINKS = positiveInt(process.env.OMB_BENCH_LINKS, 10_000)
 const ITERATIONS = positiveInt(process.env.OMB_BENCH_ITERATIONS, 100)
 const WRITES = positiveInt(process.env.OMB_BENCH_WRITES, 200)
 const REUSE = process.env.OMB_BENCH_REUSE === '1'
+/** 逐 store 方法的耗时诊断（默认关闭，不影响 p95 判定）。 */
+const DIAG = process.env.OMB_BENCH_DIAG === '1'
 const FULL_SCALE = ENTITIES >= 100_000 && LINKS >= 10_000
 const STAGE_ONE_BUDGET_MS = 150
 const TOTAL_BUDGET_MS = 300
@@ -59,6 +62,53 @@ function percentile(values: readonly number[], ratio: number): number {
 
 function format(value: number): string {
   return value.toFixed(2)
+}
+
+/**
+ * 逐通道诊断：把 Store 读方法包一层计时，用来定位阶段一 p95 落在哪个查询上。
+ * 只记录方法名与耗时，不改变任何查询语义；`OMB_BENCH_DIAG=1` 才启用。
+ */
+const DIAG_METHODS = [
+  'triggers',
+  'fulltext',
+  'singleChar',
+  'vector',
+  'time',
+  'stateBoard',
+  'summaries',
+  'get',
+  'expand',
+  'recordRecall',
+  'markAccessed',
+] as const
+
+function instrumentStore(store: Store, sink: (method: string, ms: number) => void): Store {
+  const tracked = new Set<string>(DIAG_METHODS)
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, target) as unknown
+      if (typeof property !== 'string' || typeof value !== 'function' || !tracked.has(property)) {
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(receiver) : value
+      }
+      const method = value as (...args: unknown[]) => unknown
+      return (...args: unknown[]): unknown => {
+        const started = performance.now()
+        return Promise.resolve(method.apply(target, args)).finally(() => {
+          sink(property, performance.now() - started)
+        })
+      }
+    },
+  })
+}
+
+function reportDiagnostics(samples: ReadonlyMap<string, number[]>): void {
+  for (const method of DIAG_METHODS) {
+    const values = samples.get(method)
+    if (values === undefined || values.length === 0) continue
+    console.log(
+      `[bench][diag] store.${method} calls=${values.length} p50=${format(percentile(values, 0.5))}ms p95=${format(percentile(values, 0.95))}ms max=${format(Math.max(...values))}ms`,
+    )
+  }
 }
 
 async function seed(): Promise<void> {
@@ -191,7 +241,15 @@ async function main(): Promise<void> {
 
   const store = new PostgresStore(URL)
   const writer = new AttributeWriter(store.db)
-  const engine = new RecallEngine({ store, embedder: new HashEmbedder(), clock: clock() })
+  const diagSamples = new Map<string, number[]>()
+  const engineStore = DIAG
+    ? instrumentStore(store, (method, ms) => {
+      const values = diagSamples.get(method) ?? []
+      values.push(ms)
+      diagSamples.set(method, values)
+    })
+    : store
+  const engine = new RecallEngine({ store: engineStore, embedder: new HashEmbedder(), clock: clock() })
   const query = '基准记忆 42'
   const recall = { query, scenario: 'manual' as const, scope: 'global' as const, limit: 10 }
 
@@ -207,6 +265,8 @@ async function main(): Promise<void> {
     totals.push(result.timings?.totalMs ?? wall)
     hits += result.hits.length
   }
+  if (DIAG) reportDiagnostics(diagSamples)
+  if (DIAG) console.log(`[bench][diag] stage1 series(ms)=${stageOne.map(value => value.toFixed(0)).join(',')}`)
 
   const normalized = normalizeWrite({
     kind: 'memory',

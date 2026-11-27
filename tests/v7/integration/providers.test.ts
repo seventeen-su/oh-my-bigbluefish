@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { HASH_DIMS, HASH_MODEL, HashEmbedder, hashEmbed } from '../../../packages/v7/src/adapters/embedding/index.js'
 import type { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
+import { tokenize } from '../../../packages/v7/src/domain/text.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'
 import type { Embedder } from '../../../packages/v7/src/ports/embedding.js'
 import type { Store } from '../../../packages/v7/src/ports/store.js'
@@ -263,6 +264,58 @@ describe('QueryCompiler + Providers（真实 PostgreSQL）', () => {
     expect(outcomes[0]?.hits.map(entry => entry.entityId)).toEqual([id])
     // 同一文本的哈希向量余弦距离为 0：raw = 1 - distance ≈ 1。
     expect(outcomes[0]?.hits[0]?.rawScore ?? 0).toBeGreaterThan(0.99)
+  })
+
+  it('给定长查询只命中一个词当全文检索则原始分仍按 ts_rank_cd 量纲高于门控下限', async () => {
+    // 全文检索是「粗筛 ts_rank + 精排 ts_rank_cd」两段式（性能预算 ADR-0013）：粗筛只收窄
+    // 候选窗，出分口径必须仍是 ts_rank_cd。ts_rank 会按 OR 词数摊薄（0.0608×命中词数/查询
+    // 词数），长查询里只共享一个词的记忆会掉到 channelFloors.fulltext（0.02）以下被静默淘汰；
+    // ts_rank_cd 的覆盖密度按命中词数累计（每个词 0.1），不会。
+    const id = await writeMemory({ title: 'alpha' })
+    const tokens = tokenize('alpha bravo charlie delta echo foxtrot golf hotel')
+    expect(tokens).toHaveLength(8)
+
+    const reference = await db.db.query<{ raw: number; coarse: number }>(
+      `select ts_rank_cd(v.search_tsv, q)::float8 as raw, ts_rank(v.search_tsv, q)::float8 as coarse
+       from omb.entity_view v, to_tsquery('simple', $1) q
+       where v.entity_id = $2`,
+      [tokens.join(' | '), id],
+    )
+    const fineScore = Number(reference.rows[0]?.raw)
+    const coarseScore = Number(reference.rows[0]?.coarse)
+    // 先证明这条语料真的能把两种量纲区分开（否则断言无法锁定精排函数）。
+    expect(fineScore).toBeGreaterThanOrEqual(DEFAULT_RETRIEVAL_CONFIG.channelFloors.fulltext)
+    expect(coarseScore).toBeLessThan(DEFAULT_RETRIEVAL_CONFIG.channelFloors.fulltext)
+
+    const hits = await db.fulltext({ query: tokens.join(' '), tokens, limit: 10 })
+
+    const hit = hits.find(entry => entry.entityId === id)
+    expect(hit).toBeDefined()
+    expect(hit?.rawScore).toBeCloseTo(fineScore, 6)
+    expect(hit?.rawScore ?? 0).toBeGreaterThanOrEqual(DEFAULT_RETRIEVAL_CONFIG.channelFloors.fulltext)
+  })
+
+  it('给定命中数超过粗筛候选窗当全文检索则仍返回满通道上限的命中而不截断', async () => {
+    // 600 条命中 > 粗筛窗口；limit=100 时必须返回 100 条，否则说明粗筛窗口在静默少返回。
+    await db.db.query(
+      `insert into omb.entity (id, kind, revision, origin)
+       select 'mem_window_' || lpad(i::text, 3, '0'), 'memory', 1, 'test' from generate_series(1, 600) as i`,
+    )
+    await db.db.query(
+      `insert into omb.entity_view (
+         entity_id, kind, category, scope, project_key, title, attrs, attr_names,
+         search_text, snippet, chars, revision, updated_at
+       )
+       select 'mem_window_' || lpad(i::text, 3, '0'), 'memory', 'fact', 'global', '',
+              'window ' || i, jsonb_build_object('title', 'window ' || i), array['title'],
+              'window ' || i, 'window ' || i, array['w'], 1, now()
+       from generate_series(1, 600) as i`,
+    )
+
+    const hits = await db.fulltext({ query: 'window', tokens: tokenize('window'), limit: 100 })
+
+    expect(hits).toHaveLength(100)
+    expect(hits.every(hit => hit.rawScore > 0)).toBe(true)
   })
 
   it('给定真实 PG 当引擎用计划 JSON 重放则命中/融合分/通道报告与 recall 一致', async () => {

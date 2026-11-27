@@ -43,6 +43,29 @@ import { AttributeWriter, mapPgError, selectAttributes } from './writer.js'
 export const FULLTEXT_MAX_QUERY_TERMS = 48
 
 /**
+ * 全文精排的候选窗上限：粗筛（ts_rank，线性成本）保留这么多条，再在其上做
+ * ts_rank_cd 精排。实测 10 万命中时粗筛 39ms、500 条精排 <1ms；
+ * 该窗口是通道上限（≤100）的 5 倍以上，且与「全量 ts_rank_cd」的前 N 名一致。
+ */
+export const FULLTEXT_PREFILTER_MAX = 500
+/** 候选窗下限：小 limit 时也留足余量，避免粗筛/精排的排序分歧截断前 N。 */
+export const FULLTEXT_PREFILTER_MIN = 200
+/** 候选窗相对单次查询 limit 的倍数。 */
+export const FULLTEXT_PREFILTER_FACTOR = 10
+
+/** 全文粗筛候选窗：max(下限, limit×倍数) 并封顶，保证有界且随 limit 放大。 */
+export function fulltextPrefilterCandidates(limit: number): number {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1
+  return Math.min(FULLTEXT_PREFILTER_MAX, Math.max(FULLTEXT_PREFILTER_MIN, safeLimit * FULLTEXT_PREFILTER_FACTOR))
+}
+
+/**
+ * 精排使用 ts_rank_cd 的查询词上限：与改造前一致（≤8 词保留邻近度，>8 词用线性 ts_rank）。
+ * 两阶段只改成本，不改出分口径，否则门控下限（按 ts_rank_cd 量纲标定）会被悄悄改写。
+ */
+export const FULLTEXT_FINE_TS_RANK_CD_MAX_TERMS = 8
+
+/**
  * 每次召回最多加载多少个 regex 触发键候选。正则只在应用层执行，
  * 候选必须按 kind 索引收窄并有确定序上限，不能退化成无界全表扫描。
  */
@@ -704,25 +727,53 @@ export class PostgresStore implements Store {
     return clauses.length > 0 ? `and ${clauses.join(' and ')}` : ''
   }
 
+  /**
+   * 两阶段排序（ADR-0013 性能预算）：粗筛用线性成本的 `ts_rank` 取出有界候选窗，
+   * 再在候选窗上用改造前同一个精排函数出分。
+   *
+   * 为什么必须两段：
+   * - CJK 查询会被 tokenize 成单字 + bigram 的 OR 词表，单字在真实语料里几乎命中全表。
+   *   10 万命中实测：ts_rank_cd 163ms / ts_rank 38ms（cover-density 成本随 OR 词数与命中
+   *   文档数超线性增长，ts_rank 是线性的），单段 ts_rank_cd 无法在阶段一预算内完成。
+   * - 出分口径不能换：ts_rank 会按 OR 词数摊薄（0.0608×命中词数/查询词数），长查询里只
+   *   共享一个词的记忆会掉到 channelFloors.fulltext（0.02）以下被静默淘汰；ts_rank_cd 的
+   *   覆盖密度按命中词累计（每词 0.1），门控/融合分/explain 都按这个量纲标定。
+   * - 候选窗（`fulltextPrefilterCandidates`）远大于通道上限（≤100）与默认 limit，
+   *   500 条的精排成本可忽略；10 万命中夹具上与「全量 ts_rank_cd」的前 50 名一致。
+   */
   private async searchFulltext(spec: TextSearchSpec): Promise<ChannelHit[]> {
     // 全 AND（tokens.join(' & ')）会让长工具输出/自然语言几乎恒零命中（RET-02）：
-    // 改成有界 OR；短查询用 ts_rank_cd 保留邻近度，长查询用 ts_rank 控成本。
+    // 改成有界 OR，由 fulltextQueryTerms 负责去重、白名单与词数上限。
     const terms = fulltextQueryTerms(spec.tokens)
     if (terms.length === 0) return []
     const params: unknown[] = [terms.join(' | ')]
     const filter = this.scopeClause(spec, params)
-    params.push(Math.max(1, Math.min(100, spec.limit)))
-    // ts_rank_cd 的 cover-density 成本随 OR 词数超线性增长；短查询仍用它保留邻近度，
-    // 长查询（>8 词）改用线性成本的 ts_rank，避免 10 万级候选把 T1 拖过预算。
-    const rank = terms.length <= 8 ? 'ts_rank_cd' : 'ts_rank'
-    const rows = await this.db.query<{ entity_id: string; raw: number }>(
-      `select v.entity_id, ${rank}(v.search_tsv, q) as raw
-       from omb.entity_view v, to_tsquery('simple', $1) q
-       where v.search_tsv @@ q ${filter}
-       order by raw desc, v.updated_at desc, v.entity_id asc
-       limit $${params.length}`,
-      params,
-    )
+    const limit = Math.max(1, Math.min(100, spec.limit))
+    const prefilter = fulltextPrefilterCandidates(limit)
+    params.push(prefilter)
+    const prefilterParam = `$${params.length}`
+    params.push(limit)
+    // 精排函数与改造前一致（短查询 ts_rank_cd 保留邻近度、长查询 ts_rank 控成本），
+    // 保证门控与融合分的量纲不变；粗筛恒用线性成本的 ts_rank。
+    const fineRank = terms.length <= FULLTEXT_FINE_TS_RANK_CD_MAX_TERMS ? 'ts_rank_cd' : 'ts_rank'
+    const sql =
+      `select c.entity_id, ${fineRank}(c.search_tsv, q) as raw
+       from (
+         select v.entity_id, v.search_tsv, v.updated_at, ts_rank(v.search_tsv, q) as coarse
+         from omb.entity_view v, to_tsquery('simple', $1) q
+         where v.search_tsv @@ q ${filter}
+         order by coarse desc, v.updated_at desc, v.entity_id asc
+         limit ${prefilterParam}
+       ) as c, to_tsquery('simple', $1) q
+       order by raw desc, c.updated_at desc, c.entity_id asc
+       limit $${params.length}`
+    // 这条查询是全库扫描 + 排序：并行执行在 Windows/PG17 上会给 p95 带来 ~+75ms 的
+    // worker 启动尾延迟（实测 p50 51ms/p95 127ms，串行 p50 75ms/p95 90ms）。阶段一预算
+    // 按 p95 判定，所以固定串行执行，用事务级 `set local` 只影响本语句。
+    const rows = await this.db.transaction(async client => {
+      await client.query('set local max_parallel_workers_per_gather = 0')
+      return client.query<{ entity_id: string; raw: number }>(sql, params)
+    })
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: 'fulltext' }))
   }
 
