@@ -10,15 +10,17 @@ import { ensureDatabase, migrateDatabase } from '../../../packages/v7/src/adapte
 import type { MigrationReport } from '../../../packages/v7/src/adapters/postgres/migrate.js'
 
 /**
- * Phase 1 Task 6：008 expand 迁移 + 回填脚本的真实 PostgreSQL 回归。
+ * Phase 1 Task 6 + Phase 5b Task 20：008 expand / 009 contract 迁移 + 回填脚本的真实 PostgreSQL 回归。
  *
  * 用独立数据库（默认 `omb_v7_test_schema`），不碰生产 `omb`、也不碰其它测试共用的
  * `omb_v7_test`：
- *   1. 空库跑 001-008，再跑一次证明 runner 幂等；
- *   2. 直接重跑 008 SQL，证明语句自身幂等；
- *   3. 模拟已有 v7.0 库（001-007 + 老数据 + 旧审计行），证明只应用 008、旧表列定义不变；
+ *   1. 空库跑 001-009，再跑一次证明 runner 幂等；
+ *   2. 直接重跑 008/009 SQL，证明语句自身幂等；
+ *   3. 模拟已有 v7.0 库（001-007 + 老数据 + 旧审计行），证明只应用 008+009、旧列定义除
+ *      `rollback_of` 外不变；
  *   4. 空库/已有库分别回填两次，行数与内容摘要一致，第二次 changed=0；
- *   5. 源归档后再回填，看板残留行被清理。
+ *   5. 源归档后再回填，看板残留行被清理；
+ *   6. 009 只删 4 个零查询索引与 `audit_log.rollback_of`，仍被写入/映射的列必须保留。
  */
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(HERE, '../../..')
@@ -27,6 +29,7 @@ const BACKFILL_SCRIPT = join(REPO_ROOT, 'scripts/v7-backfill.mjs')
 const TEST_DATABASE_URL =
   process.env.OMB_SCHEMA_TEST_DATABASE_URL ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_test_schema'
 const EXPAND_MIGRATION = '008_v7_expand.sql'
+const CONTRACT_MIGRATION = '009_contract.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -69,7 +72,7 @@ const AUDIT_EVENT_COLUMNS = [
   'stream_version',
 ] as const
 
-/** 旧 audit_log 列：迁移后必须一个都不少、类型不变。 */
+/** 旧 audit_log 列：001-007 的列定义；008 追加事件列、009 只删除 rollback_of。 */
 const AUDIT_LEGACY_COLUMNS = [
   'actor',
   'action',
@@ -82,6 +85,45 @@ const AUDIT_LEGACY_COLUMNS = [
   'rollback_of',
   'rolled_back_at',
   'target_ids',
+] as const
+
+/** 009 唯一删除的列：001 起从未写入、从未读取（回滚只写 rolled_back_at 与新审计行）。 */
+const AUDIT_CONTRACT_REMOVED_COLUMNS: readonly string[] = ['rollback_of']
+
+/** 009 删除的零查询索引：全仓没有任何 SQL 使用它们做过滤/排序。 */
+const CONTRACT_REMOVED_INDEXES = [
+  'attribute_expr_gin',
+  'entity_view_search_trgm',
+  'entity_view_triggers',
+  'attr_registry_aliases',
+] as const
+
+/** 009 必须保留的索引：仍是真实查询面，或本轮不在删除清单内（删错会静默退化）。 */
+const CONTRACT_KEPT_INDEXES = [
+  'attribute_name',
+  'audit_log_created',
+  'audit_log_job_failure',
+  'audit_log_target',
+  'entity_view_attrs_gin',
+  'entity_view_chars',
+  'entity_view_search_tsv',
+  'entity_view_snippet_trgm',
+] as const
+
+/** 009 明确不删、留观测窗口的列：仍被写入或映射，必须等下一轮证据再 cut。 */
+const CONTRACT_KEPT_COLUMNS = [
+  ['attribute', 'confidence'],
+  ['attribute', 'expr'],
+  ['attribute', 'source'],
+  ['attr_registry', 'aliases'],
+  ['attr_registry', 'description'],
+  ['entity_view', 'access_count'],
+  ['entity_view', 'adoption_count'],
+  ['entity_view', 'confidence'],
+  ['entity_view', 'pinned'],
+  ['entity_view', 'revision'],
+  ['entity_view', 'salience'],
+  ['entity_view', 'triggers'],
 ] as const
 
 interface IndexExpectation {
@@ -182,6 +224,12 @@ interface ColumnRow {
 interface MigrationRow {
   readonly name: string
   readonly checksum: string
+}
+
+/** 009 前后对象快照：索引定义 + 相关表列名，用于断言“只删该删的”。 */
+interface ContractSnapshot {
+  readonly indexes: Map<string, string>
+  readonly columns: Record<string, readonly string[]>
 }
 
 function migrationFiles(): string[] {
@@ -515,6 +563,37 @@ async function snapshotColumns(client: Client): Promise<Record<string, string[]>
   return snapshot
 }
 
+async function snapshotIndexes(client: Client): Promise<Map<string, string>> {
+  const result = await client.query<{ indexname: string; indexdef: string }>(
+    `select indexname, indexdef from pg_indexes where schemaname = 'omb' order by indexname`,
+  )
+  return new Map(result.rows.map(row => [row.indexname, row.indexdef]))
+}
+
+async function snapshotColumnNames(client: Client, table: string): Promise<string[]> {
+  const result = await client.query<{ column_name: string }>(
+    `select column_name from information_schema.columns
+      where table_schema = 'omb' and table_name = $1
+      order by ordinal_position`,
+    [table],
+  )
+  return result.rows.map(row => row.column_name)
+}
+
+async function snapshotContract(client: Client): Promise<ContractSnapshot> {
+  const indexes = await snapshotIndexes(client)
+  const columns: Record<string, string[]> = {}
+  for (const table of ['audit_log', 'entity_view', 'attr_registry', 'attribute'] as const) {
+    columns[table] = await snapshotColumnNames(client, table)
+  }
+  return { indexes, columns }
+}
+
+function columnNameOf(signature: string): string {
+  const separator = signature.indexOf(':')
+  return separator < 0 ? signature : signature.slice(0, separator)
+}
+
 async function digestTable(client: Client, table: DigestTable): Promise<TableDigest> {
   const result = await client.query<TableDigest>(
     `select count(*)::int as rows,
@@ -565,6 +644,8 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
   let legacyAuditBefore: AuditLegacyRow
   let legacyAuditAfter: AuditLegacyRow
   let legacyAuditEventColumns: AuditEventColumns
+  let emptyContract: ContractSnapshot
+  let legacyContract: ContractSnapshot
 
   let emptyBackfillFirst: BackfillStats
   let emptyBackfillSecond: BackfillStats
@@ -580,10 +661,11 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await ensureDatabase(TEST_DATABASE_URL)
     client = await connectClient()
 
-    // --- 空库：001-008 全量，接着再跑一次 -------------------------------
+    // --- 空库：001-009 全量，接着再跑一次 -------------------------------
     await resetSchema(client)
     emptyFirst = await migrateDatabase(TEST_DATABASE_URL)
     emptySecond = await migrateDatabase(TEST_DATABASE_URL)
+    emptyContract = await snapshotContract(client)
     const emptyRows = await client.query<MigrationRow>(
       'select name, checksum from omb.schema_migrations order by name',
     )
@@ -605,6 +687,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     legacyReport = await migrateDatabase(TEST_DATABASE_URL)
     legacySecond = await migrateDatabase(TEST_DATABASE_URL)
     legacyColumnsAfter = await snapshotColumns(client)
+    legacyContract = await snapshotContract(client)
     legacyAuditAfter = await readLegacyAudit(client)
     legacyAuditEventColumns = await readAuditEventColumns(client)
 
@@ -619,10 +702,11 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await client?.end()
   })
 
-  it('给定空库当跑全量迁移则应用 001-008 且第二次不再重复应用', () => {
+  it('给定空库当跑全量迁移则应用 001-009 且第二次不再重复应用', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
-    expect(emptyFirst.applied.at(-1)).toBe(EXPAND_MIGRATION)
+    expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
+    expect(emptyFirst.applied.at(-1)).toBe(CONTRACT_MIGRATION)
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
   })
@@ -644,8 +728,22 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(rows.rows.map(row => row.name)).toEqual(migrationFiles())
   })
 
-  it('给定已有 007 库当跑迁移则只应用 008 且旧审计行与新列可空性符合预期', () => {
-    expect(legacyReport.applied).toEqual([EXPAND_MIGRATION])
+  it('给定 009 已应用当直接重跑契约 SQL 则幂等且被删对象仍不存在', async () => {
+    const sql = readFileSync(join(MIGRATIONS_DIR, CONTRACT_MIGRATION), 'utf8')
+    await expect(client.query(sql)).resolves.toBeDefined()
+    await expect(client.query(sql)).resolves.toBeDefined()
+    const rows = await client.query<MigrationRow>('select name, checksum from omb.schema_migrations order by name')
+    expect(rows.rows.map(row => row.name)).toEqual(migrationFiles())
+
+    const indexes = await snapshotIndexes(client)
+    for (const index of CONTRACT_REMOVED_INDEXES) {
+      expect(indexes.has(index), `${index} 重跑后仍应不存在`).toBe(false)
+    }
+    expect(await snapshotColumnNames(client, 'audit_log')).not.toContain('rollback_of')
+  })
+
+  it('给定已有 007 库当跑迁移则应用 008+009 且旧审计行与新列可空性符合预期', () => {
+    expect(legacyReport.applied).toEqual([EXPAND_MIGRATION, CONTRACT_MIGRATION])
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])
     expect(legacyAuditAfter).toEqual(legacyAuditBefore)
@@ -657,7 +755,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     })
   })
 
-  it('给定已有库迁移后则旧表列定义不变、只有 audit_log 追加可空列', () => {
+  it('给定已有库迁移后则旧表列定义不变、audit_log 只追加事件列并删除 rollback_of', () => {
     const legacyTables = Object.keys(legacyColumnsBefore)
     for (const table of legacyTables) {
       if (table === 'audit_log') continue
@@ -665,14 +763,55 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     }
     const legacyAuditColumns = legacyColumnsBefore.audit_log ?? []
     const migratedAuditColumns = legacyColumnsAfter.audit_log ?? []
-    expect(migratedAuditColumns.slice(0, legacyAuditColumns.length)).toEqual(legacyAuditColumns)
-    expect(migratedAuditColumns.length).toBe(legacyAuditColumns.length + AUDIT_EVENT_COLUMNS.length)
+    const legacyNames = legacyAuditColumns.map(columnNameOf)
+    const migratedNames = migratedAuditColumns.map(columnNameOf)
+    // 001 的旧列除 009 明确删除的 rollback_of 外全部保留，且 008 的事件列可空。
+    expect(migratedNames).toEqual(
+      expect.arrayContaining([
+        ...legacyNames.filter(name => !AUDIT_CONTRACT_REMOVED_COLUMNS.includes(name)),
+        ...AUDIT_EVENT_COLUMNS,
+      ]),
+    )
+    expect(migratedNames).toHaveLength(
+      legacyNames.length - AUDIT_CONTRACT_REMOVED_COLUMNS.length + AUDIT_EVENT_COLUMNS.length,
+    )
+    for (const name of AUDIT_CONTRACT_REMOVED_COLUMNS) {
+      expect(migratedNames, `audit_log.${name} 应被 009 删除`).not.toContain(name)
+    }
+    // 保留下来的旧列类型/可空性必须与 001 完全一致（009 只删列、不改类型）。
+    const migratedBySignature = new Map(migratedAuditColumns.map(signature => [columnNameOf(signature), signature]))
+    for (const signature of legacyAuditColumns) {
+      const name = columnNameOf(signature)
+      if (AUDIT_CONTRACT_REMOVED_COLUMNS.includes(name)) continue
+      expect(migratedBySignature.get(name), `audit_log.${name} 类型/可空性不应变化`).toBe(signature)
+    }
     for (const table of NEW_TABLES) {
       expect(legacyColumnsBefore[table], `${table} 应是 008 新增表`).toBeUndefined()
     }
   })
 
-  it('给定 008 已应用当查表/列/索引则新表、可空事件列与部分 due 索引齐全', async () => {
+  it('给定空库/已有库跑 009 当查索引与列则只删 4 个零查询索引与 audit_log.rollback_of', () => {
+    const snapshots: ReadonlyArray<readonly [string, ContractSnapshot]> = [
+      ['空库', emptyContract],
+      ['已有库', legacyContract],
+    ]
+    for (const [label, snapshot] of snapshots) {
+      for (const index of CONTRACT_REMOVED_INDEXES) {
+        expect(snapshot.indexes.has(index), `${label}：${index} 应被 009 删除`).toBe(false)
+      }
+      for (const index of CONTRACT_KEPT_INDEXES) {
+        expect(snapshot.indexes.has(index), `${label}：${index} 不应被 009 删除`).toBe(true)
+      }
+      for (const [table, column] of CONTRACT_KEPT_COLUMNS) {
+        const columns = snapshot.columns[table]
+        expect(columns, `${label}：${table} 列快照缺失`).toBeDefined()
+        expect(columns, `${label}：${table}.${column} 应留观测窗口`).toContain(column)
+      }
+      expect(snapshot.columns.audit_log, `${label}：audit_log.rollback_of 应被删除`).not.toContain('rollback_of')
+    }
+  })
+
+  it('给定 008+009 已应用当查表/列/索引则新表、可空事件列、部分 due 索引齐全且 rollback_of 已删', async () => {
     const tables = await client.query<{ table_name: string }>(
       `select table_name from information_schema.tables where table_schema = 'omb'`,
     )
@@ -686,7 +825,11 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     )
     const auditColumns = new Map(columns.rows.map(row => [row.column_name, row]))
     for (const name of AUDIT_LEGACY_COLUMNS) {
+      if (AUDIT_CONTRACT_REMOVED_COLUMNS.includes(name)) continue
       expect(auditColumns.get(name), `audit_log.${name} 旧列应保留`).toBeDefined()
+    }
+    for (const name of AUDIT_CONTRACT_REMOVED_COLUMNS) {
+      expect(auditColumns.get(name), `audit_log.${name} 应被 009 删除`).toBeUndefined()
     }
     for (const name of AUDIT_EVENT_COLUMNS) {
       const column = auditColumns.get(name)
