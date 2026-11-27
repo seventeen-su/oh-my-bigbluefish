@@ -235,7 +235,8 @@ describe('投影 worker / boards（真实 PostgreSQL）', () => {
     expect(revision).toBe(1)
 
     const enqueued = await tasks.enqueue({ entityId: id, projection: 'preference_board', revision })
-    expect(enqueued).toMatchObject({ revision: 1, status: 'pending', changed: true })
+    // writer 已在同一写事务里入队这一版：显式重复入队不产生新工作（幂等命令重放走这条路）。
+    expect(enqueued).toMatchObject({ revision: 1, status: 'pending', changed: false })
     expect(await tasks.watermark('preference_board')).toBeUndefined()
 
     const worker = workerOf()
@@ -618,6 +619,8 @@ describe('投影 worker / boards（真实 PostgreSQL）', () => {
 
   it('给定 enqueue 在写事务里但当事务回滚则不留下任务与唤醒', async () => {
     const { id } = await createPreference()
+    // writer 创建事务已入队 revision 1；清掉它，单独验证“显式事务里 enqueue 后回滚”的场景。
+    await db.query('delete from omb.projection_task where entity_id = $1', [id])
     await expect(db.transaction(async client => {
       const appended = await tasks.enqueue({ entityId: id, projection: 'preference_board', revision: 1 }, client)
       expect(appended.changed).toBe(true)

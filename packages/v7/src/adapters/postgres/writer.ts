@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg'
 import type {
   Attribute,
+  Entity,
   PatchEntityInput,
   StateStatus,
   StateVersion,
@@ -22,8 +23,14 @@ import {
   type PreparedCommand,
   type ProjectionToken,
 } from '../../app/commands/index.js'
+import type { ProjectionName, ProjectionTaskStore } from '../../app/projections/index.js'
 import { asNumber, asString, iso, PostgresDb } from './db.js'
 import { notifyOutbox } from './outbox.js'
+import {
+  boardProjectionsFor,
+  boardProjectionsForRename,
+  PostgresProjectionTaskStore,
+} from './projection.js'
 import {
   autoArchivedAt,
   buildViewValues,
@@ -40,7 +47,8 @@ import {
  *
  * 固定写事务：
  *   CAS（或 create insert）→ 属性批量写 → 从属性行派生 view/触发键/引用 → link/chain
- *   → 追加审计事件（含 stream/command 元数据）→ 追加 outbox。（同事务、短事务）
+ *   → 对已注册看板投影 upsert `projection_task` → 追加审计事件（含 stream/command 元数据）
+ *   → 追加 outbox。（同事务、短事务）
  *
  * 事务内不做相似查询、不嵌入、不调用 LLM；相似建议/嵌入/看板由 outbox 之后的异步投影负责。
  * `Store` 只保留读路径与计数器，写方法全部委托到这里。
@@ -576,8 +584,56 @@ function revisionConflict(expected: number | undefined, currentRevision: number)
   })
 }
 
+export interface AttributeWriterOptions {
+  /**
+   * 投影任务队列。默认构造一个共享同一 `PostgresDb` 的适配器：组合根（plugin）无法触达
+   * PostgresStore 内部 writer，而 writer 是唯一业务写入口，只有在这里入队才能保证同一事务。
+   * 注入只用于错误路径测试（证明 enqueue 失败会回滚整个写事务）。
+   */
+  readonly projectionTasks?: ProjectionTaskStore
+}
+
 export class AttributeWriter implements CommandWriter {
-  constructor(private readonly db: PostgresDb) {}
+  private readonly projectionTasks: ProjectionTaskStore
+
+  constructor(private readonly db: PostgresDb, options: AttributeWriterOptions = {}) {
+    this.projectionTasks = options.projectionTasks ?? new PostgresProjectionTaskStore(db)
+  }
+
+  /**
+   * 写事务内 upsert 已注册投影任务：与 entity/attribute/view/audit/outbox 同一个 `client`，
+   * 任一后续写入失败时由同一个事务一起回滚；同 revision 重放由 store 的 `where revision <`
+   * 吸收，重复 commandId 不会产生第二次任务。
+   *
+   * 多个 entity 用于 patch 这类“写前/写后都可能属于看板”的命令：写前属于看板时也要入队，
+   * projector 才能按写入后的谓词删除陈旧读模型行。
+   */
+  private async enqueueProjections(
+    client: PoolClient,
+    entityId: string,
+    revision: number,
+    entities: readonly Entity[],
+    options: { readonly archived?: boolean } = {},
+  ): Promise<void> {
+    const projections = new Set<ProjectionName>()
+    for (const entity of entities) {
+      for (const projection of boardProjectionsFor(entity, options)) projections.add(projection)
+    }
+    await this.enqueueProjectionTasks(client, entityId, revision, projections)
+  }
+
+  /** 直接入队一组投影（rename 需要与改名后的谓词无关地重新判定）。 */
+  private async enqueueProjectionTasks(
+    client: PoolClient,
+    entityId: string,
+    revision: number,
+    projections: Iterable<ProjectionName>,
+  ): Promise<void> {
+    const unique = new Set(projections)
+    for (const projection of unique) {
+      await this.projectionTasks.enqueue({ entityId, projection, revision }, client)
+    }
+  }
 
   /**
    * 命令单事务入口。幂等：
@@ -680,6 +736,9 @@ export class AttributeWriter implements CommandWriter {
     const { view } = buildViewFromRows(entityRow, persisted, now, archivedAt)
     await upsertView(client, view)
     const revision = Number(entityRow.revision)
+    const persistedEntity = mapEntity(entityRow, persisted)
+    // 入队放在事件之前：后续 audit/outbox 写入失败时任务行随事务一起回滚。
+    await this.enqueueProjections(client, input.id, revision, [persistedEntity])
     const payload: Record<string, JsonValue> = { entityId: input.id, entityKind: input.kind, revision }
     const event = await insertEvent(client, {
       meta,
@@ -696,7 +755,7 @@ export class AttributeWriter implements CommandWriter {
       events: [event],
       revision,
       projectionToken: projectionToken(payloadEntityId(payload, input.id), revision, event),
-      entity: mapEntity(entityRow, persisted),
+      entity: persistedEntity,
     }
   }
 
@@ -765,6 +824,8 @@ export class AttributeWriter implements CommandWriter {
     const { view } = buildViewFromRows(updated, persisted, now, archivedAt)
     await upsertView(client, view)
     const revision = Number(updated.revision)
+    // 写前/写后都传：之前属于看板、之后不属于时要让 projector 收到 revision 去删旧行。
+    await this.enqueueProjections(client, input.id, revision, [oldEntity, mapEntity(updated, persisted)])
     const payload: Record<string, JsonValue> = {
       entityId: input.id,
       entityKind: input.kind,
@@ -898,6 +959,13 @@ export class AttributeWriter implements CommandWriter {
     }
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = now(), revision = $2 where entity_id = $1', [id, revision])
+    // 归档前属于看板时入队：projector 按归档后的谓词删除读模型行。
+    // 只有 memory/state 参与看板，链/历史版本不为它们白查一次属性行。
+    if (row.kind === 'memory' || row.kind === 'state') {
+      const attributes = await selectAttributes(asAttributeQuery(client), id)
+      // 传入的是已归档的行；判定要按归档前（archived:false）才能产生删除任务。
+      await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)], { archived: false })
+    }
     const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision }
     const event = await insertEvent(client, {
       meta,
@@ -939,6 +1007,11 @@ export class AttributeWriter implements CommandWriter {
     }
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = null, revision = $2 where entity_id = $1', [id, revision])
+    // 取消归档后重新满足看板谓词时入队，projector 重建读模型行（同样只对 memory/state 查属性）。
+    if (row.kind === 'memory' || row.kind === 'state') {
+      const attributes = await selectAttributes(asAttributeQuery(client), id)
+      await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)])
+    }
     const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision }
     const event = await insertEvent(client, {
       meta,
@@ -1112,6 +1185,8 @@ export class AttributeWriter implements CommandWriter {
       await client.query('delete from omb.attr_registry where name = $1', [from])
     }
     const now = nowIso()
+    // 改名可能改变看板谓词（标签↔tags、status 等）；写前谓词无法完整还原，
+    // 受影响的 memory/state 一律重新入队，由 projector 幂等重建/删除读模型行。
     for (const entityId of entityIds) {
       const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [entityId])
       const current = currentResult.rows[0]
@@ -1127,6 +1202,12 @@ export class AttributeWriter implements CommandWriter {
       await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
       await insertTriggers(client, entityId, triggers)
       await upsertView(client, view)
+      if (updated.is_current && updated.archived_at === null) {
+        const projections = boardProjectionsForRename(from, to, updated.kind)
+        if (projections.length > 0) {
+          await this.enqueueProjectionTasks(client, entityId, Number(updated.revision), projections)
+        }
+      }
     }
     const streamId = `attr:${from}->${to}`
     const streamVersion = await nextStreamVersion(client, streamId)

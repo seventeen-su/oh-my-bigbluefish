@@ -76,6 +76,33 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<v
   }
 }
 
+interface AdoptionRow {
+  adopted_at: string | null
+  adoption_kind: string | null
+}
+
+/**
+ * 采用标记由 session/event 回调异步写库：用有界条件等待断言，而不是命中后固定 wait(100)。
+ * 固定等待在整库/事件循环繁忙时会偶发假红（本轮全量 PG 出现过一次）。
+ */
+async function waitForAdoption(
+  db: PostgresStore,
+  traceId: string | undefined,
+  entityId: string,
+): Promise<AdoptionRow | undefined> {
+  let row: AdoptionRow | undefined
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await db.db.query<AdoptionRow>(
+      'select adopted_at, adoption_kind from omb.recall_event where trace_id=$1 and entity_id=$2',
+      [traceId, entityId],
+    )
+    row = result.rows[0]
+    if (row?.adopted_at !== null && row?.adopted_at !== undefined) return row
+    await wait(25)
+  }
+  return row
+}
+
 interface InjectedMessageLike {
   readonly id?: string
   readonly role?: string
@@ -238,15 +265,11 @@ describe('v7 plugin entry', () => {
       { id: 'adoption-session', header: { cwd: PROJECT } },
       { type: 'assistant/message', seq: 1, data: { content: [{ type: 'text', text: `使用 ${id}` }] } },
     )
-    await wait(100)
 
     const db = new PostgresStore(TEST_DATABASE_URL)
-    const byText = await db.db.query<{ adopted_at: string | null; adoption_kind: string | null }>(
-      'select adopted_at, adoption_kind from omb.recall_event where trace_id=$1 and entity_id=$2',
-      [trace, id],
-    )
-    expect(byText.rows[0]?.adopted_at).not.toBeNull()
-    expect(byText.rows[0]?.adoption_kind).toBe('text')
+    const byText = await waitForAdoption(db, trace, id as string)
+    expect(byText?.adopted_at).not.toBeNull()
+    expect(byText?.adoption_kind).toBe('text')
 
     const second = await host.tools.get('omb_recall')?.execute({ query: 'adoption probe', scope: 'project' }, exec)
     const secondTrace = /trace (trc_[0-9a-f-]{36})/.exec(second?.text ?? '')?.[1]
@@ -254,13 +277,9 @@ describe('v7 plugin entry', () => {
       { id: 'adoption-session', header: { cwd: PROJECT } },
       { type: 'tool/call', seq: 2, data: { name: 'read_file', arguments: JSON.stringify({ id }) } },
     )
-    await wait(100)
-    const byTool = await db.db.query<{ adopted_at: string | null; adoption_kind: string | null }>(
-      'select adopted_at, adoption_kind from omb.recall_event where trace_id=$1 and entity_id=$2',
-      [secondTrace, id],
-    )
-    expect(byTool.rows[0]?.adopted_at).not.toBeNull()
-    expect(byTool.rows[0]?.adoption_kind).toBe('tool')
+    const byTool = await waitForAdoption(db, secondTrace, id as string)
+    expect(byTool?.adopted_at).not.toBeNull()
+    expect(byTool?.adoption_kind).toBe('tool')
     await db.close()
     dispose()
   })
@@ -340,14 +359,9 @@ describe('v7 plugin entry', () => {
       { id: 'resident-pref-session', header: { cwd: PROJECT } },
       { type: 'assistant/message', seq: 1, data: { content: [{ type: 'text', text: '采用 T0 偏好采用' }] } },
     )
-    await wait(100)
-    const adopted = await db.db.query<{ adopted_at: string | null; adoption_kind: string | null }>(
-      `select adopted_at, adoption_kind from omb.recall_event
-       where trace_id = $1 and entity_id = $2`,
-      [residentEvent?.trace_id, id],
-    )
-    expect(adopted.rows[0]?.adopted_at).not.toBeNull()
-    expect(adopted.rows[0]?.adoption_kind).toBe('text')
+    const adopted = await waitForAdoption(db, residentEvent?.trace_id, id as string)
+    expect(adopted?.adopted_at).not.toBeNull()
+    expect(adopted?.adoption_kind).toBe('text')
     await db.close()
     dispose()
   })
@@ -955,5 +969,95 @@ describe('v7 plugin entry', () => {
     expect(storeIndex).toBeGreaterThan(queueIndex)
     expect(host.logs.filter(line => line.includes('teardown 收尾完成'))).toHaveLength(1)
     expect(host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
+  })
+
+  it('投影接线：status 报每投影 lag、worker 由 NOTIFY 唤醒投影，disposer 先停 worker/notifier 再关连接', async () => {
+    // 清掉没有 FK 的投影状态：这样“从未成功投影”的 watermarkAgeMs 可以稳定断言为 unknown。
+    const prep = new PostgresStore(TEST_DATABASE_URL)
+    await prep.db.query(
+      `truncate table omb.projection_watermark, omb.projection_task,
+                      omb.preference_board, omb.state_board
+         restart identity cascade`,
+    )
+    await prep.close()
+
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'projection-wiring-session', header: { cwd: PROJECT } } } }
+
+    // 没有成功投影过：lag 已测量（0），但水位年龄必须是 unknown，不能伪报 0。
+    const before = await host.tools.get('omb_status')?.execute({}, exec)
+    expect(before?.ok).toBe(true)
+    expect(before?.text).toContain('projection=ok')
+    expect(before?.text).toMatch(
+      /projectionLag:preference_board pending=0 due=0 dead=0 oldestDueAgeMs=0 watermarkAgeMs=unknown registered=yes/,
+    )
+    expect(before?.text).toMatch(
+      /projectionLag:state_board pending=0 due=0 dead=0 oldestDueAgeMs=0 watermarkAgeMs=unknown registered=yes/,
+    )
+    // 未接线的读模型不能看起来在跑：没有 writer 入队的投影标 registered=no。
+    expect(before?.text).toMatch(/projectionLag:adoption_stat .* registered=no/)
+
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'global',
+      attrs: { title: '投影接线偏好', body: 'plugin 的 worker 要投影', tags: ['偏好'] },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+    const id = /mem_[0-9a-f-]{36}/.exec(remembered?.text ?? '')?.[0]
+    expect(id).toBeDefined()
+
+    // 不显式 tick：写入事务提交后的 NOTIFY 唤醒 plugin 自己启动的 worker。
+    const db = new PostgresStore(TEST_DATABASE_URL)
+    let boardRow: { entity_id: string; revision: string } | undefined
+    for (let attempt = 0; attempt < 100 && boardRow === undefined; attempt += 1) {
+      const rows = await db.db.query<{ entity_id: string; revision: string }>(
+        'select entity_id, revision::text as revision from omb.preference_board where entity_id = $1',
+        [id],
+      )
+      boardRow = rows.rows[0]
+      if (boardRow === undefined) await wait(25)
+    }
+    expect(boardRow).toMatchObject({ entity_id: id, revision: '1' })
+
+    // 读模型行先提交、水位在 complete 之后才推进：等水位出现，避免在两步之间读 status 产生假红。
+    let watermark: string | undefined
+    for (let attempt = 0; attempt < 200 && watermark === undefined; attempt += 1) {
+      const rows = await db.db.query<{ watermark: string }>(
+        "select watermark from omb.projection_watermark where projection = 'preference_board'",
+      )
+      watermark = rows.rows[0]?.watermark
+      if (watermark === undefined) await wait(25)
+    }
+    expect(watermark).toBeDefined()
+
+    const after = await host.tools.get('omb_status')?.execute({}, exec)
+    expect(after?.text).toContain('projection=ok')
+    expect(after?.text).toMatch(
+      /projectionLag:preference_board pending=\d+ due=\d+ dead=\d+ oldestDueAgeMs=\d+ watermarkAgeMs=\d+ registered=yes/,
+    )
+    expect(after?.text).toContain('projectionLag:state_board')
+
+    // 卸载顺序：worker → read API → notifier → store.close（投影链路先于连接池收尾）。
+    expect(() => dispose()).not.toThrow()
+    await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
+    const infoLines = host.logs.filter(line => line.startsWith('info '))
+    const workerIndex = infoLines.findIndex(line => line.includes('teardown projection.worker.stop 完成'))
+    const readIndex = infoLines.findIndex(line => line.includes('teardown projection.read.close 完成'))
+    const notifierIndex = infoLines.findIndex(line => line.includes('teardown projection.notifier.close 完成'))
+    const storeIndex = infoLines.findIndex(line => line.includes('teardown store.close 完成'))
+    expect(workerIndex).toBeGreaterThanOrEqual(0)
+    expect(readIndex).toBeGreaterThan(workerIndex)
+    expect(notifierIndex).toBeGreaterThan(readIndex)
+    expect(storeIndex).toBeGreaterThan(notifierIndex)
+    // 投影停止不能有超时/失败：那会说明 worker 或 LISTEN 连接泄漏到连接池关闭之后。
+    expect(host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
+    await db.close()
   })
 })

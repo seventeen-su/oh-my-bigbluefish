@@ -13,6 +13,13 @@ import { PostgresMaintenance } from '../../packages/v7/src/adapters/postgres/mai
 import { migrateDatabase } from '../../packages/v7/src/adapters/postgres/migrate.js'
 import { PostgresLifecycle } from '../../packages/v7/src/adapters/postgres/lifecycle.js'
 import { PostgresJobFailureLog } from '../../packages/v7/src/adapters/postgres/jobs.js'
+import {
+  createBoardProjectors,
+  createBoardReader,
+  PostgresProjectionNotifier,
+  PostgresProjectionTaskStore,
+  REGISTERED_PROJECTIONS,
+} from '../../packages/v7/src/adapters/postgres/projection.js'
 import { PgBossQueue, describeJobHealth } from '../../packages/v7/src/adapters/pg-boss/index.js'
 import type { JobFinalFailureSummary } from '../../packages/v7/src/ports/jobs.js'
 import { createEventCapture } from '../../packages/v7/src/adapters/dsh/events.js'
@@ -26,6 +33,7 @@ import {
   type ToolRuntime,
 } from '../../packages/v7/src/adapters/dsh/tools.js'
 import { DynamicService } from '../../packages/v7/src/app/dynamic.js'
+import { ProjectionReadApi, ProjectionWorker } from '../../packages/v7/src/app/projections/index.js'
 import { RecallService, recallScenarioForQuery, type RecallInjection } from '../../packages/v7/src/app/recall.js'
 import { RememberService } from '../../packages/v7/src/app/remember.js'
 import { UpdateService } from '../../packages/v7/src/app/update.js'
@@ -406,6 +414,87 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   let consolidationJobsRegistered = false
   let queueStarted = false
   let consolidationStarted = false
+  // 投影读模型：DB ready 后由组合根构造 task store / LISTEN notifier / worker / 读 API。
+  let projectionStarted = false
+  let projectionWorker: ProjectionWorker | undefined
+  let projectionReadApi: ProjectionReadApi | undefined
+  let projectionNotifier: PostgresProjectionNotifier | undefined
+
+  /**
+   * 构造并启动投影链路。顺序固定：
+   * 1. `notifier.ready()` 先建立 LISTEN（worker/读 API 都靠它被 NOTIFY 唤醒）；
+   * 2. `worker.recover()` 统计崩溃遗留的可领取任务（租约到期的 claimed + pending），
+   *    启动后的事件循环会立刻 tick 处理；
+   * 3. `worker.start()` 后没有 setInterval：只在本批领满时继续 drain，否则等待 NOTIFY/wake。
+   *
+   * 失败时关闭 notifier 并抛出，由 LazyInitializer 的下一次真实调用整体重试，
+   * 不留半启动的 worker/连接。
+   */
+  async function startProjection(): Promise<void> {
+    const notifier = new PostgresProjectionNotifier({ connectionString: config.databaseUrl })
+    projectionNotifier = notifier
+    try {
+      await notifier.ready()
+      const tasks = new PostgresProjectionTaskStore(store.db)
+      const worker = new ProjectionWorker(
+        {
+          store: tasks,
+          projectors: createBoardProjectors(store.db),
+          clock,
+          wake: notifier,
+          logger,
+        },
+        { batchSize: 25, leaseMs: 30_000 },
+      )
+      const recovered = await worker.recover()
+      worker.start()
+      projectionWorker = worker
+      projectionReadApi = new ProjectionReadApi({
+        store: tasks,
+        boards: createBoardReader(store.db),
+        clock,
+        wake: notifier,
+      })
+      projectionStarted = true
+      logger.info('投影 worker 已启动', { projections: worker.projections(), recovered })
+    } catch (error) {
+      projectionWorker = undefined
+      projectionReadApi = undefined
+      await notifier.close().catch(() => {})
+      throw error
+    }
+  }
+
+  /**
+   * `omb_status` 的投影读数：每个投影 pending/due/dead/oldestDueAgeMs/watermarkAgeMs。
+   * 从未成功投影（没有水位）时 watermarkAgeMs 报 unknown，不伪报 0；
+   * DB down / 未初始化 / lag 查询失败时整体报 `projection=unknown` + 原因，同样不伪造读数。
+   */
+  async function projectionStatusLines(): Promise<string[]> {
+    if (!projectionStarted || projectionReadApi === undefined) {
+      return ['projection=unknown', `projectionReason=${startup.error ?? 'not-started'}`]
+    }
+    try {
+      const lag = await projectionReadApi.lag()
+      // 只有 writer 真正入队的投影才标 registered=yes：其余读模型还没接线，不能让它看起来在跑。
+      const registered = new Set(REGISTERED_PROJECTIONS.map(item => item.projection))
+      return [
+        'projection=ok',
+        ...lag.map(item => [
+          `projectionLag:${item.projection}`,
+          `pending=${item.pending}`,
+          `due=${item.due}`,
+          `dead=${item.dead}`,
+          `oldestDueAgeMs=${item.oldestDueAgeMs}`,
+          `watermarkAgeMs=${item.watermarkAgeMs ?? 'unknown'}`,
+          `registered=${registered.has(item.projection) ? 'yes' : 'no'}`,
+        ].join(' ')),
+      ]
+    } catch (error) {
+      return ['projection=unknown', `projectionReason=${messageOf(error)}`]
+    }
+  }
+
   const startup = new LazyInitializer({
     cooldownMs: 1_000,
     onError: error => logger.error(`v7 启动失败（下次调用会重试）：${messageOf(error)}`),
@@ -417,6 +506,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         await migrateDatabase(config.databaseUrl, config.adminDatabaseUrl)
         migrated = true
       }
+      // 投影不依赖后台任务开关：jobs=false 也要维护读模型/提供 lag 读数。
+      if (!projectionStarted) await startProjection()
       if (!config.jobs) return
       if (!embedJobRegistered) {
         await registerEmbedJob(queue, { store, embedder })
@@ -540,6 +631,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         return ok([
           'db=down',
           `reason=${messageOf(error)}`,
+          'projection=unknown',
+          'projectionReason=db-down',
           ...describeJobHealth({
             enabled: config.jobs,
             initialized: false,
@@ -566,6 +659,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
             failures: queue.handlerFailures(),
             ...finalFailureHealth,
           }),
+          ...(await projectionStatusLines()),
           ...surfaceLines,
         ]
         if (!initialized && startup.error !== undefined) {
@@ -576,6 +670,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
         return ok([
           'db=error',
           `reason=${messageOf(error)}`,
+          'projection=unknown',
+          'projectionReason=status-query-failed',
           ...describeJobHealth({
             enabled: config.jobs,
             initialized,
@@ -1074,8 +1170,13 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     // 先让 worker 停掉，再关业务连接池，最后才停便携 PostgreSQL；三个动作不能并发，
     // 否则 queue 仍在跑时 store 已关、或 PG 已被 fast shutdown。每步独立 5s 超时，
     // 超时/失败只记日志并继续，绝不把异常抛回宿主。
+    // 投影链路必须早于 store.close：worker/read API 在跑时连接池不能先关；
+    // worker 与 notifier 分成两步，worker 卡住超时也不会让 LISTEN 连接泄漏到进程退出。
     const teardownSteps: TeardownStep[] = [
       { name: 'queue.stop', run: () => queue.stop() },
+      { name: 'projection.worker.stop', run: () => projectionWorker?.stop() },
+      { name: 'projection.read.close', run: () => projectionReadApi?.close() },
+      { name: 'projection.notifier.close', run: () => projectionNotifier?.close() },
       { name: 'store.close', run: () => store.close() },
       ...(lifecycle === undefined ? [] : [{ name: 'lifecycle.stop', run: () => lifecycle.stop() }]),
     ]

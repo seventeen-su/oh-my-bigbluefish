@@ -24,7 +24,15 @@ import {
   type ProjectionWakeSource,
   type ProjectionWatermark,
 } from '../../app/projections/index.js'
-import type { StateStatus } from '../../domain/entity.js'
+import {
+  attributeValue,
+  isArchived,
+  scopeOf,
+  statusOf,
+  type Entity,
+  type EntityKind,
+  type StateStatus,
+} from '../../domain/entity.js'
 import { iso, PostgresDb, type PostgresConfig } from './db.js'
 
 /**
@@ -41,6 +49,93 @@ import { iso, PostgresDb, type PostgresConfig } from './db.js'
 
 /** 队列唤醒通道：事务提交后投递，只负责叫醒，不承载队列语义。 */
 export const PROJECTION_NOTIFY_CHANNEL = 'omb_projection'
+
+// ---------------------------------------------------------------------------
+// 已注册投影：writer 的入队判定
+// ---------------------------------------------------------------------------
+
+/** 已注册投影与它对应的看板；writer 的入队判定与 projector 工厂共用这一份清单。 */
+interface RegisteredBoardProjection {
+  readonly projection: ProjectionName
+  readonly kind: BoardKind
+}
+
+/**
+ * 已注册投影：本期只接 preference/state 两个看板读模型。
+ * adoption_stat/co_recall_pair/similar_cache 在对应写入路径落地后再注册，避免空转任务。
+ */
+export const REGISTERED_PROJECTIONS: readonly RegisteredBoardProjection[] = [
+  { projection: projectionOfBoard('preference'), kind: 'preference' },
+  { projection: projectionOfBoard('state'), kind: 'state' },
+]
+
+const BOARD_STATUSES: readonly StateStatus[] = ['in_progress', 'blocked', 'waiting']
+const PREFERENCE_TAG = '偏好'
+
+/**
+ * 改名会改变看板成员判定的属性：
+ * `tags`/`标签` 决定偏好谓词，`status`/`title`/`time` 决定状态看板行与派生列。
+ */
+const BOARD_RELEVANT_ATTRIBUTES: ReadonlySet<string> = new Set(['tags', '标签', 'status', 'title', 'time'])
+
+/**
+ * 当前写模型状态需要哪些已注册投影。
+ *
+ * 谓词与 `PREFERENCE_DERIVE_SQL` / `STATE_DERIVE_SQL` 的 where 条件逐条对应：kind、
+ * is_current、archived、scope、偏好标签、状态三类。两处语义必须一起改，否则 writer 的
+ * 入队与 projector 的“离开看板就删除”会脱节，留下陈旧读模型行。
+ *
+ * `options.archived` 用于归档命令：调用方拿到的是已归档的 entity 行，但入队判定必须使用
+ * 归档前的状态，才能把“删除读模型行”的任务交给 projector。
+ */
+export function boardProjectionsFor(
+  entity: Entity,
+  options: { readonly archived?: boolean } = {},
+): readonly ProjectionName[] {
+  const archived = options.archived ?? isArchived(entity)
+  if (!entity.isCurrent || archived) return []
+  const projections: ProjectionName[] = []
+  const scope = scopeOf(entity)
+  if (entity.kind === 'memory' && scope.kind === 'global' && hasPreferenceTag(entity)) {
+    projections.push(projectionOfBoard('preference'))
+  }
+  const status = statusOf(entity)
+  if (
+    entity.kind === 'state'
+    && scope.kind === 'project'
+    && scope.projectKey.trim().length > 0
+    && status !== undefined
+    && BOARD_STATUSES.includes(status)
+  ) {
+    projections.push(projectionOfBoard('state'))
+  }
+  return projections
+}
+
+/**
+ * 改名后必须重新判定的投影。
+ *
+ * 与 {@link boardProjectionsFor} 不同，这里**不**看改名后的谓词：改名可能把实体移出看板，
+ * 而写前状态已无法从属性行完整还原，所以受影响的 memory/state 一律重新入队，让 projector
+ * 幂等地重建或删除读模型行；与看板无关的属性改名返回空数组（不产生无意义任务）。
+ */
+export function boardProjectionsForRename(
+  from: string,
+  to: string,
+  kind: EntityKind,
+): readonly ProjectionName[] {
+  if (!BOARD_RELEVANT_ATTRIBUTES.has(from) && !BOARD_RELEVANT_ATTRIBUTES.has(to)) return []
+  if (kind === 'memory') return [projectionOfBoard('preference')]
+  if (kind === 'state') return [projectionOfBoard('state')]
+  return []
+}
+
+/** 与 PREFERENCE_DERIVE_SQL 一致：`tags` 数组含“偏好”，或 `标签` 字符串等于“偏好”。 */
+function hasPreferenceTag(entity: Entity): boolean {
+  const tags = attributeValue(entity, 'tags')
+  if (Array.isArray(tags) && tags.includes(PREFERENCE_TAG)) return true
+  return attributeValue(entity, '标签') === PREFERENCE_TAG
+}
 
 const MAX_BOARD_LIMIT = 100
 const MAX_ERROR_LENGTH = 4_000
@@ -684,9 +779,9 @@ class PostgresBoardProjector implements ProjectionProjector {
   }
 }
 
-/** preference/state 两个真实投影；顺序固定，便于 worker 批量 claim 的测试断言。 */
+/** preference/state 两个真实投影；顺序取 `REGISTERED_PROJECTIONS`，便于 worker 批量 claim 的测试断言。 */
 export function createBoardProjectors(db: PostgresDb): readonly ProjectionProjector[] {
-  return [new PostgresBoardProjector(db, 'preference'), new PostgresBoardProjector(db, 'state')]
+  return REGISTERED_PROJECTIONS.map(item => new PostgresBoardProjector(db, item.kind))
 }
 
 class PostgresBoardReader implements BoardReader {
