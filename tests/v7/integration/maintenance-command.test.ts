@@ -8,7 +8,8 @@ import { OUTBOX_NOTIFY_CHANNEL, PostgresOutboxNotifier } from '../../../packages
 import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { AttributeWriter } from '../../../packages/v7/src/adapters/postgres/writer.js'
 import { DefaultCommandBus, type CommandMeta } from '../../../packages/v7/src/app/commands/index.js'
-import type { RawAttributeValue, WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
+import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
+import type { RawAttributeValue } from '../../../packages/v7/src/domain/dynamic-spec.js'
 
 /**
  * 独立测试库：不读写 omb_v7_test / 生产库（本套件要装临时 deferred 触发器证明回滚语义）。

@@ -1,6 +1,6 @@
 import type { Entity, Scope } from '../domain/entity.js'
-import { scopeOf } from '../domain/entity.js'
-import type { ArtifactRecord } from '../ports/store.js'
+import { scopeOf } from '../domain/entity-access.js'
+import type { ArtifactRecord } from '../ports/observability.js'
 import {
   createTrustPolicy,
   entityContentText,

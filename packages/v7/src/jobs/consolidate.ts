@@ -1,5 +1,6 @@
-import type { Entity, EntityKind, RawAttributeValue, StateStatus, WriteEntityInput } from '../domain/entity.js'
-import { attributeValue, scopeOf } from '../domain/entity.js'
+import type { Entity, EntityKind, StateStatus, WriteEntityInput } from '../domain/entity.js'
+import type { RawAttributeValue } from '../domain/dynamic-spec.js'
+import { attributeValue, scopeOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
 import { isPlainObject } from '../domain/json.js'
 import { tokenize } from '../domain/text.js'

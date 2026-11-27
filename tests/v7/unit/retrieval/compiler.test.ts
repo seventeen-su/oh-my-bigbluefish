@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { ChannelHit, EntitySummary } from '../../../../packages/v7/src/ports/store.js'
+import type { ChannelHit, EntitySummary } from '../../../../packages/v7/src/ports/search.js'
 import {
   compileRetrievalPlan,
   parseRetrievalPlan,

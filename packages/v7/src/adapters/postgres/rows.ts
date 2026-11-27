@@ -1,11 +1,13 @@
 import type {
   Attribute,
-  AttributeValue,
   Category,
   Entity,
   EntityKind,
   StateStatus,
 } from '../../domain/entity.js'
+import type {
+  AttributeValue,
+} from '../../domain/dynamic-spec.js'
 import { isCategory, isStateStatus } from '../../domain/entity.js'
 import type { JsonValue } from '../../domain/json.js'
 import { isPlainObject } from '../../domain/json.js'

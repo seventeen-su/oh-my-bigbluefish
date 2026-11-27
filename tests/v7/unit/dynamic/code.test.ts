@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DefaultDynamicResolver } from '../../../../packages/v7/src/adapters/dynamic/index.js'
-import type { DynamicSpec } from '../../../../packages/v7/src/domain/entity.js'
+import type { DynamicSpec } from '../../../../packages/v7/src/domain/dynamic-spec.js'
 import type { JsonValue } from '../../../../packages/v7/src/domain/json.js'
 import type { CodeSandbox } from '../../../../packages/v7/src/ports/dynamic.js'
 import { FakeContext, expectOmbError } from './helpers.js'

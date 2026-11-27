@@ -1,7 +1,7 @@
 import type { Clock } from '../ports/clock.js'
 import type { WriteResult } from '../ports/store.js'
 import type { WriteEntityInput } from '../domain/entity.js'
-import { validationError } from '../domain/entity.js'
+import { validationError } from '../domain/validation-result.js'
 import { err, ok, type Result, type OmbError } from '../domain/errors.js'
 import { deriveReferences, deriveSearchText, deriveTriggers, normalizeWrite } from '../domain/validation.js'
 import { populateEmbedding, type EmbeddingDeps, type EmbeddingStatus } from './embedding.js'

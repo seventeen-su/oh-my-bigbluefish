@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import type { ArtifactRecord } from '../../../packages/v7/src/ports/store.js'
+import type { ArtifactRecord } from '../../../packages/v7/src/ports/observability.js'
 import type { Entity } from '../../../packages/v7/src/domain/entity.js'
 import {
   DEFAULT_SOURCE_CAPS,

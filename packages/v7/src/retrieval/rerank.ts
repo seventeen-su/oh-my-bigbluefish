@@ -1,6 +1,6 @@
-import { attributeValue } from '../domain/entity.js'
+import { attributeValue } from '../domain/entity-access.js'
 import type { Entity } from '../domain/entity.js'
-import type { EntitySummary } from '../ports/store.js'
+import type { EntitySummary } from '../ports/search.js'
 import type { RetrievalConfig, ScenarioConfig } from './config.js'
 import type { RecallRequest } from './types.js'
 

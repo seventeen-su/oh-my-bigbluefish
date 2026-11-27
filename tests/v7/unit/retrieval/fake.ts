@@ -5,26 +5,30 @@ import type { NormalizedWrite } from '../../../../packages/v7/src/domain/validat
 import type { Clock } from '../../../../packages/v7/src/ports/clock.js'
 import type { Embedder } from '../../../../packages/v7/src/ports/embedding.js'
 import type {
-  ArtifactInput,
-  ArtifactRecord,
-  AuditRecord,
-  ChannelHit,
   DerivedWrite,
-  EntitySummary,
   LinkResult,
   PatchResult,
   ReadOptions,
+  Store,
+  WriteResult,
+} from '../../../../packages/v7/src/ports/store.js'
+import type {
+  ArtifactInput,
+  ArtifactRecord,
+  AuditRecord,
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
+} from '../../../../packages/v7/src/ports/observability.js'
+import type {
+  ChannelHit,
+  EntitySummary,
   StateBoardSpec,
-  Store,
   TextSearchSpec,
   TimeSearchSpec,
   TriggerSearchSpec,
   VectorSearchSpec,
-  WriteResult,
-} from '../../../../packages/v7/src/ports/store.js'
+} from '../../../../packages/v7/src/ports/search.js'
 import type { PatchEntityInput } from '../../../../packages/v7/src/domain/entity.js'
 import type { StageOneChannel } from '../../../../packages/v7/src/retrieval/types.js'
 import { RecallEngine } from '../../../../packages/v7/src/retrieval/engine.js'

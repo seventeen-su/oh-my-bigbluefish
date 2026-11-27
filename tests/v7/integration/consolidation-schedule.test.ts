@@ -8,7 +8,7 @@ import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.
 import { PostgresTimerStore } from '../../../packages/v7/src/adapters/postgres/timer.js'
 import { TimerWorker } from '../../../packages/v7/src/app/workflow/index.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
-import { attributeValue } from '../../../packages/v7/src/domain/entity.js'
+import { attributeValue } from '../../../packages/v7/src/domain/entity-access.js'
 import { createConsolidationScheduler } from '../../../packages/v7/src/jobs/index.js'
 import type { JobQueue } from '../../../packages/v7/src/ports/jobs.js'
 import { databaseNameOf, isDisposableDatabaseName } from '../../../packages/v7/src/security/trust.js'

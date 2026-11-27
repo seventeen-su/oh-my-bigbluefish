@@ -8,10 +8,12 @@ import type { RecallHit, RecallResult, RecallScenario } from '../retrieval/types
 import type { RuntimeContext } from '../ports/context.js'
 import type {
   EntitySummary,
+} from '../ports/search.js'
+import type {
   ResidentTraceInput,
   ResidentTraceSection,
   StoreStats,
-} from '../ports/store.js'
+} from '../ports/observability.js'
 
 export const DEFAULT_RESIDENT_BUDGET = 600
 /** 读模型等待预算：超时立即回退写模型，不把整个 T0 预算耗在读模型上。 */

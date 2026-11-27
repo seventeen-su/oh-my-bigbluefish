@@ -6,27 +6,32 @@ import {
   isCategory,
   isStateStatus,
   type Attribute,
-  type DynamicSpec,
-  type RawAttributeValue,
   type Scope,
   type StateStatus,
-  type ValidationIssue,
-  type ValidationResult,
   type WriteEntityInput,
-  scopeKey,
 } from './entity.js'
+import type {
+  DynamicSpec,
+  RawAttributeValue,
+} from './dynamic-spec.js'
+import type {
+  ValidationIssue,
+  ValidationResult,
+} from './validation-result.js'
+import {
+  scopeKey,
+} from './entity-access.js'
 import { isJsonValue, isNonEmptyJson, isPlainObject, jsonSize, type JsonValue } from './json.js'
 import { isId, newId } from './ids.js'
 
-export const MAX_ATTRIBUTES = 128
-export const MAX_ATTRIBUTE_NAME = 120
-export const MAX_ATTRIBUTE_BYTES = 256 * 1024
-export const MAX_TOTAL_ATTRIBUTE_BYTES = 1024 * 1024
+// 校验上限是 normalizeWrite 的内部细节；只有入口层需要同一预算时才导出（MAX_TITLE）。
+const MAX_ATTRIBUTES = 128
+const MAX_ATTRIBUTE_NAME = 120
+const MAX_ATTRIBUTE_BYTES = 256 * 1024
+const MAX_TOTAL_ATTRIBUTE_BYTES = 1024 * 1024
 export const MAX_TITLE = 500
-export const MAX_CODE_BYTES = 32 * 1024
-export const MAX_TEMPLATE_BYTES = 16 * 1024
-
-export const REQUIRED_NAMES = ['id', 'category', 'scope', 'title', 'status', 'time', 'group'] as const
+const MAX_CODE_BYTES = 32 * 1024
+const MAX_TEMPLATE_BYTES = 16 * 1024
 
 export interface NormalizedWrite {
   readonly id: string
@@ -37,14 +42,6 @@ export interface NormalizedWrite {
   readonly pinned: boolean
   readonly attributes: readonly Attribute[]
   readonly group?: readonly string[]
-}
-
-export interface NormalizedPatch {
-  readonly id: string
-  readonly expectedRevision?: number
-  readonly properties: Readonly<Record<string, RawAttributeValue | null>>
-  readonly pinned?: boolean
-  readonly confidence?: number
 }
 
 function issue(field: string, message: string): ValidationIssue {
@@ -85,7 +82,7 @@ function normalizeGroup(input: unknown, selfId: string): string[] | undefined {
   return unique.length > 0 ? unique : undefined
 }
 
-export function normalizeDynamicSpec(spec: unknown, path: string, errors: ValidationIssue[], depth = 0): DynamicSpec | undefined {
+function normalizeDynamicSpec(spec: unknown, path: string, errors: ValidationIssue[], depth = 0): DynamicSpec | undefined {
   if (depth > 8) {
     errors.push(issue(path, '动态值嵌套超过 8 层'))
     return undefined
@@ -256,7 +253,7 @@ export function normalizeDynamicSpec(spec: unknown, path: string, errors: Valida
   return undefined
 }
 
-export function normalizeRawValue(raw: RawAttributeValue, path: string, errors: ValidationIssue[]): Attribute['value'] | undefined {
+function normalizeRawValue(raw: RawAttributeValue, path: string, errors: ValidationIssue[]): Attribute['value'] | undefined {
   if (isPlainObject(raw) && '$dynamic' in raw) {
     if (Object.keys(raw).length !== 1) {
       errors.push(issue(path, '$dynamic 必须是对象里唯一的键'))

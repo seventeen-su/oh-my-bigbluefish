@@ -104,25 +104,6 @@ export interface ProjectionLag {
   readonly updatedAt?: string
 }
 
-/** 一次 worker 运行累计的计数，便于 omb_status 暴露“投影是否在动”。 */
-export interface ProjectionTotals {
-  readonly claimed: number
-  readonly projected: number
-  readonly retried: number
-  readonly dead: number
-  readonly released: number
-  /** CAS 失败：租约已被其它 worker 接管，本 worker 没有写结果。 */
-  readonly lost: number
-  /** 投影成功但水位推进失败；读模型已是新值，只是观测指标落后。 */
-  readonly watermarkErrors: number
-}
-
-export interface ProjectionStats extends ProjectionTotals {
-  readonly byProjection: readonly ProjectionLag[]
-  /** 最近一次投影/水位错误；成功不会清除它，便于 omb_status 暴露问题。 */
-  readonly lastError?: string
-}
-
 /**
  * 一条读模型行的统一形状。preference 用 salience/summary，state 用 status/projectKey/eventTime；
  * 所有行都带 `revision`，read-your-writes 就靠它判断是否已覆盖 token。
@@ -156,16 +137,3 @@ export interface BoardSnapshot {
   readonly waitedMs: number
   readonly token?: ProjectionToken
 }
-
-/** NOTIFY/LISTEN 之类只负责“叫醒”，不是队列本身。 */
-export interface ProjectionWakeSource {
-  subscribe(listener: () => void): () => void
-}
-
-export interface ProjectionLogger {
-  warn(message: string, details?: unknown): void
-  error(message: string, details?: unknown): void
-}
-
-/** 不透明事务句柄：app 只把它转交给适配器，不解释其类型。 */
-export type ProjectionTransaction = unknown

@@ -5,9 +5,11 @@ import { migrateDatabase, truncateAll } from '../../../packages/v7/src/adapters/
 import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import {
   AttributeWriter,
+} from '../../../packages/v7/src/adapters/postgres/writer.js'
+import {
   auditChainHash,
   type AuditChainEntry,
-} from '../../../packages/v7/src/adapters/postgres/writer.js'
+} from '../../../packages/v7/src/adapters/postgres/writer-audit.js'
 import { DefaultCommandBus, type CommandMeta } from '../../../packages/v7/src/app/commands/index.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import { OmbFailure } from '../../../packages/v7/src/domain/errors.js'

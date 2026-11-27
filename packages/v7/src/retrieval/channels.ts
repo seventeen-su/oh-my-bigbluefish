@@ -1,5 +1,6 @@
 import type { Embedder } from '../ports/embedding.js'
-import type { ChannelHit, Store } from '../ports/store.js'
+import type { Store } from '../ports/store.js'
+import type { ChannelHit } from '../ports/search.js'
 import type { RetrievalConfig, ScenarioConfig } from './config.js'
 import { RECALL_SCENARIOS, STAGE_ONE_CHANNELS } from './constants.js'
 import { compileRetrievalPlan, type ProviderChannel, type RetrievalPlan } from './compiler.js'

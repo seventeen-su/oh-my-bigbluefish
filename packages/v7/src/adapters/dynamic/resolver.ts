@@ -8,7 +8,7 @@ import type {
   TaskSpec,
   TemplateSpec,
   UrlSpec,
-} from '../../domain/entity.js'
+} from '../../domain/dynamic-spec.js'
 import { OmbFailure, fail, internal, invalid, notFound, type OmbError } from '../../domain/errors.js'
 import { isJsonValue, isPlainObject, type JsonValue } from '../../domain/json.js'
 import type { CodeSandbox, DynamicContext, DynamicResolver, SandboxResult } from '../../ports/dynamic.js'

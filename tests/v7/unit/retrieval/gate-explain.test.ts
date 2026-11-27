@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { ChannelHit } from '../../../../packages/v7/src/ports/store.js'
+import type { ChannelHit } from '../../../../packages/v7/src/ports/search.js'
 import { DEFAULT_RETRIEVAL_CONFIG, createRetrievalConfig } from '../../../../packages/v7/src/retrieval/config.js'
 import { explainEmpty, explainFiltered, explainHit, explainWhyNot } from '../../../../packages/v7/src/retrieval/explain.js'
 import { collectSeeds } from '../../../../packages/v7/src/retrieval/expand.js'

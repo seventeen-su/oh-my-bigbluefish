@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { tokenize } from '../../../packages/v7/src/domain/text.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
-import { attributeValue } from '../../../packages/v7/src/domain/entity.js'
+import { attributeValue } from '../../../packages/v7/src/domain/entity-access.js'
 import { DefaultDynamicResolver } from '../../../packages/v7/src/adapters/dynamic/index.js'
 import { DynamicService } from '../../../packages/v7/src/app/dynamic.js'
 import { derived, normalized, prepareDatabase, resetDatabase, store } from './helpers.js'

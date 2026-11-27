@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
+  RegexService,
+} from '../../../packages/v7/src/security/regex.js'
+import {
   REGEX_MAX_CANDIDATES,
   REGEX_MAX_CONCURRENCY,
   REGEX_MAX_INPUT_CHARS,
   REGEX_MAX_QUANTIFIERS,
   REGEX_MAX_SOURCE_CHARS,
   REGEX_QUEUE_LIMIT,
-  RegexService,
-} from '../../../packages/v7/src/security/regex.js'
+} from '../../../packages/v7/src/security/regex-limits.js'
 
 function pattern(id: string, source: string, flags?: string) {
   return { id, source, ...(flags === undefined ? {} : { flags }) }

@@ -1,14 +1,16 @@
-import type { UrlSpec } from '../../domain/entity.js'
+import type { UrlSpec } from '../../domain/dynamic-spec.js'
 import { fail, invalid, OmbFailure } from '../../domain/errors.js'
 import {
   DEFAULT_EGRESS_MAX_BYTES,
   DEFAULT_EGRESS_TIMEOUT_MS,
   EgressBroker,
-  isBlockedHostname,
-  matchesAllowlist,
   type EgressResolve,
   type EgressTransport,
 } from '../../security/egress.js'
+import {
+  isBlockedHostname,
+  matchesAllowlist,
+} from '../../security/egress-address.js'
 
 /** 与 egress broker 共用默认值；保留旧导出名，宿主配置不需要改。 */
 export const DEFAULT_URL_TIMEOUT_MS = DEFAULT_EGRESS_TIMEOUT_MS

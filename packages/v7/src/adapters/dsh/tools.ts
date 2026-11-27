@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { LinkInput } from '../../domain/link.js'
-import type { PatchEntityInput, RawAttributeValue, WriteEntityInput } from '../../domain/entity.js'
+import type { PatchEntityInput, WriteEntityInput } from '../../domain/entity.js'
+import type { RawAttributeValue } from '../../domain/dynamic-spec.js'
 import type { Result } from '../../domain/errors.js'
 import { MAX_TITLE } from '../../domain/validation.js'
 import type { Logger } from '../../ports/jobs.js'

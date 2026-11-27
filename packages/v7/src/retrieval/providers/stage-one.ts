@@ -1,5 +1,5 @@
 import { toOmbError } from '../../domain/errors.js'
-import type { ChannelHit } from '../../ports/store.js'
+import type { ChannelHit } from '../../ports/search.js'
 import type { RetrievalPlan } from '../compiler.js'
 import { providerLimit, searchBase } from './run.js'
 import type { IndexProvider, ProviderContext, ProviderIssue, ProviderResult } from './types.js'

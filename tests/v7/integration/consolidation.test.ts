@@ -5,7 +5,7 @@ import { PostgresMaintenance } from '../../../packages/v7/src/adapters/postgres/
 import { DynamicService } from '../../../packages/v7/src/app/dynamic.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
-import { attributeValue } from '../../../packages/v7/src/domain/entity.js'
+import { attributeValue } from '../../../packages/v7/src/domain/entity-access.js'
 import {
   handleAttrAlias,
   handleCluePromote,

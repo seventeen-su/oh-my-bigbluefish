@@ -3,13 +3,20 @@ import { createBoardReader } from '../../../packages/v7/src/adapters/postgres/pr
 import type { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
 import {
   ProjectionReadApi,
-  type BoardItem,
-  type BoardQuery,
-  type BoardReader,
-  type ProjectionTaskStore,
 } from '../../../packages/v7/src/app/projections/index.js'
+import type {
+  BoardItem,
+} from '../../../packages/v7/src/app/projections/types.js'
+import type {
+  BoardQuery,
+  BoardReader,
+} from '../../../packages/v7/src/app/projections/read.js'
+import type {
+  ProjectionTaskStore,
+} from '../../../packages/v7/src/app/projections/tasks.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'
-import type { EntitySummary, StoreStats } from '../../../packages/v7/src/ports/store.js'
+import type { EntitySummary } from '../../../packages/v7/src/ports/search.js'
+import type { StoreStats } from '../../../packages/v7/src/ports/observability.js'
 import { buildResident, type ResidentBoardsReader } from '../../../packages/v7/src/recall/resident.js'
 import type { RecallEngine } from '../../../packages/v7/src/retrieval/engine.js'
 import type { RecallHit, RecallResult } from '../../../packages/v7/src/retrieval/types.js'

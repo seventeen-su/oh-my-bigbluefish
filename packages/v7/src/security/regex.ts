@@ -6,6 +6,23 @@ import {
   type QuickJSRuntime,
   type QuickJSWASMModule,
 } from 'quickjs-emscripten'
+import {
+  REGEX_MAX_CANDIDATES,
+  REGEX_MAX_CONCURRENCY,
+  REGEX_MAX_INPUT_CHARS,
+  REGEX_MAX_QUANTIFIERS,
+  REGEX_MAX_SOURCE_CHARS,
+  REGEX_MAX_TOTAL_MS,
+  REGEX_QUEUE_LIMIT,
+  REGEX_TIMEOUT_MS,
+} from './regex-limits.js'
+import type {
+  RegexCandidate,
+  RegexMatchRequest,
+  RegexMatchResult,
+  RegexRejectedCandidate,
+  RegexServiceOptions,
+} from './regex-types.js'
 
 /**
  * 正则安全执行服务（R3）。
@@ -22,23 +39,6 @@ import {
  * - 并发调用有上限；超过等待队列直接返回 busy，不无限堆积。
  */
 
-/** 单条正则的 CPU 上限（毫秒）。 */
-export const REGEX_TIMEOUT_MS = 50
-/** 单次 match 调用的总预算（毫秒）；正常候选远低于它，恶意候选不能把一次召回拖垮。 */
-export const REGEX_MAX_TOTAL_MS = 100
-/** 匹配输入上限（字符）；超长查询不做正则匹配，避免把 CPU 交给不可控输入。 */
-export const REGEX_MAX_INPUT_CHARS = 16_384
-/** 单条正则源码上限（字符）。 */
-export const REGEX_MAX_SOURCE_CHARS = 2_048
-/** 单次最多评估多少条候选正则（与 store 的候选上限对齐）。 */
-export const REGEX_MAX_CANDIDATES = 500
-/** 同一服务内最多同时执行多少个 QuickJS 正则任务。 */
-export const REGEX_MAX_CONCURRENCY = 4
-/** 并发上限之外的等待队列长度；超过直接 busy。 */
-export const REGEX_QUEUE_LIMIT = 8
-/** 静态复杂度快速拒绝：量词超过该数量直接拒绝。 */
-export const REGEX_MAX_QUANTIFIERS = 64
-
 /** QuickJS 沙箱内存上限；正则只需要源码 + 输入 + 少量结果。 */
 const REGEX_MEMORY_LIMIT_BYTES = 16 * 1024 * 1024
 /** QuickJS 栈上限；回溯很深的病态正则会先撞栈，而不是让进程崩溃。 */
@@ -47,56 +47,6 @@ const REGEX_STACK_BYTES = 512 * 1024
 const REGEX_ALLOWED_FLAGS = new Set(['d', 'g', 'i', 'm', 's', 'u', 'v', 'y'])
 /** 一次 match 里允许出现的 flags 最大长度。 */
 const REGEX_MAX_FLAGS_LENGTH = 8
-
-export interface RegexCandidate {
-  /** 调用方用来把结果映射回候选行的稳定 id（同一批里应唯一）。 */
-  readonly id: string
-  readonly source: string
-  readonly flags?: string
-}
-
-export interface RegexMatchRequest {
-  readonly input: string
-  readonly candidates: readonly RegexCandidate[]
-  /** 单条正则的 CPU 上限；缺省 50ms，传更大值也会被压到 50ms。 */
-  readonly timeoutMs?: number
-}
-
-export type RegexRejectReason =
-  | 'empty-source'
-  | 'source-too-long'
-  | 'invalid-flags'
-  | 'too-complex'
-  | 'invalid-source'
-  | 'engine-error'
-
-export interface RegexRejectedCandidate {
-  readonly id: string
-  readonly reason: RegexRejectReason
-  readonly detail?: string
-}
-
-export type RegexMatchStatus = 'ok' | 'timeout' | 'busy' | 'invalid-input' | 'engine-error'
-
-export interface RegexMatchResult {
-  readonly status: RegexMatchStatus
-  /** 命中的候选 id，按候选输入顺序；超时前已完成的命中仍保留。 */
-  readonly matchedIds: readonly string[]
-  /** 被静态检查或沙箱拒绝的候选；单个候选出错不影响其它候选。 */
-  readonly rejected: readonly RegexRejectedCandidate[]
-  /** 撞到 CPU/总预算的候选 id（通常是最后一条）。 */
-  readonly timedOutIds: readonly string[]
-  /** 本次调用的真实耗时（毫秒，含排队）。 */
-  readonly durationMs: number
-  readonly reason?: string
-}
-
-export interface RegexServiceOptions {
-  /** 覆盖并发上限（默认 4，最小 1）。 */
-  readonly maxConcurrent?: number
-  /** 覆盖等待队列上限（默认 8，最小 0）。 */
-  readonly queueLimit?: number
-}
 
 interface ConcurrencyGate {
   acquire(): Promise<boolean>

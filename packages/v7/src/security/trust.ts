@@ -1,5 +1,5 @@
 import type { Entity, Scope } from '../domain/entity.js'
-import { scopeOf, titleOf } from '../domain/entity.js'
+import { scopeOf, titleOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
 
 /**

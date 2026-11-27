@@ -10,6 +10,32 @@ import type {
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
 import type { NormalizedWrite } from '../domain/validation.js'
+import type {
+  ChannelHit,
+  EntitySummary,
+  StateBoardSpec,
+  TextSearchSpec,
+  TimeSearchSpec,
+  TriggerSearchSpec,
+  VectorSearchSpec,
+} from './search.js'
+import type {
+  ArtifactInput,
+  ArtifactRecord,
+  AuditRecord,
+  RecallEventInput,
+  ResidentTraceInput,
+  RollbackResult,
+  StoreStats,
+} from './observability.js'
+
+/**
+ * 写路径端口：`Store` 是 entity/attribute/view/link/chain/audit/outbox 的读入口，
+ * 写方法全部委托 `AttributeWriter`（ADR-0007）。
+ *
+ * 检索通道在 `search.ts`，观测/审计记录在 `observability.ts`；
+ * 本文件只保留写命令的入参与结果形状，调用方按需组合，不再面对一个 26 导出的宽契约。
+ */
 
 export interface ReferenceInput {
   readonly sourceAttrName: string
@@ -63,157 +89,6 @@ export interface ReadOptions {
 export interface LinkResult {
   readonly link: Link
   readonly created: boolean
-}
-
-export interface SearchBase {
-  readonly scope?: 'global' | 'project'
-  readonly projectKey?: string
-  readonly kind?: EntityKind
-  readonly category?: Category
-  readonly status?: readonly StateStatus[]
-  readonly includeArchived?: boolean
-  readonly includeHistory?: boolean
-  readonly limit: number
-}
-
-export interface TextSearchSpec extends SearchBase {
-  readonly query: string
-  readonly tokens: readonly string[]
-}
-
-export interface TriggerSearchSpec extends SearchBase {
-  readonly keys: readonly string[]
-  readonly regexText?: string
-}
-
-export interface VectorSearchSpec extends SearchBase {
-  readonly embedding: readonly number[]
-}
-
-export interface TimeSearchSpec extends SearchBase {
-  readonly from: string
-  readonly to: string
-  readonly now: string
-}
-
-export interface StateBoardSpec extends SearchBase {
-  readonly now: string
-}
-
-export interface ChannelHit {
-  readonly entityId: string
-  readonly rank: number
-  readonly rawScore: number
-  readonly channel: string
-  readonly meta?: Record<string, JsonValue>
-}
-
-export interface EntitySummary {
-  readonly id: string
-  readonly kind: EntityKind
-  readonly title?: string
-  readonly category?: Category
-  readonly status?: StateStatus
-  readonly scope: Scope
-  readonly snippet: string
-  readonly archived: boolean
-  readonly isCurrent: boolean
-  /** 实体事件时间（ISO 8601）；只有带 time 属性的实体（状态机等）才有，缺省表示未知。 */
-  readonly eventTime?: string
-  readonly updatedAt: string
-  readonly historyCount: number
-  readonly score?: number
-}
-
-export interface RecallEventInput {
-  readonly traceId: string
-  readonly sessionId?: string
-  readonly turnId?: string
-  readonly query?: string
-  readonly trigger?: string
-  readonly entityId: string
-  readonly channel: string
-  readonly rank: number
-  readonly rawScore?: number
-  readonly fusedScore?: number
-  readonly injected: boolean
-}
-
-/** T0 常驻注入的一段候选；kept=false 表示因预算被裁掉。 */
-export interface ResidentTraceSection {
-  readonly name: string
-  readonly tokens: number
-  readonly kept: boolean
-  readonly text: string
-  readonly entityIds: readonly string[]
-}
-
-/** 一次 T0 常驻构建的完整 trace；用于证明注入预算与裁剪真实发生。 */
-export interface ResidentTraceInput {
-  readonly traceId: string
-  readonly sessionId?: string
-  readonly turnId?: string
-  readonly budgetTokens: number
-  readonly usedTokens: number
-  readonly text: string
-  readonly sections: readonly ResidentTraceSection[]
-  readonly droppedSections: readonly string[]
-}
-
-export interface AuditEntry {
-  readonly actor: string
-  readonly action: string
-  readonly targetIds?: readonly string[]
-  readonly before?: JsonValue
-  readonly after?: JsonValue
-  readonly inverse?: JsonValue
-  readonly jobId?: string
-}
-
-export interface AuditRecord {
-  readonly id: number
-  readonly actor: string
-  readonly action: string
-  readonly targetIds: readonly string[]
-  readonly inverse?: JsonValue
-  readonly createdAt: string
-  readonly rolledBackAt?: string
-}
-
-export interface RollbackResult {
-  readonly auditId: number
-  readonly rollbackAuditId: number
-  readonly applied: readonly string[]
-}
-
-export interface ArtifactInput {
-  readonly id: string
-  readonly sessionId?: string
-  readonly kind: string
-  readonly content: string
-  readonly source?: string
-  readonly metadata?: JsonValue
-}
-
-export interface ArtifactRecord {
-  readonly id: string
-  readonly sessionId?: string
-  readonly kind: string
-  readonly content: string
-  readonly source: string
-  readonly metadata: JsonValue
-  readonly createdAt: string
-}
-
-export interface StoreStats {
-  readonly memory: number
-  readonly state: number
-  readonly chain: number
-  readonly archived: number
-  readonly attrNames: readonly string[]
-  readonly categories?: Readonly<Record<'fact' | 'clue' | 'event', number>>
-  readonly scopes?: Readonly<{ global: number; project: number }>
-  readonly recentStates?: readonly { id: string; title?: string; status: string }[]
 }
 
 export interface Store {

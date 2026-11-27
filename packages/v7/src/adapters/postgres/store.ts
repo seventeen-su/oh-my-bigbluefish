@@ -6,38 +6,46 @@ import type {
   StateStatus,
   StateVersion,
 } from '../../domain/entity.js'
-import { titleOf } from '../../domain/entity.js'
+import { titleOf } from '../../domain/entity-access.js'
 import { OmbFailure, internal } from '../../domain/errors.js'
 import type { JsonValue } from '../../domain/json.js'
 import type { Expansion } from '../../domain/link.js'
 import { decodeRegexTriggerKey, type NormalizedWrite } from '../../domain/validation.js'
-import { defaultRegexService, REGEX_TIMEOUT_MS, type RegexCandidate } from '../../security/regex.js'
+import { defaultRegexService } from '../../security/regex.js'
+import { REGEX_TIMEOUT_MS } from '../../security/regex-limits.js'
+import type { RegexCandidate } from '../../security/regex-types.js'
+import type {
+  DerivedWrite,
+  LinkResult,
+  PatchResult,
+  ReadOptions,
+  Store,
+  WriteResult,
+} from '../../ports/store.js'
 import type {
   ArtifactInput,
   ArtifactRecord,
   AuditRecord,
-  ChannelHit,
-  DerivedWrite,
-  EntitySummary,
-  LinkResult,
-  PatchResult,
-  ReadOptions,
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
+} from '../../ports/observability.js'
+import type {
+  ChannelHit,
+  EntitySummary,
   StateBoardSpec,
-  Store,
   TextSearchSpec,
   TimeSearchSpec,
   TriggerSearchSpec,
   VectorSearchSpec,
-  WriteResult,
-} from '../../ports/store.js'
+} from '../../ports/search.js'
 import { systemCommandMeta } from '../../app/commands/index.js'
 import { iso, PostgresDb } from './db.js'
 import { mapEntity, type EntityRow, type ViewRow } from './rows.js'
 import { findSimilar } from './similar.js'
-import { AttributeWriter, mapPgError, selectAttributes } from './writer.js'
+import { AttributeWriter } from './writer.js'
+import { mapPgError } from './writer-support.js'
+import { selectAttributes } from './writer-tables.js'
 
 /** 单次全文检索最多拼多少个 OR 词：长工具输出 tokenize 后动辄上百词，全量会撑大 tsquery。 */
 export const FULLTEXT_MAX_QUERY_TERMS = 48

@@ -1,5 +1,5 @@
 import type { Expansion } from '../domain/link.js'
-import type { ChannelHit } from '../ports/store.js'
+import type { ChannelHit } from '../ports/search.js'
 import type { RetrievalConfig, ScenarioWeights } from './config.js'
 import type { ChainInfo, SeedSet } from './expand.js'
 import { bestSeedOverall, resolveExpansionSeed } from './expand.js'

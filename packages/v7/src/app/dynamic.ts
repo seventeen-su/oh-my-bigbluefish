@@ -1,5 +1,6 @@
-import type { Attribute, DynamicSpec, Entity } from '../domain/entity.js'
-import { scopeOf } from '../domain/entity.js'
+import type { Attribute, Entity } from '../domain/entity.js'
+import type { DynamicSpec } from '../domain/dynamic-spec.js'
+import { scopeOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
 import { OmbFailure, toOmbError } from '../domain/errors.js'
 import type { Clock } from '../ports/clock.js'

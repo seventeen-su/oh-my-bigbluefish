@@ -5,6 +5,12 @@ import {
   DEFAULT_EGRESS_MAX_BYTES,
   DEFAULT_EGRESS_TIMEOUT_MS,
   EgressBroker,
+  type EgressPolicy,
+  type EgressRequest,
+  type EgressResponse,
+  type EgressTransport,
+} from '../../../packages/v7/src/security/egress.js'
+import {
   classifyAddress,
   isBlockedAddress,
   isBlockedHostname,
@@ -12,11 +18,7 @@ import {
   normalizeHostname,
   type EgressAddress,
   type EgressFamily,
-  type EgressPolicy,
-  type EgressRequest,
-  type EgressResponse,
-  type EgressTransport,
-} from '../../../packages/v7/src/security/egress.js'
+} from '../../../packages/v7/src/security/egress-address.js'
 import { expectOmbError } from './dynamic/helpers.js'
 
 function addr(address: string, family: EgressFamily = 4): EgressAddress {

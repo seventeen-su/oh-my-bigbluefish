@@ -3,7 +3,9 @@ import type { Entity } from '../domain/entity.js'
 import { newId } from '../domain/ids.js'
 import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
-import type { EntitySummary, RecallEventInput, Store } from '../ports/store.js'
+import type { Store } from '../ports/store.js'
+import type { EntitySummary } from '../ports/search.js'
+import type { RecallEventInput } from '../ports/observability.js'
 import { runStageOnePlan } from './channels.js'
 import {
   compileRetrievalPlan,

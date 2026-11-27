@@ -3,7 +3,7 @@ import { DefaultDynamicResolver } from '../../../packages/v7/src/adapters/dynami
 import type { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { DynamicService } from '../../../packages/v7/src/app/dynamic.js'
 import type { Attribute, WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
-import { attributeValue } from '../../../packages/v7/src/domain/entity.js'
+import { attributeValue } from '../../../packages/v7/src/domain/entity-access.js'
 import { tokenize } from '../../../packages/v7/src/domain/text.js'
 import { deriveTriggers, decodeRegexTriggerKey, encodeRegexTriggerKey } from '../../../packages/v7/src/domain/validation.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'

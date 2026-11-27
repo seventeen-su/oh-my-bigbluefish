@@ -1,8 +1,13 @@
-import type { JsonValue } from './json.js'
-import type { OmbError } from './errors.js'
+import type { AttributeValue, RawAttributeValue } from './dynamic-spec.js'
 
-export const ENTITY_KINDS = ['memory', 'state', 'chain', 'state_version'] as const
-export type EntityKind = (typeof ENTITY_KINDS)[number]
+/**
+ * 实体聚合的稳定契约：kind/category/status 词表、scope、属性与实体形状、写入输入。
+ *
+ * 动态值 spec 在 `dynamic-spec.ts`，从属性读值的访问器在 `entity-access.ts`，
+ * 校验结果在 `validation-result.ts`：本文件只放「一条实体是什么」。
+ */
+
+export type EntityKind = 'memory' | 'state' | 'chain' | 'state_version'
 
 export const CATEGORIES = ['fact', 'clue', 'event'] as const
 export type Category = (typeof CATEGORIES)[number]
@@ -26,79 +31,6 @@ export const STATUS_LABELS: Record<StateStatus, string> = {
 export type Scope =
   | { readonly kind: 'global' }
   | { readonly kind: 'project'; readonly projectKey: string }
-
-export function scopeKey(scope: Scope): string {
-  return scope.kind === 'global' ? '' : scope.projectKey
-}
-
-export interface RefSpec {
-  readonly kind: 'ref'
-  readonly entityId: string
-  readonly attr?: string
-  readonly fallback?: JsonValue
-}
-
-export interface TemplateSpec {
-  readonly kind: 'template'
-  readonly template: string
-  readonly refs?: readonly { readonly entityId: string; readonly attr?: string; readonly as?: string }[]
-}
-
-export interface FileSpec {
-  readonly kind: 'file'
-  readonly path: string
-  readonly extract?:
-    | { readonly kind: 'text' }
-    | { readonly kind: 'json'; readonly pointer?: string }
-    | { readonly kind: 'regex'; readonly source: string; readonly flags?: string; readonly group?: number }
-}
-
-export interface RegexSpec {
-  readonly kind: 'regex'
-  readonly source: string
-  readonly flags?: string
-  readonly input: RefSpec | { readonly kind: 'literal'; readonly value: string }
-  readonly group?: number
-}
-
-export interface CodeSpec {
-  readonly kind: 'code'
-  readonly source: string
-  readonly timeoutMs?: number
-  readonly memoryMb?: number
-}
-
-export interface TaskSpec {
-  readonly kind: 'task'
-  readonly source: 'subagent' | 'team' | 'job'
-  readonly id: string
-  readonly field?: string
-}
-
-export interface UrlSpec {
-  readonly kind: 'url'
-  readonly url: string
-  readonly jsonPath?: string
-  readonly allowlist?: readonly string[]
-}
-
-export type DynamicSpec = RefSpec | TemplateSpec | FileSpec | RegexSpec | CodeSpec | TaskSpec | UrlSpec
-
-export interface StaticAttributeValue {
-  readonly kind: 'static'
-  readonly value: JsonValue
-}
-
-export interface DynamicAttributeValue {
-  readonly kind: 'dynamic'
-  readonly spec: DynamicSpec
-  readonly cachedValue?: JsonValue
-  readonly cachedAt?: string
-  readonly staleAfterMs?: number
-  readonly lastError?: string
-}
-
-export type AttributeValue = StaticAttributeValue | DynamicAttributeValue
 
 export interface Attribute {
   readonly name: string
@@ -130,10 +62,7 @@ export interface Entity {
   readonly attributes: readonly Attribute[]
 }
 
-/** 属性输入：普通 JSON 是静态值；`{ $dynamic: spec }` 是动态值。 */
-export type RawAttributeValue = JsonValue | { readonly $dynamic: DynamicSpec }
-
-export interface WriteBase {
+interface WriteBase {
   readonly id?: string
   readonly scope: Scope
   readonly attrs?: Readonly<Record<string, RawAttributeValue>>
@@ -142,19 +71,19 @@ export interface WriteBase {
   readonly pinned?: boolean
 }
 
-export interface WriteMemory extends WriteBase {
+interface WriteMemory extends WriteBase {
   readonly kind: 'memory'
   readonly category: Category
 }
 
-export interface WriteState extends WriteBase {
+interface WriteState extends WriteBase {
   readonly kind: 'state'
   readonly title: string
   readonly status: StateStatus
   readonly time: string
 }
 
-export interface WriteChain extends WriteBase {
+interface WriteChain extends WriteBase {
   readonly kind: 'chain'
   readonly title: string
   readonly group: readonly string[]
@@ -189,63 +118,10 @@ export interface StateVersion {
   readonly createdAt: string
 }
 
-export interface ValidationIssue {
-  readonly field: string
-  readonly message: string
-}
-
-export type ValidationResult<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly errors: readonly ValidationIssue[] }
-
-export function validationError(errors: readonly ValidationIssue[]): OmbError {
-  return {
-    code: 'invalid-input',
-    message: errors.map(issue => `${issue.field}: ${issue.message}`).join('；'),
-    details: errors,
-  }
-}
-
 export function isCategory(value: unknown): value is Category {
   return typeof value === 'string' && (CATEGORIES as readonly string[]).includes(value)
 }
 
 export function isStateStatus(value: unknown): value is StateStatus {
   return typeof value === 'string' && (STATE_STATUSES as readonly string[]).includes(value)
-}
-
-export function getAttribute(entity: Entity, name: string): Attribute | undefined {
-  return entity.attributes.find(attribute => attribute.name === name)
-}
-
-/** 读取属性当前值：静态直接返回；动态返回缓存值（没有缓存则 undefined）。 */
-export function attributeValue(entity: Entity, name: string): JsonValue | undefined {
-  const attribute = getAttribute(entity, name)
-  if (attribute === undefined) return undefined
-  return attribute.value.kind === 'static' ? attribute.value.value : attribute.value.cachedValue
-}
-
-export function statusOf(entity: Entity): StateStatus | undefined {
-  const value = attributeValue(entity, 'status')
-  return typeof value === 'string' && isStateStatus(value) ? value : undefined
-}
-
-export function titleOf(entity: Entity): string | undefined {
-  const value = attributeValue(entity, 'title')
-  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
-}
-
-export function scopeOf(entity: Entity): Scope {
-  const value = attributeValue(entity, 'scope')
-  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    const record = value as Record<string, JsonValue>
-    if (record['kind'] === 'project' && typeof record['projectKey'] === 'string') {
-      return { kind: 'project', projectKey: record['projectKey'] }
-    }
-  }
-  return { kind: 'global' }
-}
-
-export function isArchived(entity: Entity): boolean {
-  return entity.archivedAt !== undefined
 }

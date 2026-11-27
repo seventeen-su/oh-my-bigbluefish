@@ -2,36 +2,48 @@ import type { QueryResult, QueryResultRow } from 'pg'
 import {
   PROJECTION_NAMES,
   projectionOfBoard,
-  type BoardItem,
-  type BoardKind,
-  type BoardQuery,
-  type BoardReader,
-  type ClaimedProjectionTask,
-  type ProjectionClaimOptions,
-  type ProjectionEnqueueInput,
-  type ProjectionEnqueueResult,
-  type ProjectionFailureInput,
-  type ProjectionLag,
-  type ProjectionName,
-  type ProjectionOutcome,
-  type ProjectionProjector,
-  type ProjectionTask,
-  type ProjectionTaskState,
-  type ProjectionTaskStatus,
-  type ProjectionTaskStore,
-  type ProjectionTransaction,
-  type ProjectionWakeSource,
-  type ProjectionWatermark,
 } from '../../app/projections/index.js'
+import type {
+  BoardItem,
+  BoardKind,
+  ClaimedProjectionTask,
+  ProjectionEnqueueInput,
+  ProjectionEnqueueResult,
+  ProjectionLag,
+  ProjectionName,
+  ProjectionTask,
+  ProjectionTaskState,
+  ProjectionTaskStatus,
+  ProjectionWatermark,
+} from '../../app/projections/types.js'
+import type {
+  BoardQuery,
+  BoardReader,
+} from '../../app/projections/read.js'
+import type {
+  ProjectionClaimOptions,
+  ProjectionFailureInput,
+  ProjectionTaskStore,
+} from '../../app/projections/tasks.js'
+import type {
+  ProjectionOutcome,
+  ProjectionProjector,
+} from '../../app/projections/worker.js'
+import type {
+  ProjectionTransaction,
+  ProjectionWakeSource,
+} from '../../app/projections/contracts.js'
+import {
+  type Entity,
+  type EntityKind,
+  type StateStatus,
+} from '../../domain/entity.js'
 import {
   attributeValue,
   isArchived,
   scopeOf,
   statusOf,
-  type Entity,
-  type EntityKind,
-  type StateStatus,
-} from '../../domain/entity.js'
+} from '../../domain/entity-access.js'
 import { iso, PostgresDb, type PostgresConfig } from './db.js'
 import { PostgresListenNotifier, type ListenNotifierStatus } from './listen.js'
 

@@ -1,7 +1,8 @@
 import { toOmbError } from '../../domain/errors.js'
 import type { Expansion } from '../../domain/link.js'
 import type { Embedder } from '../../ports/embedding.js'
-import type { ChannelHit, SearchBase, Store } from '../../ports/store.js'
+import type { Store } from '../../ports/store.js'
+import type { ChannelHit, SearchBase } from '../../ports/search.js'
 import type { ProviderChannel, RetrievalPlan } from '../compiler.js'
 import type {
   IndexProvider,

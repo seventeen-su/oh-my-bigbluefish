@@ -10,12 +10,10 @@ import type { ProjectionTaskStore } from './tasks.js'
 import type {
   ClaimedProjectionTask,
   ProjectionLag,
-  ProjectionLogger,
   ProjectionName,
-  ProjectionStats,
   ProjectionTask,
-  ProjectionWakeSource,
 } from './types.js'
+import type { ProjectionLogger, ProjectionStats, ProjectionWakeSource } from './contracts.js'
 
 /**
  * 一个投影的处理器：读源（entity/attribute）→ 幂等写读模型。

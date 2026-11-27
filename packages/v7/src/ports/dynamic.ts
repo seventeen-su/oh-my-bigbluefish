@@ -1,4 +1,4 @@
-import type { DynamicSpec } from '../domain/entity.js'
+import type { DynamicSpec } from '../domain/dynamic-spec.js'
 import type { JsonValue } from '../domain/json.js'
 
 /**

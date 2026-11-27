@@ -11,11 +11,15 @@ import {
 import {
   ProjectionReadApi,
   ProjectionWorker,
-  type BoardItem,
-  type ProjectionProjector,
-  type ProjectionTask,
-  type ProjectionTickSummary,
 } from '../../../packages/v7/src/app/projections/index.js'
+import type {
+  BoardItem,
+  ProjectionTask,
+} from '../../../packages/v7/src/app/projections/types.js'
+import type {
+  ProjectionProjector,
+  ProjectionTickSummary,
+} from '../../../packages/v7/src/app/projections/worker.js'
 import { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
 import { migrateDatabase, truncateAll } from '../../../packages/v7/src/adapters/postgres/migrate.js'
 import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'

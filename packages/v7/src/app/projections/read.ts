@@ -8,8 +8,8 @@ import type {
   BoardSnapshot,
   ProjectionLag,
   ProjectionName,
-  ProjectionWakeSource,
 } from './types.js'
+import type { ProjectionWakeSource } from './contracts.js'
 import { PROJECTION_NAMES, projectionOfBoard } from './types.js'
 
 /**
@@ -85,7 +85,7 @@ export interface ReadTokenOutcome {
   readonly token: ProjectionToken
 }
 
-export const DEFAULT_READ_TIMEOUT_MS = 1_000
+const DEFAULT_READ_TIMEOUT_MS = 1_000
 const MAX_READ_TIMEOUT_MS = 30_000
 const MAX_BOARD_LIMIT = 100
 

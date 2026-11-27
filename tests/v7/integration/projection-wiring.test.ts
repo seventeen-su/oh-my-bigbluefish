@@ -9,11 +9,15 @@ import {
 } from '../../../packages/v7/src/app/commands/index.js'
 import {
   ProjectionWorker,
-  type ProjectionEnqueueInput,
-  type ProjectionEnqueueResult,
-  type ProjectionName,
-  type ProjectionTransaction,
 } from '../../../packages/v7/src/app/projections/index.js'
+import type {
+  ProjectionEnqueueInput,
+  ProjectionEnqueueResult,
+  ProjectionName,
+} from '../../../packages/v7/src/app/projections/types.js'
+import type {
+  ProjectionTransaction,
+} from '../../../packages/v7/src/app/projections/contracts.js'
 import { AttributeWriter } from '../../../packages/v7/src/adapters/postgres/writer.js'
 import { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
 import { migrateDatabase, truncateAll } from '../../../packages/v7/src/adapters/postgres/migrate.js'

@@ -1,4 +1,6 @@
-import { attributeValue, scopeOf, type Attribute, type Category, type Entity, type PatchEntityInput, type RawAttributeValue, type Scope, type StateStatus, type WriteEntityInput } from '../../domain/entity.js'
+import { type Attribute, type Category, type Entity, type PatchEntityInput, type Scope, type StateStatus, type WriteEntityInput } from '../../domain/entity.js'
+import { attributeValue, scopeOf } from '../../domain/entity-access.js'
+import type { RawAttributeValue } from '../../domain/dynamic-spec.js'
 import { OmbFailure } from '../../domain/errors.js'
 
 /**

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { HASH_DIMS, HASH_MODEL, HashEmbedder, hashEmbed } from '../../../packages/v7/src/adapters/embedding/index.js'
+import { HASH_DIMS, HASH_MODEL, HashEmbedder, hashEmbed } from '../../../packages/v7/src/adapters/embedding/hash.js'
 import type { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'

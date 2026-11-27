@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { CONTEXT_HEADER } from '../../../packages/v7/src/prompt/assembler.js'
-import type { EntitySummary } from '../../../packages/v7/src/ports/store.js'
+import type { EntitySummary } from '../../../packages/v7/src/ports/search.js'
 import type { RecallEngine } from '../../../packages/v7/src/retrieval/engine.js'
 import type { RecallHit, RecallResult } from '../../../packages/v7/src/retrieval/types.js'
 import { buildResident } from '../../../packages/v7/src/recall/resident.js'

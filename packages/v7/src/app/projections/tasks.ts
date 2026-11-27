@@ -5,9 +5,9 @@ import type {
   ProjectionLag,
   ProjectionName,
   ProjectionTaskState,
-  ProjectionTransaction,
   ProjectionWatermark,
 } from './types.js'
+import type { ProjectionTransaction } from './contracts.js'
 
 /**
  * 投影队列 + 水位的存储端口（ARCHITECTURE-PLAN §4.4、CONCURRENCY §4.4）。

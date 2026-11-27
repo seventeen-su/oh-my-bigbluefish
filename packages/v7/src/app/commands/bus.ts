@@ -1,4 +1,4 @@
-import { validationError } from '../../domain/entity.js'
+import { validationError } from '../../domain/validation-result.js'
 import { OmbFailure, err, invalid, notFound, ok, type OmbError } from '../../domain/errors.js'
 import { isPlainObject } from '../../domain/json.js'
 import type { Store } from '../../ports/store.js'

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createRetrievalConfig } from '../../../../packages/v7/src/retrieval/config.js'
-import type { EntitySummary } from '../../../../packages/v7/src/ports/store.js'
+import type { EntitySummary } from '../../../../packages/v7/src/ports/search.js'
 import { FakeEmbedder, FakeStore, FIXED_NOW, entity, hit, makeEngine, summary } from './fake.js'
 
 function seedMemory(store: FakeStore, ids: readonly string[], overrides: Partial<EntitySummary> = {}): void {

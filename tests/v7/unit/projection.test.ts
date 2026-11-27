@@ -6,22 +6,32 @@ import {
   PROJECTION_NAMES,
   ProjectionReadApi,
   ProjectionWorker,
-  type BoardItem,
-  type BoardQuery,
-  type BoardReader,
-  type ClaimedProjectionTask,
-  type ProjectionEnqueueInput,
-  type ProjectionEnqueueResult,
-  type ProjectionLag,
-  type ProjectionName,
-  type ProjectionOutcome,
-  type ProjectionProjector,
-  type ProjectionTask,
-  type ProjectionTaskState,
-  type ProjectionTaskStore,
-  type ProjectionWakeSource,
-  type ProjectionWatermark,
 } from '../../../packages/v7/src/app/projections/index.js'
+import type {
+  BoardItem,
+  ClaimedProjectionTask,
+  ProjectionEnqueueInput,
+  ProjectionEnqueueResult,
+  ProjectionLag,
+  ProjectionName,
+  ProjectionTask,
+  ProjectionTaskState,
+  ProjectionWatermark,
+} from '../../../packages/v7/src/app/projections/types.js'
+import type {
+  BoardQuery,
+  BoardReader,
+} from '../../../packages/v7/src/app/projections/read.js'
+import type {
+  ProjectionOutcome,
+  ProjectionProjector,
+} from '../../../packages/v7/src/app/projections/worker.js'
+import type {
+  ProjectionTaskStore,
+} from '../../../packages/v7/src/app/projections/tasks.js'
+import type {
+  ProjectionWakeSource,
+} from '../../../packages/v7/src/app/projections/contracts.js'
 
 /**
  * 投影 worker / read-your-writes 的纯逻辑证据（不依赖 PostgreSQL）。

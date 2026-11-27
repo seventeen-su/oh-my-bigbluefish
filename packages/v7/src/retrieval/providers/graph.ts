@@ -1,5 +1,5 @@
 import type { Entity } from '../../domain/entity.js'
-import { attributeValue, titleOf } from '../../domain/entity.js'
+import { attributeValue, titleOf } from '../../domain/entity-access.js'
 import type { JsonValue } from '../../domain/json.js'
 import type { Expansion } from '../../domain/link.js'
 import { filterExpansions, type ChainInfo } from '../expand.js'

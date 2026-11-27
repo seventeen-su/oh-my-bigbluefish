@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { DefaultDynamicResolver } from '../../../../packages/v7/src/adapters/dynamic/index.js'
 import type { UrlFetchPolicy } from '../../../../packages/v7/src/adapters/dynamic/url.js'
 import type {
-  EgressAddress,
   EgressRequest,
   EgressResponse,
   EgressTransport,
 } from '../../../../packages/v7/src/security/egress.js'
+import type {
+  EgressAddress,
+} from '../../../../packages/v7/src/security/egress-address.js'
 import { FakeContext, expectOmbError } from './helpers.js'
 
 const PUBLIC_V4 = '93.184.216.34'

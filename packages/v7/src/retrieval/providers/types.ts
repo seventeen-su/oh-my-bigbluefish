@@ -1,7 +1,8 @@
 import type { OmbErrorCode } from '../../domain/errors.js'
 import type { Expansion } from '../../domain/link.js'
 import type { Embedder } from '../../ports/embedding.js'
-import type { ChannelHit, Store } from '../../ports/store.js'
+import type { Store } from '../../ports/store.js'
+import type { ChannelHit } from '../../ports/search.js'
 import type { ProviderChannel, RetrievalPlan } from '../compiler.js'
 import type { ChainInfo } from '../expand.js'
 
