@@ -5,4 +5,12 @@ export {
   resolveRawValue,
   type DynamicResolverOptions,
 } from './resolver.js'
-export { DEFAULT_URL_MAX_BYTES, DEFAULT_URL_TIMEOUT_MS, type FetchLike, type UrlFetchPolicy } from './url-policy.js'
+export { DEFAULT_URL_MAX_BYTES, DEFAULT_URL_TIMEOUT_MS, type UrlFetchPolicy } from './url.js'
+export { type FileStat, type FileStatLike } from './file.js'
+export {
+  type EgressAddress,
+  type EgressRequest,
+  type EgressResolve,
+  type EgressResponse,
+  type EgressTransport,
+} from '../../security/egress.js'

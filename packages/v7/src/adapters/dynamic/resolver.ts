@@ -13,16 +13,23 @@ import { OmbFailure, fail, internal, invalid, notFound, type OmbError } from '..
 import { isJsonValue, isPlainObject, type JsonValue } from '../../domain/json.js'
 import type { CodeSandbox, DynamicContext, DynamicResolver, SandboxResult } from '../../ports/dynamic.js'
 import { QuickJsSandbox } from '../quickjs/sandbox.js'
+import {
+  assertRegularFile,
+  assertTextWithinLimit,
+  defaultFileStat,
+  DEFAULT_MAX_FILE_BYTES,
+  resolveFilePath,
+  type FileStat,
+} from './file.js'
 import { resolveJsonPath } from './json-pointer.js'
-import { isInsideRoot, resolveInsideRoot } from './path-guard.js'
+import { isInsideRoot } from './path-guard.js'
 import { scanCodeRefs } from './ref-scan.js'
 import { renderTemplate } from './template.js'
-import { assertUrlAllowed, fetchUrlText, type UrlFetchPolicy } from './url-policy.js'
+import { assertUrlAllowed, fetchUrlText, type UrlFetchPolicy } from './url.js'
 
 /** SPEC：引用解析深度最多 8 层。 */
 export const MAX_REFERENCE_DEPTH = 8
-/** 文件属性默认读取上限；与 domain 的单属性 256KB 上限对齐。 */
-export const DEFAULT_MAX_FILE_BYTES = 256 * 1024
+export { DEFAULT_MAX_FILE_BYTES }
 
 export interface DynamicResolverOptions {
   /** 可注入替身；默认使用 QuickJS WASM 沙箱。 */
@@ -32,14 +39,18 @@ export interface DynamicResolverOptions {
   readonly maxFileBytes?: number
   /** 生产宿主必须传 fs.realpath；解析符号链接后再校验是否仍在 projectRoot 内。 */
   readonly realpath?: (path: string) => Promise<string>
+  /** stat 预检钩子；默认 lstat（不跟随符号链接），测试可注入替身。 */
+  readonly statFile?: FileStat
 }
 
 /**
  * 动态属性解析器：实现 SPEC §5.2 的 ref/template/file/regex/code/task/url。
  *
  * 安全边界：
- * - 文件只能读 `context.projectRoot` 之内（解析后前缀校验，越界拒绝）；
- * - url 默认拒绝，需要宿主显式启用 + allowlist 命中 + 环回/私网排除；
+ * - 文件只能读 `context.projectRoot` 之内：词法拒绝 UNC/设备/`..`，realpath 后再验根，
+ *   stat 预检拒绝符号链接/非普通文件/超限文件，读取后复核字节上限（见 file.ts）；
+ * - url 默认拒绝，需要宿主显式启用 + allowlist 命中 + 私网/环回排除；实际请求走
+ *   EgressBroker：DNS 后逐 IP 校验、固定 IP、禁重定向、流式字节上限（见 security/egress.ts）；
  * - 动态代码只进 QuickJS 沙箱，`ctx.ref` 由预扫描/预加载实现，宿主函数不进入沙箱。
  *
  * 深度与循环：嵌套动态值（属性值本身是 `{ $dynamic: spec }`）按深度 +1 继续解析，
@@ -50,12 +61,14 @@ export class DefaultDynamicResolver implements DynamicResolver {
   private readonly url?: UrlFetchPolicy
   private readonly maxFileBytes: number
   private readonly realpath?: (path: string) => Promise<string>
+  private readonly statFile: FileStat
 
   constructor(options: DynamicResolverOptions = {}) {
     this.sandbox = options.sandbox ?? new QuickJsSandbox()
     this.url = options.url
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES
     this.realpath = options.realpath
+    this.statFile = options.statFile ?? defaultFileStat
   }
 
   async resolve(spec: DynamicSpec, context: DynamicContext): Promise<JsonValue | undefined> {
@@ -151,10 +164,7 @@ export class DefaultDynamicResolver implements DynamicResolver {
     if (root === undefined || root.trim().length === 0) {
       throw fail(invalid(`文件动态值需要 context.projectRoot 才能限制读取范围：${spec.path}`))
     }
-    const resolved = resolveInsideRoot(root, spec.path)
-    if (resolved === undefined) {
-      throw fail(invalid(`文件路径必须位于项目根内：${spec.path}`))
-    }
+    const resolved = resolveFilePath(root, spec.path)
     let readable = resolved
     if (this.realpath !== undefined) {
       const [realRoot, realFile] = await Promise.all([
@@ -166,6 +176,8 @@ export class DefaultDynamicResolver implements DynamicResolver {
       }
       readable = realFile
     }
+    const info = await this.statFile(readable).catch(error => { throw fail(statError(error, spec.path)) })
+    assertRegularFile(spec.path, info, this.maxFileBytes)
     const text = await this.readTextFile(context, readable, spec.path)
     const extract = spec.extract
     if (extract === undefined || extract.kind === 'text') return text
@@ -237,9 +249,7 @@ export class DefaultDynamicResolver implements DynamicResolver {
       throw fail(omb)
     }
     if (typeof text !== 'string') throw fail(invalid(`readFile 必须返回字符串：${originalPath}`))
-    if (new TextEncoder().encode(text).length > this.maxFileBytes) {
-      throw fail(invalid(`文件超过 ${this.maxFileBytes} 字节上限：${originalPath}`))
-    }
+    assertTextWithinLimit(originalPath, text, this.maxFileBytes)
     return text
   }
 
@@ -373,4 +383,12 @@ function fileExtractKey(spec: FileSpec): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** stat 预检失败的错误映射：文件不存在 → not-found；其余（权限/IO）→ internal。 */
+function statError(error: unknown, displayPath: string): OmbError {
+  if (error instanceof OmbFailure) return error.error
+  const code = (error as { code?: unknown } | null)?.code
+  if (code === 'ENOENT' || code === 'ENOTDIR') return notFound(`文件不存在：${displayPath}`)
+  return internal(`无法检查文件：${displayPath}（${messageOf(error)}）`)
 }
