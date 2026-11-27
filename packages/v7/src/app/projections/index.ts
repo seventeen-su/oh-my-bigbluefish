@@ -1,0 +1,45 @@
+export {
+  PROJECTION_NAMES,
+  projectionOfBoard,
+  type BoardItem,
+  type BoardKind,
+  type BoardSnapshot,
+  type ClaimedProjectionTask,
+  type ProjectionEnqueueInput,
+  type ProjectionEnqueueResult,
+  type ProjectionLag,
+  type ProjectionLogger,
+  type ProjectionName,
+  type ProjectionStats,
+  type ProjectionTask,
+  type ProjectionTaskState,
+  type ProjectionTaskStatus,
+  type ProjectionTotals,
+  type ProjectionTransaction,
+  type ProjectionWakeSource,
+  type ProjectionWatermark,
+} from './types.js'
+export type {
+  ProjectionClaimOptions,
+  ProjectionFailureInput,
+  ProjectionTaskStore,
+} from './tasks.js'
+export {
+  ProjectionReadApi,
+  DEFAULT_READ_TIMEOUT_MS,
+  type BoardQuery,
+  type BoardReader,
+  type ProjectionReadDeps,
+  type ProjectionReadFallback,
+  type ProjectionReadOptions,
+  type ReadTokenOutcome,
+} from './read.js'
+export {
+  ProjectionWorker,
+  emptyTickSummary,
+  type ProjectionOutcome,
+  type ProjectionProjector,
+  type ProjectionTickSummary,
+  type ProjectionWorkerDeps,
+  type ProjectionWorkerOptions,
+} from './worker.js'
