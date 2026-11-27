@@ -4,30 +4,28 @@ import { newId } from '../domain/ids.js'
 import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
 import type { EntitySummary, RecallEventInput, Store } from '../ports/store.js'
-import { runStageOne } from './channels.js'
-import type { RetrievalConfig, ScenarioConfig } from './config.js'
+import { runStageOnePlan } from './channels.js'
+import {
+  compileRetrievalPlan,
+  parseRetrievalPlan,
+  type RetrievalPlan,
+} from './compiler.js'
+import type { RetrievalConfig } from './config.js'
 import { DEFAULT_RETRIEVAL_CONFIG } from './config.js'
 import { explainEmpty, explainFiltered, explainHit, type WhyNot } from './explain.js'
-import {
-  collectSeeds,
-  expandSeeds,
-  filterExpansions,
-  type ChainInfo,
-  type ExpansionOutcome,
-  type SeedSet,
-} from './expand.js'
+import { collectSeeds, type ChainInfo, type SeedSet } from './expand.js'
 import { applyExpansions, fuseStageOne, sortChannels, type FusionCandidate } from './fuse.js'
 import { gateCandidates } from './gate.js'
+import { runExpansionProviders, type ExpansionRunResult } from './providers/index.js'
 import { rerankPrior, type PriorResult } from './rerank.js'
 import type {
   EmptyReason,
-  ExpansionMode,
+  ExpansionStats,
   RecallChannel,
   RecallHit,
   RecallRequest,
   RecallResult,
-  RecallScenario,
-  ExpansionStats,
+  TimeWindow,
 } from './types.js'
 
 export interface RecallEngineDeps {
@@ -36,6 +34,28 @@ export interface RecallEngineDeps {
   readonly clock: Clock
   /** 审计配置；缺省用 DEFAULT_RETRIEVAL_CONFIG。 */
   readonly config?: RetrievalConfig
+  /** 阶段一 + 阶段二扩展的总预算（ms）；缺省 DEFAULT_STAGE_ONE_BUDGET_MS。 */
+  readonly stageOneBudgetMs?: number
+  /** 单个 provider 超时（ms）；缺省 DEFAULT_PROVIDER_TIMEOUT_MS。 */
+  readonly providerTimeoutMs?: number
+}
+
+/** `recallFromPlan` 的审计字段；检索语义全部来自 plan，这里只影响 recall_event。 */
+export interface RecallPlanAudit {
+  readonly traceId?: string
+  readonly sessionId?: string
+  readonly turnId?: string
+  readonly trigger?: string
+  readonly injected?: boolean
+}
+
+interface RecallExecution {
+  readonly plan: RetrievalPlan
+  readonly traceId: string
+  readonly sessionId?: string
+  readonly turnId?: string
+  readonly trigger?: string
+  readonly injected: boolean
 }
 
 interface ScoredCandidate {
@@ -48,6 +68,11 @@ interface ScoredCandidate {
 interface FilteredCandidate {
   readonly candidate: FusionCandidate
   readonly summary: EntitySummary
+}
+
+interface TimeWindowBounds {
+  readonly fromMs: number
+  readonly toMs: number
 }
 
 const MAX_CHAIN_SIBLINGS = 12
@@ -63,30 +88,8 @@ function resolveNowIso(request: RecallRequest, clock: Clock): string {
   return new Date().toISOString()
 }
 
-function resolveLimit(request: RecallRequest, config: RetrievalConfig): number {
-  const requested = request.limit ?? config.defaultLimit
-  if (!Number.isFinite(requested)) return config.defaultLimit
-  return Math.max(1, Math.min(config.maxLimit, Math.floor(requested)))
-}
-
-interface TimeWindowBounds {
-  readonly fromMs: number
-  readonly toMs: number
-}
-
-/**
- * 只有显式 timeWindow 参与最终候选的全局收窄；场景默认窗与查询里的相对时间
- * （昨天/最近 N 天）仍只作用于 time 通道，否则默认召回会被场景窗静默截断。
- * 非法窗（无法解析或 from > to）交给 channels 的 time 通道回退，这里返回
- * undefined 表示“不收窄”，不凭空丢候选。
- */
-function explicitTimeWindow(request: RecallRequest): TimeWindowBounds | undefined {
-  const window = request.timeWindow
-  if (window === undefined) return undefined
-  const fromMs = Date.parse(window.from)
-  const toMs = Date.parse(window.to)
-  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs) return undefined
-  return { fromMs, toMs }
+function traceIdOf(request: RecallRequest): string {
+  return request.traceId !== undefined && request.traceId.trim().length > 0 ? request.traceId : newId('trace')
 }
 
 /** 无 eventTime（非状态机实体）或时间无法解析时按未知处理：不因时间窗排除。 */
@@ -95,6 +98,30 @@ function withinTimeWindow(bounds: TimeWindowBounds, eventTime: string | undefine
   const eventMs = Date.parse(eventTime)
   if (!Number.isFinite(eventMs)) return true
   return eventMs >= bounds.fromMs && eventMs <= bounds.toMs
+}
+
+function boundsOf(window: TimeWindow): TimeWindowBounds {
+  return { fromMs: Date.parse(window.from), toMs: Date.parse(window.to) }
+}
+
+/** 重排先验只需要请求里的少量字段；从计划重建一个只读视图，避免把原 request 透传进来。 */
+function requestViewOf(plan: RetrievalPlan): RecallRequest {
+  return {
+    query: plan.query,
+    scenario: plan.scenario,
+    expand: plan.expand,
+    hops: plan.hops,
+    limit: plan.limit,
+    ...(plan.filters.scope === undefined ? {} : { scope: plan.filters.scope }),
+    ...(plan.filters.projectKey === undefined ? {} : { projectKey: plan.filters.projectKey }),
+    ...(plan.filters.kind === undefined ? {} : { kind: plan.filters.kind }),
+    ...(plan.filters.category === undefined ? {} : { category: plan.filters.category }),
+    ...(plan.filters.status === undefined ? {} : { status: plan.filters.status }),
+    ...(plan.filters.includeArchived ? { includeArchived: true } : {}),
+    ...(plan.filters.includeHistory ? { includeHistory: true } : {}),
+    ...(plan.time.explicit === undefined ? {} : { timeWindow: plan.time.explicit }),
+    now: plan.time.now,
+  }
 }
 
 function compareScored(left: ScoredCandidate, right: ScoredCandidate): number {
@@ -138,51 +165,104 @@ function chainSiblingTitles(
 }
 
 /**
- * 两阶段召回引擎。
+ * 计划驱动的两阶段召回引擎。
  *
- * 阶段一：六通道（五个并行 + 单字回退条件执行），单通道失败隔离。
- * 阶段二：每通道前 seedLimit 做 1–2 跳图扩展（衰减 0.5/0.25），加权 RRF（k 来自配置，默认 60）
- * 融合，原始分 + 融合分双重门控，场景重排（先验乘数夹在 [0.5, 1.5]），最后写 recall_event。
- * 命中 why 与空结果 whyNot 都由 explain.ts 统一生成；空结果一定带 emptyReason，不静默返回 []。
+ * 阶段一：`runStageOnePlan` 执行六个 provider（五个并行 + 单字回退条件执行），
+ * 每个 provider 有独立 deadline/状态，单个失败不拖垮其它；deadline 在报告里记为
+ * failed + `deadline:` reason，并在 warnings 里明示。
+ * 阶段二：`runExpansionProviders` 执行 expand → links（按计划 expand 模式），失败降级为 warning。
+ * 之后仍是加权 RRF（k 来自配置，默认 60）融合、原始分 + 融合分双重门控、场景重排、
+ * 显式时间窗收窄，最后写 recall_event；空结果一定带 emptyReason，不静默返回 []。
+ *
+ * 计划可序列化：`compilePlan(request)` 得到纯数据计划，`recallFromPlan(JSON 往返后的计划)`
+ * 可以重放同一份检索语义；配置版本漂移会在 warnings 里暴露，不静默换口径。
  */
 export class RecallEngine {
   readonly config: RetrievalConfig
   private readonly store: Store
   private readonly embedder: Embedder
   private readonly clock: Clock
+  private readonly stageOneBudgetMs: number | undefined
+  private readonly providerTimeoutMs: number | undefined
 
   constructor(deps: RecallEngineDeps) {
     this.store = deps.store
     this.embedder = deps.embedder
     this.clock = deps.clock
     this.config = deps.config ?? DEFAULT_RETRIEVAL_CONFIG
+    this.stageOneBudgetMs = deps.stageOneBudgetMs
+    this.providerTimeoutMs = deps.providerTimeoutMs
+  }
+
+  /** 纯编译：同一请求 + 时钟锚点永远得到同一份计划（含同一 hash）。 */
+  compilePlan(request: RecallRequest): RetrievalPlan {
+    return compileRetrievalPlan(request, {
+      config: this.config,
+      now: resolveNowIso(request, this.clock),
+      executionAnchorMs: this.executionAnchorMs(),
+      ...(this.stageOneBudgetMs === undefined ? {} : { budgetMs: this.stageOneBudgetMs }),
+      ...(this.providerTimeoutMs === undefined ? {} : { providerTimeoutMs: this.providerTimeoutMs }),
+    })
   }
 
   async recall(request: RecallRequest): Promise<RecallResult> {
-    const scenarioName: RecallScenario = request.scenario ?? 'manual'
-    const scenario: ScenarioConfig = this.config.scenarios[scenarioName]
-    const traceId = request.traceId !== undefined && request.traceId.trim().length > 0 ? request.traceId : newId('trace')
-    const now = resolveNowIso(request, this.clock)
-    const limit = resolveLimit(request, this.config)
-    const startedAt = performance.now()
+    return this.execute({
+      plan: this.compilePlan(request),
+      traceId: traceIdOf(request),
+      ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+      ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
+      ...(request.trigger === undefined ? {} : { trigger: request.trigger }),
+      injected: request.injected === true,
+    })
+  }
 
-    const stageOne = await runStageOne(
+  /**
+   * 用**序列化后的计划**重放召回；结构/hash 不符直接抛 invalid-input，不执行被篡改的计划。
+   * 注意：计划里的 deadline 是绝对时刻，历史计划需要用 `rebaseRetrievalPlan` 重新锚定执行窗口。
+   */
+  async recallFromPlan(plan: unknown, audit: RecallPlanAudit = {}): Promise<RecallResult> {
+    const parsed = parseRetrievalPlan(plan)
+    return this.execute({
+      plan: parsed,
+      traceId: audit.traceId !== undefined && audit.traceId.trim().length > 0 ? audit.traceId : newId('trace'),
+      ...(audit.sessionId === undefined ? {} : { sessionId: audit.sessionId }),
+      ...(audit.turnId === undefined ? {} : { turnId: audit.turnId }),
+      ...(audit.trigger === undefined ? {} : { trigger: audit.trigger }),
+      injected: audit.injected === true,
+    })
+  }
+
+  private executionAnchorMs(): number {
+    const parsed = Date.parse(this.clock.iso())
+    return Number.isFinite(parsed) ? parsed : Date.now()
+  }
+
+  private async execute(input: RecallExecution): Promise<RecallResult> {
+    const plan = input.plan
+    const scenario = this.config.scenarios[plan.scenario]
+    const startedAt = performance.now()
+    const warnings: string[] = []
+    if (plan.configVersion !== this.config.version) {
+      warnings.push(`plan 由检索配置 ${plan.configVersion} 编译，当前配置 ${this.config.version}：融合/门控按当前配置计算。`)
+    }
+
+    const stageOne = await runStageOnePlan(
       { store: this.store, embedder: this.embedder },
-      { request, config: this.config, scenario, now },
+      plan,
+      { executionAnchorMs: this.executionAnchorMs() },
     )
     const stageOneMs = performance.now() - startedAt
-    const warnings: string[] = [...stageOne.warnings]
+    warnings.push(...stageOne.warnings)
     const stageOneHitCount = [...stageOne.hitsByChannel.values()].reduce((sum, hits) => sum + hits.length, 0)
 
-    const seedSet = collectSeeds(stageOne.hitsByChannel, this.config)
-    const expansionMode: ExpansionMode = request.expand ?? 'both'
-    const expansion = await this.expand(
-      seedSet,
-      request.hops === 1 ? 1 : 2,
-      expansionMode,
-      warnings,
-      request.includeArchived === true,
-    )
+    // 计划是权威：种子数按 plan.budget.seeds 取（重放一份旧计划时不能悄悄用当前配置的 seedLimit）。
+    const seedConfig: RetrievalConfig = plan.budget.seeds === this.config.seedLimit
+      ? this.config
+      : { ...this.config, seedLimit: plan.budget.seeds }
+    const seedSet: SeedSet = collectSeeds(stageOne.hitsByChannel, seedConfig)
+    // 阶段二的执行锚点要扣掉阶段一已用时间；否则同一份计划的 deadline 会被两个阶段各用一遍。
+    const expansionAnchorMs = this.executionAnchorMs() + (performance.now() - startedAt)
+    const expansion = await this.expand(plan, seedSet, warnings, expansionAnchorMs)
     const expansionStats: ExpansionStats = {
       seeds: seedSet.entityIds.length,
       expanded: expansion.expansions.length,
@@ -202,10 +282,10 @@ export class RecallEngine {
     }
 
     const empty = (reason: EmptyReason): RecallResult => ({
-      traceId,
+      traceId: input.traceId,
       configVersion: this.config.version,
-      scenario: scenarioName,
-      query: request.query,
+      scenario: plan.scenario,
+      query: plan.query,
       hits: [],
       emptyReason: reason,
       channelErrors: stageOne.errors,
@@ -217,7 +297,7 @@ export class RecallEngine {
 
     if (gate.passed.length === 0) {
       return empty(explainEmpty({
-        query: request.query,
+        query: plan.query,
         stageOneHitCount,
         reports: stageOne.reports,
         gate,
@@ -238,7 +318,7 @@ export class RecallEngine {
     }
     if (summariesFailed) {
       return empty(explainEmpty({
-        query: request.query,
+        query: plan.query,
         stageOneHitCount,
         reports: stageOne.reports,
         gate,
@@ -248,11 +328,12 @@ export class RecallEngine {
       }))
     }
 
+    const filters = plan.filters
     const filtered: FilteredCandidate[] = []
     const filteredReasons: WhyNot[] = []
     let filteredOut = 0
     let timeFiltered = 0
-    const timeWindow = explicitTimeWindow(request)
+    const timeWindow = plan.time.explicit === undefined ? undefined : boundsOf(plan.time.explicit)
     for (const candidate of gate.passed) {
       const summary = summaryMap.get(candidate.entityId)
       if (summary === undefined) {
@@ -260,32 +341,32 @@ export class RecallEngine {
         filteredReasons.push(explainFiltered('missing-summary', candidate.entityId))
         continue
       }
-      if (request.includeArchived !== true && summary.archived) {
+      if (!filters.includeArchived && summary.archived) {
         filteredOut += 1
         filteredReasons.push(explainFiltered('archived', candidate.entityId))
         continue
       }
-      if (request.includeHistory !== true && !summary.isCurrent) {
+      if (!filters.includeHistory && !summary.isCurrent) {
         filteredOut += 1
         filteredReasons.push(explainFiltered('history', candidate.entityId))
         continue
       }
-      if (request.kind !== undefined && summary.kind !== request.kind) {
+      if (filters.kind !== undefined && summary.kind !== filters.kind) {
         filteredOut += 1
-        filteredReasons.push(explainFiltered('kind', candidate.entityId, `kind=${summary.kind} expected=${request.kind}`))
+        filteredReasons.push(explainFiltered('kind', candidate.entityId, `kind=${summary.kind} expected=${filters.kind}`))
         continue
       }
-      if (request.category !== undefined && summary.category !== request.category) {
+      if (filters.category !== undefined && summary.category !== filters.category) {
         filteredOut += 1
         filteredReasons.push(
-          explainFiltered('category', candidate.entityId, `category=${summary.category ?? 'undefined'} expected=${request.category}`),
+          explainFiltered('category', candidate.entityId, `category=${summary.category ?? 'undefined'} expected=${filters.category}`),
         )
         continue
       }
-      if (request.status !== undefined && (summary.status === undefined || !request.status.includes(summary.status))) {
+      if (filters.status !== undefined && (summary.status === undefined || !filters.status.includes(summary.status))) {
         filteredOut += 1
         filteredReasons.push(
-          explainFiltered('status', candidate.entityId, `status=${summary.status ?? 'undefined'} expected=${request.status.join('|')}`),
+          explainFiltered('status', candidate.entityId, `status=${summary.status ?? 'undefined'} expected=${filters.status.join('|')}`),
         )
         continue
       }
@@ -308,7 +389,7 @@ export class RecallEngine {
 
     if (filtered.length === 0) {
       return empty(explainEmpty({
-        query: request.query,
+        query: plan.query,
         stageOneHitCount,
         reports: stageOne.reports,
         gate,
@@ -319,14 +400,15 @@ export class RecallEngine {
       }))
     }
 
+    const requestView = requestViewOf(plan)
     const prelim: ScoredCandidate[] = filtered.map(item => {
       const prior = rerankPrior({
         summary: item.summary,
         linkStrength: item.candidate.link?.linkScore ?? 0,
         scenario,
         config: this.config,
-        request,
-        now,
+        request: requestView,
+        now: plan.time.now,
       })
       return { candidate: item.candidate, summary: item.summary, prior, score: item.candidate.fused * prior.factor }
     })
@@ -335,7 +417,7 @@ export class RecallEngine {
       .sort(compareScored)
       .slice(0, Math.max(0, this.config.rerankEnrichLimit))
       .map(item => item.candidate.entityId)
-    const entities = await this.fetchEntities(enrichIds, warnings, request.includeArchived === true)
+    const entities = await this.fetchEntities(enrichIds, warnings, filters.includeArchived)
 
     const scored = prelim.map(item => {
       const entity = entities.get(item.candidate.entityId)
@@ -346,13 +428,13 @@ export class RecallEngine {
         linkStrength: item.candidate.link?.linkScore ?? 0,
         scenario,
         config: this.config,
-        request,
-        now,
+        request: requestView,
+        now: plan.time.now,
       })
       return { candidate: item.candidate, summary: item.summary, prior, score: item.candidate.fused * prior.factor }
     })
     scored.sort(compareScored)
-    const selected = scored.slice(0, limit)
+    const selected = scored.slice(0, plan.limit)
 
     const titles = new Map<string, string>()
     for (const summary of summaryMap.values()) {
@@ -401,15 +483,15 @@ export class RecallEngine {
       }
     })
 
-    await this.recordRecall(traceId, request, hits, warnings)
+    await this.recordRecall(input, hits, warnings)
     // 访问计数用于采用率先验与遗忘；失败不影响本次召回结果。
     if (hits.length > 0) await this.store.markAccessed?.(hits.map(hit => hit.entityId)).catch(() => {})
 
     return {
-      traceId,
+      traceId: input.traceId,
       configVersion: this.config.version,
-      scenario: scenarioName,
-      query: request.query,
+      scenario: plan.scenario,
+      query: plan.query,
       hits,
       channelErrors: stageOne.errors,
       channels: stageOne.reports,
@@ -419,29 +501,26 @@ export class RecallEngine {
     }
   }
 
+  /** 阶段二：计划要求图扩展时才执行；失败只降级为 warning，阶段一结果照常返回。 */
   private async expand(
+    plan: RetrievalPlan,
     seedSet: SeedSet,
-    hops: 1 | 2,
-    mode: ExpansionMode,
     warnings: string[],
-    includeArchived: boolean,
-  ): Promise<ExpansionOutcome> {
-    if (mode === 'none' || seedSet.entityIds.length === 0) {
-      return { expansions: [], chains: new Map(), warnings: [] }
-    }
+    nowMs: number,
+  ): Promise<ExpansionRunResult> {
+    const empty: ExpansionRunResult = { expansions: [], chains: new Map(), warnings: [], outcomes: [] }
+    if (plan.expand === 'none') return empty
     try {
-      // expand=links 不需要读思维链组；chain/both 才解析组属性。
-      const includeChains = mode === 'chain' || mode === 'both'
-      const outcome = await expandSeeds(this.store, seedSet, hops, this.config, { includeChains, includeArchived })
-      warnings.push(...outcome.warnings)
-      return {
-        expansions: filterExpansions(outcome.expansions, mode),
-        chains: includeChains ? outcome.chains : new Map(),
-        warnings: outcome.warnings,
-      }
+      const result = await runExpansionProviders(
+        plan,
+        { store: this.store, embedder: this.embedder },
+        { nowMs, seeds: seedSet.entityIds },
+      )
+      warnings.push(...result.warnings)
+      return result
     } catch (error) {
       warnings.push(`图扩展失败（阶段一结果保留）：${toOmbError(error).message}`)
-      return { expansions: [], chains: new Map(), warnings: [] }
+      return empty
     }
   }
 
@@ -466,8 +545,7 @@ export class RecallEngine {
   }
 
   private async recordRecall(
-    traceId: string,
-    request: RecallRequest,
+    execution: RecallExecution,
     hits: readonly RecallHit[],
     warnings: string[],
   ): Promise<void> {
@@ -477,17 +555,17 @@ export class RecallEngine {
         const rawScore = hit.rawScores[channel]
         if (rawScore === undefined) continue
         events.push({
-          traceId,
-          ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
-          ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
-          ...(request.query.length === 0 ? {} : { query: request.query }),
-          ...(request.trigger === undefined ? {} : { trigger: request.trigger }),
+          traceId: execution.traceId,
+          ...(execution.sessionId === undefined ? {} : { sessionId: execution.sessionId }),
+          ...(execution.turnId === undefined ? {} : { turnId: execution.turnId }),
+          ...(execution.plan.query.length === 0 ? {} : { query: execution.plan.query }),
+          ...(execution.trigger === undefined ? {} : { trigger: execution.trigger }),
           entityId: hit.entityId,
           channel,
           rank: index + 1,
           rawScore,
           fusedScore: hit.fusedScore,
-          injected: request.injected === true,
+          injected: execution.injected,
         })
       }
     })
