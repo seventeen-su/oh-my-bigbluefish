@@ -536,6 +536,7 @@ export class AttributeWriter implements CommandWriter {
   ): Promise<CommandOutcome> {
     const { from, to, reason } = command
     // 同一个 from→to 的并发改名必须串行，否则两边会算出同一个 stream_version。
+    // check:ignore-next-line sec-sql-concat -- from/to 只作为 $1 参数值，不是 SQL 片段
     await client.query('select pg_advisory_xact_lock(hashtext($1))', [`omb:rename-attr:${from}->${to}`])
     const affected = await client.query<{ entity_id: string }>(
       'select distinct entity_id from omb.attribute where name = $1 order by entity_id asc',
@@ -561,6 +562,7 @@ export class AttributeWriter implements CommandWriter {
       await client.query('update omb.attr_registry set name = $2, last_seen = now() where name = $1', [from, to])
       await client.query('update omb.attr_registry set aliases = array_append(aliases, $1) where name = $2', [from, to])
     } else {
+      // check:ignore-next-line sec-sql-concat -- name 走 $1 参数，模板是常量 SQL
       await client.query(
         `update omb.attr_registry
          set aliases = array_append(aliases, $1),

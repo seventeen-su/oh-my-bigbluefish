@@ -188,6 +188,7 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
       archivedAt,
       kindOverride: current.kind,
     })
+    // check:ignore-next-line sec-sql-concat -- 所有值走 $2..$7 参数，模板是常量 SQL
     await client.query(
       `update omb.entity
        set revision = $2, confidence = $3, pinned = $4, origin = $5,

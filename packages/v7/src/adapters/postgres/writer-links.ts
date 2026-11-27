@@ -123,6 +123,7 @@ export async function unlinkCommand(client: PoolClient, id: string, meta: Comman
   if (row === undefined) return noopOutcome('')
   if (row.relation === 'possible_conflict') {
     const [left, right] = row.from_id < row.to_id ? [row.from_id, row.to_id] : [row.to_id, row.from_id]
+    // check:ignore-next-line sec-sql-concat -- pair_key 走 $1 参数，reason 是常量字面量
     await client.query(
       `insert into omb.conflict_suppression (pair_key, reason)
        values ($1, 'manual-unlink') on conflict (pair_key) do nothing`,

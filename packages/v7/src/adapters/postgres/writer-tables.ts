@@ -94,6 +94,7 @@ export async function upsertRegistry(client: PoolClient, attributes: readonly At
   }
   if (usage.size === 0) return
   const records = [...usage].map(([name, item]) => ({ name, value_kind: item.kind, usage: item.count }))
+  // check:ignore-next-line sec-sql-concat -- records 走 $1::jsonb 参数，模板是常量 SQL
   await client.query(
     `insert into omb.attr_registry (name, value_kind, usage_count)
      select e->>'name', e->>'value_kind', coalesce((e->>'usage')::int, 1)

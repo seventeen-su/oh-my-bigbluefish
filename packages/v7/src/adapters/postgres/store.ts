@@ -435,6 +435,7 @@ export class PostgresStore implements Store {
   async upsertEmbedding(entityId: string, model: string, dims: number, embedding: readonly number[]): Promise<void> {
     if (embedding.length !== 512) throw new OmbFailure(internal('向量维度必须是 512'))
     await this.run(async () => {
+      // check:ignore-next-line sec-sql-concat -- 四个值全部是 $1..$4 参数，模板无外部片段
       await this.db.query(
         `insert into omb.embedding (entity_id, model, dims, embedding)
          values ($1,$2,$3,$4::vector)
@@ -518,6 +519,7 @@ export class PostgresStore implements Store {
   async markAccessed(ids: readonly string[]): Promise<void> {
     if (ids.length === 0) return
     await this.run(async () => {
+      // check:ignore-next-line sec-sql-concat -- id 列表走 $1::text[] 参数，模板无外部片段
       await this.db.query(
         `update omb.entity
          set access_count = access_count + 1, last_accessed_at = now()
@@ -537,6 +539,7 @@ export class PostgresStore implements Store {
           [traceId, entityId, kind],
         )
         if (updated.rowCount !== null && updated.rowCount > 0) {
+          // check:ignore-next-line sec-sql-concat -- entityId 走 $1 参数，模板是常量 SQL
           await client.query('update omb.entity set adoption_count = adoption_count + 1 where id = $1', [entityId])
         }
       })

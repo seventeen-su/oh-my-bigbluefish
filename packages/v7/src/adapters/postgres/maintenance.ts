@@ -209,6 +209,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
 
   async conflictSuppressed(a: string, b: string): Promise<boolean> {
     const [left, right] = a < b ? [a, b] : [b, a]
+    // check:ignore-next-line sec-sql-concat -- 值走 $1；模板只拼 pair_key 参数值，不是 SQL 片段
     const rows = await this.db.query('select 1 from omb.conflict_suppression where pair_key = $1', [`${left}|${right}`])
     return rows.rowCount !== 0
   }
