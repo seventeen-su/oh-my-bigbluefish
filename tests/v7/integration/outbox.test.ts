@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import type { QueryResultRow } from 'pg'
 import { OutboxRelay, type OutboxRelayOptions } from '../../../packages/v7/src/app/outbox/relay.js'
 import { ReactionRegistry } from '../../../packages/v7/src/app/outbox/registry.js'
 import type { OutboxWakeSource } from '../../../packages/v7/src/app/outbox/events.js'
@@ -80,6 +81,32 @@ async function rawPending(eventId: number, ageMs: number, topic = 'probe'): Prom
      values ($1, $2, '{}'::jsonb, now() - ($3::int * interval '1 millisecond'))`,
     [eventId, topic, ageMs],
   )
+}
+
+/**
+ * 直接把行标成 dead。投递失败进入 dead 的真实路径由“重试耗尽”用例覆盖；
+ * 这里只构造 replay 的输入，避免每个过滤/上限用例都重跑一遍退避。
+ */
+async function markDead(id: number, lastError = 'manual-dead', attempts = 3): Promise<void> {
+  await db.query(
+    "update omb.outbox set status = 'dead', attempts = $2, last_error = $3, claimed_at = null where id = $1",
+    [id, attempts, lastError],
+  )
+}
+
+interface ReplayAuditRow extends QueryResultRow {
+  actor: string
+  action: string
+  target_ids: string[]
+  after: Record<string, unknown> | null
+}
+
+/** `omb_admin replay` 写的运维审计行：actor/action/target_ids/after 就是契约。 */
+async function replayAudits(): Promise<ReplayAuditRow[]> {
+  const result = await db.query<ReplayAuditRow>(
+    "select actor, action, target_ids, after from omb.audit_log where action = 'outbox-replay' order by id",
+  )
+  return result.rows
 }
 
 function relayOf(
@@ -459,5 +486,104 @@ describe('outbox PostgreSQL 适配器', () => {
     ).toBe(true)
 
     expect(await store.claim({ limit: 25, leaseMs: 5_000 })).toHaveLength(5)
+  })
+
+  it('给定 reaction 重试耗尽进入 dead 当按 id replay 则回到 pending、attempts 归零并留审计', async () => {
+    const appended = await appendEvent('flaky')
+    const registry = new ReactionRegistry()
+    registry.register('flaky', {
+      name: 'always-fail',
+      run: () => {
+        throw new Error('boom')
+      },
+    })
+    const relay = relayOf(registry, undefined, {
+      retry: { maxAttempts: 1, baseDelayMs: 0, factor: 1, maxDelayMs: 0 },
+    })
+    await expect(relay.tick()).resolves.toMatchObject({ claimed: 1, dead: 1 })
+
+    const dead = await store.deadSummary(5)
+    expect(dead.count).toBe(1)
+    expect(dead.rows[0]).toMatchObject({
+      id: appended.id,
+      eventId: appended.eventId,
+      topic: 'flaky',
+      attempts: 1,
+    })
+    expect(dead.rows[0]?.lastError).toContain('boom')
+
+    const replayed = await store.replayDead({ id: appended.id, limit: 10, actor: 'model', reason: '人工重放' })
+    expect(replayed.replayed).toHaveLength(1)
+    expect(replayed.replayed[0]).toMatchObject({ id: appended.id, topic: 'flaky', attempts: 1 })
+    expect(replayed.replayed[0]?.lastError).toContain('boom')
+    expect(replayed.remaining).toBe(0)
+
+    const row = await onlyRow()
+    expect(row).toMatchObject({ status: 'pending', attempts: 0 })
+    // 死信原因保留到下一次投递结果覆盖：重放后运维仍能追查它为什么会进死信。
+    expect(row.last_error).toContain('boom')
+    expect(row.available_at.getTime()).toBeLessThanOrEqual(Date.now())
+
+    const audits = await replayAudits()
+    expect(audits).toHaveLength(1)
+    expect(audits[0]).toMatchObject({
+      actor: 'model',
+      action: 'outbox-replay',
+      target_ids: [String(appended.id)],
+    })
+    expect(audits[0]?.after).toMatchObject({ reason: '人工重放' })
+
+    const reclaimed = await store.claim({ limit: 5, leaseMs: 5_000 })
+    expect(reclaimed.map(event => event.id)).toEqual([appended.id])
+    expect(reclaimed[0]?.attempts).toBe(0)
+  })
+
+  it('给定同一条 dead 行重复 replay 当第二次则无行可重放且不再写审计', async () => {
+    const appended = await appendEvent('flaky')
+    await markDead(appended.id)
+
+    expect((await store.replayDead({ id: appended.id, limit: 10, actor: 'model' })).replayed).toHaveLength(1)
+    const second = await store.replayDead({ id: appended.id, limit: 10, actor: 'model' })
+    expect(second.replayed).toEqual([])
+    expect(second.remaining).toBe(0)
+    expect(await replayAudits()).toHaveLength(1)
+    expect(await onlyRow()).toMatchObject({ status: 'pending', attempts: 0 })
+  })
+
+  it('给定同 topic 多条 dead 当按 topic 与 limit replay 则只重放上限内且不碰其它 topic', async () => {
+    const ids: number[] = []
+    for (let index = 0; index < 3; index += 1) {
+      const appended = await appendEvent('bulk-topic')
+      ids.push(appended.id)
+      await markDead(appended.id, `dead-${index}`, 2)
+    }
+    const other = await appendEvent('other-topic')
+    await markDead(other.id)
+
+    const first = await store.replayDead({ topic: 'bulk-topic', limit: 2, actor: 'model' })
+    expect(first.replayed.map(row => row.id)).toEqual([ids[0], ids[1]])
+    expect(first.remaining).toBe(1)
+    const all = await rows()
+    expect(all.filter(row => row.status === 'pending').map(row => row.id)).toEqual([ids[0], ids[1]])
+    expect(all.find(row => row.id === ids[2])?.status).toBe('dead')
+    expect(all.find(row => row.id === other.id)?.status).toBe('dead')
+
+    const rest = await store.replayDead({ topic: 'bulk-topic', limit: 5, actor: 'model' })
+    expect(rest.replayed.map(row => row.id)).toEqual([ids[2]])
+    expect(rest.remaining).toBe(0)
+    expect((await rows()).find(row => row.id === other.id)?.status).toBe('dead')
+  })
+
+  it('给定两个 worker 并发 replay 同一条 dead 行当都提交则只有一次真正重放并只写一条审计', async () => {
+    const appended = await appendEvent('flaky')
+    await markDead(appended.id)
+
+    const [left, right] = await Promise.all([
+      store.replayDead({ id: appended.id, limit: 1, actor: 'model' }),
+      store.replayDead({ id: appended.id, limit: 1, actor: 'model' }),
+    ])
+    expect(left.replayed.length + right.replayed.length).toBe(1)
+    expect(await replayAudits()).toHaveLength(1)
+    expect(await onlyRow()).toMatchObject({ status: 'pending', attempts: 0 })
   })
 })

@@ -32,9 +32,15 @@ import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import type { JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import {
   EMBED_REACTION_TOPICS,
+  LINK_REACTION_TOPICS,
   REFRESH_REACTION_TOPICS,
+  WRITE_SIDE_EFFECT_TOPICS,
+  createAckReaction,
   createEmbedReaction,
+  createLinkSuggestReaction,
+  createReactionAckMetrics,
   createRefreshReaction,
+  type ReactionAckMetrics,
 } from './reactions.js'
 import type { TeardownStep } from './supervisor.js'
 import { messageOf } from './messages.js'
@@ -112,7 +118,14 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
   let runtimeStarted = false
   let outboxNotifier: PostgresOutboxNotifier | undefined
   let outboxRelay: OutboxRelay | undefined
+  /**
+   * 死信读取/重放与 relay 共用同一个 `PostgresOutboxStore` 实例（无状态）。
+   * relay 的 `OutboxStore` 端口不含运维面，status 的 dead 读数从这里读。
+   */
+  let outboxReplayStore: PostgresOutboxStore | undefined
   let reactionRegistry: ReactionRegistry | undefined
+  /** 合法 topic 的明确 ack 计数；进程内累计，和 relay 的 delivered/dead 同口径。 */
+  const reactionAcks: ReactionAckMetrics = createReactionAckMetrics()
   let timerNotifier: PostgresTimerNotifier | undefined
   let timerWorker: TimerWorker | undefined
   let workflowRuntime: WorkflowRuntime | undefined
@@ -217,9 +230,15 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
       for (const topic of EMBED_REACTION_TOPICS) registry.register(topic, embedReaction)
       const refreshReaction: Reaction = createRefreshReaction({ store, queue, logger })
       for (const topic of REFRESH_REACTION_TOPICS) registry.register(topic, refreshReaction)
+      // 链接变化 → link-suggest；写事务已完成的副作用 topic 只 ack 并计数（不进死信）。
+      const linkReaction: Reaction = createLinkSuggestReaction({ queue })
+      for (const topic of LINK_REACTION_TOPICS) registry.register(topic, linkReaction)
+      const ackReaction: Reaction = createAckReaction({ metrics: reactionAcks })
+      for (const topic of WRITE_SIDE_EFFECT_TOPICS) registry.register(topic, ackReaction)
+      const outboxStore = new PostgresOutboxStore(store.db)
       relay = new OutboxRelay(
         {
-          store: new PostgresOutboxStore(store.db),
+          store: outboxStore,
           registry,
           clock,
           wake: outboxListen,
@@ -267,6 +286,7 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
       timerNotifier = timerListen
       reactionRegistry = registry
       outboxRelay = relay
+      outboxReplayStore = outboxStore
       timerWorker = timer
       workflowRuntime = workflow
       workflowStoreRef = workflowStore
@@ -303,6 +323,7 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
     if (!deps.jobsEnabled) return runtimeUnknownLines(false, 'jobs-disabled')
     if (!runtimeStarted
       || outboxRelay === undefined
+      || outboxReplayStore === undefined
       || timerWorker === undefined
       || workflowRuntime === undefined
       || workflowStoreRef === undefined
@@ -315,15 +336,33 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
       // status 调用时做一次有界“叫醒”：有 pending 就 wake relay 补一次 drain。
       // 这不是轮询——只有用户/模型真的调用 omb_status 时才发生。
       if (stats.pending > 0) outboxRelay.wake()
+      const acked = reactionAcks.snapshot()
+      const ackedTotal = Object.values(acked).reduce((sum, count) => sum + count, 0)
+      const ackedByTopic = Object.entries(acked).map(([topic, count]) => `${topic}:${count}`).join(',') || 'none'
       lines.push(
         'outbox=ok',
-        // pending/claimed/lag 是实时 SQL；dead 是本进程累计（OutboxStore 端口没有跨进程
-        // dead 计数），用 outboxDeadScope 标清口径，不把它当成全局死信总数。
+        // pending/claimed/lag 是实时 SQL；dead/delivered/acked 是本进程累计（端口只暴露
+        // 内存 totals），用 scope 标清口径，不把进程读数当成全局总数。
         `outboxLagMs=${stats.oldestAgeMs} outboxPending=${stats.pending} outboxClaimed=${stats.claimed} outboxDead=${stats.dead} outboxDeadScope=process`,
-        `outboxDelivered=${stats.delivered} outboxSkipped=${stats.skipped} outboxRetried=${stats.retried} outboxLost=${stats.lost}`,
+        `outboxDelivered=${stats.delivered} outboxSkipped=${stats.skipped} outboxRetried=${stats.retried} outboxLost=${stats.lost} outboxAcked=${ackedTotal} outboxAckedScope=process`,
+        // 合法 topic 被明确 ack（写事务已完成副作用）的逐 topic 计数：它不是 dead，也不是
+        // 未注册 topic 的 skip；运维可以据此判断“事件确实被看过”。
+        `outboxAckedByTopic=${ackedByTopic}`,
         `outboxTopics=${reactionRegistry.topics().join(',') || 'none'} outboxUnknownTopic=dead`,
       )
       if (stats.lastError !== undefined) lines.push(`outboxLastError=${stats.lastError}`)
+      // 死信原因来自真实表：进程累计的 outboxDead 只覆盖本进程，跨进程/重启后的死信必须查库。
+      try {
+        const dead = await outboxReplayStore.deadSummary(3)
+        lines.push(`outboxDeadRows=${dead.count} outboxDeadRowsScope=db`)
+        for (const row of dead.rows) {
+          lines.push(
+            `outboxDeadRecent=id=${row.id} attempts=${row.attempts} topic=${row.topic} error=${JSON.stringify(row.lastError)}`,
+          )
+        }
+      } catch (error) {
+        lines.push('outboxDeadRows=unknown', `outboxDeadReason=${messageOf(error)}`)
+      }
     } catch (error) {
       lines.push('outbox=unknown', `outboxReason=${messageOf(error)}`)
     }

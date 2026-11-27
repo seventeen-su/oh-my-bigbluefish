@@ -223,6 +223,11 @@ interface EmbedJobRow {
   readonly data: { readonly entityId: string; readonly text: string }
 }
 
+interface LinkSuggestJobRow {
+  readonly singleton_key: string | null
+  readonly data: { readonly trigger?: string; readonly topic?: string; readonly linkId?: string }
+}
+
 async function embedJobOf(entityId: string): Promise<EmbedJobRow | undefined> {
   const result = await store.db.query<EmbedJobRow>(
     `select singleton_key, state, data
@@ -233,6 +238,17 @@ async function embedJobOf(entityId: string): Promise<EmbedJobRow | undefined> {
     [entityId],
   )
   return result.rows[0]
+}
+
+/** 只取 outbox reaction 入队的任务：启动首轮巩固也会入队同名任务，不能混在一起断言。 */
+async function linkSuggestJobs(): Promise<LinkSuggestJobRow[]> {
+  const result = await store.db.query<LinkSuggestJobRow>(
+    `select singleton_key, data
+       from pgboss.job
+      where name = 'omb.link-suggest' and data->>'trigger' = 'outbox-link'
+      order by created_on desc`,
+  )
+  return result.rows
 }
 
 async function createEntityOnBus(title: string): Promise<string> {
@@ -263,17 +279,22 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
     try {
       // 启动首轮巩固任务会立刻到期并执行：等它们都 rearm 成 pending 再读聚合数。
       // 否则 timer 统计与 consolidation 快照是两条 SQL，正常在途也会出现“差值”。
+      // 条件里同时要求两条计数一致：只在 consolidationPending 到 10 的那一刻取数，
+      // 仍可能撞上两个查询之间的一次 rearm/claim（窗口 1 条），因此按“稳定快照”等待。
       const text = await waitFor(
         async () => {
           const current = await statusText(runtime)
-          return metric(current, 'consolidationPending') === EXPECTED_CONSOLIDATION_TIMERS ? current : undefined
+          if (metric(current, 'consolidationPending') !== EXPECTED_CONSOLIDATION_TIMERS) return undefined
+          if (metric(current, 'timerPending') !== metric(current, 'consolidationPending')) return undefined
+          if (metric(current, 'timerClaimed') !== metric(current, 'consolidationClaimed')) return undefined
+          return current
         },
-        '巩固任务全部 rearm 成 pending',
+        '巩固任务全部 rearm 成 pending 且 timer 聚合数一致',
       )
       expect(text).toContain('projection=ok')
       expect(text).toContain('outbox=ok')
       expect(text).toContain('outboxLagMs=0 outboxPending=0 outboxClaimed=0 outboxDead=0')
-      expect(text).toContain('outboxTopics=EntityCreated,EntityPatched')
+      expect(text).toContain('outboxTopics=AttributeRenamed,EntityArchived,EntityCreated,EntityPatched,EntityUnarchived,LinkCreated,LinkUnlinked')
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('timer=ok')
       // 业务 timer（workflow wake）空闲；consolidation 的 durable schedule 是合法 pending。
@@ -399,13 +420,248 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
     }
   })
 
-  it('给定未注册 topic 当 relay 投递则进死信并报出原因，不静默丢弃', async () => {
+  it('给定 AttributeRenamed 事件当 relay 投递则 ack 而不是进死信（改名副作用已在写事务完成）', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const id = await createEntityOnBus('改名 ack 验证')
+      const bus = busOn(store)
+      const patched = await bus.execute(
+        { type: 'PatchEntity', input: { id, expectedRevision: 1, attrs: { oldTag: 'x' } } },
+        meta(),
+      )
+      if (!patched.ok) throw new Error(`补丁失败：${patched.error.message}`)
+      const renamed = await bus.execute(
+        { type: 'RenameAttribute', from: 'oldTag', to: 'newTag', reason: 'test-rename' },
+        meta(),
+      )
+      if (!renamed.ok) throw new Error(`改名失败：${renamed.error.message}`)
+
+      await waitFor(
+        async () => {
+          const row = await outboxRowOfStream('attr:oldTag->newTag', 'AttributeRenamed')
+          return row?.status === 'done' ? row : undefined
+        },
+        'AttributeRenamed 被 ack',
+      )
+      const text = await statusText(runtime)
+      expect(text).toContain('outboxAckedByTopic=AttributeRenamed:1')
+      expect(text).toContain('outboxDeadRows=0')
+      expect(text).not.toContain('outboxDeadRecent=')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定 LinkCreated 事件当 relay 投递则注册的真实消费者入队 omb.link-suggest', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const from = await createEntityOnBus('链接起点')
+      const to = await createEntityOnBus('链接终点')
+      const linked = await busOn(store).execute(
+        { type: 'Link', input: { fromId: from, toId: to, relation: 'related_to' } },
+        meta(),
+      )
+      if (!linked.ok) throw new Error(`创建链接失败：${linked.error.message}`)
+      const linkId = linked.value.events[0]?.streamId
+      if (linkId === undefined) throw new Error('链接命令没有返回事件')
+
+      const delivered = await waitFor(
+        async () => {
+          const row = await outboxRowOfStream(linkId, 'LinkCreated')
+          return row?.status === 'done' ? row : undefined
+        },
+        'LinkCreated 的 outbox 行被 relay 投递',
+      )
+      expect(delivered.attempts).toBe(0)
+
+      // 真实消费：不是只把 outbox 行标 done，而是入队了巩固任务。
+      const jobs = await waitFor(
+        async () => {
+          const rows = await linkSuggestJobs()
+          return rows.length > 0 ? rows : undefined
+        },
+        'reaction 入队 omb.link-suggest',
+      )
+      expect(jobs[0]?.singleton_key).toBe('link-suggest:event')
+      expect(jobs[0]?.data).toMatchObject({ trigger: 'outbox-link', topic: 'LinkCreated', linkId })
+
+      const text = await statusText(runtime)
+      expect(text).toContain('outbox=ok')
+      expect(text).toMatch(/outboxLagMs=0 outboxPending=0 outboxClaimed=0/)
+      expect(text).toContain('outboxDeadRows=0')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定 LinkUnlinked 事件当 relay 投递则同样触发 link-suggest，不因取消链接被静默丢弃', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const from = await createEntityOnBus('取消链接起点')
+      const to = await createEntityOnBus('取消链接终点')
+      const bus = busOn(store)
+      const linked = await bus.execute(
+        { type: 'Link', input: { fromId: from, toId: to, relation: 'related_to' } },
+        meta(),
+      )
+      if (!linked.ok) throw new Error(`创建链接失败：${linked.error.message}`)
+      const linkId = linked.value.events[0]?.streamId
+      if (linkId === undefined) throw new Error('链接命令没有返回事件')
+      const unlinked = await bus.execute({ type: 'Unlink', linkId }, meta())
+      if (!unlinked.ok) throw new Error(`取消链接失败：${unlinked.error.message}`)
+
+      const delivered = await waitFor(
+        async () => {
+          const row = await outboxRowOfStream(linkId, 'LinkUnlinked')
+          return row?.status === 'done' ? row : undefined
+        },
+        'LinkUnlinked 的 outbox 行被 relay 投递',
+      )
+      expect(delivered.attempts).toBe(0)
+      const jobs = await waitFor(
+        async () => {
+          const rows = await linkSuggestJobs()
+          return rows.some(row => row.data.topic === 'LinkUnlinked') ? rows : undefined
+        },
+        'LinkUnlinked 也入队 omb.link-suggest',
+      )
+      expect(jobs.some(row => row.data.topic === 'LinkUnlinked')).toBe(true)
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定 EntityArchived 事件当 relay 投递则明确 ack（不冒充未注册 topic）并计入 metric', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const id = await createEntityOnBus('归档 ack 验证')
+      const archived = await busOn(store).execute({ type: 'ArchiveEntity', id, reason: 'test-archive' }, meta())
+      if (!archived.ok) throw new Error(`归档失败：${archived.error.message}`)
+
+      const delivered = await waitFor(
+        async () => {
+          const row = await outboxRowOfStream(id, 'EntityArchived')
+          return row?.status === 'done' ? row : undefined
+        },
+        'EntityArchived 被 ack',
+      )
+      expect(delivered.attempts).toBe(0)
+
+      const text = await statusText(runtime)
+      expect(text).toContain('outboxAcked=1')
+      expect(text).toContain('outboxAckedByTopic=EntityArchived:1')
+      expect(text).toContain('outboxDeadRows=0')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定 dead outbox 行当 omb_admin replay 则回 pending 并被真实消费者重新投递，重复重放幂等', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const from = await createEntityOnBus('重放链接起点')
+      const to = await createEntityOnBus('重放链接终点')
+      // 手工构造一条 dead 行（等价“消费者上线前积压的死信”）：event/outbox 与 writer 同形。
+      const linkId = `link_${randomUUID()}`
+      const audit = await store.db.query<{ id: string }>(
+        `insert into omb.audit_log (actor, action, event_type, stream_id, stream_version, target_ids)
+         values ('test', 'link', 'LinkCreated', $1, 1, $2::text[])
+         returning id`,
+        [linkId, [from, to]],
+      )
+      const eventId = Number(audit.rows[0]?.id)
+      const payload = {
+        id: String(eventId),
+        seq: eventId,
+        streamId: linkId,
+        streamVersion: 1,
+        type: 'LinkCreated',
+        actor: { id: 'test', kind: 'system' },
+        origin: 'test',
+        occurredAt: new Date().toISOString(),
+        payload: { entityId: from, linkId, fromId: from, toId: to, relation: 'related_to', directed: true, strength: 0.5 },
+      }
+      const outbox = await store.db.query<{ id: string }>(
+        `insert into omb.outbox (event_id, topic, payload, status, attempts, last_error)
+         values ($1, 'LinkCreated', $2::jsonb, 'dead', 4, '模拟死信')
+         returning id`,
+        [eventId, JSON.stringify(payload)],
+      )
+      const outboxId = Number(outbox.rows[0]?.id)
+      expect(Number.isSafeInteger(outboxId)).toBe(true)
+
+      const replayed = await runtime.host.tools.get('omb_admin')?.execute(
+        { action: 'replay', outboxId, reason: 'e2e 重放' },
+        EXEC,
+      )
+      expect(replayed?.ok).toBe(true)
+      expect(replayed?.text).toContain('已重放 1 行 dead → pending')
+      expect(replayed?.text).toContain('LinkCreated')
+      expect(replayed?.text).toContain('attempts=4')
+
+      const delivered = await waitFor(
+        async () => {
+          const rows = await store.db.query<OutboxRow>(
+            'select id::int as id, status, last_error, attempts from omb.outbox where id = $1',
+            [outboxId],
+          )
+          const row = rows.rows[0]
+          return row?.status === 'done' ? row : undefined
+        },
+        '重放后的 dead 行被真实消费者重新投递',
+      )
+      expect(delivered.attempts).toBe(0)
+      const jobs = await linkSuggestJobs()
+      expect(jobs.some(job => job.data.linkId === linkId)).toBe(true)
+
+      const audits = await store.db.query<{ count: number }>(
+        "select count(*)::int as count from omb.audit_log where action = 'outbox-replay'",
+      )
+      expect(audits.rows[0]?.count).toBe(1)
+
+      // 重复 replay：行已经 done，不再写审计，也不会让消费者再跑一次。
+      const again = await runtime.host.tools.get('omb_admin')?.execute(
+        { action: 'replay', outboxId, reason: 'e2e 重放' },
+        EXEC,
+      )
+      expect(again?.ok).toBe(true)
+      expect(again?.text).toContain('没有匹配的 dead outbox 行')
+      const auditsAgain = await store.db.query<{ count: number }>(
+        "select count(*)::int as count from omb.audit_log where action = 'outbox-replay'",
+      )
+      expect(auditsAgain.rows[0]?.count).toBe(1)
+      expect((await linkSuggestJobs()).filter(job => job.data.linkId === linkId)).toHaveLength(1)
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定 replay 缺少 outboxId 与 topic 当调用 omb_admin 则返回 invalid-input，不猜全量重放', async () => {
+    const runtime = startRuntime()
+    try {
+      await statusText(runtime)
+      const result = await runtime.host.tools.get('omb_admin')?.execute({ action: 'replay' }, EXEC)
+      expect(result?.ok).toBe(false)
+      expect(result?.text).toContain('invalid-input')
+      expect(result?.text).toContain('outboxId')
+      expect(result?.text).toContain('topic')
+    } finally {
+      await runtime.stop()
+    }
+  })
+
+  it('给定未注册 topic 当 relay 投递则进死信并在 status 报出原因，不静默丢弃', async () => {
     const runtime = startRuntime()
     try {
       await statusText(runtime)
       const audit = await store.db.query<{ id: string }>(
         `insert into omb.audit_log (actor, action, event_type, stream_id, stream_version)
-         values ('test', 'probe', 'EntityArchived', $1, 1)
+         values ('test', 'probe', 'TopicWithoutConsumer', $1, 1)
          returning id`,
         [`probe-${randomUUID()}`],
       )
@@ -413,13 +669,13 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       if (eventId === undefined) throw new Error('没有拿到 audit_log.id')
       const outbox = await store.db.query<{ id: string }>(
         `insert into omb.outbox (event_id, topic, payload)
-         values ($1, 'EntityArchived', '{}'::jsonb)
+         values ($1, 'TopicWithoutConsumer', '{}'::jsonb)
          returning id`,
         [eventId],
       )
-      const outboxId = outbox.rows[0]?.id
-      if (outboxId === undefined) throw new Error('没有拿到 outbox.id')
-      await store.db.query('select pg_notify($1, $2)', [OUTBOX_CHANNEL, outboxId])
+      const outboxId = Number(outbox.rows[0]?.id)
+      if (!Number.isSafeInteger(outboxId) || outboxId <= 0) throw new Error('没有拿到 outbox.id')
+      await store.db.query('select pg_notify($1, $2)', [OUTBOX_CHANNEL, String(outboxId)])
 
       const dead = await waitFor(
         async () => {
@@ -433,7 +689,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
         '未注册 topic 进死信',
       )
       // 策略是 dead（不是静默 skip）：错误里点名 topic，可按 topic 补注册后重放。
-      expect(dead.last_error).toContain('EntityArchived')
+      expect(dead.last_error).toContain('TopicWithoutConsumer')
       // 死信也走一次 fail 写结果：attempts 记录本次投递，便于对账而不是假装没尝试过。
       expect(dead.attempts).toBe(1)
 
@@ -441,6 +697,10 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       expect(text).toContain('outboxDead=1')
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('outboxLastError=')
+      // 死信原因不只存在内存 lastError：status 读真实 dead 行（含条数与原因）。
+      expect(text).toContain('outboxDeadRows=1 outboxDeadRowsScope=db')
+      expect(text).toContain(`outboxDeadRecent=id=${outboxId} attempts=1 topic=TopicWithoutConsumer`)
+      expect(text).toContain('没有注册 reaction')
     } finally {
       await runtime.stop()
     }
@@ -478,13 +738,14 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
         async () => {
           const current = await statusText(runtime)
           // timerFired 是本进程累计，含 consolidation 的启动首轮，所以只断言 >=1；
-          // 同时等 consolidation 全部 rearm，避免两条 SQL 之间正常在途造成差值。
-          return /timerFired=[1-9]\d*/.test(current)
-            && metric(current, 'consolidationPending') === EXPECTED_CONSOLIDATION_TIMERS
-            ? current
-            : undefined
+          // 同时等 consolidation 全部 rearm 且两条计数一致（两条 SQL 之间可能撞上一次 rearm/claim）。
+          if (!/timerFired=[1-9]\d*/.test(current)) return undefined
+          if (metric(current, 'consolidationPending') !== EXPECTED_CONSOLIDATION_TIMERS) return undefined
+          if (metric(current, 'timerPending') !== metric(current, 'consolidationPending')) return undefined
+          if (metric(current, 'timerClaimed') !== metric(current, 'consolidationClaimed')) return undefined
+          return current
         },
-        'status 报 timerFired>=1 且巩固任务已 rearm',
+        'status 报 timerFired>=1 且巩固任务已 rearm、timer 聚合数一致',
       )
       // probe timer 已 done；剩下的 timer 只应来自 consolidation 的 durable schedule。
       expect(metric(text, 'timerPending') - metric(text, 'consolidationPending')).toBe(0)

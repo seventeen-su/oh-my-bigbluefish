@@ -96,9 +96,11 @@ const historySchema = z.object({
 })
 
 const adminSchema = z.object({
-  action: z.enum(['audit', 'rollback', 'archive', 'unarchive']),
+  action: z.enum(['audit', 'rollback', 'archive', 'unarchive', 'replay']),
   auditId: z.number().int().positive().optional(),
   targetId: idText.optional(),
+  topic: z.string().min(1).max(MAX_ID_CHARS).optional().describe('replay 用：按 outbox topic 重放 dead 行'),
+  outboxId: z.number().int().positive().optional().describe('replay 用：按 omb.outbox.id 重放单条 dead 行'),
   reason: z.string().min(1).max(200).optional(),
   limit: z.number().int().min(1).max(100).optional(),
 })
@@ -338,7 +340,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_admin',
-    '需要查看审计、回滚某次后台操作，或手工归档/取消归档时调用；rollback 只支持有 inverse 的审计记录。',
+    '需要查看审计、回滚某次后台操作、手工归档/取消归档，或重放 dead outbox 事件时调用；rollback 只支持有 inverse 的审计记录；replay 用 outboxId 或 topic 二选一（都缺省会被拒绝），把 dead 行重置为 pending 并写一条 outbox-replay 审计。',
     toolParameters(adminSchema),
     async rawArgs => {
       const parsed = parseToolArgs(adminSchema, rawArgs)

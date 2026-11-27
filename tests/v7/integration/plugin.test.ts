@@ -314,6 +314,29 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
+  it('omb_admin 暴露 replay：宿主 schema 含 action/topic/outboxId，缺参数返回 invalid-input', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'admin-replay-session', header: { cwd: PROJECT } } } }
+    const definition = host.tools.get('omb_admin')
+    // 宿主看到的 schema 必须包含 replay，否则模型永远调用不到这个能力。
+    const schema = JSON.stringify(definition?.parameters)
+    expect(schema).toContain('"replay"')
+    expect(schema).toContain('"outboxId"')
+    expect(schema).toContain('"topic"')
+
+    const missing = await definition?.execute({ action: 'replay' }, exec)
+    expect(missing?.ok).toBe(false)
+    expect(missing?.text).toContain('invalid-input')
+    expect(missing?.text).toContain('outboxId 或 topic 二选一')
+    dispose()
+  })
+
   it('assistant 文本与工具参数引用命中时记录 adoption', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {

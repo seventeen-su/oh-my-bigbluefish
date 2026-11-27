@@ -25,6 +25,13 @@ export {
   type RetryPolicy,
 } from './retry.js'
 export { ReactionRegistry, errorMessage } from './registry.js'
+export type {
+  OutboxDeadRow,
+  OutboxDeadSummary,
+  OutboxReplayInput,
+  OutboxReplayResult,
+  OutboxReplayStore,
+} from './replay.js'
 export {
   OutboxRelay,
   emptyTickSummary,
