@@ -10,7 +10,7 @@ import {
 } from '../../../packages/v7/src/app/projections/index.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'
 import type { EntitySummary, StoreStats } from '../../../packages/v7/src/ports/store.js'
-import { buildResident } from '../../../packages/v7/src/recall/resident.js'
+import { buildResident, type ResidentBoardsReader } from '../../../packages/v7/src/recall/resident.js'
 import type { RecallEngine } from '../../../packages/v7/src/retrieval/engine.js'
 import type { RecallHit, RecallResult } from '../../../packages/v7/src/retrieval/types.js'
 
@@ -18,7 +18,8 @@ import type { RecallHit, RecallResult } from '../../../packages/v7/src/retrieval
  * T0 读投影看板的单元证据（不依赖 PostgreSQL）。
  *
  * 覆盖：优先读模型、状态只保留三类、两块都空/失败/超时回退写模型、trace 预算与
- * 来源标注、以及“用 boards 时恰好两条 SQL（不查 lag）”的读预算。
+ * 来源标注、“用 boards 时恰好两条 SQL（不查 lag）”，以及水位停摆（worker 挂着时
+ * 读模型会静默变旧）只在“超龄 **且** 还有未投影任务”时回退。
  * 真实 PG 的看板回填/投影由 integration/projection-wiring.test.ts 证明；
  * plugin 的注入接线由 integration/plugin.test.ts 证明。
  */
@@ -87,6 +88,29 @@ function taskStoreOf(onLag: () => void = () => {}): ProjectionTaskStore {
 
 function readApiOf(boards: BoardReader, onLag?: () => void): ProjectionReadApi {
   return new ProjectionReadApi({ store: taskStoreOf(onLag), boards, clock: clockOf() })
+}
+
+/** 一片看板的新鲜度：水位年龄 + 仍未投影的源行数（由读模型实现方提供）。 */
+interface FakeFreshness {
+  readonly watermarkAgeMs?: number
+  readonly unprojected: number
+}
+
+/** 直接返回快照的读取器：只测 resident.ts 的停摆判定，不经过 ProjectionReadApi 的 SQL。 */
+function boardsReaderOf(input: {
+  readonly preference?: readonly BoardItem[]
+  readonly state?: readonly BoardItem[]
+  readonly preferenceFreshness?: FakeFreshness
+  readonly stateFreshness?: FakeFreshness
+}): ResidentBoardsReader {
+  return {
+    readResidentBoards: async () => ({
+      preference: input.preference ?? [],
+      state: input.state ?? [],
+      ...(input.preferenceFreshness === undefined ? {} : { preferenceFreshness: input.preferenceFreshness }),
+      ...(input.stateFreshness === undefined ? {} : { stateFreshness: input.stateFreshness }),
+    }),
+  }
 }
 
 const stateHit: RecallHit = {
@@ -449,5 +473,135 @@ describe('T0 读投影看板', () => {
     expect(queries).toHaveLength(2)
     expect(built.text).toContain(PREFERENCE_BOARD_TITLE)
     expect(engine.calls).toBe(0)
+  })
+
+  it('给定看板水位超龄且仍有未投影任务当构建常驻文本则回退写模型并标 fallbackReason', async () => {
+    const boards = boardsReaderOf({
+      preference: [boardPreference()],
+      preferenceFreshness: { watermarkAgeMs: 120_000, unprojected: 2 },
+    })
+    const engine = engineProbe(stateResult())
+
+    const built = await buildResident(
+      engine.engine,
+      contextOf(),
+      600,
+      async () => statsOf(),
+      undefined,
+      async () => [preferenceSummary],
+      { reader: boards },
+    )
+
+    // 停摆时读模型的行还在、但已经不新：必须换成写模型，而不是静默注入旧值。
+    expect(built.text).toContain(`偏好：${preferenceSummary.title}`)
+    expect(built.text).toContain('库索引')
+    const preferenceSection = built.trace.sections.find(section => section.name === 'preferences')
+    expect(preferenceSection).toMatchObject({ kept: true, source: 'write-model' })
+    expect(preferenceSection?.fallbackReason).toBe(
+      'read-model-watermark-stale: preference_board watermarkAgeMs=120000 unprojected=2',
+    )
+    expect(built.preferenceHits).toEqual([{ id: preferenceSummary.id, title: preferenceSummary.title }])
+  })
+
+  it('给定水位超龄但没有未投影任务当构建常驻文本则仍用读模型（空闲不是停摆）', async () => {
+    // 长时间没有写入时水位同样很老，但读模型并没有落后：这时回退只是白花查询。
+    const boards = boardsReaderOf({
+      preference: [boardPreference()],
+      preferenceFreshness: { watermarkAgeMs: 3_600_000, unprojected: 0 },
+    })
+    const engine = engineProbe(undefined)
+
+    const built = await buildResident(
+      engine.engine,
+      contextOf(),
+      600,
+      undefined,
+      undefined,
+      undefined,
+      { reader: boards },
+    )
+
+    expect(built.text).toContain(PREFERENCE_BOARD_TITLE)
+    expect(built.trace.sections.find(section => section.name === 'preferences')).toMatchObject({
+      kept: true,
+      source: 'read-model',
+    })
+    expect(built.trace.sections.some(section => section.fallbackReason !== undefined)).toBe(false)
+    expect(engine.calls).toBe(0)
+  })
+
+  it('给定水位未超龄但仍有待投影任务当构建常驻文本则仍用读模型（正常在途）', async () => {
+    const boards = boardsReaderOf({
+      preference: [boardPreference()],
+      preferenceFreshness: { watermarkAgeMs: 5_000, unprojected: 3 },
+    })
+    const engine = engineProbe(undefined)
+
+    const built = await buildResident(
+      engine.engine,
+      contextOf(),
+      600,
+      undefined,
+      undefined,
+      undefined,
+      { reader: boards },
+    )
+
+    expect(built.text).toContain(PREFERENCE_BOARD_TITLE)
+    expect(built.trace.sections.find(section => section.name === 'preferences')?.source).toBe('read-model')
+    expect(engine.calls).toBe(0)
+  })
+
+  it('给定水位门槛可配置当年龄超过配置值则按配置回退', async () => {
+    const boards = boardsReaderOf({
+      preference: [boardPreference()],
+      preferenceFreshness: { watermarkAgeMs: 2_000, unprojected: 1 },
+    })
+    const engine = engineProbe(stateResult())
+
+    const built = await buildResident(
+      engine.engine,
+      contextOf(),
+      600,
+      async () => statsOf(),
+      undefined,
+      async () => [preferenceSummary],
+      { reader: boards, maxWatermarkAgeMs: 1_000 },
+    )
+
+    const preferenceSection = built.trace.sections.find(section => section.name === 'preferences')
+    expect(preferenceSection?.source).toBe('write-model')
+    expect(preferenceSection?.fallbackReason).toBe(
+      'read-model-watermark-stale: preference_board watermarkAgeMs=2000 unprojected=1',
+    )
+  })
+
+  it('给定状态看板没有行但当水位超龄且仍有未投影任务则回退写模型（缺行也是旧读）', async () => {
+    // worker 停摆时新写的状态根本还没投影进来，读模型读到 0 行恰恰是最该回退的情形。
+    const boards = boardsReaderOf({
+      preference: [boardPreference()],
+      state: [],
+      stateFreshness: { watermarkAgeMs: 90_000, unprojected: 1 },
+    })
+    const engine = engineProbe(stateResult())
+
+    const built = await buildResident(
+      engine.engine,
+      contextOf(),
+      600,
+      async () => statsOf(),
+      undefined,
+      async () => [preferenceSummary],
+      { reader: boards },
+    )
+
+    expect(built.trace.sections.find(section => section.name === 'preferences')?.source).toBe('write-model')
+    const stateSection = built.trace.sections.find(section => section.name === 'states')
+    expect(stateSection).toMatchObject({ kept: true, source: 'write-model' })
+    expect(stateSection?.fallbackReason).toBe(
+      'read-model-watermark-stale: state_board watermarkAgeMs=90000 unprojected=1',
+    )
+    // 回退后状态来自写模型（engine），所以没有 boards 路径的 stateHits。
+    expect(built.stateHits).toEqual([])
   })
 })

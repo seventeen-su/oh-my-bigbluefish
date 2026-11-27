@@ -14,6 +14,13 @@ import type {
 export const DEFAULT_RESIDENT_BUDGET = 600
 /** 读模型等待预算：超时立即回退写模型，不把整个 T0 预算耗在读模型上。 */
 const DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS = 250
+/**
+ * 看板水位超龄门槛。
+ *
+ * 判据是“水位比现在老这么久 **且** 还有没投影的源行”：只靠年龄会把“长时间没写”
+ * 误判成停摆（那时读模型并没有落后），两者一起才说明 worker 真的停在那里、读模型在静默变旧。
+ */
+const DEFAULT_BOARDS_WATERMARK_MAX_AGE_MS = 30_000
 /** T0 偏好/状态的条数上限；预算裁剪仍由 token 预算决定。 */
 const RESIDENT_PREFERENCE_LIMIT = 5
 const RESIDENT_STATE_LIMIT = 5
@@ -42,31 +49,48 @@ interface ResidentBoardItem {
   readonly status?: StateStatus
 }
 
-interface ResidentBoardsQuery {
+export interface ResidentBoardsQuery {
   readonly projectKey?: string
   readonly preferenceLimit?: number
   readonly stateLimit?: number
 }
 
-interface ResidentBoardsSnapshot {
+/**
+ * 一块看板的新鲜度（由读模型实现方提供）：水位年龄 + 仍未投影的源行数。
+ *
+ * recall 层不查库，也不认识 PostgreSQL；它只按这两个事实判断“读模型是否停摆”。
+ */
+export interface ResidentBoardFreshness {
+  /** `now - watermark`（毫秒）；从未成功投影过时缺省。 */
+  readonly watermarkAgeMs?: number
+  /** 仍未被投影的源行数；>0 说明读模型可能落后于写模型。 */
+  readonly unprojected: number
+}
+
+export interface ResidentBoardsSnapshot {
   readonly preference: readonly ResidentBoardItem[]
   readonly state: readonly ResidentBoardItem[]
+  /** 偏好看板的新鲜度；读取器不提供时缺省（退化为旧的“只看空/错/超时”语义）。 */
+  readonly preferenceFreshness?: ResidentBoardFreshness
+  readonly stateFreshness?: ResidentBoardFreshness
 }
 
 /**
  * T0 优先读取的投影看板（消费方定义的窄端口）。
  *
- * 实现方是 plugin 组合根里的 `ProjectionReadApi.readResidentBoards`：每个看板一条
- * SQL，不带 lag/token 等待。失败、超时或两块都为空时由 buildResident 回退到
- * engine/stats 旧路径并在 trace 里标来源，绝不静默返回读模型空结果。
+ * 实现方是 plugin 组合根里的「ProjectionReadApi + 看板新鲜度」组合：两块看板各一条
+ * SQL、新鲜度一条 SQL，不带 lag/token 等待。失败、超时、两块都为空或水位停摆时由
+ * buildResident 回退到 engine/stats 旧路径并在 trace 里标来源，绝不静默返回读模型空结果。
  */
-interface ResidentBoardsReader {
+export interface ResidentBoardsReader {
   readResidentBoards(query: ResidentBoardsQuery): Promise<ResidentBoardsSnapshot>
 }
 
 export interface ResidentBoardsOptions {
   readonly reader: ResidentBoardsReader
   readonly timeoutMs?: number
+  /** 水位超龄门槛（毫秒），默认 30s；只和“还有未投影任务”一起判停摆。 */
+  readonly maxWatermarkAgeMs?: number
 }
 
 /** trace 里一段内容的来源：读模型，或读模型不可用时的写模型回退。 */
@@ -289,6 +313,34 @@ function fallbackReasonOf(outcome: BoardsReadOutcome): string {
   return 'read-model-empty'
 }
 
+/**
+ * 水位停摆判据：某块看板“水位比门槛老 **且** 还有未投影任务”时读模型在静默变旧。
+ *
+ * 只看年龄不够：长时间没有写入时水位同样很老，但读模型并没有落后，回退写模型只会
+ * 白花查询并让日志噪音常驻。两者同时成立才是 worker 停在那里。
+ *
+ * 也不看“这块看板有没有读到行”：停摆时新写的行根本还没投影进来，读到 0 行恰恰是
+ * 最该回退的情形（缺失行同样是旧读）。
+ */
+function watermarkStaleReason(
+  snapshot: ResidentBoardsSnapshot,
+  maxWatermarkAgeMs: number,
+): string | undefined {
+  const limit = Number.isFinite(maxWatermarkAgeMs) ? Math.max(1, Math.trunc(maxWatermarkAgeMs)) : DEFAULT_BOARDS_WATERMARK_MAX_AGE_MS
+  const boards: readonly [string, ResidentBoardFreshness | undefined][] = [
+    ['preference_board', snapshot.preferenceFreshness],
+    ['state_board', snapshot.stateFreshness],
+  ]
+  for (const [projection, freshness] of boards) {
+    if (freshness === undefined) continue
+    if (freshness.unprojected <= 0) continue
+    const age = freshness.watermarkAgeMs
+    if (age === undefined || age <= limit) continue
+    return `read-model-watermark-stale: ${projection} watermarkAgeMs=${Math.trunc(age)} unprojected=${freshness.unprojected}`
+  }
+  return undefined
+}
+
 function indexCandidates(index: StoreStats | undefined): ResidentCandidate[] {
   if (index === undefined) return []
   const candidates: ResidentCandidate[] = [{
@@ -342,9 +394,9 @@ function toTraceSection(candidate: ResidentCandidate, kept: boolean, tokens: num
 /**
  * T0 常驻层：固定预算内注入偏好、当前项目进行中/阻塞/等待状态与一行工具提示。
  *
- * 有 `boards` 读取器时优先读投影读模型（两块看板各一条 SQL，不跑六通道）；
- * 读模型失败/超时/两块都为空则回退 engine/stats 的写模型路径，并在 trace 的
- * section.source/fallbackReason 里标出来源，不静默把空读模型当成“没有内容”。
+ * 有 `boards` 读取器时优先读投影读模型（两块看板各一条 SQL + 一条新鲜度 SQL，不跑六通道）；
+ * 读模型失败/超时/两块都为空/水位超龄且还有未投影任务，都回退 engine/stats 的写模型路径，
+ * 并在 trace 的 section.source/fallbackReason 里标出来源，不静默把空的或停摆的读模型当成“没有内容”。
  *
  * 返回值同时包含文本和 trace：trace 记录每个候选段落是否被预算裁掉，调用方负责
  * 落库；只读，不写 recall_event 的 adopted 字段。
@@ -385,7 +437,15 @@ export async function buildResident(
         boards.timeoutMs ?? DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS,
       )
 
-  if (boardOutcome?.snapshot !== undefined) {
+  // 读模型有行也可能已经落后：worker 停摆时水位不再前进。超龄且仍有未投影任务就回退写模型。
+  const staleReason = boardOutcome?.snapshot === undefined
+    ? undefined
+    : watermarkStaleReason(
+        boardOutcome.snapshot,
+        boards?.maxWatermarkAgeMs ?? DEFAULT_BOARDS_WATERMARK_MAX_AGE_MS,
+      )
+
+  if (boardOutcome?.snapshot !== undefined && staleReason === undefined) {
     usedBoards = true
     const preferenceCandidate = compactBoardSummaries(
       boardOutcome.snapshot.preference,
@@ -406,7 +466,7 @@ export async function buildResident(
       toolHint,
     ]
   } else {
-    if (boardOutcome !== undefined) fallbackReason = fallbackReasonOf(boardOutcome)
+    if (boardOutcome !== undefined) fallbackReason = staleReason ?? fallbackReasonOf(boardOutcome)
     const [preferenceItems, states, index] = await Promise.all([
       preferences === undefined ? Promise.resolve(undefined) : preferences().catch(() => undefined),
       projectKey === undefined ? Promise.resolve(undefined) : engine.recall({

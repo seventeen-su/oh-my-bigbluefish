@@ -23,6 +23,7 @@ import {
 import { PgBossQueue, describeJobHealth } from '../../packages/v7/src/adapters/pg-boss/index.js'
 import { PostgresOutboxNotifier, PostgresOutboxStore } from '../../packages/v7/src/adapters/postgres/outbox.js'
 import { PostgresTimerNotifier, PostgresTimerStore } from '../../packages/v7/src/adapters/postgres/timer.js'
+import type { ListenNotifierStatus } from '../../packages/v7/src/adapters/postgres/listen.js'
 import { PostgresWorkflowStore } from '../../packages/v7/src/adapters/postgres/workflow.js'
 import type { JobFinalFailureSummary, JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import { createEventCapture } from '../../packages/v7/src/adapters/dsh/events.js'
@@ -51,7 +52,7 @@ import type { LinkInput } from '../../packages/v7/src/domain/link.js'
 import { registerConsolidationJobs, registerEmbedJob, startConsolidationLoop } from '../../packages/v7/src/jobs/index.js'
 import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
-import { buildEventRecallText, buildResident } from '../../packages/v7/src/recall/resident.js'
+import { buildEventRecallText, buildResident, type ResidentBoardsOptions, type ResidentBoardsQuery } from '../../packages/v7/src/recall/resident.js'
 import { LazyInitializer } from './startup.js'
 import { Supervisor, TEARDOWN_STEP_TIMEOUT_MS, runTeardownSteps, wireHostHook, type TeardownStep } from './supervisor.js'
 import { registerSkills } from './skills.js'
@@ -514,6 +515,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   let projectionWorker: ProjectionWorker | undefined
   let projectionReadApi: ProjectionReadApi | undefined
   let projectionNotifier: PostgresProjectionNotifier | undefined
+  /** T0 用的看板读取器：除看板行外还要读一次水位新鲜度（worker 停摆时读模型会静默变旧）。 */
+  let projectionBoardReader: ReturnType<typeof createBoardReader> | undefined
   // 事件运行时：DB ready 且投影启动之后才构造/启动（task-42 的顺序要求）。
   // relay/timer/workflow 都依赖连接池，必须早于 store.close 停止。
   let runtimeStarted = false
@@ -526,6 +529,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   // runtime.stats() 的 dead/completed 是**本进程累计**；status 里的 workflow 状态计数
   // 要读 DB 行状态，所以单独保留 workflow store 的实时读数入口。
   let workflowStoreRef: PostgresWorkflowStore | undefined
+  /** 进行中的一次有界对账：三个 notifier 同时重连时合并，避免重复查询。 */
+  let reconcileRunning: Promise<void> | undefined
 
   /**
    * 构造并启动投影链路。顺序固定：
@@ -543,6 +548,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     try {
       await notifier.ready()
       const tasks = new PostgresProjectionTaskStore(store.db)
+      const boards = createBoardReader(store.db)
       const worker = new ProjectionWorker(
         {
           store: tasks,
@@ -556,17 +562,24 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       const recovered = await worker.recover()
       worker.start()
       projectionWorker = worker
+      projectionBoardReader = boards
       projectionReadApi = new ProjectionReadApi({
         store: tasks,
-        boards: createBoardReader(store.db),
+        boards,
         clock,
         wake: notifier,
+      })
+      // LISTEN 断线重连后做一次有界对账（扫一次 lag 并叫醒），不引入固定轮询。
+      notifier.onReconnect(() => {
+        logger.info('投影 LISTEN 已重连', notifier.status())
+        scheduleReconcile()
       })
       projectionStarted = true
       logger.info('投影 worker 已启动', { projections: worker.projections(), recovered })
     } catch (error) {
       projectionWorker = undefined
       projectionReadApi = undefined
+      projectionBoardReader = undefined
       await notifier.close().catch(() => {})
       throw error
     }
@@ -583,6 +596,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
     try {
       const lag = await projectionReadApi.lag()
+      // status 也是一次有界的“叫醒”机会：worker 停摆（NOTIFY 丢了/连接刚恢复）时
+      // 不该等到下一次写入才恢复。这里只 wake，不 tick、不轮询。
+      if (lag.some(item => item.due > 0)) projectionWorker?.wake()
       // 只有 writer 真正入队的投影才标 registered=yes：其余读模型还没接线，不能让它看起来在跑。
       const registered = new Set(REGISTERED_PROJECTIONS.map(item => item.projection))
       return [
@@ -603,6 +619,81 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   }
 
   /**
+   * LISTEN 连接的可观测读数（三段各一行）：是否连着、重连了几次、发起过几次连接。
+   *
+   * 断连后不再静默停摆：重连计数在 `omb_status` 里可见，`connected=false` 表示退避中。
+   * 未启动（jobs=false / 初始化失败）时显式报 unknown，不伪报 true。
+   */
+  function listenStatusLines(): string[] {
+    const line = (label: string, notifier: { status(): ListenNotifierStatus } | undefined): string[] => {
+      if (notifier === undefined) {
+        return [`${label}ListenConnected=unknown ${label}ListenReconnects=unknown ${label}ListenAttempts=unknown`]
+      }
+      const status = notifier.status()
+      return [
+        [
+          `${label}ListenConnected=${status.connected}`,
+          `${label}ListenReconnects=${status.reconnects}`,
+          `${label}ListenAttempts=${status.connectAttempts}`,
+        ].join(' '),
+        ...(status.lastError === undefined ? [] : [`${label}ListenLastError=${status.lastError}`]),
+      ]
+    }
+    return [
+      ...line('projection', projectionNotifier),
+      ...line('outbox', outboxNotifier),
+      ...line('timer', timerNotifier),
+    ]
+  }
+
+  /**
+   * 一次性、有界的对账：各查一次“有没有到期/旧 pending”，有就叫醒对应循环。
+   *
+   * 触发点只有两个：LISTEN 重连成功、`omb_status` 调用——两者都不是固定节拍，
+   * 所以它既不让漏掉的 NOTIFY 变成永久停摆，也不额外引入轮询。
+   * 数据库重启会让三个 notifier 同时重连：这里合并成一次对账，仍然是“有界一次”。
+   */
+  async function reconcileOnce(source: 'reconnect' | 'status'): Promise<void> {
+    const running = reconcileRunning
+    if (running !== undefined) {
+      await running
+      return
+    }
+    const run = runReconcile(source)
+    reconcileRunning = run
+    try {
+      await run
+    } finally {
+      if (reconcileRunning === run) reconcileRunning = undefined
+    }
+  }
+
+  async function runReconcile(source: 'reconnect' | 'status'): Promise<void> {
+    const pending: Promise<unknown>[] = []
+    if (outboxRelay !== undefined) pending.push(outboxRelay.reconcile())
+    if (timerWorker !== undefined) pending.push(timerWorker.recover())
+    if (projectionWorker !== undefined) pending.push(projectionWorker.recover())
+    workflowRuntime?.wake()
+    if (pending.length === 0) return
+    const settled = await Promise.allSettled(pending)
+    const failed = settled.filter(item => item.status === 'rejected')
+    if (failed.length > 0) {
+      const reasons = failed
+        .map(item => (item.status === 'rejected' ? messageOf(item.reason) : ''))
+        .filter(reason => reason.length > 0)
+        .join('; ')
+      logger.warn('事件运行时对账失败（下一次 status/重连会再试）', { source, reasons })
+    }
+  }
+
+  /** 重连回调里触发一次对账；失败只记日志，绝不把异常抛进 pg 的事件循环/宿主。 */
+  function scheduleReconcile(): void {
+    void reconcileOnce('reconnect').catch(error => {
+      logger.warn('事件运行时对账异常', messageOf(error))
+    })
+  }
+
+  /**
    * 构造并启动事件运行时（outbox relay / timer worker / workflow runtime）。
    *
    * 顺序固定：
@@ -614,13 +705,12 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
    *    pending 并唤醒循环（启动恢复）。
    *
    * 没有固定轮询：relay 空闲时等 NOTIFY，timer/workflow 只在有未来到期行时 arm 一个
-   * 单次定时器；本函数不新增 setInterval。`OutboxRelay.reconcile()` 的兜底扫描也没有接线：
-   * 它需要一个固定节拍，与“不新增固定轮询”冲突；漏掉的唤醒由下一次 NOTIFY、relay 首次
-   * drain 与重启后的恢复投递兜底（未接线的安全网不冒充已启用）。
+   * 单次定时器；本函数不新增 setInterval。
    *
-   * 已知边界（与投影 notifier 同款适配器行为）：LISTEN 连接断开后适配器不自动重连。
-   * 数据库重启后 outbox pending/lag 仍在 status 实测可见，插件/D SH 重启会重新 LISTEN
-   * 并在首次 drain 投递；本次不引入固定轮询去补这个缺口。
+   * 断连恢复：两个 LISTEN 连接自带指数退避重连（`adapters/postgres/listen.ts`），重连成功后
+   * 重新 LISTEN、唤醒对应 worker，并触发一次有界 `reconcileOnce()`（数一次旧 pending/到期
+   * timer 并叫醒）。这样数据库重启/kill 连接后不需要重启插件，也不会靠固定轮询兜底；
+   * `OutboxRelay.reconcile()` 因此有了真实消费者，不再是一条没接线的安全网。
    *
    * 失败时把已启动的循环停掉、LISTEN 连接关掉再抛出，由 LazyInitializer 的下一次真实
    * 调用整体重试，不留半启动的 worker/连接。
@@ -673,6 +763,15 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
       timer.start()
       workflow.start()
       const recovered = await workflow.recover()
+      // 断线重连只触发一次有界对账，不引入固定轮询；close 时 notifier 会清掉这些监听。
+      outboxListen.onReconnect(() => {
+        logger.info('outbox LISTEN 已重连', outboxListen.status())
+        scheduleReconcile()
+      })
+      timerListen.onReconnect(() => {
+        logger.info('timer LISTEN 已重连', timerListen.status())
+        scheduleReconcile()
+      })
       // 全部成功后才回写状态：失败时不留“看起来在跑”的引用。
       outboxNotifier = outboxListen
       timerNotifier = timerListen
@@ -737,6 +836,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     const lines: string[] = []
     try {
       const stats = await outboxRelay.stats()
+      // status 调用时做一次有界“叫醒”：有 pending 就 wake relay 补一次 drain。
+      // 这不是轮询——只有用户/模型真的调用 omb_status 时才发生。
+      if (stats.pending > 0) outboxRelay.wake()
       lines.push(
         'outbox=ok',
         // pending/claimed/lag 是实时 SQL；dead 是本进程累计（OutboxStore 端口没有跨进程
@@ -751,6 +853,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
     try {
       const stats = await timerWorker.stats()
+      // 与 outbox 同款：有未派发的 timer 就 wake 一次，让停在“无未来到期”的循环重新算延时。
+      if (stats.pending > 0) timerWorker.wake()
       lines.push(
         'timer=ok',
         `timerPending=${stats.pending} timerClaimed=${stats.claimed} timerDueAgeMs=${stats.oldestDueAgeMs} timerDead=${stats.deadTimers}`,
@@ -922,6 +1026,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           'projection=unknown',
           'projectionReason=db-down',
           ...runtimeUnknownLines('db-down'),
+          // 数据库不可达时 LISTEN 也必然断开/在退避：连接读数正是这时候最该如实报出来。
+          ...listenStatusLines(),
           ...describeJobHealth({
             enabled: config.jobs,
             initialized: false,
@@ -950,6 +1056,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           }),
           ...(await projectionStatusLines()),
           ...(await runtimeStatusLines()),
+          // LISTEN 断连不再静默：connected/reconnects 是运维判断“要不要重启”的第一手读数。
+          ...listenStatusLines(),
           ...surfaceLines,
         ]
         if (!initialized && startup.error !== undefined) {
@@ -963,6 +1071,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           'projection=unknown',
           'projectionReason=status-query-failed',
           ...runtimeUnknownLines('status-query-failed'),
+          ...listenStatusLines(),
           ...describeJobHealth({
             enabled: config.jobs,
             initialized,
@@ -1250,6 +1359,33 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   }
 
   /**
+   * T0 用的投影看板读取器：两块看板（各 1 条 SQL）+ 看板新鲜度（1 条 SQL）。
+   *
+   * 新鲜度必须来自读模型侧：水位年龄与未投影任务数是判断“worker 是否停摆”的唯一可信
+   * 信号，`recall/resident.ts` 只做阈值判断（它不依赖适配器，也就不能自己查库）。
+   * 新鲜度查询失败不阻断 T0：退化成“没有新鲜度”的旧语义，并留下日志。
+   */
+  function residentBoardsOptions(): ResidentBoardsOptions | undefined {
+    const api = projectionReadApi
+    const boards = projectionBoardReader
+    if (!projectionStarted || api === undefined || boards === undefined) return undefined
+    return {
+      reader: {
+        async readResidentBoards(query: ResidentBoardsQuery) {
+          const [snapshot, freshness] = await Promise.all([
+            api.readResidentBoards(query),
+            boards.readFreshness().catch(error => {
+              logger.warn('T0 看板新鲜度查询失败', messageOf(error))
+              return undefined
+            }),
+          ])
+          return freshness === undefined ? snapshot : { ...snapshot, ...freshness }
+        },
+      },
+    }
+  }
+
+  /**
    * 汇总本步的 T1 准备结果（只计算 + 写 T0），不碰 decision：
    * - T0（常驻）仍写 `systemPrompt.context` provider（promptSink）；空 T0 也覆盖写空串（RUN-04）；
    * - T1（事件召回）不再写 promptSink：provider 是装配期快照，逐步骤高频 T1 会退化成
@@ -1287,11 +1423,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
           () => store.stats(),
           notice => rememberInjection(sessionId, notice),
           () => store.preferenceSummaries?.(5) ?? Promise.resolve([]),
-          // T0 优先读投影看板（preference/state 各一条 SQL）；投影未启动（DB 未就绪/
-          // 启动失败）时保持旧的 engine/stats 路径，行为与没有读模型前一致。
-          projectionStarted && projectionReadApi !== undefined
-            ? { reader: projectionReadApi }
-            : undefined,
+          // T0 优先读投影看板（两块看板各一条 SQL + 一条新鲜度 SQL）；投影未启动
+          // （DB 未就绪/启动失败）时保持旧的 engine/stats 路径，行为与没有读模型前一致。
+          residentBoardsOptions(),
         ),
         1_500,
       )

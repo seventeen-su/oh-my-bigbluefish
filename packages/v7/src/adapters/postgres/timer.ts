@@ -1,4 +1,3 @@
-import pg from 'pg'
 import type { QueryResult, QueryResultRow } from 'pg'
 import type {
   TimerCancelInput,
@@ -12,6 +11,7 @@ import type {
   TimerWakeSource,
 } from '../../app/workflow/index.js'
 import { iso, PostgresDb, type PostgresConfig } from './db.js'
+import { PostgresListenNotifier, type ListenNotifierStatus } from './listen.js'
 
 /** timer 提交后发出的低延迟唤醒信号；它只负责叫醒，不承载队列语义。 */
 export const TIMER_NOTIFY_CHANNEL = 'omb_timer'
@@ -258,86 +258,44 @@ export async function notifyTimer(executor: TimerQueryExecutor, topic: string): 
 
 /**
  * NOTIFY 监听器（LISTEN 需要专用连接，不能占用连接池里的短连接）。
- * 它只负责唤醒；漏通知时由 worker 的 `nextDueAt` 兜底，因此这里不做自动重连。
+ *
+ * 它只负责唤醒。连接被终止/数据库重启后由共享的 `PostgresListenNotifier` 按指数退避
+ * 重连、重新 LISTEN 并唤醒订阅者（含 timer worker），不再把“断线”变成静默停摆；
+ * 漏掉的唤醒由重连后的一次性对账 + `nextDueAt` 的单次定时器兜底。
  */
 export class PostgresTimerNotifier implements TimerWakeSource {
-  private client: pg.Client | undefined
-  private connecting: Promise<void> | undefined
-  private readonly listeners = new Set<() => void>()
-  private closed = false
+  private readonly listen: PostgresListenNotifier
 
-  constructor(private readonly config: PostgresConfig) {}
+  constructor(config: PostgresConfig) {
+    this.listen = new PostgresListenNotifier({
+      connectionString: config.connectionString,
+      channel: TIMER_NOTIFY_CHANNEL,
+      applicationName: 'omb-v7-timer',
+      connectionTimeoutMillis: config.connectionTimeoutMillis ?? 5_000,
+    })
+  }
 
   /** 等待 LISTEN 真正注册完成；测试和需要确定性时序的调用方使用。 */
   async ready(): Promise<void> {
-    await this.listen()
+    await this.listen.ready()
   }
 
   subscribe(listener: () => void): () => void {
-    this.listeners.add(listener)
-    void this.listen().catch(() => {
-      // 连接失败不阻塞 worker 启动；NOTIFY 只是提示，nextDueAt 会兜底。
-    })
-    return () => {
-      this.listeners.delete(listener)
-    }
+    return this.listen.subscribe(listener)
+  }
+
+  /** 重连成功回调：组合根据此做一次有界对账（不是固定轮询）。 */
+  onReconnect(listener: () => void): () => void {
+    return this.listen.onReconnect(listener)
+  }
+
+  /** connected/reconnects 读数；`omb_status` 用它证明 LISTEN 没有静默停摆。 */
+  status(): ListenNotifierStatus {
+    return this.listen.status()
   }
 
   async close(): Promise<void> {
-    this.closed = true
-    this.listeners.clear()
-    const client = this.client
-    this.client = undefined
-    if (client !== undefined) await client.end().catch(() => {})
-  }
-
-  private listen(): Promise<void> {
-    if (this.client !== undefined) return Promise.resolve()
-    if (this.connecting !== undefined) return this.connecting
-    if (this.closed) return Promise.reject(new Error('timer notifier 已关闭'))
-    const connecting = this.open()
-    this.connecting = connecting
-    void connecting
-      .catch(() => {})
-      .finally(() => {
-        if (this.connecting === connecting) this.connecting = undefined
-      })
-    return connecting
-  }
-
-  private async open(): Promise<void> {
-    const client = new pg.Client({
-      connectionString: this.config.connectionString,
-      connectionTimeoutMillis: this.config.connectionTimeoutMillis ?? 5_000,
-      application_name: 'omb-v7-timer',
-    })
-    client.on('notification', message => {
-      if (message.channel !== TIMER_NOTIFY_CHANNEL) return
-      for (const listener of [...this.listeners]) {
-        try {
-          listener()
-        } catch {
-          // 单个监听器异常不能影响其它监听器，也不能把错误抛进 pg 的事件循环。
-        }
-      }
-    })
-    client.on('error', () => {
-      // 连接断开：丢弃它；漏掉的唤醒交给 nextDueAt 兜底。
-      if (this.client === client) this.client = undefined
-      void client.end().catch(() => {})
-    })
-    try {
-      await client.connect()
-      await client.query(`listen ${TIMER_NOTIFY_CHANNEL}`)
-    } catch (error) {
-      await client.end().catch(() => {})
-      throw error
-    }
-    if (this.closed) {
-      await client.end().catch(() => {})
-      throw new Error('timer notifier 已关闭')
-    }
-    this.client = client
+    await this.listen.close()
   }
 }
 

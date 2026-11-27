@@ -1,4 +1,3 @@
-import pg from 'pg'
 import type { QueryResult, QueryResultRow } from 'pg'
 import {
   PROJECTION_NAMES,
@@ -34,6 +33,7 @@ import {
   type StateStatus,
 } from '../../domain/entity.js'
 import { iso, PostgresDb, type PostgresConfig } from './db.js'
+import { PostgresListenNotifier, type ListenNotifierStatus } from './listen.js'
 
 /**
  * 投影队列 / 水位 / 看板读模型的 PostgreSQL 适配器（ARCHITECTURE-PLAN §4.4/§5.2/§5.3）。
@@ -336,6 +336,57 @@ select entity_id, title, status, project_key, event_time, revision::bigint as re
  order by (case status when 'in_progress' then 0 when 'blocked' then 1 else 2 end),
           event_time desc nulls last, entity_id asc
  limit $2
+`
+
+/**
+ * 一块看板的新鲜度：水位年龄 + 仍未投影的源行数。
+ *
+ * T0 只用它判断“读模型是否停摆”：worker 停摆时水位不再前进、任务堆在 pending/claimed，
+ * 读模型会静默变旧。阈值判断在 `recall/resident.ts`（消费方定义），这里只提供事实。
+ *
+ * 类型不导出：`createBoardReader()` 的返回类型已经把它带出来（见 `readFreshness`），
+ * 不额外扩大本文件的导出面（它已经在 15 个符号的上限上）。
+ */
+interface BoardFreshness {
+  /** `now() - watermark`（毫秒）：该投影从未成功投影过时缺省。 */
+  readonly watermarkAgeMs?: number
+  /** 仍处于 pending/claimed、尚未投影的源行数；>0 表示读模型可能落后于写模型。 */
+  readonly unprojected: number
+}
+
+interface BoardFreshnessPair {
+  readonly preferenceFreshness: BoardFreshness
+  readonly stateFreshness: BoardFreshness
+}
+
+interface FreshnessRow extends QueryResultRow {
+  projection: string
+  watermark_age_ms: string | number | null
+  unprojected: number
+}
+
+/**
+ * 两块看板的新鲜度放在同一条 SQL 里（T0 的读预算只多这一条，不额外查 lag/token）。
+ *
+ * `unprojected` 统计 pending/claimed 而**不是** `available_at <= now()`：退避等待中的
+ * 任务同样是“还没投影到读模型”的源行，用到期与否判断会把退避中的停摆漏掉。
+ */
+const BOARD_FRESHNESS_SQL = `
+select board.projection,
+       case
+         when w.projection is null then null
+         else (extract(epoch from (now() - w.watermark::timestamptz)) * 1000)::bigint
+       end as watermark_age_ms,
+       coalesce(t.unprojected, 0)::int as unprojected
+  from (values ('preference_board'), ('state_board')) as board(projection)
+  left join omb.projection_watermark w on w.projection = board.projection
+  left join (
+    select projection, count(*)::int as unprojected
+      from omb.projection_task
+     where projection in ('preference_board', 'state_board')
+       and status in ('pending', 'claimed')
+     group by projection
+  ) t on t.projection = board.projection
 `
 
 /**
@@ -642,84 +693,46 @@ export async function notifyProjection(executor: ProjectionQueryExecutor, projec
   await executor.query('select pg_notify($1, $2)', [PROJECTION_NOTIFY_CHANNEL, projection])
 }
 
-/** NOTIFY 监听器（LISTEN 需要专用连接）；只负责唤醒，漏通知时读调用方按 deadline 回退。 */
+/**
+ * NOTIFY 监听器（LISTEN 需要专用连接）。
+ *
+ * 它只负责唤醒。连接被终止/数据库重启后由共享的 `PostgresListenNotifier` 按指数退避
+ * 重连、重新 LISTEN 并唤醒订阅者（worker / 等 token 的读调用方）；漏掉的唤醒由重连后
+ * 的一次性对账 + 读调用方的 deadline 回退兜底。
+ */
 export class PostgresProjectionNotifier implements ProjectionWakeSource {
-  private client: pg.Client | undefined
-  private connecting: Promise<void> | undefined
-  private readonly listeners = new Set<() => void>()
-  private closed = false
+  private readonly listen: PostgresListenNotifier
 
-  constructor(private readonly config: PostgresConfig) {}
+  constructor(config: PostgresConfig) {
+    this.listen = new PostgresListenNotifier({
+      connectionString: config.connectionString,
+      channel: PROJECTION_NOTIFY_CHANNEL,
+      applicationName: 'omb-v7-projection',
+      connectionTimeoutMillis: config.connectionTimeoutMillis ?? 5_000,
+    })
+  }
 
   /** 等待 LISTEN 真正注册完成；测试与需要确定性时序的调用方使用。 */
   async ready(): Promise<void> {
-    await this.listen()
+    await this.listen.ready()
   }
 
   subscribe(listener: () => void): () => void {
-    this.listeners.add(listener)
-    void this.listen().catch(() => {
-      // 连接失败不阻塞 worker/读路径；NOTIFY 只是提示，deadline/下一次 tick 会兜底。
-    })
-    return () => {
-      this.listeners.delete(listener)
-    }
+    return this.listen.subscribe(listener)
+  }
+
+  /** 重连成功回调：组合根据此做一次有界对账（不是固定轮询）。 */
+  onReconnect(listener: () => void): () => void {
+    return this.listen.onReconnect(listener)
+  }
+
+  /** connected/reconnects 读数；`omb_status` 用它证明 LISTEN 没有静默停摆。 */
+  status(): ListenNotifierStatus {
+    return this.listen.status()
   }
 
   async close(): Promise<void> {
-    this.closed = true
-    this.listeners.clear()
-    const client = this.client
-    this.client = undefined
-    if (client !== undefined) await client.end().catch(() => {})
-  }
-
-  private listen(): Promise<void> {
-    if (this.client !== undefined) return Promise.resolve()
-    if (this.connecting !== undefined) return this.connecting
-    if (this.closed) return Promise.reject(new Error('projection notifier 已关闭'))
-    const connecting = this.open()
-    this.connecting = connecting
-    void connecting
-      .catch(() => {})
-      .finally(() => {
-        if (this.connecting === connecting) this.connecting = undefined
-      })
-    return connecting
-  }
-
-  private async open(): Promise<void> {
-    const client = new pg.Client({
-      connectionString: this.config.connectionString,
-      connectionTimeoutMillis: this.config.connectionTimeoutMillis ?? 5_000,
-      application_name: 'omb-v7-projection',
-    })
-    client.on('notification', message => {
-      if (message.channel !== PROJECTION_NOTIFY_CHANNEL) return
-      for (const listener of [...this.listeners]) {
-        try {
-          listener()
-        } catch {
-          // 单个监听器异常不能影响其它监听器，也不能把错误抛进 pg 的事件循环。
-        }
-      }
-    })
-    client.on('error', () => {
-      if (this.client === client) this.client = undefined
-      void client.end().catch(() => {})
-    })
-    try {
-      await client.connect()
-      await client.query(`listen ${PROJECTION_NOTIFY_CHANNEL}`)
-    } catch (error) {
-      await client.end().catch(() => {})
-      throw error
-    }
-    if (this.closed) {
-      await client.end().catch(() => {})
-      throw new Error('projection notifier 已关闭')
-    }
-    this.client = client
+    await this.listen.close()
   }
 }
 
@@ -822,6 +835,18 @@ class PostgresBoardReader implements BoardReader {
     return rows.rows.map(row => (query.kind === 'preference' ? this.preferenceItem(row) : this.stateItem(row)))
   }
 
+  /**
+   * 两块看板的 T0 新鲜度（1 条 SQL）：水位年龄 + 未投影任务数。
+   * 只回答“读模型有没有落后”，不读看板行、不查 lag、不等 token。
+   */
+  async readFreshness(): Promise<BoardFreshnessPair> {
+    const result = await this.db.query<FreshnessRow>(BOARD_FRESHNESS_SQL)
+    return {
+      preferenceFreshness: freshnessOf(result.rows, 'preference_board'),
+      stateFreshness: freshnessOf(result.rows, 'state_board'),
+    }
+  }
+
   private preferenceItem(row: DeriveRow | BoardRow): BoardItem {
     return {
       entityId: row.entity_id,
@@ -849,8 +874,19 @@ class PostgresBoardReader implements BoardReader {
 }
 
 /** 看板读模型读取器；`boardDerivationSql` 同时服务投影 worker 与超时回退。 */
-export function createBoardReader(db: PostgresDb): BoardReader {
+export function createBoardReader(db: PostgresDb): PostgresBoardReader {
   return new PostgresBoardReader(db)
+}
+
+/** 一行新鲜度 → T0 的窄形状；没有水位（从未成功投影）时只给 unprojected。 */
+function freshnessOf(rows: readonly FreshnessRow[], projection: ProjectionName): BoardFreshness {
+  const row = rows.find(item => item.projection === projection)
+  const raw = row?.watermark_age_ms
+  const age = raw === null || raw === undefined ? undefined : Number(raw)
+  return {
+    ...(age !== undefined && Number.isFinite(age) ? { watermarkAgeMs: Math.max(0, Math.trunc(age)) } : {}),
+    unprojected: Number(row?.unprojected ?? 0),
+  }
 }
 
 /**
