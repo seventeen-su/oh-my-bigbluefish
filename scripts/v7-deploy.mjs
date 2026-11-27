@@ -11,7 +11,7 @@
  * `--apply` 默认先探测 DSH（127.0.0.1:3080，一次 TCP connect）并拒绝；只有
  * `--force` 或 `OMB_DEPLOY_ALLOW_RUNNING=1` 才放行。dry-run 不探测也不写盘。
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -121,6 +121,27 @@ function smoke(build) {
   if (result.status !== 0) throw new Error(`bundle smoke 失败：${result.status ?? 'unknown'}`)
 }
 
+/** 只保留最近 3 代 v7-g*（当前 + 2 代回退），清掉更早的 g31/g32/g33 等旧代。 */
+function pruneOldGenerations(currentGeneration) {
+  const libGen = join(TARGET, 'lib-gen')
+  if (!existsSync(libGen)) return
+  const generations = readdirSync(libGen, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^v7-g\d+$/.test(entry.name))
+    .map(entry => ({ name: entry.name, number: Number(/^v7-g(\d+)$/.exec(entry.name)[1]) }))
+    .sort((a, b) => b.number - a.number)
+  const keep = new Set(generations.slice(0, 3).map(item => item.name))
+  for (const item of generations) {
+    if (keep.has(item.name)) continue
+    if (!APPLY) {
+      log(`将删除旧代目录 ${item.name}`)
+      continue
+    }
+    rmSync(join(libGen, item.name), { recursive: true, force: true })
+    log(`删除旧代目录 ${item.name}`)
+  }
+  log(`保留 v7 代际：${[...keep].join(', ') || 'none'}（当前 ${currentGeneration}）`)
+}
+
 async function main() {
   const guard = await ensureDeployAllowed({ apply: APPLY, force: FORCE, env: process.env })
   if (!guard.allowed) {
@@ -160,8 +181,8 @@ async function main() {
   copyIfExists(join(ROOT, 'icon.svg'), join(TARGET, 'icon.svg'))
   copyIfExists(join(ROOT, 'package.json'), join(TARGET, 'package.json'))
   copyIfExists(join(ROOT, 'version-manifest.json'), join(TARGET, 'version-manifest.json'))
+  pruneOldGenerations(build.generation)
 
-  // 旧代/旧入口不删：package.json 已不再导出它们，保留可回退；只在报告里列出。
   if (APPLY) {
     smoke(build)
     log('完成。DSH 仍需重启才能加载新插件行（会结束当前会话，请在需要时手动重启）。')

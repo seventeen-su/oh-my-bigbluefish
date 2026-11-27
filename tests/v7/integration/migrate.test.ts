@@ -30,6 +30,7 @@ const TEST_DATABASE_URL =
   process.env.OMB_SCHEMA_TEST_DATABASE_URL ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_test_schema'
 const EXPAND_MIGRATION = '008_v7_expand.sql'
 const CONTRACT_MIGRATION = '009_contract.sql'
+const OUTBOX_DEAD_MIGRATION = '010_outbox_dead.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -706,7 +707,8 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
     expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
-    expect(emptyFirst.applied.at(-1)).toBe(CONTRACT_MIGRATION)
+    expect(emptyFirst.applied).toContain(CONTRACT_MIGRATION)
+    expect(emptyFirst.applied.at(-1)).toBe(OUTBOX_DEAD_MIGRATION)
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
   })
@@ -743,7 +745,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
   })
 
   it('给定已有 007 库当跑迁移则应用 008+009 且旧审计行与新列可空性符合预期', () => {
-    expect(legacyReport.applied).toEqual([EXPAND_MIGRATION, CONTRACT_MIGRATION])
+    expect(legacyReport.applied).toEqual([EXPAND_MIGRATION, CONTRACT_MIGRATION, OUTBOX_DEAD_MIGRATION])
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])
     expect(legacyAuditAfter).toEqual(legacyAuditBefore)
