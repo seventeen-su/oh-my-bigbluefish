@@ -245,7 +245,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         ) ?? ''
       }
       if (injected.length === 0) return decision
-      // 12 步/3 轮窗口内同一段文本已投递过：不再重复追加，也不登记新的 receipt。
+      // 90 步/7 轮窗口内同一段文本已投递过：不再重复追加，也不登记新的 receipt。
       if (session.isDuplicateT1Content(sessionId, injected, position)) {
         if (callId !== undefined) session.prefetchedT1.delete(callId)
         return decision
@@ -383,7 +383,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
           1_500,
         ) ?? ''
         if (injected.length > 0 && session.isDuplicateT1Content(sessionId, injected, { turn, step })) {
-          // 同一段内容在 12 步/3 轮内已经投递；不要因中间插入了别的召回而再次注入。
+          // 同一段内容在 90 步/7 轮内已经投递；不要因中间插入了别的召回而再次注入。
           injected = ''
           notice = undefined
           fingerprint = undefined

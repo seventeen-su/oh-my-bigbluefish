@@ -98,8 +98,10 @@ export function recallContentFingerprint(input: RecallFingerprintInput): string 
 }
 
 /** 同一段注入文本在该步数/轮数窗口内不再重复进入上下文。 */
-export const T1_DEDUP_WINDOW_STEPS = 12
-export const T1_DEDUP_WINDOW_TURNS = 3
+// 长任务常见 40–50 步；90 步 / 7 轮覆盖两轮长任务。压缩事件会 clear 后重计，
+// 所以压缩后的首轮仍能立即重新注入（见 hooks.observeEvent）。
+const T1_DEDUP_WINDOW_STEPS = 90
+const T1_DEDUP_WINDOW_TURNS = 7
 
 interface T1ContentEntry {
   readonly hash: string
@@ -109,7 +111,7 @@ interface T1ContentEntry {
 }
 
 /** 注入文本的稳定哈希；只看内容，不把本步查询/工具结果差异带进键。 */
-export function t1TextHash(text: string): string {
+function t1TextHash(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 32)
 }
 

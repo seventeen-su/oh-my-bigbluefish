@@ -438,7 +438,15 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
     try {
       // 启动首轮立即到期 → 各任务入队并执行 → 执行完 rearm 到下一网格（due 在未来）。
       await waitFor(fullyArmedRows, '巩固任务全部 rearm 到下一网格', 60_000)
-      const text = await statusText(plugin)
+      // 首轮入队的 10 个 pg-boss 作业可能还在消费中；等队列清空再断言，避免瞬时计数 flaky。
+      const text = await waitFor(
+        async () => {
+          const current = await statusText(plugin)
+          return metric(current, 'consolidationQueued') === 0 ? current : undefined
+        },
+        '首轮巩固任务队列清空',
+        20_000,
+      )
       expect(text).toContain('consolidation=ok')
       expect(text).toContain(`consolidationJobs=${CONSOLIDATION_JOB_NAMES.join(',')}`)
       expect(text).toContain('timerTopics=omb.workflow.wake,omb.consolidation')

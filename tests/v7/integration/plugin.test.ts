@@ -1027,7 +1027,7 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('A-B-A 召回在 12 步窗口内不重复注入 A', async () => {
+  it('A-B-A 召回在 90 步窗口内不重复注入 A', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -1082,6 +1082,50 @@ describe('v7 plugin entry', () => {
       step: 3,
     }, async () => ({ kind: 'enter', messages: [] }))
     expect(t1Messages(third)).toHaveLength(0)
+    dispose()
+  })
+
+  it('压缩后 T1 内容窗口重计：同一段内容可以在压缩后的下一步重新注入', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'compaction-window-session', header: { cwd: PROJECT } } } }
+    await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '压缩后窗口重计', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: { session: { id: 'compaction-window-session', header: { cwd: PROJECT } } },
+      messages: [
+        { source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'ENOENT 压缩后窗口重计 失败' },
+      ],
+      turn: 1,
+      step: 1,
+    }
+    expect(t1Messages(await preStep?.(payload, async () => ({ kind: 'enter', messages: [] })))).toHaveLength(1)
+
+    // 未压缩的下一步同一内容应当被内容窗口挡住。
+    const blocked = await preStep?.({ ...payload, step: 2 }, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(blocked)).toHaveLength(0)
+
+    host.listeners.get('session/event')?.(
+      { id: 'compaction-window-session', header: { cwd: PROJECT } },
+      { type: 'compaction/start', seq: 2, data: { summary: '压缩后窗口重计' } },
+    )
+    const afterCompaction = await preStep?.(
+      { ...payload, step: 3 },
+      async () => ({ kind: 'enter', messages: [] }),
+    )
+    expect(t1Messages(afterCompaction)).toHaveLength(1)
+    expect(t1TextOf(afterCompaction)).toContain('[OMB 事件召回]')
     dispose()
   })
 

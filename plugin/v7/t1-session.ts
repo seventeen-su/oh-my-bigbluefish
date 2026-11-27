@@ -62,7 +62,7 @@ export interface T1Session {
   readonly residentCache: Map<string, { readonly turn: number | undefined; readonly text: string }>
   /** 已投递 T1 的跨 step 内容指纹（session+query+result，不含 turn/step）。 */
   readonly lastT1: Map<string, string>
-  /** 同一段注入文本在 12 步/3 轮窗口内不重复注入。 */
+  /** 同一段注入文本在 90 步/7 轮窗口内不重复注入；压缩事件会清空重计。 */
   isDuplicateT1Content(sessionId: string, text: string, position?: StepPosition): boolean
   rememberT1Content(sessionId: string, text: string, position?: StepPosition): void
   clearT1Content(sessionId: string): void
