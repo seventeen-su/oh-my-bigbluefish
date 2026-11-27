@@ -1,4 +1,3 @@
-import { tokenize } from '../../domain/text.js'
 import type {
   Attribute,
   Entity,
@@ -34,9 +33,10 @@ import type {
   WriteResult,
 } from '../../ports/store.js'
 import { systemCommandMeta } from '../../app/commands/index.js'
-import { asNumber, iso, PostgresDb } from './db.js'
+import { iso, PostgresDb } from './db.js'
 import { mapEntity, type EntityRow, type ViewRow } from './rows.js'
-import { AttributeWriter, mapPgError, selectAttributes, type AttributeQuery } from './writer.js'
+import { findSimilar } from './similar.js'
+import { AttributeWriter, mapPgError, selectAttributes } from './writer.js'
 
 /** 单次全文检索最多拼多少个 OR 词：长工具输出 tokenize 后动辄上百词，全量会撑大 tsquery。 */
 export const FULLTEXT_MAX_QUERY_TERMS = 48
@@ -120,8 +120,13 @@ export class PostgresStore implements Store {
       )
       const entity = outcome.entity
       if (entity === undefined) throw new OmbFailure(internal('写入没有返回实体'))
-      // 相似建议在写事务之外读（事务内禁止相似查询）；与旧路径同一组查询/排序。
-      const similar = await this.findSimilar(this.db, input, titleOf(entity)?.trim() ?? null)
+      // 相似建议在写事务之外读（事务内禁止相似查询）；有界候选窗口见 similar.ts。
+      const similar = await findSimilar(this.db, {
+        entityId: entity.id,
+        kind: input.kind,
+        attributes: entity.attributes,
+        title: titleOf(entity)?.trim() ?? null,
+      })
       return { entity, ...similar }
     })
   }
@@ -844,90 +849,5 @@ export class PostgresStore implements Store {
       .sort((left, right) => right[1] - left[1])
       .slice(0, Math.max(1, Math.min(50, spec.limit)))
       .map(([entityId, raw], index) => ({ entityId, rank: index + 1, rawScore: raw, channel: 'trigger' }))
-  }
-
-  /**
-   * 写后相似建议：只读查询，必须在写事务之外执行（事务内禁止相似/全表扫描）。
-   * 参数 `title` 只用于正文为空时的兜底检索词，与旧实现读 `entity_view.title` 等价。
-   */
-  private async findSimilar(
-    queryable: AttributeQuery,
-    input: NormalizedWrite,
-    title: string | null,
-  ): Promise<{ similarAttributes: WriteResult['similarAttributes']; similarEntities: WriteResult['similarEntities']; archivedMatches: WriteResult['similarEntities'] }> {
-    const optionalNames = input.attributes.filter(attribute => !attribute.required).map(attribute => attribute.name)
-    const attrs = optionalNames.length > 0
-      ? await queryable.query<{ name: string; usage_count: number; similarity: number }>(
-          `select r.name, r.usage_count, max(similarity(r.name, q.name)) as similarity
-           from omb.attr_registry r
-           cross join unnest($1::text[]) as q(name)
-           where similarity(r.name, q.name) >= 0.35
-           group by r.name, r.usage_count
-           order by similarity desc, r.usage_count desc
-           limit 10`,
-          [optionalNames],
-        )
-      : { rows: [] as { name: string; usage_count: number; similarity: number }[] }
-
-    const optionalText = input.attributes
-      .filter(attribute => !attribute.required)
-      .map(attribute => attribute.value.kind === 'static' ? attribute.value.value : attribute.value.cachedValue)
-      .filter((value): value is NonNullable<typeof value> => value !== undefined)
-      .map(value => typeof value === 'string' ? value : JSON.stringify(value))
-      .join('\n')
-    const search = optionalText.slice(0, 240) || title || ''
-    // 只从可选属性取查询词；snippet 含必填分类（事实/fact），会把任意两条记忆都判成相似。
-    // 共享至少两个长度 >=2 的 token 才算相似：共同分类/单字噪声不够。
-    const similarTokens = tokenize(optionalText, 64).filter(token => token.length >= 2)
-    const similarQuery = similarTokens.join(' | ')
-    const minShared = Math.min(2, similarTokens.length)
-    const active = similarTokens.length === 0
-      ? { rows: [] as (ViewRow & { similarity: number })[] }
-      : await queryable.query<ViewRow & { similarity: number }>(
-        `select v.*, similarity(v.snippet, $4) as similarity
-         from omb.entity_view v
-         where v.entity_id <> $1 and v.kind = $2 and v.archived_at is null
-           and v.search_tsv @@ to_tsquery('simple', $3)
-           and (
-             select count(*) from unnest(string_to_array(v.search_text, ' ')) as t(token)
-             where t.token = any($5::text[])
-           ) >= $6
-         order by similarity(v.snippet, $4) desc, v.updated_at desc
-         limit 8`,
-        [input.id, input.kind, similarQuery, search, similarTokens, minShared],
-      )
-    const archived = similarTokens.length === 0
-      ? { rows: [] as (ViewRow & { similarity: number })[] }
-      : await queryable.query<ViewRow & { similarity: number }>(
-        `select v.*, similarity(v.snippet, $4) as similarity
-         from omb.entity_view v
-         where v.entity_id <> $1 and v.kind = $2 and v.archived_at is not null
-           and v.search_tsv @@ to_tsquery('simple', $3)
-           and (
-             select count(*) from unnest(string_to_array(v.search_text, ' ')) as t(token)
-             where t.token = any($5::text[])
-           ) >= $6
-         order by similarity(v.snippet, $4) desc, v.updated_at desc
-         limit 3`,
-        [input.id, input.kind, similarQuery, search, similarTokens, minShared],
-      )
-
-    const toSimilar = (row: ViewRow & { similarity?: number }): WriteResult['similarEntities'][number] => ({
-      id: row.entity_id,
-      kind: row.kind,
-      ...(row.title !== null ? { title: row.title } : {}),
-      ...(row.category !== null ? { category: row.category } : {}),
-      ...(row.status !== null ? { status: row.status } : {}),
-      scope: row.scope === 'global' ? { kind: 'global' } : { kind: 'project', projectKey: row.project_key },
-      archived: row.archived_at !== null,
-      score: Number(asNumber(row.similarity) ?? 0),
-      reason: row.archived_at !== null ? 'archived-similar' : 'text-or-attribute-overlap',
-    })
-
-    return {
-      similarAttributes: attrs.rows.map(row => ({ name: row.name, usageCount: Number(row.usage_count), similarity: Number(row.similarity) })),
-      similarEntities: active.rows.map(toSimilar),
-      archivedMatches: archived.rows.map(row => ({ ...toSimilar(row), score: 1 })),
-    }
   }
 }

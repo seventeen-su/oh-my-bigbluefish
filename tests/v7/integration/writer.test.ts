@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
 import { AttributeWriter } from '../../../packages/v7/src/adapters/postgres/writer.js'
 import {
   DefaultCommandBus,
@@ -7,14 +9,43 @@ import {
   type CommandMeta,
 } from '../../../packages/v7/src/app/commands/index.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
-import { derived, normalized, prepareDatabase, resetDatabase, store } from './helpers.js'
+import { derived, normalized, prepareDatabase, resetDatabase, store, TEST_DATABASE_URL } from './helpers.js'
 
 /**
  * CommandBus / AttributeWriter 的真实 PostgreSQL 证据（ARCHITECTURE-PLAN §4.1/§4.2、ADR-0007）。
  *
  * 覆盖：单事务写审计+outbox、CAS 冲突返回 currentRevision、commandId 幂等（串行/并发）、
- * 失败回滚无脏行、不同实体并发成功、旧 Store 路径委托不变。
+ * 失败回滚无脏行、不同实体并发成功、旧 Store 路径委托不变、批量写语句数与属性数无关。
  */
+
+/** 统计写事务里实际发出的语句：用来证明属性/注册表写入是单条多值语句，不是逐属性 N+1。 */
+class CountingDb extends PostgresDb {
+  readonly statements: string[] = []
+
+  override async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+    return super.transaction(async client => {
+      const counting = {
+        query: (text: unknown, values?: unknown[]) => {
+          this.statements.push(typeof text === 'string' ? text : JSON.stringify(text))
+          return client.query(text as never, values as never)
+        },
+      } as unknown as PoolClient
+      return work(counting)
+    })
+  }
+}
+
+async function countWriteStatements(input: WriteEntityInput): Promise<string[]> {
+  const counted = new CountingDb({ connectionString: TEST_DATABASE_URL })
+  try {
+    const writer = new AttributeWriter(counted)
+    const result = await writer.execute({ type: 'CreateEntity', input: normalized(input) }, meta())
+    expect(result.revision).toBe(1)
+    return counted.statements
+  } finally {
+    await counted.close()
+  }
+}
 
 function meta(overrides: Partial<CommandMeta> = {}): CommandMeta {
   return {
@@ -180,6 +211,132 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
     // 写事务内不做相似查询/嵌入：两张异步表都为空。
     expect((await db.db.query('select 1 from omb.embedding')).rowCount).toBe(0)
     expect((await db.db.query('select 1 from omb.similar_cache')).rowCount).toBe(0)
+  })
+
+  it('给定 40 个属性当 CreateEntity 则写事务语句数与 2 个属性时完全相同（单条多值写，无逐属性 N+1）', async () => {
+    const many: Record<string, unknown> = {}
+    for (let i = 0; i < 40; i += 1) many[`field_${i}`] = `值 ${i}`
+    const longStatements = await countWriteStatements(memory('批量语句多', '正文', many))
+    const shortStatements = await countWriteStatements(memory('批量语句少', '正文', { note: '一' }))
+    expect(longStatements).toHaveLength(shortStatements.length)
+    // 属性与注册表各一条 insert；不能出现按属性重复的 insert。
+    const attributeInserts = longStatements.filter(sql => sql.includes('insert into omb.attribute'))
+    const registryInsert = longStatements.filter(sql => sql.includes('insert into omb.attr_registry'))
+    expect(attributeInserts).toHaveLength(1)
+    expect(registryInsert).toHaveLength(1)
+    // 写事务内不得跑相似查询：相似建议在提交后由 Store.write 的只读查询给出（ADR-0013）。
+    expect(longStatements.some(sql => /to_tsquery|similarity\(/i.test(sql))).toBe(false)
+  })
+
+  it('给定多属性含触发键与动态引用当写入则属性/注册表/触发键/引用/视图一次落库', async () => {
+    const target = await createMemory('批量引用目标')
+    const attrs: Record<string, unknown> = {}
+    for (let i = 0; i < 30; i += 1) attrs[`field_${i}`] = `值 ${i}`
+    attrs['tool'] = 'bash'
+    attrs['error'] = 'E_BATCH_001'
+    attrs['path'] = 'C:\\work\\batch\\file.ts'
+    attrs['mirror'] = { $dynamic: { kind: 'ref', entityId: target.id, attr: 'title' } }
+    attrs['twin'] = { $dynamic: { kind: 'ref', entityId: target.id } }
+    const command = meta()
+    const result = await bus.execute({ type: 'CreateEntity', input: memory('批量落库', '批量正文', attrs) }, command)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const id = result.value.events[0]!.streamId
+
+    const rows = await attributeRows(db, id)
+    // 3 个必填 + title/body + 30 field_* + tool/error/path/mirror/twin。
+    expect(rows).toHaveLength(3 + 2 + 30 + 5)
+
+    const registry = await db.db.query<{ name: string; usage_count: string }>(
+      "select name, usage_count::text from omb.attr_registry where name like 'field\\_%' order by name",
+    )
+    expect(registry.rows).toHaveLength(30)
+    expect(registry.rows.every(row => Number(row.usage_count) === 1)).toBe(true)
+
+    const triggers = await db.db.query<{ kind: string; key: string }>(
+      'select kind, key from omb.trigger_key where entity_id = $1 order by kind, key',
+      [id],
+    )
+    expect(triggers.rows).toEqual(expect.arrayContaining([
+      { kind: 'tool', key: 'bash' },
+      { kind: 'error', key: 'E_BATCH_001' },
+      { kind: 'path', key: 'C:\\work\\batch\\file.ts' },
+      { kind: 'entity', key: target.id },
+    ]))
+
+    const references = await db.db.query<{ source_attr_name: string; target_entity_id: string; kind: string }>(
+      'select source_attr_name, target_entity_id, kind from omb.reference where source_entity_id = $1 order by source_attr_name',
+      [id],
+    )
+    expect(references.rows).toEqual([
+      { source_attr_name: 'mirror', target_entity_id: target.id, kind: 'ref' },
+      { source_attr_name: 'twin', target_entity_id: target.id, kind: 'ref' },
+    ])
+
+    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown>; attr_names: string[] }>(
+      'select search_text, attrs, attr_names from omb.entity_view where entity_id = $1',
+      [id],
+    )
+    expect(view.rows[0]?.search_text).toContain('批量')
+    expect(view.rows[0]?.attrs['field_29']).toBe('值 29')
+    expect(view.rows[0]?.attr_names).toContain('mirror')
+    expect(await count('omb.audit_log', 'command_id = $1', [command.commandId])).toBe(1)
+    expect(await count(
+      'omb.outbox',
+      'event_id in (select id from omb.audit_log where command_id = $1)',
+      [command.commandId],
+    )).toBe(1)
+  })
+
+  it('给定同名可选属性两次写入当批量 upsert 注册表则 usage_count 累加且 last_seen 更新', async () => {
+    await createMemory('注册一', { note: '甲' })
+    await createMemory('注册二', { note: '乙' })
+    const registry = await db.db.query<{ usage_count: string; value_kind: string; last_seen: Date | string }>(
+      "select usage_count::text, value_kind, last_seen from omb.attr_registry where name = 'note'",
+    )
+    expect(registry.rows).toHaveLength(1)
+    expect(Number(registry.rows[0]?.usage_count)).toBe(2)
+    expect(registry.rows[0]?.value_kind).toBe('static')
+    expect(registry.rows[0]?.last_seen).toBeTruthy()
+  })
+
+  it('给定动态属性缓存当补丁 spec 不变则保留缓存、spec 变化则丢弃', async () => {
+    const target = await createMemory('缓存目标')
+    const input: WriteEntityInput = {
+      kind: 'memory',
+      category: 'fact',
+      scope: { kind: 'global' },
+      attrs: {
+        title: '缓存来源',
+        mirror: { $dynamic: { kind: 'ref', entityId: target.id, attr: 'title' } },
+        other: '保留',
+      },
+    }
+    const written = await db.write(normalized(input), derived(input))
+    const ordinal = written.entity.attributes.find(attribute => attribute.name === 'mirror')?.ordinal ?? 0
+    const cachedAt = new Date().toISOString()
+    await db.setAttributeCache(written.entity.id, 'mirror', ordinal, '目标标题', cachedAt)
+
+    const same: WriteEntityInput = { ...input, id: written.entity.id }
+    await db.patch(normalized(same), { id: written.entity.id, expectedRevision: 1 }, derived(same))
+    const preserved = (await db.get(written.entity.id))?.attributes.find(attribute => attribute.name === 'mirror')?.value
+    expect(preserved?.kind).toBe('dynamic')
+    expect(preserved?.kind === 'dynamic' ? preserved.cachedValue : undefined).toBe('目标标题')
+    expect(preserved?.kind === 'dynamic' ? preserved.cachedAt : undefined).toBe(cachedAt)
+
+    const changed: WriteEntityInput = {
+      ...input,
+      id: written.entity.id,
+      attrs: {
+        title: '缓存来源',
+        mirror: { $dynamic: { kind: 'ref', entityId: target.id, attr: 'body' } },
+        other: '保留',
+      },
+    }
+    await db.patch(normalized(changed), { id: written.entity.id, expectedRevision: 2 }, derived(changed))
+    const dropped = (await db.get(written.entity.id))?.attributes.find(attribute => attribute.name === 'mirror')?.value
+    expect(dropped?.kind).toBe('dynamic')
+    expect(dropped?.kind === 'dynamic' ? dropped.cachedValue : undefined).toBeUndefined()
   })
 
   it('给定 PatchEntity 命令当 expectedRevision 匹配则版本 +1、视图重派生、审计/outbox 各一条', async () => {

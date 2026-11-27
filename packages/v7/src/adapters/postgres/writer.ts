@@ -119,6 +119,17 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null'
 }
 
+/**
+ * 把一批写入行序列化成单个 jsonb 数组参数。
+ *
+ * 批量语句统一用 `jsonb_array_elements` 展开：一次往返写完整批属性/触发键/引用，
+ * 而不是逐行 `await`（N 次往返）；jsonb 列用 `e->'col'` 取值，保留「JSON null」与
+ * 「该列不适用（SQL NULL）」的区别，避免值和约束被悄悄改义。
+ */
+function jsonRecords(rows: readonly Record<string, unknown>[]): string {
+  return JSON.stringify(rows)
+}
+
 /** patch 重新插入属性时保留同名、同 spec 动态属性的缓存；spec 变了才丢弃。 */
 async function preserveDynamicCaches(
   client: PoolClient,
@@ -127,110 +138,152 @@ async function preserveDynamicCaches(
   next: readonly Attribute[],
 ): Promise<void> {
   const oldByName = new Map(previous.filter(item => item.value.kind === 'dynamic').map(item => [item.name, item]))
+  const records: Record<string, unknown>[] = []
   for (const attribute of next) {
     if (attribute.value.kind !== 'dynamic') continue
     const old = oldByName.get(attribute.name)
     if (old?.value.kind !== 'dynamic') continue
     if (canonicalJson(old.value.spec) !== canonicalJson(attribute.value.spec)) continue
     if (old.value.cachedValue === undefined && old.value.lastError === undefined) continue
-    await client.query(
-      `update omb.attribute
-       set cached_value = $3::jsonb, cached_at = $4, last_error = $5
-       where entity_id = $1 and name = $2 and ordinal = $6`,
-      [
-        entityId,
-        attribute.name,
-        old.value.cachedValue === undefined ? null : JSON.stringify(old.value.cachedValue),
-        old.value.cachedAt ?? null,
-        old.value.lastError ?? null,
-        attribute.ordinal,
-      ],
-    )
+    records.push({
+      name: attribute.name,
+      ordinal: attribute.ordinal,
+      ...(old.value.cachedValue !== undefined ? { cached_value: old.value.cachedValue } : {}),
+      ...(old.value.cachedAt !== undefined ? { cached_at: old.value.cachedAt } : {}),
+      ...(old.value.lastError !== undefined ? { last_error: old.value.lastError } : {}),
+    })
   }
+  if (records.length === 0) return
+  await client.query(
+    `update omb.attribute a
+     set cached_value = c.cached_value, cached_at = c.cached_at, last_error = c.last_error
+     from (
+       select e->>'name' as name,
+              coalesce((e->>'ordinal')::int, 0) as ordinal,
+              e->'cached_value' as cached_value,
+              (e->>'cached_at')::timestamptz as cached_at,
+              e->>'last_error' as last_error
+       from jsonb_array_elements($2::jsonb) as e
+     ) as c
+     where a.entity_id = $1 and a.name = c.name and a.ordinal = c.ordinal`,
+    [entityId, jsonRecords(records)],
+  )
 }
 
+/** 单条多值 INSERT：整批属性一次往返写完（ADR-0007/0013）。 */
 async function insertAttributes(client: PoolClient, entityId: string, attributes: readonly Attribute[]): Promise<void> {
-  for (const attribute of attributes) {
+  if (attributes.length === 0) return
+  const records = attributes.map(attribute => {
     const value = attribute.value
-    await client.query(
-      `insert into omb.attribute (
-         entity_id, name, ordinal, value_kind, value, expr, cached_value, cached_at,
-         stale_after_ms, last_error, is_required, confidence, source
-       ) values ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12,$13)`,
-      [
-        entityId,
-        attribute.name,
-        attribute.ordinal,
-        value.kind,
-        value.kind === 'static' ? JSON.stringify(value.value) : null,
-        value.kind === 'dynamic' ? JSON.stringify(value.spec) : null,
-        value.kind === 'dynamic' && value.cachedValue !== undefined ? JSON.stringify(value.cachedValue) : null,
-        value.kind === 'dynamic' && value.cachedAt !== undefined ? value.cachedAt : null,
-        value.kind === 'dynamic' && value.staleAfterMs !== undefined ? value.staleAfterMs : null,
-        value.kind === 'dynamic' && value.lastError !== undefined ? value.lastError : null,
-        attribute.required,
-        attribute.confidence ?? null,
-        attribute.source,
-      ],
-    )
-  }
+    return {
+      name: attribute.name,
+      ordinal: attribute.ordinal,
+      value_kind: value.kind,
+      ...(value.kind === 'static' ? { value: value.value } : { expr: value.spec }),
+      ...(value.kind === 'dynamic' && value.cachedValue !== undefined ? { cached_value: value.cachedValue } : {}),
+      ...(value.kind === 'dynamic' && value.cachedAt !== undefined ? { cached_at: value.cachedAt } : {}),
+      ...(value.kind === 'dynamic' && value.staleAfterMs !== undefined ? { stale_after_ms: value.staleAfterMs } : {}),
+      ...(value.kind === 'dynamic' && value.lastError !== undefined ? { last_error: value.lastError } : {}),
+      is_required: attribute.required,
+      ...(attribute.confidence !== undefined ? { confidence: attribute.confidence } : {}),
+      source: attribute.source,
+    }
+  })
+  await client.query(
+    `insert into omb.attribute (
+       entity_id, name, ordinal, value_kind, value, expr, cached_value, cached_at,
+       stale_after_ms, last_error, is_required, confidence, source
+     )
+     select $1,
+            e->>'name',
+            coalesce((e->>'ordinal')::int, 0),
+            e->>'value_kind',
+            e->'value',
+            e->'expr',
+            e->'cached_value',
+            (e->>'cached_at')::timestamptz,
+            (e->>'stale_after_ms')::int,
+            e->>'last_error',
+            (e->>'is_required')::boolean,
+            (e->>'confidence')::float8,
+            e->>'source'
+     from jsonb_array_elements($2::jsonb) as e`,
+    [entityId, jsonRecords(records)],
+  )
 }
 
+/** 注册表按属性名聚合成一批 upsert：同名多 ordinal 只累加一次 usage_count。 */
 async function upsertRegistry(client: PoolClient, attributes: readonly Attribute[]): Promise<void> {
+  const usage = new Map<string, { kind: string; count: number }>()
   for (const attribute of attributes) {
     if (attribute.required) continue
-    await client.query(
-      `insert into omb.attr_registry (name, value_kind, usage_count)
-       values ($1,$2,1)
-       on conflict (name) do update
-         set usage_count = omb.attr_registry.usage_count + 1,
-             last_seen = now(),
-             value_kind = excluded.value_kind`,
-      [attribute.name, attribute.value.kind],
-    )
+    const current = usage.get(attribute.name)
+    if (current === undefined) usage.set(attribute.name, { kind: attribute.value.kind, count: 1 })
+    else {
+      current.count += 1
+      current.kind = attribute.value.kind
+    }
   }
+  if (usage.size === 0) return
+  const records = [...usage].map(([name, item]) => ({ name, value_kind: item.kind, usage: item.count }))
+  await client.query(
+    `insert into omb.attr_registry (name, value_kind, usage_count)
+     select e->>'name', e->>'value_kind', coalesce((e->>'usage')::int, 1)
+     from jsonb_array_elements($1::jsonb) as e
+     on conflict (name) do update
+       set usage_count = omb.attr_registry.usage_count + excluded.usage_count,
+           last_seen = now(),
+           value_kind = excluded.value_kind`,
+    [jsonRecords(records)],
+  )
 }
 
 async function insertTriggers(client: PoolClient, entityId: string, triggers: readonly { readonly kind: string; readonly key: string; readonly weight: number }[]): Promise<void> {
-  for (const trigger of triggers) {
-    await client.query(
-      `insert into omb.trigger_key (entity_id, kind, key, weight)
-       values ($1,$2,$3,$4)
-       on conflict (entity_id, kind, key) do update set weight = greatest(omb.trigger_key.weight, excluded.weight)`,
-      [entityId, trigger.kind, trigger.key, trigger.weight],
-    )
-  }
+  if (triggers.length === 0) return
+  await client.query(
+    `insert into omb.trigger_key (entity_id, kind, key, weight)
+     select $1, e->>'kind', e->>'key', coalesce((e->>'weight')::float8, 1)
+     from jsonb_array_elements($2::jsonb) as e
+     on conflict (entity_id, kind, key) do update set weight = greatest(omb.trigger_key.weight, excluded.weight)`,
+    [entityId, jsonRecords(triggers.map(trigger => ({ kind: trigger.kind, key: trigger.key, weight: trigger.weight })))],
+  )
 }
 
 async function replaceReferences(client: PoolClient, entityId: string, references: readonly ReferenceInput[]): Promise<void> {
   await client.query('delete from omb.reference where source_entity_id = $1', [entityId])
-  for (const reference of references) {
-    await client.query(
-      `insert into omb.reference (
-         source_entity_id, source_attr_name, source_ordinal, target_entity_id, target_attr_name, kind
-       ) values ($1,$2,$3,$4,$5,$6)
-       on conflict do nothing`,
-      [
-        entityId,
-        reference.sourceAttrName,
-        reference.sourceOrdinal,
-        reference.targetEntityId,
-        reference.targetAttrName ?? '',
-        reference.kind,
-      ],
-    )
-  }
+  if (references.length === 0) return
+  const records = references.map(reference => ({
+    source_attr_name: reference.sourceAttrName,
+    source_ordinal: reference.sourceOrdinal,
+    target_entity_id: reference.targetEntityId,
+    target_attr_name: reference.targetAttrName ?? '',
+    kind: reference.kind,
+  }))
+  await client.query(
+    `insert into omb.reference (
+       source_entity_id, source_attr_name, source_ordinal, target_entity_id, target_attr_name, kind
+     )
+     select $1, e->>'source_attr_name', coalesce((e->>'source_ordinal')::int, 0),
+            e->>'target_entity_id', coalesce(e->>'target_attr_name', ''), e->>'kind'
+     from jsonb_array_elements($2::jsonb) as e
+     on conflict do nothing`,
+    [entityId, jsonRecords(records)],
+  )
 }
 
 async function insertChainMembers(client: PoolClient, chainId: string, members: readonly string[], source: string): Promise<void> {
-  for (const [position, memberId] of members.entries()) {
-    await client.query(
-      `insert into omb.chain_member (chain_id, member_id, position, source)
-       values ($1,$2,$3,$4)
-       on conflict (chain_id, member_id) do update set position = excluded.position`,
-      [chainId, memberId, position, source],
-    )
-  }
+  if (members.length === 0) return
+  // 后出现的位置覆盖前面：与逐行 upsert 的最终状态一致，同时避免同一批里重复键。
+  const positions = new Map<string, number>()
+  for (const [position, memberId] of members.entries()) positions.set(memberId, position)
+  const records = [...positions].map(([memberId, position]) => ({ member_id: memberId, position, source }))
+  await client.query(
+    `insert into omb.chain_member (chain_id, member_id, position, source)
+     select $1, e->>'member_id', coalesce((e->>'position')::int, 0), e->>'source'
+     from jsonb_array_elements($2::jsonb) as e
+     on conflict (chain_id, member_id) do update set position = excluded.position`,
+    [chainId, jsonRecords(records)],
+  )
 }
 
 async function replaceChainMembers(client: PoolClient, chainId: string, members: readonly string[], source: string): Promise<void> {

@@ -14,10 +14,12 @@ import { performance } from 'node:perf_hooks'
 import type { WriteEntityInput } from '../packages/v7/src/domain/entity.js'
 import { newId } from '../packages/v7/src/domain/ids.js'
 import { deriveSearchText, deriveTriggers, normalizeWrite } from '../packages/v7/src/domain/validation.js'
+import { systemCommandMeta } from '../packages/v7/src/app/commands/index.js'
 import { HashEmbedder } from '../packages/v7/src/adapters/embedding/hash.js'
 import { migrateDatabase, truncateAll } from '../packages/v7/src/adapters/postgres/migrate.js'
 import { PostgresDb } from '../packages/v7/src/adapters/postgres/db.js'
 import { PostgresStore } from '../packages/v7/src/adapters/postgres/store.js'
+import { AttributeWriter } from '../packages/v7/src/adapters/postgres/writer.js'
 import { RecallEngine } from '../packages/v7/src/retrieval/engine.js'
 import type { Clock } from '../packages/v7/src/ports/clock.js'
 
@@ -30,6 +32,9 @@ const REUSE = process.env.OMB_BENCH_REUSE === '1'
 const FULL_SCALE = ENTITIES >= 100_000 && LINKS >= 10_000
 const STAGE_ONE_BUDGET_MS = 150
 const TOTAL_BUDGET_MS = 300
+/** ADR-0013：写事务本体 p95 ≤20ms；含写后相似建议 p95 ≤50ms（100k/10k 夹具）。 */
+const WRITE_TXN_BUDGET_MS = 20
+const WRITE_BUDGET_MS = 50
 const FIXED_NOW = '2026-11-23T00:00:00.000Z'
 
 function positiveInt(raw: string | undefined, fallback: number): number {
@@ -178,6 +183,7 @@ async function main(): Promise<void> {
   }
 
   const store = new PostgresStore(URL)
+  const writer = new AttributeWriter(store.db)
   const engine = new RecallEngine({ store, embedder: new HashEmbedder(), clock: clock() })
   const query = '基准记忆 42'
   const recall = { query, scenario: 'manual' as const, scope: 'global' as const, limit: 10 }
@@ -208,10 +214,24 @@ async function main(): Promise<void> {
     scope: { kind: 'global' },
     attrs: { title: '基准写入记忆', body: 'write probe' },
   }
+  const buildWrite = (body: string): ReturnType<typeof normalizeWrite> => normalizeWrite({
+    ...writeInput,
+    id: newId('memory'),
+    attrs: { ...writeInput.attrs, body },
+  })
+  // 写事务本体（不含相似建议）：ADR-0013 预算 p95 ≤20ms。
+  const txnTimes: number[] = []
+  for (let i = 0; i < WRITES; i += 1) {
+    const value = buildWrite(`txn probe ${i}`)
+    if (!value.ok) throw new Error(`基准写入输入非法：${JSON.stringify(value.errors)}`)
+    const started = performance.now()
+    await writer.execute({ type: 'CreateEntity', input: value.value }, systemCommandMeta('bench'))
+    txnTimes.push(performance.now() - started)
+  }
+  // 旧 Store.write 入口（事务 + 写后相似建议）：包含有界索引相似查询的开销。
   const writeTimes: number[] = []
   for (let i = 0; i < WRITES; i += 1) {
-    const input = { ...writeInput, id: newId('memory'), attrs: { ...writeInput.attrs, body: `write probe ${i}` } }
-    const value = normalizeWrite(input)
+    const value = buildWrite(`write probe ${i}`)
     if (!value.ok) throw new Error(`基准写入输入非法：${JSON.stringify(value.errors)}`)
     const derived = {
       searchText: deriveSearchText(value.value.attributes),
@@ -226,16 +246,22 @@ async function main(): Promise<void> {
   const stageOneP95 = percentile(stageOne, 0.95)
   const totalP50 = percentile(totals, 0.5)
   const totalP95 = percentile(totals, 0.95)
+  const txnP50 = percentile(txnTimes, 0.5)
+  const txnP95 = percentile(txnTimes, 0.95)
   const writeP50 = percentile(writeTimes, 0.5)
   const writeP95 = percentile(writeTimes, 0.95)
 
   console.log(`[bench] recall iterations=${ITERATIONS} hits=${hits} stage1 p50=${format(stageOneP50)}ms p95=${format(stageOneP95)}ms total p50=${format(totalP50)}ms p95=${format(totalP95)}ms`)
+  console.log(`[bench] write-txn iterations=${WRITES} p50=${format(txnP50)}ms p95=${format(txnP95)}ms`)
   console.log(`[bench] write iterations=${WRITES} p50=${format(writeP50)}ms p95=${format(writeP95)}ms`)
-  console.log(`[bench] budget stage1 p95<=${STAGE_ONE_BUDGET_MS}ms total p95<=${TOTAL_BUDGET_MS}ms fullScale=${FULL_SCALE}`)
+  console.log(`[bench] budget stage1 p95<=${STAGE_ONE_BUDGET_MS}ms total p95<=${TOTAL_BUDGET_MS}ms writeTxn p95<=${WRITE_TXN_BUDGET_MS}ms write p95<=${WRITE_BUDGET_MS}ms fullScale=${FULL_SCALE}`)
 
   await store.close()
-  if (FULL_SCALE && (stageOneP95 > STAGE_ONE_BUDGET_MS || totalP95 > TOTAL_BUDGET_MS)) {
-    console.error('[bench] FAIL：检索 p95 超过 SPEC 第 11 节预算')
+  const recallOverBudget = stageOneP95 > STAGE_ONE_BUDGET_MS || totalP95 > TOTAL_BUDGET_MS
+  const writeOverBudget = txnP95 > WRITE_TXN_BUDGET_MS || writeP95 > WRITE_BUDGET_MS
+  if (FULL_SCALE && (recallOverBudget || writeOverBudget)) {
+    if (recallOverBudget) console.error('[bench] FAIL：检索 p95 超过 SPEC 第 11 节预算')
+    if (writeOverBudget) console.error('[bench] FAIL：写入 p95 超过 ADR-0013 预算')
     process.exitCode = 1
     return
   }
