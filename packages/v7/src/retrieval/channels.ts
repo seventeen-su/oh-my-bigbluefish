@@ -176,12 +176,24 @@ export async function runStageOne(deps: StageOneDeps, input: StageOneInput): Pro
         if (keys.length === 0 && regexText === undefined) {
           return { status: 'skipped', hits: [], reason: '查询为空，没有可匹配的触发键或正则文本' }
         }
-        const hits = await store.triggers({
-          ...base,
-          keys,
-          ...(regexText === undefined ? {} : { regexText }),
-        })
-        return toExecution(hits, config.channelLimit)
+        try {
+          const hits = await store.triggers({
+            ...base,
+            keys,
+            ...(regexText === undefined ? {} : { regexText }),
+          })
+          return toExecution(hits, config.channelLimit)
+        } catch (error) {
+          // 正则分支超时说明存在病态正则：记录 channel error 后**只重试字面触发键**。
+          // 不能把整个 trigger 通道标 failed，否则路径/错误码/实体等字面命中会被一条正则连坐。
+          if (toOmbError(error).code !== 'sandbox-timeout') throw error
+          recordError('trigger', error)
+          const fallback = await store.triggers({ ...base, keys })
+          return {
+            ...toExecution(fallback, config.channelLimit),
+            reason: '正则触发匹配超时，已降级为仅按字面触发键匹配',
+          }
+        }
       },
     },
     {

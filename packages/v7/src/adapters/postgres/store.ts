@@ -11,6 +11,7 @@ import { OmbFailure, internal } from '../../domain/errors.js'
 import type { JsonValue } from '../../domain/json.js'
 import type { Expansion } from '../../domain/link.js'
 import { decodeRegexTriggerKey, type NormalizedWrite } from '../../domain/validation.js'
+import { defaultRegexService, REGEX_TIMEOUT_MS, type RegexCandidate } from '../../security/regex.js'
 import type {
   ArtifactInput,
   ArtifactRecord,
@@ -94,6 +95,8 @@ export class PostgresStore implements Store {
   readonly db: PostgresDb
   /** 唯一写入口：所有业务表写入都经 AttributeWriter（读路径仍在本类）。 */
   private readonly writer: AttributeWriter
+  /** 正则触发匹配统一走 QuickJS 安全服务（ReDoS 防线），本类不直接执行用户正则。 */
+  private readonly regex = defaultRegexService
 
   constructor(connectionString: string) {
     this.db = new PostgresDb({ connectionString })
@@ -833,20 +836,43 @@ export class PostgresStore implements Store {
          limit ${TRIGGER_REGEX_CANDIDATE_LIMIT}`,
         filterParams,
       )
-      for (const row of rows.rows) {
-        const { source, flags } = decodeRegexTriggerKey(row.key)
-        try {
-          const pattern = flags === undefined ? new RegExp(source) : new RegExp(source, flags)
-          if (pattern.test(spec.regexText)) {
-            scores.set(row.entity_id, Math.max(scores.get(row.entity_id) ?? 0, Number(row.weight) * 1.2))
+      if (rows.rows.length > 0) {
+        // 用户正则一律在 QuickJS 沙箱执行：单条 50ms 上限 + 输入/源码/候选上限 + 并发上限。
+        // 静态检查只做快速拒绝；超时说明存在病态正则，降级为“本通道只按字面触发键匹配”，
+        // 由 channels 记录 channel error 并重试一次，不能因为一条正则丢掉路径/错误码等字面命中。
+        const entries = rows.rows.map((row, index) => {
+          const { source, flags } = decodeRegexTriggerKey(row.key)
+          const candidate: RegexCandidate = {
+            id: String(index),
+            source,
+            ...(flags === undefined ? {} : { flags }),
           }
-        } catch {
-          // 写入时已校验正则；这里跳过损坏的历史行，不让单行拖垮通道。
+          return { candidate, entityId: row.entity_id, weight: Number(row.weight) }
+        })
+        const outcome = await this.regex.match({
+          input: spec.regexText,
+          candidates: entries.map(entry => entry.candidate),
+        })
+        if (outcome.status === 'timeout') {
+          throw new OmbFailure({
+            code: 'sandbox-timeout',
+            message: `正则触发匹配超过 ${REGEX_TIMEOUT_MS}ms CPU 上限，已降级为仅按字面触发键匹配`,
+            retryable: false,
+          })
         }
+        if (outcome.status === 'ok') {
+          for (const id of outcome.matchedIds) {
+            const entry = entries[Number(id)]
+            if (entry === undefined) continue
+            scores.set(entry.entityId, Math.max(scores.get(entry.entityId) ?? 0, entry.weight * 1.2))
+          }
+        }
+        // invalid-input/busy/engine-error：正则分支本次跳过，字面触发键结果照常返回。
       }
     }
     return [...scores.entries()]
-      .sort((left, right) => right[1] - left[1])
+      .sort((left, right) => right[1] - left[1]
+        || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
       .slice(0, Math.max(1, Math.min(50, spec.limit)))
       .map(([entityId, raw], index) => ({ entityId, rank: index + 1, rawScore: raw, channel: 'trigger' }))
   }
