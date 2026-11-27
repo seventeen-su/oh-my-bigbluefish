@@ -188,8 +188,19 @@ function stubQueue(): JobQueue {
 
 type ConsolidationScheduler = ReturnType<typeof createConsolidationScheduler>
 
+/** 只记录“到期该入队哪个任务”的队列替身：workflow 用例断言 forget 不入队。 */
+function recordingQueue(enqueued: string[]): JobQueue {
+  return {
+    ...stubQueue(),
+    enqueue: async (name: string) => {
+      enqueued.push(name)
+      return null
+    },
+  }
+}
+
 /** 与 plugin 组合根同形的调度器：真实 timer 适配器 + 真实/替身队列。 */
-function schedulerFor(queue: JobQueue = stubQueue()): ConsolidationScheduler {
+function schedulerFor(queue: JobQueue = stubQueue(), workflow?: Parameters<typeof createConsolidationScheduler>[0]['workflow']): ConsolidationScheduler {
   const timers = new PostgresTimerStore(db.db)
   return createConsolidationScheduler({
     timers: {
@@ -207,6 +218,7 @@ function schedulerFor(queue: JobQueue = stubQueue()): ConsolidationScheduler {
     },
     queue,
     clock: testClock(),
+    ...(workflow === undefined ? {} : { workflow }),
   })
 }
 
@@ -341,6 +353,14 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
     expect(dueAt).toBeGreaterThan(now)
     expect(dueAt - now).toBeLessThanOrEqual(CONSOLIDATION_INTERVAL_MS)
     expect(dueAt % CONSOLIDATION_INTERVAL_MS).toBe(0)
+
+    // 重复 rearm 幂等：同一期网格内再排一次不改行 id / due_at，也不新增行
+    // （workflow step 重试/恢复都会再调一次 rearm）。
+    await scheduler.rearm('omb.forget')
+    const repeated = await consolidationTimerRows()
+    expect(repeated).toHaveLength(CONSOLIDATION_JOB_NAMES.length)
+    expect(consolidationTimerRow(repeated, forgetKey).id).toBe(row.id)
+    expect(new Date(consolidationTimerRow(repeated, forgetKey).due_at).toISOString()).toBe(new Date(row.due_at).toISOString())
   })
 
   it('给定 timer 被取消当再次 ensure 则只补那一条，其余行不动', async () => {
@@ -430,6 +450,93 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
       await queue.stop()
     }
   })
+
+  it('给定 forget 配置了 workflow dispatch 当 timer 到期则按「期」start 一次且不入队 pg-boss', async () => {
+    const enqueued: string[] = []
+    const starts: Array<{ readonly name: string; readonly key: string }> = []
+    const scheduler = schedulerFor(recordingQueue(enqueued), {
+      job: 'omb.forget',
+      workflow: 'forget',
+      start: async (name, idempotencyKey) => {
+        starts.push({ name, key: idempotencyKey })
+      },
+    })
+    const schedule = scheduler.schedules.find(item => item.job === 'omb.forget')
+    if (schedule === undefined) throw new Error('缺少 omb.forget 调度')
+    const timers = new PostgresTimerStore(db.db)
+    // 排期时就把期号写进载荷：重试同一条 timer 不会换幂等键。
+    const dueAt = new Date(Date.now() - 1_000)
+    const period = Math.floor(dueAt.getTime() / CONSOLIDATION_INTERVAL_MS)
+    await timers.schedule({
+      topic: CONSOLIDATION_TIMER_TOPIC,
+      payload: { job: 'omb.forget', period },
+      dueAt,
+      dedupeKey: schedule.dedupeKey,
+    })
+    const worker = new TimerWorker(
+      { store: timers, handlers: [scheduler.timerHandler], clock: testClock() },
+      { batchSize: 5, leaseMs: 5_000 },
+    )
+
+    expect(await worker.tick()).toMatchObject({ claimed: 1, fired: 1, dead: 0, lost: 0 })
+    expect(starts).toEqual([{ name: 'forget', key: `consolidation:omb.forget:${period}` }])
+    // 不得双跑：workflow 路径下同一个 timer 不再入队 pg-boss。
+    expect(enqueued).toEqual([])
+    // handler 不碰 timer 行（重排期会让 complete CAS 失败）：派发器正常 complete 成 done，
+    // 续期由 workflow step 的 rearm 负责。
+    expect(consolidationTimerRow(await consolidationTimerRows(), schedule.dedupeKey).status).toBe('done')
+  })
+
+  it('给定旧载荷（无 period）当 timer 到期则按当前期兜底，不把到期 timer 打成死信', async () => {
+    const starts: Array<{ readonly name: string; readonly key: string }> = []
+    const scheduler = schedulerFor(stubQueue(), {
+      job: 'omb.forget',
+      workflow: 'forget',
+      start: async (name, idempotencyKey) => {
+        starts.push({ name, key: idempotencyKey })
+      },
+    })
+    const schedule = scheduler.schedules.find(item => item.job === 'omb.forget')
+    if (schedule === undefined) throw new Error('缺少 omb.forget 调度')
+    const timers = new PostgresTimerStore(db.db)
+    await timers.schedule({
+      topic: CONSOLIDATION_TIMER_TOPIC,
+      payload: { job: 'omb.forget' },
+      dueAt: new Date(Date.now() - 1_000),
+      dedupeKey: schedule.dedupeKey,
+    })
+    const worker = new TimerWorker(
+      { store: timers, handlers: [scheduler.timerHandler], clock: testClock() },
+      { batchSize: 5, leaseMs: 5_000 },
+    )
+
+    expect(await worker.tick()).toMatchObject({ claimed: 1, fired: 1, dead: 0 })
+    const key = starts[0]?.key ?? ''
+    expect(key).toMatch(/^consolidation:omb\.forget:\d+$/)
+    const period = Number(key.slice('consolidation:omb.forget:'.length))
+    expect(Math.abs(period - Math.floor(Date.now() / CONSOLIDATION_INTERVAL_MS))).toBeLessThanOrEqual(1)
+  })
+
+  it('给定未配置 workflow dispatch 当 forget timer 到期则走 pg-boss 入队（兼容路径，与 workflow 互斥）', async () => {
+    const enqueued: string[] = []
+    const scheduler = schedulerFor(recordingQueue(enqueued))
+    const schedule = scheduler.schedules.find(item => item.job === 'omb.forget')
+    if (schedule === undefined) throw new Error('缺少 omb.forget 调度')
+    const timers = new PostgresTimerStore(db.db)
+    await timers.schedule({
+      topic: CONSOLIDATION_TIMER_TOPIC,
+      payload: { job: 'omb.forget' },
+      dueAt: new Date(Date.now() - 1_000),
+      dedupeKey: schedule.dedupeKey,
+    })
+    const worker = new TimerWorker(
+      { store: timers, handlers: [scheduler.timerHandler], clock: testClock() },
+      { batchSize: 5, leaseMs: 5_000 },
+    )
+
+    expect(await worker.tick()).toMatchObject({ claimed: 1, fired: 1 })
+    expect(enqueued).toEqual(['omb.forget'])
+  })
 })
 
 describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss）', () => {
@@ -511,7 +618,7 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
     }
   }, 90_000)
 
-  it('给定删除 10 分钟 loop 当启动则 forget 仍由 timer → pg-boss → handler 执行并归档', async () => {
+  it('给定删除 10 分钟 loop 当启动则 forget 由 timer → workflow step 执行并归档，run completed 且 timer 续期', async () => {
     const old = await writeEntity({
       kind: 'memory',
       category: 'event',
@@ -526,19 +633,56 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
 
     const plugin = startPlugin()
     try {
-      // 没有 setInterval 了：唯一驱动是启动时 durable timer 到期 → 入队一次 → handler 执行。
+      // 没有 setInterval 了：唯一驱动是启动时 durable timer 到期 → start 一个真实
+      // forget workflow run → step 调用 runForget 归档。
       await waitFor(
         async () => ((await db.get(old)) === undefined ? true : undefined),
-        'forget 任务被 timer 驱动执行并归档',
+        'forget 的 workflow step 执行并归档',
         60_000,
       )
-      // 任务执行过一次（归档是不可逆的 handler 副作用）；pg-boss 完成后会删除 job 行，
-      // 所以“只入队一次”的口径看调度侧：每个 timer 只成功派发一次、无重试/死信。
-      const fired = await statusText(plugin)
-      expect(metric(fired, 'timerFired')).toBeGreaterThanOrEqual(CONSOLIDATION_JOB_NAMES.length)
-      expect(metric(fired, 'timerRetried')).toBe(0)
-      expect(metric(fired, 'consolidationDead')).toBe(0)
-      // 归档之后下一期已经 rearm，不靠任何固定节拍。
+
+      // run 是真实定义、真实完成：name/version/status/idempotencyKey 都落库。
+      // 归档副作用发生在 step 内、completeStep 之前，所以“实体已归档”不等于 run 已 completed：
+      // 等 run 自己到终态再断言（有上界，不是固定 sleep）。
+      const run = await waitFor(
+        async () => {
+          const rows = await db.db.query<{ id: string; status: string; version: number; idempotency_key: string }>(
+            "select id, status, version, idempotency_key from omb.workflow_run where name = 'forget' order by created_at",
+          )
+          const row = rows.rows[0]
+          return rows.rows.length === 1 && row?.status === 'completed' ? row : undefined
+        },
+        'forget workflow run 完成',
+        30_000,
+      )
+      expect(run.version).toBe(1)
+      // 幂等键 = <dedupeKey>:<期号>：同一期的重复派发只会命中同一个 run。
+      expect(run.idempotency_key).toMatch(/^consolidation:omb\.forget:\d+$/)
+
+      const steps = await db.db.query<{ step: string; status: string; output: { state?: Record<string, unknown> } }>(
+        'select step, status, output from omb.workflow_step where run_id = $1 order by attempt',
+        [run.id],
+      )
+      expect(steps.rows.map(row => `${row.step}:${row.status}`)).toEqual(['archive:completed'])
+      // step state 记录了 ctx 的幂等键/时钟读数与真实归档数（不是只跑了个空壳）。
+      expect(steps.rows[0]?.output.state).toMatchObject({
+        target: 'forget',
+        archived: 1,
+        commandId: `${run.id}:archive`,
+      })
+      expect(typeof steps.rows[0]?.output.state?.['at']).toBe('string')
+
+      const text = await statusText(plugin)
+      // status 必须报真实定义与 completed 计数，而不是 workflowDefinitions=none。
+      expect(text).toContain('workflowDefinitions=forget')
+      expect(metric(text, 'workflowCompleted')).toBeGreaterThanOrEqual(1)
+      expect(metric(text, 'workflowDead')).toBe(0)
+      // 不得双跑：workflow 路径下 forget 不再入队 pg-boss。
+      const queued = await db.db.query<{ count: string }>(
+        "select count(*)::text as count from pgboss.job where name = 'omb.forget'",
+      )
+      expect(Number(queued.rows[0]?.count ?? 0)).toBe(0)
+      // 归档之后由 step 的 rearm 把同一行排到下一网格，不靠任何固定节拍。
       await waitFor(
         async () => {
           const row = consolidationTimerRow(await consolidationTimerRows(), 'consolidation:omb.forget')
@@ -626,6 +770,23 @@ describe('巩固调度源码（静态）', () => {
     // 调度必须真的走 timer 表：dedupeKey 稳定、topic 固定、任务名是载荷。
     expect(jobsSource).toContain("const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'")
     expect(jobsSource).toContain('dedupeKey: `consolidation:${job}`')
-    expect(jobsSource).toContain('payload: { job: schedule.job }')
+    expect(jobsSource).toContain('payload: { job: schedule.job, period: periodOf(dueAt, schedule.intervalMs) }')
+  })
+
+  it('给定 forget 改成 workflow 执行当静态检查则定义有真实 step、调度只 start，续期不在 handler 里', async () => {
+    const business = await readFile(new URL('../../../packages/v7/src/app/workflow/business.ts', import.meta.url), 'utf8')
+    const jobsSource = await readFile(new URL('../../../packages/v7/src/jobs/consolidate.ts', import.meta.url), 'utf8')
+    const pluginConsolidation = await readFile(new URL('../../../plugin/v7/consolidation.ts', import.meta.url), 'utf8')
+
+    // 定义是真实业务步骤（不是空壳）：step 名固定，命令幂等键与时钟来自 ctx。
+    expect(business).toContain("export const FORGET_WORKFLOW = 'forget'")
+    expect(business).toContain("export const FORGET_STEP = 'archive'")
+    expect(business).toContain('ctx.commandId')
+    expect(business).toContain('ctx.now')
+    // 行为与后台 handler 一致：定义只通过注入的 forget port 调同一个实现。
+    expect(pluginConsolidation).toContain('runForget(')
+    expect(pluginConsolidation).toContain('rearm: () => scheduler.rearm(FORGET_JOB)')
+    // timer 到期在 workflow 路径下只 start：不得同时入队 pg-boss（双跑）。
+    expect(jobsSource).toContain('await dispatch.start(dispatch.workflow')
   })
 })

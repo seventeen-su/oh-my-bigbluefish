@@ -103,6 +103,29 @@ async function waitFor<T>(
   }
 }
 
+/**
+ * 等真实 forget workflow 的启动首轮结束。
+ *
+ * 真实定义注册后，plugin 启动时的首轮 timer 会创建一条 `name='forget'` 的 run；
+ * 在它结束前断言全局 `workflowPending/Running` 计数会读到那条 run（合法，但不是
+ * 本文件想验证的 seeded run）。这里等“timer 已派发过本期 + 没有在途 forget run”。
+ */
+async function waitForForgetIdle(): Promise<void> {
+  await waitFor(
+    async () => {
+      const timer = await store.db.query<{ status: string }>(
+        "select status from omb.timer where dedupe_key = 'consolidation:omb.forget'",
+      )
+      const dispatched = timer.rows[0]?.status === 'done' || timer.rows[0]?.status === 'pending'
+      const active = await store.db.query<{ count: number }>(
+        "select count(*)::int as count from omb.workflow_run where name = 'forget' and status in ('pending', 'running', 'waiting')",
+      )
+      return dispatched && (active.rows[0]?.count ?? 0) === 0 ? true : undefined
+    },
+    'forget workflow 启动首轮结束',
+  )
+}
+
 interface RunningRuntime {
   readonly host: FakeHost
   readonly dispose: () => void
@@ -287,6 +310,9 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
           if (metric(current, 'consolidationPending') !== EXPECTED_CONSOLIDATION_TIMERS) return undefined
           if (metric(current, 'timerPending') !== metric(current, 'consolidationPending')) return undefined
           if (metric(current, 'timerClaimed') !== metric(current, 'consolidationClaimed')) return undefined
+          // 真实 forget run 可能在 step rearm 之后、completeStep 之前被读到（1–2ms 窗口）；
+          // 等它离开 pending/running 再取快照，否则 workflowRunning=1 会让下面的断言抖动。
+          if (metric(current, 'workflowPending') !== 0 || metric(current, 'workflowRunning') !== 0) return undefined
           return current
         },
         '巩固任务全部 rearm 成 pending 且 timer 聚合数一致',
@@ -307,7 +333,8 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       expect(text).toMatch(/consolidationJobs=omb\.[a-z-]+(,omb\.[a-z-]+)*/)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=0 workflowRunning=0 workflowWaiting=0 workflowDead=0/)
-      expect(text).toContain('workflowDefinitions=none')
+      // 真实业务定义已注册：status 必须报定义名，不再是 none。
+      expect(text).toContain('workflowDefinitions=forget')
 
       // 启动顺序：投影 worker 先起，event 运行时（outbox/timer/workflow）在其后。
       const lines = infoLines(runtime)
@@ -777,6 +804,8 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       )
       expect(dead.last_error).toContain('未注册')
 
+      // 先等 plugin 启动首轮创建的真实 forget run 结束，再读全局计数。
+      await waitForForgetIdle()
       const text = await statusText(runtime)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=0 workflowRunning=0/)
@@ -800,6 +829,8 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
            ('wf_dead', 'future-d', 1, '{}'::jsonb, 'a', 'dead', 3, null, $4)`,
         [`idem-${randomUUID()}`, `idem-${randomUUID()}`, `idem-${randomUUID()}`, `idem-${randomUUID()}`],
       )
+      // 先等 plugin 启动首轮创建的真实 forget run 结束，seeded run 的精确计数才稳定。
+      await waitForForgetIdle()
       const text = await statusText(runtime)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=1 workflowRunning=1 workflowWaiting=1 workflowDead=1/)

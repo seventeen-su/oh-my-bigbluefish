@@ -5,10 +5,11 @@
  * 1. 两个 notifier 先 `ready()`：LISTEN 建立后才能保证“事务提交后的 NOTIFY”不丢；
  *    漏通知仍由 relay 首次 drain 与 timer 的 `nextDueAt` 单次定时器兜底。
  * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed` + 合并 `omb.refresh`）与
- *    两个 timer handler（到期唤醒 workflow runtime；巩固任务的 durable schedule 到期入队）。
+ *    两个 timer handler（到期唤醒 workflow runtime；巩固任务的 durable schedule 到期派发）。
  *    未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
- * 3. 启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的 running 回
- *    pending 并唤醒循环（启动恢复）。
+ * 3. 构造 workflow runtime 时先注册真实业务定义（当前 `forget`），再把「按幂等键 start run」
+ *    绑定给巩固调度；然后启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的
+ *    running 回 pending 并唤醒循环（启动恢复）。
  *
  * 没有固定轮询：relay 空闲时等 NOTIFY，timer/workflow 只在有未来到期行时 arm 一个
  * 单次定时器；本模块不新增 setInterval。
@@ -27,7 +28,7 @@ import type { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/inde
 import { OutboxRelay, ReactionRegistry } from '../../packages/v7/src/app/outbox/index.js'
 import type { Reaction } from '../../packages/v7/src/app/outbox/index.js'
 import { TimerWorker, WorkflowRuntime } from '../../packages/v7/src/app/workflow/index.js'
-import type { TimerHandler } from '../../packages/v7/src/app/workflow/index.js'
+import type { TimerHandler, WorkflowDefinition } from '../../packages/v7/src/app/workflow/index.js'
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import type { JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import {
@@ -57,6 +58,10 @@ export interface EventRuntimeDeps {
   readonly clock: Clock
   readonly logger: Logger
   readonly timerStore: PostgresTimerStore
+  /** 真实业务 workflow 定义（当前只有 forget）：启动时注册进 WorkflowRuntime。 */
+  readonly workflowDefinitions: readonly WorkflowDefinition[]
+  /** workflow runtime 就绪后，把「按幂等键 start run」的窄能力交给巩固调度。 */
+  readonly bindConsolidationWorkflow: (start: (name: string, idempotencyKey: string) => Promise<unknown>) => void
   readonly consolidationTimerHandler: TimerHandler
   readonly consolidationStatusLines: () => Promise<string[]>
   /** 投影链路属于另一个模块，但 `omb_status` 的 LISTEN 三段读数必须一起报。 */
@@ -247,10 +252,17 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
         { batchSize: 25, leaseMs: 30_000, unknownTopic: 'dead' },
       )
       const workflowStore = new PostgresWorkflowStore(store.db)
-      workflow = new WorkflowRuntime(
+      const workflowRuntimeInstance = new WorkflowRuntime(
         { store: workflowStore, clock, logger },
         { batchSize: 10, leaseMs: 30_000 },
       )
+      workflow = workflowRuntimeInstance
+      // 真实业务定义必须在 start 前注册：status 的 workflowDefinitions 与 timer 的 start
+      // 都依赖它；然后才把 start 能力交给巩固调度（timer 到期要用）。
+      for (const definition of deps.workflowDefinitions) workflowRuntimeInstance.register(definition)
+      deps.bindConsolidationWorkflow((name, idempotencyKey) => (
+        workflowRuntimeInstance.startRun(name, undefined, { idempotencyKey })
+      ))
       const workflowWake: TimerHandler = {
         topic: WORKFLOW_WAKE_TIMER_TOPIC,
         async run(): Promise<void> {

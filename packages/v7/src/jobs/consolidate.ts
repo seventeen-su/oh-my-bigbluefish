@@ -10,7 +10,7 @@ import type { JobQueue, Logger } from '../ports/jobs.js'
 import type { MaintenanceQueries } from '../ports/maintenance.js'
 import type { SimilarEntity, Store, WriteResult } from '../ports/store.js'
 import { UpdateService } from '../app/update.js'
-import type { TimerHandler, TimerScheduleInput, TimerTask } from '../app/workflow/index.js'
+import type { TimerContext, TimerHandler, TimerScheduleInput, TimerTask } from '../app/workflow/index.js'
 import type { DynamicService } from '../app/dynamic.js'
 import type { Embedder } from '../ports/embedding.js'
 
@@ -583,15 +583,62 @@ export async function handleLinkSuggest(deps: ConsolidationDeps, limit = 50): Pr
   return { linked, grouped }
 }
 
-export async function handleForget(deps: ConsolidationDeps, limit = 30, threshold = 0.35): Promise<{ archived: number }> {
-  const items = await deps.queries.forgettable(limit, threshold)
+/** 忘记任务的默认选择窗口：一次最多 30 条、显著度低于 0.35。 */
+const FORGET_LIMIT = 30
+const FORGET_THRESHOLD = 0.35
+
+/** 忘记任务可选入参：workflow step 传 ctx 的 commandId/now/signal，队列入口只传窗口。 */
+interface ForgetRunInput {
+  /** 命令幂等键：workflow step 传 `ctx.commandId`；队列入口合成一次性键。 */
+  readonly commandId?: string
+  /** 注入时钟读数：workflow step 传 `ctx.now`，步骤内不再读系统时间。 */
+  readonly now?: Date
+  /** 取消信号：workflow step 传 `ctx.signal`；中止后抛错让运行时按取消收尾。 */
+  readonly signal?: AbortSignal
+  readonly limit?: number
+  readonly threshold?: number
+}
+
+interface ForgetRunResult {
+  readonly archived: number
+  readonly commandId: string
+  /** 本次执行的时钟读数（ISO），来自入参 now 或注入的 Clock。 */
+  readonly at: string
+}
+
+/** `runForget` 只需要「选谁可忘 + 归档」两件事，不依赖整个巩固依赖集。 */
+interface ForgetRunDeps {
+  readonly store: Pick<Store, 'archive'>
+  readonly queries: Pick<MaintenanceQueries, 'forgettable'>
+  readonly clock: Clock
+  readonly logger?: Logger
+}
+
+/**
+ * 忘记任务的**唯一**执行体：后台队列 handler 与 workflow step 都调用它。
+ * 选择条件/归档原因与改造前一致；workflow 入口只额外传 `ctx.commandId/now/signal`。
+ * 重放时归档集合只会缩小不会翻倍——`forgettable` 本身排除已归档条目。
+ */
+export async function runForget(deps: ForgetRunDeps, input: ForgetRunInput = {}): Promise<ForgetRunResult> {
+  const commandId = input.commandId ?? `job:forget:${crypto.randomUUID()}`
+  const now = input.now ?? deps.clock.now()
+  const items = await deps.queries.forgettable(input.limit ?? FORGET_LIMIT, input.threshold ?? FORGET_THRESHOLD)
   let archived = 0
   for (const item of items) {
+    if (input.signal?.aborted === true) throw new Error('forget 已取消')
     // 显著度只用于选择与审计，不再单独写一个无审计的 salience 更新；回滚 archive 即完整恢复。
     await deps.store.archive(item.id, `forgetting:${item.salience.toFixed(3)}`, 'job:forget')
     archived += 1
   }
-  return { archived }
+  const at = now.toISOString()
+  deps.logger?.debug('遗忘任务完成', { commandId, at, archived })
+  return { archived, commandId, at }
+}
+
+/** 队列入口：行为与改造前一致，只是复用 `runForget`（不另写一份归档逻辑）。 */
+export async function handleForget(deps: ConsolidationDeps, limit = FORGET_LIMIT, threshold = FORGET_THRESHOLD): Promise<{ archived: number }> {
+  const result = await runForget(deps, { limit, threshold })
+  return { archived: result.archived }
 }
 
 export async function handleEmbedSweep(deps: ConsolidationDeps, limit = 20): Promise<{ embedded: number }> {
@@ -696,14 +743,26 @@ const CONSOLIDATION_JOBS = [
   'omb.embed-sweep',
 ] as const
 
+/** 巩固任务名（`omb.*`）；调度与事件 reaction 用它对齐。 */
 type ConsolidationJobName = (typeof CONSOLIDATION_JOBS)[number]
 
+/** 「按幂等键启动一个已注册 run」：幂等键由调度方按「期」生成，重放返回已有 run。 */
+type WorkflowRunStarter = (name: string, idempotencyKey: string) => Promise<unknown>
+
 /**
- * 巩固任务的 durable schedule（ADR-0011）。
- *
- * 调度只落三样东西：稳定的 `dedupeKey`、`due_at` 网格、以及“到期把哪个任务入队”。
- * 重试/死信由 pg-boss 负责；到期只入队一次。对外只暴露一个窄接口
- * `createConsolidationScheduler`，排期/续期/触发标记都是模块内部细节。
+ * 一个由 workflow（而不是 pg-boss 队列）执行的巩固任务：timer 到期只按「期」幂等 start，
+ * 本期执行完由 step 的 `rearm` 续期（不在 handler 里改 timer 行，见 timerHandler 注释）。
+ */
+interface ConsolidationWorkflowDispatch {
+  readonly job: ConsolidationJobName
+  /** 已注册在 WorkflowRuntime 里的定义名；调度只按名字启动，不解释步骤。 */
+  readonly workflow: string
+  readonly start: WorkflowRunStarter
+}
+
+/**
+ * 巩固任务的 durable schedule（ADR-0011）：稳定 `dedupeKey` + `due_at` 网格 + 到期派发。
+ * 派发互斥：默认入队 pg-boss；配置 workflow dispatch 的 forget 改为 start 真实 run。
  */
 const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'
 const CONSOLIDATION_INTERVAL_MS = 10 * 60 * 1000
@@ -751,7 +810,7 @@ interface ConsolidationScheduler {
   ensure(jobs?: readonly string[]): Promise<ConsolidationScheduleResult>
   /** 调度驱动的任务执行完：把下一期排到网格点（同 dedupeKey 覆盖，行数恒定）。 */
   rearm(job: string): Promise<void>
-  /** 到期只把对应任务入队 pg-boss 一次；重试/死信交给 pg-boss。 */
+  /** 到期派发一次：默认入队 pg-boss；配置了 workflow dispatch 的任务改为 start 一个 run。 */
   readonly timerHandler: TimerHandler
 }
 
@@ -760,6 +819,11 @@ interface ConsolidationSchedulerDeps {
   readonly queue: JobQueue
   readonly clock: Clock
   readonly logger?: Logger
+  /**
+   * 由真实 workflow 执行的任务（当前只有 forget）。缺省/未配置时该任务仍走 pg-boss 入队
+   * 的旧路径（测试与旧装配），两者互斥：同一任务只会有一种派发方式，不会双跑。
+   */
+  readonly workflow?: ConsolidationWorkflowDispatch
 }
 
 function scheduleOf(job: string): ConsolidationSchedule {
@@ -779,10 +843,33 @@ function nextDue(now: Date, intervalMs: number): Date {
   return new Date(Math.ceil((now.getTime() + 1) / interval) * interval)
 }
 
+/**
+ * 网格期号：同一期内的重试/重复派发得到同一个数字。
+ *
+ * 它随 timer 载荷一起落库（排期时按 `due_at` 写入），所以重试一条 timer 不会换期号，
+ * workflow 的幂等键（`<dedupeKey>:<period>`）也就不会换。
+ */
+function periodOf(at: Date, intervalMs: number): number {
+  return Math.floor(at.getTime() / Math.max(1, Math.trunc(intervalMs)))
+}
+
+/**
+ * timer 载荷里的期号。
+ *
+ * 部署前已经排好的行只有 `{ job }`：按本次派发时刻的期号兜底，不把到期 timer 打成死信；
+ * 本轮 rearm 会把带 period 的载荷写回去，之后的重试都稳定。
+ */
+function periodOfPayload(payload: JsonValue, intervalMs: number, now: Date): number {
+  const period = isPlainObject(payload) ? payload['period'] : undefined
+  if (typeof period === 'number' && Number.isInteger(period) && period >= 0) return period
+  return periodOf(now, intervalMs)
+}
+
 function timerInput(schedule: ConsolidationSchedule, dueAt: Date): TimerScheduleInput {
   return {
     topic: CONSOLIDATION_TIMER_TOPIC,
-    payload: { job: schedule.job },
+    // period 是「这一期」的身份：workflow 幂等键与 pg-boss singletonKey 都从它派生。
+    payload: { job: schedule.job, period: periodOf(dueAt, schedule.intervalMs) },
     dueAt,
     dedupeKey: schedule.dedupeKey,
   }
@@ -830,10 +917,23 @@ export function createConsolidationScheduler(deps: ConsolidationSchedulerDeps): 
     },
     timerHandler: {
       topic: CONSOLIDATION_TIMER_TOPIC,
-      async run(task: TimerTask): Promise<void> {
+      async run(task: TimerTask, ctx: TimerContext): Promise<void> {
         const job = jobOfPayload(task.payload)
-        const intervalMs = scheduleOf(job).intervalMs
-        const bucket = Math.floor(deps.clock.now().getTime() / intervalMs)
+        const schedule = scheduleOf(job)
+        const dispatch = deps.workflow
+        if (dispatch !== undefined && dispatch.job === job) {
+          // 只启动、不续期：此刻 timer 行还是 claimed，重排期会让派发器的 complete CAS 失败。
+          // 本期执行完由 workflow step 调 rearm 续下一期（见 app/workflow/business.ts）。
+          const period = periodOfPayload(task.payload, schedule.intervalMs, ctx.now)
+          await dispatch.start(dispatch.workflow, `${schedule.dedupeKey}:${period}`)
+          deps.logger?.debug('巩固任务已交给 workflow 执行', {
+            job,
+            workflow: dispatch.workflow,
+            period,
+          })
+          return
+        }
+        const bucket = periodOf(ctx.now, schedule.intervalMs)
         await deps.queue.enqueue(job, { trigger: CONSOLIDATION_TRIGGER, job }, {
           singletonKey: `${job}:${bucket}`,
           retryLimit: 3,

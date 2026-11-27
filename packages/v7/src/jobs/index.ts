@@ -6,9 +6,9 @@ export {
   handleConflict,
   handleDedupe,
   handleExtract,
-  handleForget,
   handleLinkSuggest,
   handleReferenceRot,
   registerConsolidationJobs,
+  runForget,
   type ConsolidationDeps,
 } from './consolidate.js'

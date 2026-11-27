@@ -13,10 +13,22 @@ import {
   type WorkflowRuntimeOptions,
   type WorkflowStore,
 } from '../../../packages/v7/src/app/workflow/index.js'
+import {
+  createForgetWorkflow,
+  FORGET_STEP,
+  FORGET_WORKFLOW,
+} from '../../../packages/v7/src/app/workflow/business.js'
+import type { ForgetStepRequest } from '../../../packages/v7/src/app/workflow/business.js'
+import { handleForget, runForget } from '../../../packages/v7/src/jobs/consolidate.js'
+import type { ConsolidationDeps } from '../../../packages/v7/src/jobs/consolidate.js'
+import { UpdateService } from '../../../packages/v7/src/app/update.js'
+import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import type { JsonValue } from '../../../packages/v7/src/domain/json.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'
 import { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
+import { PostgresMaintenance } from '../../../packages/v7/src/adapters/postgres/maintenance.js'
 import { migrateDatabase } from '../../../packages/v7/src/adapters/postgres/migrate.js'
+import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import {
   PostgresTimerNotifier,
   PostgresTimerStore,
@@ -26,6 +38,7 @@ import {
   PostgresWorkflowStore,
   WORKFLOW_CLAIM_SQL,
 } from '../../../packages/v7/src/adapters/postgres/workflow.js'
+import { derived, normalized } from './helpers.js'
 
 /** 独立测试库：不读写 omb_v7_test / 生产库；008 的 workflow/timer 表由本套件自己建。 */
 const DATABASE_URL = process.env.OMB_WORKFLOW_TEST_DATABASE_URL
@@ -1027,6 +1040,275 @@ describe('TimerStore/TimerWorker（真实 PostgreSQL）', () => {
     ).toBe(true)
 
     expect(await timerStore.claimDue({ limit: 25, leaseMs: 5_000 })).toHaveLength(5)
+  })
+})
+
+/**
+ * 真实业务 workflow 定义（`forget`）：与后台队列 handler 共用 `runForget`，
+ * 所以这里既验证定义契约（ctx.commandId/now、initial/step），也验证真实归档行为。
+ *
+ * 固定 Clock：断言 step 的 `at` 来自注入时钟而不是系统时间（重放确定性）。
+ */
+describe('forget 业务 workflow（真实 PostgreSQL）', () => {
+  const FIXED = new Date('2026-01-02T03:04:05.000Z')
+  const fixedClock: Clock = { now: () => FIXED, iso: () => FIXED.toISOString() }
+
+  let entityStore: PostgresStore
+  let maintenance: PostgresMaintenance
+
+  beforeAll(async () => {
+    await migrateDatabase(DATABASE_URL)
+    db = new PostgresDb({ connectionString: DATABASE_URL })
+    store = new PostgresWorkflowStore(db)
+    timerStore = new PostgresTimerStore(db)
+    entityStore = new PostgresStore(DATABASE_URL)
+    maintenance = new PostgresMaintenance(db)
+  })
+
+  beforeEach(async () => {
+    await reset()
+    // 实体表只被本套件使用（独立库）；清空避免跨用例的可遗忘条目互相污染。
+    await db.query('truncate table omb.entity restart identity cascade')
+  })
+
+  afterAll(async () => {
+    await entityStore.close()
+    await db.close()
+  })
+
+  function fixedRuntime(options: WorkflowRuntimeOptions = {}): WorkflowRuntime {
+    return new WorkflowRuntime(
+      { store, clock: fixedClock },
+      { batchSize: 10, leaseMs: 30_000, retry: { maxAttempts: 3, baseDelayMs: 1_000, factor: 2, maxDelayMs: 5_000 }, ...options },
+    )
+  }
+
+  async function seed(input: WriteEntityInput): Promise<string> {
+    const written = await entityStore.write(normalized(input), derived(input))
+    const id = written.entity.id
+    await db.query("update omb.entity set updated_at = now() - interval '365 days' where id = $1", [id])
+    await db.query("update omb.entity_view set updated_at = now() - interval '365 days', confidence = 0 where entity_id = $1", [id])
+    return id
+  }
+
+  /** 低显著度、老时间、未 pin 的记忆：后台 handler 与本定义都应当把它归档。 */
+  function seedForgettable(title: string): Promise<string> {
+    return seed({
+      kind: 'memory',
+      category: 'event',
+      scope: { kind: 'global' },
+      attrs: { title, body: '无关紧要' },
+    })
+  }
+
+  function seedState(title: string): Promise<string> {
+    return seed({
+      kind: 'state',
+      scope: { kind: 'global' },
+      title,
+      status: 'in_progress',
+      time: '2026-01-01T00:00:00.000Z',
+      attrs: { body: '不能被遗忘任务自动归档' },
+    })
+  }
+
+  interface ForgetHarness {
+    readonly definition: WorkflowDefinition
+    readonly calls: ForgetStepRequest[]
+    rearmCalls(): number
+    failNext(times: number): void
+  }
+
+  /** 真实 deps + 可注入失败的 wrapper：同一 handler，失败只发生在本用例的包装层。 */
+  function forgetHarness(): ForgetHarness {
+    const calls: ForgetStepRequest[] = []
+    let failuresLeft = 0
+    let rearm = 0
+    const definition = createForgetWorkflow({
+      async forget(request) {
+        calls.push(request)
+        if (failuresLeft > 0) {
+          failuresLeft -= 1
+          throw new Error('forget boom')
+        }
+        return await runForget({ store: entityStore, queries: maintenance, clock: fixedClock }, {
+          commandId: request.commandId,
+          now: request.now,
+          signal: request.signal,
+        })
+      },
+      async rearm() {
+        rearm += 1
+      },
+    })
+    return {
+      definition,
+      calls,
+      rearmCalls: () => rearm,
+      failNext: times => {
+        failuresLeft = times
+      },
+    }
+  }
+
+  it('给定真实 forget 定义当 drain 则 step 用 ctx.commandId/now 调用同一 handler、归档生效且 run completed', async () => {
+    const forgettable = await seedForgettable('很久以前的日志')
+    const kept = await seedState('进行中的状态')
+    const harness = forgetHarness()
+    const runtime = fixedRuntime()
+    runtime.register(harness.definition)
+    expect(harness.definition).toMatchObject({ name: FORGET_WORKFLOW, version: 1, initial: { target: FORGET_WORKFLOW } })
+    expect(harness.definition.steps.map(step => step.name)).toEqual([FORGET_STEP])
+
+    const { runId } = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'forget-period-1' })
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+
+    const row = await runRow(runId)
+    expect(row).toMatchObject({ status: 'completed', step: null })
+    // 期望值写死：commandId = <runId>:<step>，at 来自注入的固定时钟。
+    expect(row.state).toEqual({
+      target: FORGET_WORKFLOW,
+      archived: 1,
+      commandId: `${runId}:${FORGET_STEP}`,
+      at: FIXED.toISOString(),
+    })
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.calls[0]?.commandId).toBe(`${runId}:${FORGET_STEP}`)
+    expect(harness.calls[0]?.now.toISOString()).toBe(FIXED.toISOString())
+    expect(harness.rearmCalls()).toBe(1)
+    expect(await entityStore.get(forgettable)).toBeUndefined()
+    expect(await entityStore.get(kept)).toBeDefined()
+
+    const steps = await store.steps(runId)
+    expect(steps.map(record => `${record.step}:${record.status}`)).toEqual([`${FORGET_STEP}:completed`])
+    expect(steps[0]?.output).toEqual({
+      state: { target: FORGET_WORKFLOW, archived: 1, commandId: `${runId}:${FORGET_STEP}`, at: FIXED.toISOString() },
+      next: null,
+    })
+  })
+
+  it('给定同一期幂等键当重复派发则只建一个 run 且只执行一次归档', async () => {
+    const forgettable = await seedForgettable('重复派发的遗忘')
+    const harness = forgetHarness()
+    const runtime = fixedRuntime()
+    runtime.register(harness.definition)
+
+    const first = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'consolidation:omb.forget:77' })
+    const second = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'consolidation:omb.forget:77' })
+    expect(first.inserted).toBe(true)
+    expect(second).toEqual({ runId: first.runId, inserted: false })
+
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect(await runtime.drain()).toMatchObject({ claimed: 0 })
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.rearmCalls()).toBe(1)
+    expect(await entityStore.get(forgettable)).toBeUndefined()
+    const runs = await db.query<{ count: number }>("select count(*)::int as count from omb.workflow_run where name = 'forget'")
+    expect(runs.rows[0]?.count).toBe(1)
+  })
+
+  it('给定前两次失败当第三次成功则 commandId 重放稳定、run completed、每次 attempt 都续期', async () => {
+    const forgettable = await seedForgettable('第三次才成功')
+    const harness = forgetHarness()
+    harness.failNext(2)
+    // 真实时钟 + 显式 makeDue：固定时钟会让退避时间落在过去，一次 drain 就重试完，
+    // 反而测不到“每次 attempt 各续期一次”。
+    const runtime = runtimeOf({ retry: { maxAttempts: 3, baseDelayMs: 500, factor: 2, maxDelayMs: 5_000 } })
+    runtime.register(harness.definition)
+    const { runId } = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'forget-retry' })
+
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, retried: 1, steps: 0 })
+    expect(await runRow(runId)).toMatchObject({ status: 'pending' })
+    await makeDue(runId)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, retried: 1 })
+    await makeDue(runId)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+
+    // 三次 attempt 的幂等键相同：重放不会换命令。
+    expect(harness.calls.map(call => call.commandId)).toEqual([
+      `${runId}:${FORGET_STEP}`,
+      `${runId}:${FORGET_STEP}`,
+      `${runId}:${FORGET_STEP}`,
+    ])
+    // 续期跟着每次真实尝试走（step finally）：失败也把下一期排上，不静默断链。
+    expect(harness.rearmCalls()).toBe(3)
+    const state = (await runRow(runId)).state as { archived?: unknown; commandId?: unknown; at?: unknown }
+    expect(state.archived).toBe(1)
+    expect(state.commandId).toBe(`${runId}:${FORGET_STEP}`)
+    expect(typeof state.at).toBe('string')
+    expect(await entityStore.get(forgettable)).toBeUndefined()
+    expect((await store.steps(runId)).map(record => `${record.attempt}:${record.status}`)).toEqual([
+      '1:failed',
+      '2:failed',
+      '3:completed',
+    ])
+  })
+
+  it('给定一直失败当重试耗尽则 run dead，人工 retry 后重放 completed', async () => {
+    const forgettable = await seedForgettable('死信后人工重放')
+    const harness = forgetHarness()
+    harness.failNext(Number.MAX_SAFE_INTEGER)
+    const runtime = fixedRuntime({ retry: { maxAttempts: 1, baseDelayMs: 100, factor: 2, maxDelayMs: 1_000 } })
+    runtime.register(harness.definition)
+    const { runId } = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'forget-dead' })
+
+    expect((await runtime.drain()).dead).toBe(1)
+    expect((await runRow(runId)).status).toBe('dead')
+
+    harness.failNext(0)
+    expect(await runtime.retry(runId)).toBe(true)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect((await runRow(runId)).status).toBe('completed')
+    // 人工重放不重置 attempts：第 2 次 attempt 完成，幂等键仍是同一个。
+    expect((await store.steps(runId)).map(record => `${record.attempt}:${record.status}`)).toEqual(['1:failed', '2:completed'])
+    expect(harness.calls.map(call => call.commandId)).toEqual([`${runId}:${FORGET_STEP}`, `${runId}:${FORGET_STEP}`])
+    expect(await entityStore.get(forgettable)).toBeUndefined()
+  })
+
+  it('给定 running 且租约过期当 recover 则从 archive checkpoint 继续并 completed', async () => {
+    const forgettable = await seedForgettable('崩溃后恢复')
+    const harness = forgetHarness()
+    const runtime = fixedRuntime()
+    runtime.register(harness.definition)
+    const { runId } = await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'forget-recover' })
+
+    // 模拟进程在 step 中途被杀：已 claim + beginStep，run 停在 running。
+    const claimed = await store.claimDue({ limit: 1, leaseMs: 30_000 })
+    expect(claimed.map(run => run.id)).toEqual([runId])
+    await store.beginStep({ runId, step: FORGET_STEP, attempt: 1, input: { target: FORGET_WORKFLOW } })
+    await makeDue(runId)
+
+    expect(await runtime.recover()).toMatchObject({ recovered: 1, due: 1 })
+    expect((await runRow(runId)).status).toBe('pending')
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect(harness.calls.map(call => call.commandId)).toEqual([`${runId}:${FORGET_STEP}`])
+    expect(await entityStore.get(forgettable)).toBeUndefined()
+    expect((await store.steps(runId)).map(record => `${record.step}:${record.attempt}:${record.status}`)).toEqual([
+      `${FORGET_STEP}:1:running`,
+      `${FORGET_STEP}:2:completed`,
+    ])
+  })
+
+  it('给定等价数据当 workflow step 与后台 handleForget 各跑一次则归档结果一致', async () => {
+    // 两个入口的选择范围相同（同一 forgettable 查询），所以分两段做“等价输入各跑一次”。
+    const viaWorkflow = await seedForgettable('经由 workflow')
+    const harness = forgetHarness()
+    const runtime = fixedRuntime()
+    runtime.register(harness.definition)
+    await runtime.startRun(FORGET_WORKFLOW, undefined, { idempotencyKey: 'forget-parity' })
+    expect(await runtime.drain()).toMatchObject({ completed: 1 })
+    expect(await entityStore.get(viaWorkflow)).toBeUndefined()
+
+    const viaHandler = await seedForgettable('经由后台 handler')
+    const handlerDeps: ConsolidationDeps = {
+      store: entityStore,
+      queries: maintenance,
+      updateService: new UpdateService({ store: entityStore }),
+      clock: fixedClock,
+    }
+    const result = await handleForget(handlerDeps)
+    expect(result.archived).toBe(1)
+    expect(await entityStore.get(viaHandler)).toBeUndefined()
   })
 })
 
