@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import type {
   Attribute,
@@ -451,11 +452,85 @@ async function upsertView(client: PoolClient, view: ViewValues): Promise<void> {
   )
 }
 
-async function insertAudit(client: PoolClient, entry: AuditEntry): Promise<number> {
-  const result = await client.query<{ id: string }>(
-    `insert into omb.audit_log (actor, action, target_ids, before, after, inverse, job_id)
-     values ($1,$2,$3::text[],$4::jsonb,$5::jsonb,$6::jsonb,$7)
-     returning id`,
+/** 审计链一条记录的规范字段；业务事件与运维审计两个写入入口共用。 */
+export interface AuditChainEntry {
+  readonly actor: string
+  readonly action: string
+  readonly targetIds?: readonly string[]
+  readonly before?: JsonValue
+  readonly after?: JsonValue
+  readonly inverse?: JsonValue
+  readonly jobId?: string | null
+  readonly commandId?: string | null
+  readonly streamId?: string | null
+  readonly streamVersion?: number | null
+  readonly eventType?: string | null
+  readonly revision?: number | null
+  readonly correlationId?: string | null
+  readonly causationId?: string | null
+  readonly actorKind?: string | null
+}
+
+/**
+ * 链载荷的规范 JSON：键序固定（canonicalJson 排序）、缺省写成 null，保证同一行在
+ * 任意进程/任意时间都算出同一 hash。command/event/revision 都在载荷里：命令幂等键、
+ * 事件类型、stream 版本任一被改都会打断链。
+ */
+export function auditChainPayload(entry: AuditChainEntry): string {
+  return canonicalJson({
+    actor: entry.actor,
+    action: entry.action,
+    targetIds: [...(entry.targetIds ?? [])],
+    before: entry.before ?? null,
+    after: entry.after ?? null,
+    inverse: entry.inverse ?? null,
+    jobId: entry.jobId ?? null,
+    commandId: entry.commandId ?? null,
+    streamId: entry.streamId ?? null,
+    streamVersion: entry.streamVersion ?? null,
+    eventType: entry.eventType ?? null,
+    revision: entry.revision ?? null,
+    correlationId: entry.correlationId ?? null,
+    causationId: entry.causationId ?? null,
+    actorKind: entry.actorKind ?? null,
+  })
+}
+
+/** `prev_hash` + 载荷的 sha256；空链起点用空串占位（`prev_hash` 列同时存 null）。 */
+export function auditChainHash(prevHash: string | null, entry: AuditChainEntry): string {
+  return createHash('sha256').update(`${prevHash ?? ''}\n${auditChainPayload(entry)}`).digest('hex')
+}
+
+interface AppendedAuditRow {
+  readonly id: number
+  readonly hash: string
+  readonly createdAt: Date | string
+}
+
+/**
+ * 追加审计行并链接 hash chain（ADR-0010）。
+ *
+ * 串行化：事务内先取 `omb:audit-chain` advisory lock，再读链头、写新行；并发写事务
+ * 不可能算出同一个 `prev_hash`（唯一索引之外的第二道保证），也不会 fork。
+ * 链头只看 `hash is not null`：迁移前遗留的无 hash 行不参与链接，新链从第一条带
+ * hash 的行开始。链尾被单独删除无法仅凭链内数据发现，这是链式审计的固有限制
+ * （需要外部锚点/定期快照），已在交付说明里记录。
+ */
+async function appendAuditRow(client: PoolClient, entry: AuditChainEntry): Promise<AppendedAuditRow> {
+  await client.query("select pg_advisory_xact_lock(hashtext('omb:audit-chain'))")
+  const head = await client.query<{ hash: string | null }>(
+    'select hash from omb.audit_log where hash is not null order by id desc limit 1',
+  )
+  const prevHash = head.rows[0]?.hash ?? null
+  const hash = auditChainHash(prevHash, entry)
+  const result = await client.query<{ id: string; created_at: Date | string }>(
+    `insert into omb.audit_log (
+       actor, action, target_ids, before, after, inverse, job_id,
+       command_id, stream_id, stream_version, event_type, revision,
+       correlation_id, causation_id, actor_kind, prev_hash, hash
+     ) values ($1,$2,$3::text[],$4::jsonb,$5::jsonb,$6::jsonb,$7,
+       $8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+     returning id, created_at`,
     [
       entry.actor,
       entry.action,
@@ -464,9 +539,34 @@ async function insertAudit(client: PoolClient, entry: AuditEntry): Promise<numbe
       entry.after === undefined ? null : JSON.stringify(entry.after),
       entry.inverse === undefined ? null : JSON.stringify(entry.inverse),
       entry.jobId ?? null,
+      entry.commandId ?? null,
+      entry.streamId ?? null,
+      entry.streamVersion ?? null,
+      entry.eventType ?? null,
+      entry.revision ?? null,
+      entry.correlationId ?? null,
+      entry.causationId ?? null,
+      entry.actorKind ?? null,
+      prevHash,
+      hash,
     ],
   )
-  return Number(result.rows[0]?.id ?? 0)
+  const row = result.rows[0]
+  if (row === undefined) throw new OmbFailure(internal('审计写入没有返回行'))
+  return { id: Number(row.id), hash, createdAt: row.created_at }
+}
+
+async function insertAudit(client: PoolClient, entry: AuditEntry): Promise<number> {
+  const inserted = await appendAuditRow(client, {
+    actor: entry.actor,
+    action: entry.action,
+    ...(entry.targetIds === undefined ? {} : { targetIds: entry.targetIds }),
+    ...(entry.before === undefined ? {} : { before: entry.before }),
+    ...(entry.after === undefined ? {} : { after: entry.after }),
+    ...(entry.inverse === undefined ? {} : { inverse: entry.inverse }),
+    jobId: entry.jobId ?? null,
+  })
+  return inserted.id
 }
 
 interface EventInput {
@@ -483,38 +583,27 @@ interface EventInput {
 }
 
 /**
- * 追加一条领域事件：audit_log（含 command/stream 元数据）+ outbox 同一事务写入。
- * `event.id` 取 audit_log.id，重复命令重放时 id 不变（event_id 稳定）。
+ * 追加一条领域事件：audit_log（含 command/stream 元数据 + hash chain）+ outbox
+ * 同一事务写入。`event.id` 取 audit_log.id，重复命令重放时 id 不变（event_id 稳定）。
  */
 async function insertEvent(client: PoolClient, input: EventInput): Promise<DomainEvent> {
-  const result = await client.query<{ id: string; created_at: Date | string }>(
-    `insert into omb.audit_log (
-       actor, action, target_ids, before, after, inverse, job_id,
-       command_id, stream_id, stream_version, event_type, revision,
-       correlation_id, causation_id, actor_kind
-     ) values ($1,$2,$3::text[],$4::jsonb,$5::jsonb,$6::jsonb,null,
-       $7,$8,$9,$10,$11,$12,$13,$14)
-     returning id, created_at`,
-    [
-      input.meta.actor.id,
-      input.action,
-      [...input.targetIds],
-      input.before === undefined ? null : JSON.stringify(input.before),
-      input.after === undefined ? null : JSON.stringify(input.after),
-      input.inverse === undefined ? null : JSON.stringify(input.inverse),
-      input.meta.commandId,
-      input.streamId,
-      input.streamVersion,
-      input.eventType,
-      input.streamVersion,
-      input.meta.correlationId,
-      input.meta.causationId ?? null,
-      input.meta.actor.kind,
-    ],
-  )
-  const row = result.rows[0]
-  if (row === undefined) throw new OmbFailure(internal('事件写入没有返回行'))
-  const id = Number(row.id)
+  const inserted = await appendAuditRow(client, {
+    actor: input.meta.actor.id,
+    action: input.action,
+    targetIds: input.targetIds,
+    ...(input.before === undefined ? {} : { before: input.before }),
+    ...(input.after === undefined ? {} : { after: input.after }),
+    ...(input.inverse === undefined ? {} : { inverse: input.inverse }),
+    commandId: input.meta.commandId,
+    streamId: input.streamId,
+    streamVersion: input.streamVersion,
+    eventType: input.eventType,
+    revision: input.streamVersion,
+    correlationId: input.meta.correlationId,
+    causationId: input.meta.causationId ?? null,
+    actorKind: input.meta.actor.kind,
+  })
+  const id = inserted.id
   const event: DomainEvent = {
     id: String(id),
     seq: id,
@@ -523,7 +612,7 @@ async function insertEvent(client: PoolClient, input: EventInput): Promise<Domai
     type: input.eventType,
     actor: input.meta.actor,
     origin: input.meta.origin,
-    occurredAt: iso(row.created_at) as string,
+    occurredAt: iso(inserted.createdAt) as string,
     payload: input.payload,
     ...(input.inverse !== undefined ? { inverse: input.inverse } : {}),
   }
@@ -580,8 +669,64 @@ function revisionConflict(expected: number | undefined, currentRevision: number)
   return new OmbFailure({
     code: 'conflict',
     message: `实体版本已变化（${detail}）`,
-    details: { currentRevision },
+    details: { currentRevision, ...(expected === undefined ? {} : { expectedRevision: expected }) },
   })
+}
+
+interface RollbackAuditRow {
+  readonly id: string
+  readonly inverse: JsonValue | null
+  readonly target_ids: string[]
+  readonly rolled_back_at: Date | string | null
+  readonly stream_id: string | null
+  readonly stream_version: string | null
+}
+
+/**
+ * 快照类 inverse 的 CAS 守卫（ADR-0010）：只回滚“审计时那个版本”，版本已前进就拒绝。
+ *
+ * 只对**回写旧内容**的 inverse 生效（`restore` 恢复补丁前属性、`restore_attr_rows`
+ * 恢复改名前的属性行）：这两类会用旧快照覆盖当前数据，必须先证明当前版本仍是审计时
+ * 的版本。`archive`/`unarchive`/`unlink`/`restore_link`/`remove_written` 是状态切换，
+ * 不回写旧属性，仍由 `rolled_back_at` 保证一条审计只回滚一次。
+ *
+ * 迁移前（008 之前）的审计行没有 stream/revision 数据时无法证明快照归属；
+ * `restore_attr_rows` 旧 inverse 没有 `revisions`，保持旧行为而不是凭空拒绝。
+ */
+async function assertRollbackSnapshotCas(
+  client: PoolClient,
+  row: RollbackAuditRow,
+  inverse: Record<string, JsonValue>,
+): Promise<void> {
+  const action = asString(inverse['action'])
+  if (action === 'restore') {
+    const entityId = asString(inverse['entityId'])
+    const expected = row.stream_version === null ? undefined : Number(row.stream_version)
+    if (entityId === undefined || expected === undefined || row.stream_id !== entityId) return
+    await assertEntityRevision(client, entityId, expected)
+    return
+  }
+  if (action === 'restore_attr_rows') {
+    const revisions = inverse['revisions']
+    if (!isPlainObject(revisions)) return
+    for (const [entityId, raw] of Object.entries(revisions)) {
+      const expected = asNumber(raw)
+      if (expected === undefined) continue
+      await assertEntityRevision(client, entityId, expected)
+    }
+  }
+}
+
+async function assertEntityRevision(client: PoolClient, entityId: string, expected: number): Promise<void> {
+  // 行锁 + 重新读取：并发回滚/写入在 READ COMMITTED 下等锁后会看到最新版本。
+  const result = await client.query<{ revision: string }>(
+    'select revision from omb.entity where id = $1 for update',
+    [entityId],
+  )
+  const row = result.rows[0]
+  if (row === undefined) throw new OmbFailure(notFound(`实体不存在：${entityId}`))
+  const currentRevision = Number(row.revision)
+  if (currentRevision !== expected) throw revisionConflict(expected, currentRevision)
 }
 
 export interface AttributeWriterOptions {
@@ -1185,6 +1330,9 @@ export class AttributeWriter implements CommandWriter {
       await client.query('delete from omb.attr_registry where name = $1', [from])
     }
     const now = nowIso()
+    // 改名会 bump 每个受影响实体的 revision；把“改名后的版本”记进 inverse，
+    // 回滚时就能做逐实体 CAS：改名之后又发生的写入不会被旧快照覆盖。
+    const renamedRevisions = new Map<string, number>()
     // 改名可能改变看板谓词（标签↔tags、status 等）；写前谓词无法完整还原，
     // 受影响的 memory/state 一律重新入队，由 projector 幂等重建/删除读模型行。
     for (const entityId of entityIds) {
@@ -1197,6 +1345,7 @@ export class AttributeWriter implements CommandWriter {
         [entityId],
       )
       const updated = updatedResult.rows[0] ?? current
+      renamedRevisions.set(entityId, Number(updated.revision))
       const { view, triggers, references } = buildViewFromRows(updated, attributes, now, iso(updated.archived_at) ?? null)
       await replaceReferences(client, entityId, references)
       await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
@@ -1228,7 +1377,13 @@ export class AttributeWriter implements CommandWriter {
       targetIds: entityIds,
       payload,
       after: toJson({ from, to, affected: entityIds.length }),
-      inverse: toJson({ action: 'restore_attr_rows', from, to, rows: before.rows }),
+      inverse: toJson({
+        action: 'restore_attr_rows',
+        from,
+        to,
+        rows: before.rows,
+        revisions: Object.fromEntries(renamedRevisions),
+      }),
     })
     return {
       events: [event],
@@ -1298,12 +1453,11 @@ export class AttributeWriter implements CommandWriter {
   async rollback(auditId: number, actor: string): Promise<RollbackResult> {
     try {
       return await this.db.transaction(async client => {
-        const result = await client.query<{
-          id: string
-          inverse: JsonValue | null
-          target_ids: string[]
-          rolled_back_at: Date | string | null
-        }>('select id, inverse, target_ids, rolled_back_at from omb.audit_log where id = $1 for update', [auditId])
+        const result = await client.query<RollbackAuditRow>(
+          `select id, inverse, target_ids, rolled_back_at, stream_id, stream_version
+           from omb.audit_log where id = $1 for update`,
+          [auditId],
+        )
         const row = result.rows[0]
         if (row === undefined) throw new OmbFailure(notFound(`审计记录不存在：${auditId}`))
         if (row.rolled_back_at !== null) throw new OmbFailure(conflict(`审计记录已回滚：${auditId}`))
@@ -1311,6 +1465,8 @@ export class AttributeWriter implements CommandWriter {
           throw new OmbFailure(internal(`审计记录没有可执行 inverse：${auditId}`))
         }
         const inverse = row.inverse as Record<string, JsonValue>
+        // 先进 CAS 再动数据：旧快照覆盖新修改时整笔回滚失败，不留半写。
+        await assertRollbackSnapshotCas(client, row, inverse)
         const action = asString(inverse['action'])
         const applied: string[] = []
         if (action === 'unarchive') {
@@ -1475,6 +1631,12 @@ export class AttributeWriter implements CommandWriter {
             if (current === undefined) continue
             const attributes = await selectAttributes(asAttributeQuery(client), entityId)
             const restoredEntity = mapEntity(current, attributes)
+            // 回滚也是一次修改：bump revision，后续审计的快照 CAS 才判断得出来。
+            const restoredRevision = Number(current.revision) + 1
+            await client.query('update omb.entity set revision = $2, updated_at = now() where id = $1', [
+              entityId,
+              restoredRevision,
+            ])
             const normalized: NormalizedWrite = {
               id: entityId,
               kind: (current.kind === 'state_version' ? 'state' : current.kind) as 'memory' | 'state' | 'chain',
@@ -1492,7 +1654,7 @@ export class AttributeWriter implements CommandWriter {
             const view = buildViewValues(normalized, derived, {
               now: nowIso(),
               isCurrent: current.is_current,
-              revision: Number(current.revision),
+              revision: restoredRevision,
               archivedAt: current.archived_at === null ? null : iso(current.archived_at) ?? null,
               kindOverride: current.kind,
             })

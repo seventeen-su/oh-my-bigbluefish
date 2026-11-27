@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
+import { assertDestructiveAllowed } from '../../security/trust.js'
 
 /**
  * 源码测试时 migrations 与 migrate.ts 同目录；esbuild 单文件产物在
@@ -131,6 +132,9 @@ export async function migrateDatabase(connectionString: string, adminConnectionS
 }
 
 export async function truncateAll(connectionString: string): Promise<void> {
+  // 破坏性操作在建立连接之前就被授权判定拦住（ADR-0010）：
+  // 生产库名、NODE_ENV=production、缺少显式 flag 的路径都碰不到任何一行。
+  const databaseName = assertDestructiveAllowed(connectionString)
   const client = new pg.Client({ connectionString, connectionTimeoutMillis: CONNECT_TIMEOUT_MS })
   await client.connect()
   try {
@@ -154,6 +158,10 @@ export async function truncateAll(connectionString: string): Promise<void> {
         omb.conflict_suppression
       restart identity cascade
     `)
+    // 审计链被清空后重新从空链开始：这条日志只是给误操作留可追溯线索，不写库。
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn(`[omb] 已清空数据库 ${databaseName} 的 omb schema 数据`)
+    }
   } finally {
     await client.end()
   }

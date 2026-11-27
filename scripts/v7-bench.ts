@@ -17,6 +17,7 @@ import { deriveSearchText, deriveTriggers, normalizeWrite } from '../packages/v7
 import { systemCommandMeta } from '../packages/v7/src/app/commands/index.js'
 import { HashEmbedder } from '../packages/v7/src/adapters/embedding/hash.js'
 import { migrateDatabase, truncateAll } from '../packages/v7/src/adapters/postgres/migrate.js'
+import { databaseNameOf, isDisposableDatabaseName } from '../packages/v7/src/security/trust.js'
 import { PostgresDb } from '../packages/v7/src/adapters/postgres/db.js'
 import { PostgresStore } from '../packages/v7/src/adapters/postgres/store.js'
 import { AttributeWriter } from '../packages/v7/src/adapters/postgres/writer.js'
@@ -24,6 +25,12 @@ import { RecallEngine } from '../packages/v7/src/retrieval/engine.js'
 import type { Clock } from '../packages/v7/src/ports/clock.js'
 
 const URL = process.env.OMB_BENCH_DATABASE_URL ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_bench'
+// 显式声明破坏性用途（truncateAll 守卫，ADR-0010）：只有库名命中 test/bench 段才允许；
+// 生产库名（如 omb）即使设置了该 flag 也会在连接前被拒绝。
+const benchDatabaseName = databaseNameOf(URL)
+if (benchDatabaseName !== undefined && isDisposableDatabaseName(benchDatabaseName)) {
+  process.env.OMB_ALLOW_DESTRUCTIVE ??= '1'
+}
 const ENTITIES = positiveInt(process.env.OMB_BENCH_ENTITIES, 100_000)
 const LINKS = positiveInt(process.env.OMB_BENCH_LINKS, 10_000)
 const ITERATIONS = positiveInt(process.env.OMB_BENCH_ITERATIONS, 100)
