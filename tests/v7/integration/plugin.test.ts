@@ -76,6 +76,33 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<v
   }
 }
 
+interface InjectedMessageLike {
+  readonly id?: string
+  readonly role?: string
+  readonly source?: { readonly kind?: string }
+  readonly content?: readonly { readonly type?: string; readonly text?: string }[]
+}
+
+/** pre-step decision.messages 里由 OMB 追加的 T1 消息（按 producer-owned source kind 识别）。 */
+function t1Messages(decision: unknown): InjectedMessageLike[] {
+  const record = typeof decision === 'object' && decision !== null
+    ? decision as { messages?: unknown }
+    : undefined
+  const messages: unknown[] = Array.isArray(record?.messages) ? record.messages : []
+  return messages.filter((message): message is InjectedMessageLike => (
+    typeof message === 'object'
+    && message !== null
+    && (message as InjectedMessageLike).source?.kind === 'plugin:oh-my-bigbluefish/v7'
+  ))
+}
+
+/** T1 文本；systemPrompt provider 读的是 T0 通道，两者必须分别断言。 */
+function t1TextOf(decision: unknown): string {
+  return t1Messages(decision)
+    .flatMap(message => (message.content ?? []).map(block => block.text ?? ''))
+    .join('\n')
+}
+
 describe('v7 plugin entry', () => {
   beforeAll(async () => {
     await prepareDatabase()
@@ -152,7 +179,7 @@ describe('v7 plugin entry', () => {
     const preStep = host.listeners.get('agent/pre-step')
     expect(preStep).toBeDefined()
     const next = async () => ({ kind: 'enter', messages: [] })
-    await preStep?.(
+    const decision = await preStep?.(
       {
         agent: { session: { id: 'session-smoke', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'user' }, content: '插件冒烟记忆' }],
@@ -160,6 +187,8 @@ describe('v7 plugin entry', () => {
       },
       next,
     )
+    // 普通指令没有回忆意图/强信号：本步不追加 T1 消息。
+    expect(t1Messages(decision)).toHaveLength(0)
     expect(host.provider).toBeDefined()
     const injected = host.provider?.({ agent: { session: { id: 'session-smoke' } } }) ?? ''
     expect(injected).toContain('[OMB 常驻]')
@@ -369,7 +398,7 @@ describe('v7 plugin entry', () => {
     expect(injected).toContain('工具报错召回记忆')
 
     const preStep = host.listeners.get('agent/pre-step')
-    await preStep?.(
+    const stepDecision = await preStep?.(
       {
         agent: { session: { id: 'tool-t1-session', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'tool' }, role: 'tool', content: 'ENOENT 工具失败 工具报错召回记忆' }],
@@ -377,8 +406,9 @@ describe('v7 plugin entry', () => {
       },
       async () => ({ kind: 'enter', messages: [] }),
     )
+    // 工具结果已走 additionalContexts；pre-step 不能再追加同一段召回，也不写 system prompt。
+    expect(t1Messages(stepDecision)).toHaveLength(0)
     const prompt = host.provider?.({ agent: { session: { id: 'tool-t1-session' } } }) ?? ''
-    // 工具结果已走 additionalContexts；system prompt 不能再重复同一段召回。
     expect(prompt).not.toContain('[OMB 事件召回]')
 
     const db = new PostgresStore(TEST_DATABASE_URL)
@@ -456,7 +486,7 @@ describe('v7 plugin entry', () => {
     )
 
     const preStep = host.listeners.get('agent/pre-step')
-    await preStep?.(
+    const first = await preStep?.(
       {
         agent: { session: { id: 'compaction-session', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'user' }, content: '你好' }],
@@ -465,9 +495,15 @@ describe('v7 plugin entry', () => {
       },
       async () => ({ kind: 'enter', messages: [] }),
     )
-    expect(host.provider?.({ agent: { session: { id: 'compaction-session' } } })).toContain('[OMB 事件召回]')
+    // T1 走 pre-step 的 decision.messages（producer-owned user message）。
+    expect(t1Messages(first)).toHaveLength(1)
+    expect(t1TextOf(first)).toContain('[OMB 事件召回]')
+    // T0 常驻仍走 systemPrompt provider，T1 不得再混进去。
+    const firstPrompt = host.provider?.({ agent: { session: { id: 'compaction-session' } } }) ?? ''
+    expect(firstPrompt).toContain('[OMB 常驻]')
+    expect(firstPrompt).not.toContain('[OMB 事件召回]')
 
-    await preStep?.(
+    const second = await preStep?.(
       {
         agent: { session: { id: 'compaction-session', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'user' }, content: '你好' }],
@@ -477,6 +513,7 @@ describe('v7 plugin entry', () => {
       async () => ({ kind: 'enter', messages: [] }),
     )
     // 待消费事件只用一次：下一步没有新触发就不再召回。
+    expect(t1Messages(second)).toHaveLength(0)
     expect(host.provider?.({ agent: { session: { id: 'compaction-session' } } })).not.toContain('[OMB 事件召回]')
     dispose()
   })
@@ -582,7 +619,7 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('空 T1 的 pre-step 清除上一轮 system prompt 旧文本', async () => {
+  it('T1 不写 system prompt：下一步没有 T1 时 prompt 只留 T0', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -600,7 +637,7 @@ describe('v7 plugin entry', () => {
     expect(remembered?.ok).toBe(true)
 
     const preStep = host.listeners.get('agent/pre-step')
-    await preStep?.(
+    const first = await preStep?.(
       {
         agent: { session: { id: 'stale-clear-session', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' }],
@@ -609,9 +646,14 @@ describe('v7 plugin entry', () => {
       },
       async () => ({ kind: 'enter', messages: [] }),
     )
-    expect(host.provider?.({ agent: { session: { id: 'stale-clear-session' } } })).toContain('[OMB 事件召回]')
+    expect(t1Messages(first)).toHaveLength(1)
+    expect(t1TextOf(first)).toContain('[OMB 事件召回]')
+    // T1 只出现在 decision.messages；systemPrompt provider 只承载 T0。
+    const firstPrompt = host.provider?.({ agent: { session: { id: 'stale-clear-session' } } }) ?? ''
+    expect(firstPrompt).toContain('[OMB 常驻]')
+    expect(firstPrompt).not.toContain('[OMB 事件召回]')
 
-    await preStep?.(
+    const second = await preStep?.(
       {
         agent: { session: { id: 'stale-clear-session', header: { cwd: PROJECT } } },
         // 与记忆共享全文词，但没有回忆意图/强信号：新 T1 必须为空。
@@ -621,10 +663,11 @@ describe('v7 plugin entry', () => {
       },
       async () => ({ kind: 'enter', messages: [] }),
     )
+    expect(t1Messages(second)).toHaveLength(0)
     const prompt = host.provider?.({ agent: { session: { id: 'stale-clear-session' } } }) ?? ''
-    // RUN-04：T1 为空也必须覆盖写入，上一轮的 [OMB 事件召回] 不能留在 system prompt。
-    expect(prompt).not.toContain('[OMB 事件召回]')
+    // RUN-04：T0 仍要覆盖写，上一轮的 T1 也不能留在系统提示里。
     expect(prompt).toContain('[OMB 常驻]')
+    expect(prompt).not.toContain('[OMB 事件召回]')
     dispose()
   })
 
@@ -655,17 +698,169 @@ describe('v7 plugin entry', () => {
       turn: 1,
       step: 1,
     }
-    await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
-    expect(host.provider?.({ agent: { session: { id: 'repeat-pre-step-session' } } })).toContain('[OMB 事件召回]')
+    const first = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(first)).toHaveLength(1)
+    expect(t1TextOf(first)).toContain('[OMB 事件召回]')
 
     // 只有步号变化、事件源内容完全一致：跨 step 内容指纹必须挡住第二次召回。
-    await preStep?.(
+    const second = await preStep?.(
       { ...payload, step: 2 },
       async () => ({ kind: 'enter', messages: [] }),
     )
+    expect(t1Messages(second)).toHaveLength(0)
     const prompt = host.provider?.({ agent: { session: { id: 'repeat-pre-step-session' } } }) ?? ''
     expect(prompt).not.toContain('[OMB 事件召回]')
     expect(prompt).toContain('[OMB 常驻]')
+    dispose()
+  })
+
+  it('pre-step 在 next() 之后追加 T1：宿主认领的消息原样保留在前', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'append-contract-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '追加契约召回探针', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const claimed = [{
+      id: 'msg_claimed_a',
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'ENOENT 上次失败的处理方式是什么' }],
+    }]
+    const decision = await host.listeners.get('agent/pre-step')?.(
+      {
+        agent: { session: { id: 'append-contract-session', header: { cwd: PROJECT } } },
+        messages: claimed,
+        turn: 1,
+        step: 1,
+      },
+      async () => ({ kind: 'enter', messages: claimed }),
+    ) as { messages?: InjectedMessageLike[] } | undefined
+
+    const messages = decision?.messages ?? []
+    expect(messages).toHaveLength(2)
+    // T1 是追加，不是替换：宿主已排好的认领消息保持原位置与身份。
+    expect(messages[0]).toBe(claimed[0])
+    const t1 = t1Messages(decision)
+    expect(t1).toHaveLength(1)
+    expect(t1[0]?.id).toMatch(/^msg_omb_[0-9a-f-]{36}$/)
+    expect(t1[0]?.role).toBe('user')
+    expect(t1[0]?.source).toEqual({ kind: 'plugin:oh-my-bigbluefish/v7' })
+    expect(t1TextOf(decision)).toContain('[OMB 事件召回]')
+    dispose()
+  })
+
+  it('同一 step 连续两次 pre-step 只追加一次 T1 消息', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'same-step-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '单步配额召回', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: { session: { id: 'same-step-session', header: { cwd: PROJECT } } },
+      messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' }],
+      turn: 1,
+      step: 1,
+    }
+    const first = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(first)).toHaveLength(1)
+
+    const again = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    // 同一步配额：即使事件源完全相同，第二次 pre-step 也不能再追加一条。
+    expect(t1Messages(again)).toHaveLength(0)
+    dispose()
+  })
+
+  it('宿主 reject 的 step 不追加 T1，也不占用本步配额', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'reject-step-session', header: { cwd: PROJECT } } } }
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '拒绝步召回', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: { session: { id: 'reject-step-session', header: { cwd: PROJECT } } },
+      messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' }],
+      turn: 1,
+      step: 1,
+    }
+    const rejected = await preStep?.(payload, async () => ({ kind: 'reject' }))
+    // reject 没有 messages：OMB 不能往它上面追加任何东西。
+    expect(rejected).toEqual({ kind: 'reject' })
+
+    // 同一步重新进入时配额没有被白占：T1 仍然要追加一次。
+    const entered = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(entered)).toHaveLength(1)
+    dispose()
+  })
+
+  it('本轮 T0 为空时 pre-step 仍覆盖写空串，清掉上一轮常驻文本', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const session = { id: 'empty-t0-session', header: { cwd: PROJECT } }
+    const preStep = host.listeners.get('agent/pre-step')
+    const enter = async () => ({ kind: 'enter', messages: [] })
+
+    await preStep?.(
+      { agent: { session }, messages: [{ source: { kind: 'user' }, content: '你好' }], turn: 1, step: 1 },
+      enter,
+    )
+    expect(host.provider?.({ agent: { session } })).toContain('[OMB 常驻]')
+
+    // 本轮 T0 构建超过 1.5s 预算（锁住它读的表即可让构建超时）时 buildResident 返回空，
+    // 这只是“没有 T0 可写”的现实入口；断言的是清旧行为，不是造数据。
+    const blocker = new PostgresStore(TEST_DATABASE_URL)
+    try {
+      await blocker.db.transaction(async client => {
+        await client.query('lock table omb.entity in access exclusive mode')
+        await preStep?.(
+          { agent: { session }, messages: [{ source: { kind: 'user' }, content: '你好' }], turn: 2, step: 1 },
+          enter,
+        )
+      })
+    } finally {
+      await blocker.close()
+    }
+    // RUN-04：没有 T0 也必须覆盖写空串，否则上一轮的常驻文本会留在 system prompt。
+    expect(host.provider?.({ agent: { session } })).toBe('')
     dispose()
   })
 
@@ -687,7 +882,7 @@ describe('v7 plugin entry', () => {
     expect(remembered?.ok).toBe(true)
 
     const preStep = host.listeners.get('agent/pre-step')
-    await preStep?.(
+    const first = await preStep?.(
       {
         agent: { session: { id: 'disposed-session', header: { cwd: PROJECT } } },
         messages: [{ source: { kind: 'user' }, content: 'ENOENT 上次的报错' }],
@@ -696,7 +891,8 @@ describe('v7 plugin entry', () => {
       },
       async () => ({ kind: 'enter', messages: [] }),
     )
-    expect(host.provider?.({ agent: { session: { id: 'disposed-session' } } })).toContain('[OMB 事件召回]')
+    expect(t1Messages(first)).toHaveLength(1)
+    expect(host.provider?.({ agent: { session: { id: 'disposed-session' } } })).not.toContain('[OMB 事件召回]')
 
     const postExecute = host.listeners.get('tools/post-execute')
     const toolExec = {

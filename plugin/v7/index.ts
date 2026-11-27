@@ -49,6 +49,7 @@ import {
   stepKeyOf,
   toolFailed,
 } from './t1.js'
+import { appendT1Message, isEnterDecisionLike } from './t1-message.js'
 
 export interface V7Config {
   readonly databaseUrl: string
@@ -246,6 +247,29 @@ function rememberSessionState<T>(map: Map<string, T>, sessionId: string, value: 
     if (oldest === undefined) break
     map.delete(oldest)
   }
+}
+
+/**
+ * 一次 pre-step 里 T1 的准备结果。
+ *
+ * 配额/指纹不在这里登记：只有 decision 明确 `enter`、T1 消息真的追加进本步，
+ * 这次召回才算投递过；`reject` 的 step 不消费 T1。
+ */
+interface PreparedT1Injection {
+  readonly sessionId: string
+  /** 本轮要追加进 decision.messages 的 T1 文本；空串表示本步不注入。 */
+  readonly text: string
+  /** 工具结果已通过 additionalContexts 投递过 T1：本步只登记配额，不重复追加。 */
+  readonly immediate: boolean
+  /** 跨 step 内容指纹；只有真正投递/消费时才登记。 */
+  readonly fingerprint: string | undefined
+  readonly stepKey: string | undefined
+}
+
+/** 宿主 waterfall 没有 next（老宿主/测试替身）时的 enter 复合：与 DSH 基线 decision 同形。 */
+function enterDecisionFor(payload: unknown): { readonly kind: 'enter'; readonly messages: readonly unknown[] } {
+  const record = typeof payload === 'object' && payload !== null ? payload as { messages?: unknown } : undefined
+  return { kind: 'enter', messages: Array.isArray(record?.messages) ? record.messages : [] }
 }
 
 function formatWrite(result: Awaited<ReturnType<RememberService['remember']>>): string {
@@ -806,132 +830,151 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     }
   }
 
-  const preStep = async (payload: unknown, next?: () => unknown): Promise<unknown> => {
-    try {
-      const context = await resolveToolContext(payload)
-      const record = typeof payload === 'object' && payload !== null ? payload as Record<string, unknown> : undefined
-      if (context !== undefined && record !== undefined) {
-        const sessionId = context.sessionId
-        const turn = typeof record['turn'] === 'number' ? record['turn'] : undefined
-        const step = typeof record['step'] === 'number' ? record['step'] : undefined
-        const stepKey = stepKeyOf({ turn, step })
-        // post-execute 拿不到步号，只能沿用最近一次 pre-step 的 turn/step 判断本步配额。
-        if (turn !== undefined && step !== undefined && stepKey !== undefined) {
-          rememberSessionState(currentStep, sessionId, { turn, step, key: stepKey })
-        }
-        const triggered = pendingT1.get(sessionId)
-        if (triggered !== undefined) {
-          pendingT1.delete(sessionId)
-          // 压缩/子任务切换后常驻层必须重建，不能吃同一 turn 的旧文本。
-          residentCache.delete(sessionId)
-        }
-        const cached = residentCache.get(sessionId)
-        let resident = cached !== undefined && cached.turn === turn ? cached.text : ''
-        if (resident.length === 0) {
-          const built = await withTimeout(
-            buildResident(
-              engine,
-              context,
-              config.residentBudget,
-              () => store.stats(),
-              notice => rememberInjection(sessionId, notice),
-              () => store.preferenceSummaries?.(5) ?? Promise.resolve([]),
-            ),
-            1_500,
-          )
-          resident = built?.text ?? ''
-          if (built !== undefined) {
-            const trace = turn === undefined
-              ? built.trace
-              : { ...built.trace, turnId: String(turn) }
-            // trace 是 T0 的预算/裁剪证据；写失败不能阻断本轮注入。
-            void store.recordResidentTrace(trace).catch(error => {
-              logger.warn('T0 常驻 trace 写入失败', messageOf(error))
+  /**
+   * 汇总本步的 T1 准备结果（只计算 + 写 T0），不碰 decision：
+   * - T0（常驻）仍写 `systemPrompt.context` provider（promptSink）；空 T0 也覆盖写空串（RUN-04）；
+   * - T1（事件召回）不再写 promptSink：provider 是装配期快照，逐步骤高频 T1 会退化成
+   *   整段重装配（docs/v7/review/RESEARCH.md §8 #2）。T1 的注入口是 pre-step 的
+   *   `decision.messages`（packages/core/agent/src/runtime-types.ts:139-146）：追加一条
+   *   producer-owned user message，宿主准入时落成 durable `user/message`
+   *   （time-context 同款：packages/context/time-context/src/index.ts:199-242）。
+   */
+  const prepareT1Injection = async (payload: unknown): Promise<PreparedT1Injection | undefined> => {
+    const context = await resolveToolContext(payload)
+    const record = typeof payload === 'object' && payload !== null ? payload as Record<string, unknown> : undefined
+    if (context === undefined || record === undefined) return undefined
+    const sessionId = context.sessionId
+    const turn = typeof record['turn'] === 'number' ? record['turn'] : undefined
+    const step = typeof record['step'] === 'number' ? record['step'] : undefined
+    const stepKey = stepKeyOf({ turn, step })
+    // post-execute 拿不到步号，只能沿用最近一次 pre-step 的 turn/step 判断本步配额。
+    if (turn !== undefined && step !== undefined && stepKey !== undefined) {
+      rememberSessionState(currentStep, sessionId, { turn, step, key: stepKey })
+    }
+    const triggered = pendingT1.get(sessionId)
+    if (triggered !== undefined) {
+      pendingT1.delete(sessionId)
+      // 压缩/子任务切换后常驻层必须重建，不能吃同一 turn 的旧文本。
+      residentCache.delete(sessionId)
+    }
+    const cached = residentCache.get(sessionId)
+    let resident = cached !== undefined && cached.turn === turn ? cached.text : ''
+    if (resident.length === 0) {
+      const built = await withTimeout(
+        buildResident(
+          engine,
+          context,
+          config.residentBudget,
+          () => store.stats(),
+          notice => rememberInjection(sessionId, notice),
+          () => store.preferenceSummaries?.(5) ?? Promise.resolve([]),
+        ),
+        1_500,
+      )
+      resident = built?.text ?? ''
+      if (built !== undefined) {
+        const trace = turn === undefined
+          ? built.trace
+          : { ...built.trace, turnId: String(turn) }
+        // trace 是 T0 的预算/裁剪证据；写失败不能阻断本轮注入。
+        void store.recordResidentTrace(trace).catch(error => {
+          logger.warn('T0 常驻 trace 写入失败', messageOf(error))
+        })
+        const preferenceHits = built.preferenceHits
+        if (preferenceHits.length > 0) {
+          const preferenceTraceId = built.trace.traceId
+          // 偏好不走 engine.recall；必须单独写 recall_event，后续才能记录 adopted。
+          void store.recordRecall(preferenceHits.map((hit, index) => ({
+            traceId: preferenceTraceId,
+            sessionId,
+            ...(turn === undefined ? {} : { turnId: String(turn) }),
+            query: 'T0 常驻偏好',
+            trigger: 't0',
+            entityId: hit.id,
+            channel: 'resident',
+            rank: index + 1,
+            injected: true,
+          }))).then(() => {
+            // 只有 recall_event 已落库后才登记采用等待，避免 adopted 更新不到行。
+            rememberInjection(sessionId, {
+              traceId: preferenceTraceId,
+              hits: preferenceHits,
             })
-            const preferenceHits = built.preferenceHits
-            if (preferenceHits.length > 0) {
-              const preferenceTraceId = built.trace.traceId
-              // 偏好不走 engine.recall；必须单独写 recall_event，后续才能记录 adopted。
-              void store.recordRecall(preferenceHits.map((hit, index) => ({
-                traceId: preferenceTraceId,
-                sessionId,
-                ...(turn === undefined ? {} : { turnId: String(turn) }),
-                query: 'T0 常驻偏好',
-                trigger: 't0',
-                entityId: hit.id,
-                channel: 'resident',
-                rank: index + 1,
-                injected: true,
-              }))).then(() => {
-                // 只有 recall_event 已落库后才登记采用等待，避免 adopted 更新不到行。
-                rememberInjection(sessionId, {
-                  traceId: preferenceTraceId,
-                  hits: preferenceHits,
-                })
-              }).catch(error => {
-                logger.warn('T0 偏好 recall_event 写入失败', messageOf(error))
-              })
-            }
-          }
-          rememberSessionState(residentCache, sessionId, { turn, text: resident })
+          }).catch(error => {
+            logger.warn('T0 偏好 recall_event 写入失败', messageOf(error))
+          })
         }
-        const userText = lastUserText(record['messages'])
-        const toolText = lastToolText(record['messages'])
-        const recentText = lastRoundsText(record['messages'], 2)
-        const eventSource = [triggered?.query, recentText, userText, toolText]
-          .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
-          .join('\n')
-        // 工具结果已经通过 additionalContexts 进入下一步：本步不再把同一段文本写回
-        // system prompt，但仍记为本步已消费 T1，避免同一步的后续工具结果再挂一段。
-        // 跨 step 的内容指纹不含 turn/step：同一段事件源在下一步不能因步号变化重复召回。
-        // 注意 Map.delete 返回 boolean，不是旧文本。
-        const contentFingerprint = recallContentFingerprint({ sessionId, query: eventSource })
-        const consumedImmediate = immediateT1.delete(sessionId)
-        let injected = ''
-        if (consumedImmediate) {
-          if (stepKey !== undefined) rememberSessionState(t1Step, sessionId, stepKey)
-          // 工具结果已经把这批内容送进上下文；下一步事件源不变时 pre-step 不再重复召回。
-          if (eventSource.length > 0) rememberSessionState(lastT1, sessionId, contentFingerprint)
-        } else if (shouldRecallOnPreStep({ pending: triggered !== undefined, text: eventSource })) {
-          const alreadyRecalled = stepKey !== undefined && t1Step.get(sessionId) === stepKey
-          if (!alreadyRecalled && lastT1.get(sessionId) !== contentFingerprint) {
-            const signals = extractQuerySignals(eventSource)
-            const query = [eventSource, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
-            const scenario: RecallScenario = triggered?.scenario
-              ?? (userText !== undefined && recallScenarioForQuery(userText) === 'last-time'
-                ? 'last-time'
-                : toolFailed(false, eventSource)
-                  ? 'tool-error'
-                  : turn === 1 ? 'session-start' : 'manual')
-            injected = await withTimeout(
-              buildEventRecallText(
-                engine,
-                context,
-                query,
-                scenario,
-                400,
-                notice => rememberInjection(sessionId, notice),
-              ),
-              1_500,
-            ) ?? ''
-            if (injected.length > 0) {
-              // 只有真正进入 system prompt 的召回才占用本步配额与去重指纹。
-              rememberSessionState(lastT1, sessionId, contentFingerprint)
-              if (stepKey !== undefined) rememberSessionState(t1Step, sessionId, stepKey)
-            }
-          }
-        }
-        const text = [resident, injected].filter(part => part.length > 0).join('\n\n')
-        // RUN-04：本次没有 T1（甚至 T0 也为空）时也要覆盖写空串，清掉上一轮旧文本。
-        promptSink.write(sessionId, text)
       }
+      rememberSessionState(residentCache, sessionId, { turn, text: resident })
+    }
+    const userText = lastUserText(record['messages'])
+    const toolText = lastToolText(record['messages'])
+    const recentText = lastRoundsText(record['messages'], 2)
+    const eventSource = [triggered?.query, recentText, userText, toolText]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join('\n')
+    // 跨 step 的内容指纹不含 turn/step：同一段事件源在下一步不能因步号变化重复召回。
+    const contentFingerprint = recallContentFingerprint({ sessionId, query: eventSource })
+    // 工具结果已通过 additionalContexts 投递过 T1：本步不再追加同一段文本。
+    // 这里只读取、不删除：decision 被下层 reject 时这次投递没有发生，配额不能被白占。
+    const pendingImmediate = immediateT1.get(sessionId)
+    let injected = ''
+    let fingerprint: string | undefined
+    if (pendingImmediate !== undefined) {
+      // 工具结果已经把这批内容送进上下文；下一步事件源不变时 pre-step 不再重复召回。
+      if (eventSource.length > 0) fingerprint = contentFingerprint
+    } else if (shouldRecallOnPreStep({ pending: triggered !== undefined, text: eventSource })) {
+      const alreadyRecalled = stepKey !== undefined && t1Step.get(sessionId) === stepKey
+      if (!alreadyRecalled && lastT1.get(sessionId) !== contentFingerprint) {
+        const signals = extractQuerySignals(eventSource)
+        const query = [eventSource, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
+        const scenario: RecallScenario = triggered?.scenario
+          ?? (userText !== undefined && recallScenarioForQuery(userText) === 'last-time'
+            ? 'last-time'
+            : toolFailed(false, eventSource)
+              ? 'tool-error'
+              : turn === 1 ? 'session-start' : 'manual')
+        injected = await withTimeout(
+          buildEventRecallText(
+            engine,
+            context,
+            query,
+            scenario,
+            400,
+            notice => rememberInjection(sessionId, notice),
+          ),
+          1_500,
+        ) ?? ''
+        if (injected.length > 0) fingerprint = contentFingerprint
+      }
+    }
+    // T0 仍走 promptSink；RUN-04：本轮没有 T0 时也要覆盖写空串，清掉上一轮旧文本。
+    promptSink.write(sessionId, resident)
+    return { sessionId, text: injected, immediate: pendingImmediate !== undefined, fingerprint, stepKey }
+  }
+
+  const preStep = async (payload: unknown, next?: () => unknown): Promise<unknown> => {
+    let prepared: PreparedT1Injection | undefined
+    try {
+      prepared = await prepareT1Injection(payload)
     } catch (error) {
       logger.warn('pre-step 注入失败', messageOf(error))
     }
-    if (typeof next !== 'function') {
-      return { kind: 'enter', messages: Array.isArray((payload as { messages?: unknown })?.messages) ? (payload as { messages: unknown[] }).messages : [] }
+    // next() 必须在 try 之外：其它 pre-step 监听器抛错要原样上抛，不能被 OMB 吞成放行。
+    const decision = typeof next === 'function' ? await next() : enterDecisionFor(payload)
+    if (!isEnterDecisionLike(decision)) return decision
+    if (prepared === undefined) return decision
+    if (prepared.immediate) {
+      // 工具结果的即时注入已经送达：本步只消费一次配额，不再追加第二条 T1。
+      immediateT1.delete(prepared.sessionId)
+      if (prepared.stepKey !== undefined) rememberSessionState(t1Step, prepared.sessionId, prepared.stepKey)
+      if (prepared.fingerprint !== undefined) rememberSessionState(lastT1, prepared.sessionId, prepared.fingerprint)
+    } else if (prepared.text.length > 0) {
+      // 只有真正追加进 decision.messages 的召回才占用本步配额与去重指纹。
+      if (prepared.stepKey !== undefined) rememberSessionState(t1Step, prepared.sessionId, prepared.stepKey)
+      if (prepared.fingerprint !== undefined) rememberSessionState(lastT1, prepared.sessionId, prepared.fingerprint)
     }
-    return next()
+    return appendT1Message(decision, prepared.text)
   }
 
   const preStepOff = wireHostHook({ ctx, supervisor, name: 'agent/pre-step', handler: preStep }).off
