@@ -25,17 +25,19 @@ export interface FusionCandidate {
   fused: number
   readonly rawByChannel: Map<RecallChannel, number>
   readonly rankByChannel: Map<RecallChannel, number>
+  /** 每通道对 RRF 融合分的贡献（weight / (rrfK + rank)），求和恒等于 fused。 */
+  readonly contributionByChannel: Map<RecallChannel, number>
   link?: LinkEvidence
 }
 
-export interface GateOutcome {
-  readonly passed: readonly FusionCandidate[]
-  readonly belowRaw: number
-  readonly belowFused: number
-}
-
 export function createCandidate(entityId: string): FusionCandidate {
-  return { entityId, fused: 0, rawByChannel: new Map(), rankByChannel: new Map() }
+  return {
+    entityId,
+    fused: 0,
+    rawByChannel: new Map(),
+    rankByChannel: new Map(),
+    contributionByChannel: new Map(),
+  }
 }
 
 function ensureCandidate(candidates: Map<string, FusionCandidate>, entityId: string): FusionCandidate {
@@ -54,7 +56,10 @@ function addChannelContribution(
   weight: number,
   rrfK: number,
 ): void {
-  candidate.fused += weight / (rrfK + rank)
+  const contribution = weight / (rrfK + rank)
+  candidate.fused += contribution
+  const previousContribution = candidate.contributionByChannel.get(channel) ?? 0
+  candidate.contributionByChannel.set(channel, previousContribution + contribution)
   const previousRaw = candidate.rawByChannel.get(channel)
   candidate.rawByChannel.set(channel, previousRaw === undefined ? rawScore : Math.max(previousRaw, rawScore))
   if (channel !== 'links') {
@@ -63,7 +68,11 @@ function addChannelContribution(
   }
 }
 
-/** RRF：sum(weight[channel] / (rrfK + rank))；只看名次，不看原始分。 */
+/**
+ * 加权 RRF：sum(weight[channel] / (rrfK + rank))；只看名次，不看原始分。
+ * `rrfK` 与 `weight` 都由调用方从 RetrievalConfig / 场景配置传入，不在这里写死；
+ * 每通道贡献单独记录，供 explain 输出「这条分数由谁贡献」。
+ */
 export function fuseStageOne(
   hitsByChannel: ReadonlyMap<StageOneChannel, readonly ChannelHit[]>,
   weights: ScenarioWeights,
@@ -139,42 +148,12 @@ export function applyExpansions(
   for (const [entityId, evidence] of bestByEntity) {
     const candidate = ensureCandidate(candidates, entityId)
     candidate.fused += evidence.contribution
+    const previousContribution = candidate.contributionByChannel.get('links') ?? 0
+    candidate.contributionByChannel.set('links', previousContribution + evidence.contribution)
     const previousRaw = candidate.rawByChannel.get('links')
     candidate.rawByChannel.set('links', previousRaw === undefined ? evidence.rawScore : Math.max(previousRaw, evidence.rawScore))
     candidate.link = evidence
   }
-}
-
-/**
- * 原始分门控：每个命中至少一个通道的原始分 ≥ 该通道下限，
- * 且 RRF 融合分 ≥ fusedFloor；不达标宁可不返回。
- */
-export function gateCandidates(
-  candidates: readonly FusionCandidate[],
-  config: RetrievalConfig,
-): GateOutcome {
-  const passed: FusionCandidate[] = []
-  let belowRaw = 0
-  let belowFused = 0
-  for (const candidate of candidates) {
-    let rawPass = false
-    for (const [channel, rawScore] of candidate.rawByChannel) {
-      if (rawScore >= config.channelFloors[channel]) {
-        rawPass = true
-        break
-      }
-    }
-    if (!rawPass) {
-      belowRaw += 1
-      continue
-    }
-    if (candidate.fused < config.fusedFloor) {
-      belowFused += 1
-      continue
-    }
-    passed.push(candidate)
-  }
-  return { passed, belowRaw, belowFused }
 }
 
 export function sortChannels(channels: Iterable<RecallChannel>): RecallChannel[] {

@@ -22,7 +22,35 @@ describe('RecallEngine 阶段一与融合', () => {
     expect(result.hits[0]?.channels).toEqual(['fulltext', 'vector'])
     expect(result.hits[0]?.rawScores).toEqual({ fulltext: 0.5, vector: 0.8 })
     expect(result.hits[0]?.why.some(line => line.startsWith('channel:fulltext#1'))).toBe(true)
+    expect(result.hits[0]?.why).toContain('channel:fulltext#1 raw=0.5000 contribution=0.0164')
+    expect(result.hits[0]?.why).toContain('channel:vector#1 raw=0.8000 contribution=0.0164')
+    expect(result.hits[0]?.why).toContain('rrf=0.0328')
     expect(result.emptyReason).toBeUndefined()
+  })
+
+  it('给定场景权重不同当同一触发命中召回则 fusedScore 按 weight/(k+rank) 加权', async () => {
+    const store = new FakeStore()
+    store.channelHits.trigger = [hit('mem_b', 1, 1, 'trigger')]
+    seedMemory(store, ['mem_b'])
+    const engine = makeEngine(store)
+
+    const manual = await engine.recall({ query: 'TS2304 handleFix', scenario: 'manual', now: FIXED_NOW })
+    const toolBefore = await engine.recall({ query: 'TS2304 handleFix', scenario: 'tool-before', now: FIXED_NOW })
+
+    expect(manual.hits[0]?.fusedScore).toBeCloseTo(0.4 / 61, 9)
+    expect(toolBefore.hits[0]?.fusedScore).toBeCloseTo(1.4 / 61, 9)
+  })
+
+  it('给定部分候选低于原始分下限当仍有命中则用 warning 暴露 below 统计而不静默', async () => {
+    const store = new FakeStore()
+    store.channelHits.fulltext = [hit('mem_a', 1, 0.5, 'fulltext'), hit('mem_b', 2, 0.1, 'fulltext')]
+    seedMemory(store, ['mem_a', 'mem_b'])
+    const config = createRetrievalConfig({ channelFloors: { fulltext: 0.2 } })
+
+    const result = await makeEngine(store, config).recall({ query: 'needle', now: FIXED_NOW })
+
+    expect(result.hits.map(entry => entry.entityId)).toEqual(['mem_a'])
+    expect(result.warnings.some(warning => warning.includes('belowRaw=1') && warning.includes('belowFused=0'))).toBe(true)
   })
 
   it('给定通道原始分低于下限当门控则整条候选不返回', async () => {
@@ -36,6 +64,9 @@ describe('RecallEngine 阶段一与融合', () => {
     expect(result.hits).toHaveLength(0)
     expect(result.emptyReason?.code).toBe('below-threshold')
     expect(result.emptyReason?.details).toEqual({ belowRaw: 1, belowFused: 0 })
+    expect(result.emptyReason?.message).toContain(
+      'whyNot：below-raw entity=mem_a channel=fulltext raw=0.1000 floor=0.2000',
+    )
   })
 
   it('给定融合分低于 fusedFloor 当原始分够高则仍不返回', async () => {
@@ -48,6 +79,9 @@ describe('RecallEngine 阶段一与融合', () => {
 
     expect(result.hits).toHaveLength(0)
     expect(result.emptyReason?.details).toEqual({ belowRaw: 0, belowFused: 1 })
+    expect(result.emptyReason?.message).toContain(
+      'whyNot：below-fused entity=mem_a fused=0.0164 floor=0.0200',
+    )
   })
 
   it('给定 manual 当比较 tool-before 则触发命中与全文命中的先后顺序不同', async () => {
@@ -171,6 +205,7 @@ describe('RecallEngine 阶段一与融合', () => {
     const result = await makeEngine(store).recall({ query: '', now: FIXED_NOW })
 
     expect(result.emptyReason?.code).toBe('empty-query')
+    expect(result.emptyReason?.message).toContain('whyNot：empty-query')
     expect(store.calls.fulltext).toHaveLength(0)
     expect(store.calls.trigger).toHaveLength(0)
     expect(store.calls.single_char).toHaveLength(0)
@@ -186,6 +221,7 @@ describe('RecallEngine 阶段一与融合', () => {
     expect(result.hits).toHaveLength(0)
     expect(result.emptyReason?.code).toBe('filtered-out')
     expect(result.emptyReason?.details).toEqual({ filteredOut: 1 })
+    expect(result.emptyReason?.message).toContain('whyNot：filtered-archived entity=mem_a')
   })
 
   it('给定归档命中当 includeArchived=true 则返回', async () => {
@@ -207,6 +243,7 @@ describe('RecallEngine 阶段一与融合', () => {
 
     expect(result.hits).toHaveLength(0)
     expect(result.emptyReason?.code).toBe('summaries-failed')
+    expect(result.emptyReason?.message).toContain('whyNot：summaries-failed')
     expect(result.warnings.some(warning => warning.includes('summary boom'))).toBe(true)
   })
 

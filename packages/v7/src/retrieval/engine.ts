@@ -1,13 +1,13 @@
 import { toOmbError } from '../domain/errors.js'
 import type { Entity } from '../domain/entity.js'
 import { newId } from '../domain/ids.js'
-import { normalizeText } from '../domain/text.js'
 import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
 import type { EntitySummary, RecallEventInput, Store } from '../ports/store.js'
 import { runStageOne } from './channels.js'
 import type { RetrievalConfig, ScenarioConfig } from './config.js'
 import { DEFAULT_RETRIEVAL_CONFIG } from './config.js'
+import { explainEmpty, explainFiltered, explainHit, type WhyNot } from './explain.js'
 import {
   collectSeeds,
   expandSeeds,
@@ -16,17 +16,10 @@ import {
   type ExpansionOutcome,
   type SeedSet,
 } from './expand.js'
-import {
-  applyExpansions,
-  fuseStageOne,
-  gateCandidates,
-  sortChannels,
-  type FusionCandidate,
-  type GateOutcome,
-} from './fuse.js'
+import { applyExpansions, fuseStageOne, sortChannels, type FusionCandidate } from './fuse.js'
+import { gateCandidates } from './gate.js'
 import { rerankPrior, type PriorResult } from './rerank.js'
 import type {
-  ChannelReport,
   EmptyReason,
   ExpansionMode,
   RecallChannel,
@@ -58,10 +51,6 @@ interface FilteredCandidate {
 }
 
 const MAX_CHAIN_SIBLINGS = 12
-
-function formatScore(value: number): string {
-  return value.toFixed(4)
-}
 
 function resolveNowIso(request: RecallRequest, clock: Clock): string {
   if (request.now !== undefined) {
@@ -113,81 +102,6 @@ function compareScored(left: ScoredCandidate, right: ScoredCandidate): number {
   return left.candidate.entityId < right.candidate.entityId ? -1 : left.candidate.entityId > right.candidate.entityId ? 1 : 0
 }
 
-function buildWhy(candidate: FusionCandidate, prior: PriorResult, score: number): string[] {
-  const parts: string[] = []
-  for (const channel of sortChannels(candidate.rawByChannel.keys())) {
-    const raw = candidate.rawByChannel.get(channel)
-    if (raw === undefined) continue
-    const rank = candidate.rankByChannel.get(channel)
-    parts.push(rank === undefined ? `channel:${channel} raw=${formatScore(raw)}` : `channel:${channel}#${rank} raw=${formatScore(raw)}`)
-  }
-  if (candidate.link !== undefined) {
-    const link = candidate.link
-    const chain = link.chainId === undefined ? '' : ` chain=${link.chainId}`
-    parts.push(`link:hop${link.hop} seed=${link.seedId} decay=${formatScore(link.decay)} via=${link.viaLinkId}${chain}`)
-  }
-  parts.push(`rrf=${formatScore(candidate.fused)}`)
-  parts.push(...prior.reasons)
-  parts.push(`score=${formatScore(score)}`)
-  return parts
-}
-
-function emptyReason(input: {
-  readonly query: string
-  readonly stageOneHitCount: number
-  readonly reports: readonly ChannelReport[]
-  readonly gate: GateOutcome
-  readonly filteredOut: number
-  readonly timeFiltered?: number
-  readonly summariesFailed: boolean
-}): EmptyReason {
-  if (input.stageOneHitCount === 0) {
-    if (normalizeText(input.query).length === 0) {
-      return {
-        code: 'empty-query',
-        message: '查询为空：只运行了时间与状态机看板通道，两者都没有命中。',
-      }
-    }
-    const attempted = input.reports.filter(report => report.status !== 'skipped')
-    if (attempted.length > 0 && attempted.every(report => report.status === 'failed')) {
-      return {
-        code: 'all-channels-failed',
-        message: '六个通道全部失败：这是存储或嵌入不可用，不代表库里没有相关内容。',
-        details: { channels: attempted.map(report => report.channel) },
-      }
-    }
-    return {
-      code: 'no-stage-one-hits',
-      message: '六个通道均无命中：检查查询词、作用域、归档/历史开关是否把目标排除在外。',
-      details: { channels: input.reports.map(report => `${report.channel}:${report.status}`) },
-    }
-  }
-  if (input.gate.passed.length === 0) {
-    return {
-      code: 'below-threshold',
-      message: `有 ${input.gate.belowRaw + input.gate.belowFused} 条候选进入融合，但原始分或融合分低于门控下限；为避免噪声不返回。`,
-      details: {
-        belowRaw: input.gate.belowRaw,
-        belowFused: input.gate.belowFused,
-      },
-    }
-  }
-  if (input.summariesFailed) {
-    return {
-      code: 'summaries-failed',
-      message: '候选已通过门控，但读取实体摘要失败，无法给出可解释结果。',
-    }
-  }
-  return {
-    code: 'filtered-out',
-    message: `有 ${input.gate.passed.length} 条候选通过门控，但都被归档/历史/类型/状态/时间窗过滤排除。`,
-    details: {
-      filteredOut: input.filteredOut,
-      ...(input.timeFiltered === undefined || input.timeFiltered === 0 ? {} : { timeFiltered: input.timeFiltered }),
-    },
-  }
-}
-
 function collectSiblingIds(hitId: string, chains: ReadonlyMap<string, ChainInfo>, out: Set<string>): void {
   for (const chain of chains.values()) {
     const isChain = chain.chainId === hitId
@@ -227,9 +141,9 @@ function chainSiblingTitles(
  * 两阶段召回引擎。
  *
  * 阶段一：六通道（五个并行 + 单字回退条件执行），单通道失败隔离。
- * 阶段二：每通道前 seedLimit 做 1–2 跳图扩展（衰减 0.5/0.25），RRF 融合，
- * 原始分门控，场景重排（先验乘数夹在 [0.5, 1.5]），最后写 recall_event。
- * 空结果一定带 emptyReason，不静默返回 []。
+ * 阶段二：每通道前 seedLimit 做 1–2 跳图扩展（衰减 0.5/0.25），加权 RRF（k 来自配置，默认 60）
+ * 融合，原始分 + 融合分双重门控，场景重排（先验乘数夹在 [0.5, 1.5]），最后写 recall_event。
+ * 命中 why 与空结果 whyNot 都由 explain.ts 统一生成；空结果一定带 emptyReason，不静默返回 []。
  */
 export class RecallEngine {
   readonly config: RetrievalConfig
@@ -280,6 +194,12 @@ export class RecallEngine {
       applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config)
     }
     const gate = gateCandidates([...candidates.values()], this.config)
+    // 有结果时 below 统计不会进 emptyReason；用一条 warning 保证门控淘汰不静默。
+    if (gate.passed.length > 0 && gate.rejected.length > 0) {
+      warnings.push(
+        `门控淘汰 ${gate.rejected.length} 条候选（belowRaw=${gate.belowRaw}，belowFused=${gate.belowFused}）：低于下限的证据不进入结果。`,
+      )
+    }
 
     const empty = (reason: EmptyReason): RecallResult => ({
       traceId,
@@ -296,13 +216,14 @@ export class RecallEngine {
     })
 
     if (gate.passed.length === 0) {
-      return empty(emptyReason({
+      return empty(explainEmpty({
         query: request.query,
         stageOneHitCount,
         reports: stageOne.reports,
         gate,
         filteredOut: 0,
         summariesFailed: false,
+        filteredReasons: [],
       }))
     }
 
@@ -316,13 +237,19 @@ export class RecallEngine {
       warnings.push(`读取实体摘要失败：${toOmbError(error).message}`)
     }
     if (summariesFailed) {
-      return empty({
-        code: 'summaries-failed',
-        message: '候选已通过门控，但读取实体摘要失败，无法给出可解释结果。',
-      })
+      return empty(explainEmpty({
+        query: request.query,
+        stageOneHitCount,
+        reports: stageOne.reports,
+        gate,
+        filteredOut: 0,
+        summariesFailed: true,
+        filteredReasons: [],
+      }))
     }
 
     const filtered: FilteredCandidate[] = []
+    const filteredReasons: WhyNot[] = []
     let filteredOut = 0
     let timeFiltered = 0
     const timeWindow = explicitTimeWindow(request)
@@ -330,26 +257,36 @@ export class RecallEngine {
       const summary = summaryMap.get(candidate.entityId)
       if (summary === undefined) {
         filteredOut += 1
+        filteredReasons.push(explainFiltered('missing-summary', candidate.entityId))
         continue
       }
       if (request.includeArchived !== true && summary.archived) {
         filteredOut += 1
+        filteredReasons.push(explainFiltered('archived', candidate.entityId))
         continue
       }
       if (request.includeHistory !== true && !summary.isCurrent) {
         filteredOut += 1
+        filteredReasons.push(explainFiltered('history', candidate.entityId))
         continue
       }
       if (request.kind !== undefined && summary.kind !== request.kind) {
         filteredOut += 1
+        filteredReasons.push(explainFiltered('kind', candidate.entityId, `kind=${summary.kind} expected=${request.kind}`))
         continue
       }
       if (request.category !== undefined && summary.category !== request.category) {
         filteredOut += 1
+        filteredReasons.push(
+          explainFiltered('category', candidate.entityId, `category=${summary.category ?? 'undefined'} expected=${request.category}`),
+        )
         continue
       }
       if (request.status !== undefined && (summary.status === undefined || !request.status.includes(summary.status))) {
         filteredOut += 1
+        filteredReasons.push(
+          explainFiltered('status', candidate.entityId, `status=${summary.status ?? 'undefined'} expected=${request.status.join('|')}`),
+        )
         continue
       }
       // 显式 timeWindow 对最终候选统一收窄：事件时间在窗外的实体不进入 hits。
@@ -357,13 +294,20 @@ export class RecallEngine {
       if (timeWindow !== undefined && !withinTimeWindow(timeWindow, summary.eventTime)) {
         filteredOut += 1
         timeFiltered += 1
+        filteredReasons.push(
+          explainFiltered(
+            'time-window',
+            candidate.entityId,
+            `eventTime=${summary.eventTime ?? 'unknown'} window=${new Date(timeWindow.fromMs).toISOString()}..${new Date(timeWindow.toMs).toISOString()}`,
+          ),
+        )
         continue
       }
       filtered.push({ candidate, summary })
     }
 
     if (filtered.length === 0) {
-      return empty(emptyReason({
+      return empty(explainEmpty({
         query: request.query,
         stageOneHitCount,
         reports: stageOne.reports,
@@ -371,6 +315,7 @@ export class RecallEngine {
         filteredOut,
         timeFiltered,
         summariesFailed: false,
+        filteredReasons,
       }))
     }
 
@@ -447,7 +392,7 @@ export class RecallEngine {
         updatedAt: item.summary.updatedAt,
         score: item.score,
         fusedScore: candidate.fused,
-        why: buildWhy(candidate, item.prior, item.score),
+        why: explainHit({ candidate, prior: item.prior, score: item.score }),
         channels,
         rawScores,
         chainSiblings: chainSiblingTitles(candidate.entityId, expansion.chains, titles),
