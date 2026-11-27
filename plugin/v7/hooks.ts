@@ -125,7 +125,8 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       session.residentCache.delete(sessionId)
       session.immediateT1.delete(sessionId)
       session.lastT1.delete(sessionId)
-      session.clearT1Content(sessionId)
+      // 只清待消费事件，不清内容窗口：task/team/subagent 事件在长任务里很频繁，
+      // 若每次触发都清窗口，60–90 步内同一段 T1 会反复注入。只有 compaction/* 才重计。
       session.pendingT1.set(sessionId, { scenario: 'session-start', query: text.slice(0, 4_000) })
     }
   }

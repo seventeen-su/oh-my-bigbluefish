@@ -1085,6 +1085,42 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
+  it('task/ 触发事件不清空 90 步内容窗口', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    const exec = { agent: { session: { id: 'task-trigger-window-session', header: { cwd: PROJECT } } } }
+    await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      scope: 'project',
+      attrs: { title: '任务触发窗口记忆', body: 'ENOENT 失败 处理方式', error: 'ENOENT' },
+    }, exec)
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: { session: { id: 'task-trigger-window-session', header: { cwd: PROJECT } } },
+      messages: [
+        { source: { kind: 'user' }, content: 'ENOENT 上次失败的处理方式是什么' },
+        { source: { kind: 'tool' }, role: 'tool', content: 'ENOENT 任务触发窗口记忆 失败' },
+      ],
+      turn: 1,
+      step: 1,
+    }
+    expect(t1Messages(await preStep?.(payload, async () => ({ kind: 'enter', messages: [] })))).toHaveLength(1)
+
+    host.listeners.get('session/event')?.(
+      { id: 'task-trigger-window-session', header: { cwd: PROJECT } },
+      { type: 'task/progress', seq: 2, data: { summary: '任务仍在进行' } },
+    )
+    const second = await preStep?.({ ...payload, step: 2 }, async () => ({ kind: 'enter', messages: [] }))
+    expect(t1Messages(second)).toHaveLength(0)
+    dispose()
+  })
+
   it('压缩后 T1 内容窗口重计：同一段内容可以在压缩后的下一步重新注入', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
