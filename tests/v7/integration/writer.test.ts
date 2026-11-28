@@ -167,14 +167,13 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
       [entityId],
     )
     expect(Number(entity.rows[0]?.revision)).toBe(1)
-    const view = await db.db.query<{ search_text: string; revision: string; attrs: Record<string, unknown> }>(
-      'select search_text, revision, attrs from omb.entity_view where entity_id = $1',
+    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown> }>(
+      'select search_text, attrs from omb.entity_view where entity_id = $1',
       [entityId],
     )
     // search_text 是分词结果（CJK bigram 以空格分隔），按词面断言而不是连续子串。
     expect(view.rows[0]?.search_text).toContain('属性')
     expect(view.rows[0]?.search_text).toContain('派生')
-    expect(Number(view.rows[0]?.revision)).toBe(1)
     expect(view.rows[0]?.attrs['body']).toBe('属性行派生视图')
 
     const audit = await db.db.query<{
@@ -273,13 +272,13 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
       { source_attr_name: 'twin', target_entity_id: target.id, kind: 'ref' },
     ])
 
-    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown>; attr_names: string[] }>(
-      'select search_text, attrs, attr_names from omb.entity_view where entity_id = $1',
+    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown> }>(
+      'select search_text, attrs from omb.entity_view where entity_id = $1',
       [id],
     )
     expect(view.rows[0]?.search_text).toContain('批量')
     expect(view.rows[0]?.attrs['field_29']).toBe('值 29')
-    expect(view.rows[0]?.attr_names).toContain('mirror')
+    expect(rows.map(row => row.name)).toContain('mirror')
     expect(await count('omb.audit_log', 'command_id = $1', [command.commandId])).toBe(1)
     expect(await count(
       'omb.outbox',
@@ -351,14 +350,13 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
     expect(result.value.revision).toBe(2)
     expect(result.value.events[0]?.type).toBe('EntityPatched')
     expect(result.value.events[0]?.streamVersion).toBe(2)
-    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown>; revision: string }>(
-      'select search_text, attrs, revision from omb.entity_view where entity_id = $1',
+    const view = await db.db.query<{ search_text: string; attrs: Record<string, unknown> }>(
+      'select search_text, attrs from omb.entity_view where entity_id = $1',
       [created.id],
     )
     expect(view.rows[0]?.attrs['note']).toBe('新')
     expect(view.rows[0]?.attrs['extra']).toBe('x')
     expect(view.rows[0]?.search_text).toContain('新')
-    expect(Number(view.rows[0]?.revision)).toBe(2)
     const audit = await db.db.query<{ event_type: string; stream_version: string; command_id: string }>(
       'select event_type, stream_version::text, command_id from omb.audit_log where command_id = $1',
       [command.commandId],
@@ -526,12 +524,11 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
     expect(archivedRow.rows[0]?.archived_at).not.toBeNull()
     expect(archivedRow.rows[0]?.archive_reason).toBe('cleanup')
     expect(Number(archivedRow.rows[0]?.revision)).toBe(2)
-    const archivedView = await db.db.query<{ archived_at: string | null; revision: string }>(
-      'select archived_at, revision from omb.entity_view where entity_id = $1',
+    const archivedView = await db.db.query<{ archived_at: string | null }>(
+      'select archived_at from omb.entity_view where entity_id = $1',
       [created.id],
     )
     expect(archivedView.rows[0]?.archived_at).not.toBeNull()
-    expect(Number(archivedView.rows[0]?.revision)).toBe(2)
     expect(await db.get(created.id)).toBeUndefined()
 
     // 同一 commandId 重放：返回首次结果，不再改库。
@@ -644,14 +641,13 @@ describe('AttributeWriter / CommandBus（真实 PostgreSQL）', () => {
       const names = (await attributeRows(db, id)).map(row => row.name)
       expect(names).toContain('project_name')
       expect(names).not.toContain('项目名')
-      const view = await db.db.query<{ attr_names: string[]; search_text: string; revision: string }>(
-        'select attr_names, search_text, revision from omb.entity_view where entity_id = $1',
+      const view = await db.db.query<{ attrs: Record<string, unknown>; search_text: string }>(
+        'select attrs, search_text from omb.entity_view where entity_id = $1',
         [id],
       )
-      expect(view.rows[0]?.attr_names).toContain('project_name')
-      expect(view.rows[0]?.attr_names).not.toContain('项目名')
+      expect(view.rows[0]?.attrs).toHaveProperty('project_name')
+      expect(view.rows[0]?.attrs).not.toHaveProperty('项目名')
       expect(view.rows[0]?.search_text).toContain(id === first.id ? '甲' : '乙')
-      expect(Number(view.rows[0]?.revision)).toBe(2)
     }
     const registry = await db.db.query<{ name: string; aliases: string[] }>(
       "select name, aliases from omb.attr_registry where name in ('项目名', 'project_name') order by name",
@@ -760,9 +756,9 @@ async function attributeRows(
 async function viewRow(
   db: ReturnType<typeof store>,
   entityId: string,
-): Promise<{ search_text: string; attrs: unknown; revision: string } | undefined> {
-  const result = await db.db.query<{ search_text: string; attrs: unknown; revision: string }>(
-    'select search_text, attrs, revision from omb.entity_view where entity_id = $1',
+): Promise<{ search_text: string; attrs: unknown } | undefined> {
+  const result = await db.db.query<{ search_text: string; attrs: unknown }>(
+    'select search_text, attrs from omb.entity_view where entity_id = $1',
     [entityId],
   )
   return result.rows[0]

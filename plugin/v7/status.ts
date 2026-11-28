@@ -76,11 +76,18 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
       `select kind, count(*)::text as count from omb.entity where archived_at is null group by kind order by kind`,
     )
     const archived = await store.db.query<{ count: string }>('select count(*)::text as count from omb.entity where archived_at is not null')
+    const meta = await store.db.query<{ key: string; value: Record<string, unknown> }>(
+      'select key, value from omb.meta order by key',
+    )
+    const embeddingAvailable = await embedder.available().catch(() => false)
+    const embeddingReason = embedder.unavailableReason()
     const lines = [
       `db=ok`,
       `entities=${counts.rows.map(row => `${row.kind}:${row.count}`).join(', ') || 'none'}`,
       `archived=${archived.rows[0]?.count ?? '0'}`,
-      `embedding=${await embedder.available().catch(() => false) ? embedder.model : 'unavailable'}`,
+      `embedding=${embeddingAvailable ? embedder.model : 'unavailable'}`,
+      ...(embeddingReason === undefined ? [] : [`embeddingReason=${embeddingReason}`]),
+      `meta=${meta.rows.map(row => `${row.key}:${JSON.stringify(row.value)}`).join(',') || 'none'}`,
       ...describeJobHealth({
         enabled: config.jobs,
         initialized,

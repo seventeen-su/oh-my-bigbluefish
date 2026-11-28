@@ -61,19 +61,11 @@ export interface ViewRow {
   status: StateStatus | null
   event_time: Date | string | null
   attrs: Record<string, JsonValue>
-  attr_names: string[]
   search_text: string
   snippet: string
   chars: string[]
-  triggers: string[]
   is_current: boolean
   archived_at: Date | string | null
-  revision: string | number
-  confidence: number | null
-  pinned: boolean
-  salience: number
-  access_count: number
-  adoption_count: number
   updated_at: Date | string
 }
 
@@ -87,19 +79,11 @@ export interface ViewValues {
   status: StateStatus | null
   eventTime: string | null
   attrs: Record<string, JsonValue>
-  attrNames: string[]
   searchText: string
   snippet: string
   chars: string[]
-  triggers: string[]
   isCurrent: boolean
   archivedAt: string | null
-  revision: number
-  confidence: number | null
-  pinned: boolean
-  salience: number
-  accessCount: number
-  adoptionCount: number
   updatedAt: string
 }
 
@@ -210,7 +194,7 @@ export function autoArchivedAt(kind: EntityKind, attributes: readonly Attribute[
 
 export function buildViewValues(
   input: NormalizedWrite,
-  derived: DerivedWrite,
+  _derived: DerivedWrite,
   options: {
     now: string
     /**
@@ -219,7 +203,6 @@ export function buildViewValues(
      */
     attributes?: readonly Attribute[]
     isCurrent?: boolean
-    revision?: number
     archivedAt?: string | null
     kindOverride?: EntityKind
   },
@@ -240,10 +223,8 @@ export function buildViewValues(
   const title = typeof titleValue === 'string' && titleValue.trim().length > 0 ? titleValue.trim() : null
 
   const attrs: Record<string, JsonValue> = {}
-  const attrNames: string[] = []
   for (const attribute of attributes) {
     if (attribute.required) continue
-    attrNames.push(attribute.name)
     if (attribute.value.kind === 'static') {
       attrs[attribute.name] = attribute.value.value
     } else if (attribute.value.cachedValue !== undefined) {
@@ -266,19 +247,11 @@ export function buildViewValues(
     status,
     eventTime,
     attrs,
-    attrNames,
     searchText: tokenizeForSearch(derivedText),
     snippet: preview,
     chars: charSet(`${preview} ${derivedText}`),
-    triggers: derived.triggers.map(trigger => `${trigger.kind}:${trigger.key}`),
     isCurrent: options.isCurrent ?? true,
     archivedAt,
-    revision: options.revision ?? 1,
-    confidence: input.confidence ?? null,
-    pinned: input.pinned,
-    salience: 0.5,
-    accessCount: 0,
-    adoptionCount: 0,
     updatedAt: options.now,
   }
 }

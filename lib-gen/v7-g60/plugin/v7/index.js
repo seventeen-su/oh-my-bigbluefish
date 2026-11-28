@@ -339,9 +339,11 @@ function resolveModelDir(options = {}) {
     reason: `未找到模型（已试：${tried.length > 0 ? tried.join(" / ") : "无候选"}）。可设 $${MODEL_DIR_ENV} 或传 modelDir 指向模型目录，或把 BGE-small-zh-v1.5 放到 <仓库根>/models/${BGE_MODEL_DIR}/（需 ${describeRequirement()}）`
   };
 }
+var runtimeHolder = globalThis;
 async function defaultLoadRuntime() {
   const specifier = "onnxruntime-node";
-  return await import(specifier);
+  runtimeHolder.__ombOnnxRuntimePromise ??= import(specifier).then((module) => module);
+  return runtimeHolder.__ombOnnxRuntimePromise;
 }
 async function releaseQuietly(session) {
   try {
@@ -3151,7 +3153,7 @@ function autoArchivedAt(kind, attributes, now) {
   const status = attributeValue2(attributes, "status");
   return typeof status === "string" && isStateStatus(status) && shouldAutoArchive(status) ? now : null;
 }
-function buildViewValues(input2, derived2, options) {
+function buildViewValues(input2, _derived, options) {
   const scope = input2.scope;
   const projectKey = scope.kind === "global" ? "" : scope.projectKey;
   const attributes = options.attributes ?? input2.attributes;
@@ -3165,10 +3167,8 @@ function buildViewValues(input2, derived2, options) {
   const eventTime = typeof timeValue === "string" && Number.isFinite(Date.parse(timeValue)) ? new Date(timeValue).toISOString() : null;
   const title = typeof titleValue === "string" && titleValue.trim().length > 0 ? titleValue.trim() : null;
   const attrs = {};
-  const attrNames = [];
   for (const attribute of attributes) {
     if (attribute.required) continue;
-    attrNames.push(attribute.name);
     if (attribute.value.kind === "static") {
       attrs[attribute.name] = attribute.value.value;
     } else if (attribute.value.cachedValue !== void 0) {
@@ -3188,19 +3188,11 @@ function buildViewValues(input2, derived2, options) {
     status,
     eventTime,
     attrs,
-    attrNames,
     searchText: searchText(derivedText),
     snippet: preview,
     chars: charSet(`${preview} ${derivedText}`),
-    triggers: derived2.triggers.map((trigger) => `${trigger.kind}:${trigger.key}`),
     isCurrent: options.isCurrent ?? true,
     archivedAt,
-    revision: options.revision ?? 1,
-    confidence: input2.confidence ?? null,
-    pinned: input2.pinned,
-    salience: 0.5,
-    accessCount: 0,
-    adoptionCount: 0,
     updatedAt: options.now
   };
 }
@@ -3297,10 +3289,14 @@ function toSimilar(row) {
 function similarAttributesQuery(names) {
   return {
     text: `
-      select r.name, r.usage_count, max(similarity(r.name, q.name)) as similarity
+      select r.name, r.usage_count,
+             max(greatest(
+               similarity(r.name, q.name),
+               case when q.name = any(r.aliases) then 1.0 else 0.0 end
+             )) as similarity
       from omb.attr_registry r
       cross join unnest($1::text[]) as q(name)
-      where similarity(r.name, q.name) >= 0.35
+      where similarity(r.name, q.name) >= 0.35 or q.name = any(r.aliases)
       group by r.name, r.usage_count
       order by similarity desc, r.usage_count desc
       limit ${SIMILAR_ATTRIBUTE_LIMIT}
@@ -5702,22 +5698,22 @@ async function replaceReferences(client, entityId, references) {
     [entityId, jsonRecords(records)]
   );
 }
-async function insertChainMembers(client, chainId, members2, source) {
+async function insertChainMembers(client, chainId, members2) {
   if (members2.length === 0) return;
   const positions = /* @__PURE__ */ new Map();
   for (const [position, memberId] of members2.entries()) positions.set(memberId, position);
-  const records = [...positions].map(([memberId, position]) => ({ member_id: memberId, position, source }));
+  const records = [...positions].map(([memberId, position]) => ({ member_id: memberId, position }));
   await client.query(
-    `insert into omb.chain_member (chain_id, member_id, position, source)
-     select $1, e->>'member_id', coalesce((e->>'position')::int, 0), e->>'source'
+    `insert into omb.chain_member (chain_id, member_id, position)
+     select $1, e->>'member_id', coalesce((e->>'position')::int, 0)
      from jsonb_array_elements($2::jsonb) as e
      on conflict (chain_id, member_id) do update set position = excluded.position`,
     [chainId, jsonRecords(records)]
   );
 }
-async function replaceChainMembers(client, chainId, members2, source) {
+async function replaceChainMembers(client, chainId, members2) {
   await client.query("delete from omb.chain_member where chain_id = $1", [chainId]);
-  await insertChainMembers(client, chainId, members2, source);
+  await insertChainMembers(client, chainId, members2);
 }
 async function assertChainMemberKinds(client, members2) {
   const rows = await client.query(
@@ -5763,7 +5759,6 @@ function buildViewFromRows(row, attributes, now, archivedAt) {
       now,
       attributes,
       isCurrent: row.is_current,
-      revision: Number(row.revision),
       kindOverride: row.kind,
       archivedAt
     }
@@ -5784,11 +5779,9 @@ async function upsertView(client, view) {
   await client.query(
     `insert into omb.entity_view (
        entity_id, kind, category, scope, project_key, title, status, event_time, attrs,
-       attr_names, search_text, snippet, chars, triggers, is_current, archived_at, revision,
-       confidence, pinned, salience, access_count, adoption_count, updated_at
+       search_text, snippet, chars, is_current, archived_at, updated_at
      ) values (
-       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::text[],$11,$12,$13::text[],$14::text[],
-       $15,$16,$17,$18,$19,$20,$21,$22,$23
+       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::text[],$13,$14,$15
      )
      on conflict (entity_id) do update set
        kind = excluded.kind,
@@ -5799,19 +5792,11 @@ async function upsertView(client, view) {
        status = excluded.status,
        event_time = excluded.event_time,
        attrs = excluded.attrs,
-       attr_names = excluded.attr_names,
        search_text = excluded.search_text,
        snippet = excluded.snippet,
        chars = excluded.chars,
-       triggers = excluded.triggers,
        is_current = excluded.is_current,
        archived_at = excluded.archived_at,
-       revision = excluded.revision,
-       confidence = excluded.confidence,
-       pinned = excluded.pinned,
-       salience = excluded.salience,
-       access_count = excluded.access_count,
-       adoption_count = excluded.adoption_count,
        updated_at = excluded.updated_at`,
     [
       view.entityId,
@@ -5823,19 +5808,11 @@ async function upsertView(client, view) {
       view.status,
       view.eventTime,
       JSON.stringify(view.attrs),
-      view.attrNames,
       view.searchText,
       view.snippet,
       view.chars,
-      view.triggers,
       view.isCurrent,
       view.archivedAt,
-      view.revision,
-      view.confidence,
-      view.pinned,
-      view.salience,
-      view.accessCount,
-      view.adoptionCount,
       view.updatedAt
     ]
   );
@@ -5989,13 +5966,12 @@ async function rollbackAudit(client, auditId, actor) {
       const group = groupAttr?.value.kind === "static" && Array.isArray(groupAttr.value.value) ? groupAttr.value.value.filter((item) => typeof item === "string") : [];
       if (group.length > 0) {
         await assertChainMemberKinds(client, group);
-        await replaceChainMembers(client, entityId, group, origin);
+        await replaceChainMembers(client, entityId, group);
       }
     }
     const view = buildViewValues(normalized, derived2, {
       now: nowIso(),
       isCurrent: current.is_current,
-      revision: Math.max(Number(current.revision), revision) + 1,
       archivedAt,
       kindOverride: current.kind
     });
@@ -6095,7 +6071,6 @@ async function rollbackAudit(client, auditId, actor) {
       const view = buildViewValues(normalized, derived2, {
         now: nowIso(),
         isCurrent: current.is_current,
-        revision: restoredRevision,
         archivedAt: current.archived_at === null ? null : iso(current.archived_at) ?? null,
         kindOverride: current.kind
       });
@@ -6244,7 +6219,7 @@ var AttributeWriter = class {
     await insertTriggers(client, input2.id, deriveTriggers(persisted));
     if (input2.kind === "chain" && input2.group !== void 0) {
       await assertChainMemberKinds(client, input2.group);
-      await insertChainMembers(client, input2.id, input2.group, meta3.origin);
+      await insertChainMembers(client, input2.id, input2.group);
     }
     const { view } = buildViewFromRows(entityRow, persisted, now, archivedAt);
     await upsertView(client, view);
@@ -6296,7 +6271,7 @@ var AttributeWriter = class {
     await insertTriggers(client, input2.id, deriveTriggers(persisted));
     if (input2.kind === "chain" && input2.group !== void 0) {
       await assertChainMemberKinds(client, input2.group);
-      await replaceChainMembers(client, input2.id, input2.group, meta3.origin);
+      await replaceChainMembers(client, input2.id, input2.group);
     }
     const archivedAt = autoArchivedAt(input2.kind, persisted, now);
     const updatedResult = await client.query(
@@ -6397,7 +6372,6 @@ var AttributeWriter = class {
     const view = buildViewValues(snapshotInput, derived2, {
       now,
       isCurrent: false,
-      revision: Number(current.revision),
       archivedAt: null,
       kindOverride: "state_version"
     });
@@ -6447,7 +6421,7 @@ var AttributeWriter = class {
       throw revisionConflict(expected, Number(current.revision));
     }
     const revision = Number(row.revision);
-    await client.query("update omb.entity_view set archived_at = now(), revision = $2 where entity_id = $1", [id, revision]);
+    await client.query("update omb.entity_view set archived_at = now() where entity_id = $1", [id]);
     if (row.kind === "memory" || row.kind === "state") {
       const attributes = await selectAttributes(asAttributeQuery(client), id);
       await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)], { archived: false });
@@ -6489,7 +6463,7 @@ var AttributeWriter = class {
       throw revisionConflict(expected, Number(current.revision));
     }
     const revision = Number(row.revision);
-    await client.query("update omb.entity_view set archived_at = null, revision = $2 where entity_id = $1", [id, revision]);
+    await client.query("update omb.entity_view set archived_at = null where entity_id = $1", [id]);
     if (row.kind === "memory" || row.kind === "state") {
       const attributes = await selectAttributes(asAttributeQuery(client), id);
       await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)]);
@@ -6873,7 +6847,7 @@ var PostgresStore = class {
            union
            select id from unnest($1::text[]) as id
          )
-         select cm.chain_id, cm.member_id, cm.chain_id as seed_id
+         select cm.chain_id, cm.member_id, cm.chain_id as seed_id, cm.position
          from omb.chain_member cm
          join target_chains tc on tc.chain_id = cm.chain_id
          where not (cm.member_id = any($1::text[]))`,
@@ -6901,10 +6875,11 @@ var PostgresStore = class {
             viaLinkId: `chain:${row.chain_id}`,
             fromId: row.seed_id,
             relation: "chain",
-            chainId: row.chain_id
+            chainId: row.chain_id,
+            chainPosition: Number(row.position)
           });
         } else if (existing.chainId === void 0) {
-          byId.set(row.member_id, { ...existing, chainId: row.chain_id });
+          byId.set(row.member_id, { ...existing, chainId: row.chain_id, chainPosition: Number(row.position) });
         }
       }
       if (options.includeArchived !== true && byId.size > 0) {
@@ -35683,11 +35658,18 @@ async function createStatusTool(deps) {
       `select kind, count(*)::text as count from omb.entity where archived_at is null group by kind order by kind`
     );
     const archived = await store.db.query("select count(*)::text as count from omb.entity where archived_at is not null");
+    const meta3 = await store.db.query(
+      "select key, value from omb.meta order by key"
+    );
+    const embeddingAvailable = await embedder.available().catch(() => false);
+    const embeddingReason = embedder.unavailableReason();
     const lines = [
       `db=ok`,
       `entities=${counts.rows.map((row) => `${row.kind}:${row.count}`).join(", ") || "none"}`,
       `archived=${archived.rows[0]?.count ?? "0"}`,
-      `embedding=${await embedder.available().catch(() => false) ? embedder.model : "unavailable"}`,
+      `embedding=${embeddingAvailable ? embedder.model : "unavailable"}`,
+      ...embeddingReason === void 0 ? [] : [`embeddingReason=${embeddingReason}`],
+      `meta=${meta3.rows.map((row) => `${row.key}:${JSON.stringify(row.value)}`).join(",") || "none"}`,
       ...describeJobHealth({
         enabled: config2.jobs,
         initialized,

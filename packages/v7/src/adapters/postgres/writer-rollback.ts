@@ -178,13 +178,12 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
         : []
       if (group.length > 0) {
         await assertChainMemberKinds(client, group)
-        await replaceChainMembers(client, entityId, group, origin)
+        await replaceChainMembers(client, entityId, group)
       }
     }
     const view = buildViewValues(normalized, derived, {
       now: nowIso(),
       isCurrent: current.is_current,
-      revision: Math.max(Number(current.revision), revision) + 1,
       archivedAt,
       kindOverride: current.kind,
     })
@@ -286,7 +285,6 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
       const view = buildViewValues(normalized, derived, {
         now: nowIso(),
         isCurrent: current.is_current,
-        revision: restoredRevision,
         archivedAt: current.archived_at === null ? null : iso(current.archived_at) ?? null,
         kindOverride: current.kind,
       })

@@ -106,7 +106,7 @@ async function runBatches(client, { fetchPage, applyPage, batchSize }) {
 // ---------------------------------------------------------------------------
 async function fetchPreferencePage(client, after, limit) {
   const result = await client.query(
-    `select v.entity_id, v.scope, v.title, v.snippet as summary, e.salience, v.revision, v.updated_at
+    `select v.entity_id, v.scope, v.title, v.snippet as summary, e.salience, e.revision, v.updated_at
        from omb.entity_view v
        join omb.entity e on e.id = v.entity_id
       where v.kind = 'memory' and v.scope = 'global'
@@ -171,8 +171,9 @@ async function prunePreferenceBoard(client) {
 // ---------------------------------------------------------------------------
 async function fetchStatePage(client, after, limit) {
   const result = await client.query(
-    `select v.entity_id, v.project_key, v.title, v.status, v.event_time, v.revision, v.updated_at
+    `select v.entity_id, v.project_key, v.title, v.status, v.event_time, e.revision, v.updated_at
        from omb.entity_view v
+       join omb.entity e on e.id = v.entity_id
       where v.kind = 'state' and v.scope = 'project'
         and v.archived_at is null and v.is_current
         and v.status in ('in_progress', 'blocked', 'waiting')

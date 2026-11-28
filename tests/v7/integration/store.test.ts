@@ -306,7 +306,9 @@ describe('PostgresStore', () => {
     }
     const chain = await db.write(normalized(chainInput), derived(chainInput))
     const chainExpanded = await db.expand([left.entity.id], 1)
-    expect(chainExpanded.some(item => item.chainId === chain.entity.id && item.entityId === right.entity.id)).toBe(true)
+    const chainMember = chainExpanded.find(item => item.chainId === chain.entity.id && item.entityId === right.entity.id)
+    expect(chainMember).toBeDefined()
+    expect(chainMember?.chainPosition).toBe(1)
 
     // 改组必须同步 chain_member：移除 right、加入 left 后，从 right 不再展开出旧组。
     const changed: WriteEntityInput = { ...chainInput, id: chain.entity.id, group: [left.entity.id] }

@@ -19,7 +19,7 @@
     "./package.json": "./package.json",
     "./icon.svg": "./icon.svg",
     "./locale/*.json": "./locale/*.json",
-    "./v7": "./lib-gen/v7-g55/plugin/v7/index.js",
+    "./v7": "./lib-gen/v7-g60/plugin/v7/index.js",
     "./v7/icon": "./icon.svg",
     "./v7/locale/*.json": "./locale/v7/*.json"
   },
@@ -80,5 +80,5 @@
     "models",
     "version-manifest.json"
   ],
-  "main": "./lib-gen/v7-g55/plugin/v7/index.js"
+  "main": "./lib-gen/v7-g60/plugin/v7/index.js"
 }

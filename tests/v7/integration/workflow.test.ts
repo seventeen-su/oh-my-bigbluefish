@@ -1088,7 +1088,7 @@ describe('forget 业务 workflow（真实 PostgreSQL）', () => {
     const written = await entityStore.write(normalized(input), derived(input))
     const id = written.entity.id
     await db.query("update omb.entity set updated_at = now() - interval '365 days' where id = $1", [id])
-    await db.query("update omb.entity_view set updated_at = now() - interval '365 days', confidence = 0 where entity_id = $1", [id])
+    await db.query("update omb.entity_view set updated_at = now() - interval '365 days' where entity_id = $1", [id])
     return id
   }
 

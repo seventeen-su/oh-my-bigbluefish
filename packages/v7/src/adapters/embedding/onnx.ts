@@ -188,9 +188,23 @@ export function resolveModelDir(options: OnnxModelDirOptions = {}): ModelDirReso
  * `tsc` 在构建期尝试解析它，未安装即 TS2307——把"可选"变成"必须安装才能构建"。
  * 用变量拼接可让 tsc 不解析（模块类型由上面的结构面承担）。
  */
+/**
+ * 进程级 ONNX runtime 缓存。
+ *
+ * DSH 的插件热重载会重新执行本模块；如果每次重新 `import('onnxruntime-node')`，
+ * 原生模块会在同一进程内重复注册 N-API cleanup hook，Node 会直接 assert 崩溃
+ * （`napi_add_env_cleanup_hook` insertion failed）。模块缓存必须跨插件实例存活，
+ * 因此放在 globalThis，而不是模块作用域。
+ */
+const runtimeHolder = globalThis as typeof globalThis & {
+  __ombOnnxRuntimePromise?: Promise<OnnxRuntimeLike>
+}
+
 async function defaultLoadRuntime(): Promise<OnnxRuntimeLike> {
   const specifier = 'onnxruntime-node'
-  return (await import(specifier)) as unknown as OnnxRuntimeLike
+  runtimeHolder.__ombOnnxRuntimePromise ??=
+    import(specifier).then(module => module as unknown as OnnxRuntimeLike)
+  return runtimeHolder.__ombOnnxRuntimePromise
 }
 
 interface SessionHandle {

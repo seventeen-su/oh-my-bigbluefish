@@ -322,13 +322,13 @@ export class PostgresStore implements Store {
         [seeds, hops],
       )
 
-      const chainRows = await this.db.query<{ chain_id: string; member_id: string; seed_id: string }>(
+      const chainRows = await this.db.query<{ chain_id: string; member_id: string; seed_id: string; position: number }>(
         `with target_chains as (
            select chain_id from omb.chain_member where member_id = any($1::text[])
            union
            select id from unnest($1::text[]) as id
          )
-         select cm.chain_id, cm.member_id, cm.chain_id as seed_id
+         select cm.chain_id, cm.member_id, cm.chain_id as seed_id, cm.position
          from omb.chain_member cm
          join target_chains tc on tc.chain_id = cm.chain_id
          where not (cm.member_id = any($1::text[]))`,
@@ -358,9 +358,10 @@ export class PostgresStore implements Store {
             fromId: row.seed_id,
             relation: 'chain',
             chainId: row.chain_id,
+            chainPosition: Number(row.position),
           })
         } else if (existing.chainId === undefined) {
-          byId.set(row.member_id, { ...existing, chainId: row.chain_id })
+          byId.set(row.member_id, { ...existing, chainId: row.chain_id, chainPosition: Number(row.position) })
         }
       }
       if (options.includeArchived !== true && byId.size > 0) {

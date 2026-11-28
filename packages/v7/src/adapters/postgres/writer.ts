@@ -226,7 +226,7 @@ export class AttributeWriter implements CommandWriter {
     await insertTriggers(client, input.id, deriveTriggers(persisted))
     if (input.kind === 'chain' && input.group !== undefined) {
       await assertChainMemberKinds(client, input.group)
-      await insertChainMembers(client, input.id, input.group, meta.origin)
+      await insertChainMembers(client, input.id, input.group)
     }
     const { view } = buildViewFromRows(entityRow, persisted, now, archivedAt)
     await upsertView(client, view)
@@ -290,7 +290,7 @@ export class AttributeWriter implements CommandWriter {
     await insertTriggers(client, input.id, deriveTriggers(persisted))
     if (input.kind === 'chain' && input.group !== undefined) {
       await assertChainMemberKinds(client, input.group)
-      await replaceChainMembers(client, input.id, input.group, meta.origin)
+      await replaceChainMembers(client, input.id, input.group)
     }
     // 自动归档由状态机 status 决定；先落 entity 再按最终行派生视图，版本号与归档列保持一致。
     const archivedAt = autoArchivedAt(input.kind, persisted, now)
@@ -399,7 +399,6 @@ export class AttributeWriter implements CommandWriter {
     const view = buildViewValues(snapshotInput, derived, {
       now,
       isCurrent: false,
-      revision: Number(current.revision),
       archivedAt: null,
       kindOverride: 'state_version',
     })
@@ -453,7 +452,7 @@ export class AttributeWriter implements CommandWriter {
       throw revisionConflict(expected, Number(current.revision))
     }
     const revision = Number(row.revision)
-    await client.query('update omb.entity_view set archived_at = now(), revision = $2 where entity_id = $1', [id, revision])
+    await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
     // 归档前属于看板时入队：projector 按归档后的谓词删除读模型行。
     // 只有 memory/state 参与看板，链/历史版本不为它们白查一次属性行。
     if (row.kind === 'memory' || row.kind === 'state') {
@@ -501,7 +500,7 @@ export class AttributeWriter implements CommandWriter {
       throw revisionConflict(expected, Number(current.revision))
     }
     const revision = Number(row.revision)
-    await client.query('update omb.entity_view set archived_at = null, revision = $2 where entity_id = $1', [id, revision])
+    await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
     // 取消归档后重新满足看板谓词时入队，projector 重建读模型行（同样只对 memory/state 查属性）。
     if (row.kind === 'memory' || row.kind === 'state') {
       const attributes = await selectAttributes(asAttributeQuery(client), id)

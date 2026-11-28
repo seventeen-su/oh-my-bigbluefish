@@ -627,7 +627,7 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
     })
     await db.db.query("update omb.entity set updated_at = now() - interval '365 days' where id = $1", [old])
     await db.db.query(
-      "update omb.entity_view set updated_at = now() - interval '365 days', confidence = 0 where entity_id = $1",
+      "update omb.entity_view set updated_at = now() - interval '365 days' where entity_id = $1",
       [old],
     )
 

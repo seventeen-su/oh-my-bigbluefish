@@ -466,11 +466,11 @@ async function mutateDrillData(client, marker) {
     )
     await client.query(
       `insert into omb.entity_view
-         (entity_id, kind, category, scope, project_key, title, attrs, attr_names,
-          search_text, triggers, revision, updated_at)
+         (entity_id, kind, category, scope, project_key, title, attrs,
+          search_text, updated_at)
        values ($1, 'memory', 'fact', 'global', '', '回滚演练标记',
-               '{"title":"回滚演练标记"}'::jsonb, '{title}'::text[],
-               '回滚演练标记', '{}'::text[], 1, now())`,
+               '{"title":"回滚演练标记"}'::jsonb,
+               '回滚演练标记', now())`,
       [marker],
     )
     await client.query(

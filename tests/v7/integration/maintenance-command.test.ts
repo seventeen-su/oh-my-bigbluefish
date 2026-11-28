@@ -264,14 +264,12 @@ describe('writer outbox NOTIFY 与 maintenance rename 收编（真实 PostgreSQL
       )
       expect(names.rows.map(row => row.name)).toContain('project_name')
       expect(names.rows.map(row => row.name)).not.toContain('项目名')
-      const view = await store.db.query<{ attrs: Record<string, unknown>; attr_names: string[]; revision: string }>(
-        'select attrs, attr_names, revision from omb.entity_view where entity_id = $1',
+      const view = await store.db.query<{ attrs: Record<string, unknown> }>(
+        'select attrs from omb.entity_view where entity_id = $1',
         [id],
       )
       expect(view.rows[0]?.attrs).toHaveProperty('project_name')
-      expect(view.rows[0]?.attr_names).toContain('project_name')
-      expect(view.rows[0]?.attr_names).not.toContain('项目名')
-      expect(Number(view.rows[0]?.revision)).toBe(2)
+      expect(view.rows[0]?.attrs).not.toHaveProperty('项目名')
     }
 
     // 引用源属性改名后，同一事务重建 reference 的 source_attr_name（旧直写路径不会更新它）。
@@ -314,12 +312,12 @@ describe('writer outbox NOTIFY 与 maintenance rename 收编（真实 PostgreSQL
       [id],
     )
     expect(after.rows).not.toContainEqual({ kind: 'error', key: 'E42' })
-    const view = await store.db.query<{ attr_names: string[] }>(
-      'select attr_names from omb.entity_view where entity_id = $1',
+    const view = await store.db.query<{ attrs: Record<string, unknown> }>(
+      'select attrs from omb.entity_view where entity_id = $1',
       [id],
     )
-    expect(view.rows[0]?.attr_names).toContain('failureNote')
-    expect(view.rows[0]?.attr_names).not.toContain('error')
+    expect(view.rows[0]?.attrs).toHaveProperty('failureNote')
+    expect(view.rows[0]?.attrs).not.toHaveProperty('error')
   })
 
   it('给定必填属性名当 maintenance 归并则返回空且不写审计/outbox/版本', async () => {

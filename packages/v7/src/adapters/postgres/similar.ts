@@ -170,10 +170,14 @@ function toSimilar(row: CandidateRow): SimilarEntity {
 function similarAttributesQuery(names: readonly string[]): SimilarQuery {
   return {
     text: `
-      select r.name, r.usage_count, max(similarity(r.name, q.name)) as similarity
+      select r.name, r.usage_count,
+             max(greatest(
+               similarity(r.name, q.name),
+               case when q.name = any(r.aliases) then 1.0 else 0.0 end
+             )) as similarity
       from omb.attr_registry r
       cross join unnest($1::text[]) as q(name)
-      where similarity(r.name, q.name) >= 0.35
+      where similarity(r.name, q.name) >= 0.35 or q.name = any(r.aliases)
       group by r.name, r.usage_count
       order by similarity desc, r.usage_count desc
       limit ${SIMILAR_ATTRIBUTE_LIMIT}

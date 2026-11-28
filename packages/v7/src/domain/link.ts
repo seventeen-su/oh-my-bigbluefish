@@ -30,4 +30,6 @@ export interface Expansion {
   readonly fromId: string
   readonly relation: string
   readonly chainId?: string
+  /** 思维链成员在链内的位置；普通链接扩展没有该字段。 */
+  readonly chainPosition?: number
 }

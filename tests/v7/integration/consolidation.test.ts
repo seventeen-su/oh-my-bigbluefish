@@ -312,7 +312,7 @@ describe('background consolidation', () => {
       attrs: { title: '很久以前的日志', body: '无关紧要' },
     })
     await db.db.query("update omb.entity set updated_at = now() - interval '365 days' where id = $1", [old.entity.id])
-    await db.db.query("update omb.entity_view set updated_at = now() - interval '365 days', confidence = 0 where entity_id = $1", [old.entity.id])
+    await db.db.query("update omb.entity_view set updated_at = now() - interval '365 days' where entity_id = $1", [old.entity.id])
     const state = await write(db, {
       kind: 'state', scope: { kind: 'global' }, title: '进行中的状态', status: 'in_progress',
       time: '2026-01-01T00:00:00.000Z', attrs: { body: '不能被遗忘任务自动归档' },
@@ -322,7 +322,7 @@ describe('background consolidation', () => {
     })
     for (const id of [state.entity.id, chain.entity.id]) {
       await db.db.query("update omb.entity set updated_at = now() - interval '365 days' where id = $1", [id])
-      await db.db.query("update omb.entity_view set updated_at = now() - interval '365 days', confidence = 0 where entity_id = $1", [id])
+      await db.db.query("update omb.entity_view set updated_at = now() - interval '365 days' where entity_id = $1", [id])
     }
     const result = await handleForget(context)
     expect(result.archived).toBe(1)

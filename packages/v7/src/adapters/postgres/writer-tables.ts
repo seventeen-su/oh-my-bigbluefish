@@ -140,24 +140,24 @@ export async function replaceReferences(client: PoolClient, entityId: string, re
   )
 }
 
-export async function insertChainMembers(client: PoolClient, chainId: string, members: readonly string[], source: string): Promise<void> {
+export async function insertChainMembers(client: PoolClient, chainId: string, members: readonly string[]): Promise<void> {
   if (members.length === 0) return
   // 后出现的位置覆盖前面：与逐行 upsert 的最终状态一致，同时避免同一批里重复键。
   const positions = new Map<string, number>()
   for (const [position, memberId] of members.entries()) positions.set(memberId, position)
-  const records = [...positions].map(([memberId, position]) => ({ member_id: memberId, position, source }))
+  const records = [...positions].map(([memberId, position]) => ({ member_id: memberId, position }))
   await client.query(
-    `insert into omb.chain_member (chain_id, member_id, position, source)
-     select $1, e->>'member_id', coalesce((e->>'position')::int, 0), e->>'source'
+    `insert into omb.chain_member (chain_id, member_id, position)
+     select $1, e->>'member_id', coalesce((e->>'position')::int, 0)
      from jsonb_array_elements($2::jsonb) as e
      on conflict (chain_id, member_id) do update set position = excluded.position`,
     [chainId, jsonRecords(records)],
   )
 }
 
-export async function replaceChainMembers(client: PoolClient, chainId: string, members: readonly string[], source: string): Promise<void> {
+export async function replaceChainMembers(client: PoolClient, chainId: string, members: readonly string[]): Promise<void> {
   await client.query('delete from omb.chain_member where chain_id = $1', [chainId])
-  await insertChainMembers(client, chainId, members, source)
+  await insertChainMembers(client, chainId, members)
 }
 
 /**
@@ -228,7 +228,6 @@ export function buildViewFromRows(
       now,
       attributes,
       isCurrent: row.is_current,
-      revision: Number(row.revision),
       kindOverride: row.kind,
       archivedAt,
     },
@@ -255,11 +254,9 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
   await client.query(
     `insert into omb.entity_view (
        entity_id, kind, category, scope, project_key, title, status, event_time, attrs,
-       attr_names, search_text, snippet, chars, triggers, is_current, archived_at, revision,
-       confidence, pinned, salience, access_count, adoption_count, updated_at
+       search_text, snippet, chars, is_current, archived_at, updated_at
      ) values (
-       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::text[],$11,$12,$13::text[],$14::text[],
-       $15,$16,$17,$18,$19,$20,$21,$22,$23
+       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::text[],$13,$14,$15
      )
      on conflict (entity_id) do update set
        kind = excluded.kind,
@@ -270,19 +267,11 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
        status = excluded.status,
        event_time = excluded.event_time,
        attrs = excluded.attrs,
-       attr_names = excluded.attr_names,
        search_text = excluded.search_text,
        snippet = excluded.snippet,
        chars = excluded.chars,
-       triggers = excluded.triggers,
        is_current = excluded.is_current,
        archived_at = excluded.archived_at,
-       revision = excluded.revision,
-       confidence = excluded.confidence,
-       pinned = excluded.pinned,
-       salience = excluded.salience,
-       access_count = excluded.access_count,
-       adoption_count = excluded.adoption_count,
        updated_at = excluded.updated_at`,
     [
       view.entityId,
@@ -294,19 +283,11 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
       view.status,
       view.eventTime,
       JSON.stringify(view.attrs),
-      view.attrNames,
       view.searchText,
       view.snippet,
       view.chars,
-      view.triggers,
       view.isCurrent,
       view.archivedAt,
-      view.revision,
-      view.confidence,
-      view.pinned,
-      view.salience,
-      view.accessCount,
-      view.adoptionCount,
       view.updatedAt,
     ],
   )

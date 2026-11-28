@@ -303,12 +303,12 @@ describe('QueryCompiler + Providers（真实 PostgreSQL）', () => {
     )
     await db.db.query(
       `insert into omb.entity_view (
-         entity_id, kind, category, scope, project_key, title, attrs, attr_names,
-         search_text, snippet, chars, revision, updated_at
+         entity_id, kind, category, scope, project_key, title, attrs,
+         search_text, snippet, chars, updated_at
        )
        select 'mem_window_' || lpad(i::text, 3, '0'), 'memory', 'fact', 'global', '',
-              'window ' || i, jsonb_build_object('title', 'window ' || i), array['title'],
-              'window ' || i, 'window ' || i, array['w'], 1, now()
+              'window ' || i, jsonb_build_object('title', 'window ' || i),
+              'window ' || i, 'window ' || i, array['w'], now()
        from generate_series(1, 600) as i`,
     )
 

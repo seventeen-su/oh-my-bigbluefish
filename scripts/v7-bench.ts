@@ -160,25 +160,23 @@ async function seed(): Promise<void> {
         [ENTITIES],
       )
       await db.query(
-        `insert into omb.attr_registry (name, description, usage_count, first_seen, last_seen)
-         values ('title', 'bench', $1, now(), now()), ('body', 'bench', $1, now(), now())
+        `insert into omb.attr_registry (name, usage_count, first_seen, last_seen)
+         values ('title', $1, now(), now()), ('body', $1, now(), now())
          on conflict (name) do update set usage_count = excluded.usage_count, last_seen = now()`,
         [ENTITIES],
       )
       await db.query(
         `insert into omb.entity_view (
            entity_id, kind, category, scope, project_key, title, status, event_time,
-           attrs, attr_names, search_text, snippet, chars, is_current, archived_at,
-           revision, confidence, pinned, salience, access_count, adoption_count, updated_at
+           attrs, search_text, snippet, chars, is_current, archived_at, updated_at
          )
          select 'mem_bench_' || lpad(i::text, 6, '0'), 'memory', 'fact', 'global', '',
                 '基准记忆 ' || i, null, null,
                 jsonb_build_object('title', '基准记忆 ' || i, 'body', '性能测试正文 ' || i),
-                array['title', 'body'],
                 '基 基准 准 准记 记 记忆 忆 ' || i,
                 '基准记忆 ' || i || ' 性能测试正文 ' || i,
                 array['基', '准', '记', '忆', '性', '能', '测', '试'],
-                true, null, 1, null, false, 0.5, 0, 0, now()
+                true, null, now()
          from generate_series(1, $1) as i`,
         [ENTITIES],
       )

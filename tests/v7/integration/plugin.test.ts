@@ -274,6 +274,8 @@ describe('v7 plugin entry', () => {
     const status = await host.tools.get('omb_status')?.execute({}, exec)
     expect(status?.ok).toBe(true)
     expect(status?.text).toContain('db=ok')
+    expect(status?.text).toContain('meta=')
+    expect(status?.text).toContain('schema_version')
     expect(status?.text).toContain('jobFailures=0')
     // 宿主面自检：7 个工具与 4 个钩子都真实接线。
     expect(status?.text).toContain('tools=7/7')

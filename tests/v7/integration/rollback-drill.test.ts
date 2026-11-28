@@ -103,11 +103,11 @@ async function createSourceDatabase(): Promise<void> {
       )
       await client.query(
         `insert into omb.entity_view
-           (entity_id, kind, category, scope, project_key, title, attrs, attr_names,
-            search_text, triggers, revision, updated_at)
+           (entity_id, kind, category, scope, project_key, title, attrs,
+            search_text, revision, updated_at)
          values ('mem_drill_fixture', 'memory', 'fact', 'global', '', '回滚演练基线',
-                 '{"title":"回滚演练基线"}'::jsonb, '{title}'::text[], '回滚演练基线',
-                 '{}'::text[], 1, '2026-11-01T00:00:00Z')`,
+                 '{"title":"回滚演练基线"}'::jsonb, '回滚演练基线',
+                 1, '2026-11-01T00:00:00Z')`,
       )
       await client.query(
         `insert into omb.attribute

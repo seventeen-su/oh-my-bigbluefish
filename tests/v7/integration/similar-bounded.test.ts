@@ -174,6 +174,29 @@ describe('写后相似建议（有界候选窗口，真实 PostgreSQL）', () =>
     expect(title?.similarity).toBe(1)
   })
 
+  it('给定 attr_registry alias 当相似属性查询则以 canonical 名返回', async () => {
+    const input = memory('别名相似', `${SIMILAR_BODY} 别名`)
+    const written = await db.write(normalized(input), derived(input))
+    await db.db.query("update omb.attr_registry set aliases = array['project_name'] where name = 'title'")
+    const similar = await findSimilar(db.db, {
+      entityId: written.entity.id,
+      kind: 'memory',
+      attributes: [
+        ...written.entity.attributes,
+        {
+          name: 'project_name',
+          ordinal: 99,
+          value: { kind: 'static' as const, value: '别名属性' },
+          required: false,
+          source: 'test',
+        },
+      ],
+      title: null,
+    })
+    expect(similar.similarAttributes).toContainEqual(
+      expect.objectContaining({ name: 'title', similarity: 1 }),
+    )
+  })
   it('给定单字正文当真实写入则相似实体为空数组而不是报错（无 tsquery）', async () => {
     const input = memory('雨', '雨')
     const written = await db.write(normalized(input), derived(input))
