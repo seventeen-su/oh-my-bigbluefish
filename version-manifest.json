@@ -1,6 +1,6 @@
 {
   "major": 7,
-  "description": "OMB 7.1.2 = 在 7.0 单库属性化认知存储基础上，增加主动记忆协议、未记录信号检查点与写入销账，并修复真实 DSH 宿主上 prompt 服务方法 this 绑定导致的注入失败。",
+  "description": "OMB 7.1.18 = 在 7.1 主动记忆基础上，修复热开关与生命周期、项目身份、状态并发、动态依赖、采用证据、巩固幂等、检索门控/时区与 supersedes 生命周期，并补齐审计链与数据库安全规范。",
   "features": [
     {
       "id": "v7-single-store",
@@ -33,7 +33,25 @@
         "prompt=protocol+checkpoint+t0 健康读数",
         "DSH 服务方法 this 绑定审计"
       ]
+    },
+    {
+      "id": "stability-concurrency",
+      "name": "稳定性、并发与知识时效",
+      "since": "7.1",
+      "subfeatures": [
+        "热开关与受管 PostgreSQL 生命周期",
+        "project/workspace/repository/branch 身份",
+        "状态 revision CAS 与 actor/source 差异",
+        "动态属性依赖失效传播",
+        "Retrieved/Referenced/Utilized/Validated 采用证据",
+        "工具命令与内容双层幂等",
+        "Evidence 账本与独立来源晋升",
+        "superseded/retracted/archived 生命周期与 valid_from/valid_to",
+        "融合门控、显式 IANA 时区与两级重排",
+        "连续断连、重复装配与 dispose 清理",
+        "审计哈希链边界与数据库默认安全"
+      ]
     }
   ],
-  "version": "7.1.2"
+  "version": "7.1.18"
 }
