@@ -177,6 +177,11 @@ async function main() {
   // 所以复制后清掉。只认精确目录名，未知目录/用户自建技能一律保留。
   pruneStaleSkills({ skillsDir: join(TARGET, 'skills'), apply: APPLY, log })
   copyIfExists(join(ROOT, 'models', 'bge-small-zh-v1.5'), join(TARGET, 'models', 'bge-small-zh-v1.5'))
+  copyIfExists(join(ROOT, 'locale'), join(TARGET, 'locale'))
+  copyIfExists(join(ROOT, 'README.md'), join(TARGET, 'README.md'))
+  copyIfExists(join(ROOT, 'LICENSE'), join(TARGET, 'LICENSE'))
+  copyIfExists(join(ROOT, 'COPYRIGHT'), join(TARGET, 'COPYRIGHT'))
+  copyIfExists(join(ROOT, 'THIRD_PARTY_NOTICES.md'), join(TARGET, 'THIRD_PARTY_NOTICES.md'))
   copyIfExists(join(ROOT, 'cordis.patch.v7.yml'), join(TARGET, 'cordis.patch.v7.yml'))
   copyIfExists(join(ROOT, 'icon.svg'), join(TARGET, 'icon.svg'))
   copyIfExists(join(ROOT, 'package.json'), join(TARGET, 'package.json'))

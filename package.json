@@ -2,6 +2,8 @@
   "name": "oh-my-bigbluefish",
   "version": "7.0.0",
   "private": true,
+  "author": "苏拾柒",
+  "license": "GPL-3.0-only",
   "engines": {
     "dsh": ">=0.2.2-rc.1 <=0.2.3"
   },
@@ -66,6 +68,9 @@
   },
   "files": [
     "README.md",
+    "COPYRIGHT",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses",
     "lib-gen",
     "locale",
     "skills",
