@@ -16,6 +16,7 @@
  * Utilization，不能直接决定长期遗忘或强采用。
  */
 import { asRecord } from '../../packages/v7/src/adapters/dsh/host.js'
+import { entityReceiptsOf } from '../../packages/v7/src/app/adoption.js'
 import { contentText, eventText } from './messages.js'
 import { toolFailed } from './t1.js'
 
@@ -35,17 +36,22 @@ export interface ReceiptVisibility {
 }
 
 /**
- * 只保留 receipt 判定为 kept 且未被隔离的命中。
+ * 只保留 receipt 判定为真正展示的命中。
  *
- * `receipt` 缺省时表示调用点没有装配器 receipt（T0 的 notice 走 build 结果的可见
- * 命中），此时 hits 已经是可见集合；有 receipt 时必须做交集，未展示/被隔离的命中
- * 不能进入候选，更不能升采用。
+ * 首选 `entities`（逐实体 receipt）：只有 `state='kept'` 才可见；quarantined 与没有
+ * 条目的未展示实体都排除。旧 receipt 没有 `entities` 时才退回块级 keptIds 交集。
+ * `receipt` 缺省表示调用点没有装配器 receipt（T0 notice 走 build 结果的可见命中）。
  */
 export function receiptVisibleHits<T extends AdoptionHit>(
   hits: readonly T[],
   receipt: ReceiptVisibility | undefined,
 ): T[] {
   if (receipt === undefined) return [...hits]
+  const entities = entityReceiptsOf(receipt)
+  if (entities !== undefined) {
+    const kept = new Set(entities.filter(entity => entity.state === 'kept').map(entity => entity.entityId))
+    return hits.filter(hit => kept.has(hit.id))
+  }
   const kept = new Set(receipt.keptIds)
   const quarantined = new Set(receipt.quarantinedIds ?? [])
   return hits.filter(hit => kept.has(hit.id) && !quarantined.has(hit.id))

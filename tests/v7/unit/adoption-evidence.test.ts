@@ -181,4 +181,68 @@ describe('T1 会话证据：验证必须依赖最新版本与外部信号', () =
       .toEqual([])
     session.dispose()
   })
+
+  it('T1 逐实体 entities 是唯一来源：kept 记账、quarantined 不升、未展示不记', async () => {
+    const store = new FakeStore()
+    const poison = { id: 'mem_22222222-2222-4222-8222-222222222222', title: '隔离记忆标题' }
+    const undisplayed = { id: 'mem_33333333-3333-4333-8333-333333333333', title: '未展示记忆标题' }
+    const session = createT1Session({ store: store as unknown as PostgresStore, logger })
+    session.rememberInjection('s-entities', {
+      traceId: 'trc_entities',
+      // hits 里故意混入未展示命中；receipt.entities 没有条目就必须被排除。
+      hits: [HIT, poison, undisplayed],
+      receipt: {
+        receiptId: 'rcpt_entities',
+        traceId: 'trc_entities',
+        textHash: 'hash',
+        budgetTokens: 400,
+        usedTokens: 20,
+        injected: true,
+        blocks: [],
+        // 旧块级字段故意与 entities 冲突：entities 优先，quarantined 不能被 keptIds 洗白。
+        keptIds: [HIT.id, poison.id, undisplayed.id],
+        droppedIds: [undisplayed.id],
+        truncatedIds: [],
+        quarantinedIds: [],
+        demotedIds: [],
+        entities: [
+          {
+            traceId: 'trc_entities',
+            entityId: HIT.id,
+            section: 'event-recall',
+            state: 'kept',
+            blockId: HIT.id,
+            title: HIT.title,
+          },
+          {
+            traceId: 'trc_entities',
+            entityId: poison.id,
+            section: 'event-recall',
+            state: 'quarantined',
+            blockId: poison.id,
+          },
+        ],
+      } as never,
+    })
+    await session.flushEvidence('s-entities')
+    const receipt = store.receipts[0]?.input
+    expect(receipt).toMatchObject({
+      kind: 't1',
+      traceId: 'trc_entities',
+      keptIds: [HIT.id],
+      quarantinedIds: [poison.id],
+      droppedIds: [],
+    })
+    expect(receipt?.hits?.map(hit => hit.entityId)).toEqual([HIT.id, poison.id])
+    expect(store.exposures.map(item => item.entityId)).toEqual([HIT.id])
+
+    await session.ingestEvidence('s-entities', evidenceFromSessionEvent('assistant/message', {
+      message: { content: [{ type: 'text', text: `${HIT.title} ${poison.id} ${undisplayed.id}` }] },
+    }))
+    expect(store.usage.some(item => item.input.entityId === HIT.id && item.level === 'reference')).toBe(true)
+    expect(store.usage.filter(item => (
+      item.input.entityId === poison.id || item.input.entityId === undisplayed.id
+    ))).toEqual([])
+    session.dispose()
+  })
 })

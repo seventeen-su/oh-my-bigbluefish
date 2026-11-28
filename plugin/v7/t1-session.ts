@@ -22,6 +22,10 @@ import type {
   AdoptionReceiptInput,
   UsageEvidenceInput,
 } from '../../packages/v7/src/ports/observability.js'
+import {
+  adoptionFieldsFromEntities,
+  entityReceiptsOf,
+} from '../../packages/v7/src/app/adoption.js'
 import type { InjectionReceipt } from '../../packages/v7/src/prompt/assembler.js'
 import type { RecallNotice } from '../../packages/v7/src/recall/resident.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
@@ -575,7 +579,9 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
 
   /**
    * 记录一次真实注入。receipt 是采用证据的唯一来源：
-   * - 候选只取 receipt 的 kept 且未隔离命中（未展示/被隔离的命中不能升采用）；
+   * - 新 receipt 以 `entities` 为准：kept 收集候选，quarantined 只留住证据，未展示
+   *   实体没有条目、不写任何行；
+   * - 旧 receipt（无 entities）退回块级 keptIds/quarantinedIds/droppedIds；
    * - 即使 hits 为空（全被隔离）也写 receipt 行，留下“为什么没升”的审计证据；
    * - Exposure 写入与 evidence 处理共用同一串行链，事件到达前机会已存在。
    */
@@ -586,6 +592,15 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     const visibleHits = receiptVisibleHits(notice.hits, receipt)
     const injected = receipt?.injected ?? visibleHits.length > 0
     const traceText = meta.text ?? notice.text
+    const entities = entityReceiptsOf(receipt)
+    const fields = entities === undefined
+      ? {
+          keptIds: receipt === undefined ? visibleHits.map(hit => hit.id) : receipt.keptIds,
+          quarantinedIds: receipt?.quarantinedIds ?? [],
+          droppedIds: receipt?.droppedIds ?? [],
+          hits: receiptHitInputs(notice.hits),
+        }
+      : adoptionFieldsFromEntities(entities)
     scheduleReceipt(sessionId, taskId, {
       traceId: notice.traceId,
       kind: receipt === undefined ? 't0' : 't1',
@@ -603,10 +618,7 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
           }),
       injected,
       ...(traceText === undefined ? {} : { text: traceText }),
-      keptIds: receipt === undefined ? visibleHits.map(hit => hit.id) : receipt.keptIds,
-      quarantinedIds: receipt?.quarantinedIds ?? [],
-      droppedIds: receipt?.droppedIds ?? [],
-      hits: receiptHitInputs(notice.hits),
+      ...fields,
     })
     if (visibleHits.length === 0) return
     sequence += 1

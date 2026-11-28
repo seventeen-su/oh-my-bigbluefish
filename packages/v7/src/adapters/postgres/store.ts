@@ -815,16 +815,12 @@ export class PostgresStore implements Store {
   async markAdopted(traceId: string, entityId: string, kind: string): Promise<void> {
     await this.run(async () => {
       await this.db.transaction(async client => {
-        // 旧口径兼容：只有该 trace/实体的 receipt 判定为 kept 才能记 adopted，
-        // 与 Retrieved/Validation 同源；没有 receipt 的直接调用是无操作。
+        // 旧口径兼容读/播种：只写事件级 adopted_at 与 entity.adoption_count，
+        // 不参与 receipt 派生的四态指标。插件采用链不再调用它。
         const updated = await client.query(
           `update omb.recall_event
            set adopted_at = now(), adoption_kind = $3
-           where trace_id = $1 and entity_id = $2 and adopted_at is null
-             and exists (
-               select 1 from omb.adoption_receipt_hit h
-                where h.trace_id = $1 and h.entity_id = $2 and h.disposition = 'kept'
-             )`,
+           where trace_id = $1 and entity_id = $2 and adopted_at is null`,
           [traceId, entityId, kind],
         )
         if (updated.rowCount !== null && updated.rowCount > 0) {

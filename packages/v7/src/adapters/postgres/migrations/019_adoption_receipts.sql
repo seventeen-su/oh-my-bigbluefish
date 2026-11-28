@@ -17,11 +17,14 @@
 --
 -- 回填：
 --   - 从 `resident_trace`（006 起就是 T0/T1 注入证据）重建 receipt/hit；
---   - T1 行只有一个 `injection-receipt` section，其 text 是 InjectionReceipt JSON；
---     T0 行按 sections[].entityIds + kept/quarantined 判定逐实体处置；
+--   - 新 receipt 的 `injection-receipt` JSON 带逐实体 `entities`（state=kept/quarantined）：
+--     只按它记账，没有条目的实体就是未展示，**不写** dropped；
+--   - 旧 T1 receipt 没有 entities 时按其 keptIds/quarantinedIds、旧 T0 按
+--     sections[].entityIds + kept/quarantined 判定；
 --   - 没有 receipt 的旧 recall_event 计数被清零（它可被伪造，不能作为采用依据）。
 --
--- 编号 019：001–018 已发布文件不再修改；迁移执行器按文件名排序、只应用未记录文件。
+-- 注意：019 在本分支尚未发布/合并；逐实体 contract 合入后可直接修改本文件并重置测试库
+-- checksum。已发布的 001–018 仍不可修改。
 
 create table if not exists omb.adoption_receipt (
   trace_id text primary key,
@@ -102,7 +105,62 @@ select
 from omb.resident_trace t
 on conflict (trace_id) do nothing;
 
--- --- 回填 2/3a：T0 逐 section 处置 -----------------------------------------
+-- --- 回填 2/3a：逐实体 entities（T0/T1 新 receipt）优先 ----------------------
+-- 新 receipt 的 injection-receipt JSON 带 entities：只记 kept/quarantined，
+-- 未展示实体没有条目（不写 dropped）。这是 adoption 的唯一权威来源。
+with trace_entities as (
+  select
+    t.trace_id,
+    t.created_at,
+    item.entity_json->>'entityId' as entity_id,
+    item.entity_json->>'state' as state,
+    nullif(item.entity_json->>'title', '') as title,
+    nullif(item.entity_json->>'updatedAt', '') as updated_at,
+    item.ordinality
+  from omb.resident_trace t
+  cross join lateral (
+    select section_value as section
+      from jsonb_array_elements(t.sections) as rs(section_value)
+     where section_value->>'name' = 'injection-receipt'
+     limit 1
+  ) receipt_section
+  cross join lateral jsonb_array_elements(
+    case
+      when (receipt_section.section->>'text') ~ '^\s*\{'
+       and jsonb_typeof((receipt_section.section->>'text')::jsonb->'entities') = 'array'
+      then (receipt_section.section->>'text')::jsonb->'entities'
+      else '[]'::jsonb
+    end
+  ) with ordinality as item(entity_json, ordinality)
+  where jsonb_typeof(
+    case when (receipt_section.section->>'text') ~ '^\s*\{'
+         then (receipt_section.section->>'text')::jsonb->'entities'
+         else null end
+  ) = 'array'
+    and item.entity_json->>'state' in ('kept', 'quarantined')
+    and nullif(item.entity_json->>'entityId', '') is not null
+)
+insert into omb.adoption_receipt_hit (
+  trace_id, entity_id, disposition, title, updated_at, rank, source, created_at
+)
+select
+  trace_entities.trace_id,
+  trace_entities.entity_id,
+  trace_entities.state,
+  case when trace_entities.state = 'kept' then trace_entities.title end,
+  case
+    when trace_entities.state = 'kept'
+     and trace_entities.updated_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+    then trace_entities.updated_at::timestamptz
+  end,
+  trace_entities.ordinality::int,
+  'resident-trace-entities-backfill',
+  trace_entities.created_at
+from trace_entities
+join omb.entity en on en.id = trace_entities.entity_id
+on conflict (trace_id, entity_id) do nothing;
+
+-- --- 回填 2/3b：旧 T0（无 entities）退回 sections ---------------------------
 insert into omb.adoption_receipt_hit (trace_id, entity_id, disposition, source, created_at)
 select
   t.trace_id,
@@ -121,9 +179,19 @@ join omb.entity en on en.id = e.entity_id
 where not (jsonb_array_length(t.sections) = 1 and t.sections->0->>'name' = 'injection-receipt')
   and coalesce(s->>'name', '') <> 'injection-receipt'
   and jsonb_array_length(coalesce(s->'entityIds', '[]'::jsonb)) > 0
+  and not coalesce((
+    select jsonb_typeof(
+      case when (rs->>'text') ~ '^\s*\{'
+           then (rs->>'text')::jsonb->'entities'
+           else null end
+    ) = 'array'
+    from jsonb_array_elements(t.sections) rs
+    where rs->>'name' = 'injection-receipt'
+    limit 1
+  ), false)
 on conflict (trace_id, entity_id) do nothing;
 
--- --- 回填 2/3b：T1 按 InjectionReceipt JSON 的 kept/quarantined 判定 ---------
+-- --- 回填 2/3c：旧 T1（无 entities）按 keptIds/quarantinedIds 判定 ----------
 insert into omb.adoption_receipt_hit (trace_id, entity_id, disposition, source, created_at)
 select
   t.trace_id,
@@ -156,6 +224,11 @@ cross join lateral jsonb_array_elements_text(
 join omb.entity en on en.id = e.entity_id
 where jsonb_array_length(t.sections) = 1
   and t.sections->0->>'name' = 'injection-receipt'
+  and coalesce(jsonb_typeof(
+    case when (t.sections->0->>'text') ~ '^\s*\{'
+         then (t.sections->0->>'text')::jsonb->'entities'
+         else null end
+  ) = 'array', false) = false
 on conflict (trace_id, entity_id) do nothing;
 
 -- --- 回填 3/3：retrieved_count 只按 receipt 的 kept 重算 --------------------

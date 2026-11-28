@@ -109,8 +109,6 @@ describe('采用证据只从 receipt 派生（真实 PostgreSQL）', () => {
       entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_forged',
       kind: 'user-confirmation', source: 'user-message',
     })
-    // 旧兼容入口同样需要 receipt：没有 kept 行就是无操作。
-    await db.markAdopted('trc_forged', id, 'legacy')
     expect(await receiptRow(db, 'trc_forged')).toBeUndefined()
     expect(await metricOf(db, id)).toBeUndefined()
     const exposure = await db.db.query('select 1 from omb.usage_opportunity where entity_id = $1', [id])
@@ -118,12 +116,11 @@ describe('采用证据只从 receipt 派生（真实 PostgreSQL）', () => {
     const entity = await db.get(id)
     expect(entity?.adoptionCount).toBe(0)
     // recall_event 仍然是可查的事件级审计，只是不再驱动 adoption。
-    const audit = await db.db.query<{ injected: boolean; adopted_at: string | null }>(
-      'select injected, adopted_at from omb.recall_event where trace_id = $1 limit 1',
+    const audit = await db.db.query<{ injected: boolean }>(
+      'select injected from omb.recall_event where trace_id = $1 limit 1',
       ['trc_forged'],
     )
     expect(audit.rows[0]?.injected).toBe(true)
-    expect(audit.rows[0]?.adopted_at).toBeNull()
     await db.close()
   })
 
@@ -344,11 +341,160 @@ describe('采用证据只从 receipt 派生（真实 PostgreSQL）', () => {
     await db.close()
   })
 
+  it('T0 逐实体 entities：kept 记账、quarantined 不升、未展示不记', async () => {
+    const keptId = await seedMemory('T0 实体 kept')
+    const poisonId = await seedMemory('T0 实体 quarantined')
+    const undisplayedId = await seedMemory('T0 实体未展示')
+    const db = store()
+    const trace: ResidentTraceInput = {
+      traceId: 'trc_t0_entities',
+      sessionId: SESSION,
+      turnId: '2',
+      budgetTokens: 300,
+      usedTokens: 100,
+      text: '[OMB 常驻]',
+      sections: [
+        section('header', true, []),
+        section('preferences', true, [keptId]),
+        section('states', true, [], { quarantined: true }),
+        // 索引段包含未展示实体：entities 是唯一来源，不得从旧段级 entityIds 补记。
+        section('index', true, [undisplayedId]),
+        {
+          name: 'injection-receipt',
+          tokens: 10,
+          kept: true,
+          text: JSON.stringify({
+            injected: true,
+            budgetTokens: 300,
+            usedTokens: 100,
+            textHash: 'hash',
+            entities: [
+              {
+                traceId: 'trc_t0_entities',
+                entityId: keptId,
+                section: 'preferences',
+                state: 'kept',
+                blockId: 'resident:preferences',
+                title: 'T0 实体 kept',
+              },
+              {
+                traceId: 'trc_t0_entities',
+                entityId: poisonId,
+                section: 'states',
+                state: 'quarantined',
+                blockId: 'resident:states',
+              },
+            ],
+          }),
+          entityIds: [keptId],
+        },
+      ],
+      droppedSections: [],
+    }
+    await db.recordResidentTrace(trace)
+    expect(await hitDispositions(db, trace.traceId)).toEqual({
+      [keptId]: 'kept',
+      [poisonId]: 'quarantined',
+    })
+    expect((await metricOf(db, keptId))?.retrieved_count).toBe('1')
+    expect(await metricOf(db, poisonId)).toBeUndefined()
+    expect(await metricOf(db, undisplayedId)).toBeUndefined()
+
+    // 只有 kept 能建机会/升采用；quarantined 与未展示都被门禁挡住。
+    await db.recordExposure({ entityId: keptId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    await db.recordUsage('reference', {
+      entityId: keptId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId,
+      kind: 'title', source: 'assistant-text',
+    })
+    await db.recordExposure({ entityId: poisonId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    await db.recordExposure({ entityId: undisplayedId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    await db.recordUsage('validation', {
+      entityId: undisplayedId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId,
+      kind: 'user-confirmation', source: 'user-message',
+    })
+    expect(await metricOf(db, keptId)).toMatchObject({
+      retrieved_count: '1', opportunities: '1', referenced_count: '1', validated_count: '0',
+    })
+    expect(await metricOf(db, poisonId)).toBeUndefined()
+    expect(await metricOf(db, undisplayedId)).toBeUndefined()
+    await db.close()
+  })
+
+  it('T1 resident_trace 的 entities 按 kept/quarantined 记账，未展示不记', async () => {
+    const keptId = await seedMemory('T1 实体 kept')
+    const poisonId = await seedMemory('T1 实体 quarantined')
+    const undisplayedId = await seedMemory('T1 实体未展示')
+    const db = store()
+    const trace: ResidentTraceInput = {
+      traceId: 'trc_t1_entities',
+      sessionId: SESSION,
+      budgetTokens: 400,
+      usedTokens: 80,
+      text: '[OMB 事件召回]',
+      sections: [{
+        name: 'injection-receipt',
+        tokens: 80,
+        kept: true,
+        entityIds: [keptId],
+        text: JSON.stringify({
+          injected: true,
+          budgetTokens: 400,
+          usedTokens: 80,
+          textHash: 'hash',
+          // 旧块级字段故意包含全部实体：entities 存在时以 entities 为准。
+          keptIds: [keptId, poisonId, undisplayedId],
+          quarantinedIds: [],
+          droppedIds: [undisplayedId],
+          entities: [
+            {
+              traceId: 'trc_t1_entities',
+              entityId: keptId,
+              section: 'event-recall',
+              state: 'kept',
+              blockId: keptId,
+              title: 'T1 实体 kept',
+            },
+            {
+              traceId: 'trc_t1_entities',
+              entityId: poisonId,
+              section: 'event-recall',
+              state: 'quarantined',
+              blockId: poisonId,
+            },
+          ],
+        }),
+      }],
+      droppedSections: [],
+    }
+    await db.recordResidentTrace(trace)
+    expect(await receiptRow(db, trace.traceId)).toMatchObject({ kind: 't1', session_id: SESSION })
+    expect(await hitDispositions(db, trace.traceId)).toEqual({
+      [keptId]: 'kept',
+      [poisonId]: 'quarantined',
+    })
+    expect((await metricOf(db, keptId))?.retrieved_count).toBe('1')
+    expect(await metricOf(db, poisonId)).toBeUndefined()
+    expect(await metricOf(db, undisplayedId)).toBeUndefined()
+    await db.recordExposure({ entityId: keptId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    await db.recordExposure({ entityId: poisonId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    await db.recordExposure({ entityId: undisplayedId, sessionId: SESSION, taskId: TASK, traceId: trace.traceId })
+    expect(await metricOf(db, keptId)).toMatchObject({ retrieved_count: '1', opportunities: '1' })
+    expect(await metricOf(db, poisonId)).toBeUndefined()
+    expect(await metricOf(db, undisplayedId)).toBeUndefined()
+    await db.close()
+  })
+
   it('019 能从旧 resident_trace 回填 receipt，并按 kept 重算 Retrieved（清掉可伪造计数）', async () => {
     const t0Kept = await seedMemory('回填 T0 正常')
     const t0Poison = await seedMemory('回填 T0 隔离')
     const t1Kept = await seedMemory('回填 T1 正常')
     const t1Poison = await seedMemory('回填 T1 隔离')
+    const e0Kept = await seedMemory('回填 entities T0 正常')
+    const e0Poison = await seedMemory('回填 entities T0 隔离')
+    const e0Undisplayed = await seedMemory('回填 entities T0 未展示')
+    const e1Kept = await seedMemory('回填 entities T1 正常')
+    const e1Poison = await seedMemory('回填 entities T1 隔离')
+    const e1Undisplayed = await seedMemory('回填 entities T1 未展示')
     const db = store()
     // 旧库只有 resident_trace、没有 019 的 receipt 表；这里直接写表模拟历史数据。
     await db.db.query(
@@ -384,6 +530,56 @@ describe('采用证据只从 receipt 派生（真实 PostgreSQL）', () => {
         }]),
       ],
     )
+    // 新契约：injection-receipt JSON 带 entities；未展示实体没有条目。
+    await db.db.query(
+      `insert into omb.resident_trace (
+         trace_id, session_id, budget_tokens, used_tokens, text, sections, dropped_sections
+       ) values ($1,$2,$3,$4,$5,$6::jsonb,'{}')`,
+      [
+        'trc_backfill_entities_t0', SESSION, 300, 100, '[OMB 常驻]',
+        JSON.stringify([
+          { name: 'header', tokens: 5, kept: true, text: '[OMB 常驻]', entityIds: [] },
+          { name: 'preferences', tokens: 20, kept: true, text: '偏好', entityIds: [e0Kept] },
+          { name: 'index', tokens: 20, kept: true, text: '索引', entityIds: [e0Undisplayed] },
+          {
+            name: 'injection-receipt',
+            tokens: 10,
+            kept: true,
+            entityIds: [e0Kept],
+            text: JSON.stringify({
+              injected: true,
+              entities: [
+                { traceId: 'trc_backfill_entities_t0', entityId: e0Kept, section: 'preferences', state: 'kept', blockId: 'resident:preferences' },
+                { traceId: 'trc_backfill_entities_t0', entityId: e0Poison, section: 'states', state: 'quarantined', blockId: 'resident:states' },
+              ],
+            }),
+          },
+        ]),
+      ],
+    )
+    await db.db.query(
+      `insert into omb.resident_trace (
+         trace_id, session_id, budget_tokens, used_tokens, text, sections, dropped_sections
+       ) values ($1,null,$2,$3,$4,$5::jsonb,'{}')`,
+      [
+        'trc_backfill_entities_t1', 400, 80, '[OMB 事件召回]',
+        JSON.stringify([{
+          name: 'injection-receipt',
+          tokens: 80,
+          kept: true,
+          entityIds: [e1Kept],
+          text: JSON.stringify({
+            injected: true,
+            keptIds: [e1Kept, e1Poison, e1Undisplayed],
+            droppedIds: [e1Undisplayed],
+            entities: [
+              { traceId: 'trc_backfill_entities_t1', entityId: e1Kept, section: 'event-recall', state: 'kept', blockId: e1Kept },
+              { traceId: 'trc_backfill_entities_t1', entityId: e1Poison, section: 'event-recall', state: 'quarantined', blockId: e1Poison },
+            ],
+          }),
+        }]),
+      ],
+    )
     // 旧口径计数（可能来自伪造的 injected recall_event）。
     await db.db.query(
       `insert into omb.adoption_metric (entity_id, retrieved_count, last_retrieved_at)
@@ -404,10 +600,28 @@ describe('采用证据只从 receipt 派生（真实 PostgreSQL）', () => {
       [t1Kept]: 'kept',
       [t1Poison]: 'quarantined',
     })
+    expect(await hitDispositions(db, 'trc_backfill_entities_t0')).toEqual({
+      [e0Kept]: 'kept',
+      [e0Poison]: 'quarantined',
+    })
+    expect(await hitDispositions(db, 'trc_backfill_entities_t1')).toEqual({
+      [e1Kept]: 'kept',
+      [e1Poison]: 'quarantined',
+    })
     expect((await metricOf(db, t0Kept))?.retrieved_count).toBe('1')
     expect((await metricOf(db, t1Kept))?.retrieved_count).toBe('1')
+    expect((await metricOf(db, e0Kept))?.retrieved_count).toBe('1')
+    expect((await metricOf(db, e1Kept))?.retrieved_count).toBe('1')
     expect(await metricOf(db, t0Poison)).toBeUndefined()
     expect(await metricOf(db, t1Poison)).toBeUndefined()
+    // entities 里没有的实体不记（旧 droppedIds/段级 entityIds 都不能复活它们）。
+    expect(await metricOf(db, e0Undisplayed)).toBeUndefined()
+    expect(await metricOf(db, e1Undisplayed)).toBeUndefined()
+    const undisplayed = await db.db.query(
+      'select 1 from omb.adoption_receipt_hit where entity_id = any($1::text[])',
+      [[e0Undisplayed, e1Undisplayed]],
+    )
+    expect(undisplayed.rowCount).toBe(0)
     await db.close()
   })
 })
