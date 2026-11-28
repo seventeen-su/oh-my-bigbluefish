@@ -1,4 +1,4 @@
-/*! oh-my-bigbluefish v7.0.0 — OMB v7 服务端产物（scripts/build-v7.mjs 生成，勿手改）。入口 plugin/v7/index.ts */
+/*! oh-my-bigbluefish v7.1.2 — OMB v7 服务端产物（scripts/build-v7.mjs 生成，勿手改）。入口 plugin/v7/index.ts */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -35292,7 +35292,8 @@ function detectDurableSignals(input2, limit = MAX_SIGNALS) {
 // plugin/v7/memory-check.ts
 var SESSION_LIMIT = 256;
 var PENDING_LIMIT = 4;
-var STALE_STEPS = 3;
+var SAME_TURN_REPEAT_STEPS = 12;
+var MAX_SAME_TURN_SHOWN = 2;
 var MAX_EXCERPT = 140;
 function compact3(input2) {
   return input2.replace(/\s+/g, " ").trim();
@@ -35322,7 +35323,7 @@ var MemoryCheckpointLedger = class {
     if (state.lastUserHash === digest && state.lastUserTurn === position.turn) return;
     state.lastUserHash = digest;
     state.lastUserTurn = position.turn;
-    const signals = detectDurableSignals(trimmed, PENDING_LIMIT);
+    const signals = detectDurableSignals(trimmed, PENDING_LIMIT).filter((signal) => signal.strength === "strong");
     if (signals.length === 0) return;
     for (const signal of signals) {
       if (state.pending.some((item) => item.text === signal.text && item.kind === signal.kind)) continue;
@@ -35351,7 +35352,8 @@ var MemoryCheckpointLedger = class {
   /**
    * 生成本次 pre-step 的检查点文本；空串表示不显示，并应覆盖写空以清掉旧文本。
    *
-   * 显示策略：首次/信号变化/跨轮立即显示；同一轮同一信号只在连续 3 步未销账时再显示。
+   * 显示策略：首次/信号变化/跨轮立即显示；同一轮最多两次，第二次至少隔 12 步。
+   * 这样既不会等到 Timeline 的 24 步才提醒，也不会在长工具循环里每 3 步刷屏。
    */
   render(sessionId, position = {}) {
     const state = this.sessions.get(sessionId);
@@ -35365,16 +35367,19 @@ var MemoryCheckpointLedger = class {
       return "";
     }
     const missed = state.pending.some((item) => item.turn !== void 0 && position.turn !== void 0 && item.turn < position.turn);
-    const stale = state.pending.some((item) => item.step !== void 0 && position.step !== void 0 && position.step - item.step >= STALE_STEPS);
+    const stale = state.pending.some((item) => item.step !== void 0 && position.step !== void 0 && position.step - item.step >= SAME_TURN_REPEAT_STEPS);
     const signature = state.pending.map((item) => `${item.kind}:${item.text}`).join("\0");
-    const level = missed ? "missed" : stale ? "stale" : "new";
-    const key = `${signature}\0${level}`;
     const shown = state.shown;
     const sameTurn = shown !== void 0 && shown.turn === position.turn;
-    const recentlyShown = sameTurn && shown.step !== void 0 && position.step !== void 0 && position.step - shown.step < STALE_STEPS;
-    if (shown !== void 0 && shown.key === key && recentlyShown) return "";
+    if (shown !== void 0 && shown.signature === signature && sameTurn) {
+      if (shown.count >= MAX_SAME_TURN_SHOWN) return "";
+      if (shown.step === void 0 || position.step === void 0) return "";
+      if (position.step - shown.step < SAME_TURN_REPEAT_STEPS) return "";
+    }
+    const count = shown !== void 0 && shown.signature === signature && sameTurn ? shown.count + 1 : 1;
     state.shown = {
-      key,
+      signature,
+      count,
       ...position.turn === void 0 ? {} : { turn: position.turn },
       ...position.step === void 0 ? {} : { step: position.step }
     };
