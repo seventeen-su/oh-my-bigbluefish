@@ -142,4 +142,43 @@ describe('T1 会话证据：验证必须依赖最新版本与外部信号', () =
     expect(store.usage.some(item => item.level === 'refutation')).toBe(true)
     session.dispose()
   })
+
+  it('T1 receipt 里被隔离/未展示的命中不进候选，模型复述也不记引用', async () => {
+    const store = new FakeStore()
+    const poison = { id: 'mem_22222222-2222-4222-8222-222222222222', title: '隔离记忆标题' }
+    const dropped = { id: 'mem_33333333-3333-4333-8333-333333333333', title: '未展示记忆标题' }
+    const session = createT1Session({ store: store as unknown as PostgresStore, logger })
+    session.rememberInjection('s-receipt', {
+      traceId: 'trc_receipt',
+      // 故意把隔离命中放进 hits：候选必须再与 receipt 的 kept/quarantined 取交集。
+      hits: [HIT, poison],
+      receipt: {
+        receiptId: 'rcpt_test',
+        traceId: 'trc_receipt',
+        textHash: 'hash',
+        budgetTokens: 400,
+        usedTokens: 20,
+        injected: true,
+        blocks: [],
+        keptIds: [HIT.id, poison.id],
+        droppedIds: [dropped.id],
+        truncatedIds: [],
+        quarantinedIds: [poison.id],
+        demotedIds: [],
+      },
+    })
+    await session.flushEvidence('s-receipt')
+    expect(store.receipts).toHaveLength(1)
+    expect(store.receipts[0]?.input).toMatchObject({ kind: 't1', traceId: 'trc_receipt' })
+    expect(store.exposures.map(item => item.entityId)).toEqual([HIT.id])
+    expect(store.exposures.some(item => item.entityId === poison.id || item.entityId === dropped.id)).toBe(false)
+
+    await session.ingestEvidence('s-receipt', evidenceFromSessionEvent('assistant/message', {
+      message: { content: [{ type: 'text', text: `${HIT.title} ${poison.id} ${dropped.id}` }] },
+    }))
+    expect(store.usage.some(item => item.input.entityId === HIT.id && item.level === 'reference')).toBe(true)
+    expect(store.usage.filter(item => item.input.entityId === poison.id || item.input.entityId === dropped.id))
+      .toEqual([])
+    session.dispose()
+  })
 })

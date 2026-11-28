@@ -15,6 +15,8 @@ import type {
   WriteResult,
 } from '../../../../packages/v7/src/ports/store.js'
 import type {
+  AdoptionReceiptHit,
+  AdoptionReceiptInput,
   ArtifactInput,
   ArtifactRecord,
   AuditRecord,
@@ -25,6 +27,7 @@ import type {
   UsageEvidenceLevel,
   UsageExposureInput,
 } from '../../../../packages/v7/src/ports/observability.js'
+import { receiptKeptHits } from '../../../../packages/v7/src/app/adoption.js'
 import type {
   ChannelHit,
   EntityPriorFeatures,
@@ -383,6 +386,13 @@ export class FakeStore implements Store {
 
   readonly exposures: UsageExposureInput[] = []
   readonly usage: { level: UsageEvidenceLevel; input: UsageEvidenceInput }[] = []
+  readonly receipts: { input: AdoptionReceiptInput; kept: readonly AdoptionReceiptHit[] }[] = []
+
+  async recordAdoptionReceipt(input: AdoptionReceiptInput): Promise<readonly AdoptionReceiptHit[]> {
+    const kept = receiptKeptHits(input)
+    this.receipts.push({ input, kept })
+    return kept
+  }
 
   async recordExposure(input: UsageExposureInput): Promise<void> {
     this.exposures.push(input)

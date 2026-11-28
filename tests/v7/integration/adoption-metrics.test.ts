@@ -1,6 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import { PostgresMaintenance } from '../../../packages/v7/src/adapters/postgres/maintenance.js'
+import type { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { prepareDatabase, resetDatabase, store, normalized, derived } from './helpers.js'
 
 const SESSION = 'session-adoption-metrics'
@@ -20,7 +21,36 @@ async function seedMemory(title: string): Promise<string> {
   return written.entity.id
 }
 
-describe('采用证据：Exposure → Reference → Utilization → Validation（真实 PostgreSQL）', () => {
+/**
+ * 写一条 T1 receipt：采用证据的唯一来源。019 之后，没有 receipt 的 Exposure/Usage
+ * 一律被忽略；测试不再用 recordRecall/markRecallInjected 伪造“已注入”。
+ */
+async function seedReceipt(
+  db: PostgresStore,
+  options: {
+    readonly traceId: string
+    readonly entityId: string
+    readonly sessionId?: string
+    readonly taskId?: string
+    readonly disposition?: 'kept' | 'quarantined' | 'dropped'
+    readonly title?: string
+  },
+): Promise<void> {
+  const disposition = options.disposition ?? 'kept'
+  await db.recordAdoptionReceipt({
+    traceId: options.traceId,
+    kind: 't1',
+    sessionId: options.sessionId ?? SESSION,
+    taskId: options.taskId ?? TASK,
+    injected: disposition === 'kept',
+    keptIds: disposition === 'kept' ? [options.entityId] : [],
+    quarantinedIds: disposition === 'quarantined' ? [options.entityId] : [],
+    droppedIds: disposition === 'dropped' ? [options.entityId] : [],
+    hits: [{ entityId: options.entityId, ...(options.title === undefined ? {} : { title: options.title }) }],
+  })
+}
+
+describe('采用证据：receipt → Exposure → Reference → Utilization → Validation（真实 PostgreSQL）', () => {
   beforeAll(async () => {
     await prepareDatabase()
   })
@@ -29,18 +59,20 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
     await resetDatabase()
   })
 
-  it('Retrieved 按 distinct trace/实体计一次：重复标记注入不重复累计', async () => {
+  it('Retrieved 只按 receipt 的 kept 计一次：伪造 recall_event/重复标记注入都不增加', async () => {
     const id = await seedMemory('Retrieved 计数测试')
     const db = store()
+    // 旧旁路：直接写 injected 的 recall_event，再标记注入——不再产生任何采用指标。
     await db.recordRecall([
-      { traceId: 'trc_r1', entityId: id, channel: 'fulltext', rank: 1, injected: true },
-      { traceId: 'trc_r1', entityId: id, channel: 'vector', rank: 2, injected: true },
+      { traceId: 'trc_forged', entityId: id, channel: 'fulltext', rank: 1, injected: true },
+      { traceId: 'trc_forged', entityId: id, channel: 'vector', rank: 2, injected: true },
     ])
-    await db.recordRecall([
-      { traceId: 'trc_r2', entityId: id, channel: 'fulltext', rank: 1, injected: false },
-    ])
-    await db.markRecallInjected('trc_r2')
-    await db.markRecallInjected('trc_r2')
+    await db.markRecallInjected('trc_forged')
+    await db.markRecallInjected('trc_forged')
+    // 合法 receipt：同一 trace 重复写入也只算一次。
+    await seedReceipt(db, { traceId: 'trc_r1', entityId: id })
+    await seedReceipt(db, { traceId: 'trc_r1', entityId: id })
+    await seedReceipt(db, { traceId: 'trc_r2', entityId: id })
     const metric = await db.db.query<{ retrieved_count: string }>(
       'select retrieved_count::text from omb.adoption_metric where entity_id = $1',
       [id],
@@ -54,6 +86,9 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
     const db = store()
     const exists = await db.db.query('select id from omb.entity where id = $1', [id])
     expect(exists.rowCount, `seed entity ${id} 应存在`).toBe(1)
+    await seedReceipt(db, { traceId: 'trc_1', entityId: id })
+    await seedReceipt(db, { traceId: 'trc_2', entityId: id })
+    await seedReceipt(db, { traceId: 'trc_3', entityId: id })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_1' })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_2' })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_3' })
@@ -62,7 +97,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
       'select opportunities::text, retrieved_count::text from omb.adoption_metric where entity_id = $1',
       [id],
     )
-    expect(metric.rows[0]).toMatchObject({ opportunities: '1', retrieved_count: '0' })
+    expect(metric.rows[0]).toMatchObject({ opportunities: '1', retrieved_count: '3' })
     const opportunity = await db.db.query<{ exposures: number; task_id: string }>(
       'select exposures, task_id from omb.usage_opportunity where entity_id = $1 and session_id = $2',
       [id, SESSION],
@@ -74,8 +109,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
   it('同一机会重复引用/使用/验证不会重复累计成功次数；换任务才新增机会', async () => {
     const id = await seedMemory('同任务重复证据只算一次')
     const db = store()
-    const exists = await db.db.query('select id from omb.entity where id = $1', [id])
-    expect(exists.rowCount, `seed entity ${id} 应存在`).toBe(1)
+    await seedReceipt(db, { traceId: 'trc_1', entityId: id })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_1' })
     for (let index = 0; index < 3; index += 1) {
       await db.recordUsage('reference', {
@@ -109,6 +143,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
     })
 
     // 同一实体在另一任务里被使用 = 一个新的独立机会，成功次数才会再加一。
+    await seedReceipt(db, { traceId: 'trc_2', entityId: id, taskId: OTHER_TASK })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: OTHER_TASK, traceId: 'trc_2' })
     await db.recordUsage('validation', {
       entityId: id, sessionId: SESSION, taskId: OTHER_TASK, traceId: 'trc_2',
@@ -128,6 +163,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
     await db.recordRecall([{
       traceId: 'trc_levels', entityId: id, channel: 'fulltext', rank: 1, injected: true,
     }])
+    await seedReceipt(db, { traceId: 'trc_levels', entityId: id })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_levels' })
     await db.recordUsage('reference', {
       entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_levels',
@@ -175,6 +211,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
   it('用户证伪是负向证据：refutation 计数与低的 utility/refutation 信号', async () => {
     const id = await seedMemory('被证伪的旧结论')
     const db = store()
+    await seedReceipt(db, { traceId: 'trc_refute', entityId: id })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_refute' })
     await db.recordUsage('validation', {
       entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_refute',
@@ -200,6 +237,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
   it('小样本平滑：一次 Validation 不会得到高分，随机会积累才上升', async () => {
     const id = await seedMemory('小样本平滑测试')
     const db = store()
+    await seedReceipt(db, { traceId: 'trc_smooth', entityId: id })
     await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_smooth' })
     await db.recordUsage('validation', {
       entityId: id, sessionId: SESSION, taskId: TASK, traceId: 'trc_smooth',
@@ -212,6 +250,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
     // 再积累 5 个“被验证的机会”：后验置信度应单调上升。
     for (let index = 0; index < 5; index += 1) {
       const task = `team:smooth-${index}`
+      await seedReceipt(db, { traceId: `trc_smooth_${index}`, entityId: id, taskId: task })
       await db.recordExposure({ entityId: id, sessionId: SESSION, taskId: task, traceId: `trc_smooth_${index}` })
       await db.recordUsage('validation', {
         entityId: id, sessionId: SESSION, taskId: task, traceId: `trc_smooth_${index}`,
@@ -233,6 +272,7 @@ describe('采用证据：Exposure → Reference → Utilization → Validation�
       `update omb.entity set access_count = 100000 where id = $1`,
       [accessed],
     )
+    await seedReceipt(db, { traceId: 'trc_forget', entityId: evidenced })
     await db.recordExposure({ entityId: evidenced, sessionId: SESSION, taskId: TASK, traceId: 'trc_forget' })
     await db.recordUsage('validation', {
       entityId: evidenced, sessionId: SESSION, taskId: TASK, traceId: 'trc_forget',

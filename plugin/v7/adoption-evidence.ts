@@ -6,7 +6,11 @@
  * - `toolCallExplicitReferences`：完整 entity ID 进入工具参数 → Utilization 候选；
  * - `userConfirmationReferences`：人类用户在确认句里引用 → Validation 候选；
  * - `userRefutationReferences`：人类用户在否定句里引用 → Refutation 候选；
+ * - `receiptVisibleHits`：只保留 receipt 里 kept 且未隔离的命中，作为采用候选；
  * - `evidenceFromSessionEvent`：把 DSH 事件归一化，并附带任务边界（goal/team task）。
+ *
+ * 采用候选只能来自真实注入的 T0/T1/T2 receipt：被隔离（原文未进入提示）或未展示
+ * （预算/去重丢弃）的命中不能升采用，伪造 recall_event 也不能。
  *
  * 模型自述“我用了/验证成功”永远不产生 Validation；字符串匹配最多到 Reference/
  * Utilization，不能直接决定长期遗忘或强采用。
@@ -23,6 +27,29 @@ export interface AdoptionHit {
 }
 
 export type ReferenceKind = 'entity-id' | 'title'
+
+/** 与装配器 `InjectionReceipt` 结构解耦的可见性输入。 */
+export interface ReceiptVisibility {
+  readonly keptIds: readonly string[]
+  readonly quarantinedIds?: readonly string[]
+}
+
+/**
+ * 只保留 receipt 判定为 kept 且未被隔离的命中。
+ *
+ * `receipt` 缺省时表示调用点没有装配器 receipt（T0 的 notice 走 build 结果的可见
+ * 命中），此时 hits 已经是可见集合；有 receipt 时必须做交集，未展示/被隔离的命中
+ * 不能进入候选，更不能升采用。
+ */
+export function receiptVisibleHits<T extends AdoptionHit>(
+  hits: readonly T[],
+  receipt: ReceiptVisibility | undefined,
+): T[] {
+  if (receipt === undefined) return [...hits]
+  const kept = new Set(receipt.keptIds)
+  const quarantined = new Set(receipt.quarantinedIds ?? [])
+  return hits.filter(hit => kept.has(hit.id) && !quarantined.has(hit.id))
+}
 
 export interface HitReference {
   readonly hit: AdoptionHit

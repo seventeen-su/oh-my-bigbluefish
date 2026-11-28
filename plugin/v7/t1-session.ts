@@ -2,19 +2,26 @@
  * T1 会话态、注入账本与采用证据队列：全部按 sessionId 键控，
  * session/disposed 与插件卸载时清理（RET-13/RUN-05）。
  *
- * 采用证据模型（与 `013_adoption_metrics.sql` 对齐）：
- * - Exposure：注入/召回只创建“使用机会”，同一 (entity, session, task) 只算一个机会；
+ * 采用证据模型（与 `019_adoption_receipts.sql` 对齐）：
+ * - 唯一来源是真实注入的 T0/T1/T2 receipt：只有 kept 且未隔离的命中进入候选/机会；
+ * - Exposure：receipt 里的 kept 命中才创建“使用机会”，同一 (entity, session, task)
+ *   只算一个机会，同一 receipt 只登记一次 exposures；
  * - Reference：模型文本明确提到记忆（弱证据）；
  * - Utilization：完整实体 ID 进入工具参数/命令（实际参与，按任务可追溯）；
  * - Validation：用户确认、验证工具（test/typecheck/build 等）通过、任务完成；
  * - Refutation：用户在同一句里否定/证伪该记忆（负向证据）。
  *
  * 所有写入都是事件驱动、按 session 串行化；没有轮询，也没有“看见字符串就 adopted”。
- * receipt 仍复用 `resident_trace.sections`（JSONB），不改这张表的职责。
+ * `recall_event` 仍写，但只做事件级审计：伪造它不会增加任何采用指标。
+ * receipt 落 `omb.adoption_receipt`；resident_trace 继续作为 T0/T1 的注入证据通道。
  */
 import type { PostgresStore } from '../../packages/v7/src/adapters/postgres/store.js'
 import type { Logger } from '../../packages/v7/src/ports/jobs.js'
-import type { UsageEvidenceInput } from '../../packages/v7/src/ports/observability.js'
+import type {
+  AdoptionReceiptHitInput,
+  AdoptionReceiptInput,
+  UsageEvidenceInput,
+} from '../../packages/v7/src/ports/observability.js'
 import type { InjectionReceipt } from '../../packages/v7/src/prompt/assembler.js'
 import type { RecallNotice } from '../../packages/v7/src/recall/resident.js'
 import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
@@ -23,6 +30,7 @@ import { messageOf } from './messages.js'
 import {
   findReferences,
   isVerificationTool,
+  receiptVisibleHits,
   toolCallExplicitReferences,
   userConfirmationReferences,
   userRefutationReferences,
@@ -74,11 +82,29 @@ export interface PrefetchedT1 {
   readonly notice?: RecallNotice
 }
 
+/** 注入 receipt 的补充元数据（不属于 RecallNotice，由调用点提供）。 */
+export interface InjectionMeta {
+  readonly turnId?: string
+  readonly source?: string
+  readonly text?: string
+  readonly taskId?: string
+}
+
 interface Candidate {
   readonly traceId: string
   readonly taskId: string
   readonly hit: AdoptionHit
   readonly seq: number
+}
+
+/** 把会话态命中转成 receipt 的可选展示元数据（标题用于弱引用匹配，不参与门控）。 */
+function receiptHitInputs(hits: readonly AdoptionHit[]): AdoptionReceiptHitInput[] {
+  return hits.map((hit, index) => ({
+    entityId: hit.id,
+    ...(hit.title === undefined ? {} : { title: hit.title }),
+    ...(hit.updatedAt === undefined ? {} : { updatedAt: hit.updatedAt }),
+    rank: index + 1,
+  }))
 }
 
 /** 一条已经写进 recall_event/usage_opportunity 的引用；用于后续确认/任务完成再验证。 */
@@ -138,9 +164,12 @@ export interface T1Session {
   recentT1EntityIds(sessionId: string): ReadonlySet<string>
   /** RecallService 的注入回调：只进引用候选集合，并按当前任务登记 Exposure。 */
   rememberPendingRecall(injection: RecallInjection): void
-  /** 记录一次注入：receipt 落库、登记 Exposure、命中进引用候选集合。 */
-  rememberInjection(sessionId: string, notice: RecallNotice): void
-  /** T0 实际注入的偏好/状态写 recall_event（injected=true），落库成功后再登记 Exposure/候选。 */
+  /**
+   * 记录一次真实注入：receipt 落库（采用唯一来源）、kept 命中进引用候选并按当前
+   * 任务登记 Exposure。T1 必须带 `notice.receipt`；T0 由 build 结果提供可见命中。
+   */
+  rememberInjection(sessionId: string, notice: RecallNotice, meta?: InjectionMeta): void
+  /** T0 实际注入的偏好/状态写事件级 recall_event 审计，并落 T0 receipt + 候选。 */
   recordResidentHits(
     sessionId: string,
     turn: number | undefined,
@@ -278,12 +307,21 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     return next
   }
 
-  /** 登记 Exposure：重复调用只会增加机会内 exposures，不增加 opportunities。 */
-  function scheduleExposure(sessionId: string, taskId: string, traceId: string, hits: readonly AdoptionHit[]): void {
-    if (hits.length === 0) return
+  /**
+   * 记录一次注入：先写 receipt（采用唯一来源），再只给 receipt 判定为 kept 的命中
+   * 登记 Exposure。quarantined/dropped 命中不会创建使用机会；同一 receipt 重复
+   * 登记由适配器的 (trace_id, entity_id) 主键去重。
+   */
+  function scheduleReceipt(sessionId: string, taskId: string, input: AdoptionReceiptInput): void {
     void enqueue(exposureQueues, sessionId, async () => {
-      for (const hit of hits) {
-        await store.recordExposure({ entityId: hit.id, sessionId, taskId, traceId })
+      const kept = await store.recordAdoptionReceipt(input)
+      for (const hit of kept) {
+        await store.recordExposure({
+          entityId: hit.entityId,
+          sessionId,
+          taskId,
+          traceId: input.traceId,
+        })
       }
     })
   }
@@ -481,25 +519,38 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     }
   }
 
+  /**
+   * T2（omb_recall 工具结果）：检索结果原样回到模型上下文，属于真实注入。
+   * 同样先落 receipt，再登记 Exposure 与引用候选；伪造 recall_event 不走这条路。
+   */
   function rememberPendingRecall(injection: RecallInjection): void {
-    sequence += 1
     const taskId = currentTaskId(injection.sessionId)
+    const hits = injection.hits
+    scheduleReceipt(injection.sessionId, taskId, {
+      traceId: injection.traceId,
+      kind: 't2',
+      sessionId: injection.sessionId,
+      taskId,
+      source: 'omb_recall',
+      injected: true,
+      keptIds: hits.map(hit => hit.id),
+      hits: receiptHitInputs(hits),
+    })
+    if (hits.length === 0) return
+    sequence += 1
     rememberPending(injection.sessionId, {
       sessionId: injection.sessionId,
       traceId: injection.traceId,
       taskId,
-      hits: injection.hits,
+      hits,
       seq: sequence,
     })
-    scheduleExposure(injection.sessionId, taskId, injection.traceId, injection.hits)
   }
 
   /**
-   * 记录一次注入：T1 的 receipt 落 `omb.resident_trace` 作为注入证据（与 recall_event
-   * 共享 traceId）；hits 进引用候选，并按当前任务登记一次 Exposure。
-   *
-   * receipt 仍复用 resident_trace：schema 里没有独立的 injection_receipt 表；T1 行不带
-   * session_id，避免把 T0 的“该 session 最新 trace”查询顶掉。
+   * T1 的 resident_trace 兼容通道（注入证据/旧查询用）：与 recall_event 共享 traceId。
+   * 采用判定不读它：receipt 由 rememberInjection 写进 omb.adoption_receipt。
+   * T1 行不带 session_id，避免把 T0 的“该 session 最新 trace”查询顶掉。
    */
   function persistInjectionReceipt(notice: RecallNotice): void {
     const receipt = notice.receipt
@@ -522,26 +573,56 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     })
   }
 
-  function rememberInjection(sessionId: string, notice: RecallNotice): void {
-    // receipt 与“有没有可采用的命中”无关：隔离块不进 hits，但这次的隔离证据必须可查。
+  /**
+   * 记录一次真实注入。receipt 是采用证据的唯一来源：
+   * - 候选只取 receipt 的 kept 且未隔离命中（未展示/被隔离的命中不能升采用）；
+   * - 即使 hits 为空（全被隔离）也写 receipt 行，留下“为什么没升”的审计证据；
+   * - Exposure 写入与 evidence 处理共用同一串行链，事件到达前机会已存在。
+   */
+  function rememberInjection(sessionId: string, notice: RecallNotice, meta: InjectionMeta = {}): void {
     persistInjectionReceipt(notice)
-    if (notice.hits.length === 0) return
+    const receipt = notice.receipt
+    const taskId = meta.taskId ?? currentTaskId(sessionId)
+    const visibleHits = receiptVisibleHits(notice.hits, receipt)
+    const injected = receipt?.injected ?? visibleHits.length > 0
+    const traceText = meta.text ?? notice.text
+    scheduleReceipt(sessionId, taskId, {
+      traceId: notice.traceId,
+      kind: receipt === undefined ? 't0' : 't1',
+      sessionId,
+      taskId,
+      ...(meta.turnId === undefined ? {} : { turnId: meta.turnId }),
+      source: meta.source ?? 'agent/pre-step',
+      ...(receipt === undefined
+        ? {}
+        : {
+            receiptId: receipt.receiptId,
+            budgetTokens: receipt.budgetTokens,
+            usedTokens: receipt.usedTokens,
+            textHash: receipt.textHash,
+          }),
+      injected,
+      ...(traceText === undefined ? {} : { text: traceText }),
+      keptIds: receipt === undefined ? visibleHits.map(hit => hit.id) : receipt.keptIds,
+      quarantinedIds: receipt?.quarantinedIds ?? [],
+      droppedIds: receipt?.droppedIds ?? [],
+      hits: receiptHitInputs(notice.hits),
+    })
+    if (visibleHits.length === 0) return
     sequence += 1
-    const taskId = currentTaskId(sessionId)
     rememberPending(sessionId, {
       sessionId,
       traceId: notice.traceId,
       taskId,
-      hits: notice.hits,
-      ...(notice.receipt === undefined ? {} : { receipt: notice.receipt }),
+      hits: visibleHits,
+      ...(receipt === undefined ? {} : { receipt }),
       seq: sequence,
     })
-    scheduleExposure(sessionId, taskId, notice.traceId, notice.hits)
   }
 
   /**
-   * T0 实际注入的偏好/状态写 recall_event（injected=true），落库成功后再登记
-   * Exposure/候选。等待落库是让下一步证据能看到这些候选，不是轮询。
+   * T0 实际注入的偏好/状态先写事件级 recall_event 审计，再落 T0 receipt + 候选。
+   * recall_event 写失败只记日志：采用证据来自 receipt，不应被审计表故障阻断。
    */
   async function recordResidentHits(
     sessionId: string,
@@ -563,10 +644,14 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
         rank: index + 1,
         injected: true,
       })))
-      rememberInjection(sessionId, { traceId, hits })
     } catch (error) {
-      logger.warn('T0 常驻 recall_event 写入失败', messageOf(error))
+      logger.warn('T0 常驻 recall_event 审计写入失败', messageOf(error))
     }
+    rememberInjection(sessionId, { traceId, hits }, {
+      ...(turn === undefined ? {} : { turnId: String(turn) }),
+      source: 't0-resident',
+      text: query,
+    })
   }
 
   function observeTaskState(sessionId: string, taskId: string | undefined, status: TaskStatus): void {

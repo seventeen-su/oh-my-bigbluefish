@@ -35,6 +35,7 @@ const LEGACY_CONTRACT_MIGRATION = '011_contract_legacy_columns.sql'
 const PROJECT_IDENTITY_MIGRATION = '012_project_identity.sql'
 const STATE_CONCURRENCY_MIGRATION = '014_state_concurrency.sql'
 const SUPERSESSION_MIGRATION = '017_supersession.sql'
+const ADOPTION_RECEIPTS_MIGRATION = '019_adoption_receipts.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -774,7 +775,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await client?.end()
   })
 
-  it('给定空库当跑全量迁移则应用 001-017 且第二次不再重复应用', () => {
+  it('给定空库当跑全量迁移则应用全部迁移（当前 001–019）且第二次不再重复应用', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
     expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
@@ -782,6 +783,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(emptyFirst.applied).toContain(PROJECT_IDENTITY_MIGRATION)
     expect(emptyFirst.applied).toContain(STATE_CONCURRENCY_MIGRATION)
     expect(emptyFirst.applied).toContain(SUPERSESSION_MIGRATION)
+    expect(emptyFirst.applied).toContain(ADOPTION_RECEIPTS_MIGRATION)
     expect(emptyFirst.applied.at(-1)).toBe(migrationFiles().at(-1))
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
@@ -843,9 +845,12 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(legacyAdoptionEvent?.reference_kind).toBe('text')
     expect(legacyAdoptionEvent?.reference_source).toBe('legacy-adoption')
     expect(legacyAdoptionEvent?.validated_at).toBeNull()
+    // 019 之后 Retrieved 只按 receipt 的 kept 重算：这个旧库只有 recall_event，
+    // 没有 resident_trace 注入证据，因此旧 retrieved_count=2 被清零（可被伪造的口径不再保留）；
+    // 旧 adopted_at 仍降级为 Referenced 候选（legacy_adopted_count 保留审计），不虚构使用机会。
     expect(legacyAdoptionMetric).toMatchObject({
       entity_id: PREF_TAGS,
-      retrieved_count: '2',
+      retrieved_count: '0',
       opportunities: '0',
       referenced_count: '0',
       validated_count: '0',

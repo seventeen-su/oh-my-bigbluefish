@@ -1,4 +1,3 @@
-import type { PoolClient } from 'pg'
 import type { Attribute, Entity, EntityKind, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../../domain/dependency.js'
 import { titleOf } from '../../domain/entity-access.js'
@@ -11,6 +10,7 @@ import { validationError } from '../../domain/validation-result.js'
 import { defaultRegexService } from '../../security/regex.js'
 import { REGEX_TIMEOUT_MS } from '../../security/regex-limits.js'
 import type { RegexCandidate } from '../../security/regex-types.js'
+import { adoptionReceiptFromResidentTrace } from '../../app/adoption.js'
 import type {
   DerivedWrite,
   LinkResult,
@@ -21,6 +21,8 @@ import type {
   WriteResult,
 } from '../../ports/store.js'
 import type {
+  AdoptionReceiptHit,
+  AdoptionReceiptInput,
   ArtifactInput,
   ArtifactRecord,
   AuditEntry,
@@ -45,6 +47,13 @@ import type {
 import { duplicateCommandIdOf, systemCommandMeta, type CommandOutcome } from '../../app/commands/index.js'
 import type { ProjectIdentity } from '../../domain/project-identity.js'
 import { iso, PostgresDb } from './db.js'
+import {
+  markRecallInjectedAudit,
+  recordAdoptionReceipt,
+  recordReceiptExposure,
+  recordUsageEvidence,
+  writeAdoptionReceipt,
+} from './adoption.js'
 import { projectRootRow, recordProjectIdentityRow } from './identity-store.js'
 import {
   clearDependencyMarks,
@@ -148,31 +157,6 @@ export function fulltextQueryTerms(tokens: readonly string[]): string[] {
       || left.index - right.index)
     .slice(0, FULLTEXT_MAX_QUERY_TERMS)
   return selected.sort((left, right) => left.index - right.index).map(item => item.term)
-}
-
-/** `omb.usage_opportunity` 的一行（snake_case 与 SQL 对齐）。 */
-interface UsageOpportunityRow {
-  entity_id: string
-  session_id: string
-  task_id: string
-  exposures: number
-  exposed_at: Date | string
-  referenced_at: Date | string | null
-  reference_kind: string | null
-  reference_source: string | null
-  utilized_at: Date | string | null
-  utilization_kind: string | null
-  utilization_source: string | null
-  validated_at: Date | string | null
-  validation_kind: string | null
-  validation_source: string | null
-  validation_evidence: JsonValue
-  refuted_at: Date | string | null
-  refutation_kind: string | null
-  refutation_source: string | null
-  refutation_evidence: JsonValue
-  last_trace_id: string | null
-  updated_at: Date | string
 }
 
 export class PostgresStore implements Store {
@@ -731,35 +715,12 @@ export class PostgresStore implements Store {
   }
 
   async markRecallInjected(traceId: string): Promise<void> {
-    if (traceId.trim().length === 0) return
-    await this.run(() => this.db.transaction(async client => {
-      // 从“候选”到“真正投递”只发生一次状态迁移；同一 trace+entity 的多个通道行
-      // 只让 adoption_metric 加一次（distinct entity）。重复调用是无操作。
-      await client.query(
-        `with counted as (
-           update omb.recall_event
-              set injected = true,
-                  injected_at = coalesce(injected_at, now()),
-                  retrieved_counted = true
-            where trace_id = $1
-              and (not injected or not retrieved_counted)
-           returning entity_id
-         )
-         insert into omb.adoption_metric as metric (entity_id, retrieved_count, last_retrieved_at, updated_at)
-         select entity_id, 1, now(), now()
-           from (select distinct entity_id from counted) entities
-         on conflict (entity_id) do update
-           set retrieved_count = metric.retrieved_count + 1,
-               last_retrieved_at = now(),
-               updated_at = now()`,
-        [traceId],
-      )
-    }))
+    // 只做事件级审计；采用指标只认 receipt（recordAdoptionReceipt），伪造 recall_event 无效。
+    await this.run(() => markRecallInjectedAudit(this.db, traceId))
   }
 
   async recordRecall(events: readonly RecallEventInput[]): Promise<void> {
     if (events.length === 0) return
-    const traceIds = [...new Set(events.filter(event => event.injected).map(event => event.traceId))]
     await this.run(() => this.db.transaction(async client => {
       for (const event of events) {
         await client.query(
@@ -783,32 +744,16 @@ export class PostgresStore implements Store {
           ],
         )
       }
-      // 直接以 injected=true 写入的召回（T0/T2）与延迟投递（T1）共用同一去重标记：
-      // 只有从“未计数”到“已计数”的行才让 Retrieved 加一。
-      for (const traceId of traceIds) {
-        await client.query(
-          `with counted as (
-             update omb.recall_event
-                set retrieved_counted = true
-              where trace_id = $1 and injected and not retrieved_counted
-             returning entity_id
-           )
-           insert into omb.adoption_metric as metric (entity_id, retrieved_count, last_retrieved_at, updated_at)
-           select entity_id, 1, now(), now()
-             from (select distinct entity_id from counted) entities
-           on conflict (entity_id) do update
-             set retrieved_count = metric.retrieved_count + 1,
-                 last_retrieved_at = now(),
-                 updated_at = now()`,
-          [traceId],
-        )
-      }
+      // recall_event 只是事件级审计：Retrieved/使用机会/采用层级全部由
+      // `recordAdoptionReceipt` 的 kept/quarantined 派生（019）。
     }))
   }
 
   async recordResidentTrace(trace: ResidentTraceInput): Promise<void> {
-    await this.run(async () => {
-      await this.db.query(
+    // trace 与采用 receipt 同一事务落库：T0/T1 的 sections 就是现有 receipt 约定，
+    // 由此派生的 kept/quarantined/dropped 是 adoption 的唯一历史来源。
+    await this.run(() => this.db.transaction(async client => {
+      await client.query(
         `insert into omb.resident_trace (
            trace_id, session_id, turn_id, budget_tokens, used_tokens, text, sections, dropped_sections
          ) values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::text[])
@@ -824,7 +769,16 @@ export class PostgresStore implements Store {
           [...trace.droppedSections],
         ],
       )
-    })
+      await writeAdoptionReceipt(client, adoptionReceiptFromResidentTrace(trace))
+    }))
+  }
+
+  /**
+   * 记录一次真实注入的 receipt（T0/T1/T2）。receipt 的 kept/quarantined 是采用证据的
+   * 唯一来源；`recordExposure`/`recordUsage` 会先验证这里写下的 kept 行。
+   */
+  async recordAdoptionReceipt(input: AdoptionReceiptInput): Promise<readonly AdoptionReceiptHit[]> {
+    return this.run(() => recordAdoptionReceipt(this.db, input))
   }
 
   async markAccessed(ids: readonly string[]): Promise<void> {
@@ -843,258 +797,34 @@ export class PostgresStore implements Store {
   }
 
   /**
-   * 记录一次曝光（Exposure）：只创建/累加使用机会，不给任何显著度。
-   * 同一 `(entity, session, task)` 的重复召回只增加 exposures；opportunities 只加一次。
+   * 记录一次曝光（Exposure）：必须已有 kept receipt（019），否则忽略。
+   * 同一 `(entity, session, task)` 只创建一个使用机会；同一 receipt 只登记一次 exposures。
    */
   async recordExposure(input: UsageExposureInput): Promise<void> {
-    const sessionId = input.sessionId.trim()
-    const taskId = input.taskId.trim().length === 0 ? 'session' : input.taskId.trim()
-    if (input.entityId.trim().length === 0 || sessionId.length === 0) return
-    await this.run(() => this.db.transaction(async client => {
-      const inserted = await client.query(
-        `insert into omb.usage_opportunity (
-           entity_id, session_id, task_id, exposures, exposed_at, last_trace_id, updated_at
-         ) values ($1, $2, $3, 1, now(), $4, now())
-         on conflict (entity_id, session_id, task_id) do nothing
-         returning entity_id`,
-        [input.entityId, sessionId, taskId, input.traceId ?? null],
-      )
-      if ((inserted.rowCount ?? 0) > 0) {
-        await client.query(
-          `insert into omb.adoption_metric as metric (entity_id, opportunities, updated_at)
-           values ($1, 1, now())
-           on conflict (entity_id) do update
-             set opportunities = metric.opportunities + 1,
-                 updated_at = now()`,
-          [input.entityId],
-        )
-        return
-      }
-      await client.query(
-        `update omb.usage_opportunity
-            set exposures = exposures + 1,
-                last_trace_id = coalesce($4, last_trace_id),
-                updated_at = now()
-          where entity_id = $1 and session_id = $2 and task_id = $3`,
-        [input.entityId, sessionId, taskId, input.traceId ?? null],
-      )
-    }))
+    await this.run(() => recordReceiptExposure(this.db, input))
   }
 
   /**
-   * 记录一条使用证据。机会级状态只升级一次，指标按机会计数：同一任务里的
-   * 重复引用/使用/验证不会重复累计成功次数。
-   *
-   * 只写参考/使用/验证/证伪；`Exposure` 由 `recordExposure` 独立记录。
+   * 记录一条使用证据：必须已有 kept receipt，否则忽略（伪造 recall_event 不会增加采用）。
+   * 机会级状态只升级一次，指标按机会计数；同一任务里重复引用/验证不会重复累计。
    */
   async recordUsage(level: UsageEvidenceLevel, input: UsageEvidenceInput): Promise<void> {
-    const sessionId = input.sessionId.trim()
-    const entityId = input.entityId.trim()
-    if (sessionId.length === 0 || entityId.length === 0) return
-    const requestedTaskId = input.taskId?.trim()
-    await this.run(() => this.db.transaction(async client => {
-      let opportunity = await this.selectOpportunity(client, entityId, sessionId, requestedTaskId)
-      let opportunitiesBump = 0
-      if (opportunity === undefined) {
-        const taskId = requestedTaskId === undefined || requestedTaskId.length === 0 ? 'session' : requestedTaskId
-        const inserted = await client.query<UsageOpportunityRow>(
-          `insert into omb.usage_opportunity (
-             entity_id, session_id, task_id, exposures, exposed_at, updated_at
-           ) values ($1, $2, $3, 0, now(), now())
-           on conflict (entity_id, session_id, task_id) do nothing
-           returning *`,
-          [entityId, sessionId, taskId],
-        )
-        opportunity = inserted.rows[0] ?? await this.selectOpportunity(client, entityId, sessionId, taskId)
-        if (opportunity === undefined) throw new OmbFailure(internal('使用机会写入后读不到'))
-        // 并发下 on conflict do nothing 可能由另一个事务先建机会：只有真正插入才计机会数。
-        opportunitiesBump = inserted.rows[0] === undefined ? 0 : 1
-      }
-
-      const referenceTransition = level !== 'refutation' && opportunity.referenced_at === null
-      const utilizationTransition = level === 'utilization' && opportunity.utilized_at === null
-      const validationTransition = level === 'validation' && opportunity.validated_at === null
-      const refutationTransition = level === 'refutation' && opportunity.refuted_at === null
-      const candidateKind = level === 'utilization' ? 'entity-id' : input.kind
-      const referenceKind = opportunity.reference_kind === 'entity-id' || candidateKind === 'entity-id'
-        ? 'entity-id'
-        : opportunity.reference_kind ?? candidateKind
-
-      // 一条件更新所有机会证据列：布尔参数决定本次是否迁移，避免动态拼 SQL。
-      await client.query(
-        `update omb.usage_opportunity
-            set updated_at = now(),
-                last_trace_id = coalesce($4, last_trace_id),
-                referenced_at = coalesce(referenced_at, case when $5 then now() end),
-                reference_kind = case when $5 then coalesce($6, reference_kind) else reference_kind end,
-                reference_source = coalesce(reference_source, case when $5 then $9 end),
-                utilized_at = coalesce(utilized_at, case when $8 then now() end),
-                utilization_kind = coalesce(utilization_kind, case when $8 then $7 end),
-                utilization_source = coalesce(utilization_source, case when $8 then $9 end),
-                validated_at = coalesce(validated_at, case when $10 then now() end),
-                validation_kind = coalesce(validation_kind, case when $10 then $7 end),
-                validation_source = coalesce(validation_source, case when $10 then $9 end),
-                validation_evidence = coalesce(validation_evidence, case when $10 then $11::jsonb end),
-                refuted_at = coalesce(refuted_at, case when $12 then now() end),
-                refutation_kind = coalesce(refutation_kind, case when $12 then $7 end),
-                refutation_source = coalesce(refutation_source, case when $12 then $9 end),
-                refutation_evidence = coalesce(refutation_evidence, case when $12 then $11::jsonb end)
-          where entity_id = $1 and session_id = $2 and task_id = $3`,
-        [
-          entityId,
-          sessionId,
-          opportunity.task_id,
-          input.traceId ?? null,
-          referenceTransition,
-          referenceKind,
-          input.kind,
-          utilizationTransition,
-          input.source,
-          validationTransition,
-          input.evidence === undefined ? null : JSON.stringify(input.evidence),
-          refutationTransition,
-        ],
-      )
-
-      if (input.traceId !== undefined && input.traceId.trim().length > 0) {
-        await this.writeRecallEvidence(client, level, input)
-      }
-
-      const referencedBump = referenceTransition ? 1 : 0
-      const utilizedBump = utilizationTransition ? 1 : 0
-      const validatedBump = validationTransition ? 1 : 0
-      const refutedBump = refutationTransition ? 1 : 0
-      if (opportunitiesBump + referencedBump + utilizedBump + validatedBump + refutedBump === 0) return
-      await client.query(
-        `insert into omb.adoption_metric as metric (
-           entity_id, opportunities, referenced_count, utilized_count, validated_count, refuted_count,
-           last_referenced_at, last_utilized_at, last_validated_at, last_refuted_at, updated_at
-         ) values (
-           $1, $2::bigint, $3::bigint, $4::bigint, $5::bigint, $6::bigint,
-           case when $3 > 0 then now() end,
-           case when $4 > 0 then now() end,
-           case when $5 > 0 then now() end,
-           case when $6 > 0 then now() end,
-           now()
-         )
-         on conflict (entity_id) do update
-           set opportunities = metric.opportunities + excluded.opportunities,
-               referenced_count = metric.referenced_count + excluded.referenced_count,
-               utilized_count = metric.utilized_count + excluded.utilized_count,
-               validated_count = metric.validated_count + excluded.validated_count,
-               refuted_count = metric.refuted_count + excluded.refuted_count,
-               last_referenced_at = coalesce(excluded.last_referenced_at, metric.last_referenced_at),
-               last_utilized_at = coalesce(excluded.last_utilized_at, metric.last_utilized_at),
-               last_validated_at = coalesce(excluded.last_validated_at, metric.last_validated_at),
-               last_refuted_at = coalesce(excluded.last_refuted_at, metric.last_refuted_at),
-               updated_at = now()`,
-        [
-          entityId,
-          opportunitiesBump,
-          referencedBump,
-          utilizedBump,
-          validatedBump,
-          refutedBump,
-        ],
-      )
-      // 旧口径兼容读：只有 Validation 才增 entity.adoption_count。
-      if (validatedBump > 0) {
-        await client.query('update omb.entity set adoption_count = adoption_count + 1 where id = $1', [entityId])
-      }
-    }))
-  }
-
-  private async selectOpportunity(
-    client: Pick<PoolClient, 'query'>,
-    entityId: string,
-    sessionId: string,
-    taskId: string | undefined,
-  ): Promise<UsageOpportunityRow | undefined> {
-    const result = await client.query<UsageOpportunityRow>(
-      `select *
-         from omb.usage_opportunity
-        where entity_id = $1 and session_id = $2
-          and ($3::text is null or task_id = $3)
-        order by updated_at desc
-        limit 1
-        for update`,
-      [entityId, sessionId, taskId === undefined || taskId.length === 0 ? null : taskId],
-    )
-    return result.rows[0]
-  }
-
-  /** 事件级证据列只写第一次；与机会级指标分开，便于按 trace 审计。 */
-  private async writeRecallEvidence(
-    client: Pick<PoolClient, 'query'>,
-    level: UsageEvidenceLevel,
-    input: UsageEvidenceInput,
-  ): Promise<void> {
-    const traceId = input.traceId as string
-    const evidence = input.evidence === undefined ? null : JSON.stringify(input.evidence)
-    if (level === 'reference') {
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, $3),
-                reference_source = coalesce(reference_source, $4)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input.entityId, input.kind, input.source],
-      )
-      return
-    }
-    if (level === 'utilization') {
-      // Utilization 必然隐含一次显式引用：事件级审计也补上弱/强引用列。
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, 'entity-id'),
-                reference_source = coalesce(reference_source, $4),
-                utilized_at = coalesce(utilized_at, now()),
-                utilization_kind = coalesce(utilization_kind, $3),
-                utilization_source = coalesce(utilization_source, $4)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input.entityId, input.kind, input.source],
-      )
-      return
-    }
-    if (level === 'validation') {
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, $3),
-                reference_source = coalesce(reference_source, $4),
-                validated_at = coalesce(validated_at, now()),
-                validation_kind = coalesce(validation_kind, $3),
-                validation_source = coalesce(validation_source, $4),
-                validation_evidence = coalesce(validation_evidence, $5::jsonb),
-                adopted_at = coalesce(adopted_at, now()),
-                adoption_kind = coalesce(adoption_kind, 'validated:' || $3)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input.entityId, input.kind, input.source, evidence],
-      )
-      return
-    }
-    await client.query(
-      `update omb.recall_event
-          set referenced_at = coalesce(referenced_at, now()),
-              reference_kind = coalesce(reference_kind, $3),
-              reference_source = coalesce(reference_source, $4),
-              refuted_at = coalesce(refuted_at, now()),
-              refutation_kind = coalesce(refutation_kind, $3),
-              refutation_source = coalesce(refutation_source, $4),
-              refutation_evidence = coalesce(refutation_evidence, $5::jsonb)
-        where trace_id = $1 and entity_id = $2`,
-      [traceId, input.entityId, input.kind, input.source, evidence],
-    )
+    await this.run(() => recordUsageEvidence(this.db, level, input))
   }
 
   async markAdopted(traceId: string, entityId: string, kind: string): Promise<void> {
     await this.run(async () => {
       await this.db.transaction(async client => {
+        // 旧口径兼容：只有该 trace/实体的 receipt 判定为 kept 才能记 adopted，
+        // 与 Retrieved/Validation 同源；没有 receipt 的直接调用是无操作。
         const updated = await client.query(
           `update omb.recall_event
            set adopted_at = now(), adoption_kind = $3
-           where trace_id = $1 and entity_id = $2 and adopted_at is null`,
+           where trace_id = $1 and entity_id = $2 and adopted_at is null
+             and exists (
+               select 1 from omb.adoption_receipt_hit h
+                where h.trace_id = $1 and h.entity_id = $2 and h.disposition = 'kept'
+             )`,
           [traceId, entityId, kind],
         )
         if (updated.rowCount !== null && updated.rowCount > 0) {

@@ -31,6 +31,62 @@ export interface RecallEventInput {
  */
 export type UsageEvidenceLevel = 'reference' | 'utilization' | 'validation' | 'refutation'
 
+/** 一次真实注入的来源：T0 常驻、T1 事件召回、T2 工具检索。 */
+export type AdoptionReceiptKind = 't0' | 't1' | 't2'
+
+/**
+ * 一个命中在本次注入里的处置：
+ * - kept：原文真正进入注入文本（计入 Retrieved，可参与后续采用）；
+ * - quarantined：高风险，只注入了隔离说明（原文未进入，不能升采用）；
+ * - dropped：预算/去重/空内容导致未展示（不能升采用）。
+ */
+export type AdoptionReceiptDisposition = 'kept' | 'quarantined' | 'dropped'
+
+/** receipt 里可选的展示元数据；标题用于后续弱引用匹配，不参与门控。 */
+export interface AdoptionReceiptHitInput {
+  readonly entityId: string
+  readonly title?: string
+  readonly updatedAt?: string
+  readonly rank?: number
+}
+
+/**
+ * 一次注入的 receipt（采用证据的唯一来源）。
+ *
+ * 调用方必须在文本真正投递后写入：`keptIds` 来自装配器的 kept 集合，
+ * `quarantinedIds` 是 kept 但原文被隔离的那部分，`droppedIds` 是未展示的候选。
+ * 伪造 recall_event 不会创建 receipt，因此不会增加任何采用指标。
+ */
+export interface AdoptionReceiptInput {
+  readonly traceId: string
+  readonly kind: AdoptionReceiptKind
+  readonly sessionId?: string
+  readonly turnId?: string
+  readonly taskId?: string
+  readonly scenario?: string
+  readonly source?: string
+  readonly receiptId?: string
+  readonly budgetTokens?: number
+  readonly usedTokens?: number
+  readonly injected: boolean
+  readonly textHash?: string
+  readonly text?: string
+  readonly keptIds: readonly string[]
+  readonly quarantinedIds?: readonly string[]
+  readonly droppedIds?: readonly string[]
+  /** 可带标题/更新时间的命中；未列在三个 id 集合里的命中按 kept 处理。 */
+  readonly hits?: readonly AdoptionReceiptHitInput[]
+}
+
+/** 落库后的逐实体处置；只有 disposition='kept' 的命中会登记 Exposure。 */
+export interface AdoptionReceiptHit {
+  readonly entityId: string
+  readonly disposition: AdoptionReceiptDisposition
+  readonly title?: string
+  readonly updatedAt?: string
+  readonly rank?: number
+}
+
 /**
  * 一次独立使用机会的曝光。`(entityId, sessionId, taskId)` 是机会主键：
  * 同一次任务里的重复召回只增加 exposures，不重复累计成功次数。

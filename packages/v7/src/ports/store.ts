@@ -25,6 +25,8 @@ import type {
   VectorSearchSpec,
 } from './search.js'
 import type {
+  AdoptionReceiptHit,
+  AdoptionReceiptInput,
   ArtifactInput,
   ArtifactRecord,
   AuditEntry,
@@ -199,22 +201,34 @@ export interface Store {
   clearDependencyMarks(entityId: string, attrs?: readonly DependencyAttributeRef[]): Promise<void>
   rebuildView(id: string): Promise<void>
   recordRecall(events: readonly RecallEventInput[]): Promise<void>
-  /** T1 真正投递后把该 trace 的候选从 injected=false 置为 true（不提前记账）。 */
+  /**
+   * 事件级审计：把该 trace 的 recall_event 标成真正投递（injected=true）。
+   * **不再影响采用指标**：Retrieved/机会/采用层级只从 `recordAdoptionReceipt` 派生。
+   */
   markRecallInjected?(traceId: string): Promise<void>
   /** 记录一次 T0 常驻构建（预算、段落、裁剪），不参与 adopted 统计。 */
   recordResidentTrace(trace: ResidentTraceInput): Promise<void>
+  /**
+   * 记录一次真实注入的 receipt（T0/T1/T2）：receipt 的 kept/quarantined/dropped 是
+   * Retrieved 与后续 Reference/Utilization/Validation 的唯一来源。
+   *
+   * 返回本次输入里 disposition='kept' 的命中（已带标题），调用方据此登记 Exposure
+   * 与引用候选；quarantined/dropped 永不登记。同 traceId 重复写入按主键幂等合并。
+   */
+  recordAdoptionReceipt(input: AdoptionReceiptInput): Promise<readonly AdoptionReceiptHit[]>
   /** 检索命中即记一次访问；旧 fake 可不实现。 */
   markAccessed?(ids: readonly string[]): Promise<void>
   /** 按静态属性值查活跃实体；后台收敛（goalId/taskId/自动分组键）使用。 */
   findByAttribute?(name: string, value: JsonValue, kind?: EntityKind): Promise<string | undefined>
   /**
-   * 记录一次曝光：同一 `(entityId, sessionId, taskId)` 只创建一个使用机会，
-   * 重复曝光只增加机会内的 exposures 计数；不增加任何显著度。
+   * 记录一次曝光：必须已有该实体在本 session 的 kept receipt（否则忽略，伪造
+   * recall_event 不会创建机会）。同一 `(entityId, sessionId, taskId)` 只创建一个
+   * 使用机会；同一 receipt 对同一实体只登记一次，不同 receipt 只增加 exposures。
    */
   recordExposure(input: UsageExposureInput): Promise<void>
   /**
-   * 记录一条引用/使用/验证/证伪证据。机会级状态只升级一次；指标按机会计数，
-   * 因此同一任务里多次引用/验证不会重复累计成功次数。
+   * 记录一条引用/使用/验证/证伪证据。同样必须已有 kept receipt；机会级状态只升级
+   * 一次，指标按机会计数，因此同一任务里多次引用/验证不会重复累计成功次数。
    */
   recordUsage(level: UsageEvidenceLevel, input: UsageEvidenceInput): Promise<void>
   /**
