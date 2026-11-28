@@ -59,7 +59,7 @@ T0 注入长期偏好、当前状态和库索引。T1 在用户消息、工具�
 
 插件使用 PostgreSQL 保存任务、outbox、投影水位、timer 和工作流状态。后台任务由 LISTEN/NOTIFY 和到期 timer 唤醒，不使用固定轮询。实体写入与 outbox 在同一个事务提交。投影失败会保留待处理任务并在水位超龄时回退到写模型。
 
-审计日志使用哈希链。单步回滚会检查实体版本，拒绝覆盖更新后的修改。动态 URL 默认关闭，动态代码只在 QuickJS 沙箱中执行。
+审计日志使用哈希链：逐行复算能发现行被改动或中间行被删除，但只能做到篡改可发现（tamper-evident），不等于不可篡改存储；没有外部锚点时也无法发现链尾删除。单步回滚会检查实体版本，拒绝覆盖更新后的修改。动态 URL 默认关闭，动态代码只在 QuickJS 沙箱中执行。
 
 ## 安装
 
@@ -67,11 +67,11 @@ T0 注入长期偏好、当前状态和库索引。T1 在用户消息、工具�
 2. 粘贴仓库地址 `https://github.com/seventeen-su/oh-my-bigbluefish`。
 3. 安装并启用插件，然后重启 DSH。
 
-安装包包含运行产物、数据库迁移和嵌入模型。安装过程不需要构建步骤、下载脚本或手动复制文件。首次启动时，插件会自动创建数据库结构。
+安装包包含运行产物、数据库迁移和嵌入模型。安装过程不需要构建步骤、下载脚本或手动复制文件。首次启动时，插件会自动创建数据库结构。自动迁移会用插件自己的连接执行 DDL；生产环境建议改为用管理角色执行一次 `pnpm v7:db:setup`，并在配置中关闭 `autoMigrate`。
 
 ## 配置
 
-默认连接 `postgres://omb:omb@127.0.0.1:5432/omb`。在插件配置中修改 `databaseUrl` 可以连接其他数据库。
+默认连接 `postgres://omb:omb@127.0.0.1:5432/omb` 只是本机 loopback 开发默认，不是生产安全配置：口令公开、没有 TLS，且 `v7:db:setup` 会让连接串里的角色成为 schema/表 owner。生产或共享环境必须覆盖 `databaseUrl` 与口令，并按 `docs/v7/SPEC.md` §6.2 收紧监听、认证、TLS 和角色权限。在插件配置中修改 `databaseUrl` 可以连接其他数据库。
 
 常用配置：
 
@@ -110,13 +110,21 @@ pg_dump -Fc -d omb -f omb-backup.dump
 pg_restore -d omb --clean --if-exists omb-backup.dump
 ```
 
+部署、权限变更或恢复后，做一次只读连接安全检查（单次执行，不修改数据库）：
+
+```powershell
+node scripts/v7-db-security-check.mjs --url $env:OMB_DATABASE_URL
+```
+
+脚本只查系统目录，默认拒绝非 loopback 目标；远程检查需显式 `--allow-remote`，`--help` 可看检查项与退出码。
+
 升级插件后重启 DSH。数据库迁移在启动时自动执行。
 
 ## 文档
 
 - `docs/v7/REQUIREMENTS.md`：需求和验收标准。
-- `docs/v7/SPEC.md`：实现规格。
-- `docs/v7/adr/`：架构决策。
+- `docs/v7/SPEC.md`：实现规格（审计链见 §6.1，数据库连接与部署安全见 §6.2）。
+- `docs/v7/adr/`、`docs/v7/review/adr/`：架构决策记录。
 
 ## 许可证
 
