@@ -250,4 +250,66 @@ describe('T1 检索召回质量（真实 PostgreSQL）', () => {
     expect(fulltext?.reason ?? '').toContain('没有全文词')
     expect(result.hits).toHaveLength(0)
   })
+
+  it('给定批量富化读取当查询 30 个实体则一次返回标签/置顶/置信度/采用计数，缺失 id 不返回', async () => {
+    const withFeatures = await writeMemory({
+      kind: 'memory',
+      category: 'fact',
+      scope: { kind: 'global' },
+      attrs: { title: '偏好甲', body: '批量富化读取', 标签: ['偏好'] },
+      pinned: true,
+      confidence: 0.8,
+      origin: 'model',
+    })
+    const plain = await writeMemory({
+      kind: 'memory',
+      category: 'fact',
+      scope: { kind: 'global' },
+      attrs: { title: '普通乙', body: '批量富化读取' },
+    })
+
+    const rows = await db.priorFeatures([withFeatures, plain, 'mem_missing'])
+    const byId = new Map(rows.map(row => [row.entityId, row]))
+
+    expect(rows).toHaveLength(2)
+    expect(byId.get(withFeatures)).toMatchObject({
+      pinned: true,
+      confidence: 0.8,
+      origin: 'model',
+      tags: ['偏好'],
+      accessCount: 0,
+      adoptionCount: 0,
+    })
+    expect(byId.get(plain)).toMatchObject({ pinned: false, accessCount: 0 })
+    expect(byId.get(plain)?.confidence).toBeUndefined()
+    expect(byId.get(plain)?.tags).toBeUndefined()
+    expect(await db.priorFeatures([])).toEqual([])
+  })
+
+  it('给定 30 条先验相同的候选当 limit=30 召回则第 25/30 名的有效先验乘数与第 1 名一致', async () => {
+    for (let index = 1; index <= 30; index += 1) {
+      await writeMemory({
+        kind: 'state',
+        scope: { kind: 'global' },
+        title: `批量富化探针 ${index}`,
+        status: 'in_progress',
+        time: '2026-11-20T00:00:00.000Z',
+        attrs: { body: '批量富化探针 同一段文本' },
+        pinned: true,
+        confidence: 1,
+        origin: 'user',
+      })
+    }
+    const engine = new RecallEngine({ store: db, embedder: new NoVectorEmbedder(), clock })
+
+    const result = await engine.recall({ query: '批量富化探针', now: FIXED_NOW, limit: 30 })
+
+    expect(result.hits).toHaveLength(30)
+    // 每条都拿到了实体级证据（旧实现只富化前 24 名，第 25 名起没有 pinned/confidence 乘数）。
+    expect(result.hits.every(entry => entry.why.some(line => line.startsWith('prior:pinned=')))).toBe(true)
+    // 特征相同 → 有效先验乘数必须处处相同：分数比只由融合分决定，截断位置不产生系统性压低。
+    const factors = result.hits.map(entry => entry.score / entry.fusedScore)
+    for (const factor of factors) expect(factor).toBeCloseTo(factors[0] ?? Number.NaN, 9)
+    expect(result.hits[29]?.score).toBeCloseTo((result.hits[29]?.fusedScore ?? 0) * (factors[0] ?? 0), 9)
+  })
 })

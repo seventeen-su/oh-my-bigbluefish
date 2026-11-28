@@ -34,6 +34,11 @@ export interface RecallRequest {
   readonly hops?: 1 | 2
   /** 显式时间窗；缺省时按场景的 timeWindowDays 从 now 回推。 */
   readonly timeWindow?: TimeWindow
+  /**
+   * 查询日历日使用的 IANA 时区（如 `Asia/Shanghai`）；缺省用检索配置的 `timezone`。
+   * 只影响「今天/昨天/前天」这类**日历日**解析，不影响其余相对时间（最近 N 天）。
+   */
+  readonly timezone?: string
   /** 注入时钟（ISO 8601）；不传用 Clock 端口。 */
   readonly now?: string
   readonly traceId?: string

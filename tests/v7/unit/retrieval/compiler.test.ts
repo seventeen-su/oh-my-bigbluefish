@@ -51,7 +51,7 @@ describe('RetrievalPlan 编译（纯函数）', () => {
       limit: 7,
     }, COMPILE)
 
-    expect(plan.schema).toBe('omb.retrieval-plan/1')
+    expect(plan.schema).toBe('omb.retrieval-plan/2')
     expect(plan.configVersion).toBe(DEFAULT_RETRIEVAL_CONFIG.version)
     expect(plan.scenario).toBe('tool-error')
     expect(plan.filters).toEqual({

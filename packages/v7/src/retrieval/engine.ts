@@ -1,10 +1,9 @@
 import { toOmbError } from '../domain/errors.js'
-import type { Entity } from '../domain/entity.js'
 import { newId } from '../domain/ids.js'
 import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
 import type { Store } from '../ports/store.js'
-import type { EntitySummary } from '../ports/search.js'
+import type { EntityPriorFeatures, EntitySummary } from '../ports/search.js'
 import type { RecallEventInput } from '../ports/observability.js'
 import { runStageOnePlan } from './channels.js'
 import {
@@ -173,11 +172,18 @@ function chainSiblingTitles(
  * 每个 provider 有独立 deadline/状态，单个失败不拖垮其它；deadline 在报告里记为
  * failed + `deadline:` reason，并在 warnings 里明示。
  * 阶段二：`runExpansionProviders` 执行 expand → links（按计划 expand 模式），失败降级为 warning。
- * 之后仍是加权 RRF（k 来自配置，默认 60）融合、原始分 + 融合分双重门控、场景重排、
- * 显式时间窗收窄，最后写 recall_event；空结果一定带 emptyReason，不静默返回 []。
+ * 之后是加权 RRF（k 来自配置，默认 60）融合、原始分门控 + 融合层相对/一致性门控、
+ * 两级场景重排、显式时间窗收窄，最后写 recall_event；空结果一定带 emptyReason，不静默返回 []。
  *
  * 计划可序列化：`compilePlan(request)` 得到纯数据计划，`recallFromPlan(JSON 往返后的计划)`
  * 可以重放同一份检索语义；配置版本漂移会在 warnings 里暴露，不静默换口径。
+ * 门控阈值与日历日时区都从计划读（计划是权威），重放不受当前配置影响。
+ *
+ * 两级重排（`rerankEnrichTopK`）：
+ * 1. 初排：**全部**候选只用摘要级特征（分类/新近度/作用域/历史/链路）算分；
+ * 2. 精排：对初排前 `max(rerankEnrichTopK, limit)` 名做**一次**批量富化
+ *    （`store.priorFeatures`），把置信度/置顶/偏好标签/采用率/来源加进来再排序。
+ * 窗口不小于返回条数，所以截断位置不会决定谁拿到实体级乘数；富化缺失按中性处理。
  */
 export class RecallEngine {
   readonly config: RetrievalConfig
@@ -186,6 +192,8 @@ export class RecallEngine {
   private readonly clock: Clock
   private readonly stageOneBudgetMs: number | undefined
   private readonly providerTimeoutMs: number | undefined
+  /** 存储缺少批量富化能力只提示一次，不让每次召回都刷同一条 warning。 */
+  private enrichmentGapReported = false
 
   constructor(deps: RecallEngineDeps) {
     this.store = deps.store
@@ -275,11 +283,17 @@ export class RecallEngine {
     if (expansion.expansions.length > 0) {
       applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config)
     }
-    const gate = gateCandidates([...candidates.values()], this.config)
+    // 门控阈值以计划为权威：重放一份历史计划时不能悄悄换用当前配置的门控。
+    const gate = gateCandidates([...candidates.values()], {
+      ...this.config,
+      fusedFloor: plan.thresholds.fusedFloor,
+      fusionGate: plan.thresholds.fusionGate,
+    })
     // 有结果时 below 统计不会进 emptyReason；用一条 warning 保证门控淘汰不静默。
     if (gate.passed.length > 0 && gate.rejected.length > 0) {
       warnings.push(
-        `门控淘汰 ${gate.rejected.length} 条候选（belowRaw=${gate.belowRaw}，belowFused=${gate.belowFused}）：低于下限的证据不进入结果。`,
+        `门控淘汰 ${gate.rejected.length} 条候选（belowRaw=${gate.belowRaw}，belowFused=${gate.belowFused}，`
+        + `belowRelative=${gate.belowRelative}，noConsensus=${gate.belowConsensus}）：证据不足的不进入结果。`,
       )
     }
 
@@ -403,37 +417,32 @@ export class RecallEngine {
     }
 
     const requestView = requestViewOf(plan)
-    const prelim: ScoredCandidate[] = filtered.map(item => {
+    const scoreOf = (candidate: FusionCandidate, summary: EntitySummary, features?: EntityPriorFeatures): ScoredCandidate => {
       const prior = rerankPrior({
-        summary: item.summary,
-        linkStrength: item.candidate.link?.linkScore ?? 0,
+        summary,
+        ...(features === undefined ? {} : { features }),
+        linkStrength: candidate.link?.linkScore ?? 0,
         scenario,
         config: this.config,
         request: requestView,
         now: plan.time.now,
       })
-      return { candidate: item.candidate, summary: item.summary, prior, score: item.candidate.fused * prior.factor }
-    })
+      return { candidate, summary, prior, score: candidate.fused * prior.factor }
+    }
 
-    const enrichIds = [...prelim]
-      .sort(compareScored)
-      .slice(0, Math.max(0, this.config.rerankEnrichLimit))
-      .map(item => item.candidate.entityId)
-    const entities = await this.fetchEntities(enrichIds, warnings, filters.includeArchived)
+    // 初排：全部候选、同一套廉价摘要特征，先得到没有富化偏差的顺序。
+    const prelim: ScoredCandidate[] = filtered.map(item => scoreOf(item.candidate, item.summary))
+    prelim.sort(compareScored)
 
-    const scored = prelim.map(item => {
-      const entity = entities.get(item.candidate.entityId)
-      if (entity === undefined) return item
-      const prior = rerankPrior({
-        summary: item.summary,
-        entity,
-        linkStrength: item.candidate.link?.linkScore ?? 0,
-        scenario,
-        config: this.config,
-        request: requestView,
-        now: plan.time.now,
-      })
-      return { candidate: item.candidate, summary: item.summary, prior, score: item.candidate.fused * prior.factor }
+    // 富化窗口 ≥ 计划限制：返回的每一条都拿到实体级证据，截断位置不再是“谁被富化”的依据。
+    const enrichWindow = Math.max(0, Math.min(prelim.length, Math.max(this.config.rerankEnrichTopK, plan.limit)))
+    const enrichIds = prelim.slice(0, enrichWindow).map(item => item.candidate.entityId)
+    const featuresById = await this.priorFeaturesOf(enrichIds, warnings)
+    const scored = prelim.map((item, index) => {
+      if (index >= enrichWindow) return item
+      const features = featuresById.get(item.candidate.entityId)
+      // 窗口内但没拿到富化数据：与窗口外完全同一套中性策略，不额外加减乘数。
+      return features === undefined ? item : scoreOf(item.candidate, item.summary, features)
     })
     scored.sort(compareScored)
     const selected = scored.slice(0, plan.limit)
@@ -526,24 +535,34 @@ export class RecallEngine {
     }
   }
 
-  private async fetchEntities(ids: readonly string[], warnings: string[], includeArchived = false): Promise<Map<string, Entity>> {
-    const entities = new Map<string, Entity>()
-    if (ids.length === 0) return entities
-    const settled = await Promise.allSettled(ids.map(id => this.store.get(id, includeArchived ? { includeArchived: true } : {})))
-    let failures = 0
-    settled.forEach((result, index) => {
-      const id = ids[index]
-      if (id === undefined) return
-      if (result.status === 'fulfilled') {
-        if (result.value !== undefined) entities.set(id, result.value)
-        return
+  /**
+   * 精排富化：**一次**批量读取（不逐条 `store.get`，也不轮询）。
+   * 返回缺失/抛错/端口未实现都退化为中性策略：对应候选保持初排分数，
+   * 与其它未富化候选完全一致，不产生位置相关的惩罚或奖励。
+   */
+  private async priorFeaturesOf(
+    ids: readonly string[],
+    warnings: string[],
+  ): Promise<Map<string, EntityPriorFeatures>> {
+    const features = new Map<string, EntityPriorFeatures>()
+    if (ids.length === 0) return features
+    if (this.store.priorFeatures === undefined) {
+      if (!this.enrichmentGapReported) {
+        this.enrichmentGapReported = true
+        warnings.push('存储未实现批量富化读取（priorFeatures）：精排退化为摘要级中性先验。')
       }
-      failures += 1
-    })
-    if (failures > 0) {
-      warnings.push(`实体富化失败 ${failures}/${ids.length} 条，未富化条目使用摘要级先验`)
+      return features
     }
-    return entities
+    try {
+      for (const item of await this.store.priorFeatures(ids)) features.set(item.entityId, item)
+    } catch (error) {
+      warnings.push(`批量富化失败（未富化候选按中性先验处理）：${toOmbError(error).message}`)
+      return features
+    }
+    if (features.size < ids.length) {
+      warnings.push(`批量富化只返回 ${features.size}/${ids.length} 条，其余按中性先验处理`)
+    }
+    return features
   }
 
   private async recordRecall(

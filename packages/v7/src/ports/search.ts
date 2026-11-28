@@ -68,3 +68,25 @@ export interface EntitySummary {
   readonly historyCount: number
   readonly score?: number
 }
+
+/**
+ * 重排精排阶段的实体级先验特征：一次批量读取拿回，不在候选循环里逐条读实体。
+ *
+ * 字段缺省一律按**中性**处理（对应乘数为 1）：这样「没有富化数据」不会变成惩罚，
+ * 也不会变成奖励，截断位置本身不参与打分。
+ */
+export interface EntityPriorFeatures {
+  readonly entityId: string
+  readonly confidence?: number
+  readonly pinned?: boolean
+  readonly origin?: string
+  readonly accessCount?: number
+  /** 旧口径，仅兼容读；重排改用 utilityConfidence。 */
+  readonly adoptionCount?: number
+  /** 机会级、平滑后的使用效用；Exposure/access 不计入。 */
+  readonly utilityConfidence?: number
+  /** 被用户否定/证伪的比例（0–1）。 */
+  readonly refutationRate?: number
+  /** 标签属性（`标签`/`tags`/`tag`）拍平后的字符串数组。 */
+  readonly tags?: readonly string[]
+}

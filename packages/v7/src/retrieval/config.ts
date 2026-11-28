@@ -1,5 +1,6 @@
 import type { Category } from '../domain/entity.js'
 import { RECALL_SCENARIOS } from './constants.js'
+import { DEFAULT_TIME_ZONE } from './timezone.js'
 import type { RecallChannel, RecallScenario } from './types.js'
 
 /**
@@ -10,6 +11,9 @@ import type { RecallChannel, RecallScenario } from './types.js'
  * - 修改权重必须同时升 `version`，方便 recall_event / 基准报告对上版本。
  * - 原始分门控按通道设下限（各通道原始分不在同一量纲：ts_rank_cd ≈0.0x，
  *   vector cosine ≈0.5+，trigger 是权重和，state_board 0.5~1.1）。
+ * - 融合层门控是**相对/一致性**规则（见 `FusionGate`）：RRF 分是排名融合分不是概率，
+ *   不能当绝对相关性保证；`fusedFloor` 只留作 0/负分的健全性下限。
+ * - 日历日语义（今天/昨天/前天）按 `timezone`（IANA）算，见 retrieval/timezone.ts。
  */
 export interface ScenarioWeights {
   readonly trigger: number
@@ -19,6 +23,25 @@ export interface ScenarioWeights {
   readonly time: number
   readonly state_board: number
   readonly links: number
+}
+
+/**
+ * 融合层门控：把「未校准的 RRF 分」换成两种可解释的相对证据。
+ *
+ * - `relativeFloor`：候选融合分 / 本轮最高融合分 ≥ 该比例。RRF 分只保证「同一次查询内
+ *   谁比谁强」，所以只能做相对比较；绝对分在不同查询、不同通道权重下没有可比性。
+ * - `minChannels`：至少有几个通道的原始分达到各自下限（多通道共识）。
+ * - `singleChannelRank`：单通道候选的通道名次 ≤ 该值即视为精确命中（排名共识），
+ *   可以单独通过一致性与相对门控；图扩展候选看它来源种子的名次。
+ *
+ * `relativeFloor=0.35 / minChannels=2 / singleChannelRank=5` 的含义：单通道排名第 6 名
+ * 以后必须有第二个通道佐证；单通道末位（例如 rank 50 的 state_board，融合分
+ * 0.2/(60+50)=0.001818，高于旧的绝对下限 0.0015）不再默认通过。
+ */
+export interface FusionGate {
+  readonly relativeFloor: number
+  readonly minChannels: number
+  readonly singleChannelRank: number
 }
 
 export interface RerankPriors {
@@ -50,6 +73,8 @@ export interface ScenarioConfig {
   /** time 通道与重排时间衰减使用的默认回看天数。 */
   readonly timeWindowDays: number
   readonly priors: RerankPriors
+  /** 场景级融合门控校准：按场景放宽/收紧单通道排名共识；缺省用全局 `fusionGate`。 */
+  readonly gate?: FusionGate
 }
 
 export interface RetrievalConfig {
@@ -64,21 +89,39 @@ export interface RetrievalConfig {
   readonly hopDecay: Readonly<Record<1 | 2, number>>
   /** 每通道原始分绝对下限。 */
   readonly channelFloors: Readonly<Record<RecallChannel, number>>
-  /** 融合分绝对下限；不达标宁可不返回。 */
+  /**
+   * 融合分**绝对**下限。RRF 分未校准，这个值只挡 0/负分与明显无效的融合结果，
+   * 不承担相关性过滤职责；相关性由 `fusionGate` 的相对/一致性规则判断。
+   */
   readonly fusedFloor: number
+  /** 融合层相对/一致性门控（全局缺省；场景可覆盖）。 */
+  readonly fusionGate: FusionGate
+  /** 查询日历日（今天/昨天/前天）使用的 IANA 时区；显式配置，不读宿主本地时区。 */
+  readonly timezone: string
   /** 全文零命中时，查询归一化长度 ≤ 该值才跑单字回退。 */
   readonly singleCharMaxQueryLength: number
   readonly defaultLimit: number
   readonly maxLimit: number
   /** 最多解析多少个思维链组的成员（避免一次召回打爆读取）。 */
   readonly maxChainGroups: number
-  /** 重排时最多富化多少条候选的实体字段（confidence/adoption/origin 等）。 */
-  readonly rerankEnrichLimit: number
+  /**
+   * 精排富化窗口的**下限**：初排（全部候选，只用摘要级特征）之后，对前
+   * `max(rerankEnrichTopK, limit)` 名做一次批量富化再精排。窗口取 max 保证
+   * 所有返回结果都拿到富化证据，截断位置本身不会造成隐性惩罚/奖励。
+   */
+  readonly rerankEnrichTopK: number
   readonly rerankHalfLifeDays: number
   readonly scenarios: Readonly<Record<RecallScenario, ScenarioConfig>>
 }
 
 const NEUTRAL_CATEGORY: Readonly<Record<Category, number>> = { fact: 1, clue: 1, event: 1 }
+
+/** 融合层门控缺省：单通道只保留前 5 名，更深的单通道命中必须有第二个通道佐证。 */
+const DEFAULT_FUSION_GATE: FusionGate = Object.freeze({
+  relativeFloor: 0.35,
+  minChannels: 2,
+  singleChannelRank: 5,
+})
 
 function priors(overrides: Partial<RerankPriors> = {}): RerankPriors {
   return {
@@ -104,6 +147,9 @@ function priors(overrides: Partial<RerankPriors> = {}): RerankPriors {
  * - tool-error：错误签名/事件类加权；
  * - session-start：状态机/偏好加权；
  * - last-time：时间窗放宽、时间通道加权。
+ *
+ * `session-start` 的门控放宽到单通道前 10 名：看板/偏好本身就是单通道信号，
+ * 当前项目在做什么不该因为「只出现在 state_board 的第 7 条」被丢掉。
  */
 export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = Object.freeze({
   version: 'v7-retrieval-2',
@@ -121,11 +167,13 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = Object.freeze({
     links: 0.1,
   }),
   fusedFloor: 0.0015,
+  fusionGate: DEFAULT_FUSION_GATE,
+  timezone: DEFAULT_TIME_ZONE,
   singleCharMaxQueryLength: 2,
   defaultLimit: 10,
   maxLimit: 50,
   maxChainGroups: 8,
-  rerankEnrichLimit: 24,
+  rerankEnrichTopK: 24,
   rerankHalfLifeDays: 30,
   scenarios: Object.freeze({
     manual: {
@@ -186,6 +234,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = Object.freeze({
         history: 1.1,
         confidence: 1.05,
       }),
+      gate: Object.freeze({ ...DEFAULT_FUSION_GATE, singleChannelRank: 10 }),
     },
     'last-time': {
       weights: { trigger: 0.4, fulltext: 0.7, single_char: 0.3, vector: 0.4, time: 1.5, state_board: 0.4, links: 0.5 },
@@ -220,6 +269,8 @@ export interface ScenarioConfigOverrides {
   readonly weights?: Partial<ScenarioWeights>
   readonly timeWindowDays?: number
   readonly priors?: RerankPriorOverrides
+  /** 场景级融合门控校准；只覆盖显式给出的字段，其余沿用全局 `fusionGate`。 */
+  readonly gate?: Partial<FusionGate>
 }
 
 export interface RetrievalConfigOverrides {
@@ -230,11 +281,14 @@ export interface RetrievalConfigOverrides {
   readonly hopDecay?: Partial<Record<1 | 2, number>>
   readonly channelFloors?: Partial<Record<RecallChannel, number>>
   readonly fusedFloor?: number
+  readonly fusionGate?: Partial<FusionGate>
+  /** IANA 时区；插件组合根会按配置/宿主显式传入。 */
+  readonly timezone?: string
   readonly singleCharMaxQueryLength?: number
   readonly defaultLimit?: number
   readonly maxLimit?: number
   readonly maxChainGroups?: number
-  readonly rerankEnrichLimit?: number
+  readonly rerankEnrichTopK?: number
   readonly rerankHalfLifeDays?: number
   readonly scenarios?: Partial<Record<RecallScenario, ScenarioConfigOverrides>>
 }
@@ -257,27 +311,56 @@ function mergePriors(base: RerankPriors, override?: RerankPriorOverrides): Reran
   }
 }
 
-function mergeScenarios(base: RetrievalConfig, override: RetrievalConfigOverrides['scenarios'] = {}): Record<RecallScenario, ScenarioConfig> {
+function mergeGate(base: FusionGate, override?: Partial<FusionGate>): FusionGate {
+  if (override === undefined) return base
+  return {
+    relativeFloor: override.relativeFloor ?? base.relativeFloor,
+    minChannels: override.minChannels ?? base.minChannels,
+    singleChannelRank: override.singleChannelRank ?? base.singleChannelRank,
+  }
+}
+
+function mergeScenarios(
+  base: RetrievalConfig,
+  globalGate: FusionGate,
+  override: RetrievalConfigOverrides['scenarios'] = {},
+): Record<RecallScenario, ScenarioConfig> {
   const scenarios = {} as Record<RecallScenario, ScenarioConfig>
   for (const name of RECALL_SCENARIOS) {
     const baseScenario = base.scenarios[name]
+    // 场景门控 = 全局门控 + 该场景相对默认全局的校准差 + 调用方显式覆盖。
+    // 这样全局改 relativeFloor 时，只校准了 singleChannelRank 的场景也会跟着走。
+    const delta = baseScenario.gate === undefined ? {} : diffGate(baseScenario.gate, base.fusionGate)
+    const gate = mergeGate(mergeGate(globalGate, delta), override[name]?.gate)
     const scenarioOverride = override[name]
+    const baseWithGate: ScenarioConfig = { ...baseScenario, gate }
     if (scenarioOverride === undefined) {
-      scenarios[name] = baseScenario
+      scenarios[name] = baseWithGate
       continue
     }
     scenarios[name] = {
-      weights: { ...baseScenario.weights, ...(scenarioOverride.weights ?? {}) },
-      timeWindowDays: scenarioOverride.timeWindowDays ?? baseScenario.timeWindowDays,
-      priors: mergePriors(baseScenario.priors, scenarioOverride.priors),
+      ...baseWithGate,
+      weights: { ...baseWithGate.weights, ...(scenarioOverride.weights ?? {}) },
+      timeWindowDays: scenarioOverride.timeWindowDays ?? baseWithGate.timeWindowDays,
+      priors: mergePriors(baseWithGate.priors, scenarioOverride.priors),
     }
   }
   return scenarios
 }
 
+/** 场景门控相对全局门控的差分（只保留真正不同的字段）。 */
+function diffGate(gate: FusionGate, globalGate: FusionGate): Partial<FusionGate> {
+  return {
+    ...(gate.relativeFloor === globalGate.relativeFloor ? {} : { relativeFloor: gate.relativeFloor }),
+    ...(gate.minChannels === globalGate.minChannels ? {} : { minChannels: gate.minChannels }),
+    ...(gate.singleChannelRank === globalGate.singleChannelRank ? {} : { singleChannelRank: gate.singleChannelRank }),
+  }
+}
+
 /** 生成一份可审计的检索配置；只替换显式给出的字段，其余沿用默认值。 */
 export function createRetrievalConfig(overrides: RetrievalConfigOverrides = {}): RetrievalConfig {
-  const scenarios = mergeScenarios(DEFAULT_RETRIEVAL_CONFIG, overrides.scenarios)
+  const fusionGate = mergeGate(DEFAULT_RETRIEVAL_CONFIG.fusionGate, overrides.fusionGate)
+  const scenarios = mergeScenarios(DEFAULT_RETRIEVAL_CONFIG, fusionGate, overrides.scenarios)
   return {
     version: overrides.version ?? DEFAULT_RETRIEVAL_CONFIG.version,
     rrfK: overrides.rrfK ?? DEFAULT_RETRIEVAL_CONFIG.rrfK,
@@ -292,11 +375,13 @@ export function createRetrievalConfig(overrides: RetrievalConfigOverrides = {}):
       ...(overrides.channelFloors ?? {}),
     },
     fusedFloor: overrides.fusedFloor ?? DEFAULT_RETRIEVAL_CONFIG.fusedFloor,
+    fusionGate,
+    timezone: overrides.timezone ?? DEFAULT_RETRIEVAL_CONFIG.timezone,
     singleCharMaxQueryLength: overrides.singleCharMaxQueryLength ?? DEFAULT_RETRIEVAL_CONFIG.singleCharMaxQueryLength,
     defaultLimit: overrides.defaultLimit ?? DEFAULT_RETRIEVAL_CONFIG.defaultLimit,
     maxLimit: overrides.maxLimit ?? DEFAULT_RETRIEVAL_CONFIG.maxLimit,
     maxChainGroups: overrides.maxChainGroups ?? DEFAULT_RETRIEVAL_CONFIG.maxChainGroups,
-    rerankEnrichLimit: overrides.rerankEnrichLimit ?? DEFAULT_RETRIEVAL_CONFIG.rerankEnrichLimit,
+    rerankEnrichTopK: overrides.rerankEnrichTopK ?? DEFAULT_RETRIEVAL_CONFIG.rerankEnrichTopK,
     rerankHalfLifeDays: overrides.rerankHalfLifeDays ?? DEFAULT_RETRIEVAL_CONFIG.rerankHalfLifeDays,
     scenarios,
   }

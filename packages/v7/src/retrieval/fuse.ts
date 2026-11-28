@@ -15,6 +15,9 @@ export interface LinkEvidence {
   readonly contribution: number
   readonly viaLinkId: string
   readonly relation: string
+  /** 种子自身的通道名次；图扩展候选的「排名共识」按它判断（种子够精确才免于第二轮门控）。 */
+  readonly seedRank: number
+  readonly seedChannel: StageOneChannel
   readonly chainId?: string
   /** 存储层给的链路分（含其自身衰减），只作为「链路强度」先验证据。 */
   readonly linkScore: number
@@ -138,6 +141,8 @@ export function applyExpansions(
       contribution: (weights.links * decay) / (config.rrfK + seed.rank),
       viaLinkId: expansion.viaLinkId,
       relation: expansion.relation,
+      seedRank: seed.rank,
+      seedChannel: seed.channel,
       ...(expansion.chainId === undefined ? {} : { chainId: expansion.chainId }),
       linkScore: Number.isFinite(expansion.score) ? Math.max(0, Math.min(1, expansion.score)) : 0,
     }

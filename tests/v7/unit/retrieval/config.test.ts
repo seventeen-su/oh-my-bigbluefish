@@ -66,6 +66,12 @@ describe('检索配置可审计', () => {
     expect(config.scenarios.manual.weights.fulltext).toBe(DEFAULT_RETRIEVAL_CONFIG.scenarios.manual.weights.fulltext)
     expect(config.scenarios.manual.priors.category.event).toBe(1.3)
     expect(config.scenarios.manual.priors.category.fact).toBe(DEFAULT_RETRIEVAL_CONFIG.scenarios.manual.priors.category.fact)
-    expect(config.scenarios['tool-before']).toEqual(DEFAULT_RETRIEVAL_CONFIG.scenarios['tool-before'])
+    const untouched = config.scenarios['tool-before']
+    const base = DEFAULT_RETRIEVAL_CONFIG.scenarios['tool-before']
+    expect(untouched.weights).toEqual(base.weights)
+    expect(untouched.priors).toEqual(base.priors)
+    expect(untouched.timeWindowDays).toBe(base.timeWindowDays)
+    // 没有显式门控校准的场景，生成后带的是解析好的全局门控（计划/引擎直接可用）。
+    expect(untouched.gate).toEqual(DEFAULT_RETRIEVAL_CONFIG.fusionGate)
   })
 })

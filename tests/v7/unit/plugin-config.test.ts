@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { isValidTimeZone } from '../../../packages/v7/src/retrieval/timezone.js'
 import { parseConfig } from '../../../plugin/v7/index.js'
 
 describe('v7 plugin config', () => {
@@ -26,5 +27,17 @@ describe('v7 plugin config', () => {
     const parsed = parseConfig({})
     expect(parsed.config.urlAllowlist).toEqual([])
     expect(parsed.config.urlAllowPrivateAddresses).toBe(false)
+    // 时区永远落到一个显式 IANA 名称上（配置 > 宿主 > UTC），检索模块不需要自己猜。
+    expect(isValidTimeZone(parsed.config.timeZone)).toBe(true)
+  })
+
+  it('给定时区配置当解析配置则保留 IANA 名称，非法值报问题并回落到宿主时区', () => {
+    expect(parseConfig({ timezone: 'Asia/Shanghai' }).config.timeZone).toBe('Asia/Shanghai')
+
+    const fallback = parseConfig({})
+    const invalid = parseConfig({ timezone: 'Not/AZone' })
+    expect(invalid.problems.some(problem => problem.includes('timezone'))).toBe(true)
+    expect(invalid.config.timeZone).toBe(fallback.config.timeZone)
+    expect(isValidTimeZone(invalid.config.timeZone)).toBe(true)
   })
 })

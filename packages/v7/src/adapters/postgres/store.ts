@@ -32,6 +32,7 @@ import type {
 } from '../../ports/observability.js'
 import type {
   ChannelHit,
+  EntityPriorFeatures,
   EntitySummary,
   StateBoardSpec,
   TextSearchSpec,
@@ -73,6 +74,23 @@ export const FULLTEXT_PREFILTER_FACTOR = 10
 export function fulltextPrefilterCandidates(limit: number): number {
   const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1
   return Math.min(FULLTEXT_PREFILTER_MAX, Math.max(FULLTEXT_PREFILTER_MIN, safeLimit * FULLTEXT_PREFILTER_FACTOR))
+}
+
+/** 标签属性名的取值顺序，与重排先验的标签语义保持一致。 */
+const TAG_ATTRIBUTE_NAMES = ['标签', 'tags', 'tag'] as const
+
+/** `entity_view.attrs` 里的标签拍平成数组；没有标签返回空数组（重排按中性处理）。 */
+function tagsOfAttrs(attrs: Record<string, JsonValue> | null): string[] {
+  if (attrs === null) return []
+  for (const name of TAG_ATTRIBUTE_NAMES) {
+    const value = attrs[name]
+    if (typeof value === 'string' && value.trim().length > 0) return [value]
+    if (Array.isArray(value)) {
+      const tags = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      if (tags.length > 0) return tags
+    }
+  }
+  return []
 }
 
 /**
@@ -500,8 +518,66 @@ export class PostgresStore implements Store {
     })
   }
 
-  async preferenceSummaries(limit: number): Promise<EntitySummary[]> {
+  /**
+   * 精排富化：一条 SQL 批量取实体级先验字段（`omb.entity` 的置信度/置顶/来源/采用计数 +
+   * `entity_view.attrs` 里的标签），不在候选循环里逐条 `get`（那是 N+1 且会把
+   * 「谁被富化」变成截断位置的函数）。缺失的 id 不返回，调用方按中性处理。
+   */
+  async priorFeatures(ids: readonly string[]): Promise<EntityPriorFeatures[]> {
+    if (ids.length === 0) return []
     return this.run(async () => {
+      const rows = await this.db.query<{
+        id: string
+        confidence: number | null
+        pinned: boolean
+        origin: string
+        access_count: number
+        adoption_count: number
+        opportunities: number | null
+        referenced_count: number | null
+        utilized_count: number | null
+        validated_count: number | null
+        refuted_count: number | null
+        attrs: Record<string, JsonValue> | null
+      }>(
+        `select e.id, e.confidence, e.pinned, e.origin, e.access_count, e.adoption_count, v.attrs,
+                m.opportunities, m.referenced_count, m.utilized_count, m.validated_count, m.refuted_count
+         from omb.entity e
+         join omb.entity_view v on v.entity_id = e.id
+         left join omb.adoption_metric m on m.entity_id = e.id
+         where e.id = any($1::text[])`,
+        [ids],
+      )
+      return rows.rows.map(row => {
+        const tags = tagsOfAttrs(row.attrs)
+        const opportunities = Number(row.opportunities ?? 0)
+        const positive = Math.min(
+          opportunities,
+          Number(row.validated_count ?? 0)
+            + 0.5 * Number(row.utilized_count ?? 0)
+            + 0.2 * Number(row.referenced_count ?? 0),
+        )
+        const refuted = Number(row.refuted_count ?? 0)
+        const utilityConfidence = opportunities === 0
+          ? 0
+          : (Math.max(0, positive - 0.75 * refuted) + 1) / (opportunities + 5)
+        const refutationRate = opportunities === 0 ? 0 : Math.min(1, refuted / opportunities)
+        return {
+          entityId: row.id,
+          ...(row.confidence === null ? {} : { confidence: Number(row.confidence) }),
+          pinned: row.pinned,
+          origin: row.origin,
+          accessCount: Number(row.access_count),
+          adoptionCount: Number(row.adoption_count),
+          utilityConfidence,
+          refutationRate,
+          ...(tags.length === 0 ? {} : { tags }),
+        }
+      })
+    })
+  }
+
+  async preferenceSummaries(limit: number): Promise<EntitySummary[]> {    return this.run(async () => {
       const rows = await this.db.query<ViewRow & { history_count: number }>(
         `select v.*, 0 as history_count
          from omb.entity_view v

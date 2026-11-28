@@ -28,6 +28,8 @@ export type WhyNotCode =
   | 'all-channels-failed'
   | 'below-raw'
   | 'below-fused'
+  | 'below-relative'
+  | 'no-consensus'
   | `filtered-${FilterCode}`
   | 'summaries-failed'
 
@@ -100,6 +102,22 @@ function rejectionWhyNot(rejection: GateRejection): WhyNot {
     return {
       code: 'below-raw',
       message: `below-raw entity=${rejection.entityId}${channel}${raw} floor=${formatScore(rejection.floor)}`,
+    }
+  }
+  if (rejection.code === 'no-consensus') {
+    const channels = rejection.channels === undefined ? '' : ` channels=${rejection.channels}`
+    const rank = rejection.rank === undefined ? '' : ` rank=${rejection.rank}`
+    return {
+      code: 'no-consensus',
+      message: `no-consensus entity=${rejection.entityId}${channels}${rank} minChannels=${rejection.floor}`,
+    }
+  }
+  if (rejection.code === 'below-relative') {
+    const ratio = rejection.ratio === undefined ? '' : ` ratio=${formatScore(rejection.ratio)}`
+    const reference = rejection.reference === undefined ? '' : ` reference=${formatScore(rejection.reference)}`
+    return {
+      code: 'below-relative',
+      message: `below-relative entity=${rejection.entityId} fused=${formatScore(rejection.fused)} floor=${formatScore(rejection.floor)}${ratio}${reference}`,
     }
   }
   return {
@@ -188,12 +206,16 @@ function baseEmptyReason(input: EmptyExplanationInput): EmptyReasonBase {
     }
   }
   if (input.gate.passed.length === 0) {
+    const gate = input.gate
     return {
       code: 'below-threshold',
-      message: `有 ${input.gate.belowRaw + input.gate.belowFused} 条候选进入融合，但原始分或融合分低于门控下限；为避免噪声不返回。`,
+      message: `有 ${gate.belowRaw + gate.belowFused + gate.belowRelative + gate.belowConsensus} 条候选进入融合，但没有一条同时满足原始分下限、融合层相对门控与通道一致性；为避免噪声不返回。`,
       details: {
-        belowRaw: input.gate.belowRaw,
-        belowFused: input.gate.belowFused,
+        belowRaw: gate.belowRaw,
+        belowFused: gate.belowFused,
+        // 新增的两类门控只在真的发生时出现，旧 logs 的 details 形状保持可读。
+        ...(gate.belowRelative === 0 ? {} : { belowRelative: gate.belowRelative }),
+        ...(gate.belowConsensus === 0 ? {} : { belowConsensus: gate.belowConsensus }),
       },
     }
   }

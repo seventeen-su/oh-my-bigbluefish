@@ -26,6 +26,7 @@ import { RecallService } from '../../packages/v7/src/app/recall.js'
 import { RememberService } from '../../packages/v7/src/app/remember.js'
 import { UpdateService } from '../../packages/v7/src/app/update.js'
 import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
+import { createRetrievalConfig } from '../../packages/v7/src/retrieval/config.js'
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import { Supervisor } from './supervisor.js'
 import { registerSkills } from './skills.js'
@@ -105,7 +106,13 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     readFile: path => readFile(path, 'utf8'),
     taskReader: createDshTaskReader(ctx),
   })
-  const engine = new RecallEngine({ store, embedder, clock })
+  const engine = new RecallEngine({
+    store,
+    embedder,
+    clock,
+    // 日历日时区是显式配置：缺省取宿主时区（组合根解析一次），检索模块自己不读本地时区。
+    config: createRetrievalConfig({ timezone: config.timeZone }),
+  })
 
   const session = createT1Session({ store, logger })
   const recallService = new RecallService(engine, dynamicService, injection => session.rememberPendingRecall(injection))

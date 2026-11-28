@@ -1,12 +1,14 @@
-import { attributeValue } from '../domain/entity-access.js'
-import type { Entity } from '../domain/entity.js'
-import type { EntitySummary } from '../ports/search.js'
+import type { EntityPriorFeatures, EntitySummary } from '../ports/search.js'
 import type { RetrievalConfig, ScenarioConfig } from './config.js'
 import type { RecallRequest } from './types.js'
 
 export interface PriorContext {
   readonly summary: EntitySummary
-  readonly entity?: Entity
+  /**
+   * 实体级富化特征（confidence/pinned/tags/采用率/origin）。
+   * 缺省 = 没有富化数据：对应乘数全部按中性 1 处理，不因“没轮到富化”而惩罚或奖励。
+   */
+  readonly features?: EntityPriorFeatures
   /** 图扩展证据强度（0–1）；没有 links 通道时为 0。 */
   readonly linkStrength: number
   readonly scenario: ScenarioConfig
@@ -22,8 +24,6 @@ export interface PriorResult {
 
 const MIN_PRIOR = 0.5
 const MAX_PRIOR = 1.5
-
-const TAG_ATTRIBUTES = ['标签', 'tags', 'tag'] as const
 
 function format(value: number): string {
   return value.toFixed(4)
@@ -41,30 +41,22 @@ function ageInDays(isoTime: string, now: string): number | undefined {
   return Math.max(0, (at - then) / 86_400_000)
 }
 
-function tagsOf(entity: Entity): string[] {
-  for (const name of TAG_ATTRIBUTES) {
-    const value = attributeValue(entity, name)
-    if (typeof value === 'string' && value.trim().length > 0) return [value]
-    if (Array.isArray(value)) {
-      return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    }
-  }
-  return []
-}
-
-function hasPreferenceTag(entity: Entity): boolean {
-  return tagsOf(entity).some(tag => tag.includes('偏好') || /^preference/i.test(tag.trim()))
+function hasPreferenceTag(features: EntityPriorFeatures): boolean {
+  return (features.tags ?? []).some(tag => tag.includes('偏好') || /^preference/i.test(tag.trim()))
 }
 
 /**
  * 重排先验（SPEC §7.2）：分类、置信度、时间衰减、作用域匹配、历史采用率、
  * 链接强度、来源。每个先验只在有证据时乘上去，最后整体夹到 [0.5, 1.5]。
  *
- * 所有乘数都来自 `config.scenarios[scenario].priors`，不写死在代码里；
- * 没有实体富化数据（Entity 缺失）时，只有可用字段参与计算。
+ * 所有乘数都来自 `config.scenarios[scenario].priors`，不写死在代码里。
+ * 分两级使用同一函数：
+ * - 初排（全部候选）只给 `summary`：分类/新近度/作用域/历史/链路，全部廉价可得；
+ * - 精排（富化窗口）再加 `features`：置信度/置顶/偏好标签/采用率/来源。
+ * 没有 `features` 时这些实体级乘数不参与，等价于中性的 1，所以两级排序可比。
  */
 export function rerankPrior(context: PriorContext): PriorResult {
-  const { summary, entity, scenario, config, request, now } = context
+  const { summary, features, scenario, config, request, now } = context
   const reasons: string[] = []
   let factor = 1
   const apply = (label: string, multiplier: number): void => {
@@ -77,8 +69,8 @@ export function rerankPrior(context: PriorContext): PriorResult {
     apply(`category:${summary.category}`, scenario.priors.category[summary.category])
   }
 
-  if (entity?.confidence !== undefined) {
-    const confidence = clamp01(entity.confidence)
+  if (features?.confidence !== undefined) {
+    const confidence = clamp01(features.confidence)
     apply(`confidence:${format(confidence)}`, 1 + (scenario.priors.confidence - 1) * confidence)
   }
 
@@ -96,11 +88,11 @@ export function rerankPrior(context: PriorContext): PriorResult {
     apply(`history:${summary.historyCount}`, scenario.priors.history)
   }
 
-  if (entity?.pinned === true) {
+  if (features?.pinned === true) {
     apply('pinned', scenario.priors.pinned)
   }
 
-  if (entity !== undefined && hasPreferenceTag(entity)) {
+  if (features !== undefined && hasPreferenceTag(features)) {
     apply('tag:偏好', scenario.priors.preferenceTag)
   }
 
@@ -109,18 +101,18 @@ export function rerankPrior(context: PriorContext): PriorResult {
   // - 单纯 Exposure/accessCount 不在这里加分，避免“检索自己→更容易被检索”的正反馈；
   // - 旧的 adoptionCount/accessCount 字符串命中口径已从重排移除；
   // - 无有效证据时保持中性（不乘任何因子）。
-  const utility = entity?.utilityConfidence ?? 0
-  if (entity !== undefined && utility > 0) {
+  const utility = features?.utilityConfidence ?? 0
+  if (features !== undefined && utility > 0) {
     apply(`utility:${format(utility)}`, 1 + (scenario.priors.adopted - 1) * utility)
   }
   // 负向证据：只在实际存在 refutation 时降权，且乘数下限仍由全局 clamp 保护。
-  const refutation = entity?.refutationRate ?? 0
-  if (entity !== undefined && refutation > 0) {
+  const refutation = features?.refutationRate ?? 0
+  if (features !== undefined && refutation > 0) {
     apply(`refuted:${format(refutation)}`, 1 - (1 - scenario.priors.refuted) * refutation)
   }
 
-  if (entity !== undefined && /(^|[-_:])(job|auto|consolidat|background)/i.test(entity.origin)) {
-    apply(`origin:${entity.origin}`, scenario.priors.jobOrigin)
+  if (features?.origin !== undefined && /(^|[-_:])(job|auto|consolidat|background)/i.test(features.origin)) {
+    apply(`origin:${features.origin}`, scenario.priors.jobOrigin)
   }
 
   if (context.linkStrength > 0) {

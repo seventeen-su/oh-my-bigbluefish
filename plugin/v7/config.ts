@@ -3,7 +3,13 @@
  *
  * 纯函数：不读环境变量以外的外部状态（环境变量只在缺省时兜底，与旧实现一致），
  * 不做 IO、不持有状态；`apply` 只消费结果，问题以 `problems` 返回给组合根记日志。
+ *
+ * 时区是例外中的显式项：检索的「今天/昨天/前天」按日历日算，必须知道用哪个 IANA 时区。
+ * 解析顺序是 `timezone` 配置 > 宿主时区（`Intl` 解析出的系统时区）> `UTC`，
+ * 结果作为显式参数传给 `createRetrievalConfig`，检索模块自己绝不读本地时区。
  */
+import { DEFAULT_TIME_ZONE, isValidTimeZone } from '../../packages/v7/src/retrieval/timezone.js'
+
 export interface V7Config {
   readonly databaseUrl: string
   readonly adminDatabaseUrl?: string
@@ -16,6 +22,8 @@ export interface V7Config {
   readonly postgresDataDir?: string
   readonly postgresLogPath?: string
   readonly adoptExisting: boolean
+  /** 检索日历日时区（IANA）：配置显式值，缺省取宿主时区，再缺省 `UTC`。 */
+  readonly timeZone: string
   /** 空数组表示 url 动态值保持关闭；配置后仍需 allowlist + 私网/环回排除。 */
   readonly urlAllowlist: readonly string[]
   readonly urlAllowPrivateAddresses: boolean
@@ -29,6 +37,16 @@ export interface ParsedV7Config {
 }
 
 const DEFAULT_DATABASE_URL = 'postgres://omb:omb@127.0.0.1:5432/omb'
+
+/** 宿主时区探测：只在组合根做一次，解析失败回落到显式 UTC。 */
+export function detectHostTimeZone(): string {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    return zone !== undefined && isValidTimeZone(zone) ? zone : DEFAULT_TIME_ZONE
+  } catch {
+    return DEFAULT_TIME_ZONE
+  }
+}
 
 export function parseConfig(raw: unknown): ParsedV7Config {
   const record = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
@@ -76,6 +94,13 @@ export function parseConfig(raw: unknown): ParsedV7Config {
   const postgresBinDir = stringValue('postgresBinDir') ?? process.env.OMB_PG_BIN_DIR
   const postgresDataDir = stringValue('postgresDataDir') ?? process.env.OMB_PG_DATA_DIR
   const postgresLogPath = stringValue('postgresLogPath') ?? process.env.OMB_PG_LOG_PATH
+  const hostTimeZone = detectHostTimeZone()
+  const configuredTimeZone = stringValue('timezone')
+  let timeZone = hostTimeZone
+  if (configuredTimeZone !== undefined) {
+    if (isValidTimeZone(configuredTimeZone)) timeZone = configuredTimeZone
+    else problems.push(`timezone 必须是可解析的 IANA 名称（如 Asia/Shanghai），已回落到宿主时区 ${hostTimeZone}`)
+  }
   if (managePostgres && (postgresBinDir === undefined || postgresDataDir === undefined)) {
     problems.push('managePostgres=true 时必须同时配置 postgresBinDir 和 postgresDataDir')
   }
@@ -92,6 +117,7 @@ export function parseConfig(raw: unknown): ParsedV7Config {
       autoMigrate: boolValue('autoMigrate', true),
       managePostgres,
       adoptExisting: boolValue('adoptExisting', false),
+      timeZone,
       urlAllowlist: stringArrayValue('urlAllowlist'),
       urlAllowPrivateAddresses: boolValue('urlAllowPrivateAddresses', false),
       urlTimeoutMs: numberValue('urlTimeoutMs', 5_000, 250, 60_000),

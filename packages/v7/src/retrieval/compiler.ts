@@ -1,8 +1,9 @@
 import type { Category, EntityKind, StateStatus } from '../domain/entity.js'
 import { fail, invalid } from '../domain/errors.js'
 import { extractQuerySignals, normalizeText, tokenize } from '../domain/text.js'
-import type { RetrievalConfig, ScenarioConfig } from './config.js'
+import type { FusionGate, RetrievalConfig, ScenarioConfig } from './config.js'
 import { RECALL_SCENARIOS, STAGE_ONE_CHANNELS } from './constants.js'
+import { isValidTimeZone, localDayStartDaysAgo } from './timezone.js'
 import type { ExpansionMode, RecallRequest, RecallScenario, TimeWindow } from './types.js'
 
 /**
@@ -18,10 +19,13 @@ import type { ExpansionMode, RecallRequest, RecallScenario, TimeWindow } from '.
  * - `time.now` 是**查询时间锚点**（“昨天/最近 N 天”与场景默认回看窗按它算），可以来自请求里的 `now`；
  * - `deadline` 是**执行预算**，锚点是宿主墙钟（`executionAnchorMs`），与查询语义时间无关；
  *   否则回放一份历史计划会因为 `now` 在过去的语义时间而立刻超时。
+ *
+ * 日历日第三层：`time.timezone` 是 IANA 时区，决定「今天/昨天/前天」落在哪一天。
+ * 它必须是显式参数（请求 > 编译上下文 > 配置），绝不隐式读 Node 本地时区。
  */
 
 /** 计划 schema 版本；字段不兼容变更必须升版本，`parseRetrievalPlan` 会拒绝旧版本。 */
-export const PLAN_SCHEMA = 'omb.retrieval-plan/1'
+export const PLAN_SCHEMA = 'omb.retrieval-plan/2'
 
 /** 阶段一 + 阶段二扩展的总预算（ms）；缺省值对齐宿主 pre-step 的 1.5s 上限。 */
 export const DEFAULT_STAGE_ONE_BUDGET_MS = 1500
@@ -70,6 +74,8 @@ interface PlanFilters {
 interface PlanTime {
   /** 查询时间锚点（ISO 8601）；时间通道与重排衰减都按它算。 */
   readonly now: string
+  /** 日历日解析使用的 IANA 时区；计划显式记录，重放不依赖编译机本地时区。 */
+  readonly timezone: string
   /** time 通道的回看窗：显式 > 查询相对时间 > 场景默认。 */
   readonly lookback: TimeWindow
   /** 显式且合法的请求时间窗；只有它会收窄最终候选。 */
@@ -101,6 +107,10 @@ interface PlanBudget {
 interface PlanThresholds {
   /** 查询归一化长度 ≤ 该值才允许单字回退。 */
   readonly singleCharMaxQueryLength: number
+  /** 融合分绝对健全性下限（RRF 分未校准，不承担相关性过滤职责）。 */
+  readonly fusedFloor: number
+  /** 本次计划生效的融合层相对/一致性门控快照（含场景校准）。 */
+  readonly fusionGate: FusionGate
 }
 
 interface PlanDeadline {
@@ -138,6 +148,8 @@ export interface PlanCompileContext {
   readonly now: string
   /** 执行锚点（ms，宿主墙钟）；deadline 从这里 + 预算。 */
   readonly executionAnchorMs: number
+  /** 日历日时区（IANA）；请求里的 `timezone` 优先，其次这里，最后用配置的 `timezone`。 */
+  readonly timezone?: string
   readonly budgetMs?: number
   readonly providerTimeoutMs?: number
   readonly termBudget?: number
@@ -167,18 +179,18 @@ function uniqueStrings(values: readonly string[]): string[] {
 /**
  * 从查询里解析显式相对时间（今天/昨天/前天/上周/最近 N 天周月/N 天前）。
  * 只做确定性匹配，不猜「上次/之前」——那是调用方切到 `last-time` 场景的事。
+ *
+ * 「今天/昨天/前天」是**当地日历日**：按 `timeZone` 求当地零点，不用 UTC 日历日，
+ * 也不用 `now - 24h`（DST 日不是 24 小时）。「最近 N 天/上周」是时长语义，保持锚点回退。
  */
-function queryTimeWindow(query: string, nowIso: string): TimeWindow | undefined {
+function queryTimeWindow(query: string, nowIso: string, timeZone: string): TimeWindow | undefined {
   const anchor = Date.parse(nowIso)
   if (!Number.isFinite(anchor)) return undefined
-  const startOfUtcDay = (ms: number): number => {
-    const date = new Date(ms)
-    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
-  }
   const to = new Date(anchor).toISOString()
-  if (/昨天/.test(query)) return { from: new Date(startOfUtcDay(anchor) - DAY_MS).toISOString(), to }
-  if (/前天/.test(query)) return { from: new Date(startOfUtcDay(anchor) - 2 * DAY_MS).toISOString(), to }
-  if (/今天/.test(query)) return { from: new Date(startOfUtcDay(anchor)).toISOString(), to }
+  const dayStart = (daysAgo: number): string => new Date(localDayStartDaysAgo(timeZone, anchor, daysAgo)).toISOString()
+  if (/昨天/.test(query)) return { from: dayStart(1), to }
+  if (/前天/.test(query)) return { from: dayStart(2), to }
+  if (/今天/.test(query)) return { from: dayStart(0), to }
   if (/上周|过去一周|最近一周/.test(query)) return { from: new Date(anchor - 7 * DAY_MS).toISOString(), to }
   const relative = /最近\s*(\d{1,3})\s*(天|日|周|个?月)/.exec(query) ?? /(\d{1,3})\s*(天|日|周|个?月)(?:前|内)/.exec(query)
   if (relative !== null) {
@@ -199,15 +211,25 @@ function validTimeWindow(window: TimeWindow | undefined): TimeWindow | undefined
   return { from: new Date(from).toISOString(), to: new Date(to).toISOString() }
 }
 
-function compileTime(request: RecallRequest, scenario: ScenarioConfig, anchorMs: number): PlanTime {
+/** 时区解析顺序：请求 > 编译上下文 > 配置；非法值直接拒绝，不静默换成 UTC。 */
+function resolveTimeZone(request: RecallRequest, context: PlanCompileContext): string {
+  const requested = request.timezone ?? context.timezone ?? context.config.timezone
+  if (!isValidTimeZone(requested)) {
+    fail(invalid(`时区必须是可解析的 IANA 名称（如 Asia/Shanghai），实际：${String(requested)}`))
+  }
+  return requested
+}
+
+function compileTime(request: RecallRequest, scenario: ScenarioConfig, anchorMs: number, timeZone: string): PlanTime {
   const now = new Date(anchorMs).toISOString()
   const explicit = validTimeWindow(request.timeWindow)
-  if (explicit !== undefined) return { now, lookback: explicit, explicit }
+  if (explicit !== undefined) return { now, timezone: timeZone, lookback: explicit, explicit }
   const fallback = request.timeWindow === undefined ? {} : { fallbackReason: INVALID_WINDOW_REASON }
-  const queryWindow = queryTimeWindow(request.query, now)
-  if (queryWindow !== undefined) return { now, lookback: queryWindow, ...fallback }
+  const queryWindow = queryTimeWindow(request.query, now, timeZone)
+  if (queryWindow !== undefined) return { now, timezone: timeZone, lookback: queryWindow, ...fallback }
   return {
     now,
+    timezone: timeZone,
     lookback: { from: new Date(anchorMs - scenario.timeWindowDays * DAY_MS).toISOString(), to: now },
     ...fallback,
   }
@@ -345,6 +367,7 @@ function requireFinite(value: number, label: string): number {
 
 /**
  * 编译入口。同一 `(request, config, now, executionAnchorMs, 预算)` 永远得到同一份计划（含同一 hash）。
+ * 场景级门控校准在这里就解析进 `thresholds.fusionGate`，让计划本身说明「用哪套门控」。
  */
 export function compileRetrievalPlan(request: RecallRequest, context: PlanCompileContext): RetrievalPlan {
   const anchorMs = Date.parse(context.now)
@@ -359,6 +382,7 @@ export function compileRetrievalPlan(request: RecallRequest, context: PlanCompil
   const signals = compileSignals(request.query)
   const phrases = extractPhrases(request.query)
   const expand: ExpansionMode = request.expand ?? 'both'
+  const timeZone = resolveTimeZone(request, context)
 
   const body: PlanBody = {
     schema: PLAN_SCHEMA,
@@ -369,7 +393,7 @@ export function compileRetrievalPlan(request: RecallRequest, context: PlanCompil
     expand,
     hops: request.hops === 1 ? 1 : 2,
     filters: compileFilters(request),
-    time: compileTime(request, scenario, anchorMs),
+    time: compileTime(request, scenario, anchorMs, timeZone),
     signals,
     phrases,
     terms: compileTerms(request.query, signals, phrases, termBudget),
@@ -381,7 +405,11 @@ export function compileRetrievalPlan(request: RecallRequest, context: PlanCompil
       seeds: context.config.seedLimit,
       chainGroups: context.config.maxChainGroups,
     },
-    thresholds: { singleCharMaxQueryLength: context.config.singleCharMaxQueryLength },
+    thresholds: {
+      singleCharMaxQueryLength: context.config.singleCharMaxQueryLength,
+      fusedFloor: context.config.fusedFloor,
+      fusionGate: scenario.gate ?? context.config.fusionGate,
+    },
     deadline: { atMs: Math.floor(context.executionAnchorMs) + budgetMs, ms: budgetMs },
   }
   return { ...body, hash: fingerprint(body) }
@@ -411,6 +439,14 @@ export function parseRetrievalPlan(value: unknown): RetrievalPlan {
   }
   for (const key of ['terms', 'phrases', 'providers'] as const) {
     if (!Array.isArray(value[key])) fail(invalid(`RetrievalPlan.${key} 必须是数组`))
+  }
+  const time = value.time as Record<string, unknown>
+  if (typeof time.timezone !== 'string' || !isValidTimeZone(time.timezone)) {
+    fail(invalid(`RetrievalPlan.time.timezone 必须是可解析的 IANA 时区，实际：${String(time.timezone)}`))
+  }
+  const thresholds = value.thresholds as Record<string, unknown>
+  if (!Number.isFinite(thresholds.fusedFloor) || !isRecord(thresholds.fusionGate)) {
+    fail(invalid('RetrievalPlan.thresholds 必须带 fusedFloor 与 fusionGate（门控快照）'))
   }
   if (!Number.isFinite(value.limit) || !Number.isFinite((value.deadline as Record<string, unknown>).atMs)) {
     fail(invalid('RetrievalPlan.limit / deadline.atMs 必须是有限数字'))

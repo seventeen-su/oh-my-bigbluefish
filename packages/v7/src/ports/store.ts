@@ -15,6 +15,7 @@ import type { ProjectIdentity } from '../domain/project-identity.js'
 import type { NormalizedWrite } from '../domain/validation.js'
 import type {
   ChannelHit,
+  EntityPriorFeatures,
   EntitySummary,
   StateBoardSpec,
   TextSearchSpec,
@@ -158,6 +159,12 @@ export interface Store {
   time(spec: TimeSearchSpec): Promise<ChannelHit[]>
   stateBoard(spec: StateBoardSpec): Promise<ChannelHit[]>
   summaries(ids: readonly string[]): Promise<EntitySummary[]>
+  /**
+   * 精排富化：**一次批量查询**拿实体级先验字段（confidence/pinned/origin/采用率/标签）。
+   * 返回顺序与入参无关，缺失的 id 不返回；调用方按缺失走中性策略。
+   * 未实现时精排退化为摘要级先验（对所有候选一致，不产生截断偏差）。
+   */
+  priorFeatures?(ids: readonly string[]): Promise<EntityPriorFeatures[]>
   /** T0 偏好：全局、标签=偏好、未归档，按显著度排序。 */
   preferenceSummaries?(limit: number): Promise<EntitySummary[]>
   upsertEmbedding(entityId: string, model: string, dims: number, embedding: readonly number[]): Promise<void>

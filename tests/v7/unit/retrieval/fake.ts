@@ -1,5 +1,6 @@
 import type { Entity, EntityKind, StateVersion } from '../../../../packages/v7/src/domain/entity.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../../../../packages/v7/src/domain/dependency.js'
+import { attributeValue } from '../../../../packages/v7/src/domain/entity-access.js'
 import type { JsonValue } from '../../../../packages/v7/src/domain/json.js'
 import type { Expansion, LinkInput } from '../../../../packages/v7/src/domain/link.js'
 import type { NormalizedWrite } from '../../../../packages/v7/src/domain/validation.js'
@@ -26,6 +27,7 @@ import type {
 } from '../../../../packages/v7/src/ports/observability.js'
 import type {
   ChannelHit,
+  EntityPriorFeatures,
   EntitySummary,
   StateBoardSpec,
   TextSearchSpec,
@@ -105,6 +107,29 @@ export function entity(input: FakeEntityInput): Entity {
   }
 }
 
+/**
+ * 实体 → 精排富化特征：与 `PostgresStore.priorFeatures` 的字段语义一致
+ * （标签从 `标签`/`tags`/`tag` 属性拍平），让单元测试能覆盖精排而不必连库。
+ */
+export function featuresOf(item: Entity): EntityPriorFeatures {
+  const tags: string[] = []
+  for (const name of ['标签', 'tags', 'tag']) {
+    const value = attributeValue(item, name)
+    if (typeof value === 'string' && value.trim().length > 0) tags.push(value)
+    if (Array.isArray(value)) tags.push(...value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0))
+    if (tags.length > 0) break
+  }
+  return {
+    entityId: item.id,
+    ...(item.confidence === undefined ? {} : { confidence: item.confidence }),
+    pinned: item.pinned,
+    origin: item.origin,
+    accessCount: item.accessCount,
+    adoptionCount: item.adoptionCount,
+    ...(tags.length === 0 ? {} : { tags }),
+  }
+}
+
 export function expansion(input: {
   readonly entityId: string
   readonly fromId: string
@@ -153,6 +178,11 @@ export class FakeStore implements Store {
   readonly summariesById = new Map<string, EntitySummary>()
   summariesError?: Error
   readonly summaryCalls: string[][] = []
+
+  /** 精排富化：优先用显式夹具，其次从 `entitiesById` 推导；每次调用记录 ids 便于断言“只打一次”。 */
+  readonly priorFeaturesById = new Map<string, EntityPriorFeatures>()
+  readonly priorFeaturesCalls: string[][] = []
+  priorFeaturesError?: Error
 
   readonly entitiesById = new Map<string, Entity>()
   readonly entityErrors = new Map<string, Error>()
@@ -224,6 +254,17 @@ export class FakeStore implements Store {
     return ids.flatMap(id => {
       const found = this.summariesById.get(id)
       return found === undefined ? [] : [found]
+    })
+  }
+
+  async priorFeatures(ids: readonly string[]): Promise<EntityPriorFeatures[]> {
+    this.priorFeaturesCalls.push([...ids])
+    if (this.priorFeaturesError !== undefined) throw this.priorFeaturesError
+    return ids.flatMap(id => {
+      const explicit = this.priorFeaturesById.get(id)
+      if (explicit !== undefined) return [explicit]
+      const entity = this.entitiesById.get(id)
+      return entity === undefined ? [] : [featuresOf(entity)]
     })
   }
 
