@@ -13,6 +13,7 @@ import type { RecallScenario } from '../../packages/v7/src/retrieval/types.js'
 import type { RecallInjection } from '../../packages/v7/src/app/recall.js'
 import { messageOf } from './messages.js'
 import { T1ContentWindow, type StepPosition } from './t1.js'
+import { MemoryCheckpointLedger, type MemoryPosition } from './memory-check.js'
 
 const SESSION_STATE_LIMIT = 256
 
@@ -92,6 +93,14 @@ export interface T1Session {
   ): void
   /** 文本里出现的已注入命中记为 adopted（只认这次注入的 receipt kept 且未被隔离）。 */
   adoptPending(sessionId: string, text: string, kind: 'text' | 'tool'): void
+  /** 观察真实用户消息：只有值得长期保存的 strong 信号进入检查点队列。 */
+  observeUserMessage(sessionId: string, text: string, position?: MemoryPosition): void
+  /** 本次 pre-step 要显示的检查点文本；空串表示不显示并应覆盖写空。 */
+  renderMemoryCheckpoint(sessionId: string, position?: MemoryPosition): string
+  /** 成功的 omb_remember/omb_update 销账。 */
+  noteMemoryWrite(sessionId: string, position?: MemoryPosition): void
+  /** 当前未记录信号数；`omb_status`/测试可读。 */
+  memoryPendingCount(sessionId: string): number
   /** 清掉一个 session 的全部会话态（不清 system prompt，那是 hooks 的职责）。 */
   clear(sessionId: string): void
   /** 卸载时清空全部 Map，避免热重载时旧缓存跨实例存活。 */
@@ -109,6 +118,7 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
   const residentCache = new Map<string, { readonly turn: number | undefined; readonly text: string }>()
   const lastT1 = new Map<string, string>()
   const contentWindow = new T1ContentWindow()
+  const memory = new MemoryCheckpointLedger()
 
   function rememberPendingRecall(injection: RecallInjection): void {
     const list = pendingRecall.get(injection.sessionId) ?? []
@@ -224,6 +234,7 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     for (const [callId, entry] of prefetchedT1) {
       if (entry.sessionId === sessionId) prefetchedT1.delete(callId)
     }
+    memory.clear(sessionId)
   }
 
   function dispose(): void {
@@ -236,6 +247,7 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     contentWindow.clearAll()
     currentStep.clear()
     t1Step.clear()
+    memory.dispose()
   }
 
   return {
@@ -257,6 +269,10 @@ export function createT1Session(deps: { readonly store: PostgresStore; readonly 
     rememberInjection,
     recordResidentHits,
     adoptPending,
+    observeUserMessage: (sessionId, text, position) => memory.observeUserMessage(sessionId, text, position ?? {}),
+    renderMemoryCheckpoint: (sessionId, position) => memory.render(sessionId, position ?? {}),
+    noteMemoryWrite: (sessionId, position) => memory.noteWrite(sessionId, position ?? {}),
+    memoryPendingCount: sessionId => memory.pendingCount(sessionId),
     clear,
     dispose,
   }

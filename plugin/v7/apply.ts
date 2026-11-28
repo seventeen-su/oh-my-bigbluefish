@@ -29,6 +29,7 @@ import { RecallEngine } from '../../packages/v7/src/retrieval/engine.js'
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import { Supervisor } from './supervisor.js'
 import { registerSkills } from './skills.js'
+import { registerMemoryProtocol } from './memory-protocol.js'
 import { parseConfig } from './config.js'
 import { createBoot } from './boot.js'
 import { createConsolidationRuntime } from './consolidation.js'
@@ -175,6 +176,16 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     projectionStatusLines: () => projection.statusLines(),
     runtimeStatusLines: () => eventRuntime.runtimeStatusLines(),
     listenStatusLines: () => eventRuntime.listenStatusLines(),
+    promptSurface: () => ({
+      protocol: protocol.available,
+      checkpoint: checkpointSink.available,
+      injection: promptSink.available,
+      reasons: [
+        ...(protocol.reason === undefined ? [] : [`protocol: ${protocol.reason}`]),
+        ...(checkpointSink.reason === undefined ? [] : [`checkpoint: ${checkpointSink.reason}`]),
+        ...(promptSink.reason === undefined ? [] : [`injection: ${promptSink.reason}`]),
+      ],
+    }),
   }
   // 只在 `omb_status` 被真实调用时探测；不在加载期跑状态查询。
   const status = () => createStatusTool(statusDeps)
@@ -192,8 +203,16 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   supervisor.recordToolRegistration(tools)
   // 4 篇功能说明走宿主 skills provider；加载期不读盘，由 provider 惰性读取。
   const skillsOff = registerSkills(ctx, logger)
+  const protocol = registerMemoryProtocol(ctx, logger)
   const promptSink = createPromptSink(ctx)
   if (!promptSink.available) logger.warn(`提示注入未接线：${promptSink.reason ?? '未知原因'}`)
+  // 检查点单独一条 context，紧跟在 T0 后；T0 的数据头不能承载行为要求。
+  const checkpointSink = createPromptSink(ctx, {
+    name: 'omb-v7:memory-checkpoint',
+    orderOffset: 6,
+    required: true,
+  })
+  if (!checkpointSink.available) logger.warn(`记忆检查点未接线：${checkpointSink.reason ?? '未知原因'}`)
 
   const hooks = createHostHooks({
     ctx,
@@ -203,6 +222,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     store,
     engine,
     promptSink,
+    checkpointSink,
     session,
     boards: () => projection.residentBoardsOptions(),
   })
@@ -214,7 +234,9 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     tools,
     capture: hooks.capture,
     skillsOff,
+    protocolOff: protocol.dispose,
     promptSink,
+    checkpointSink,
     hooks: hooks.offs,
     session,
     eventSteps: eventRuntime.teardownSteps(),

@@ -27,12 +27,27 @@ export interface StatusDeps {
   readonly projectionStatusLines: () => Promise<string[]>
   readonly runtimeStatusLines: () => Promise<string[]>
   readonly listenStatusLines: () => string[]
+  /** 主动记忆两条提示通道是否真的接上；不把“代码存在”当成“模型看得到”。 */
+  readonly promptSurface: () => {
+    readonly protocol: boolean
+    readonly checkpoint: boolean
+    /** T0 常驻注入；它与检查点走不同的 context，任一失败都必须可见。 */
+    readonly injection: boolean
+    readonly reasons: readonly string[]
+  }
 }
 
 export async function createStatusTool(deps: StatusDeps): Promise<Result<string>> {
   const { config, supervisor, store, embedder, queue, startup } = deps
   // 宿主面读数：每次状态调用做一次真实自检（tools.get），不轮询、不缓存成 7/7。
   const surfaceLines = supervisor.statusLines()
+  const prompt = deps.promptSurface()
+  const promptLines = prompt.protocol && prompt.checkpoint && prompt.injection
+    ? ['prompt=protocol+checkpoint+t0']
+    : [
+        'prompt=degraded',
+        ...(prompt.reasons.length === 0 ? [] : [`promptReason=${prompt.reasons.join('; ')}`]),
+      ]
   // 持久最终失败与连接探测分开：数据库不可达时也要如实报“查不到”，
   // 不能因为 db=down 就把跨进程的失败显示成 0。
   let finalFailureHealth: {
@@ -68,6 +83,7 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
         ...finalFailureHealth,
       }),
       ...surfaceLines,
+      ...promptLines,
     ].join('\n'))
   }
   const initialized = await startup.ensureReady({ force: true })
@@ -99,6 +115,7 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
       // LISTEN 断连不再静默：connected/reconnects 是运维判断“要不要重启”的第一手读数。
       ...deps.listenStatusLines(),
       ...surfaceLines,
+      ...promptLines,
     ]
     if (!initialized && startup.error !== undefined) {
       lines.push(`startup=degraded`, `reason=${startup.error}`)
@@ -119,6 +136,7 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
         ...finalFailureHealth,
       }),
       ...surfaceLines,
+      ...promptLines,
     ].join('\n'))
   }
 }

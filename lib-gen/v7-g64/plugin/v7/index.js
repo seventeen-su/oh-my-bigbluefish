@@ -1954,12 +1954,12 @@ function contextError(error62, action) {
   return internal(`${action}：${error62 instanceof Error ? error62.message : String(error62)}`);
 }
 function hashText(text2) {
-  let hash2 = 2166136261;
+  let hash3 = 2166136261;
   for (let index = 0; index < text2.length; index += 1) {
-    hash2 ^= text2.charCodeAt(index);
-    hash2 = Math.imul(hash2, 16777619) >>> 0;
+    hash3 ^= text2.charCodeAt(index);
+    hash3 = Math.imul(hash3, 16777619) >>> 0;
   }
-  return hash2.toString(16).padStart(8, "0");
+  return hash3.toString(16).padStart(8, "0");
 }
 function specKey(spec) {
   switch (spec.kind) {
@@ -5387,7 +5387,7 @@ async function appendAuditRow(client, entry) {
     "select hash from omb.audit_log where hash is not null order by id desc limit 1"
   );
   const prevHash = head.rows[0]?.hash ?? null;
-  const hash2 = auditChainHash(prevHash, entry);
+  const hash3 = auditChainHash(prevHash, entry);
   const result = await client.query(
     `insert into omb.audit_log (
        actor, action, target_ids, before, after, inverse, job_id,
@@ -5413,12 +5413,12 @@ async function appendAuditRow(client, entry) {
       entry.causationId ?? null,
       entry.actorKind ?? null,
       prevHash,
-      hash2
+      hash3
     ]
   );
   const row = result.rows[0];
   if (row === void 0) throw new OmbFailure(internal("审计写入没有返回行"));
-  return { id: Number(row.id), hash: hash2, createdAt: row.created_at };
+  return { id: Number(row.id), hash: hash3, createdAt: row.created_at };
 }
 async function insertAudit(client, entry) {
   const inserted = await appendAuditRow(client, {
@@ -8234,7 +8234,8 @@ function readService(ctx, name) {
 function methodOf(value, name) {
   const record2 = asRecord(value);
   const method = record2?.[name];
-  return typeof method === "function" ? method : void 0;
+  if (typeof method !== "function") return void 0;
+  return method.bind(value);
 }
 function readTools(ctx) {
   const raw = readService(ctx, "tools");
@@ -8242,7 +8243,8 @@ function readTools(ctx) {
 }
 function readSystemPrompt(ctx) {
   const raw = readService(ctx, "systemPrompt");
-  return methodOf(raw, "context") === void 0 ? void 0 : raw;
+  const usable = methodOf(raw, "context") !== void 0 || methodOf(raw, "section") !== void 0;
+  return usable ? raw : void 0;
 }
 function sessionFromExec(exec) {
   const record2 = asRecord(exec);
@@ -8290,20 +8292,22 @@ function createLogger(ctx) {
   };
 }
 var MAX_SESSIONS = 256;
-function createPromptSink(ctx) {
+function createPromptSink(ctx, options = {}) {
   const service = readSystemPrompt(ctx);
   const context = methodOf(service, "context");
   if (service === void 0 || context === void 0) {
     return { available: false, reason: "宿主没有 systemPrompt.context", write: () => false, dispose: () => {
     } };
   }
+  const name = options.name ?? "omb-v7:injection";
+  const offset = options.orderOffset ?? 5;
   const texts = /* @__PURE__ */ new Map();
   let order = 210;
   try {
     const getOrder = methodOf(service, "getContextOrder");
     if (getOrder !== void 0) {
       const allocated = getOrder("WEB_SURFACE");
-      if (typeof allocated === "number" && Number.isFinite(allocated)) order = allocated + 5;
+      if (typeof allocated === "number" && Number.isFinite(allocated)) order = allocated + offset;
     }
   } catch {
   }
@@ -8315,7 +8319,13 @@ function createPromptSink(ctx) {
   };
   let disposer;
   try {
-    const returned = context({ name: "omb-v7:injection", order, interpolate: false, text: provider });
+    const returned = context({
+      name,
+      order,
+      interpolate: false,
+      ...options.required === true ? { required: true } : {},
+      text: provider
+    });
     if (typeof returned === "function") disposer = returned;
   } catch (error62) {
     return {
@@ -28270,7 +28280,10 @@ function projectScope(context, scope) {
 function buildRemember(input2, context) {
   const scope = projectScope(context, input2.scope);
   if (scope === void 0) return void 0;
-  const attrs = input2.attrs;
+  let attrs = input2.attrs;
+  if (input2.kind === "memory" && input2.title !== void 0 && attrs?.["title"] === void 0) {
+    attrs = { ...attrs ?? {}, title: input2.title };
+  }
   const base = {
     scope,
     ...attrs !== void 0 ? { attrs } : {},
@@ -28308,7 +28321,7 @@ function createToolDefinitions(runtime) {
   };
   add(
     "omb_remember",
-    "当用户给出长期偏好、已确认事实、任务线索、项目状态或需要分组的内容时调用。状态机可用可选动态属性 statusRule 让后台刷新自动推进状态。返回相似属性名、相似记忆与归档冲突，先复用/去重/建链再写。",
+    "当用户给出长期偏好、已确认事实、决定/结论、项目状态或需要分组的内容时调用；完成一个任务阶段后也应检查结论是否要写。memory 的标题用 title（或 attrs.title），正文用 attrs.body，摘要用 attrs.summary；状态机用 title/status/time。状态机可用可选动态属性 statusRule 让后台刷新自动推进状态。返回相似属性名、相似记忆与归档冲突，先复用/去重/建链再写。",
     toolParameters(rememberSchema),
     async (rawArgs, exec) => {
       const parsed = parseToolArgs(rememberSchema, rawArgs, REMEMBER_ARRAY_LIMITS);
@@ -28968,14 +28981,14 @@ function stableStringify(value) {
   return JSON.stringify(canonicalize(value));
 }
 function fnv1a64(input2) {
-  let hash2 = 0xcbf29ce484222325n;
+  let hash3 = 0xcbf29ce484222325n;
   const prime = 0x100000001b3n;
   const mask = 0xffffffffffffffffn;
   for (let index = 0; index < input2.length; index += 1) {
-    hash2 ^= BigInt(input2.charCodeAt(index));
-    hash2 = hash2 * prime & mask;
+    hash3 ^= BigInt(input2.charCodeAt(index));
+    hash3 = hash3 * prime & mask;
   }
-  return hash2.toString(16).padStart(16, "0");
+  return hash3.toString(16).padStart(16, "0");
 }
 function fingerprint(body) {
   return fnv1a64(stableStringify(body));
@@ -30948,6 +30961,62 @@ function registerSkills(ctx, logger, options = {}) {
   }
 }
 
+// plugin/v7/memory-protocol.ts
+var MEMORY_PROTOCOL_SECTION = "omb-v7:memory-protocol";
+var MEMORY_PROTOCOL_ORDER = 510;
+var MEMORY_PROTOCOL_TEXT = `## 记忆协议（OMB，必须执行）
+
+OMB 是本工作区的长期记忆。只在回复里说“我会记住”不算记住；必须调用工具，并且只有工具返回成功才算写入。
+
+每次出现以下任一情况，在继续任务或给出最终回答前调用 \`omb_remember\`：
+- 用户给出长期偏好、习惯、边界、约束，或“以后/不要/必须/每次”这类跨会话要求；
+- 用户确认一个决定、方案、约定、标准或最终结论；
+- 用户提供稳定的项目事实（路径、端口、版本、环境、仓库、命令、账号等）；
+- 用户纠正了旧事实，或同一事实出现新版本。
+
+如果这是已有状态机的进展、阻塞或完成，用 \`omb_update\` 更新对应状态；新旧结论之间用 \`omb_link\` 建 \`supersedes\` / \`possible_conflict\` 关系。Timeline 任务树只是计划，不是长期记忆；完成一个阶段时，把该阶段的结论、证据和未决问题写进 OMB。
+
+\`omb_remember\` 写入 memory 时至少给 \`category\` 和一个非空属性；优先用 \`attrs.title\` + \`attrs.summary\` + \`attrs.body\`，保留用户原话。工具会返回相似属性、相似记忆和已归档冲突：同内容不要重复写，近似内容先链接，旧结论被推翻时写新条目并链接旧条目。已有状态机的更新必须带 \`expectedRevision\`。
+
+如果判定本轮没有值得长期保存的内容，不要写填充记忆；但如果用户明确给了上面任一类信号，回答里要说明为什么没有写。`;
+var EMPTY = { available: false, reason: "宿主没有 systemPrompt.section", dispose: () => {
+} };
+function registerMemoryProtocol(ctx, logger) {
+  const service = readSystemPrompt(ctx);
+  const section = service === void 0 ? void 0 : methodOf(service, "section");
+  if (service === void 0 || section === void 0) {
+    logger?.warn("记忆协议未注入：宿主没有 systemPrompt.section");
+    return EMPTY;
+  }
+  let order = MEMORY_PROTOCOL_ORDER;
+  try {
+    const getOrder = methodOf(service, "getSectionOrder");
+    if (getOrder !== void 0) {
+      const allocated = getOrder("PLAN_POLICY");
+      if (typeof allocated === "number" && Number.isFinite(allocated)) order = allocated + 10;
+    }
+  } catch {
+  }
+  try {
+    const returned = section({
+      name: MEMORY_PROTOCOL_SECTION,
+      order,
+      text: MEMORY_PROTOCOL_TEXT,
+      interpolate: false
+    });
+    return {
+      available: true,
+      dispose: typeof returned === "function" ? returned : () => {
+      }
+    };
+  } catch (error62) {
+    const reason = error62 instanceof Error ? error62.message : String(error62);
+    logger?.warn(`记忆协议未注入：systemPrompt.section 注册失败`, reason);
+    return { available: false, reason, dispose: () => {
+    } };
+  }
+}
+
 // plugin/v7/config.ts
 var DEFAULT_DATABASE_URL = "postgres://omb:omb@127.0.0.1:5432/omb";
 function parseConfig(raw) {
@@ -31192,7 +31261,7 @@ function createTrustPolicy(options = {}) {
   const sourceCaps = options.sourceCaps ?? DEFAULT_SOURCE_CAPS;
   const mediumThreshold = options.mediumRiskThreshold ?? 0.3;
   const highThreshold = options.highRiskThreshold ?? 0.6;
-  const classify = (input2) => {
+  const classify2 = (input2) => {
     const origin = input2.origin ?? defaultOriginOf(input2.source);
     const actorKind = actorKindOfOrigin(origin);
     const level = clamp012(levels[actorKind]);
@@ -31216,9 +31285,9 @@ function createTrustPolicy(options = {}) {
   return {
     levels,
     sourceCaps,
-    classify,
+    classify: classify2,
     classifyEntity(entity, text2) {
-      return classify({
+      return classify2({
         text: text2 ?? entityContentText(entity),
         source: "memory",
         origin: entity.origin,
@@ -35095,10 +35164,10 @@ var T1ContentWindow = class {
   seq = 0;
   isDuplicate(sessionId, text2, position = {}, entityIds = []) {
     if (text2.trim().length === 0) return false;
-    const hash2 = t1TextHash(text2);
+    const hash3 = t1TextHash(text2);
     const list = this.entries.get(sessionId);
     if (list === void 0) return false;
-    return list.some((entry) => this.withinWindow(entry, position) && (entry.hash === hash2 || overlapsRecent(entry.entityIds, entityIds)));
+    return list.some((entry) => this.withinWindow(entry, position) && (entry.hash === hash3 || overlapsRecent(entry.entityIds, entityIds)));
   }
   remember(sessionId, text2, position = {}, entityIds = []) {
     if (text2.trim().length === 0) return;
@@ -35153,6 +35222,199 @@ function shouldRecallToolResult(input2) {
   return hasStrongSignal(input2.argumentsText) || hasStrongSignal(input2.resultText);
 }
 
+// plugin/v7/memory-check.ts
+import { createHash as createHash6 } from "node:crypto";
+
+// packages/v7/src/domain/memory-signal.ts
+var DURABLE_SIGNAL_LABELS = {
+  preference: "偏好/习惯",
+  decision: "决定/结论",
+  fact: "事实",
+  constraint: "约束/边界",
+  correction: "纠正/更正"
+};
+var MAX_SIGNAL_TEXT = 180;
+var MAX_SIGNALS = 3;
+var CODE_FENCE = /```[\s\S]*?```/g;
+var INLINE_CODE = /`[^`\n]*`/g;
+var PREFERENCE = /(?:记住|记一下|记下|别忘|不要忘|以后|今后|下次|往后|每次|总是|永远|千万别|不要再|别再|偏好|我喜欢|我不喜欢|我习惯|我要求|我希望|我倾向|我更(?:喜欢|愿意)|prefer|from\s+now\s+on|\balways\b|\bnever\b|\bremember\b)/i;
+var DECISION = /(?:我们决定|我决定|已经决定|决定(?:用|采用|选|改)|定稿|最终(?:方案|决定)|就用|采用|按这个来|结论是|定为|设为默认|we\s+decided|\bdecision\b|we(?:'ll|\s+will)\s+use|final\s+(?:plan|decision))/i;
+var CORRECTION = /(?:纠正|更正|说错|收回|其实不是|不是[^。！？!?\n]{1,40}而是|更正一下|\bcorrection\b|\bactually\b)/i;
+var CONSTRAINT_STRONG = /(?:以后|今后|每次|永远|千万不要|不要再|别再|禁止|不允许|只能|不要(?:再|在|把|让))/i;
+var CONSTRAINT_WEAK = /(?:必须|务必|一定要|只能|不要|不能|禁止|不允许|约束|限制|规则|标准|规范|约定|默认)/i;
+var SELF_FACT = /(?:我是|我的|我在|我用|我用的是|我们用的是|本机|这台|这个项目|我的项目|仓库是|路径是|端口是|版本是|环境是|数据库是|部署在|\bworkspace\b|\bmy\s+(?:machine|repo|project)\b|\bi\s+(?:use|am\s+using)\b)/i;
+var PROJECT_FACT = /(?:仓库|项目|路径|端口|版本|环境|数据库|生产|repo(?:sitory)?|\bpath\b|\bport\b|\bversion\b|\bdatabase\b|\benvironment\b)/i;
+var PROJECT_ASSERTION = /(?:是|用|在|为|：|:)/;
+function withoutCode(input2) {
+  return input2.replace(CODE_FENCE, " ").replace(INLINE_CODE, " ");
+}
+function compact2(input2) {
+  return input2.replace(/\s+/g, " ").trim();
+}
+function excerpt(input2) {
+  const text2 = compact2(input2);
+  if (text2.length <= MAX_SIGNAL_TEXT) return text2;
+  let end = MAX_SIGNAL_TEXT;
+  const last = text2.charCodeAt(end - 1);
+  if (last >= 55296 && last <= 56319) end -= 1;
+  return `${text2.slice(0, end)}…`;
+}
+function sentences(input2) {
+  return withoutCode(input2).split(/[。！？!?；;\n]+/).map((part) => part.replace(/^\s*(?:[-*•]|\d+[.)、])\s*/u, "").trim()).filter((part) => part.length > 0);
+}
+function classify(sentence) {
+  if (CORRECTION.test(sentence)) return { kind: "correction", strength: "strong" };
+  if (PREFERENCE.test(sentence)) return { kind: "preference", strength: "strong" };
+  if (DECISION.test(sentence)) return { kind: "decision", strength: "strong" };
+  if (CONSTRAINT_STRONG.test(sentence)) return { kind: "constraint", strength: "strong" };
+  if (SELF_FACT.test(sentence)) return { kind: "fact", strength: "strong" };
+  if (PROJECT_FACT.test(sentence) && PROJECT_ASSERTION.test(sentence)) return { kind: "fact", strength: "strong" };
+  if (CONSTRAINT_WEAK.test(sentence)) return { kind: "constraint", strength: "weak" };
+  return void 0;
+}
+function detectDurableSignals(input2, limit = MAX_SIGNALS) {
+  if (input2.trim().length === 0) return [];
+  const limitValue = Number.isSafeInteger(limit) ? Math.max(1, Math.min(MAX_SIGNALS, limit)) : MAX_SIGNALS;
+  const seen = /* @__PURE__ */ new Set();
+  const signals = [];
+  for (const sentence of sentences(input2)) {
+    const text2 = excerpt(sentence);
+    if (text2.length === 0 || seen.has(text2)) continue;
+    const classified = classify(sentence);
+    if (classified === void 0) continue;
+    seen.add(text2);
+    signals.push({ ...classified, text: text2 });
+    if (signals.length >= limitValue) break;
+  }
+  return signals;
+}
+
+// plugin/v7/memory-check.ts
+var SESSION_LIMIT = 256;
+var PENDING_LIMIT = 4;
+var STALE_STEPS = 3;
+var MAX_EXCERPT = 140;
+function compact3(input2) {
+  return input2.replace(/\s+/g, " ").trim();
+}
+function excerpt2(input2) {
+  const text2 = compact3(input2);
+  if (text2.length <= MAX_EXCERPT) return text2;
+  let end = MAX_EXCERPT;
+  const last = text2.charCodeAt(end - 1);
+  if (last >= 55296 && last <= 56319) end -= 1;
+  return `${text2.slice(0, end)}…`;
+}
+function hash2(input2) {
+  return createHash6("sha256").update(input2).digest("hex").slice(0, 32);
+}
+function kindLabel(kind) {
+  return DURABLE_SIGNAL_LABELS[kind];
+}
+var MemoryCheckpointLedger = class {
+  sessions = /* @__PURE__ */ new Map();
+  /** 观察一条**真实用户**消息；同一 turn 的同一文本只处理一次。 */
+  observeUserMessage(sessionId, text2, position = {}) {
+    const trimmed = text2.trim();
+    if (trimmed.length === 0) return;
+    const state = this.stateOf(sessionId);
+    const digest = hash2(trimmed);
+    if (state.lastUserHash === digest && state.lastUserTurn === position.turn) return;
+    state.lastUserHash = digest;
+    state.lastUserTurn = position.turn;
+    const signals = detectDurableSignals(trimmed, PENDING_LIMIT);
+    if (signals.length === 0) return;
+    for (const signal of signals) {
+      if (state.pending.some((item) => item.text === signal.text && item.kind === signal.kind)) continue;
+      state.seq += 1;
+      state.pending.push({
+        ...signal,
+        ...position.turn === void 0 ? {} : { turn: position.turn },
+        ...position.step === void 0 ? {} : { step: position.step },
+        ...position.turn === void 0 ? {} : { expiresTurn: position.turn + 3 },
+        seq: state.seq
+      });
+    }
+    while (state.pending.length > PENDING_LIMIT) state.pending.shift();
+    state.shown = void 0;
+  }
+  /** 一次成功的 omb_remember/omb_update 销掉当前轮及更早的未记录信号。 */
+  noteWrite(sessionId, position = {}) {
+    const state = this.sessions.get(sessionId);
+    if (state === void 0) return;
+    const writeTurn = position.turn ?? state.lastUserTurn;
+    state.lastWriteTurn = writeTurn;
+    const kept = writeTurn === void 0 ? [] : state.pending.filter((item) => item.turn !== void 0 && item.turn > writeTurn);
+    state.pending.splice(0, state.pending.length, ...kept);
+    state.shown = void 0;
+  }
+  /**
+   * 生成本次 pre-step 的检查点文本；空串表示不显示，并应覆盖写空以清掉旧文本。
+   *
+   * 显示策略：首次/信号变化/跨轮立即显示；同一轮同一信号只在连续 3 步未销账时再显示。
+   */
+  render(sessionId, position = {}) {
+    const state = this.sessions.get(sessionId);
+    const turn = position.turn;
+    if (state !== void 0 && turn !== void 0) {
+      const kept = state.pending.filter((item) => item.expiresTurn === void 0 || turn < item.expiresTurn);
+      state.pending.splice(0, state.pending.length, ...kept);
+    }
+    if (state === void 0 || state.pending.length === 0) {
+      if (state !== void 0) state.shown = void 0;
+      return "";
+    }
+    const missed = state.pending.some((item) => item.turn !== void 0 && position.turn !== void 0 && item.turn < position.turn);
+    const stale = state.pending.some((item) => item.step !== void 0 && position.step !== void 0 && position.step - item.step >= STALE_STEPS);
+    const signature = state.pending.map((item) => `${item.kind}:${item.text}`).join("\0");
+    const level = missed ? "missed" : stale ? "stale" : "new";
+    const key = `${signature}\0${level}`;
+    const shown = state.shown;
+    const sameTurn = shown !== void 0 && shown.turn === position.turn;
+    const recentlyShown = sameTurn && shown.step !== void 0 && position.step !== void 0 && position.step - shown.step < STALE_STEPS;
+    if (shown !== void 0 && shown.key === key && recentlyShown) return "";
+    state.shown = {
+      key,
+      ...position.turn === void 0 ? {} : { turn: position.turn },
+      ...position.step === void 0 ? {} : { step: position.step }
+    };
+    return this.textOf(state, missed, stale);
+  }
+  /** 当前未记录条数；`omb_status`/诊断可读。 */
+  pendingCount(sessionId) {
+    return this.sessions.get(sessionId)?.pending.length ?? 0;
+  }
+  clear(sessionId) {
+    this.sessions.delete(sessionId);
+  }
+  dispose() {
+    this.sessions.clear();
+  }
+  textOf(state, missed, stale) {
+    const lines = [
+      `[OMB 记忆检查点${missed ? "｜上一轮未记录" : ""}]`,
+      `用户已给出 ${state.pending.length} 条值得长期保存的信号，尚未写入：`,
+      ...state.pending.map((item, index) => `${index + 1}. ${kindLabel(item.kind)}：${excerpt2(item.text)}`),
+      "请在最终回答前调用 omb_remember 写入（kind=memory, category=fact，attrs 至少含 title 与 body）；如果这是已有状态机的变化，用 omb_update。若判定不需要长期保存，在回答中说明原因；不要只说“我会记住”。"
+    ];
+    if (missed) lines.push("上一轮已经出现过这些信号；先补写，再继续当前任务。");
+    else if (stale) lines.push("已连续多步未记录；先补写，再继续当前任务。");
+    return lines.join("\n");
+  }
+  stateOf(sessionId) {
+    const existing = this.sessions.get(sessionId);
+    if (existing !== void 0) return existing;
+    const state = { pending: [], seq: 0 };
+    this.sessions.set(sessionId, state);
+    while (this.sessions.size > SESSION_LIMIT) {
+      const oldest = this.sessions.keys().next().value;
+      if (oldest === void 0) break;
+      this.sessions.delete(oldest);
+    }
+    return state;
+  }
+};
+
 // plugin/v7/t1-session.ts
 var SESSION_STATE_LIMIT = 256;
 function rememberSessionState(map2, sessionId, value) {
@@ -35175,6 +35437,7 @@ function createT1Session(deps) {
   const residentCache = /* @__PURE__ */ new Map();
   const lastT1 = /* @__PURE__ */ new Map();
   const contentWindow = new T1ContentWindow();
+  const memory = new MemoryCheckpointLedger();
   function rememberPendingRecall(injection) {
     const list = pendingRecall.get(injection.sessionId) ?? [];
     list.push(injection);
@@ -35260,6 +35523,7 @@ function createT1Session(deps) {
     for (const [callId, entry] of prefetchedT1) {
       if (entry.sessionId === sessionId) prefetchedT1.delete(callId);
     }
+    memory.clear(sessionId);
   }
   function dispose() {
     pendingRecall.clear();
@@ -35271,6 +35535,7 @@ function createT1Session(deps) {
     contentWindow.clearAll();
     currentStep.clear();
     t1Step.clear();
+    memory.dispose();
   }
   return {
     pendingRecall,
@@ -35289,6 +35554,10 @@ function createT1Session(deps) {
     rememberInjection,
     recordResidentHits,
     adoptPending,
+    observeUserMessage: (sessionId, text2, position) => memory.observeUserMessage(sessionId, text2, position ?? {}),
+    renderMemoryCheckpoint: (sessionId, position) => memory.render(sessionId, position ?? {}),
+    noteMemoryWrite: (sessionId, position) => memory.noteWrite(sessionId, position ?? {}),
+    memoryPendingCount: (sessionId) => memory.pendingCount(sessionId),
     clear,
     dispose
   };
@@ -35296,7 +35565,7 @@ function createT1Session(deps) {
 
 // plugin/v7/hooks.ts
 function createHostHooks(deps) {
-  const { ctx, supervisor, logger, config: config2, store, engine, promptSink, session } = deps;
+  const { ctx, supervisor, logger, config: config2, store, engine, promptSink, checkpointSink, session } = deps;
   const clearSessionState = (sessionId) => {
     session.clear(sessionId);
     promptSink.write(sessionId, "");
@@ -35381,6 +35650,13 @@ function createHostHooks(deps) {
       const execRecord = asRecord(exec);
       const name = typeof execRecord?.["name"] === "string" ? execRecord["name"] : "";
       const callId = typeof execRecord?.["callId"] === "string" ? execRecord["callId"] : void 0;
+      const resultRecord = asRecord(result);
+      if ((name === "omb_remember" || name === "omb_update") && resultRecord?.["isError"] !== true) {
+        const writtenSessionId = sessionFromExec(exec)?.sessionId;
+        if (writtenSessionId !== void 0) {
+          session.noteMemoryWrite(writtenSessionId, session.currentStep.get(writtenSessionId) ?? {});
+        }
+      }
       if (name.length === 0 || name.startsWith("omb_")) return decision;
       const context = await resolveToolContext(exec);
       if (context === void 0) return decision;
@@ -35389,7 +35665,6 @@ function createHostHooks(deps) {
       const resultText = toolResultText(result);
       const raw = [name, argumentsText, resultText].filter((part) => part.length > 0).join("\n").slice(0, 8e3);
       if (raw.trim().length === 0) return decision;
-      const resultRecord = asRecord(result);
       const failed = toolFailed(resultRecord?.["isError"] === true, resultText);
       if (!shouldRecallToolResult({ failed, argumentsText, resultText })) {
         if (callId !== void 0) session.prefetchedT1.delete(callId);
@@ -35468,6 +35743,9 @@ function createHostHooks(deps) {
     if (turn !== void 0 && step !== void 0 && stepKey !== void 0) {
       rememberSessionState(session.currentStep, sessionId, { turn, step, key: stepKey });
     }
+    const userText = lastUserText(record2["messages"]);
+    if (userText !== void 0) session.observeUserMessage(sessionId, userText, { turn, step });
+    checkpointSink.write(sessionId, session.renderMemoryCheckpoint(sessionId, { turn, step }));
     const triggered = session.pendingT1.get(sessionId);
     if (triggered !== void 0) {
       session.pendingT1.delete(sessionId);
@@ -35505,7 +35783,6 @@ function createHostHooks(deps) {
       }
       rememberSessionState(session.residentCache, sessionId, { turn, text: resident });
     }
-    const userText = lastUserText(record2["messages"]);
     const toolText = lastToolText(record2["messages"]);
     const recentText = lastRoundsText(record2["messages"], 2);
     const eventSource = [triggered?.query, recentText, userText, toolText].filter((part) => typeof part === "string" && part.trim().length > 0).join("\n");
@@ -35624,6 +35901,11 @@ function createHostHooks(deps) {
 async function createStatusTool(deps) {
   const { config: config2, supervisor, store, embedder, queue, startup } = deps;
   const surfaceLines = supervisor.statusLines();
+  const prompt = deps.promptSurface();
+  const promptLines = prompt.protocol && prompt.checkpoint && prompt.injection ? ["prompt=protocol+checkpoint+t0"] : [
+    "prompt=degraded",
+    ...prompt.reasons.length === 0 ? [] : [`promptReason=${prompt.reasons.join("; ")}`]
+  ];
   let finalFailureHealth = {};
   if (config2.jobs) {
     try {
@@ -35649,7 +35931,8 @@ async function createStatusTool(deps) {
         failures: queue.handlerFailures(),
         ...finalFailureHealth
       }),
-      ...surfaceLines
+      ...surfaceLines,
+      ...promptLines
     ].join("\n"));
   }
   const initialized = await startup.ensureReady({ force: true });
@@ -35680,7 +35963,8 @@ async function createStatusTool(deps) {
       ...await deps.runtimeStatusLines(),
       // LISTEN 断连不再静默：connected/reconnects 是运维判断“要不要重启”的第一手读数。
       ...deps.listenStatusLines(),
-      ...surfaceLines
+      ...surfaceLines,
+      ...promptLines
     ];
     if (!initialized && startup.error !== void 0) {
       lines.push(`startup=degraded`, `reason=${startup.error}`);
@@ -35700,7 +35984,8 @@ async function createStatusTool(deps) {
         failures: queue.handlerFailures(),
         ...finalFailureHealth
       }),
-      ...surfaceLines
+      ...surfaceLines,
+      ...promptLines
     ].join("\n"));
   }
 }
@@ -35836,7 +36121,15 @@ function createDisposer(options) {
     } catch {
     }
     try {
+      options.protocolOff();
+    } catch {
+    }
+    try {
       options.promptSink.dispose();
+    } catch {
+    }
+    try {
+      options.checkpointSink.dispose();
     } catch {
     }
     try {
@@ -35985,7 +36278,17 @@ function apply(ctx, rawConfig) {
     startup: boot.startup,
     projectionStatusLines: () => projection.statusLines(),
     runtimeStatusLines: () => eventRuntime.runtimeStatusLines(),
-    listenStatusLines: () => eventRuntime.listenStatusLines()
+    listenStatusLines: () => eventRuntime.listenStatusLines(),
+    promptSurface: () => ({
+      protocol: protocol.available,
+      checkpoint: checkpointSink.available,
+      injection: promptSink.available,
+      reasons: [
+        ...protocol.reason === void 0 ? [] : [`protocol: ${protocol.reason}`],
+        ...checkpointSink.reason === void 0 ? [] : [`checkpoint: ${checkpointSink.reason}`],
+        ...promptSink.reason === void 0 ? [] : [`injection: ${promptSink.reason}`]
+      ]
+    })
   };
   const status = () => createStatusTool(statusDeps);
   const runtime = createToolRuntime({
@@ -35999,8 +36302,15 @@ function apply(ctx, rawConfig) {
   const tools = registerTools(ctx, runtime, logger);
   supervisor.recordToolRegistration(tools);
   const skillsOff = registerSkills(ctx, logger);
+  const protocol = registerMemoryProtocol(ctx, logger);
   const promptSink = createPromptSink(ctx);
   if (!promptSink.available) logger.warn(`提示注入未接线：${promptSink.reason ?? "未知原因"}`);
+  const checkpointSink = createPromptSink(ctx, {
+    name: "omb-v7:memory-checkpoint",
+    orderOffset: 6,
+    required: true
+  });
+  if (!checkpointSink.available) logger.warn(`记忆检查点未接线：${checkpointSink.reason ?? "未知原因"}`);
   const hooks = createHostHooks({
     ctx,
     supervisor,
@@ -36009,6 +36319,7 @@ function apply(ctx, rawConfig) {
     store,
     engine,
     promptSink,
+    checkpointSink,
     session,
     boards: () => projection.residentBoardsOptions()
   });
@@ -36018,7 +36329,9 @@ function apply(ctx, rawConfig) {
     tools,
     capture: hooks.capture,
     skillsOff,
+    protocolOff: protocol.dispose,
     promptSink,
+    checkpointSink,
     hooks: hooks.offs,
     session,
     eventSteps: eventRuntime.teardownSteps(),

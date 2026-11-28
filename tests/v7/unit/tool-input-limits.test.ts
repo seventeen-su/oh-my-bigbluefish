@@ -107,6 +107,33 @@ describe('v7 工具输入上限与校验失败摘要', () => {
     expect(stub.calls).toEqual(['remember', 'status'])
   })
 
+  it('给定 memory 顶层 title 当调用 remember 则映射到 attrs.title，不静默丢弃', async () => {
+    const stub = stubRuntime()
+    await runRemember(stub, {
+      kind: 'memory',
+      category: 'fact',
+      title: '本机有 GitHub CLI',
+      attrs: { body: '可以直接用 gh' },
+    })
+    expect(stub.remembered[0]).toMatchObject({
+      kind: 'memory',
+      attrs: { title: '本机有 GitHub CLI', body: '可以直接用 gh' },
+    })
+  })
+
+  it('给定 attrs.title 与顶层 title 同时存在当调用 remember 则保留 attrs.title', async () => {
+    const stub = stubRuntime()
+    await runRemember(stub, {
+      kind: 'memory',
+      category: 'fact',
+      title: '顶层标题',
+      attrs: { title: '属性标题', body: '正文' },
+    })
+    expect(stub.remembered[0]).toMatchObject({
+      attrs: { title: '属性标题', body: '正文' },
+    })
+  })
+
   it('给定 remember 参数当生成宿主 JSON Schema 则数组与字符串带上限', () => {
     const stub = stubRuntime()
     const properties = propertiesOf(stub.runtime, 'omb_remember')

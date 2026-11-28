@@ -18,6 +18,7 @@ import {
 interface RegisteredContext {
   readonly name: string
   readonly order: number
+  readonly required?: boolean
   readonly text: (assembleContext: unknown) => string
 }
 
@@ -43,6 +44,25 @@ function registeredContext(registered: unknown[]): RegisteredContext {
 }
 
 describe('DSH 宿主适配器：prompt sink 注册形状', () => {
+  it('给定服务方法是普通原型方法当调用则保留 this，不把 this 丢成 undefined', () => {
+    const registered: unknown[] = []
+    const service = {
+      marker: 'service',
+      context(this: { marker: string }, arg: unknown) {
+        if (this.marker !== 'service') throw new Error('this 丢失')
+        registered.push(arg)
+        return () => {}
+      },
+    }
+    const ctx = { get: (name: string) => (name === 'systemPrompt' ? service : undefined) } as HostContextLike
+
+    const sink = createPromptSink(ctx)
+
+    expect(sink.available).toBe(true)
+    expect(registered).toHaveLength(1)
+    expect((registered[0] as { name: string }).name).toBe('omb-v7:injection')
+  })
+
   it('给定宿主没有 getContextOrder 当注册则仍以对象式注册并可由 provider 供文本', () => {
     const host = fakeHost()
     const sink = createPromptSink(host.ctx)
@@ -60,6 +80,20 @@ describe('DSH 宿主适配器：prompt sink 注册形状', () => {
     createPromptSink(host.ctx)
 
     expect(registeredContext(host.registered).order).toBe(205)
+  })
+
+  it('给定检查点名称/偏移/required 当注册则独立于 T0 通道并保留 required', () => {
+    const host = fakeHost(() => 200)
+    createPromptSink(host.ctx, {
+      name: 'omb-v7:memory-checkpoint',
+      orderOffset: 6,
+      required: true,
+    })
+
+    const context = registeredContext(host.registered)
+    expect(context.name).toBe('omb-v7:memory-checkpoint')
+    expect(context.order).toBe(206)
+    expect(context.required).toBe(true)
   })
 
   it('给定同一 session 覆盖写当读 provider 则返回最后一次文本（空串清旧依赖此语义）', () => {

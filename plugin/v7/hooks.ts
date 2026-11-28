@@ -73,6 +73,8 @@ export interface HostHooksDeps {
   readonly store: PostgresStore
   readonly engine: RecallEngine
   readonly promptSink: PromptSink
+  /** 主动记忆检查点通道；与 T0 分开，避免被“仅数据”头压成数据。 */
+  readonly checkpointSink: PromptSink
   readonly session: T1Session
   /** T0 优先读投影看板；投影未启动时返回 undefined（回退写模型路径）。 */
   readonly boards: () => ResidentBoardsOptions | undefined
@@ -90,7 +92,7 @@ export interface HostHooksHandle {
 }
 
 export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
-  const { ctx, supervisor, logger, config, store, engine, promptSink, session } = deps
+  const { ctx, supervisor, logger, config, store, engine, promptSink, checkpointSink, session } = deps
 
   /** 清掉一个 session 的全部 T0/T1 会话态，并清空它的 system prompt 文本。 */
   const clearSessionState = (sessionId: string): void => {
@@ -195,6 +197,14 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       const execRecord = asRecord(exec)
       const name = typeof execRecord?.['name'] === 'string' ? execRecord['name'] : ''
       const callId = typeof execRecord?.['callId'] === 'string' ? execRecord['callId'] : undefined
+      const resultRecord = asRecord(result)
+      // 成功的记忆写入在这里销账；即使下一步 pre-step 还没到，检查点也应尽快关闭。
+      if ((name === 'omb_remember' || name === 'omb_update') && resultRecord?.['isError'] !== true) {
+        const writtenSessionId = sessionFromExec(exec)?.sessionId
+        if (writtenSessionId !== undefined) {
+          session.noteMemoryWrite(writtenSessionId, session.currentStep.get(writtenSessionId) ?? {})
+        }
+      }
       // OMB 自己的工具结果不需要再被 OMB 召回，避免自激。
       if (name.length === 0 || name.startsWith('omb_')) return decision
       const context = await resolveToolContext(exec)
@@ -204,7 +214,6 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       const resultText = toolResultText(result)
       const raw = [name, argumentsText, resultText].filter(part => part.length > 0).join('\n').slice(0, 8_000)
       if (raw.trim().length === 0) return decision
-      const resultRecord = asRecord(result)
       const failed = toolFailed(resultRecord?.['isError'] === true, resultText)
       // 普通成功工具不召回：只有失败，或参数/结果带路径、错误码、代码样式标识符才进入 T1。
       if (!shouldRecallToolResult({ failed, argumentsText, resultText })) {
@@ -303,6 +312,11 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     if (turn !== undefined && step !== undefined && stepKey !== undefined) {
       rememberSessionState(session.currentStep, sessionId, { turn, step, key: stepKey })
     }
+    const userText = lastUserText(record['messages'])
+    // 主动记忆：每次 pre-step 都看最后一条真实用户消息（同一文本在同 turn 只入队一次），
+    // 再把检查点写到独立的 context 通道。空串也覆盖写，避免上一轮检查点残留。
+    if (userText !== undefined) session.observeUserMessage(sessionId, userText, { turn, step })
+    checkpointSink.write(sessionId, session.renderMemoryCheckpoint(sessionId, { turn, step }))
     const triggered = session.pendingT1.get(sessionId)
     if (triggered !== undefined) {
       session.pendingT1.delete(sessionId)
@@ -349,7 +363,6 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       }
       rememberSessionState(session.residentCache, sessionId, { turn, text: resident })
     }
-    const userText = lastUserText(record['messages'])
     const toolText = lastToolText(record['messages'])
     const recentText = lastRoundsText(record['messages'], 2)
     const eventSource = [triggered?.query, recentText, userText, toolText]

@@ -33,7 +33,9 @@ export interface HostToolsLike {
 
 export interface HostSystemPromptLike {
   context?(...args: unknown[]): unknown
+  section?(...args: unknown[]): unknown
   getContextOrder?(name: string): number
+  getSectionOrder?(name: string): number
 }
 
 export type ToolContext = RuntimeContext
@@ -56,7 +58,10 @@ export function readService(ctx: HostContextLike | undefined, name: string): unk
 export function methodOf(value: unknown, name: string): ((...args: never[]) => unknown) | undefined {
   const record = asRecord(value)
   const method = record?.[name]
-  return typeof method === 'function' ? method as (...args: never[]) => unknown : undefined
+  if (typeof method !== 'function') return undefined
+  // 服务方法是原型上的普通方法，提取后直接调用会丢 `this`；DSH 的
+  // `SystemPrompt.context/section`、`jobs.read` 等都依赖 `this`，所以统一绑定。
+  return (method as (...args: never[]) => unknown).bind(value)
 }
 
 export function readTools(ctx: HostContextLike | undefined): HostToolsLike | undefined {
@@ -66,7 +71,8 @@ export function readTools(ctx: HostContextLike | undefined): HostToolsLike | und
 
 export function readSystemPrompt(ctx: HostContextLike | undefined): HostSystemPromptLike | undefined {
   const raw = readService(ctx, 'systemPrompt')
-  return methodOf(raw, 'context') === undefined ? undefined : raw as HostSystemPromptLike
+  const usable = methodOf(raw, 'context') !== undefined || methodOf(raw, 'section') !== undefined
+  return usable ? raw as HostSystemPromptLike : undefined
 }
 
 export function sessionFromExec(exec: unknown): ToolContext | undefined {
@@ -132,21 +138,32 @@ export interface PromptSink {
   dispose(): void
 }
 
+interface PromptSinkOptions {
+  /** context 名；默认是 T0 的 `omb-v7:injection`。 */
+  readonly name?: string
+  /** 相对 `WEB_SURFACE` 的偏移；默认 5，检查点用 6 紧跟在 T0 后。 */
+  readonly orderOffset?: number
+  /** 可选运行时上下文被关闭时仍保留；检查点需要它。 */
+  readonly required?: boolean
+}
+
 const MAX_SESSIONS = 256
 
-export function createPromptSink(ctx: HostContextLike | undefined): PromptSink {
+export function createPromptSink(ctx: HostContextLike | undefined, options: PromptSinkOptions = {}): PromptSink {
   const service = readSystemPrompt(ctx)
   const context = methodOf(service, 'context')
   if (service === undefined || context === undefined) {
     return { available: false, reason: '宿主没有 systemPrompt.context', write: () => false, dispose: () => {} }
   }
+  const name = options.name ?? 'omb-v7:injection'
+  const offset = options.orderOffset ?? 5
   const texts = new Map<string, string>()
   let order = 210
   try {
     const getOrder = methodOf(service, 'getContextOrder') as ((name: string) => unknown) | undefined
     if (getOrder !== undefined) {
       const allocated = getOrder('WEB_SURFACE')
-      if (typeof allocated === 'number' && Number.isFinite(allocated)) order = allocated + 5
+      if (typeof allocated === 'number' && Number.isFinite(allocated)) order = allocated + offset
     }
   } catch {
     // 顺序只影响提示位置，不影响正确性。
@@ -159,7 +176,13 @@ export function createPromptSink(ctx: HostContextLike | undefined): PromptSink {
   }
   let disposer: (() => void) | undefined
   try {
-    const returned = (context as (arg: unknown) => unknown)({ name: 'omb-v7:injection', order, interpolate: false, text: provider })
+    const returned = (context as (arg: unknown) => unknown)({
+      name,
+      order,
+      interpolate: false,
+      ...(options.required === true ? { required: true } : {}),
+      text: provider,
+    })
     if (typeof returned === 'function') disposer = returned as () => void
   } catch (error) {
     return {

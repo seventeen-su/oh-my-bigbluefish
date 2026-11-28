@@ -200,7 +200,12 @@ function projectScope(context: ToolContext, scope: 'global' | 'project' | undefi
 function buildRemember(input: z.infer<typeof rememberSchema>, context: ToolContext): WriteEntityInput | undefined {
   const scope = projectScope(context, input.scope)
   if (scope === undefined) return undefined
-  const attrs = input.attrs as Record<string, RawAttributeValue> | undefined
+  let attrs = input.attrs as Record<string, RawAttributeValue> | undefined
+  // memory 的 title 是可选属性：模型常把标题放在顶层（与 state/chain 一致），
+  // 这里映射到 attrs.title，避免“调用成功但标题被静默丢弃”。
+  if (input.kind === 'memory' && input.title !== undefined && attrs?.['title'] === undefined) {
+    attrs = { ...(attrs ?? {}), title: input.title }
+  }
   const base = {
     scope,
     ...(attrs !== undefined ? { attrs } : {}),
@@ -246,7 +251,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_remember',
-    '当用户给出长期偏好、已确认事实、任务线索、项目状态或需要分组的内容时调用。状态机可用可选动态属性 statusRule 让后台刷新自动推进状态。返回相似属性名、相似记忆与归档冲突，先复用/去重/建链再写。',
+    '当用户给出长期偏好、已确认事实、决定/结论、项目状态或需要分组的内容时调用；完成一个任务阶段后也应检查结论是否要写。memory 的标题用 title（或 attrs.title），正文用 attrs.body，摘要用 attrs.summary；状态机用 title/status/time。状态机可用可选动态属性 statusRule 让后台刷新自动推进状态。返回相似属性名、相似记忆与归档冲突，先复用/去重/建链再写。',
     toolParameters(rememberSchema),
     async (rawArgs, exec) => {
       const parsed = parseToolArgs(rememberSchema, rawArgs, REMEMBER_ARRAY_LIMITS)

@@ -19,7 +19,11 @@ export interface DisposerOptions {
   /** session/event 捕获面。 */
   readonly capture: { dispose(): void }
   readonly skillsOff: () => void
+  /** 常驻记忆协议 section 的注销；未接线时是空函数。 */
+  readonly protocolOff: () => void
   readonly promptSink: { dispose(): void }
+  /** 主动记忆检查点 context；与 T0 分开注销。 */
+  readonly checkpointSink: { dispose(): void }
   readonly hooks: {
     readonly preStep: (() => void) | undefined
     readonly toolPreExecute: (() => void) | undefined
@@ -60,7 +64,17 @@ export function createDisposer(options: DisposerOptions): () => void {
       // 注销失败不阻断卸载。
     }
     try {
+      options.protocolOff()
+    } catch {
+      // 注销失败不阻断卸载。
+    }
+    try {
       options.promptSink.dispose()
+    } catch {
+      // 同上。
+    }
+    try {
+      options.checkpointSink.dispose()
     } catch {
       // 同上。
     }

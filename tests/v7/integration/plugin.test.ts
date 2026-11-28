@@ -20,6 +20,8 @@ interface FakeHost {
   ctx: HostContextLike
   readonly tools: Map<string, HostToolDefinition>
   readonly promptText: Map<string, string>
+  readonly sections: Map<string, string>
+  readonly contexts: Map<string, (input: unknown) => string>
   readonly listeners: Map<string, (...args: unknown[]) => unknown>
   readonly logs: string[]
   provider: ((input: unknown) => string) | undefined
@@ -28,10 +30,21 @@ interface FakeHost {
 function fakeHost(): FakeHost {
   const tools = new Map<string, HostToolDefinition>()
   const promptText = new Map<string, string>()
+  const sections = new Map<string, string>()
+  const contexts = new Map<string, (input: unknown) => string>()
   const listeners = new Map<string, (...args: unknown[]) => unknown>()
   const logs: string[] = []
   const push = (level: string, message: unknown) => { logs.push(`${level} ${typeof message === 'string' ? message : JSON.stringify(message)}`) }
-  const host: FakeHost = { ctx: undefined as unknown as HostContextLike, tools, promptText, listeners, logs, provider: undefined }
+  const host: FakeHost = {
+    ctx: undefined as unknown as HostContextLike,
+    tools,
+    promptText,
+    sections,
+    contexts,
+    listeners,
+    logs,
+    provider: undefined,
+  }
   const ctx = {
     get: (name: string) => {
       if (name === 'tools') {
@@ -47,10 +60,25 @@ function fakeHost(): FakeHost {
       if (name === 'systemPrompt') {
         return {
           getContextOrder: () => 200,
+          getSectionOrder: () => 500,
+          section: (arg: unknown) => {
+            const record = arg as { name?: string; text?: string }
+            if (record.name !== undefined && typeof record.text === 'string') sections.set(record.name, record.text)
+            return () => {
+              if (record.name !== undefined) sections.delete(record.name)
+            }
+          },
           context: (arg: unknown) => {
             const record = arg as { name?: string; text?: (input: unknown) => string }
-            if (typeof record.text === 'function') host.provider = record.text
-            return () => {}
+            if (record.name !== undefined && typeof record.text === 'function') {
+              contexts.set(record.name, record.text)
+              // 既有测试用 host.provider 读 T0；检查点用 contexts 单独读。
+              if (record.name === 'omb-v7:injection') host.provider = record.text
+            }
+            return () => {
+              if (record.name !== undefined) contexts.delete(record.name)
+              if (record.name === 'omb-v7:injection') host.provider = undefined
+            }
           },
         }
       }
@@ -206,6 +234,11 @@ function t1TextOf(decision: unknown): string {
     .join('\n')
 }
 
+/** 主动记忆检查点走独立的 systemPrompt.context，不能和 T0 provider 混读。 */
+function checkpointText(host: FakeHost, sessionId: string): string {
+  return host.contexts.get('omb-v7:memory-checkpoint')?.({ agent: { session: { id: sessionId } } }) ?? ''
+}
+
 describe('v7 plugin entry', () => {
   beforeAll(async () => {
     await prepareDatabase()
@@ -280,6 +313,7 @@ describe('v7 plugin entry', () => {
     // 宿主面自检：7 个工具与 4 个钩子都真实接线。
     expect(status?.text).toContain('tools=7/7')
     expect(status?.text).toContain('hooks=4/4')
+    expect(status?.text).toContain('prompt=protocol+checkpoint+t0')
 
     const preStep = host.listeners.get('agent/pre-step')
     expect(preStep).toBeDefined()
@@ -1422,6 +1456,51 @@ describe('v7 plugin entry', () => {
     ) as { additionalContexts?: unknown[] } | undefined
     // 步键与指纹缓存都已清空：同一片段可以重新投递，不会命中残留去重。
     expect(again?.additionalContexts).toHaveLength(1)
+    dispose()
+  })
+
+  it('主动记忆：协议 section 已注册，长期信号显示检查点，omb_remember 成功后销账', async () => {
+    const host = fakeHost()
+    const dispose = apply(host.ctx, {
+      databaseUrl: TEST_DATABASE_URL,
+      autoMigrate: true,
+      jobs: false,
+      residentBudget: 300,
+    })
+    expect(host.sections.get('omb-v7:memory-protocol')).toContain('必须调用工具')
+    expect(host.sections.get('omb-v7:memory-protocol')).toContain('Timeline 任务树只是计划')
+
+    const session = { id: 'memory-checkpoint-session', header: { cwd: PROJECT } }
+    const exec = { agent: { session } }
+    const preStep = host.listeners.get('agent/pre-step')
+    const payload = {
+      agent: exec.agent,
+      messages: [{ source: { kind: 'user' }, content: '以后不要在我电脑生产端做实验' }],
+      turn: 1,
+      step: 1,
+    }
+    const first = await preStep?.(payload, async () => ({ kind: 'enter', messages: [] }))
+    expect(checkpointText(host, session.id)).toContain('[OMB 记忆检查点]')
+    expect(checkpointText(host, session.id)).toContain('以后不要在我电脑生产端做实验')
+    // 检查点是运行时 context，不是 T1 注入消息，不能混账。
+    expect(t1TextOf(first)).not.toContain('记忆检查点')
+
+    const remembered = await host.tools.get('omb_remember')?.execute({
+      kind: 'memory',
+      category: 'fact',
+      title: '不在生产端做实验',
+      attrs: { body: '用户明确要求以后不要在本机生产端做实验' },
+    }, exec)
+    expect(remembered?.ok).toBe(true)
+    const postExecute = host.listeners.get('tools/post-execute')
+    await postExecute?.(
+      { name: 'omb_remember', callId: 'call-memory-1', arguments: {}, agent: exec.agent },
+      { isError: false, content: [{ type: 'text', text: '已写入' }] },
+      async () => ({ kind: 'accept' }),
+    )
+
+    await preStep?.({ ...payload, step: 2 }, async () => ({ kind: 'enter', messages: [] }))
+    expect(checkpointText(host, session.id)).toBe('')
     dispose()
   })
 

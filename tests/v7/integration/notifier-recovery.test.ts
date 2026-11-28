@@ -222,9 +222,12 @@ function fakeHost(): FakeHost {
       if (name === 'systemPrompt') {
         return {
           getContextOrder: () => 200,
+          getSectionOrder: () => 500,
+          section: () => () => {},
           context: (arg: unknown) => {
             const record = arg as { name?: string; text?: (input: unknown) => string }
-            if (typeof record.text === 'function') host.provider = record.text
+            // 现在有 T0 与检查点两条 context；host.provider 只代表 T0。
+            if (record.name === 'omb-v7:injection' && typeof record.text === 'function') host.provider = record.text
             return () => {}
           },
         }
