@@ -31,8 +31,10 @@ export interface RerankPriors {
   readonly pinned: number
   /** 属性 标签/tags 含「偏好」时的乘数。 */
   readonly preferenceTag: number
-  /** 历史被采用率（adoption/access）触发的乘数上限。 */
+  /** 使用证据（Reference/Utilization/Validation 的平滑置信度）触发的乘数上限。 */
   readonly adopted: number
+  /** 被用户否定/证伪的负向乘数（只在实际 refutationRate > 0 时生效）。 */
+  readonly refuted: number
   /** 来源为后台自动生成（origin 含 job/auto/...）时的降权乘数。 */
   readonly jobOrigin: number
   /** 链路强度（图扩展分）触发的乘数上限。 */
@@ -86,6 +88,7 @@ function priors(overrides: Partial<RerankPriors> = {}): RerankPriors {
     pinned: 1,
     preferenceTag: 1,
     adopted: 1,
+    refuted: 0.8,
     jobOrigin: 1,
     linkStrength: 1,
     history: 1,
@@ -103,7 +106,7 @@ function priors(overrides: Partial<RerankPriors> = {}): RerankPriors {
  * - last-time：时间窗放宽、时间通道加权。
  */
 export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = Object.freeze({
-  version: 'v7-retrieval-1',
+  version: 'v7-retrieval-2',
   rrfK: 60,
   seedLimit: 8,
   channelLimit: 50,

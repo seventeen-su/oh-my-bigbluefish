@@ -20,6 +20,9 @@ import type {
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
+  UsageEvidenceInput,
+  UsageEvidenceLevel,
+  UsageExposureInput,
 } from '../../../../packages/v7/src/ports/observability.js'
 import type {
   ChannelHit,
@@ -65,6 +68,8 @@ export interface FakeEntityInput {
   readonly pinned?: boolean
   readonly accessCount?: number
   readonly adoptionCount?: number
+  readonly utilityConfidence?: number
+  readonly refutationRate?: number
 }
 
 export function entity(input: FakeEntityInput): Entity {
@@ -91,6 +96,8 @@ export function entity(input: FakeEntityInput): Entity {
     salience: 0,
     accessCount: input.accessCount ?? 0,
     adoptionCount: input.adoptionCount ?? 0,
+    ...(input.utilityConfidence === undefined ? {} : { utilityConfidence: input.utilityConfidence }),
+    ...(input.refutationRate === undefined ? {} : { refutationRate: input.refutationRate }),
     isCurrent: true,
     createdAt: FIXED_NOW,
     updatedAt: FIXED_NOW,
@@ -315,6 +322,17 @@ export class FakeStore implements Store {
 
   async markAdopted(_traceId: string, _entityId: string, _kind: string): Promise<void> {
     throw new Error('fake store 未实现 markAdopted')
+  }
+
+  readonly exposures: UsageExposureInput[] = []
+  readonly usage: { level: UsageEvidenceLevel; input: UsageEvidenceInput }[] = []
+
+  async recordExposure(input: UsageExposureInput): Promise<void> {
+    this.exposures.push(input)
+  }
+
+  async recordUsage(level: UsageEvidenceLevel, input: UsageEvidenceInput): Promise<void> {
+    this.usage.push({ level, input })
   }
 
   async listAudit(_limit: number, _targetId?: string): Promise<AuditRecord[]> {

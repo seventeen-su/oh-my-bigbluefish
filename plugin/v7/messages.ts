@@ -121,7 +121,7 @@ export function formatPatch(result: Awaited<ReturnType<UpdateService['update']>>
 }
 
 /** 从 DSH content block 数组提取可检索文本；图片等非文本块跳过。 */
-function contentText(value: unknown): string {
+export function contentText(value: unknown): string {
   if (typeof value === 'string') return value
   if (Array.isArray(value)) return value.map(contentText).filter(part => part.length > 0).join('\n')
   const record = asRecord(value)

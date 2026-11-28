@@ -50,7 +50,18 @@ export interface Entity {
   readonly pinned: boolean
   readonly salience: number
   readonly accessCount: number
+  /**
+   * 旧口径采用计数（字符串命中即 adopted）。只为兼容读保留；
+   * 重排/遗忘不再使用，新逻辑读 `utilityConfidence` / `refutationRate`。
+   */
   readonly adoptionCount: number
+  /**
+   * 使用机会的 Beta-Binomial 平滑效用置信度（0–1，不是 adoptionRate）。
+   * 只由 store 读路径按 adoption_metric 的计数计算；无使用机会时缺省。
+   */
+  readonly utilityConfidence?: number
+  /** 被用户否定/证伪的机会占比（0–1）；>0 时才进入负向先验。 */
+  readonly refutationRate?: number
   readonly lastAccessedAt?: string
   readonly archivedAt?: string
   readonly archiveReason?: string

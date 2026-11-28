@@ -129,25 +129,46 @@ export class PostgresMaintenance implements MaintenanceQueries {
       updated_at: Date | string
       revision: string
     }>(
-      `select v.entity_id,
-              (0.45 * exp(-extract(epoch from (now() - v.updated_at)) / 86400.0 / 30.0)
-               + 0.20 * least(1.0, e.adoption_count::float / greatest(1, e.access_count))
-               + 0.15 * coalesce(e.confidence, 0.5)
-               + 0.10 * (case v.category when 'fact' then 0.9 when 'clue' then 0.6 else 0.3 end)
-               + 0.10 * (case v.kind when 'state' then 0.8 else 0.5 end)) as salience,
-              v.category, e.pinned, v.updated_at, e.revision
-       from omb.entity_view v
-       join omb.entity e on e.id = v.entity_id
-       where v.kind = 'memory' and v.archived_at is null and v.is_current and e.pinned = false
-         and not (v.attrs @> '{"tags":["偏好"]}'::jsonb)
-         and coalesce(v.attrs->>'标签', '') <> '偏好'
-         and (0.45 * exp(-extract(epoch from (now() - v.updated_at)) / 86400.0 / 30.0)
-              + 0.20 * least(1.0, e.adoption_count::float / greatest(1, e.access_count))
-              + 0.15 * coalesce(e.confidence, 0.5)
-              + 0.10 * (case v.category when 'fact' then 0.9 when 'clue' then 0.6 else 0.3 end)
-              + 0.10 * (case v.kind when 'state' then 0.8 else 0.5 end)) < $1
-       order by salience asc
-       limit $2`,
+      // 采用证据改造后的长期遗忘口径：
+      // - 只有机会级的 Reference/Utilization/Validation 进入 utility_confidence，
+      //   Validation 最强；Exposure/accessCount 只做观测，不参与显著度；
+      // - 无使用机会时 0.10 中性项（既不因旧 adoption_count 虚高留下，也不因
+      //   “从没被验证”额外惩罚）；
+      // - refutation 是负向证据：0.10 * (1 + utility - refutationRate)，最低 0。
+      // - 因此 access_count 单独变化不会提高显著度或降低遗忘概率；只有证据会。
+      `with evidence as (
+         select v.entity_id, v.category, v.kind, e.confidence, e.pinned, v.updated_at,
+                e.revision,
+                (case when coalesce(m.opportunities, 0) = 0 then 0
+                      else ((greatest(0,
+                               least(m.opportunities,
+                                     m.validated_count * 1.0 + m.utilized_count * 0.5 + m.referenced_count * 0.2)
+                               - m.refuted_count * 0.75) + 1.0)
+                            / (m.opportunities + 5.0))
+                 end) as utility_confidence,
+                (case when coalesce(m.opportunities, 0) = 0 then 0
+                      else least(1.0, m.refuted_count::float / m.opportunities)
+                 end) as refutation_rate
+           from omb.entity_view v
+           join omb.entity e on e.id = v.entity_id
+           left join omb.adoption_metric m on m.entity_id = v.entity_id
+          where v.kind = 'memory' and v.archived_at is null and v.is_current and e.pinned = false
+            and not (v.attrs @> '{"tags":["偏好"]}'::jsonb)
+            and coalesce(v.attrs->>'标签', '') <> '偏好'
+       ), scored as (
+         select entity_id, category, pinned, updated_at, revision,
+                (0.45 * exp(-extract(epoch from (now() - updated_at)) / 86400.0 / 30.0)
+                 + 0.10 * (1 + utility_confidence - refutation_rate)
+                 + 0.15 * coalesce(confidence, 0.5)
+                 + 0.10 * (case category when 'fact' then 0.9 when 'clue' then 0.6 else 0.3 end)
+                 + 0.10 * (case kind when 'state' then 0.8 else 0.5 end)) as salience
+           from evidence
+       )
+       select entity_id, salience, category, pinned, updated_at, revision
+         from scored
+        where salience < $1
+        order by salience asc
+        limit $2`,
       [threshold, Math.max(1, Math.min(200, limit))],
     )
     return rows.rows.map(row => ({

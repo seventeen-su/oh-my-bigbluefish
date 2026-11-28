@@ -49,6 +49,7 @@ const STATE_IN_PROGRESS = 'st_77777777-7777-4777-8777-777777777777'
 const STATE_COMPLETED = 'st_88888888-8888-4888-8888-888888888888'
 
 const NEW_TABLES = [
+  'adoption_metric',
   'adoption_stat',
   'co_recall_pair',
   'outbox',
@@ -58,6 +59,7 @@ const NEW_TABLES = [
   'similar_cache',
   'state_board',
   'timer',
+  'usage_opportunity',
   'workflow_run',
   'workflow_step',
 ] as const
@@ -671,6 +673,20 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
   let legacyAuditBefore: AuditLegacyRow
   let legacyAuditAfter: AuditLegacyRow
   let legacyAuditEventColumns: AuditEventColumns
+  let legacyAdoptionMetric: {
+    entity_id: string
+    retrieved_count: string
+    opportunities: string
+    referenced_count: string
+    validated_count: string
+    legacy_adopted_count: string
+  } | undefined
+  let legacyAdoptionEvent: {
+    referenced_at: Date | null
+    reference_kind: string | null
+    reference_source: string | null
+    validated_at: Date | null
+  } | undefined
   let emptyContract: ContractSnapshot
   let legacyContract: ContractSnapshot
 
@@ -717,6 +733,33 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     legacyContract = await snapshotContract(client)
     legacyAuditAfter = await readLegacyAudit(client)
     legacyAuditEventColumns = await readAuditEventColumns(client)
+    const adoptionMetric = await client.query<{
+      entity_id: string
+      retrieved_count: string
+      opportunities: string
+      referenced_count: string
+      validated_count: string
+      legacy_adopted_count: string
+    }>(
+      `select entity_id, retrieved_count::text, opportunities::text, referenced_count::text,
+              validated_count::text, legacy_adopted_count::text
+         from omb.adoption_metric where entity_id = $1`,
+      [PREF_TAGS],
+    )
+    legacyAdoptionMetric = adoptionMetric.rows[0]
+    const adoptionEvent = await client.query<{
+      referenced_at: Date | null
+      reference_kind: string | null
+      reference_source: string | null
+      validated_at: Date | null
+    }>(
+      `select referenced_at, reference_kind, reference_source, validated_at
+         from omb.recall_event
+        where trace_id = 'trace-1' and entity_id = $1
+        order by id limit 1`,
+      [PREF_TAGS],
+    )
+    legacyAdoptionEvent = adoptionEvent.rows[0]
 
     // --- 已有库回填两次 -------------------------------------------------
     seededBackfillFirst = await runBackfill(BACKFILL_BATCH)
@@ -792,6 +835,21 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     for (const row of nullability.rows) expect(row.is_nullable).toBe('YES')
   })
 
+  it('给定旧 adopted_at 当迁移则降级为 Referenced 候选，Validated 与使用机会都不回填', () => {
+    expect(legacyAdoptionEvent?.referenced_at).not.toBeNull()
+    expect(legacyAdoptionEvent?.reference_kind).toBe('text')
+    expect(legacyAdoptionEvent?.reference_source).toBe('legacy-adoption')
+    expect(legacyAdoptionEvent?.validated_at).toBeNull()
+    expect(legacyAdoptionMetric).toMatchObject({
+      entity_id: PREF_TAGS,
+      retrieved_count: '2',
+      opportunities: '0',
+      referenced_count: '0',
+      validated_count: '0',
+      legacy_adopted_count: '1',
+    })
+  })
+
   it('给定已有 007 库当跑迁移则应用 008+ 及后续迁移且旧审计行与新列可空性符合预期', () => {
     expect(legacyReport.applied).toEqual(migrationFiles().filter(name => name >= EXPAND_MIGRATION))
     expect(legacyReport.total).toBe(migrationFiles().length)
@@ -808,7 +866,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
   it('给定已有库迁移后则旧表列定义只保留 P0/P2，audit_log 事件列保留且 011 旧列消失', () => {
     const legacyTables = Object.keys(legacyColumnsBefore)
     for (const table of legacyTables) {
-      if (['audit_log', 'entity_view', 'chain_member', 'attr_registry'].includes(table)) continue
+      if (['audit_log', 'entity_view', 'chain_member', 'attr_registry', 'recall_event'].includes(table)) continue
       expect(legacyColumnsAfter[table], `${table} 的列定义不应变化`).toEqual(legacyColumnsBefore[table])
     }
     const legacyAuditColumns = legacyColumnsBefore.audit_log ?? []
@@ -977,7 +1035,8 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
          from information_schema.columns
         where table_schema = 'omb' and table_name in
           ('outbox','projection_task','projection_watermark','workflow_run','workflow_step','timer',
-           'preference_board','state_board','adoption_stat','co_recall_pair','similar_cache')`,
+           'preference_board','state_board','adoption_stat','adoption_metric','usage_opportunity',
+           'co_recall_pair','similar_cache')`,
     )
     const shapeMap = new Map(shape.rows.map(row => [`${row.table_name}.${row.column_name}`, row]))
     const expected: ReadonlyArray<readonly [string, string, string]> = [
@@ -998,6 +1057,10 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
       ['preference_board.revision', 'bigint', 'NO'],
       ['state_board.status', 'text', 'NO'],
       ['adoption_stat.injected', 'integer', 'NO'],
+      ['adoption_metric.opportunities', 'bigint', 'NO'],
+      ['adoption_metric.legacy_adopted_count', 'bigint', 'NO'],
+      ['usage_opportunity.exposures', 'integer', 'NO'],
+      ['usage_opportunity.task_id', 'text', 'NO'],
       ['co_recall_pair.traces', 'integer', 'NO'],
       ['similar_cache.score', 'real', 'NO'],
     ]

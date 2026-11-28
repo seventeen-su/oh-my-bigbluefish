@@ -41,6 +41,7 @@ import {
   toolResultText,
   withTimeout,
 } from './messages.js'
+import { evidenceFromSessionEvent } from './adoption-evidence.js'
 import type { V7Config } from './config.js'
 import { rememberSessionState, type PrefetchedT1, type T1Session } from './t1-session.js'
 
@@ -104,20 +105,24 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     promptSink.write(sessionId, '')
   }
 
-  const observeEvent = (sessionId: string, type: string, data: unknown): void => {
+  /**
+   * session/event 的单一入口：先按事件形状归一化成采用证据，再处理 T1 触发/压缩。
+   *
+   * 返回 Promise 只为了让测试/组合根能在事件处理完后读取证据；宿主忽略返回值也不影响
+   * 投递。这里不做“看到标题/ID 就 adopted”：引用由 adoption-evidence 判定，验证由
+   * 独立的用户确认/工具成功/任务完成触发。
+   */
+  const observeEvent = (sessionId: string, type: string, data: unknown): void | Promise<void> => {
     const text = eventText(data)
-    if (type === 'assistant/message') {
-      session.adoptPending(sessionId, text, 'text')
-      return
+    const evidence = evidenceFromSessionEvent(type, data)
+    // 任务边界必须先同步生效：后续 Exposure/证据才能落到正确的 (session, task) 机会。
+    for (const item of evidence) {
+      if (item.kind === 'task-state') session.observeTaskState(sessionId, item.taskId, item.taskStatus ?? 'active')
+      // 完成的任务不再作为后续 Exposure 的当前任务；验证本身由事件显式 taskId 定位。
+      if (item.kind === 'task-completed') session.observeTaskState(sessionId, item.taskId, 'cleared')
     }
-    if (type === 'tool/call') {
-      session.adoptPending(sessionId, text, 'tool')
-      return
-    }
-    if (type === 'tool/result') {
-      session.adoptPending(sessionId, text, 'tool')
-      return
-    }
+    const actionable = evidence.filter(item => item.kind !== 'task-state')
+    const ingestion = actionable.length === 0 ? undefined : session.ingestEvidence(sessionId, actionable)
     if (type.startsWith('compaction/')) {
       session.residentCache.delete(sessionId)
       // 压缩后旧工具结果的 T1 已经过期；丢掉 immediateT1 与指纹，让待消费事件重新召回。
@@ -125,7 +130,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       session.lastT1.delete(sessionId)
       session.clearT1Content(sessionId)
       session.pendingT1.set(sessionId, { scenario: 'session-start', query: text.slice(0, 4_000) })
-      return
+      return ingestion
     }
     if (isRecallTriggerEvent(type)) {
       session.residentCache.delete(sessionId)
@@ -135,6 +140,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       // 若每次触发都清窗口，60–90 步内同一段 T1 会反复注入。只有 compaction/* 才重计。
       session.pendingT1.set(sessionId, { scenario: 'session-start', query: text.slice(0, 4_000) })
     }
+    return ingestion
   }
 
   const capture = createEventCapture({
@@ -277,6 +283,8 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         session.rememberInjection(sessionId, deliveredNotice)
         // 文本真正挂到 additionalContexts 后才把 recall_event 标成 injected。
         await store.markRecallInjected?.(deliveredNotice.traceId)
+        // 事件驱动地记录 Exposure；下一步证据到达时机会已经存在。
+        await session.flushEvidence(sessionId)
       }
       // 只登记真正投递出去的 T1：下一轮 pre-step 认领它，本步配额同时记为已用。
       session.rememberT1Content(sessionId, injected, position, deliveredNotice?.receipt?.keptIds)
@@ -367,9 +375,14 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         void store.recordResidentTrace(trace).catch(error => {
           logger.warn('T0 常驻 trace 写入失败', messageOf(error))
         })
-        // 偏好与（读模型路径的）状态都必须写 recall_event，后续才能记录 adopted。
-        session.recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻偏好', built.preferenceHits)
-        session.recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻状态', built.stateHits)
+        // 偏好与（读模型路径的）状态都必须写 recall_event，后续才能记录引用/验证。
+        // 等待落库再返回：这不是轮询，而是让“本次注入的候选”在下一步事件到达前已可查。
+        await Promise.all([
+          session.recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻偏好', built.preferenceHits),
+          session.recordResidentHits(sessionId, turn, built.trace.traceId, 'T0 常驻状态', built.stateHits),
+        ])
+        // T0 的 Exposure 也是事件驱动写入；等它落库后本步才返回（不是轮询）。
+        await session.flushEvidence(sessionId)
       }
       rememberSessionState(session.residentCache, sessionId, { turn, text: resident })
     }
@@ -462,6 +475,8 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
         session.rememberInjection(prepared.sessionId, prepared.notice)
         // 只有消息真的追加进 decision.messages 才把 recall_event 标成 injected。
         await store.markRecallInjected?.(prepared.notice.traceId)
+        // 记录本步的 Exposure（机会聚合在 store 内完成，重复召回不会重复累计）。
+        await session.flushEvidence(prepared.sessionId)
       }
       session.rememberT1Content(prepared.sessionId, prepared.text, {
         ...(prepared.turn === undefined ? {} : { turn: prepared.turn }),

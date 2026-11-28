@@ -104,9 +104,19 @@ export function rerankPrior(context: PriorContext): PriorResult {
     apply('tag:偏好', scenario.priors.preferenceTag)
   }
 
-  if (entity !== undefined && entity.accessCount > 0 && entity.adoptionCount > 0) {
-    const rate = Math.min(1, entity.adoptionCount / entity.accessCount)
-    apply(`adoption:${format(rate)}`, 1 + (scenario.priors.adopted - 1) * rate)
+  // 使用证据只认机会级、平滑后的 utilityConfidence：
+  // - Reference/Utilization/Validation 按受控权重进入，Validation 最强；
+  // - 单纯 Exposure/accessCount 不在这里加分，避免“检索自己→更容易被检索”的正反馈；
+  // - 旧的 adoptionCount/accessCount 字符串命中口径已从重排移除；
+  // - 无有效证据时保持中性（不乘任何因子）。
+  const utility = entity?.utilityConfidence ?? 0
+  if (entity !== undefined && utility > 0) {
+    apply(`utility:${format(utility)}`, 1 + (scenario.priors.adopted - 1) * utility)
+  }
+  // 负向证据：只在实际存在 refutation 时降权，且乘数下限仍由全局 clamp 保护。
+  const refutation = entity?.refutationRate ?? 0
+  if (entity !== undefined && refutation > 0) {
+    apply(`refuted:${format(refutation)}`, 1 - (1 - scenario.priors.refuted) * refutation)
   }
 
   if (entity !== undefined && /(^|[-_:])(job|auto|consolidat|background)/i.test(entity.origin)) {

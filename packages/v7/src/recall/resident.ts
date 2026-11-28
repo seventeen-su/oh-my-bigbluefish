@@ -29,10 +29,12 @@ const DEFAULT_BOARDS_WATERMARK_MAX_AGE_MS = 30_000
 const RESIDENT_PREFERENCE_LIMIT = 5
 const RESIDENT_STATE_LIMIT = 5
 
-/** 一条被实际注入的命中；用于 recall_event + 采用判定。 */
+/** 一条被实际注入的命中；用于 recall_event + 采用证据。 */
 interface ResidentHit {
   readonly id: string
   readonly title?: string
+  /** 注入时的实体更新时间：之后实体被改/归档就不能再升 Validated。 */
+  readonly updatedAt?: string
 }
 
 export interface RecallNotice {
@@ -55,6 +57,7 @@ interface ResidentBoardItem {
   readonly title?: string
   readonly summary?: string
   readonly status?: StateStatus
+  readonly updatedAt?: string
 }
 
 export interface ResidentBoardsQuery {
@@ -194,7 +197,11 @@ function notifyHits(
   if (hits.length === 0 && receipt === undefined) return
   sink?.({
     traceId,
-    hits: hits.map(hit => ({ id: hit.entityId, ...(hit.title !== undefined ? { title: hit.title } : {}) })),
+    hits: hits.map(hit => ({
+      id: hit.entityId,
+      ...(hit.title !== undefined ? { title: hit.title } : {}),
+      ...(hit.updatedAt === undefined ? {} : { updatedAt: hit.updatedAt }),
+    })),
     ...(receipt === undefined ? {} : { receipt }),
     ...(text === undefined ? {} : { text }),
   })
@@ -273,7 +280,11 @@ function compactBoardSummaries(
     if (label.length === 0) continue
     seen.add(item.entityId)
     const title = item.title?.trim()
-    kept.push({ id: item.entityId, ...(title !== undefined && title.length > 0 ? { title } : {}) })
+    kept.push({
+      id: item.entityId,
+      ...(title !== undefined && title.length > 0 ? { title } : {}),
+      ...(item.updatedAt !== undefined ? { updatedAt: item.updatedAt } : {}),
+    })
     parts.push(`${label}（${item.entityId}）`)
     if (kept.length >= max) break
   }
@@ -633,6 +644,7 @@ export async function buildResident(
       : (fallbackPreferences ?? []).slice(0, RESIDENT_PREFERENCE_LIMIT).map(item => ({
           id: item.id,
           ...(item.title !== undefined && item.title.length > 0 ? { title: item.title } : {}),
+          ...(item.updatedAt === undefined ? {} : { updatedAt: item.updatedAt }),
         }))
     : []
   const stateHits = usedBoards && blockVisible(stateBlockId) ? boardStateHits : []

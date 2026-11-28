@@ -47,7 +47,7 @@ export function formatRecall(result: RecallResult, extraWarnings: readonly strin
 export interface RecallInjection {
   readonly sessionId: string
   readonly traceId: string
-  readonly hits: readonly { readonly id: string; readonly title?: string }[]
+  readonly hits: readonly { readonly id: string; readonly title?: string; readonly updatedAt?: string }[]
 }
 
 const LAST_TIME_QUERY = /(?:上次|上回|之前|以前|原来|早先|先前|去年|last\s+time|previously|earlier|used\s+to)/i
@@ -94,7 +94,9 @@ export class RecallService {
       ...(input.limit !== undefined ? { limit: input.limit } : {}),
       ...(timeWindow !== undefined ? { timeWindow } : {}),
       ...(context.sessionId !== undefined ? { sessionId: context.sessionId } : {}),
-      injected: false,
+      // T2 的格式化结果会作为工具结果回到模型上下文，属于“真正投递”；
+      // 与 T1 的延迟投递不同，这里没有额外 gate，检索成功即算 Retrieved。
+      injected: true,
     }
     try {
       const result = await this.engine.recall(request)
@@ -117,7 +119,11 @@ export class RecallService {
       this.onRecall?.({
         sessionId: context.sessionId,
         traceId: result.traceId,
-        hits: result.hits.map(hit => ({ id: hit.entityId, ...(hit.title !== undefined ? { title: hit.title } : {}) })),
+        hits: result.hits.map(hit => ({
+          id: hit.entityId,
+          ...(hit.title !== undefined ? { title: hit.title } : {}),
+          updatedAt: hit.updatedAt,
+        })),
       })
       return ok(formatRecall(result, [...dependencyWarnings].sort()))
     } catch (error) {

@@ -293,6 +293,7 @@ describe('RecallEngine 阶段一与融合', () => {
       confidence: 1,
       adoptionCount: 10,
       accessCount: 10,
+      utilityConfidence: 0.9,
       origin: 'user',
     }))
 

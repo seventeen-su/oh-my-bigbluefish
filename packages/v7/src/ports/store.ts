@@ -30,6 +30,9 @@ import type {
   ResidentTraceInput,
   RollbackResult,
   StoreStats,
+  UsageEvidenceInput,
+  UsageEvidenceLevel,
+  UsageExposureInput,
 } from './observability.js'
 
 /**
@@ -163,6 +166,20 @@ export interface Store {
   markAccessed?(ids: readonly string[]): Promise<void>
   /** 按静态属性值查活跃实体；后台收敛（goalId/taskId/自动分组键）使用。 */
   findByAttribute?(name: string, value: JsonValue, kind?: EntityKind): Promise<string | undefined>
+  /**
+   * 记录一次曝光：同一 `(entityId, sessionId, taskId)` 只创建一个使用机会，
+   * 重复曝光只增加机会内的 exposures 计数；不增加任何显著度。
+   */
+  recordExposure(input: UsageExposureInput): Promise<void>
+  /**
+   * 记录一条引用/使用/验证/证伪证据。机会级状态只升级一次；指标按机会计数，
+   * 因此同一任务里多次引用/验证不会重复累计成功次数。
+   */
+  recordUsage(level: UsageEvidenceLevel, input: UsageEvidenceInput): Promise<void>
+  /**
+   * 旧口径：字符串命中直接记 adopted。仅为历史调用方/数据播种保留，
+   * 插件采用链不再调用；重排与遗忘也不读它。
+   */
   markAdopted(traceId: string, entityId: string, kind: string): Promise<void>
   listAudit(limit: number, targetId?: string): Promise<AuditRecord[]>
   /**

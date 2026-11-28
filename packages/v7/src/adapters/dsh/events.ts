@@ -32,8 +32,8 @@ export function createEventCapture(options: {
   ctx: HostContextLike | undefined
   store: Store
   logger?: Logger
-  /** 原始事件观察者：adoption / T1 触发用；不改变 artifact 捕获语义。 */
-  onEvent?: (sessionId: string, type: string, data: unknown) => void
+  /** 原始事件观察者：采用证据 / T1 触发用；不改变 artifact 捕获语义。 */
+  onEvent?: (sessionId: string, type: string, data: unknown) => void | Promise<void>
   /**
    * 项目身份解析。组合根注入与工具上下文共用的解析器/缓存；缺省时捕获器自己建
    * 一个（仍然每个 cwd 只解析一次，绝不轮询）。
@@ -51,7 +51,7 @@ export function createEventCapture(options: {
   const resolveIdentity = options.resolveIdentity
     ?? ((cwd: string, sessionId: string) => fallbackIdentity?.resolve(cwd, sessionId) ?? Promise.resolve(undefined))
 
-  const listener = (session: unknown, event: unknown): void => {
+  const listener = (session: unknown, event: unknown): void | Promise<void> => {
     if (disposed) return
     events += 1
     const sessionId = sessionIdOf(session)
@@ -63,12 +63,19 @@ export function createEventCapture(options: {
     const type = typeof record['type'] === 'string' ? record['type'] : undefined
     const seq = typeof record?.['seq'] === 'number' && Number.isSafeInteger(record['seq']) ? record['seq'] : undefined
     if (sessionId === undefined || type === undefined || seq === undefined) return
+    let observation: void | Promise<void> = undefined
     try {
-      options.onEvent?.(sessionId, type, record['data'])
+      observation = options.onEvent?.(sessionId, type, record['data'])
     } catch (error) {
       options.logger?.warn('session/event 观察者失败', error instanceof Error ? error.message : String(error))
     }
-    if (!CAPTURE_PREFIXES.some(prefix => type.startsWith(prefix))) return
+    if (!CAPTURE_PREFIXES.some(prefix => type.startsWith(prefix))) {
+      return observation === undefined
+        ? undefined
+        : observation.catch(error => {
+            options.logger?.warn('session/event 采用证据处理失败', error instanceof Error ? error.message : String(error))
+          })
+    }
     const raw = JSON.stringify(record['data'] ?? null)
     const content = raw.length > MAX_CONTENT ? raw.slice(0, MAX_CONTENT) : raw
     void (async () => {
@@ -108,6 +115,11 @@ export function createEventCapture(options: {
       errors += 1
       options.logger?.warn('事件原文落盘失败', error instanceof Error ? error.message : String(error))
     })
+    return observation === undefined
+      ? undefined
+      : observation.catch(error => {
+          options.logger?.warn('session/event 采用证据处理失败', error instanceof Error ? error.message : String(error))
+        })
   }
 
   try {

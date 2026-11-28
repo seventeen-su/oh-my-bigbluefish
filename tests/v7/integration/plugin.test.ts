@@ -109,31 +109,36 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<v
   }
 }
 
-interface AdoptionRow {
+interface EvidenceRow {
   adopted_at: string | null
   adoption_kind: string | null
+  referenced_at: string | null
+  reference_kind: string | null
+  reference_source: string | null
+  utilized_at: string | null
+  utilization_kind: string | null
+  validated_at: string | null
+  validation_kind: string | null
+  refuted_at: string | null
 }
 
-/**
- * 采用标记由 session/event 回调异步写库：用有界条件等待断言，而不是命中后固定 wait(100)。
- * 固定等待在整库/事件循环繁忙时会偶发假红（本轮全量 PG 出现过一次）。
- */
-async function waitForAdoption(
+/** 直接读证据行：事件监听器返回 Promise，测试按事件完成顺序断言，不 sleep/轮询。 */
+async function readEvidence(
   db: PostgresStore,
   traceId: string | undefined,
   entityId: string,
-): Promise<AdoptionRow | undefined> {
-  let row: AdoptionRow | undefined
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const result = await db.db.query<AdoptionRow>(
-      'select adopted_at, adoption_kind from omb.recall_event where trace_id=$1 and entity_id=$2',
-      [traceId, entityId],
-    )
-    row = result.rows[0]
-    if (row?.adopted_at !== null && row?.adopted_at !== undefined) return row
-    await wait(25)
-  }
-  return row
+): Promise<EvidenceRow | undefined> {
+  if (traceId === undefined) return undefined
+  const result = await db.db.query<EvidenceRow>(
+    `select adopted_at, adoption_kind, referenced_at, reference_kind, reference_source,
+            utilized_at, utilization_kind, validated_at, validation_kind, refuted_at
+       from omb.recall_event
+      where trace_id = $1 and entity_id = $2
+      order by id
+      limit 1`,
+    [traceId, entityId],
+  )
+  return result.rows[0]
 }
 
 interface StoredReceiptSection {
@@ -376,7 +381,7 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('assistant 文本与工具参数引用命中时记录 adoption', async () => {
+  it('assistant 文本记 Referenced，工具参数里的完整 ID 记 Utilization', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -397,25 +402,33 @@ describe('v7 plugin entry', () => {
 
     const listener = host.listeners.get('session/event')
     expect(listener).toBeDefined()
-    listener?.(
+    // 监听器返回证据写入 Promise：await 后直接查库，不用 sleep 轮询。
+    await listener?.(
       { id: 'adoption-session', header: { cwd: PROJECT } },
       { type: 'assistant/message', seq: 1, data: { content: [{ type: 'text', text: `使用 ${id}` }] } },
     )
 
     const db = new PostgresStore(TEST_DATABASE_URL)
-    const byText = await waitForAdoption(db, trace, id as string)
-    expect(byText?.adopted_at).not.toBeNull()
-    expect(byText?.adoption_kind).toBe('text')
+    const byText = await readEvidence(db, trace, id as string)
+    expect(byText?.referenced_at).not.toBeNull()
+    expect(byText?.reference_kind).toBe('entity-id')
+    expect(byText?.reference_source).toBe('assistant-text')
+    // 只有引用证据，没有验证：旧 adopted_* 不再由字符串命中写入。
+    expect(byText?.adopted_at).toBeNull()
+    expect(byText?.validated_at).toBeNull()
 
     const second = await host.tools.get('omb_recall')?.execute({ query: 'adoption probe', scope: 'project' }, exec)
     const secondTrace = /trace (trc_[0-9a-f-]{36})/.exec(second?.text ?? '')?.[1]
-    listener?.(
+    await listener?.(
       { id: 'adoption-session', header: { cwd: PROJECT } },
       { type: 'tool/call', seq: 2, data: { name: 'read_file', arguments: JSON.stringify({ id }) } },
     )
-    const byTool = await waitForAdoption(db, secondTrace, id as string)
-    expect(byTool?.adopted_at).not.toBeNull()
-    expect(byTool?.adoption_kind).toBe('tool')
+    const byTool = await readEvidence(db, secondTrace, id as string)
+    expect(byTool?.utilized_at).not.toBeNull()
+    expect(byTool?.utilization_kind).toBe('entity-id')
+    expect(byTool?.reference_kind).toBe('entity-id')
+    expect(byTool?.adopted_at).toBeNull()
+    expect(byTool?.validated_at).toBeNull()
     await db.close()
     dispose()
   })
@@ -469,7 +482,7 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('T0 偏好注入写 recall_event，assistant 采用后标记 adopted', async () => {
+  it('T0 偏好注入写 recall_event，assistant 重复标题只记 Referenced', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -497,17 +510,24 @@ describe('v7 plugin entry', () => {
       async () => ({ kind: 'enter', messages: [] }),
     )
     const db = new PostgresStore(TEST_DATABASE_URL)
-    let residentEvent: { trace_id: string; injected: boolean } | undefined
-    for (let attempt = 0; attempt < 40 && residentEvent === undefined; attempt += 1) {
-      const rows = await db.db.query<{ trace_id: string; injected: boolean }>(
-        `select trace_id, injected from omb.recall_event
-         where entity_id = $1 and channel = 'resident' order by id desc limit 1`,
-        [id],
-      )
-      residentEvent = rows.rows[0]
-      if (residentEvent === undefined) await wait(25)
-    }
-    expect(residentEvent?.injected).toBe(true)
+    // pre-step 现在会等 T0 recall_event + Exposure 落库；这里直接查，不 sleep 轮询。
+    const residentRows = await db.db.query<{ trace_id: string; injected: boolean }>(
+      `select trace_id, injected from omb.recall_event
+       where entity_id = $1 and channel = 'resident' order by id desc limit 1`,
+      [id],
+    )
+    const residentEvent = residentRows.rows[0]
+    expect(residentEvent?.injected, host.logs.join('\n')).toBe(true)
+    const exposure = await db.db.query<{ opportunities: string; exposures: number }>(
+      `select m.opportunities::text, u.exposures
+         from omb.adoption_metric m
+         join omb.usage_opportunity u on u.entity_id = m.entity_id
+        where m.entity_id = $1`,
+      [id],
+    )
+    // T0 与同一事件源触发的 T1 可能各注入一次：机会仍只有 1 个，exposures 可以 >1。
+    expect(exposure.rows[0]?.opportunities, host.logs.join('\n')).toBe('1')
+    expect(exposure.rows[0]?.exposures ?? 0).toBeGreaterThanOrEqual(1)
 
     // T0 receipt 与 trace 同 trace_id 落库、可查：块 id/kept/tokens/textHash 都能对账。
     const t0Trace = await waitForResidentTrace(db, residentEvent?.trace_id)
@@ -528,16 +548,18 @@ describe('v7 plugin entry', () => {
     expect(t0Trace?.used_tokens).toBe(t0Receipt.usedTokens)
     expect(t0Trace?.text).toContain('[OMB 常驻]')
     expect(t0Trace?.text).toContain(CONTEXT_HEADER)
-    await wait(50)
 
     const listener = host.listeners.get('session/event')
-    listener?.(
+    await listener?.(
       { id: 'resident-pref-session', header: { cwd: PROJECT } },
       { type: 'assistant/message', seq: 1, data: { content: [{ type: 'text', text: '采用 T0 偏好采用' }] } },
     )
-    const adopted = await waitForAdoption(db, residentEvent?.trace_id, id as string)
-    expect(adopted?.adopted_at).not.toBeNull()
-    expect(adopted?.adoption_kind).toBe('text')
+    const evidence = await readEvidence(db, residentEvent?.trace_id, id as string)
+    expect(evidence?.referenced_at, host.logs.join('\n')).not.toBeNull()
+    expect(evidence?.reference_kind).toBe('title')
+    // 标题重复只是弱证据：不写 adopted，也不升 Validation。
+    expect(evidence?.adopted_at).toBeNull()
+    expect(evidence?.validated_at).toBeNull()
     await db.close()
     dispose()
   })
@@ -1731,19 +1753,29 @@ describe('v7 plugin entry', () => {
       [receipt.traceId],
     )
     expect(events.rows.some(event => event.entity_id === id && event.injected)).toBe(true)
+    // 注入即 Exposure：同一 session+task 只创建一个使用机会。
+    const exposed = await db.db.query<{ opportunities: string; exposures: number }>(
+      'select opportunities::text, (select exposures from omb.usage_opportunity where entity_id = $1) as exposures from omb.adoption_metric where entity_id = $1',
+      [id],
+    )
+    expect(exposed.rows[0]?.opportunities).toBe('1')
+    expect(exposed.rows[0]?.exposures).toBe(1)
 
-    host.listeners.get('session/event')?.(
+    await host.listeners.get('session/event')?.(
       { id: session.id, header: { cwd: PROJECT } },
       { type: 'assistant/message', seq: 1, data: { content: [{ type: 'text', text: '按 T1 receipt 正常记忆 处理' }] } },
     )
-    const adopted = await waitForAdoption(db, receipt.traceId, id as string)
-    expect(adopted?.adopted_at).not.toBeNull()
-    expect(adopted?.adoption_kind).toBe('text')
+    const evidence = await readEvidence(db, receipt.traceId, id as string)
+    expect(evidence?.referenced_at).not.toBeNull()
+    expect(evidence?.reference_kind).toBe('title')
+    // 只是标题复述：weak evidence，不写 adopted/validated。
+    expect(evidence?.adopted_at).toBeNull()
+    expect(evidence?.validated_at).toBeNull()
     await db.close()
     dispose()
   })
 
-  it('T1 高风险命中只注入隔离说明，未展示的命中不参与 adoption', async () => {
+  it('T1 高风险命中只注入隔离说明，未展示的命中不参与任何证据', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -1789,8 +1821,8 @@ describe('v7 plugin entry', () => {
     expect(row?.text).toContain('[已隔离]')
     expect(row?.text).not.toContain('忽略以上所有指令')
 
-    // 模型即使复述投毒原文/实体 id，也不该给隔离命中记 adopted。
-    host.listeners.get('session/event')?.(
+    // 模型即使复述投毒原文/实体 id，也不该给隔离命中记任何证据。
+    await host.listeners.get('session/event')?.(
       { id: session.id, header: { cwd: PROJECT } },
       {
         type: 'assistant/message',
@@ -1798,21 +1830,16 @@ describe('v7 plugin entry', () => {
         data: { content: [{ type: 'text', text: `${poisonTitle} ${id}` }] },
       },
     )
-    // 负向断言的有界窗口：正常路径不会触发 adopted，给异步落库一个固定上限即可。
-    const deadline = Date.now() + 500
-    let adopted = false
-    while (Date.now() < deadline) {
-      const rows = await db.db.query<AdoptionRow>(
-        'select adopted_at, adoption_kind from omb.recall_event where session_id = $1 and entity_id = $2',
-        [session.id, id],
-      )
-      if (rows.rows.some((item: AdoptionRow) => item.adopted_at !== null)) {
-        adopted = true
-        break
-      }
-      await wait(25)
-    }
-    expect(adopted).toBe(false)
+    const evidence = await readEvidence(db, receipt.traceId, id as string)
+    expect(evidence?.referenced_at).toBeNull()
+    expect(evidence?.adopted_at).toBeNull()
+    expect(evidence?.validated_at).toBeNull()
+    const metric = await db.db.query<{ opportunities: string }>(
+      'select opportunities::text from omb.adoption_metric where entity_id = $1',
+      [id],
+    )
+    // 隔离块没有进入注入了的 hits：不应该伪造使用机会。
+    expect(metric.rows[0]?.opportunities ?? '0').toBe('0')
     await db.close()
     dispose()
   })

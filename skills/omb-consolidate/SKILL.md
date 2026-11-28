@@ -15,7 +15,7 @@ user-invocable: false
 - 冲突：只比较最近 30 条事实类记忆，属性值矛盾时写双向 `possible_conflict`；手工 `omb_link unlinkId=...` 取消后写入抑制表，不再自动标记。
 - 线索转事实：先跑引用腐化检测；`evidence` 里至少两个不同 `session:<id>`，或 `userConfirmed=true`/`assertedBy=user`，或 `verified=true` 才转 `fact`。这些属性没有系统写入者，必须由写入方显式提供。
 - 链接建议：共同召回 ≥2 次写 `co_recalled` 链接（强度 = min(1, 次数/5)）；连通组 ≥3 条生成思维链（`autoGroupKey` 去重）。
-- 遗忘：按新近度/访问/采用率/置信度/分类算显著度，低于阈值 0.35 的归档；`pinned` 与偏好标签豁免。
+- 遗忘：按新近度/置信度/分类与机会级使用证据算显著度，低于阈值 0.35 的归档；`pinned` 与偏好标签豁免。`access_count` 和单纯召回（Exposure）**不提高**显著度、不降低遗忘概率；只有同一 `(entity, session, task)` 机会里的 Reference/Utilization/Validation 受控加分（Validation 最强），用户否定/证伪会负向扣分。重复召回只增加同一机会的 `exposures`，不会重复累计成功次数。
 - 属性名归并：只对 ASCII 属性名可比（pg_trgm 对中文恒 0），中文同义名不会自动归并；改名后逐实体重建视图。
 - 向量补齐与动态刷新（含 `statusRule` 自动推进状态）。
 

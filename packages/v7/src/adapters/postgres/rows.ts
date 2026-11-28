@@ -26,6 +26,9 @@ export interface EntityRow {
   salience: number
   access_count: number
   adoption_count: number
+  /** 采用证据只在带 adoption_metric 的读路径出现；其余查询缺省。 */
+  utility_confidence?: string | number | null
+  refutation_rate?: string | number | null
   last_accessed_at: Date | string | null
   archived_at: Date | string | null
   archive_reason: string | null
@@ -120,6 +123,12 @@ export function mapEntity(row: EntityRow, attributes: readonly Attribute[], hist
     salience: row.salience,
     accessCount: row.access_count,
     adoptionCount: row.adoption_count,
+    ...(row.utility_confidence === undefined || row.utility_confidence === null
+      ? {}
+      : { utilityConfidence: Number(row.utility_confidence) }),
+    ...(row.refutation_rate === undefined || row.refutation_rate === null
+      ? {}
+      : { refutationRate: Number(row.refutation_rate) }),
     ...(iso(row.last_accessed_at) !== undefined ? { lastAccessedAt: iso(row.last_accessed_at) as string } : {}),
     ...(iso(row.archived_at) !== undefined ? { archivedAt: iso(row.archived_at) as string } : {}),
     ...(row.archive_reason !== null ? { archiveReason: row.archive_reason } : {}),

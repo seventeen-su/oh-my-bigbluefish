@@ -254,7 +254,11 @@ describe('T0 读投影看板', () => {
     expect(preferenceSection?.fallbackReason).toBeUndefined()
     expect(stateSection?.fallbackReason).toBeUndefined()
     expect(built.trace.sections.some(section => section.name === 'index')).toBe(false)
-    expect(built.preferenceHits).toEqual([{ id: 'mem_board_pref', title: PREFERENCE_BOARD_TITLE }])
+    expect(built.preferenceHits).toEqual([{
+      id: 'mem_board_pref',
+      title: PREFERENCE_BOARD_TITLE,
+      updatedAt: nowIso(),
+    }])
     expect(built.stateHits.map(hit => hit.id)).toEqual(['st_in_progress', 'st_waiting', 'st_blocked'])
 
     // 读模型命中时：两块看板各读一次，不跑六通道、不查 stats、不查 lag。
@@ -325,7 +329,11 @@ describe('T0 读投影看板', () => {
       fallbackReason: 'read-model-empty',
     })
     expect(built.trace.sections.filter(section => section.name === 'index').length).toBeGreaterThan(0)
-    expect(built.preferenceHits).toEqual([{ id: preferenceSummary.id, title: preferenceSummary.title }])
+    expect(built.preferenceHits).toEqual([{
+      id: preferenceSummary.id,
+      title: preferenceSummary.title,
+      updatedAt: preferenceSummary.updatedAt,
+    }])
     // 回退路径的状态由 engine.recall 自己写 recall_event，不在 build 结果里重复登记。
     expect(built.stateHits).toEqual([])
     expect(notices).toEqual(['trc_fallback_state'])
@@ -507,7 +515,11 @@ describe('T0 读投影看板', () => {
     expect(preferenceSection?.fallbackReason).toBe(
       'read-model-watermark-stale: preference_board watermarkAgeMs=120000 unprojected=2',
     )
-    expect(built.preferenceHits).toEqual([{ id: preferenceSummary.id, title: preferenceSummary.title }])
+    expect(built.preferenceHits).toEqual([{
+      id: preferenceSummary.id,
+      title: preferenceSummary.title,
+      updatedAt: preferenceSummary.updatedAt,
+    }])
   })
 
   it('给定水位超龄但没有未投影任务当构建常驻文本则仍用读模型（空闲不是停摆）', async () => {

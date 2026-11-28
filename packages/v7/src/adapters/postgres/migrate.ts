@@ -144,6 +144,11 @@ export async function truncateAll(connectionString: string): Promise<void> {
       truncate table
         omb.recall_event,
         omb.resident_trace,
+        omb.usage_opportunity,
+        omb.adoption_metric,
+        omb.adoption_stat,
+        omb.co_recall_pair,
+        omb.similar_cache,
         omb.audit_log,
         omb.reference,
         omb.dynamic_stale,

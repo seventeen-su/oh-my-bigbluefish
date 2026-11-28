@@ -154,7 +154,11 @@ describe('T0 常驻 trace', () => {
     expect(built.text).toContain('常用属性')
     expect(built.trace.droppedSections).toEqual([])
     expect(built.trace.usedTokens).toBeGreaterThan(0)
-    expect(built.preferenceHits).toEqual([{ id: preference.id, title: '偏好实际标题' }])
+    expect(built.preferenceHits).toEqual([{
+      id: preference.id,
+      title: '偏好实际标题',
+      updatedAt: preference.updatedAt,
+    }])
     expect(built.trace.sections.filter(section => section.kept)).toHaveLength(built.trace.sections.length)
   })
 
