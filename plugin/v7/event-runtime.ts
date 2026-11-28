@@ -8,9 +8,9 @@
  *    Archived/Unarchived 的依赖失效 → 定向 `omb.refresh`）与两个 timer handler
  *    （到期唤醒 workflow runtime；巩固任务的 durable schedule 到期派发）。
  *    未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
- * 3. 构造 workflow runtime 时先注册真实业务定义（当前 `forget`），再把「按幂等键 start run」
- *    绑定给巩固调度；然后启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的
- *    running 回 pending 并唤醒循环（启动恢复）。
+ * 3. 构造 workflow runtime 时先注册真实业务定义（10 个：forget + 9 个巩固任务），再把「按幂等键
+ *    start run」绑定给巩固调度；然后启动 relay/timer/workflow，再跑一次 workflow `recover()`：
+ *    租约过期的 running 回 pending 并唤醒循环（启动恢复）。
  *
  * 没有固定轮询：relay 空闲时等 NOTIFY，timer/workflow 只在有未来到期行时 arm 一个
  * 单次定时器；本模块不新增 setInterval。
@@ -65,7 +65,7 @@ export interface EventRuntimeDeps {
   readonly clock: Clock
   readonly logger: Logger
   readonly timerStore: PostgresTimerStore
-  /** 真实业务 workflow 定义（当前只有 forget）：启动时注册进 WorkflowRuntime。 */
+  /** 真实业务 workflow 定义（10 个：forget + 9 个巩固任务）：启动时注册进 WorkflowRuntime。 */
   readonly workflowDefinitions: readonly WorkflowDefinition[]
   /** workflow runtime 就绪后，把「按幂等键 start run」的窄能力交给巩固调度。 */
   readonly bindConsolidationWorkflow: (start: (name: string, idempotencyKey: string) => Promise<unknown>) => void

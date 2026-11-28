@@ -107,25 +107,44 @@ async function waitFor<T>(
 }
 
 /**
- * 等真实 forget workflow 的启动首轮结束。
+ * 等启动首轮创建的真实巩固 workflow run 全部结束（forget + 9 个任务）。
  *
- * 真实定义注册后，plugin 启动时的首轮 timer 会创建一条 `name='forget'` 的 run；
- * 在它结束前断言全局 `workflowPending/Running` 计数会读到那条 run（合法，但不是
- * 本文件想验证的 seeded run）。这里等“timer 已派发过本期 + 没有在途 forget run”。
+ * 真实定义注册后，plugin 启动时的首轮 timer 会为 10 个任务各创建一条 run；
+ * 在它们结束前断言全局 `workflowPending/Running` 计数会读到合法在途 run。
+ * 这里等“timer 已派发过首轮 + 10 个巩固 workflow 没有在途 run”。
  */
-async function waitForForgetIdle(): Promise<void> {
+const CONSOLIDATION_WORKFLOW_NAMES = [
+  'forget',
+  'extract',
+  'reference-rot',
+  'clue-promote',
+  'dedupe',
+  'conflict',
+  'link-suggest',
+  'attr-alias',
+  'refresh',
+  'embed-sweep',
+]
+
+async function waitForConsolidationWorkflowsIdle(): Promise<void> {
   await waitFor(
     async () => {
-      const timer = await store.db.query<{ status: string }>(
-        "select status from omb.timer where dedupe_key = 'consolidation:omb.forget'",
+      const completed = await store.db.query<{ count: number }>(
+        `select count(distinct name)::int as count from omb.workflow_run
+          where name = any($1::text[]) and status = 'completed'`,
+        [CONSOLIDATION_WORKFLOW_NAMES],
       )
-      const dispatched = timer.rows[0]?.status === 'done' || timer.rows[0]?.status === 'pending'
       const active = await store.db.query<{ count: number }>(
-        "select count(*)::int as count from omb.workflow_run where name = 'forget' and status in ('pending', 'running', 'waiting')",
+        `select count(*)::int as count from omb.workflow_run
+          where name = any($1::text[]) and status in ('pending', 'running', 'waiting')`,
+        [CONSOLIDATION_WORKFLOW_NAMES],
       )
-      return dispatched && (active.rows[0]?.count ?? 0) === 0 ? true : undefined
+      return (completed.rows[0]?.count ?? 0) >= CONSOLIDATION_WORKFLOW_NAMES.length
+        && (active.rows[0]?.count ?? 0) === 0
+        ? true
+        : undefined
     },
-    'forget workflow 启动首轮结束',
+    '巩固 workflow 启动首轮结束',
   )
 }
 
@@ -438,8 +457,15 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       )
       expect(counts.rows[0]).toEqual({ entity: 1, audit: 1, outbox: 1, embedding: 1 })
 
-      const text = await statusText(runtime)
-      expect(text).toContain('outboxDelivered=2')
+      // `delivered` 是派发器的进程累计：DB 行先变 done，计数随后在同一批里累加；
+      // 等计数到位再读一次，避免把「完成已可见、计数尚未累加」当成缺一次投递。
+      const text = await waitFor(
+        async () => {
+          const current = await statusText(runtime)
+          return metric(current, 'outboxDelivered') >= 2 ? current : undefined
+        },
+        '重复投递计入 outboxDelivered',
+      )
       expect(text).toMatch(/outboxLagMs=0 outboxPending=0/)
     } finally {
       await runtime.stop()
@@ -590,8 +616,14 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       )
       expect(delivered.attempts).toBe(0)
 
-      const text = await statusText(runtime)
-      expect(text).toContain('outboxAcked=1')
+      // ack 计数同样是进程累计：等它到位再断言，不把 CAS 完成后的微任务窗口当成丢失。
+      const text = await waitFor(
+        async () => {
+          const current = await statusText(runtime)
+          return metric(current, 'outboxAcked') >= 1 ? current : undefined
+        },
+        'EntityArchived ack 计入 metric',
+      )
       expect(text).toContain('outboxAckedByTopic=EntityArchived:1')
       expect(text).toContain('outboxDeadRows=0')
     } finally {
@@ -732,8 +764,14 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       // 死信也走一次 fail 写结果：attempts 记录本次投递，便于对账而不是假装没尝试过。
       expect(dead.attempts).toBe(1)
 
-      const text = await statusText(runtime)
-      expect(text).toContain('outboxDead=1')
+      // dead 计数也是进程累计：等它到位再读，避免 DB 已 dead、计数尚未累加的窗口。
+      const text = await waitFor(
+        async () => {
+          const current = await statusText(runtime)
+          return metric(current, 'outboxDead') >= 1 ? current : undefined
+        },
+        '未注册 topic 的 dead 计入 status',
+      )
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('outboxLastError=')
       // 死信原因不只存在内存 lastError：status 读真实 dead 行（含条数与原因）。
@@ -769,7 +807,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
           return row?.status === 'done' ? row : undefined
         },
         '到期 timer 被 timer worker 执行',
-        10_000,
+        25_000,
       )
       expect(done.last_error).toBeNull()
 
@@ -792,7 +830,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
     } finally {
       await runtime.stop()
     }
-  })
+  }, 30_000)
 
   it('给定启动前遗留的到期 workflow run 当 plugin 启动恢复则被领取并落死信（未注册定义可见）', async () => {
     // 组合根不注册任何 workflow 定义（Phase 3 没有真实生产 workflow）：遗留 run 必须
@@ -817,7 +855,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       expect(dead.last_error).toContain('未注册')
 
       // 先等 plugin 启动首轮创建的真实 forget run 结束，再读全局计数。
-      await waitForForgetIdle()
+      await waitForConsolidationWorkflowsIdle()
       const text = await statusText(runtime)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=0 workflowRunning=0/)
@@ -842,7 +880,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
         [`idem-${randomUUID()}`, `idem-${randomUUID()}`, `idem-${randomUUID()}`, `idem-${randomUUID()}`],
       )
       // 先等 plugin 启动首轮创建的真实 forget run 结束，seeded run 的精确计数才稳定。
-      await waitForForgetIdle()
+      await waitForConsolidationWorkflowsIdle()
       const text = await statusText(runtime)
       expect(text).toContain('workflow=ok')
       expect(text).toMatch(/workflowPending=1 workflowRunning=1 workflowWaiting=1 workflowDead=1/)

@@ -4,51 +4,22 @@ import type { Clock } from '../ports/clock.js'
 import type { JobQueue, Logger } from '../ports/jobs.js'
 import type { TimerContext, TimerHandler, TimerScheduleInput, TimerTask } from '../app/workflow/index.js'
 import type { ConsolidationDeps } from './consolidate.js'
-import {
-  handleAttrAlias,
-  handleCluePromote,
-  handleCluePromoteFor,
-  handleConflict,
-  handleConflictFor,
-  handleDedupe,
-  handleDedupeFor,
-  handleEmbedSweep,
-  handleExtract,
-  handleExtractArtifact,
-  handleForget,
-  handleLinkSuggest,
-  handleRefresh,
-  handleReferenceRot,
-  handleReferenceRotForTarget,
-} from './consolidate.js'
+import { CONSOLIDATION_JOBS, type ConsolidationJobName } from './names.js'
+import { createConsolidationJobRunners, type ConsolidationJobContext } from './runners.js'
+
+export { CONSOLIDATION_JOBS, type ConsolidationJobName } from './names.js'
 
 /**
  * 巩固任务的 durable 调度（ADR-0011）：把「10 分钟一轮」的旧 loop 换成 omb.timer 里的行。
  *
- * 与 `consolidate.ts` 的分工：那边是每个任务**做什么**（纯 handler），这边是任务**何时
- * 执行**（稳定 dedupeKey + due_at 网格 + 到期派发 + 执行完续期）。拆开的原因：
+ * 与 `consolidate.ts` / `runners.ts` 的分工：那边是每个任务**做什么**（纯 handler），这边是
+ * 任务**何时**执行（稳定 dedupeKey + due_at 网格 + 到期派发 + 执行完续期）。拆开的原因：
  *  1. 调度策略只有组合根关心，任务处理器可以单独测试/复用；
  *  2. 没有 setInterval/固定节拍——启动只做一次幂等 ensure，之后由 timer 到期 + 任务执行
  *     完的 rearm 续期；
- *  3. 到期派发互斥：默认只入队 pg-boss 一次；配置 workflow dispatch 的任务改为按「期」
- *     幂等 start 一个真实 run，两者不双跑。
+ *  3. 到期派发互斥：配置了 workflow 的任务到期只按「期」幂等 start 一个真实 run；没有配置
+ *     的旧装配仍入队 pg-boss，两者互斥，同一任务不会双跑。
  */
-
-export const CONSOLIDATION_JOBS = [
-  'omb.extract',
-  'omb.reference-rot',
-  'omb.clue-promote',
-  'omb.dedupe',
-  'omb.conflict',
-  'omb.link-suggest',
-  'omb.forget',
-  'omb.attr-alias',
-  'omb.refresh',
-  'omb.embed-sweep',
-] as const
-
-/** 巩固任务名（`omb.*`）；调度与事件 reaction 用它对齐。 */
-export type ConsolidationJobName = (typeof CONSOLIDATION_JOBS)[number]
 
 /** 「按幂等键启动一个已注册 run」：幂等键由调度方按「期」生成，重放返回已有 run。 */
 export type WorkflowRunStarter = (name: string, idempotencyKey: string) => Promise<unknown>
@@ -156,10 +127,10 @@ export interface ConsolidationSchedulerDeps {
   readonly clock: Clock
   readonly logger?: Logger
   /**
-   * 由真实 workflow 执行的任务（当前只有 forget）。缺省/未配置时该任务仍走 pg-boss 入队
-   * 的旧路径（测试与旧装配），两者互斥：同一任务只会有一种派发方式，不会双跑。
+   * 由真实 workflow 执行的任务（当前 10 个巩固任务全部配置）。缺省/未配置时该任务仍走
+   * pg-boss 入队的旧路径（测试与旧装配），两者互斥：同一任务只会有一种派发方式，不会双跑。
    */
-  readonly workflow?: ConsolidationWorkflowDispatch
+  readonly workflows?: readonly ConsolidationWorkflowDispatch[]
 }
 
 function scheduleOf(job: string): ConsolidationSchedule {
@@ -234,6 +205,11 @@ function isTriggered(payload: unknown): boolean {
  */
 export function createConsolidationScheduler(deps: ConsolidationSchedulerDeps): ConsolidationScheduler {
   const schedules = CONSOLIDATION_SCHEDULES
+  const dispatches = new Map<ConsolidationJobName, ConsolidationWorkflowDispatch>()
+  for (const dispatch of deps.workflows ?? []) {
+    if (dispatches.has(dispatch.job)) throw new Error(`巩固任务 ${dispatch.job} 配置了多个 workflow dispatch`)
+    dispatches.set(dispatch.job, dispatch)
+  }
   return {
     schedules,
     async ensure(jobs) {
@@ -256,10 +232,11 @@ export function createConsolidationScheduler(deps: ConsolidationSchedulerDeps): 
       async run(task: TimerTask, ctx: TimerContext): Promise<void> {
         const job = jobOfPayload(task.payload)
         const schedule = scheduleOf(job)
-        const dispatch = deps.workflow
-        if (dispatch !== undefined && dispatch.job === job) {
+        const dispatch = dispatches.get(job)
+        if (dispatch !== undefined) {
           // 只启动、不续期：此刻 timer 行还是 claimed，重排期会让派发器的 complete CAS 失败。
-          // 本期执行完由 workflow step 调 rearm 续下一期（见 app/workflow/business.ts）。
+          // 本期执行完由 workflow step 调 rearm 续下一期（见 app/workflow/business.ts 与
+          // jobs/workflows.ts）。幂等键按「期」：同一条 timer 的重试命中的是同一个 run。
           const period = periodOfPayload(task.payload, schedule.intervalMs, ctx.now)
           await dispatch.start(dispatch.workflow, `${schedule.dedupeKey}:${period}`)
           deps.logger?.debug('巩固任务已交给 workflow 执行', {
@@ -287,55 +264,29 @@ export interface ConsolidationJobOptions {
 /**
  * 注册巩固任务的 pg-boss handler，返回真实注册成功的任务名。
  *
- * 传了 `scheduler` 时，只有**调度驱动**的任务（载荷带触发标记）执行完才在 finally 里
+ * 这是**事件驱动**入口：outbox reaction 带 entityId/artifactId 入队时只处理目标；周期兜底
+ * 由 timer 到期驱动 workflow run，step 调用同一个 runner（见 `runners.ts`），不另写逻辑。
+ *
+ * 传了 `scheduler` 时，只有**调度驱动**的队列任务（载荷带触发标记）执行完才在 finally 里
  * rearm 下一期；rearm 失败只记日志，不影响本次任务结果。
  */
-/**
- * job 载荷里的定向参数。
- *
- * reaction 把「哪个实体/artifact 变了」放进载荷（`entityId`/`targetEntityId`/`artifactId`），
- * 调度驱动的周期兜底载荷只有 `{trigger, job}`；handler 按字段是否存在决定走定向还是全量，
- * 这样事件路径不会为了一个实体扫描整库，周期兜底仍能补漏。
- */
-interface ConsolidationJobPayload {
-  readonly limit?: number
-  readonly entityId?: string
-  readonly targetEntityId?: string
-  readonly artifactId?: string
-  readonly dependencyRoot?: string
-}
-
-function nonEmptyStringOf(payload: Record<string, unknown>, key: string): string | undefined {
-  const value = payload[key]
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-function jobOptionsOf(payload: unknown): ConsolidationJobPayload {
-  if (!isPlainObject(payload)) return {}
-  const options: { -readonly [K in keyof ConsolidationJobPayload]: ConsolidationJobPayload[K] } = {}
-  const entityId = nonEmptyStringOf(payload, 'entityId')
-  if (entityId !== undefined) options.entityId = entityId
-  const targetEntityId = nonEmptyStringOf(payload, 'targetEntityId')
-  if (targetEntityId !== undefined) options.targetEntityId = targetEntityId
-  const artifactId = nonEmptyStringOf(payload, 'artifactId')
-  if (artifactId !== undefined) options.artifactId = artifactId
-  const dependencyRoot = nonEmptyStringOf(payload, 'dependencyRoot')
-  if (dependencyRoot !== undefined) options.dependencyRoot = dependencyRoot
-  const limit = payload['limit']
-  if (typeof limit === 'number' && Number.isInteger(limit) && limit > 0) options.limit = limit
-  return options
-}
-
 export async function registerConsolidationJobs(
   queue: JobQueue,
   deps: ConsolidationDeps,
   options: ConsolidationJobOptions = {},
 ): Promise<readonly string[]> {
+  const runners = createConsolidationJobRunners(deps)
   const registered: string[] = []
-  const work = async (job: ConsolidationJobName, run: (payload: unknown) => Promise<void>): Promise<void> => {
+  const work = async (job: ConsolidationJobName): Promise<void> => {
     await queue.work(job, async payload => {
       try {
-        await run(payload)
+        // pg-boss 入口没有「逻辑步骤」语义（每个 job 独立 at-least-once），因此不传 commandId；
+        // handler 自身用 revision CAS / 唯一约束保证重试幂等。workflow 入口才传 `<runId>:<step>`。
+        const context: ConsolidationJobContext = {
+          now: deps.clock.now(),
+          signal: new AbortController().signal,
+        }
+        await runners[job](payload, context)
       } finally {
         if (isTriggered(payload) && options.scheduler !== undefined) {
           try {
@@ -348,43 +299,11 @@ export async function registerConsolidationJobs(
     })
     registered.push(job)
   }
-  // 载荷带实体/artifact 时只处理那一个（事件驱动主路径）；不带才是周期兜底的全量扫描。
-  await work('omb.extract', payload => {
-    const options = jobOptionsOf(payload)
-    return (options.artifactId === undefined ? handleExtract(deps, options.limit) : handleExtractArtifact(deps, options.artifactId))
-      .then(() => undefined)
-  })
-  await work('omb.dedupe', payload => {
-    const options = jobOptionsOf(payload)
-    return (options.entityId === undefined ? handleDedupe(deps, options.limit) : handleDedupeFor(deps, options.entityId))
-      .then(() => undefined)
-  })
-  await work('omb.conflict', payload => {
-    const options = jobOptionsOf(payload)
-    return (options.entityId === undefined ? handleConflict(deps, options.limit) : handleConflictFor(deps, options.entityId))
-      .then(() => undefined)
-  })
-  await work('omb.clue-promote', payload => {
-    // 线索晋升前必须先看它自己的引用腐化；定向入口内部会做这件事。
-    const options = jobOptionsOf(payload)
-    return (options.entityId === undefined ? handleCluePromote(deps, options.limit) : handleCluePromoteFor(deps, options.entityId))
-      .then(() => undefined)
-  })
-  await work('omb.link-suggest', () => handleLinkSuggest(deps).then(() => undefined))
-  await work('omb.forget', () => handleForget(deps).then(() => undefined))
-  await work('omb.attr-alias', () => handleAttrAlias(deps).then(() => undefined))
-  await work('omb.reference-rot', payload => {
-    // 事件载荷用 targetEntityId 指“被改的实体”，只检查指向它的引用。
-    const options = jobOptionsOf(payload)
-    const target = options.targetEntityId ?? options.entityId
-    return (target === undefined ? handleReferenceRot(deps, options.limit) : handleReferenceRotForTarget(deps, target))
-      .then(() => undefined)
-  })
-  if (deps.dynamic !== undefined) {
-    await work('omb.refresh', payload => handleRefresh(deps, jobOptionsOf(payload)).then(() => undefined))
-  }
-  if (deps.embedder !== undefined) {
-    await work('omb.embed-sweep', () => handleEmbedSweep(deps).then(() => undefined))
+  for (const job of CONSOLIDATION_JOBS) {
+    // 没有动态属性/嵌入器时不注册对应消费者：避免排期和队列里出现永远空跑的任务。
+    if (job === 'omb.refresh' && deps.dynamic === undefined) continue
+    if (job === 'omb.embed-sweep' && deps.embedder === undefined) continue
+    await work(job)
   }
   return registered
 }

@@ -127,8 +127,20 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
   const startupError = (): string | undefined => startupRef.current?.error
 
   // 巩固调度必须先于事件运行时构造：timer handler 要注入 TimerWorker 的 handlers。
-  // `queries` 让 forget 的 workflow step 与后台 handler 用同一份维护查询。
-  const consolidation = createConsolidationRuntime({ store, queue, clock, logger, timerStore, queries: maintenance, startupError })
+  // `queries`/`updateService`/动态刷新/嵌入器同时交给 workflow step 与后台 handler，
+  // 保证两个入口调用的是同一份执行体。
+  const consolidation = createConsolidationRuntime({
+    store,
+    queue,
+    clock,
+    logger,
+    timerStore,
+    queries: maintenance,
+    updateService,
+    dynamic: dynamicService,
+    embedder,
+    startupError,
+  })
   // 投影的 LISTEN 重连对账落在事件运行时上；用 holder 打破二者构造顺序（运行时才调用）。
   const handles: { event?: EventRuntime } = {}
   const projection = createProjectionRuntime({
@@ -148,7 +160,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     clock,
     logger,
     timerStore,
-    // 真实业务 workflow 定义（forget）；绑定后 timer 到期才有地方 start run。
+    // 真实业务 workflow 定义（forget + 9 个巩固任务）；绑定后 timer 到期才有地方 start run。
     workflowDefinitions: consolidation.workflows,
     bindConsolidationWorkflow: consolidation.bindWorkflowStart,
     consolidationTimerHandler: consolidation.timerHandler,

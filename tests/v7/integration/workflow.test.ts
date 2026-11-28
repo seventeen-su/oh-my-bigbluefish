@@ -21,10 +21,19 @@ import {
 import type { ForgetStepRequest } from '../../../packages/v7/src/app/workflow/business.js'
 import { handleForget, runForget } from '../../../packages/v7/src/jobs/consolidate.js'
 import type { ConsolidationDeps } from '../../../packages/v7/src/jobs/consolidate.js'
+import {
+  CONSOLIDATION_JOBS,
+  createConsolidationJobRunners,
+  createConsolidationWorkflows,
+  type ConsolidationJobContext,
+  type ConsolidationJobName,
+  type ConsolidationJobRunner,
+} from '../../../packages/v7/src/jobs/index.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import type { JsonValue } from '../../../packages/v7/src/domain/json.js'
 import type { Clock } from '../../../packages/v7/src/ports/clock.js'
+import type { Embedder } from '../../../packages/v7/src/ports/embedding.js'
 import { PostgresDb } from '../../../packages/v7/src/adapters/postgres/db.js'
 import { PostgresMaintenance } from '../../../packages/v7/src/adapters/postgres/maintenance.js'
 import { migrateDatabase } from '../../../packages/v7/src/adapters/postgres/migrate.js'
@@ -42,6 +51,7 @@ import { derived, normalized } from './helpers.js'
 
 /** 独立测试库：不读写 omb_v7_test / 生产库；008 的 workflow/timer 表由本套件自己建。 */
 const DATABASE_URL = process.env.OMB_WORKFLOW_TEST_DATABASE_URL
+  ?? process.env.OMB_TEST_DATABASE_URL
   ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_test_workflow'
 
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
@@ -1310,6 +1320,300 @@ describe('forget 业务 workflow（真实 PostgreSQL）', () => {
     const result = await handleForget(handlerDeps)
     expect(result.archived).toBe(1)
     expect(await entityStore.get(viaHandler)).toBeUndefined()
+  })
+})
+
+/**
+ * 九个巩固任务的真实 workflow 定义（forget 之外的 9 个）：
+ * 定义契约、step 真实执行、重试/崩溃恢复/人工 retry 都必须在真实 PostgreSQL 上成立。
+ *
+ * 期望值独立写死（定义名/step/结果字段是契约），不从被测实现推导。
+ */
+describe('九个巩固任务的 workflow 定义（真实 PostgreSQL）', () => {
+  const JOB_FIXED = new Date('2026-02-03T04:05:06.000Z')
+  const jobClock: Clock = { now: () => JOB_FIXED, iso: () => JOB_FIXED.toISOString() }
+
+  interface JobContract {
+    readonly workflow: string
+    readonly step: string
+    readonly keys: readonly string[]
+  }
+
+  const JOB_CONTRACTS: Readonly<Record<ConsolidationJobName, JobContract>> = {
+    'omb.extract': { workflow: 'extract', step: 'extract', keys: ['written', 'skipped', 'grouped'] },
+    'omb.reference-rot': { workflow: 'reference-rot', step: 'scan', keys: ['marked'] },
+    'omb.clue-promote': { workflow: 'clue-promote', step: 'promote', keys: ['promoted'] },
+    'omb.dedupe': { workflow: 'dedupe', step: 'dedupe', keys: ['merged'] },
+    'omb.conflict': { workflow: 'conflict', step: 'detect', keys: ['linked'] },
+    'omb.link-suggest': { workflow: 'link-suggest', step: 'suggest', keys: ['linked', 'grouped'] },
+    'omb.forget': { workflow: 'forget', step: 'archive', keys: ['archived', 'skipped'] },
+    'omb.attr-alias': { workflow: 'attr-alias', step: 'rename', keys: ['renamed'] },
+    'omb.refresh': { workflow: 'refresh', step: 'refresh', keys: ['refreshed', 'statusUpdated', 'skipped'] },
+    'omb.embed-sweep': { workflow: 'embed-sweep', step: 'embed', keys: ['embedded'] },
+  }
+  const JOB_NAMES_WITHOUT_FORGET = CONSOLIDATION_JOBS.filter(job => job !== 'omb.forget')
+
+  let entityStore: PostgresStore
+  let maintenance: PostgresMaintenance
+
+  beforeAll(async () => {
+    await migrateDatabase(DATABASE_URL)
+    db = new PostgresDb({ connectionString: DATABASE_URL })
+    store = new PostgresWorkflowStore(db)
+    timerStore = new PostgresTimerStore(db)
+    entityStore = new PostgresStore(DATABASE_URL)
+    maintenance = new PostgresMaintenance(db)
+  })
+
+  beforeEach(async () => {
+    await reset()
+    await db.query('truncate table omb.entity restart identity cascade')
+  })
+
+  afterAll(async () => {
+    await entityStore.close()
+    await db.close()
+  })
+
+  function fixedJobRuntime(options: WorkflowRuntimeOptions = {}): WorkflowRuntime {
+    return new WorkflowRuntime(
+      { store, clock: jobClock },
+      { batchSize: 10, leaseMs: 30_000, retry: { maxAttempts: 3, baseDelayMs: 1_000, factor: 2, maxDelayMs: 5_000 }, ...options },
+    )
+  }
+
+  function jobDeps(): ConsolidationDeps {
+    const embedder: Embedder = {
+      model: 'test-embedder',
+      dims: 512,
+      available: async () => true,
+      embed: async texts => texts.map(() => Array.from({ length: 512 }, () => 0)),
+    }
+    return {
+      store: entityStore,
+      queries: maintenance,
+      updateService: new UpdateService({ store: entityStore, clock: jobClock }),
+      clock: jobClock,
+      dynamic: { refreshById: async () => undefined },
+      embedder,
+    }
+  }
+
+  interface JobHarness {
+    readonly definitions: readonly WorkflowDefinition[]
+    readonly calls: readonly { readonly job: ConsolidationJobName; readonly commandId?: string; readonly now: Date }[]
+    readonly rearms: readonly ConsolidationJobName[]
+    failNext(job: ConsolidationJobName, times: number): void
+  }
+
+  /** 在真实 runner 外面包一层“可注入失败/可记录 commandId”，不另写业务逻辑。 */
+  function jobHarness(): JobHarness {
+    const deps = jobDeps()
+    const base = createConsolidationJobRunners(deps)
+    const failures = new Map<ConsolidationJobName, number>()
+    const calls: { job: ConsolidationJobName; commandId?: string; now: Date }[] = []
+    const rearms: ConsolidationJobName[] = []
+    const runners = Object.fromEntries(CONSOLIDATION_JOBS.map(job => [
+      job,
+      async (payload: unknown, context: ConsolidationJobContext): Promise<JsonValue> => {
+        calls.push({
+          job,
+          ...(context.commandId === undefined ? {} : { commandId: context.commandId }),
+          now: context.now,
+        })
+        const remaining = failures.get(job) ?? 0
+        if (remaining > 0) {
+          failures.set(job, remaining - 1)
+          throw new Error(`${job} boom`)
+        }
+        return await base[job](payload, context)
+      },
+    ])) as Record<ConsolidationJobName, ConsolidationJobRunner>
+    const definitions = createConsolidationWorkflows({
+      runners,
+      rearm: async job => {
+        rearms.push(job)
+      },
+    })
+    return {
+      definitions,
+      calls,
+      rearms,
+      failNext(job, times) {
+        failures.set(job, times)
+      },
+    }
+  }
+
+  function definitionOf(harness: JobHarness, job: ConsolidationJobName): WorkflowDefinition {
+    const workflow = JOB_CONTRACTS[job].workflow
+    const definition = harness.definitions.find(item => item.name === workflow)
+    if (definition === undefined) throw new Error(`缺少 workflow 定义：${workflow}`)
+    return definition
+  }
+
+  function jobOfDefinitionName(name: string): ConsolidationJobName {
+    const job = CONSOLIDATION_JOBS.find(item => JOB_CONTRACTS[item].workflow === name)
+    if (job === undefined) throw new Error(`未知 workflow：${name}`)
+    return job
+  }
+
+  it('给定 10 个任务当构造定义则 forget + 9 个都有唯一 name 与真实 step', async () => {
+    const harness = jobHarness()
+    const forgetDefinition = createForgetWorkflow({
+      forget: async request => ({ archived: 0, commandId: request.commandId, at: request.now.toISOString() }),
+      rearm: async () => {},
+    })
+    const definitions = [forgetDefinition, ...harness.definitions]
+    expect(definitions.map(definition => definition.name)).toEqual([
+      'forget',
+      ...JOB_NAMES_WITHOUT_FORGET.map(job => JOB_CONTRACTS[job].workflow),
+    ])
+    expect(new Set(definitions.map(definition => definition.name)).size).toBe(10)
+    for (const definition of definitions) {
+      const contract = JOB_CONTRACTS[jobOfDefinitionName(definition.name)]
+      expect(definition.version).toBe(1)
+      expect(definition.steps.map(step => step.name)).toEqual([contract.step])
+    }
+  })
+
+  it('给定 9 个定义各 start 一次当 drain 则每个 step 调用真实 runner、写 checkpoint 并续期', async () => {
+    const harness = jobHarness()
+    const runtime = fixedJobRuntime()
+    for (const definition of harness.definitions) runtime.register(definition)
+
+    const runIds = new Map<string, string>()
+    for (const definition of harness.definitions) {
+      const started = await runtime.startRun(definition.name, undefined, { idempotencyKey: `job-${definition.name}` })
+      expect(started.inserted).toBe(true)
+      runIds.set(definition.name, started.runId)
+    }
+    expect(await runtime.drain()).toMatchObject({ claimed: 9, steps: 9, completed: 9, dead: 0 })
+
+    for (const definition of harness.definitions) {
+      const job = jobOfDefinitionName(definition.name)
+      const contract = JOB_CONTRACTS[job]
+      const runId = runIds.get(definition.name)
+      if (runId === undefined) throw new Error(`没有 runId：${definition.name}`)
+      const row = await runRow(runId)
+      expect(row).toMatchObject({ status: 'completed', step: null, attempts: 1 })
+      const state = row.state as Record<string, JsonValue>
+      expect(state).toMatchObject({
+        target: contract.workflow,
+        job,
+        commandId: `${runId}:${contract.step}`,
+        at: JOB_FIXED.toISOString(),
+      })
+      for (const key of contract.keys) expect(typeof state[key]).toBe('number')
+      const steps = await store.steps(runId)
+      expect(steps.map(record => `${record.step}:${record.status}`)).toEqual([`${contract.step}:completed`])
+    }
+
+    expect([...harness.calls].map(call => call.job).sort()).toEqual([...JOB_NAMES_WITHOUT_FORGET].sort())
+    for (const call of harness.calls) {
+      expect(call.commandId).toBe(`${runIds.get(JOB_CONTRACTS[call.job].workflow)}:${JOB_CONTRACTS[call.job].step}`)
+      expect(call.now.toISOString()).toBe(JOB_FIXED.toISOString())
+    }
+    expect([...harness.rearms].sort()).toEqual([...JOB_NAMES_WITHOUT_FORGET].sort())
+  })
+
+  it('给定同一期幂等键重复 start 当 drain 则只建一个 run、只执行一次并只续期一次', async () => {
+    const harness = jobHarness()
+    const runtime = fixedJobRuntime()
+    runtime.register(definitionOf(harness, 'omb.dedupe'))
+
+    const first = await runtime.startRun('dedupe', undefined, { idempotencyKey: 'consolidation:omb.dedupe:41' })
+    const second = await runtime.startRun('dedupe', undefined, { idempotencyKey: 'consolidation:omb.dedupe:41' })
+    expect(first.inserted).toBe(true)
+    expect(second).toEqual({ runId: first.runId, inserted: false })
+
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect(await runtime.drain()).toMatchObject({ claimed: 0 })
+    expect(harness.calls.filter(call => call.job === 'omb.dedupe')).toHaveLength(1)
+    expect(harness.rearms).toEqual(['omb.dedupe'])
+    const runs = await db.query<{ count: number }>("select count(*)::int as count from omb.workflow_run where name = 'dedupe'")
+    expect(runs.rows[0]?.count).toBe(1)
+  })
+
+  it('给定 step 前两次失败当退避重试则 completed 且每次 attempt 复用同一个 commandId', async () => {
+    const harness = jobHarness()
+    harness.failNext('omb.dedupe', 2)
+    // 真实时钟 + 显式 makeDue：固定时钟会让退避时间落在过去，一次 drain 就重试完。
+    const runtime = runtimeOf({ retry: { maxAttempts: 3, baseDelayMs: 500, factor: 2, maxDelayMs: 5_000 } })
+    runtime.register(definitionOf(harness, 'omb.dedupe'))
+    const { runId } = await runtime.startRun('dedupe', undefined, { idempotencyKey: 'dedupe-retry' })
+
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, retried: 1, steps: 0 })
+    await makeDue(runId)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, retried: 1 })
+    await makeDue(runId)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+
+    const dedupeCalls = harness.calls.filter(call => call.job === 'omb.dedupe')
+    expect(dedupeCalls).toHaveLength(3)
+    expect(dedupeCalls.map(call => call.commandId)).toEqual([
+      `${runId}:dedupe`,
+      `${runId}:dedupe`,
+      `${runId}:dedupe`,
+    ])
+    expect(harness.rearms).toEqual(['omb.dedupe', 'omb.dedupe', 'omb.dedupe'])
+    expect((await store.steps(runId)).map(record => `${record.attempt}:${record.status}`)).toEqual([
+      '1:failed',
+      '2:failed',
+      '3:completed',
+    ])
+  })
+
+  it('给定 step 中途崩溃当 recover 则从 checkpoint 继续、commandId 不变', async () => {
+    const harness = jobHarness()
+    const runtime = fixedJobRuntime()
+    runtime.register(definitionOf(harness, 'omb.refresh'))
+    const { runId } = await runtime.startRun('refresh', undefined, { idempotencyKey: 'refresh-recover' })
+
+    // 模拟进程在 step 中途被杀：已 claim + beginStep，run 停在 running。
+    const claimed = await store.claimDue({ limit: 1, leaseMs: 30_000 })
+    expect(claimed.map(run => run.id)).toEqual([runId])
+    await store.beginStep({
+      runId,
+      step: 'refresh',
+      attempt: 1,
+      input: { target: 'refresh', job: 'omb.refresh' },
+    })
+    await makeDue(runId)
+
+    expect(await runtime.recover()).toMatchObject({ recovered: 1, due: 1 })
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect(harness.calls.map(call => call.commandId)).toEqual([`${runId}:refresh`])
+    expect((await store.steps(runId)).map(record => `${record.step}:${record.attempt}:${record.status}`)).toEqual([
+      'refresh:1:running',
+      'refresh:2:completed',
+    ])
+    expect((await runRow(runId)).status).toBe('completed')
+  })
+
+  it('给定 step 一直失败当重试耗尽则 dead，人工 retry 后完成且 commandId 不变', async () => {
+    const harness = jobHarness()
+    harness.failNext('omb.conflict', 1)
+    const runtime = fixedJobRuntime({ retry: { maxAttempts: 1, baseDelayMs: 100, factor: 2, maxDelayMs: 1_000 } })
+    runtime.register(definitionOf(harness, 'omb.conflict'))
+    const { runId } = await runtime.startRun('conflict', undefined, { idempotencyKey: 'conflict-dead' })
+
+    expect((await runtime.drain()).dead).toBe(1)
+    expect((await runRow(runId)).status).toBe('dead')
+    expect(harness.rearms).toEqual(['omb.conflict'])
+
+    expect(await runtime.retry(runId)).toBe(true)
+    expect(await runtime.drain()).toMatchObject({ claimed: 1, steps: 1, completed: 1 })
+    expect((await runRow(runId)).status).toBe('completed')
+    // 人工重放不重置 attempts：第 2 次 attempt 完成，幂等键仍是同一个。
+    expect(harness.calls.filter(call => call.job === 'omb.conflict').map(call => call.commandId)).toEqual([
+      `${runId}:detect`,
+      `${runId}:detect`,
+    ])
+    expect((await store.steps(runId)).map(record => `${record.attempt}:${record.status}`)).toEqual([
+      '1:failed',
+      '2:completed',
+    ])
   })
 })
 
