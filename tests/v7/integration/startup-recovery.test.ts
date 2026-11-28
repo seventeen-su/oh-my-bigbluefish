@@ -1,11 +1,37 @@
 import { createServer, connect, type Server, type Socket } from 'node:net'
-import { afterEach, beforeAll, describe, expect, it } from 'vitest'
+import pg from 'pg'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { apply } from '../../../plugin/v7/index.js'
 import type { HostContextLike, HostToolDefinition } from '../../../packages/v7/src/adapters/dsh/host.js'
-import { prepareDatabase, resetDatabase } from './helpers.js'
+import { ensureDatabase, migrateDatabase } from '../../../packages/v7/src/adapters/postgres/migrate.js'
+import { TEST_DATABASE_URL } from './helpers.js'
 
-const PROJECT = 'D:\\Program\\Oh-My-BigBlueFish'
+const PROJECT = process.cwd()
 const EXEC = { agent: { session: { id: 'startup-recovery', header: { cwd: PROJECT } } } }
+const ADMIN_URL = process.env.OMB_ADMIN_DATABASE_URL ?? 'postgres://postgres@127.0.0.1:5432/postgres'
+const RECOVERY_DATABASE_URL = recoveryDatabaseUrl()
+const RECOVERY_DB = databaseNameOf(RECOVERY_DATABASE_URL)
+
+function recoveryDatabaseUrl(): string {
+  const parsed = new URL(TEST_DATABASE_URL)
+  const name = `${decodeURIComponent(parsed.pathname.replace(/^\//, ''))}_recovery_${process.pid.toString(36)}`
+  parsed.pathname = `/${name}`
+  return parsed.toString()
+}
+
+function databaseNameOf(connectionString: string): string {
+  return decodeURIComponent(new URL(connectionString).pathname.replace(/^\//, ''))
+}
+
+async function dropRecoveryDatabase(): Promise<void> {
+  const client = new pg.Client({ connectionString: ADMIN_URL, connectionTimeoutMillis: 5_000 })
+  await client.connect()
+  try {
+    await client.query(`drop database if exists "${RECOVERY_DB.replaceAll('"', '""')}" with (force)`)
+  } finally {
+    await client.end().catch(() => {})
+  }
+}
 
 interface FakeHost {
   readonly ctx: HostContextLike
@@ -79,9 +105,9 @@ async function freePort(): Promise<number> {
   return port
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error('等待条件超时')
     await new Promise(resolve => setTimeout(resolve, 25))
   }
@@ -89,18 +115,22 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 
 describe('v7 startup recovery', () => {
   beforeAll(async () => {
-    await prepareDatabase()
+    await ensureDatabase(RECOVERY_DATABASE_URL, ADMIN_URL)
+    await migrateDatabase(RECOVERY_DATABASE_URL, ADMIN_URL)
   })
 
-  afterEach(async () => {
-    await resetDatabase()
+  afterAll(async () => {
+    await dropRecoveryDatabase()
   })
 
   it('does not keep a startup failure after PostgreSQL becomes reachable', async () => {
     const port = await freePort()
+    const proxied = new URL(RECOVERY_DATABASE_URL)
+    proxied.hostname = '127.0.0.1'
+    proxied.port = String(port)
     const host = fakeHost()
     const dispose = apply(host.ctx, {
-      databaseUrl: `postgres://omb:omb@127.0.0.1:${port}/omb_v7_test`,
+      databaseUrl: proxied.toString(),
       autoMigrate: true,
       jobs: false,
       residentBudget: 100,
@@ -109,15 +139,23 @@ describe('v7 startup recovery', () => {
     try {
       // 让插件的首次初始化真实失败，而不是只假设它会失败。
       await waitFor(() => host.errors.some(message => message.includes('ECONNREFUSED')))
-      const down = await host.tools.get('omb_status')?.execute({}, {})
+      const statusTool = host.tools.get('omb_status')
+      if (statusTool === undefined) throw new Error('缺少 omb_status 工具')
+      const down = await statusTool.execute({}, {})
       expect(down?.text).toContain('db=down')
       expect(down?.text).toContain('jobFailures=0')
 
       proxy = await startProxy(port)
-      const recovered = await host.tools.get('omb_status')?.execute({}, {})
+      await waitFor(async () => {
+        const status = await statusTool.execute({}, {})
+        return status?.text?.includes('db=ok') === true
+      }, 15_000)
+      const recovered = await statusTool.execute({}, {})
       expect(recovered?.text).toContain('db=ok')
 
-      const remembered = await host.tools.get('omb_remember')?.execute({
+      const rememberTool = host.tools.get('omb_remember')
+      if (rememberTool === undefined) throw new Error('缺少 omb_remember 工具')
+      const remembered = await rememberTool.execute({
         kind: 'memory',
         category: 'fact',
         scope: 'project',

@@ -995,6 +995,7 @@ describe('TimerStore/TimerWorker（真实 PostgreSQL）', () => {
     try {
       await waitFor(() => fired.length === 1, 10_000)
       expect(fired).toEqual([id])
+      await waitFor(async () => (await timerRows()).find(row => row.id === id)?.status === 'done', 10_000)
       expect((await timerRows()).find(row => row.id === id)?.status).toBe('done')
       await worker.whenIdle()
     } finally {

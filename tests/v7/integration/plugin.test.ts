@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { apply } from '../../../plugin/v7/index.js'
 import { createPromptSink, type HostContextLike, type HostToolDefinition } from '../../../packages/v7/src/adapters/dsh/host.js'
@@ -12,7 +14,7 @@ function wait(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-const PROJECT = 'D:\\Program\\Oh-My-BigBlueFish'
+const PROJECT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 
 interface FakeHost {
   ctx: HostContextLike
@@ -389,7 +391,7 @@ describe('v7 plugin entry', () => {
       jobs: false,
       residentBudget: 300,
     })
-    const subdir = `${PROJECT}\\packages`
+    const subdir = join(PROJECT, 'packages')
     const listener = host.listeners.get('session/event')
     listener?.(
       { id: 'event-capture-session', header: { cwd: subdir } },

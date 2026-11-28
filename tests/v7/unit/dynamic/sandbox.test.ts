@@ -132,6 +132,7 @@ describe('QuickJsSandbox 限额与隔离', () => {
     await expectOmbError(
       sandbox.run('const list = []; for (let i = 0; i < 100000; i += 1) list.push(new Array(100).fill(i))', input(), {
         memoryMb: 1,
+        timeoutMs: 1_000,
       }),
       'sandbox-error',
       /1MB 内存上限/,

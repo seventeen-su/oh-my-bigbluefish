@@ -1,4 +1,6 @@
 import { readFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { DefaultDynamicResolver } from '../../../packages/v7/src/adapters/dynamic/index.js'
 import { PostgresMaintenance } from '../../../packages/v7/src/adapters/postgres/maintenance.js'
@@ -20,7 +22,7 @@ import {
 import type { ConsolidationDeps } from '../../../packages/v7/src/jobs/consolidate.js'
 import { derived, normalized, prepareDatabase, resetDatabase, store } from './helpers.js'
 
-const PROJECT = 'D:\\Program\\Oh-My-BigBlueFish'
+const PROJECT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 
 describe('background consolidation', () => {
   beforeAll(async () => {
@@ -93,11 +95,12 @@ describe('background consolidation', () => {
 
   it('抽取优先使用事件 metadata 的 git-root projectKey，而不是 payload 子目录 cwd', async () => {
     const { db, deps: context } = await deps()
+    const subdir = join(PROJECT, 'packages')
     await db.recordArtifact({
       id: 'art_goal_subdir',
       kind: 'goal/change',
-      content: JSON.stringify({ cwd: `${PROJECT}\\packages`, goal: { id: 'goal-subdir', objective: '子目录目标' } }),
-      metadata: { cwd: `${PROJECT}\\packages`, projectKey: PROJECT },
+      content: JSON.stringify({ cwd: subdir, goal: { id: 'goal-subdir', objective: '子目录目标' } }),
+      metadata: { cwd: subdir, projectKey: PROJECT },
     })
     await handleExtract(context)
     const view = await db.db.query<{ project_key: string }>(

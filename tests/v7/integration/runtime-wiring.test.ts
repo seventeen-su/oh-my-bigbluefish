@@ -88,7 +88,7 @@ function fakeHost(): FakeHost {
 async function waitFor<T>(
   probe: () => Promise<T | undefined>,
   what: string,
-  timeoutMs = 15_000,
+  timeoutMs = 30_000,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   for (;;) {

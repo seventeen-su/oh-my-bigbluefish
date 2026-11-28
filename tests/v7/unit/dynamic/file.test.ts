@@ -124,12 +124,14 @@ describe('file 动态值', () => {
   })
 
   it('给定 realpath 解析后越过 projectRoot 的符号链接则拒绝且不读文件', async () => {
+    const projectRoot = path.resolve(ROOT, 'project')
+    const outside = path.resolve(ROOT, '..', 'outside', 'secret.txt')
     const guarded = new DefaultDynamicResolver({
-      realpath: async value => (value === 'C:\\project' ? value : 'C:\\outside\\secret.txt'),
+      realpath: async value => (value === projectRoot ? value : outside),
     })
     const ctx = new FakeContext({
-      projectRoot: 'C:\\project',
-      files: { 'C:\\outside\\secret.txt': 'secret' },
+      projectRoot,
+      files: { [outside]: 'secret' },
     })
     await expectOmbError(guarded.resolve({ kind: 'file', path: 'link.txt' }, ctx), 'invalid-input', /符号链接/)
     expect(ctx.readFileCalls).toEqual([])
