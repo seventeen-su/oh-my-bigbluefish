@@ -736,6 +736,7 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(emptyFirst.applied).toContain(CONTRACT_MIGRATION)
     expect(emptyFirst.applied).toContain(PROJECT_IDENTITY_MIGRATION)
     expect(emptyFirst.applied).toContain(STATE_CONCURRENCY_MIGRATION)
+    expect(emptyFirst.applied.at(-1)).toBe(migrationFiles().at(-1))
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
   })
@@ -791,15 +792,8 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     for (const row of nullability.rows) expect(row.is_nullable).toBe('YES')
   })
 
-  it('给定已有 007 库当跑迁移则应用 008-014 且旧审计行与新列可空性符合预期', () => {
-    expect(legacyReport.applied).toEqual([
-      EXPAND_MIGRATION,
-      CONTRACT_MIGRATION,
-      OUTBOX_DEAD_MIGRATION,
-      LEGACY_CONTRACT_MIGRATION,
-      PROJECT_IDENTITY_MIGRATION,
-      STATE_CONCURRENCY_MIGRATION,
-    ])
+  it('给定已有 007 库当跑迁移则应用 008+ 及后续迁移且旧审计行与新列可空性符合预期', () => {
+    expect(legacyReport.applied).toEqual(migrationFiles().filter(name => name >= EXPAND_MIGRATION))
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])
     expect(legacyAuditAfter).toEqual(legacyAuditBefore)

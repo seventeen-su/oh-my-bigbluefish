@@ -12,6 +12,7 @@ import type { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/inde
 import type { JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import type { JsonValue } from '../../packages/v7/src/domain/json.js'
 import type { Reaction } from '../../packages/v7/src/app/outbox/index.js'
+import { dependencyRefreshKey } from '../../packages/v7/src/app/dependency.js'
 import { asRecord } from '../../packages/v7/src/adapters/dsh/host.js'
 import { embeddingText } from '../../packages/v7/src/app/embedding.js'
 
@@ -19,9 +20,18 @@ export const EMBED_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'Entit
 
 /**
  * 事件触发优先：实体写入后动态属性可能已过期（新建时还没有缓存、patch 改了 ref 目标），
- * 所以 Created/Patched 也触发一次合并的 `omb.refresh`。链接/归档不改动态值，仍由 timer 巩固。
+ * 所以 Created/Patched 触发一次实体自身刷新；Archived/Unarchived 不刷新自身，但如果
+ * 写事务里落了依赖失效标记，则触发一次定向的依赖刷新（reaction 读取 payload.dependency）。
+ *
+ * 依赖失效**不靠周期扫描**：标记与 outbox 事件同事务提交，本 reaction 只按 root 入队
+ * `omb.refresh`，handler 读 root 的入边标记顺序刷新。
  */
-export const REFRESH_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'EntityPatched']
+export const REFRESH_REACTION_TOPICS: readonly string[] = [
+  'EntityCreated',
+  'EntityPatched',
+  'EntityArchived',
+  'EntityUnarchived',
+]
 
 /**
  * 链接变化 → 入队 `omb.link-suggest`。
@@ -35,7 +45,8 @@ export const LINK_REACTION_TOPICS: readonly string[] = ['LinkCreated', 'LinkUnli
  * 合法但不需要 outbox 再做一次下游动作的 topic。
  *
  * - `EntityArchived`/`EntityUnarchived`：归档列、`entity_view` 同步与看板投影任务都在
- *   writer 的同一事务里完成；再入队嵌入只会给已归档实体白算向量。
+ *   writer 的同一事务里完成；它们不参与嵌入，但可能带 `payload.dependency`，由 refresh
+ *   reaction 触发一次定向依赖刷新。
  * - `AttributeRenamed`：属性改名会 bump 受影响实体版本、重建 view/引用/触发键并重新入队
  *   看板投影（同样在写事务里）；`deriveSearchText` 不含属性名，嵌入文本不变。
  *
@@ -125,14 +136,28 @@ export function createEmbedReaction(deps: {
 }
 
 /**
- * EntityCreated / EntityPatched → 合并入队一次 `omb.refresh`（事件触发优先）。
+ * 写事务里的依赖失效摘要（`payload.dependency.marked > 0`）：返回 root 实体。
+ * payload 是完整 DomainEvent（`payload.payload.dependency`），由 writer 在 patch/archive/
+ * unarchive 事件里写入；没有标记的普通写入返回 undefined，不产生刷新任务。
+ */
+export function dependencyInvalidationOf(payload: JsonValue): { rootEntityId: string; marked: number } | undefined {
+  const event = asRecord(payload)
+  const data = asRecord(event?.['payload'])
+  const dependency = asRecord(data?.['dependency'])
+  if (dependency === undefined) return undefined
+  const marked = dependency['marked']
+  if (typeof marked !== 'number' || !Number.isFinite(marked) || marked <= 0) return undefined
+  const rootEntityId = entityIdFromOutboxPayload(payload)
+  if (rootEntityId === undefined) return undefined
+  return { rootEntityId, marked }
+}
+
+/**
+ * EntityCreated / EntityPatched → 实体自身合并入队一次 `omb.refresh`（事件触发优先）。
  *
- * 只有实体真的带动态属性才入队：`omb.refresh` 是“扫 staleDynamic”的聚合任务，
- * 普通记忆入队只会空跑一次全表查询。`singletonKey` 固定为 `refresh:event`，
- * 所以一次事件风暴最多留下一个待跑任务，不按事件放大。
- *
- * 与 embed reaction 同款：载荷不是实体事件时抛错让 relay 进死信（status 可见），
- * 不静默丢弃。
+ * 只有实体真的带动态属性才入队自身刷新；依赖失效再看写事务落的 `payload.dependency`，
+ * 对每个 root 用 `refresh:dependency:<root>` 去重（同一 root 的事件风暴只留一个待跑任务）。
+ * 与 embed reaction 同款：载荷不是实体事件时抛错让 relay 进死信（status 可见），不静默丢弃。
  */
 export function createRefreshReaction(deps: {
   readonly store: PostgresStore
@@ -148,8 +173,19 @@ export function createRefreshReaction(deps: {
       }
       const entity = await deps.store.get(entityId, { includeArchived: true })
       if (entity === undefined) return
-      if (!entity.attributes.some(attribute => attribute.value.kind === 'dynamic')) return
-      await deps.queue.enqueue('omb.refresh', { entityId }, { singletonKey: 'refresh:event', retryLimit: 3 })
+      // 归档实体自身不再刷新；只有 Created/Patched 需要把新 spec/缺失缓存补上。
+      if ((event.topic === 'EntityCreated' || event.topic === 'EntityPatched')
+        && entity.attributes.some(attribute => attribute.value.kind === 'dynamic')) {
+        await deps.queue.enqueue('omb.refresh', { entityId }, { singletonKey: 'refresh:event', retryLimit: 3 })
+      }
+      const invalidation = dependencyInvalidationOf(event.payload)
+      if (invalidation !== undefined) {
+        await deps.queue.enqueue(
+          'omb.refresh',
+          { dependencyRoot: invalidation.rootEntityId },
+          { singletonKey: dependencyRefreshKey(invalidation.rootEntityId), retryLimit: 3 },
+        )
+      }
     },
   }
 }

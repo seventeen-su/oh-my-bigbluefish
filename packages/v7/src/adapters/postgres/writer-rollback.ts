@@ -7,6 +7,15 @@ import { deriveReferences, deriveSearchText, deriveTriggers, type NormalizedWrit
 import type { RollbackResult } from '../../ports/observability.js'
 import { actorKindOf } from '../../app/commands/index.js'
 import { asNumber, asString, iso } from './db.js'
+import {
+  deleteLinkDependencyEdges,
+  deleteSourceDependencyEdges,
+  insertLinkDependencyEdges,
+  invalidateDependencies,
+  pruneDependencyMarks,
+  rebuildDependencyEdges,
+  replaceReferenceDependencyEdges,
+} from './dependency.js'
 import { buildViewValues, mapEntity, type EntityRow } from './rows.js'
 import { insertAudit } from './writer-audit.js'
 import {
@@ -114,28 +123,64 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
     if (id === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
     await client.query('update omb.entity set archived_at = null, archive_reason = null where id = $1', [id])
     await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
+    // 原 archive 删过出边：回滚恢复可读性时按当前属性/链接重建，之后上游更新仍能失效。
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+    const current = currentResult.rows[0]
+    if (current !== undefined) {
+      const attributes = await selectAttributes(asAttributeQuery(client), id)
+      await rebuildDependencyEdges(client, { id, kind: current.kind }, attributes)
+    }
+    await invalidateDependencies(client, id, 'unarchive')
     applied.push(`unarchive:${id}`)
   } else if (action === 'archive') {
     const id = asString(inverse['entityId'])
     if (id === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
     await client.query('update omb.entity set archived_at = now(), archive_reason = $2 where id = $1', [id, asString(inverse['reason']) ?? 'rollback'])
     await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
+    await deleteSourceDependencyEdges(client, id)
+    await invalidateDependencies(client, id, 'archive')
     applied.push(`archive:${id}`)
   } else if (action === 'unlink') {
     const linkId = asString(inverse['linkId'])
     if (linkId === undefined) throw new OmbFailure(internal('inverse 缺少 linkId'))
-    await client.query('update omb.link set archived_at = now() where id = $1', [linkId])
+    const unlinked = await client.query<{ from_id: string; to_id: string; relation: string; directed: boolean }>(
+      'update omb.link set archived_at = now() where id = $1 returning from_id, to_id, relation, directed',
+      [linkId],
+    )
+    const link = unlinked.rows[0]
+    if (link !== undefined) {
+      await deleteLinkDependencyEdges(client, {
+        fromId: link.from_id,
+        toId: link.to_id,
+        relation: link.relation,
+        directed: link.directed,
+      })
+    }
     applied.push(`unlink:${linkId}`)
   } else if (action === 'restore_link') {
     const linkId = asString(inverse['linkId'])
     if (linkId === undefined) throw new OmbFailure(internal('inverse 缺少 linkId'))
-    await client.query('update omb.link set archived_at = null where id = $1', [linkId])
+    const restored = await client.query<{ from_id: string; to_id: string; relation: string; directed: boolean }>(
+      'update omb.link set archived_at = null where id = $1 returning from_id, to_id, relation, directed',
+      [linkId],
+    )
+    const link = restored.rows[0]
+    if (link !== undefined) {
+      await insertLinkDependencyEdges(client, {
+        fromId: link.from_id,
+        toId: link.to_id,
+        relation: link.relation,
+        directed: link.directed,
+      })
+    }
     applied.push(`restore_link:${linkId}`)
   } else if (action === 'remove_written') {
     const entityId = asString(inverse['entityId'])
     if (entityId === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
     await client.query("update omb.entity set archived_at = now(), archive_reason = 'rollback-write' where id = $1", [entityId])
     await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [entityId])
+    await deleteSourceDependencyEdges(client, entityId)
+    await invalidateDependencies(client, entityId, 'archive')
     applied.push(`remove_written:${entityId}`)
   } else if (action === 'restore') {
     const entityId = asString(inverse['entityId'])
@@ -177,6 +222,8 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
     await client.query('delete from omb.attribute where entity_id = $1', [entityId])
     await insertAttributes(client, entityId, restored)
     await replaceReferences(client, entityId, derived.references)
+    await replaceReferenceDependencyEdges(client, entityId, current.kind, derived.references)
+    await pruneDependencyMarks(client, entityId)
     // trigger_key 是派生数据；回滚属性后必须同步重建，否则旧触发键会继续命中。
     await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
     await insertTriggers(client, entityId, derived.triggers)
@@ -213,6 +260,8 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
       ],
     )
     await upsertView(client, view)
+    // 回滚属性也是一次内容修改：依赖方按入边标记 stale（无 outbox 事件时由读取兜底）。
+    await invalidateDependencies(client, entityId, 'patch')
     applied.push(`restore:${entityId}`)
   } else if (action === 'restore_attr_rows') {
     const from = asString(inverse['from'])
@@ -300,7 +349,10 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
       await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
       await insertTriggers(client, entityId, derived.triggers)
       await replaceReferences(client, entityId, derived.references)
+      await replaceReferenceDependencyEdges(client, entityId, current.kind, derived.references)
+      await pruneDependencyMarks(client, entityId)
       await upsertView(client, view)
+      await invalidateDependencies(client, entityId, 'patch')
       applied.push(`restore_attr_rows:${entityId}`)
     }
   } else {

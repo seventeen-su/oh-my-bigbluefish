@@ -9,7 +9,9 @@ import type {
   MaintenanceQueries,
   RecentEntity,
 } from '../../ports/maintenance.js'
+import type { DependencyStaleTarget } from '../../ports/dependency.js'
 import { iso, PostgresDb } from './db.js'
+import { readDependencyTargets } from './dependency.js'
 import { AttributeWriter } from './writer.js'
 
 interface RecentRow {
@@ -50,6 +52,11 @@ export class PostgresMaintenance implements MaintenanceQueries {
       [Math.max(1, Math.min(200, limit))],
     )
     return rows.rows.map(row => row.entity_id)
+  }
+
+  /** 事件驱动的依赖刷新入口：只读本次 root 造成的标记，不参与全库扫描。 */
+  async dependencyTargets(rootEntityId: string, limit: number): Promise<readonly DependencyStaleTarget[]> {
+    return readDependencyTargets(this.db, rootEntityId, limit)
   }
 
   async missingEmbeddings(limit: number): Promise<string[]> {

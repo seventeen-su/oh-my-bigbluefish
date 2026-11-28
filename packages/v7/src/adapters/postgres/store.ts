@@ -1,11 +1,5 @@
-import type {
-  Attribute,
-  Entity,
-  EntityKind,
-  PatchEntityInput,
-  StateStatus,
-  StateVersion,
-} from '../../domain/entity.js'
+import type { Attribute, Entity, EntityKind, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
+import type { DependencyAttributeRef, DependencyStaleMark } from '../../domain/dependency.js'
 import { titleOf } from '../../domain/entity-access.js'
 import { OmbFailure, internal } from '../../domain/errors.js'
 import type { JsonValue } from '../../domain/json.js'
@@ -45,6 +39,11 @@ import { systemCommandMeta } from '../../app/commands/index.js'
 import type { ProjectIdentity } from '../../domain/project-identity.js'
 import { iso, PostgresDb } from './db.js'
 import { projectRootRow, recordProjectIdentityRow } from './identity-store.js'
+import {
+  clearDependencyMarks,
+  dependencyQueryOf,
+  readDependencyMarks,
+} from './dependency.js'
 import { mapEntity, type EntityRow, type ViewRow } from './rows.js'
 import { findSimilar } from './similar.js'
 import { sameProjectClause } from './project-key-sql.js'
@@ -484,6 +483,14 @@ export class PostgresStore implements Store {
     error?: string,
   ): Promise<void> {
     await this.run(() => this.writer.setAttributeCache(entityId, name, ordinal, value, cachedAt, error))
+  }
+
+  async dependencyMarks(entityId: string): Promise<readonly DependencyStaleMark[]> {
+    return this.run(() => readDependencyMarks(dependencyQueryOf(this.db), entityId))
+  }
+
+  async clearDependencyMarks(entityId: string, attrs?: readonly DependencyAttributeRef[]): Promise<void> {
+    await this.run(() => clearDependencyMarks(dependencyQueryOf(this.db), entityId, attrs))
   }
 
   async rebuildView(id: string): Promise<void> {

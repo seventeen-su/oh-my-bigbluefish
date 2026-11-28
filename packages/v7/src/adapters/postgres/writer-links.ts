@@ -5,6 +5,7 @@ import { newId } from '../../domain/ids.js'
 import type { JsonValue } from '../../domain/json.js'
 import type { CommandMeta, CommandOutcome } from '../../app/commands/index.js'
 import { iso } from './db.js'
+import { deleteLinkDependencyEdges, insertLinkDependencyEdges } from './dependency.js'
 import type { EntityRow } from './rows.js'
 import { insertEvent, nextStreamVersion } from './writer-audit.js'
 import { noopOutcome, projectionToken, revisionConflict, toJson } from './writer-support.js'
@@ -90,6 +91,13 @@ export async function createLinkCommand(client: PoolClient, input: LinkInput, me
     [id, input.fromId, input.toId, relation, directed, strength, input.source ?? 'model', input.origin ?? meta.origin],
   )
   const link = mapLink(inserted.rows[0] as LinkRow)
+  // 显式链接也是依赖边：目标更新会让 from 侧动态属性失效；无向链接补双向边。
+  await insertLinkDependencyEdges(client, {
+    fromId: link.fromId,
+    toId: link.toId,
+    relation: link.relation,
+    directed: link.directed,
+  })
   const payload: Record<string, JsonValue> = {
     entityId: input.fromId,
     linkId: link.id,
@@ -128,6 +136,13 @@ export async function unlinkCommand(client: PoolClient, id: string, meta: Comman
   )
   const row = result.rows[0]
   if (row === undefined) return noopOutcome('')
+  // link 软归档 → 依赖边同步删除；restore_link 回滚会重新插入。
+  await deleteLinkDependencyEdges(client, {
+    fromId: row.from_id,
+    toId: row.to_id,
+    relation: row.relation,
+    directed: row.directed,
+  })
   if (row.relation === 'possible_conflict') {
     const [left, right] = row.from_id < row.to_id ? [row.from_id, row.to_id] : [row.to_id, row.from_id]
     // check:ignore-next-line sec-sql-concat -- pair_key 走 $1 参数，reason 是常量字面量

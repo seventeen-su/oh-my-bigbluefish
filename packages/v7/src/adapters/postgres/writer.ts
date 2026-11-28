@@ -17,7 +17,15 @@ import {
 } from '../../app/commands/index.js'
 import type { ProjectionName } from '../../app/projections/types.js'
 import type { ProjectionTaskStore } from '../../app/projections/tasks.js'
+import type { DependencyInvalidationResult } from '../../app/dependency.js'
 import { iso, PostgresDb } from './db.js'
+import {
+  deleteSourceDependencyEdges,
+  invalidateDependencies,
+  pruneDependencyMarks,
+  rebuildDependencyEdges,
+  replaceReferenceDependencyEdges,
+} from './dependency.js'
 import { boardProjectionsFor, boardProjectionsForRename, PostgresProjectionTaskStore } from './projection.js'
 import { autoArchivedAt, buildViewValues, mapEntity, type EntityRow } from './rows.js'
 import { insertAudit, insertEvent, nextStreamVersion } from './writer-audit.js'
@@ -63,6 +71,23 @@ function isDuplicateCommandViolation(error: unknown): boolean {
 function textAttribute(entity: Entity, name: string): string | undefined {
   const value = attributeValue(entity, name)
   return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * 写事务里「依赖失效」结果进事件 payload 的窄投影：reaction 只据此决定是否入队
+ * `omb.refresh`（`dependency` 存在即代表有标记），不把完整标记列表塞进 outbox。
+ */
+function dependencyPayload(result: DependencyInvalidationResult): Record<string, JsonValue> {
+  if (result.total === 0) return {}
+  return {
+    dependency: {
+      marked: result.total,
+      direct: result.direct,
+      cascaded: result.cascaded,
+      truncated: result.truncated,
+      maxDepth: result.maxDepth,
+    },
+  }
 }
 
 /**
@@ -229,7 +254,9 @@ export class AttributeWriter implements CommandWriter {
     await upsertRegistry(client, input.attributes)
     // trigger_key/reference/entity_view 都从同一事务内读回的属性行派生（唯一真源）。
     const persisted = await selectAttributes(asAttributeQuery(client), input.id)
-    await replaceReferences(client, input.id, deriveReferences(persisted))
+    const references = deriveReferences(persisted)
+    await replaceReferences(client, input.id, references)
+    await replaceReferenceDependencyEdges(client, input.id, input.kind, references)
     await insertTriggers(client, input.id, deriveTriggers(persisted))
     if (input.kind === 'chain' && input.group !== undefined) {
       await assertChainMemberKinds(client, input.group)
@@ -309,7 +336,11 @@ export class AttributeWriter implements CommandWriter {
     await preserveDynamicCaches(client, input.id, oldAttributes, input.attributes)
     // 唯一真源是属性行：preserveDynamicCaches 写回缓存后再读回，视图/触发键/引用都从这里派生。
     const persisted = await selectAttributes(asAttributeQuery(client), input.id)
-    await replaceReferences(client, input.id, deriveReferences(persisted))
+    const references = deriveReferences(persisted)
+    await replaceReferences(client, input.id, references)
+    await replaceReferenceDependencyEdges(client, input.id, input.kind, references)
+    // 被删掉/改成静态的属性不再有依赖标记，避免 stale 行永久占用刷新窗口。
+    await pruneDependencyMarks(client, input.id)
     // trigger_key 也是派生数据；patch 必须整体替换，否则旧路径/错误签名会残留。
     await client.query('delete from omb.trigger_key where entity_id = $1', [input.id])
     await insertTriggers(client, input.id, deriveTriggers(persisted))
@@ -352,6 +383,8 @@ export class AttributeWriter implements CommandWriter {
     }
     const { view } = buildViewFromRows(updated, persisted, now, archivedAt)
     await upsertView(client, view)
+    // 引用依赖失效：只沿 target 入边标记直接依赖并做有界级联，与本次写入同事务。
+    const invalidation = await invalidateDependencies(client, input.id, 'patch')
     const revision = Number(updated.revision)
     // 写前/写后都传：之前属于看板、之后不属于时要让 projector 收到 revision 去删旧行。
     await this.enqueueProjections(client, input.id, revision, [oldEntity, mapEntity(updated, persisted)])
@@ -360,6 +393,7 @@ export class AttributeWriter implements CommandWriter {
       entityKind: input.kind,
       revision,
       attributes: persisted.filter(item => !item.required).map(item => item.name),
+      ...dependencyPayload(invalidation),
     }
     const event = await insertEvent(client, {
       // 审计的 expected_revision 记录“这次补丁是基于哪个版本提交的”，便于事后复现 CAS。
@@ -488,6 +522,11 @@ export class AttributeWriter implements CommandWriter {
     }
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
+    // 归档 source 不再作为可刷新依赖方：清掉它的出边与自身待刷新标记（入边保留，
+    // 取消归档后继续参与失效传播）。
+    await deleteSourceDependencyEdges(client, id)
+    // 被归档的实体内容不再可读：它的入边依赖方仍需失效，避免引用方继续用旧缓存。
+    const invalidation = await invalidateDependencies(client, id, 'archive')
     // 归档前属于看板时入队：projector 按归档后的谓词删除读模型行。
     // 只有 memory/state 参与看板，链/历史版本不为它们白查一次属性行。
     if (row.kind === 'memory' || row.kind === 'state') {
@@ -495,7 +534,7 @@ export class AttributeWriter implements CommandWriter {
       // 传入的是已归档的行；判定要按归档前（archived:false）才能产生删除任务。
       await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)], { archived: false })
     }
-    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision }
+    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, ...dependencyPayload(invalidation) }
     const event = await insertEvent(client, {
       meta,
       action: 'archive',
@@ -537,11 +576,15 @@ export class AttributeWriter implements CommandWriter {
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
     // 取消归档后重新满足看板谓词时入队，projector 重建读模型行（同样只对 memory/state 查属性）。
+    const attributes = await selectAttributes(asAttributeQuery(client), id)
+    // 归档时删过出边；取消归档要按当前属性/链接重新派生，否则之后上游更新不会失效。
+    await rebuildDependencyEdges(client, { id, kind: row.kind }, attributes)
+    // 取消归档改变可读性，依赖方可能缓存了“归档不可读”的结果。
+    const invalidation = await invalidateDependencies(client, id, 'unarchive')
     if (row.kind === 'memory' || row.kind === 'state') {
-      const attributes = await selectAttributes(asAttributeQuery(client), id)
       await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)])
     }
-    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision }
+    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, ...dependencyPayload(invalidation) }
     const event = await insertEvent(client, {
       meta,
       action: 'unarchive',
@@ -626,6 +669,7 @@ export class AttributeWriter implements CommandWriter {
       renamedRevisions.set(entityId, Number(updated.revision))
       const { view, triggers, references } = buildViewFromRows(updated, attributes, now, iso(updated.archived_at) ?? null)
       await replaceReferences(client, entityId, references)
+      await replaceReferenceDependencyEdges(client, entityId, updated.kind, references)
       await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])
       await insertTriggers(client, entityId, triggers)
       await upsertView(client, view)
@@ -723,14 +767,18 @@ export class AttributeWriter implements CommandWriter {
   ): Promise<void> {
     try {
       await this.db.transaction(async client => {
+        // 成功但解析结果为空（undefined）必须清掉旧缓存：依赖失效后“没有值”也是新结果，
+        // 不能因为 coalesce 把旧值留下。失败（error）才保留旧缓存并写 last_error。
         const updated = await client.query(
           `update omb.attribute
-           set cached_value = coalesce($4::jsonb, cached_value), cached_at = $5, last_error = $6
+           set cached_value = case when $6::text is null then $4::jsonb else coalesce($4::jsonb, cached_value) end,
+               cached_at = $5,
+               last_error = $6
            where entity_id = $1 and name = $2 and ordinal = $3`,
           [entityId, name, ordinal, value === undefined ? null : JSON.stringify(value), cachedAt, error ?? null],
         )
         if (updated.rowCount === 0) return
-        if (value !== undefined && error === undefined) {
+        if (error === undefined) {
           // 动态缓存值是检索文本的一部分：与属性行同事务重建 search_text/chars/snippet 与触发键。
           await rebuildViewFromRows(client, entityId, cachedAt)
         } else {
@@ -756,6 +804,7 @@ export class AttributeWriter implements CommandWriter {
         await client.query('delete from omb.trigger_key where entity_id = $1', [id])
         await insertTriggers(client, id, triggers)
         await replaceReferences(client, id, references)
+        await replaceReferenceDependencyEdges(client, id, row.kind, references)
         await upsertView(client, view)
       })
     } catch (error) {

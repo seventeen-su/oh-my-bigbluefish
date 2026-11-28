@@ -4,8 +4,9 @@
  * 顺序固定：
  * 1. 两个 notifier 先 `ready()`：LISTEN 建立后才能保证“事务提交后的 NOTIFY”不丢；
  *    漏通知仍由 relay 首次 drain 与 timer 的 `nextDueAt` 单次定时器兜底。
- * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed` + 合并 `omb.refresh`）与
- *    两个 timer handler（到期唤醒 workflow runtime；巩固任务的 durable schedule 到期派发）。
+ * 2. 注册真实 reaction（EntityCreated/EntityPatched → 入队 `omb.embed` + `omb.refresh`；
+ *    Archived/Unarchived 的依赖失效 → 定向 `omb.refresh`）与两个 timer handler
+ *    （到期唤醒 workflow runtime；巩固任务的 durable schedule 到期派发）。
  *    未注册 topic 由 relay 的 `unknownTopic='dead'` 明示进死信。
  * 3. 构造 workflow runtime 时先注册真实业务定义（当前 `forget`），再把「按幂等键 start run」
  *    绑定给巩固调度；然后启动 relay/timer/workflow，再跑一次 workflow `recover()`：租约过期的

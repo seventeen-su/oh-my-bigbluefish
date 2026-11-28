@@ -1,5 +1,6 @@
 import type { Attribute, Entity, Scope } from '../domain/entity.js'
-import type { DynamicSpec } from '../domain/dynamic-spec.js'
+import type { DependencyStaleMark } from '../domain/dependency.js'
+import type { DynamicAttributeValue, DynamicSpec } from '../domain/dynamic-spec.js'
 import { scopeOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
 import { OmbFailure, toOmbError } from '../domain/errors.js'
@@ -43,10 +44,60 @@ function staleAt(attribute: Attribute): number | undefined {
   return parsed + (attribute.value.staleAfterMs ?? DEFAULT_STALE_MS)
 }
 
+function markKey(name: string, ordinal: number): string {
+  return `${name}\u0000${ordinal}`
+}
+
+function marksOf(marks: readonly DependencyStaleMark[]): Map<string, DependencyStaleMark> {
+  return new Map(marks.map(mark => [markKey(mark.attrName, mark.ordinal), mark]))
+}
+
+/**
+ * 刷新顺序：依赖标记优先（depth 小 = 直接依赖在前，同深度按标记时间早的在前），
+ * 其余按 TTL 到期时间早的在前。`max` 用完后剩余标记保持 stale，不静默返回旧值。
+ */
+function refreshRank(attribute: Attribute, mark: DependencyStaleMark | undefined): readonly [number, number, number] {
+  if (mark !== undefined) return [0, mark.depth, Date.parse(mark.markedAt) || 0]
+  return [1, 0, staleAt(attribute) ?? 0]
+}
+
+/**
+ * 读取期收口：仍未刷新成功的依赖标记 → 返回 `stale:true` + 原因，并**删除 cachedValue**。
+ * 数据库里的旧值仍保留（失败不清缓存，符合 ADR-0002），但读取方拿不到它。
+ */
+function annotateStale(entity: Entity, marks: readonly DependencyStaleMark[]): Entity {
+  if (marks.length === 0) return entity
+  const byAttribute = marksOf(marks)
+  return {
+    ...entity,
+    attributes: entity.attributes.map(attribute => {
+      if (attribute.value.kind !== 'dynamic') return attribute
+      const mark = byAttribute.get(markKey(attribute.name, attribute.ordinal))
+      if (mark === undefined) return attribute
+      const value = attribute.value
+      const staleValue: DynamicAttributeValue = {
+        kind: 'dynamic',
+        spec: value.spec,
+        ...(value.cachedAt !== undefined ? { cachedAt: value.cachedAt } : {}),
+        ...(value.staleAfterMs !== undefined ? { staleAfterMs: value.staleAfterMs } : {}),
+        ...(value.lastError !== undefined ? { lastError: value.lastError } : {}),
+        stale: true,
+        staleReason: mark.reason,
+      }
+      return { ...attribute, value: staleValue }
+    }),
+  }
+}
+
 export class DynamicService {
   constructor(private readonly deps: DynamicServiceDeps) {}
 
-  /** 读取实体并只刷新过期的动态属性；失败写 last_error，不清旧缓存。 */
+  /**
+   * 读取实体并只刷新过期/依赖失效的动态属性；失败写 last_error，不清旧缓存。
+   *
+   * 依赖失效先于 TTL：同一属性带 `omb.dynamic_stale` 标记时不看 `stale_after_ms`；
+   * 刷新顺序按 depth（直接依赖在前）→ 标记时间；刷新成功后清除标记。
+   */
   async refreshEntity(entity: Entity, options: DynamicRefreshOptions = {}): Promise<Entity> {
     const now = this.deps.clock.iso()
     const nowMs = Date.parse(now)
@@ -63,17 +114,27 @@ export class DynamicService {
       ...options,
       ...(projectRoot !== undefined ? { projectRoot } : {}),
     }
+    const marks = await this.deps.store.dependencyMarks(entity.id)
+    const markByAttribute = marksOf(marks)
+    const ordered = [...dynamic].sort((left, right) => {
+      const a = refreshRank(left, markByAttribute.get(markKey(left.name, left.ordinal)))
+      const b = refreshRank(right, markByAttribute.get(markKey(right.name, right.ordinal)))
+      return a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || left.ordinal - right.ordinal
+    })
     let refreshed = 0
-    for (const attribute of dynamic) {
+    for (const attribute of ordered) {
       if (attribute.value.kind !== 'dynamic') continue
+      const mark = markByAttribute.get(markKey(attribute.name, attribute.ordinal))
       const due = staleAt(attribute)
-      if (options.force !== true && due !== undefined && due > nowMs) continue
+      // 依赖失效不看 TTL；没有标记时保持现有 stale_after_ms 惰性刷新行为。
+      if (options.force !== true && mark === undefined && due !== undefined && due > nowMs) continue
       if (refreshed >= (options.max ?? 4)) break
       refreshed += 1
       const context = this.contextFor(entity.id, effectiveOptions)
       try {
         const value = await this.deps.resolver.resolve(attribute.value.spec, context)
         await this.deps.store.setAttributeCache(entity.id, attribute.name, attribute.ordinal, value, now)
+        await this.deps.store.clearDependencyMarks(entity.id, [{ name: attribute.name, ordinal: attribute.ordinal }])
       } catch (error) {
         await this.deps.store.setAttributeCache(
           entity.id,
@@ -83,9 +144,14 @@ export class DynamicService {
           now,
           toOmbError(error).message,
         )
+        // 失败保留标记：下一次读取/事件刷新必须继续看到 stale，而不是把旧值当新值。
       }
     }
-    return (await this.deps.store.get(entity.id, { includeArchived: true })) ?? entity
+    const reloaded = (await this.deps.store.get(entity.id, { includeArchived: true })) ?? entity
+    // 没有标记时不必再查一次：TTL 刷新不产生依赖 stale；并发写入的标记由下一次读取消费。
+    if (marks.length === 0) return reloaded
+    const remaining = await this.deps.store.dependencyMarks(entity.id)
+    return annotateStale(reloaded, remaining)
   }
 
   async refreshById(id: string, options: DynamicRefreshOptions = {}): Promise<Entity | undefined> {

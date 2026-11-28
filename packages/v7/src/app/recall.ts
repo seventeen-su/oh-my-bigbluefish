@@ -31,7 +31,7 @@ function formatHit(index: number, hit: RecallResult['hits'][number]): string {
   return lines.join('\n')
 }
 
-export function formatRecall(result: RecallResult): string {
+export function formatRecall(result: RecallResult, extraWarnings: readonly string[] = []): string {
   if (result.hits.length === 0) {
     const reason = result.emptyReason
     const channels = result.channels.map(channel => `${channel.channel}:${channel.status}`).join(', ')
@@ -39,8 +39,9 @@ export function formatRecall(result: RecallResult): string {
   }
   const header = `命中 ${result.hits.length} 条（trace ${result.traceId}，场景 ${result.scenario}，扩展种子 ${result.expansion.seeds}）`
   const body = result.hits.map((hit, index) => formatHit(index, hit)).join('\n')
-  const warnings = result.warnings.length > 0 ? `\n注意：${result.warnings.join('；')}` : ''
-  return `${header}\n${body}${warnings}`
+  const warnings = [...result.warnings, ...extraWarnings]
+  const warningText = warnings.length > 0 ? `\n注意：${warnings.join('；')}` : ''
+  return `${header}\n${body}${warningText}`
 }
 
 export interface RecallInjection {
@@ -97,21 +98,28 @@ export class RecallService {
     }
     try {
       const result = await this.engine.recall(request)
+      const dependencyWarnings = new Set<string>()
       if (this.dynamic !== undefined && result.hits.length > 0) {
-        await Promise.all(result.hits.slice(0, 5).map(hit =>
-          this.dynamic!.refreshById(hit.entityId, {
+        await Promise.all(result.hits.slice(0, 5).map(async hit => {
+          const refreshed = await this.dynamic!.refreshById(hit.entityId, {
             ...(projectRoot !== undefined ? { projectRoot } : {}),
             caller: context.sessionId,
             max: 2,
-          }).catch(() => undefined),
-        ))
+          }).catch(() => undefined)
+          if (refreshed === undefined) return
+          for (const attribute of refreshed.attributes) {
+            if (attribute.value.kind !== 'dynamic' || attribute.value.staleReason === undefined) continue
+            // 依赖失效且本轮没刷新成功：结果里显式标 stale，不把旧缓存当成当前值。
+            dependencyWarnings.add(`依赖失效待刷新 ${hit.entityId}.${attribute.name}（${attribute.value.staleReason}）`)
+          }
+        }))
       }
       this.onRecall?.({
         sessionId: context.sessionId,
         traceId: result.traceId,
         hits: result.hits.map(hit => ({ id: hit.entityId, ...(hit.title !== undefined ? { title: hit.title } : {}) })),
       })
-      return ok(formatRecall(result))
+      return ok(formatRecall(result, [...dependencyWarnings].sort()))
     } catch (error) {
       return err({ code: 'internal', message: error instanceof Error ? error.message : String(error) })
     }

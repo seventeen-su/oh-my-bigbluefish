@@ -1,4 +1,5 @@
 import type { Entity, EntityKind, StateVersion } from '../../../../packages/v7/src/domain/entity.js'
+import type { DependencyAttributeRef, DependencyStaleMark } from '../../../../packages/v7/src/domain/dependency.js'
 import type { JsonValue } from '../../../../packages/v7/src/domain/json.js'
 import type { Expansion, LinkInput } from '../../../../packages/v7/src/domain/link.js'
 import type { NormalizedWrite } from '../../../../packages/v7/src/domain/validation.js'
@@ -254,6 +255,14 @@ export class FakeStore implements Store {
     _error?: string,
   ): Promise<void> {
     throw new Error('fake store 未实现 setAttributeCache')
+  }
+
+  async dependencyMarks(_entityId: string): Promise<readonly DependencyStaleMark[]> {
+    return []
+  }
+
+  async clearDependencyMarks(_entityId: string, _attrs?: readonly DependencyAttributeRef[]): Promise<void> {
+    // 默认假存储没有依赖标记；需要消费语义的测试用专门的内存实现。
   }
 
   async recordArtifact(input: ArtifactInput): Promise<void> {

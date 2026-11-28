@@ -1,5 +1,6 @@
 import type { Category, EntityKind, StateStatus } from '../domain/entity.js'
 import type { JsonValue } from '../domain/json.js'
+import type { DependencyStaleTarget } from './dependency.js'
 
 export interface RecentEntity {
   readonly id: string
@@ -52,6 +53,8 @@ export interface BrokenReference {
 
 export interface MaintenanceQueries {
   staleDynamic(limit: number): Promise<string[]>
+  /** 某次写入（root）的依赖失效目标：直接依赖优先、陈旧优先、最近访问优先。 */
+  dependencyTargets(rootEntityId: string, limit: number): Promise<readonly DependencyStaleTarget[]>
   missingEmbeddings(limit: number): Promise<string[]>
   recent(limit: number): Promise<RecentEntity[]>
   coRecallPairs(limit: number): Promise<CoRecallPair[]>

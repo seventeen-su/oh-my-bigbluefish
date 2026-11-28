@@ -146,6 +146,8 @@ export async function truncateAll(connectionString: string): Promise<void> {
         omb.resident_trace,
         omb.audit_log,
         omb.reference,
+        omb.dynamic_stale,
+        omb.dynamic_dependency,
         omb.trigger_key,
         omb.chain_member,
         omb.link,

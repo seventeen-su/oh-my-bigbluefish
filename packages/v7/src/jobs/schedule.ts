@@ -15,6 +15,7 @@ import {
   handleLinkSuggest,
   handleRefresh,
   handleReferenceRot,
+  type RefreshJobOptions,
 } from './consolidate.js'
 
 /**
@@ -249,16 +250,26 @@ export interface ConsolidationJobOptions {
  * 传了 `scheduler` 时，只有**调度驱动**的任务（载荷带触发标记）执行完才在 finally 里
  * rearm 下一期；rearm 失败只记日志，不影响本次任务结果。
  */
+function refreshJobOptionsOf(payload: unknown): RefreshJobOptions {
+  if (!isPlainObject(payload)) return {}
+  const options: { limit?: number; entityId?: string; dependencyRoot?: string } = {}
+  const entityId = payload['entityId']
+  if (typeof entityId === 'string' && entityId.length > 0) options.entityId = entityId
+  const dependencyRoot = payload['dependencyRoot']
+  if (typeof dependencyRoot === 'string' && dependencyRoot.length > 0) options.dependencyRoot = dependencyRoot
+  return options
+}
+
 export async function registerConsolidationJobs(
   queue: JobQueue,
   deps: ConsolidationDeps,
   options: ConsolidationJobOptions = {},
 ): Promise<readonly string[]> {
   const registered: string[] = []
-  const work = async (job: ConsolidationJobName, run: () => Promise<void>): Promise<void> => {
+  const work = async (job: ConsolidationJobName, run: (payload: unknown) => Promise<void>): Promise<void> => {
     await queue.work(job, async payload => {
       try {
-        await run()
+        await run(payload)
       } finally {
         if (isTriggered(payload) && options.scheduler !== undefined) {
           try {
@@ -280,7 +291,7 @@ export async function registerConsolidationJobs(
   await work('omb.attr-alias', () => handleAttrAlias(deps).then(() => undefined))
   await work('omb.reference-rot', () => handleReferenceRot(deps).then(() => undefined))
   if (deps.dynamic !== undefined) {
-    await work('omb.refresh', () => handleRefresh(deps).then(() => undefined))
+    await work('omb.refresh', payload => handleRefresh(deps, refreshJobOptionsOf(payload)).then(() => undefined))
   }
   if (deps.embedder !== undefined) {
     await work('omb.embed-sweep', () => handleEmbedSweep(deps).then(() => undefined))

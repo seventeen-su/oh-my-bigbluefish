@@ -7,6 +7,7 @@ import type {
   StateStatus,
   StateVersion,
 } from '../domain/entity.js'
+import type { DependencyAttributeRef, DependencyStaleMark } from '../domain/dependency.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
 import type { ProjectIdentity } from '../domain/project-identity.js'
@@ -145,6 +146,13 @@ export interface Store {
     cachedAt: string,
     error?: string,
   ): Promise<void>
+  /**
+   * 依赖失效标记：上游实体 write/patch/archive 时在同一事务里落 `omb.dynamic_stale`，
+   * 动态属性读取必须消费它（不能只看 `stale_after_ms`）。空数组表示没有待刷新依赖。
+   */
+  dependencyMarks(entityId: string): Promise<readonly DependencyStaleMark[]>
+  /** 某个依赖标记刷新成功后清除；`attrs` 省略表示清掉该实体全部标记。 */
+  clearDependencyMarks(entityId: string, attrs?: readonly DependencyAttributeRef[]): Promise<void>
   rebuildView(id: string): Promise<void>
   recordRecall(events: readonly RecallEventInput[]): Promise<void>
   /** T1 真正投递后把该 trace 的候选从 injected=false 置为 true（不提前记账）。 */

@@ -73,6 +73,13 @@ export interface DynamicAttributeValue {
   readonly cachedAt?: string
   readonly staleAfterMs?: number
   readonly lastError?: string
+  /**
+   * 读取期标记（不落库）：上游实体更新后依赖失效、本轮没有刷新成功时置真。
+   * 此时 `cachedValue` 会被**有意省略**，调用方必须把该属性当成不可用而不是旧值。
+   */
+  readonly stale?: boolean
+  /** 失效原因（`dependency:<operation>:<rootEntityId>`）；只在 `stale=true` 时出现。 */
+  readonly staleReason?: string
 }
 
 export type AttributeValue = StaticAttributeValue | DynamicAttributeValue

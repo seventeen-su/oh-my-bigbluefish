@@ -767,6 +767,56 @@ function statusRuleOf(entity: Entity): StateStatus | undefined {
   return typeof value === 'string' && STATUS_VALUES.has(value as StateStatus) ? value as StateStatus : undefined
 }
 
+export interface RefreshJobOptions {
+  readonly limit?: number
+  /** 事件 reaction 的定向刷新（EntityCreated/EntityPatched 自身带动态属性时）。 */
+  readonly entityId?: string
+  /** 写事务里发生依赖失效的 root：只刷新本次 root 造成的标记，不做周期扫描。 */
+  readonly dependencyRoot?: string
+}
+
+const REFRESH_MAX_ATTRIBUTES = 4
+const DEPENDENCY_REFRESH_MAX_ATTRIBUTES = 8
+
+async function refreshTarget(
+  deps: ConsolidationDeps,
+  id: string,
+  options: { readonly force: boolean; readonly max: number; readonly projectRoot?: string },
+): Promise<{ readonly refreshed: boolean; readonly statusUpdated: boolean; readonly skipped: boolean }> {
+  const dynamic = deps.dynamic
+  if (dynamic === undefined) return { refreshed: false, statusUpdated: false, skipped: false }
+  const entity = await dynamic.refreshById(id, {
+    force: options.force,
+    max: options.max,
+    ...(options.projectRoot === undefined ? {} : { projectRoot: options.projectRoot }),
+  })
+  if (entity === undefined) return { refreshed: false, statusUpdated: false, skipped: false }
+  if (entity.kind !== 'state') return { refreshed: true, statusUpdated: false, skipped: false }
+  const next = statusRuleOf(entity)
+  if (next === undefined || next === attributeValue(entity, 'status')) {
+    return { refreshed: true, statusUpdated: false, skipped: false }
+  }
+  const updated = await deps.updateService.update({
+    id,
+    expectedRevision: entity.revision,
+    status: next,
+    origin: 'job',
+  }, { actor: SYSTEM_REFRESH, source: SYSTEM_REFRESH })
+  if (updated.ok) return { refreshed: true, statusUpdated: true, skipped: false }
+  if (updated.error.code !== 'conflict' && updated.error.code !== 'archived') {
+    deps.logger?.warn(`动态状态更新失败：${id}`, updated.error.message)
+    return { refreshed: true, statusUpdated: false, skipped: false }
+  }
+  await recordSkippedAudit(skipAuditWriter(deps.store, deps.logger), {
+    action: 'auto-status-skipped',
+    actor: SYSTEM_REFRESH,
+    targetId: id,
+    error: updated.error,
+    after: { skipped: true, attemptedStatus: next, observationRevision: entity.revision },
+  })
+  return { refreshed: true, statusUpdated: false, skipped: true }
+}
+
 /**
  * 自动刷新：动态属性先由 DynamicService 刷新（缓存行，不 bump revision），状态机再按
  * `statusRule` 做一次**条件更新**。
@@ -774,50 +824,46 @@ function statusRuleOf(entity: Entity): StateStatus | undefined {
  * 并发安全：条件更新带刷新时读到的 revision；用户在刷新窗口里写了更高版本时，CAS 失败 →
  * 本次跳过、写 `auto-status-skipped` 审计（system actor），绝不无条件覆盖人工状态。跳过
  * 不是重试：下一次任务重新读取最新 revision，自然走正常路径。
+ *
+ * 入口优先级：dependencyRoot（写事务标记，事件驱动）→ entityId（定向）→ staleDynamic
+ * （仅 TTL 周期兜底）。依赖传播不靠全库扫描。
  */
 export async function handleRefresh(
   deps: ConsolidationDeps,
-  limit = 20,
+  options: RefreshJobOptions = {},
 ): Promise<{ refreshed: number; statusUpdated: number; skipped: number }> {
   if (deps.dynamic === undefined) return { refreshed: 0, statusUpdated: 0, skipped: 0 }
-  const ids = await deps.queries.staleDynamic(limit)
+  const limit = Math.max(1, Math.min(200, options.limit ?? 20))
   let refreshed = 0
   let statusUpdated = 0
   let skipped = 0
-  for (const id of ids) {
+  const apply = async (id: string, force: boolean, max: number, projectRoot?: string): Promise<void> => {
     try {
-      const entity = await deps.dynamic.refreshById(id, { force: true, max: 4 })
-      if (entity === undefined) continue
-      refreshed += 1
-      if (entity.kind !== 'state') continue
-      const next = statusRuleOf(entity)
-      if (next === undefined || next === attributeValue(entity, 'status')) continue
-      const updated = await deps.updateService.update({
-        id,
-        expectedRevision: entity.revision,
-        status: next,
-        origin: 'job',
-      }, { actor: SYSTEM_REFRESH, source: SYSTEM_REFRESH })
-      if (updated.ok) {
-        statusUpdated += 1
-        continue
-      }
-      if (updated.error.code !== 'conflict' && updated.error.code !== 'archived') {
-        deps.logger?.warn(`动态状态更新失败：${id}`, updated.error.message)
-        continue
-      }
-      skipped += 1
-      await recordSkippedAudit(skipAuditWriter(deps.store, deps.logger), {
-        action: 'auto-status-skipped',
-        actor: SYSTEM_REFRESH,
-        targetId: id,
-        error: updated.error,
-        after: { skipped: true, attemptedStatus: next, observationRevision: entity.revision },
+      const result = await refreshTarget(deps, id, {
+        force,
+        max,
+        ...(projectRoot === undefined ? {} : { projectRoot }),
       })
+      if (result.refreshed) refreshed += 1
+      if (result.statusUpdated) statusUpdated += 1
+      if (result.skipped) skipped += 1
     } catch (error) {
       deps.logger?.warn(`动态属性刷新失败：${id}`, error)
     }
   }
+  if (options.dependencyRoot !== undefined) {
+    const targets = await deps.queries.dependencyTargets(options.dependencyRoot, limit)
+    for (const target of targets) {
+      await apply(target.entityId, false, DEPENDENCY_REFRESH_MAX_ATTRIBUTES)
+    }
+    return { refreshed, statusUpdated, skipped }
+  }
+  if (options.entityId !== undefined) {
+    await apply(options.entityId, true, REFRESH_MAX_ATTRIBUTES)
+    return { refreshed, statusUpdated, skipped }
+  }
+  const ids = await deps.queries.staleDynamic(limit)
+  for (const id of ids) await apply(id, true, REFRESH_MAX_ATTRIBUTES)
   return { refreshed, statusUpdated, skipped }
 }
 
