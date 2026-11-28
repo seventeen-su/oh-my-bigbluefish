@@ -20,6 +20,7 @@ export interface LazyInitializerOptions {
 
 export class LazyInitializer {
   private ready = false
+  private closed = false
   private lastError: string | undefined
   private lastAttemptAt = Number.NEGATIVE_INFINITY
   private inflight: Promise<boolean> | undefined
@@ -30,8 +31,20 @@ export class LazyInitializer {
     return this.ready
   }
 
+  get isClosed(): boolean {
+    return this.closed
+  }
+
   get error(): string | undefined {
     return this.lastError
+  }
+
+  /**
+   * 关闭后不再发起新初始化；已在跑的那一次由调用方/适配器自己收尾，
+   * 本类只保证 `ensureReady` 不会在 dispose 之后把资源重新拉起来。
+   */
+  close(): void {
+    this.closed = true
   }
 
   /**
@@ -41,6 +54,7 @@ export class LazyInitializer {
    */
   async ensureReady(options: { readonly force?: boolean } = {}): Promise<boolean> {
     if (this.ready) return true
+    if (this.closed) return false
     if (this.inflight !== undefined) return this.inflight
     const now = this.options.now?.() ?? Date.now()
     const cooldownMs = this.options.cooldownMs ?? 1_000
@@ -62,6 +76,11 @@ export class LazyInitializer {
   private async run(): Promise<boolean> {
     try {
       await this.options.initialize()
+      if (this.closed) {
+        // initialize 在 dispose 之后才完成：不能把一个已经关闭的实例标成 ready，
+        // 但也不覆盖真实错误；调用方应把这次结果当作“已取消”。
+        return false
+      }
       this.ready = true
       this.lastError = undefined
       return true

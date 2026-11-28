@@ -12,7 +12,7 @@
  */
 import { migrateDatabase } from '../../packages/v7/src/adapters/postgres/migrate.js'
 import type { PostgresStore } from '../../packages/v7/src/adapters/postgres/store.js'
-import type { PostgresLifecycle } from '../../packages/v7/src/adapters/postgres/lifecycle.js'
+import type { ManagedPostgresHandle } from '../../packages/v7/src/adapters/postgres/managed.js'
 import type { PostgresMaintenance } from '../../packages/v7/src/adapters/postgres/maintenance.js'
 import type { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/index.js'
 import type { PgBossQueue } from '../../packages/v7/src/adapters/pg-boss/index.js'
@@ -33,7 +33,7 @@ export interface BootDeps {
   readonly config: V7Config
   readonly logger: Logger
   readonly clock: Clock
-  readonly lifecycle: PostgresLifecycle | undefined
+  readonly lifecycle: ManagedPostgresHandle | undefined
   readonly store: PostgresStore
   readonly embedder: OnnxEmbedder
   readonly queue: PgBossQueue
@@ -49,6 +49,8 @@ export interface BootHandle {
   readonly startup: LazyInitializer
   /** 工具调用前的就绪检查：未就绪返回可重试的 `db-unavailable`，而不是把错误抛给宿主。 */
   requireReady(): Promise<Result<never> | undefined>
+  /** dispose 时同步关闭启动闸门：已在跑的这次初始化走完自己的清理，不再发新步骤。 */
+  dispose(): void
 }
 
 export function createBoot(deps: BootDeps): BootHandle {
@@ -57,6 +59,12 @@ export function createBoot(deps: BootDeps): BootHandle {
   let embedJobRegistered = false
   let consolidationJobsRegistered = false
   let queueStarted = false
+  let closing = false
+
+  /** 每一步之前/之后都检查关闭信号：dispose 之后不再迁移、不再注册、不再启动。 */
+  const assertOpen = (): void => {
+    if (closing) throw new Error('v7 启动已被 dispose 取消')
+  }
 
   const startup = new LazyInitializer({
     cooldownMs: 1_000,
@@ -64,18 +72,23 @@ export function createBoot(deps: BootDeps): BootHandle {
     initialize: async () => {
       // 分步幂等：迁移成功后不再重跑；队列注册/启动失败后只补未完成的部分。
       // 这样数据库在插件启动后才恢复时，不需要重启 DSH。
+      assertOpen()
       await deps.lifecycle?.ensureStarted()
+      assertOpen()
       if (config.autoMigrate && !migrated) {
         await migrateDatabase(config.databaseUrl, config.adminDatabaseUrl)
         migrated = true
       }
+      assertOpen()
       // 投影不依赖后台任务开关：jobs=false 也要维护读模型/提供 lag 读数。
       if (!deps.projection.started) await deps.projection.start()
+      assertOpen()
       if (!config.jobs) return
       if (!embedJobRegistered) {
         await registerEmbedJob(queue, { store, embedder })
         embedJobRegistered = true
       }
+      assertOpen()
       if (!consolidationJobsRegistered) {
         const registered = await registerConsolidationJobs(queue, {
           store,
@@ -89,16 +102,20 @@ export function createBoot(deps: BootDeps): BootHandle {
         deps.consolidation.setRegisteredJobs(registered)
         consolidationJobsRegistered = true
       }
+      assertOpen()
       if (!queueStarted) {
         await queue.start()
         queueStarted = true
       }
+      assertOpen()
       // 事件运行时必须在投影之后（task-42）且在队列启动之后：reaction 要往已启动的队列入队。
       await deps.eventRuntime.start()
+      assertOpen()
       // 没有固定 loop：启动只做一次**幂等**排期——已 armed 的 timer 原样保留（崩溃期间
       // 逾期的到期后立刻执行），缺失的才补一条立即到期的。之后由 timer 到期 + 任务
       // 执行完的 rearm 续期；不再有 setInterval/固定节拍。
       await deps.consolidation.ensure()
+      assertOpen()
     },
   })
 
@@ -114,5 +131,13 @@ export function createBoot(deps: BootDeps): BootHandle {
   // 加载期只发起、不等待；失败由下一次真实调用重试。
   void startup.ensureReady()
 
-  return { startup, requireReady }
+  return {
+    startup,
+    requireReady,
+    dispose() {
+      if (closing) return
+      closing = true
+      startup.close()
+    },
+  }
 }

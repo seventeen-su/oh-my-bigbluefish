@@ -15,6 +15,14 @@ const RECENT_FAILURE_LIMIT = 10
 const SUMMARY_LIMIT = 240
 /** 我们自己入队时的默认重试上限；队列配置与任务元数据都以此为准。 */
 const DEFAULT_RETRY_LIMIT = 3
+/**
+ * dispose 时的 graceful drain 上界。
+ *
+ * pg-boss 默认 30s：插件开关关闭后宿主/用户看到的是“队列还在跑”，而且旧实现
+ * 的 5s 步骤超时只是让 teardown 继续走，并不会取消这个 30s 等待。这里显式把
+ * 本实例的收尾限制在 3s；未完成的 active 任务由租约到期后重试接管，不丢数据。
+ */
+const QUEUE_STOP_TIMEOUT_MS = 3_000
 const EMPTY_FINAL_FAILURES: JobFinalFailureSummary = { count: 0, recent: [] }
 
 function summarize(value: unknown): string {
@@ -46,6 +54,9 @@ export class PgBossQueue implements JobQueue {
   private readonly retryLimits = new Map<string, number>()
   private started = false
   private startPromise: Promise<void> | undefined
+  private stopPromise: Promise<void> | undefined
+  /** dispose 之后不再启动：排队中的 enqueue/start 不能把实例复活。 */
+  private closing = false
   /**
    * handler 异常的内存记录：只覆盖本进程，进程重启即丢失，也不持久化到 PostgreSQL。
    *
@@ -58,11 +69,7 @@ export class PgBossQueue implements JobQueue {
   private readonly recentFailures: JobHandlerFailure[] = []
 
   constructor(private readonly options: PgBossQueueOptions) {
-    this.boss = new PgBoss({
-      connectionString: options.connectionString,
-      schema: options.schema ?? 'pgboss',
-      application_name: 'omb-v7-worker',
-    })
+    this.boss = this.createBoss()
     // pg-boss 的 Db 会把连接级错误转发到 PgBoss 的 'error' 事件。EventEmitter
     // 在没有任何 error 监听器时会直接把异常抛成 uncaughtException；数据库重启
     // 或管理员终止连接时，这会让整个 DSH 进程退出。队列错误只应记录并等待
@@ -73,7 +80,17 @@ export class PgBossQueue implements JobQueue {
     })
   }
 
+  /** 连接客户端；测试可覆盖以注入假 pg-boss，生产路径不外露。 */
+  protected createBoss(): PgBoss {
+    return new PgBoss({
+      connectionString: this.options.connectionString,
+      schema: this.options.schema ?? 'pgboss',
+      application_name: 'omb-v7-worker',
+    })
+  }
+
   async start(): Promise<void> {
+    if (this.closing) throw new Error('pg-boss 队列已关闭，拒绝迟到的启动')
     if (this.startPromise !== undefined) return this.startPromise
     const attempt = (async () => {
       // pg-boss 允许在同一实例上重试 start()；失败时不能把 started 置真。
@@ -82,6 +99,8 @@ export class PgBossQueue implements JobQueue {
         this.started = true
       }
       // 启动成功后仍要补注册：上一次可能已经连上数据库，但在 work() 阶段失败。
+      // 与 stop 的竞态由 stop() 等待本 Promise 落地后关闭 pg-boss 处理，这里不抛：
+      // 否则一次关闭会让启动路径留下“失败”日志，而实际上资源随后就被停掉了。
       for (const name of this.handlers.keys()) await this.register(name)
     })()
     this.startPromise = attempt
@@ -92,10 +111,29 @@ export class PgBossQueue implements JobQueue {
     }
   }
 
+  /**
+   * 停止并等待正在进行的 start；即使 start 尚未完成，stop 也不能提前返回——
+   * 否则 pg-boss 会在 stop 之后的微任务里把 worker 拉起来，留下“关闭后仍在跑”的队列。
+   */
   async stop(): Promise<void> {
+    if (this.stopPromise !== undefined) return this.stopPromise
+    this.closing = true
+    const task = this.stopOnce()
+    this.stopPromise = task
+    try {
+      await task
+    } finally {
+      if (this.stopPromise === task) this.stopPromise = undefined
+    }
+  }
+
+  private async stopOnce(): Promise<void> {
+    const starting = this.startPromise
+    if (starting !== undefined) await starting.catch(() => {})
     if (!this.started) return
     try {
-      await this.boss.stop({ graceful: true, close: true })
+      // 显式 timeout：默认 30s 的 graceful drain 会让插件卸载后队列继续跑很久。
+      await this.boss.stop({ graceful: true, close: true, timeout: QUEUE_STOP_TIMEOUT_MS })
     } finally {
       this.started = false
       // 再 start() 时 pg-boss 的 worker 已经不存在，必须重新 work()。
@@ -104,6 +142,7 @@ export class PgBossQueue implements JobQueue {
   }
 
   async enqueue(name: string, payload: unknown, options: JobOptions = {}): Promise<string | null> {
+    if (this.closing) throw new Error('pg-boss 队列已关闭，拒绝迟到入队')
     await this.start()
     await this.ensureQueue(name)
     const retryLimit = options.retryLimit ?? this.retryLimits.get(name) ?? DEFAULT_RETRY_LIMIT
@@ -121,6 +160,8 @@ export class PgBossQueue implements JobQueue {
 
   async work(name: string, handler: (payload: unknown) => Promise<void>): Promise<void> {
     this.handlers.set(name, handler)
+    // 关闭后登记只保留内存 handler，不再向 pg-boss 注册 worker。
+    if (this.closing) return
     if (this.started) await this.register(name)
   }
 

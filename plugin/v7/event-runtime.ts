@@ -43,7 +43,7 @@ import {
   createRefreshReaction,
   type ReactionAckMetrics,
 } from './reactions.js'
-import type { TeardownStep } from './supervisor.js'
+import { RESOURCE_STOP_TIMEOUT_MS, settleWithin } from './supervisor.js'
 import { messageOf } from './messages.js'
 
 /** timer 的两类真实消费者之一：到点唤醒 workflow runtime。 */
@@ -73,32 +73,28 @@ export interface EventRuntimeDeps {
 export interface EventRuntime {
   /** 幂等启动：已启动直接返回；失败时先停循环/关 LISTEN 再抛出。 */
   start(): Promise<void>
+  /** 幂等停止：等待 in-flight start 后停 worker + 关 LISTEN；之后 start 会被拒绝。 */
+  stop(): Promise<void>
   /** 重连回调里触发一次有界对账；失败只记日志，绝不把异常抛进 pg 的事件循环/宿主。 */
   scheduleReconcile(): void
   /** `omb_status` 的事件运行时读数（outbox/timer/workflow/巩固）。 */
   runtimeStatusLines(): Promise<string[]>
   /** LISTEN 连接的可观测读数（三段各一行）。 */
   listenStatusLines(): string[]
-  teardownSteps(): readonly TeardownStep[]
 }
 
-/** 半启动清理：失败/original 错误优先，收尾失败只吞掉，不掩盖启动错误。 */
-async function stopQuietly(target: { stop(): Promise<void> } | undefined): Promise<void> {
-  if (target === undefined) return
-  try {
-    await target.stop()
-  } catch {
-    // 启动失败路径的清理失败没有调用方可处理；下一次真实调用会重建。
-  }
-}
-
-async function closeQuietly(target: { close(): Promise<void> } | undefined): Promise<void> {
-  if (target === undefined) return
-  try {
-    await target.close()
-  } catch {
-    // 同上。
-  }
+/**
+ * 半启动/收尾清理：每一步单独限时，一个 worker 卡住不会连累同阶段的其它资源。
+ * 错误只记日志，不掩盖启动/卸载的原始结果。
+ */
+async function settleQuietly(
+  logger: { warn(message: string, details?: unknown): void },
+  name: string,
+  work: () => Promise<unknown>,
+): Promise<void> {
+  const outcome = await settleWithin(Promise.resolve().then(work), RESOURCE_STOP_TIMEOUT_MS)
+  if (outcome.kind === 'failed') logger.warn(`事件运行时 ${name} 收尾失败`, outcome.reason)
+  else if (outcome.kind === 'timeout') logger.warn(`事件运行时 ${name} 收尾超时，继续关闭其它连接`)
 }
 
 /** 运行时未启动/未测量时的统一读数：显式 unknown + 原因，不把“没跑”报成 0。 */
@@ -121,6 +117,11 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
   const { store, embedder, queue, clock, logger } = deps
   /** 事件运行时：DB ready 且投影启动之后才构造/启动（task-42 的顺序要求）。 */
   let runtimeStarted = false
+  /** 生命周期闸门：dispose 之后，任何迟到步骤都不能再启动/登记资源。 */
+  let closing = false
+  let stopped = false
+  let startTask: Promise<void> | undefined
+  let stopTask: Promise<void> | undefined
   let outboxNotifier: PostgresOutboxNotifier | undefined
   let outboxRelay: OutboxRelay | undefined
   /**
@@ -215,13 +216,74 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
   }
 
   /**
+   * 启动（单飞）。dispose 之后到达的 start 直接拒绝；已在跑的那次由自身在
+   * 每个 await 之后检查 closing 并清理半成品。
+   */
+  async function start(): Promise<void> {
+    if (stopped || closing) throw new Error('事件运行时已关闭，拒绝迟到的启动')
+    if (runtimeStarted) return
+    if (startTask !== undefined) return startTask
+    const task = startOnce()
+    startTask = task
+    try {
+      await task
+    } finally {
+      if (startTask === task) startTask = undefined
+    }
+  }
+
+  /** 幂等停止：等待 in-flight start，再并行停 worker / 关 LISTEN。 */
+  async function stop(): Promise<void> {
+    if (stopTask !== undefined) return stopTask
+    closing = true
+    stopped = true
+    const task = stopOnce()
+    stopTask = task
+    return task
+  }
+
+  async function stopOnce(): Promise<void> {
+    const pending = startTask
+    if (pending !== undefined) await pending.catch(() => {})
+    await stopResources()
+  }
+
+  /** 先停循环再关 LISTEN：反过来会让仍在跑的循环失去唤醒通道/连接。 */
+  async function stopResources(): Promise<void> {
+    const workflow = workflowRuntime
+    const timer = timerWorker
+    const relay = outboxRelay
+    const outboxListen = outboxNotifier
+    const timerListen = timerNotifier
+    workflowRuntime = undefined
+    timerWorker = undefined
+    outboxRelay = undefined
+    outboxNotifier = undefined
+    timerNotifier = undefined
+    outboxReplayStore = undefined
+    reactionRegistry = undefined
+    workflowStoreRef = undefined
+    runtimeStarted = false
+    await Promise.all([
+      ...(workflow === undefined ? [] : [settleQuietly(logger, 'workflow.stop', () => workflow.stop())]),
+      ...(timer === undefined ? [] : [settleQuietly(logger, 'timer.stop', () => timer.stop())]),
+      ...(relay === undefined ? [] : [settleQuietly(logger, 'relay.stop', () => relay.stop())]),
+      ...(timerListen === undefined ? [] : [settleQuietly(logger, 'timerListen.close', () => timerListen.close())]),
+      ...(outboxListen === undefined ? [] : [settleQuietly(logger, 'outboxListen.close', () => outboxListen.close())]),
+    ])
+  }
+
+  /**
    * 构造并启动事件运行时（outbox relay / timer worker / workflow runtime）。
    *
    * 失败时把已启动的循环停掉、LISTEN 连接关掉再抛出，由 LazyInitializer 的下一次真实
    * 调用整体重试，不留半启动的 worker/连接。
    */
-  async function start(): Promise<void> {
+  async function startOnce(): Promise<void> {
     if (runtimeStarted) return
+    const assertOpen = (): void => {
+      if (closing || stopped) throw new Error('事件运行时启动被 dispose 取消')
+    }
     const outboxListen = new PostgresOutboxNotifier({ connectionString: deps.databaseUrl })
     const timerListen = new PostgresTimerNotifier({ connectionString: deps.databaseUrl })
     const registry = new ReactionRegistry()
@@ -230,7 +292,9 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
     let workflow: WorkflowRuntime | undefined
     try {
       await outboxListen.ready()
+      assertOpen()
       await timerListen.ready()
+      assertOpen()
       const embedReaction: Reaction = createEmbedReaction({ store, queue, embedder, logger })
       for (const topic of EMBED_REACTION_TOPICS) registry.register(topic, embedReaction)
       const refreshReaction: Reaction = createRefreshReaction({ store, queue, logger })
@@ -280,10 +344,14 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
         },
         { batchSize: 25, leaseMs: 30_000 },
       )
+      assertOpen()
       relay.start()
       timer.start()
       workflow.start()
       const recovered = await workflow.recover()
+      // dispose 与最后一步启动可能只差一个微任务：回写引用前再检查一次，避免
+      // “stop 已经跑完、start 又把引用写回来”的残留。
+      assertOpen()
       // 断线重连只触发一次有界对账，不引入固定轮询；close 时 notifier 会清掉这些监听。
       outboxListen.onReconnect(() => {
         logger.info('outbox LISTEN 已重连', outboxListen.status())
@@ -314,11 +382,16 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
     } catch (error) {
       runtimeStarted = false
       // 先停循环再关 LISTEN：反过来会让仍在跑的循环失去唤醒通道/连接。
-      await stopQuietly(workflow)
-      await stopQuietly(timer)
-      await stopQuietly(relay)
-      await closeQuietly(timerListen)
-      await closeQuietly(outboxListen)
+      const pendingWorkflow = workflow
+      const pendingTimer = timer
+      const pendingRelay = relay
+      await Promise.all([
+        ...(pendingWorkflow === undefined ? [] : [settleQuietly(logger, 'workflow.stop', () => pendingWorkflow.stop())]),
+        ...(pendingTimer === undefined ? [] : [settleQuietly(logger, 'timer.stop', () => pendingTimer.stop())]),
+        ...(pendingRelay === undefined ? [] : [settleQuietly(logger, 'relay.stop', () => pendingRelay.stop())]),
+        settleQuietly(logger, 'timerListen.close', () => timerListen.close()),
+        settleQuietly(logger, 'outboxListen.close', () => outboxListen.close()),
+      ])
       throw error
     }
   }
@@ -411,22 +484,19 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
     return lines
   }
 
-  /** 每个 worker 与它的 notifier 分成两步，worker 卡住超时也不会让 LISTEN 连接泄漏。 */
-  function teardownSteps(): readonly TeardownStep[] {
-    return [
-      { name: 'outbox.relay.stop', run: () => outboxRelay?.stop() },
-      { name: 'timer.worker.stop', run: () => timerWorker?.stop() },
-      { name: 'workflow.runtime.stop', run: () => workflowRuntime?.stop() },
-      { name: 'outbox.notifier.close', run: () => outboxNotifier?.close() },
-      { name: 'timer.notifier.close', run: () => timerNotifier?.close() },
-    ]
+  /** `omb_status` 的运行时状态读数：显式区分 stopped / running / disabled / unknown。 */
+  function lifecycleLine(): string {
+    if (!deps.jobsEnabled) return 'eventRuntime=disabled'
+    if (stopped) return 'eventRuntime=stopped'
+    if (runtimeStarted) return 'eventRuntime=running'
+    return 'eventRuntime=starting'
   }
 
   return {
     start,
+    stop,
     scheduleReconcile,
-    runtimeStatusLines,
+    runtimeStatusLines: async () => [...(await runtimeStatusLines()), lifecycleLine()],
     listenStatusLines,
-    teardownSteps,
   }
 }

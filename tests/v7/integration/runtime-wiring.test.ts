@@ -131,7 +131,7 @@ async function waitForForgetIdle(): Promise<void> {
 
 interface RunningRuntime {
   readonly host: FakeHost
-  readonly dispose: () => void
+  readonly dispose: () => Promise<void>
   stop(): Promise<void>
 }
 
@@ -164,11 +164,7 @@ function startRuntime(overrides: Record<string, unknown> = {}): RunningRuntime {
     async stop() {
       if (stopped) return
       stopped = true
-      dispose()
-      await waitFor(
-        async () => (host.logs.some(line => line.includes('teardown 收尾完成')) ? true : undefined),
-        'plugin teardown 收尾',
-      )
+      await dispose()
     },
   }
 }
@@ -843,37 +839,26 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
     }
   })
 
-  it('给定 jobs=true 当 disposer 收尾则先停 relay/timer/workflow 再停队列/投影/连接且不超时', async () => {
+  it('给定 jobs=true 当 disposer 收尾则先停运行时装队列/投影/连接且不超时', async () => {
     const runtime = startRuntime()
     await statusText(runtime)
-    expect(() => runtime.dispose()).not.toThrow()
-    await waitFor(
-      async () => (runtime.host.logs.some(line => line.includes('teardown 收尾完成')) ? true : undefined),
-      'plugin teardown 收尾',
-    )
+    const first = runtime.dispose()
+    expect(first).toBeInstanceOf(Promise)
+    await first
 
     const lines = infoLines(runtime)
-    const order = [
-      'outbox.relay.stop',
-      'timer.worker.stop',
-      'workflow.runtime.stop',
-      'outbox.notifier.close',
-      'timer.notifier.close',
-      'queue.stop',
-      'projection.worker.stop',
-      'projection.read.close',
-      'projection.notifier.close',
-      'store.close',
-    ]
-    const indices = order.map(name => lines.findIndex(line => line.includes(`teardown ${name} 完成`)))
-    for (let index = 0; index < order.length; index += 1) {
-      expect(indices[index], `缺少 teardown 步骤：${order[index] ?? ''}`).toBeGreaterThanOrEqual(0)
-      if (index > 0) expect(indices[index]).toBeGreaterThan(indices[index - 1] as number)
+    // 运行时的四个资源在 drain 阶段并行停；store.close 在它们全部让出连接后才执行。
+    const drainSteps = ['eventRuntime.stop', 'projection.stop', 'queue.stop', 'embedder.close']
+    const indices = drainSteps.map(name => lines.findIndex(line => line.includes(`teardown ${name} 完成`)))
+    for (let index = 0; index < drainSteps.length; index += 1) {
+      expect(indices[index], `缺少 teardown 步骤：${drainSteps[index] ?? ''}`).toBeGreaterThanOrEqual(0)
     }
-    // 每步 5s 预算内完成：超时/失败会写成 warn，不允许出现。
+    const storeIndex = lines.findIndex(line => line.includes('teardown store.close 完成'))
+    expect(storeIndex).toBeGreaterThan(Math.max(...indices.map(index => index as number)))
+    // 每个资源独立限时：超时/失败会写成 warn，不允许出现。
     expect(runtime.host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
-    // 重复 dispose 不重复收尾。
-    expect(() => runtime.dispose()).not.toThrow()
+    // 重复 dispose 返回同一个 Promise，不重复收尾。
+    expect(runtime.dispose()).toBe(first)
     expect(runtime.host.logs.filter(line => line.includes('teardown 收尾完成'))).toHaveLength(1)
   })
 })

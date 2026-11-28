@@ -1,16 +1,42 @@
 /**
- * 卸载收尾：同步返回的 disposer（宿主可能不等待异步清理）。
+ * 卸载收尾：返回**可等待的** disposer。
  *
- * 顺序有含义：事件运行时（relay/timer/workflow）→ 各自的 LISTEN 连接 → 队列 → 投影链路 →
- * store.close → 便携 PostgreSQL。relay/timer/workflow 还在跑时不能先关连接池；
- * 每个 worker 与它的 notifier 分成两步，worker 卡住超时也不会让 LISTEN 连接泄漏。
+ * DSH/cordis 在 `Entry.update(disabled)`、`ctx.registry.delete` 与 fiber reload 时都会
+ * `await` 插件回调返回的 disposer（`vendor/cordis/src/fiber.ts` 的 `_unload` 对返回的
+ * Promise 做 await），所以这里不再 `void` 掉异步收尾——宿主等待它，开关关闭时 DB 与
+ * 队列才真的停了。
  *
- * 每个宿主面 disposer 与每个 teardown 步骤都独立隔离：失败只记日志，绝不把异常抛回宿主；
- * 每步独立 5s 超时，超时只记录并继续下一步（不串行累加）。
+ * 顺序与预算（阶段内并行，阶段间串行）：
+ * 1. drain：事件运行时 / 投影 / 队列 / 嵌入器并行停，每个资源内部再限时；
+ * 2. store.close：所有数据库使用者让出连接池后再关池；
+ * 3. managedDb.release：最后释放受管 PostgreSQL，**有独立预算**，前两阶段超时也不会跳过。
+ *
+ * 每个宿主面 disposer 与每个 teardown 步骤都独立隔离：失败只记日志，绝不把异常抛回；
+ * 收尾结果写进进程级 ledger，`omb_status` 可读上一代是否真的停了。
  */
-import { TEARDOWN_STEP_TIMEOUT_MS, runTeardownSteps, type TeardownStep } from './supervisor.js'
+import { randomUUID } from 'node:crypto'
+import {
+  TEARDOWN_PHASE_BUDGET_MS,
+  runTeardownPhases,
+  valueWithin,
+  type TeardownPhase,
+  type TeardownReport,
+} from './supervisor.js'
 import type { Logger } from '../../packages/v7/src/ports/jobs.js'
+import type { ManagedPostgresStatus } from '../../packages/v7/src/adapters/postgres/managed.js'
 import { messageOf } from './messages.js'
+
+export type ManagedDbAfter = 'running' | 'stopped' | 'disabled' | 'unknown'
+
+/** 一代插件卸载的收尾结果；进程级保存最近一次，供下一次 `omb_status` 对账。 */
+export interface TeardownLedgerEntry {
+  readonly at: string
+  readonly instance: string
+  readonly completed: readonly string[]
+  readonly timedOut: readonly string[]
+  readonly failed: readonly { readonly name: string; readonly reason: string }[]
+  readonly managedDbAfter: ManagedDbAfter
+}
 
 export interface DisposerOptions {
   readonly logger: Logger
@@ -25,96 +51,146 @@ export interface DisposerOptions {
   /** 主动记忆检查点 context；与 T0 分开注销。 */
   readonly checkpointSink: { dispose(): void }
   readonly hooks: {
-    readonly preStep: (() => void) | undefined
-    readonly toolPreExecute: (() => void) | undefined
-    readonly toolPostExecute: (() => void) | undefined
-    readonly sessionDisposed: (() => void) | undefined
+    readonly preStep?: (() => void) | undefined
+    readonly toolPreExecute?: (() => void) | undefined
+    readonly toolPostExecute?: (() => void) | undefined
+    readonly sessionDisposed?: (() => void) | undefined
   }
   /** T1 会话态：卸载后没有任何调用者会再读它，显式清空避免热重载时旧缓存跨实例存活。 */
   readonly session: { dispose(): void }
-  /** 事件运行时自己的收尾步骤（relay/timer/workflow + 两个 notifier）。 */
-  readonly eventSteps: readonly TeardownStep[]
-  /** 投影链路的收尾步骤（worker/read/notifier）。 */
-  readonly projectionSteps: readonly TeardownStep[]
-  /** 队列必须排在事件运行时之后、投影链路之前停止。 */
+  /** 关闭启动闸门：之后不再发起迁移/队列注册/运行时启动。 */
+  readonly boot: { dispose(): void }
+  /** 事件运行时（relay/timer/workflow + 两个 LISTEN notifier）。 */
+  readonly eventRuntime: { stop(): Promise<void> }
+  /** 投影链路（worker/read/LISTEN notifier）。 */
+  readonly projection: { stop(): Promise<void> }
+  /** pg-boss 队列：内部等待 in-flight start，并限制 graceful drain 时间。 */
   readonly queue: { stop(): Promise<void> }
+  /** ONNX 会话释放（runtime 本身是进程级单例，不在这里释放）。 */
+  readonly embedder: { close(): Promise<void> }
   readonly store: { close(): Promise<void> }
-  readonly lifecycle: { stop(): Promise<void> } | undefined
+  /** 受管 PostgreSQL 的进程级句柄；`managePostgres=false` 时 undefined。 */
+  readonly managedDb: {
+    release(): Promise<void>
+    status(): Promise<ManagedPostgresStatus>
+  } | undefined
+  /** 覆盖预算（测试用）。 */
+  readonly budgets?: { readonly drainMs?: number; readonly storeMs?: number; readonly lifecycleMs?: number }
 }
 
-export function createDisposer(options: DisposerOptions): () => void {
-  const { logger } = options
-  let disposed = false
+const ledgerHolder = globalThis as typeof globalThis & {
+  __ombLastTeardown?: TeardownLedgerEntry
+}
+
+/** 最近一次卸载结果；从未卸载时 undefined。 */
+export function lastTeardown(): TeardownLedgerEntry | undefined {
+  return ledgerHolder.__ombLastTeardown
+}
+
+/** 测试用：清空 ledger，避免跨用例串读。 */
+export function resetTeardownLedger(): void {
+  delete ledgerHolder.__ombLastTeardown
+}
+
+export function createDisposer(options: DisposerOptions): () => Promise<void> {
+  let disposal: Promise<void> | undefined
   return () => {
-    if (disposed) return
-    disposed = true
-    try {
-      options.tools.dispose()
-    } catch {
-      // 注销失败不阻断卸载。
-    }
-    try {
-      options.capture.dispose()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.skillsOff()
-    } catch {
-      // 注销失败不阻断卸载。
-    }
-    try {
-      options.protocolOff()
-    } catch {
-      // 注销失败不阻断卸载。
-    }
-    try {
-      options.promptSink.dispose()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.checkpointSink.dispose()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.hooks.preStep?.()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.hooks.toolPostExecute?.()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.hooks.toolPreExecute?.()
-    } catch {
-      // 同上。
-    }
-    try {
-      options.hooks.sessionDisposed?.()
-    } catch {
-      // 同上。
-    }
-    options.session.dispose()
-    // 没有可停的巩固循环了：durable schedule 是 omb.timer 里的行，进程退出后仍保留，
-    // 下一个进程启动时靠幂等 ensure 接管；这里不需要（也不应该）取消它们。
-    const teardownSteps: TeardownStep[] = [
-      ...options.eventSteps,
-      { name: 'queue.stop', run: () => options.queue.stop() },
-      ...options.projectionSteps,
-      { name: 'store.close', run: () => options.store.close() },
-      ...(options.lifecycle === undefined ? [] : [{ name: 'lifecycle.stop', run: () => options.lifecycle?.stop() }]),
-    ]
-    void runTeardownSteps(teardownSteps, { logger, timeoutMs: TEARDOWN_STEP_TIMEOUT_MS })
-      .then(report => {
-        logger.info('teardown 收尾完成', report)
-      })
-      .catch(error => {
-        // runTeardownSteps 约定不 reject；这里只是最后一道保险。
-        logger.warn('teardown 收尾异常', messageOf(error))
-      })
+    disposal ??= disposeOnce(options)
+    return disposal
+  }
+}
+
+async function disposeOnce(options: DisposerOptions): Promise<void> {
+  const { logger } = options
+  // 同步注销宿主面：这些必须在同一 tick 完成，宿主注销工具后模型不再能调用它们。
+  unregister('tools', () => options.tools.dispose())
+  unregister('capture', () => options.capture.dispose())
+  unregister('skills', () => options.skillsOff())
+  unregister('protocol', () => options.protocolOff())
+  unregister('promptSink', () => options.promptSink.dispose())
+  unregister('checkpointSink', () => options.checkpointSink.dispose())
+  unregister('preStep', () => options.hooks.preStep?.())
+  unregister('toolPostExecute', () => options.hooks.toolPostExecute?.())
+  unregister('toolPreExecute', () => options.hooks.toolPreExecute?.())
+  unregister('sessionDisposed', () => options.hooks.sessionDisposed?.())
+  unregister('session', () => options.session.dispose())
+  // 先关闭启动闸门（同步），避免 drain 阶段还在跑时 boot 又发起新步骤。
+  unregister('boot', () => options.boot.dispose())
+
+  const budgets = options.budgets
+  const phases: TeardownPhase[] = [
+    {
+      name: 'drain',
+      budgetMs: budgets?.drainMs ?? TEARDOWN_PHASE_BUDGET_MS.drain,
+      steps: [
+        { name: 'eventRuntime.stop', run: () => options.eventRuntime.stop() },
+        { name: 'projection.stop', run: () => options.projection.stop() },
+        { name: 'queue.stop', run: () => options.queue.stop() },
+        { name: 'embedder.close', run: () => options.embedder.close() },
+      ],
+    },
+    {
+      name: 'store',
+      budgetMs: budgets?.storeMs ?? TEARDOWN_PHASE_BUDGET_MS.store,
+      steps: [{ name: 'store.close', run: () => options.store.close() }],
+    },
+  ]
+  // DB release 是整条收尾的最后一件事，也是唯一不能因前面超时被跳过的一步。
+  if (options.managedDb !== undefined) {
+    phases.push({
+      name: 'lifecycle',
+      budgetMs: budgets?.lifecycleMs ?? TEARDOWN_PHASE_BUDGET_MS.lifecycle,
+      steps: [{ name: 'managedDb.release', run: () => options.managedDb?.release() }],
+    })
+  }
+
+  const report = await runTeardownPhases(phases, { logger })
+  const managedDbAfter = await probeManagedDb(options)
+  const entry: TeardownLedgerEntry = {
+    at: new Date().toISOString(),
+    instance: randomUUID(),
+    completed: [...report.completed],
+    timedOut: [...report.timedOut],
+    failed: [...report.failed],
+    managedDbAfter,
+  }
+  ledgerHolder.__ombLastTeardown = entry
+  logReport(logger, report, managedDbAfter)
+}
+
+function unregister(name: string, dispose: () => void): void {
+  try {
+    dispose()
+  } catch {
+    // 注销失败不阻断卸载；后续阶段仍要执行。
+  }
+}
+
+async function probeManagedDb(options: DisposerOptions): Promise<ManagedDbAfter> {
+  const managed = options.managedDb
+  if (managed === undefined) return 'disabled'
+  try {
+    // 收尾结果不能因为一次 pg_ctl 探测卡住而拖住宿主；2s 内拿不到就如实报 unknown。
+    const status = await valueWithin(managed.status(), 2_000)
+    return status?.probe ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function logReport(logger: Logger, report: TeardownReport, managedDbAfter: ManagedDbAfter): void {
+  // 既有测试/运维用它判断“收尾真的完成”，保留固定消息。
+  logger.info('teardown 收尾完成', report)
+  logger.info('teardown 资源状态', {
+    completed: report.completed,
+    timedOut: report.timedOut,
+    failed: report.failed,
+    managedDbAfter,
+  })
+  if (report.timedOut.length > 0 || report.failed.length > 0) {
+    logger.warn('teardown 收尾不完整', {
+      timedOut: report.timedOut,
+      failed: report.failed.map(item => `${item.name}: ${messageOf(item.reason)}`),
+    })
   }
 }

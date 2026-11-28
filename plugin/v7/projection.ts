@@ -23,7 +23,7 @@ import type { ListenNotifierStatus } from '../../packages/v7/src/adapters/postgr
 import type { ResidentBoardsOptions, ResidentBoardsQuery } from '../../packages/v7/src/recall/resident.js'
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import type { Logger } from '../../packages/v7/src/ports/jobs.js'
-import type { TeardownStep } from './supervisor.js'
+import { RESOURCE_STOP_TIMEOUT_MS, settleWithin } from './supervisor.js'
 import { messageOf } from './messages.js'
 
 export interface ProjectionRuntimeDeps {
@@ -40,6 +40,8 @@ export interface ProjectionRuntimeDeps {
 export interface ProjectionRuntime {
   /** 幂等启动：已启动直接返回；失败时清理半启动状态后抛出。 */
   start(): Promise<void>
+  /** 幂等停止：等待 in-flight start 后停 worker/读 API/LISTEN；之后 start 会被拒绝。 */
+  stop(): Promise<void>
   readonly started: boolean
   /** `omb_status` 的投影读数；从未成功投影时显式 unknown，不伪报 0。 */
   statusLines(): Promise<string[]>
@@ -47,12 +49,16 @@ export interface ProjectionRuntime {
   residentBoardsOptions(): ResidentBoardsOptions | undefined
   /** LISTEN notifier（`omb_status` 的三段 LISTEN 读数需要它）；未启动时 undefined。 */
   notifier(): { status(): ListenNotifierStatus } | undefined
-  teardownSteps(): readonly TeardownStep[]
 }
 
 export function createProjectionRuntime(deps: ProjectionRuntimeDeps): ProjectionRuntime {
   const { databaseUrl, store, clock, logger } = deps
   let projectionStarted = false
+  /** 生命周期闸门：dispose 之后不再启动，也不把引用写回。 */
+  let closing = false
+  let stopped = false
+  let startTask: Promise<void> | undefined
+  let stopTask: Promise<void> | undefined
   let projectionWorker: ProjectionWorker | undefined
   let projectionReadApi: ProjectionReadApi | undefined
   let projectionNotifier: PostgresProjectionNotifier | undefined
@@ -60,14 +66,31 @@ export function createProjectionRuntime(deps: ProjectionRuntimeDeps): Projection
   let projectionBoardReader: ReturnType<typeof createBoardReader> | undefined
 
   async function start(): Promise<void> {
+    if (stopped || closing) throw new Error('投影链路已关闭，拒绝迟到的启动')
     if (projectionStarted) return
+    if (startTask !== undefined) return startTask
+    const task = startOnce()
+    startTask = task
+    try {
+      await task
+    } finally {
+      if (startTask === task) startTask = undefined
+    }
+  }
+
+  async function startOnce(): Promise<void> {
+    const assertOpen = (): void => {
+      if (closing || stopped) throw new Error('投影链路启动被 dispose 取消')
+    }
     const notifier = new PostgresProjectionNotifier({ connectionString: databaseUrl })
     projectionNotifier = notifier
+    let worker: ProjectionWorker | undefined
     try {
       await notifier.ready()
+      assertOpen()
       const tasks = new PostgresProjectionTaskStore(store.db)
       const boards = createBoardReader(store.db)
-      const worker = new ProjectionWorker(
+      worker = new ProjectionWorker(
         {
           store: tasks,
           projectors: createBoardProjectors(store.db),
@@ -78,7 +101,9 @@ export function createProjectionRuntime(deps: ProjectionRuntimeDeps): Projection
         { batchSize: 25, leaseMs: 30_000 },
       )
       const recovered = await worker.recover()
+      assertOpen()
       worker.start()
+      assertOpen()
       projectionWorker = worker
       projectionBoardReader = boards
       projectionReadApi = new ProjectionReadApi({
@@ -98,9 +123,39 @@ export function createProjectionRuntime(deps: ProjectionRuntimeDeps): Projection
       projectionWorker = undefined
       projectionReadApi = undefined
       projectionBoardReader = undefined
-      await notifier.close().catch(() => {})
+      projectionNotifier = undefined
+      await settleWithin(Promise.resolve().then(() => worker?.stop()), RESOURCE_STOP_TIMEOUT_MS)
+      await settleWithin(notifier.close(), RESOURCE_STOP_TIMEOUT_MS)
       throw error
     }
+  }
+
+  /** 幂等停止：先等 in-flight start，再并行停 worker/读 API/关 LISTEN。 */
+  async function stop(): Promise<void> {
+    if (stopTask !== undefined) return stopTask
+    closing = true
+    stopped = true
+    const task = stopOnce()
+    stopTask = task
+    return task
+  }
+
+  async function stopOnce(): Promise<void> {
+    const pending = startTask
+    if (pending !== undefined) await pending.catch(() => {})
+    const worker = projectionWorker
+    const readApi = projectionReadApi
+    const notifier = projectionNotifier
+    projectionWorker = undefined
+    projectionReadApi = undefined
+    projectionBoardReader = undefined
+    projectionNotifier = undefined
+    projectionStarted = false
+    await Promise.all([
+      ...(worker === undefined ? [] : [settleWithin(worker.stop(), RESOURCE_STOP_TIMEOUT_MS)]),
+      ...(readApi === undefined ? [] : [settleWithin(readApi.close(), RESOURCE_STOP_TIMEOUT_MS)]),
+      ...(notifier === undefined ? [] : [settleWithin(notifier.close(), RESOURCE_STOP_TIMEOUT_MS)]),
+    ])
   }
 
   /**
@@ -163,23 +218,21 @@ export function createProjectionRuntime(deps: ProjectionRuntimeDeps): Projection
     }
   }
 
-  /** worker 与它的 notifier 分开两步：worker 卡住超时也不会让 LISTEN 连接泄漏。 */
-  function teardownSteps(): readonly TeardownStep[] {
-    return [
-      { name: 'projection.worker.stop', run: () => projectionWorker?.stop() },
-      { name: 'projection.read.close', run: () => projectionReadApi?.close() },
-      { name: 'projection.notifier.close', run: () => projectionNotifier?.close() },
-    ]
+  /** `omb_status` 的运行时状态读数：显式区分 stopped / running / starting。 */
+  function lifecycleLine(): string {
+    if (stopped) return 'projectionRuntime=stopped'
+    if (projectionStarted) return 'projectionRuntime=running'
+    return 'projectionRuntime=starting'
   }
 
   return {
     start,
+    stop,
     get started() {
       return projectionStarted
     },
-    statusLines,
+    statusLines: async () => [...(await statusLines()), lifecycleLine()],
     residentBoardsOptions,
     notifier: () => projectionNotifier,
-    teardownSteps,
   }
 }

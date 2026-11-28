@@ -14,7 +14,7 @@ import { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/index.js'
 import { DefaultDynamicResolver } from '../../packages/v7/src/adapters/dynamic/index.js'
 import { PostgresStore } from '../../packages/v7/src/adapters/postgres/store.js'
 import { PostgresMaintenance } from '../../packages/v7/src/adapters/postgres/maintenance.js'
-import { PostgresLifecycle } from '../../packages/v7/src/adapters/postgres/lifecycle.js'
+import { getManagedPostgresPool } from '../../packages/v7/src/adapters/postgres/managed.js'
 import { PostgresJobFailureLog } from '../../packages/v7/src/adapters/postgres/jobs.js'
 import { PgBossQueue } from '../../packages/v7/src/adapters/pg-boss/index.js'
 import { PostgresTimerStore } from '../../packages/v7/src/adapters/postgres/timer.js'
@@ -42,7 +42,7 @@ import { createT1Session } from './t1-session.js'
 import { createDisposer } from './teardown.js'
 import type { LazyInitializer } from './startup.js'
 
-export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
+export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<void> {
   const parsed = parseConfig(rawConfig)
   const logger = createLogger(ctx)
   // 宿主面自检：记录承诺注册的 7 个工具 / 4 个钩子与真实结果，供 omb_status 报读数。
@@ -50,8 +50,10 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
   for (const problem of parsed.problems) logger.warn(`配置问题：${problem}`)
   const config = parsed.config
   const clock: Clock = { now: () => new Date(), iso: () => new Date().toISOString() }
-  const lifecycle = config.managePostgres && config.postgresBinDir !== undefined && config.postgresDataDir !== undefined
-    ? new PostgresLifecycle({
+  // 受管 PostgreSQL 走进程级池：同一 dataDir 在热重载/组件开关重叠时只有一个生命周期，
+  // 最后一个引用释放才停；旧代迟到的 ensureStarted 由 handle 拒绝。
+  const managedDb = config.managePostgres && config.postgresBinDir !== undefined && config.postgresDataDir !== undefined
+    ? getManagedPostgresPool().acquire({
         binDir: config.postgresBinDir,
         dataDir: config.postgresDataDir,
         adoptExisting: config.adoptExisting,
@@ -153,7 +155,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     config,
     logger,
     clock,
-    lifecycle,
+    lifecycle: managedDb,
     store,
     embedder,
     queue,
@@ -173,6 +175,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     embedder,
     queue,
     startup: boot.startup,
+    managedDb,
     projectionStatusLines: () => projection.statusLines(),
     runtimeStatusLines: () => eventRuntime.runtimeStatusLines(),
     listenStatusLines: () => eventRuntime.listenStatusLines(),
@@ -239,10 +242,12 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => void {
     checkpointSink,
     hooks: hooks.offs,
     session,
-    eventSteps: eventRuntime.teardownSteps(),
-    projectionSteps: projection.teardownSteps(),
+    boot,
+    eventRuntime,
+    projection,
     queue,
+    embedder,
     store,
-    lifecycle,
+    managedDb,
   })
 }

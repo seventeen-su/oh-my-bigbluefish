@@ -1524,10 +1524,14 @@ describe('v7 plugin entry', () => {
       residentBudget: 300,
     })
     expect(host.tools.size).toBe(7)
-    // 卸载：disposer 同步返回，队列/连接池在后台按序收尾；任何一步都不许抛回宿主。
-    expect(() => dispose()).not.toThrow()
-    await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
-    expect(() => dispose()).not.toThrow()
+    // 新版 disposer 返回可等待的 Promise：宿主 await 它，队列/连接池收尾完成后开关才算关掉。
+    const first = dispose()
+    expect(first).toBeInstanceOf(Promise)
+    await first
+    // 重复调用必须返回同一个收尾 Promise，不重复停队列/关池。
+    const second = dispose()
+    expect(second).toBe(first)
+    await second
 
     const infoLines = host.logs.filter(line => line.startsWith('info '))
     const queueIndex = infoLines.findIndex(line => line.includes('teardown queue.stop 完成'))
@@ -1611,18 +1615,14 @@ describe('v7 plugin entry', () => {
     )
     expect(after?.text).toContain('projectionLag:state_board')
 
-    // 卸载顺序：worker → read API → notifier → store.close（投影链路先于连接池收尾）。
-    expect(() => dispose()).not.toThrow()
-    await waitUntil(() => host.logs.some(line => line.includes('teardown 收尾完成')))
+    // 卸载：投影链路与连接池并行收尾，但 store.close 只会在投影停止之后发生；
+    // worker/read/notifier 之间并行（各自独立限时），不再有先后顺序契约。
+    await dispose()
     const infoLines = host.logs.filter(line => line.startsWith('info '))
-    const workerIndex = infoLines.findIndex(line => line.includes('teardown projection.worker.stop 完成'))
-    const readIndex = infoLines.findIndex(line => line.includes('teardown projection.read.close 完成'))
-    const notifierIndex = infoLines.findIndex(line => line.includes('teardown projection.notifier.close 完成'))
+    const workerIndex = infoLines.findIndex(line => line.includes('teardown projection.stop 完成'))
     const storeIndex = infoLines.findIndex(line => line.includes('teardown store.close 完成'))
     expect(workerIndex).toBeGreaterThanOrEqual(0)
-    expect(readIndex).toBeGreaterThan(workerIndex)
-    expect(notifierIndex).toBeGreaterThan(readIndex)
-    expect(storeIndex).toBeGreaterThan(notifierIndex)
+    expect(storeIndex).toBeGreaterThan(workerIndex)
     // 投影停止不能有超时/失败：那会说明 worker 或 LISTEN 连接泄漏到连接池关闭之后。
     expect(host.logs.some(line => line.includes('teardown') && line.startsWith('warn '))).toBe(false)
     await db.close()

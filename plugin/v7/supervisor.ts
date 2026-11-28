@@ -228,9 +228,31 @@ export function wireHostHook(options: {
 /** 每一步独立的卸载预算；等待超时后继续下一步，不串行累加。 */
 export const TEARDOWN_STEP_TIMEOUT_MS = 5_000
 
+/**
+ * 分阶段卸载预算：阶段内步骤并行，阶段之间串行。
+ *
+ * `drain` 里并行的各步互不依赖（事件运行时、投影、队列、嵌入器），共享一份预算；
+ * `store.close` 必须等它们全部让出数据库；`lifecycle.stop` 有独立预算，前两阶段
+ * 超时也不会被跳过——这正是旧实现把 DB stop 排在队尾时丢掉的那一步。
+ */
+export const TEARDOWN_PHASE_BUDGET_MS = {
+  drain: 3_500,
+  store: 1_500,
+  lifecycle: 2_500,
+} as const
+
+/** 单个资源内部停机的上界：一个 worker 卡住不能连累同一阶段里的其它资源。 */
+export const RESOURCE_STOP_TIMEOUT_MS = 2_000
+
 export interface TeardownStep {
   readonly name: string
   readonly run: () => Promise<unknown> | unknown
+}
+
+export interface TeardownPhase {
+  readonly name: string
+  readonly budgetMs: number
+  readonly steps: readonly TeardownStep[]
 }
 
 export interface TeardownReport {
@@ -244,7 +266,7 @@ export interface TeardownOptions {
   readonly logger?: Logger
 }
 
-type StepOutcome = { readonly kind: 'ok' } | { readonly kind: 'timeout' } | { readonly kind: 'failed'; readonly reason: string }
+export type StepOutcome = { readonly kind: 'ok' } | { readonly kind: 'timeout' } | { readonly kind: 'failed'; readonly reason: string }
 
 /**
  * 顺序执行卸载步骤，每步独立超时并记日志。
@@ -263,28 +285,72 @@ export async function runTeardownSteps(
   for (const step of steps) {
     let outcome: StepOutcome
     try {
-      outcome = await settleWithTimeout(step.run(), timeoutMs)
+      outcome = await settleWithin(step.run(), timeoutMs)
     } catch (error) {
       // step.run() 同步抛错也只是一步失败，继续后面的收尾。
       outcome = { kind: 'failed', reason: messageOf(error) }
     }
-    if (outcome.kind === 'ok') {
-      completed.push(step.name)
-      options.logger?.info(`teardown ${step.name} 完成`)
-      continue
-    }
-    if (outcome.kind === 'timeout') {
-      timedOut.push(step.name)
-      options.logger?.warn(`teardown ${step.name} 超过 ${timeoutMs}ms 未完成，继续后续步骤`)
-      continue
-    }
-    failed.push({ name: step.name, reason: outcome.reason })
-    options.logger?.warn(`teardown ${step.name} 失败：${outcome.reason}；继续后续步骤`)
+    classifyStep(step.name, outcome, { completed, timedOut, failed }, options.logger, timeoutMs)
   }
   return { completed, timedOut, failed }
 }
 
-function settleWithTimeout(work: Promise<unknown> | unknown, timeoutMs: number): Promise<StepOutcome> {
+/**
+ * 分阶段卸载：阶段内步骤**并行**且共享阶段预算，阶段之间按声明顺序串行。
+ *
+ * 阶段预算固定，因此 `lifecycle` 阶段始终拿到自己的整份预算；即使 drain/store
+ * 全部超时，DB release 仍会被执行。每一步单独计时与记录，一个资源卡住不会拖住
+ * 同阶段的其它资源。本函数永不 reject。
+ */
+export async function runTeardownPhases(
+  phases: readonly TeardownPhase[],
+  options: TeardownOptions = {},
+): Promise<TeardownReport> {
+  const completed: string[] = []
+  const timedOut: string[] = []
+  const failed: { name: string; reason: string }[] = []
+  for (const phase of phases) {
+    const outcomes = await Promise.all(phase.steps.map(async (step): Promise<readonly [string, StepOutcome]> => {
+      try {
+        return [step.name, await settleWithin(step.run(), phase.budgetMs)] as const
+      } catch (error) {
+        return [step.name, { kind: 'failed', reason: messageOf(error) }] as const
+      }
+    }))
+    for (const [name, outcome] of outcomes) {
+      classifyStep(name, outcome, { completed, timedOut, failed }, options.logger, phase.budgetMs)
+    }
+  }
+  return { completed, timedOut, failed }
+}
+
+/** 一步的收尾结果分类 + 日志；阶段只决定预算，报告口径始终按步骤名。 */
+function classifyStep(
+  name: string,
+  outcome: StepOutcome,
+  report: { completed: string[]; timedOut: string[]; failed: { name: string; reason: string }[] },
+  logger: Logger | undefined,
+  timeoutMs: number,
+): void {
+  if (outcome.kind === 'ok') {
+    report.completed.push(name)
+    logger?.info(`teardown ${name} 完成`)
+    return
+  }
+  if (outcome.kind === 'timeout') {
+    report.timedOut.push(name)
+    logger?.warn(`teardown ${name} 超过 ${timeoutMs}ms 未完成，继续后续步骤`)
+    return
+  }
+  report.failed.push({ name, reason: outcome.reason })
+  logger?.warn(`teardown ${name} 失败：${outcome.reason}；继续后续步骤`)
+}
+
+/**
+ * 给单个资源停机加预算；超时只返回结果，不取消底层 promise（其拒绝仍会被消费）。
+ * 用于同一阶段内互不依赖的资源：一个 worker 卡死不能阻止其它 LISTEN 连接关闭。
+ */
+export function settleWithin(work: Promise<unknown> | unknown, timeoutMs: number): Promise<StepOutcome> {
   return new Promise(resolveOutcome => {
     let settled = false
     const finish = (outcome: StepOutcome): void => {
@@ -301,4 +367,22 @@ function settleWithTimeout(work: Promise<unknown> | unknown, timeoutMs: number):
       (error: unknown) => finish({ kind: 'failed', reason: messageOf(error) }),
     )
   })
+}
+
+/**
+ * 有界取值：超时返回 undefined，原 promise 的拒绝照常被消费。
+ * 用于 `omb_status`/teardown 这类“观测不能拖住宿主”的单次探测。
+ */
+export async function valueWithin<T>(work: Promise<T> | (() => Promise<T>), timeoutMs: number): Promise<T | undefined> {
+  const task = Promise.resolve().then(typeof work === 'function' ? work : () => work)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<undefined>(resolve => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([task, timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }

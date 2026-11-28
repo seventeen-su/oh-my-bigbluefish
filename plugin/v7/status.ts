@@ -7,6 +7,7 @@
  */
 import type { PgBossQueue } from '../../packages/v7/src/adapters/pg-boss/index.js'
 import type { PostgresStore } from '../../packages/v7/src/adapters/postgres/store.js'
+import type { ManagedPostgresStatus } from '../../packages/v7/src/adapters/postgres/managed.js'
 import type { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/index.js'
 import type { JobFinalFailureSummary } from '../../packages/v7/src/ports/jobs.js'
 import { describeJobHealth } from '../../packages/v7/src/adapters/pg-boss/index.js'
@@ -14,6 +15,7 @@ import { ok, type Result } from '../../packages/v7/src/domain/errors.js'
 import type { LazyInitializer } from './startup.js'
 import type { V7Config } from './config.js'
 import type { Supervisor } from './supervisor.js'
+import { lastTeardown } from './teardown.js'
 import { messageOf } from './messages.js'
 import { runtimeUnknownLines } from './event-runtime.js'
 
@@ -24,6 +26,8 @@ export interface StatusDeps {
   readonly embedder: OnnxEmbedder
   readonly queue: PgBossQueue
   readonly startup: LazyInitializer
+  /** 受管 PostgreSQL 句柄；undefined = 配置未启用 managePostgres。 */
+  readonly managedDb?: { status(): Promise<ManagedPostgresStatus> } | undefined
   readonly projectionStatusLines: () => Promise<string[]>
   readonly runtimeStatusLines: () => Promise<string[]>
   readonly listenStatusLines: () => string[]
@@ -37,10 +41,64 @@ export interface StatusDeps {
   }
 }
 
+/** 一行内的自由文本统一压成单行并限长，避免 status 被异常消息撑爆。 */
+function oneLine(value: string): string {
+  const text = value.replace(/\s+/g, ' ').trim()
+  return text.length <= 240 ? text : `${text.slice(0, 239)}…`
+}
+
+/**
+ * 受管 PostgreSQL 的观测读数。
+ *
+ * `managedDb` 是**真实 `pg_ctl status` 探测**（每次 status 调用一次，不轮询）：
+ * - `running/stopped/unknown` 回答“数据库现在到底在不在”；
+ * - `managedDbState` 是本进程状态机状态（含 starting/stopping）；
+ * - `managedDbOwner` 区分本插件负责的实例与外部实例，避免把“没停外部库”误报成失败。
+ */
+export async function formatManagedDbLines(dep: StatusDeps['managedDb']): Promise<string[]> {
+  if (dep === undefined) return ['managedDb=disabled', 'managedDbOwner=none']
+  try {
+    const status = await dep.status()
+    const owner = status.managed ? 'self' : status.probe === 'running' ? 'external' : 'none'
+    return [
+      `managedDb=${status.probe}`,
+      `managedDbState=${status.state}`,
+      `managedDbOwner=${owner}`,
+      `managedDbRefs=${status.refs}`,
+      ...(status.lastError === undefined ? [] : [`managedDbError=${oneLine(status.lastError)}`]),
+    ]
+  } catch (error) {
+    return ['managedDb=unknown', `managedDbReason=${oneLine(messageOf(error))}`]
+  }
+}
+
+/**
+ * 上一代插件卸载的结果。
+ *
+ * 组件/总开关关闭后 `omb_status` 不可调用；重新开启时这里能回答“上一代有没有
+ * 真的停完”（尤其 DB 是否 stopped、是否有超时/失败步骤），而不是只报当前健康。
+ */
+export function formatPreviousTeardownLines(): string[] {
+  const last = lastTeardown()
+  if (last === undefined) return ['previousTeardown=none']
+  const degraded = last.timedOut.length > 0 || last.failed.length > 0
+  return [
+    `previousTeardown=${degraded ? 'degraded' : 'ok'}`,
+    `previousTeardownAt=${last.at}`,
+    `previousTeardownManagedDb=${last.managedDbAfter}`,
+    `previousTeardownSteps=completed:${last.completed.length} timedOut:${last.timedOut.length} failed:${last.failed.length}`,
+    ...(last.timedOut.length === 0 ? [] : [`previousTeardownTimedOut=${last.timedOut.join(',')}`]),
+    ...(last.failed.length === 0 ? [] : [`previousTeardownFailed=${last.failed.map(item => `${item.name}:${oneLine(item.reason)}`).join('; ')}`]),
+  ]
+}
+
 export async function createStatusTool(deps: StatusDeps): Promise<Result<string>> {
   const { config, supervisor, store, embedder, queue, startup } = deps
   // 宿主面读数：每次状态调用做一次真实自检（tools.get），不轮询、不缓存成 7/7。
   const surfaceLines = supervisor.statusLines()
+  // 受管 DB 与上一代卸载结果：与 DB 可用性无关，db-down 分支也要如实报。
+  const managedLines = await formatManagedDbLines(deps.managedDb)
+  const teardownLines = formatPreviousTeardownLines()
   const prompt = deps.promptSurface()
   const promptLines = prompt.protocol && prompt.checkpoint && prompt.injection
     ? ['prompt=protocol+checkpoint+t0']
@@ -83,6 +141,8 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
         ...finalFailureHealth,
       }),
       ...surfaceLines,
+      ...managedLines,
+      ...teardownLines,
       ...promptLines,
     ].join('\n'))
   }
@@ -115,6 +175,8 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
       // LISTEN 断连不再静默：connected/reconnects 是运维判断“要不要重启”的第一手读数。
       ...deps.listenStatusLines(),
       ...surfaceLines,
+      ...managedLines,
+      ...teardownLines,
       ...promptLines,
     ]
     if (!initialized && startup.error !== undefined) {
@@ -136,6 +198,8 @@ export async function createStatusTool(deps: StatusDeps): Promise<Result<string>
         ...finalFailureHealth,
       }),
       ...surfaceLines,
+      ...managedLines,
+      ...teardownLines,
       ...promptLines,
     ].join('\n'))
   }
