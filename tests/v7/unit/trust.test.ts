@@ -38,6 +38,7 @@ const baseEntity: Entity = {
   accessCount: 0,
   adoptionCount: 0,
   isCurrent: true,
+  lifecycle: 'active',
   createdAt: '2026-11-01T00:00:00.000Z',
   updatedAt: '2026-11-01T00:00:00.000Z',
   attributes: [

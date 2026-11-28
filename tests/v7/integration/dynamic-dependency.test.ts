@@ -37,6 +37,18 @@ async function write(db: ReturnType<typeof store>, input: WriteEntityInput) {
   return db.write(normalized(input), derived(input))
 }
 
+/**
+ * 状态 CAS 之后更新必须带 expectedRevision：测试按读到的当前版本构造 patch。
+ * 直接传 undefined 会被 writer 以 invalid-input 拒绝（不允许无条件覆盖）。
+ */
+async function applyPatch(db: ReturnType<typeof store>, input: WriteEntityInput) {
+  const id = input.id
+  if (id === undefined) throw new Error('patch 测试输入必须带 id')
+  const current = await db.get(id)
+  if (current === undefined) throw new Error(`实体不存在：${id}`)
+  return db.patch(normalized(input), { id, expectedRevision: current.revision }, derived(input))
+}
+
 async function staleRows(db: ReturnType<typeof store>): Promise<StaleRow[]> {
   const result = await db.db.query<StaleRow>(
     `select entity_id, attr_name, depth, reason, operation
@@ -142,7 +154,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       id: b.entity.id,
       attrs: { title: 'B2', mirror: refSpec(a.entity.id) },
     }
-    await db.patch(normalized(patched), { id: b.entity.id }, derived(patched))
+    await applyPatch(db, patched)
 
     const cMarks = await marksOf(db, c.entity.id)
     expect(cMarks).toHaveLength(1)
@@ -193,7 +205,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       id: root.entity.id,
       attrs: { title: 'R1' },
     }
-    await db.patch(normalized(patched), { id: root.entity.id }, derived(patched))
+    await applyPatch(db, patched)
 
     const rows = await staleRows(db)
     // 正常级联深度 0..maxDepth；下一层（depth=maxDepth+1）标记为 cascade-depth-exceeded 后停止。
@@ -236,9 +248,9 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       id: target.entity.id,
       attrs: { title: 'T2' },
     }
-    await db.patch(normalized(input), { id: target.entity.id }, derived(input))
+    await applyPatch(db, input)
     const input3: WriteEntityInput = { ...input, attrs: { title: 'T3' } }
-    await db.patch(normalized(input3), { id: target.entity.id }, derived(input3))
+    await applyPatch(db, input3)
 
     // 同一属性被两次 root 更新命中：PK 去重后仍只有一行，depth 取最小。
     const rows = await staleRows(db)
@@ -271,7 +283,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       id: a.entity.id,
       attrs: { title: '链接源', mirror: refSpec(b.entity.id) },
     }
-    await db.patch(normalized(aWithDynamic), { id: a.entity.id }, derived(aWithDynamic))
+    await applyPatch(db, aWithDynamic)
     await dynamic.refreshById(a.entity.id, { force: true })
     const linked = await db.link({ fromId: a.entity.id, toId: b.entity.id, relation: 'related_to' })
 
@@ -285,7 +297,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       kind: 'memory', category: 'fact', scope: { kind: 'global' },
       id: b.entity.id, attrs: { title: '链接目标2' },
     }
-    await db.patch(normalized(patchB), { id: b.entity.id }, derived(patchB))
+    await applyPatch(db, patchB)
     expect(await marksOf(db, a.entity.id)).toHaveLength(1)
 
     // unlink（link 软归档）→ link 边删除；reference 边仍保留。
@@ -347,7 +359,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       kind: 'memory', category: 'fact', scope: { kind: 'global' },
       id: target.entity.id, attrs: { title: '空目标2' },
     }
-    await db.patch(normalized(patch), { id: target.entity.id }, derived(patch))
+    await applyPatch(db, patch)
     expect(await marksOf(db, source.entity.id)).toHaveLength(1)
 
     const refreshed = await dynamicService(db).refreshById(source.entity.id)
@@ -375,7 +387,7 @@ describe('引用依赖失效（写事务 + 事件驱动刷新）', () => {
       kind: 'memory', category: 'fact', scope: { kind: 'global' },
       id: target.entity.id, attrs: { title: '新标题' },
     }
-    await db.patch(normalized(patch), { id: target.entity.id }, derived(patch))
+    await applyPatch(db, patch)
     expect(await marksOf(db, source.entity.id)).toHaveLength(1)
 
     const failing: DynamicResolver = {

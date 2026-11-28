@@ -23,6 +23,7 @@ function stateHit(overrides: Partial<RecallHit> = {}): RecallHit {
     rawScores: { state_board: 1 },
     chainSiblings: [],
     historyCount: 0,
+    lifecycle: 'active',
     ...overrides,
   }
 }

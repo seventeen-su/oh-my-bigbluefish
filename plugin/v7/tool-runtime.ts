@@ -19,10 +19,30 @@ import type { UpdateService } from '../../packages/v7/src/app/update.js'
 import { evidenceForWrite } from '../../packages/v7/src/app/evidence.js'
 import { err, ok, type Result } from '../../packages/v7/src/domain/errors.js'
 import type { PatchEntityInput, WriteEntityInput } from '../../packages/v7/src/domain/entity.js'
+import type { Entity } from '../../packages/v7/src/domain/entity.js'
 import type { LinkInput } from '../../packages/v7/src/domain/link.js'
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
+import type { RetractInput, SupersedeInput } from '../../packages/v7/src/domain/lifecycle.js'
+import { LIFECYCLE_LABELS } from '../../packages/v7/src/domain/lifecycle.js'
 import { formatPatch, formatWrite, resultError } from './messages.js'
 import { toolCommandId } from './tool-command.js'
+
+/** 生命周期事实行：旧事实可以看，但必须显示「已于某时被谁取代/被证伪」与有效期。 */
+function lifecycleLines(entity: Entity): string[] {
+  const window = entity.validFrom === undefined && entity.validTo === undefined
+    ? ''
+    : `；有效期 ${entity.validFrom ?? '未知'} ~ ${entity.validTo ?? '现在'}`
+  const label = LIFECYCLE_LABELS[entity.lifecycle]
+  let detail = ''
+  if (entity.lifecycle === 'superseded') {
+    detail = `${entity.supersededAt === undefined ? '' : `（${entity.supersededAt}）`}`
+      + `${entity.supersededBy === undefined ? '' : `，取代者 ${entity.supersededBy}`}`
+  } else if (entity.lifecycle === 'retracted') {
+    detail = `${entity.retractedAt === undefined ? '' : `（${entity.retractedAt}）`}`
+      + `${entity.retractedReason === undefined ? '' : `，原因 ${entity.retractedReason}`}`
+  }
+  return [`生命周期：${label}${detail}${window}`]
+}
 
 export interface ToolRuntimeDeps {
   readonly requireReady: () => Promise<Result<never> | undefined>
@@ -101,13 +121,54 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         return resultError(error)
       }
     },
+    async supersede(input: SupersedeInput): Promise<Result<string>> {
+      const unavailable = await requireReady()
+      if (unavailable !== undefined) return unavailable
+      try {
+        const result = await store.supersede(input)
+        if (result.alreadyApplied) {
+          return ok(`已确认：${result.oldId} 早已被 ${result.newId} 取代（幂等，无新写入）`)
+        }
+        return ok([
+          `已将 ${result.oldId} 标记为被 ${result.newId} 取代（生效 ${result.effectiveAt}）`,
+          `旧条目退出普通召回、保留历史；${result.created ? '新条目已在同一事务创建；' : ''}link=${result.linkId} revision=${result.revision} audit=${result.auditId}`,
+          '无需再 archive（取代不是归档）；撤销取代用 omb_admin rollback。',
+        ].join('\n'))
+      } catch (error) {
+        return resultError(error)
+      }
+    },
+    async retract(input: RetractInput): Promise<Result<string>> {
+      const unavailable = await requireReady()
+      if (unavailable !== undefined) return unavailable
+      try {
+        const result = await store.retract(input)
+        if (result.alreadyApplied) return ok(`已确认：${result.id} 早已被证伪（幂等，无新写入）`)
+        return ok([
+          `已将 ${result.id} 标记为被证伪（retracted，生效 ${result.effectiveAt}）`,
+          `它退出普通召回并保留历史；这不是取代，撤销用 omb_admin rollback（audit=${result.auditId}）。`,
+        ].join('\n'))
+      } catch (error) {
+        return resultError(error)
+      }
+    },
     async history(id: string, limit: number): Promise<Result<string>> {
       const unavailable = await requireReady()
       if (unavailable !== undefined) return unavailable
       try {
-        const versions = await store.history(id, limit)
-        if (versions.length === 0) return ok(`状态机 ${id} 暂无历史版本`)
-        return ok(versions.map(version => `${version.id} rev=${version.revision} status=${version.status} time=${version.time}`).join('\n'))
+        const [entity, versions] = await Promise.all([
+          store.get(id, { includeArchived: true }),
+          store.history(id, limit),
+        ])
+        const lines: string[] = []
+        if (entity !== undefined) lines.push(...lifecycleLines(entity))
+        // 历史快照按版本列出；没有状态历史时也要给出生命周期事实，不能只说“暂无”。
+        if (versions.length === 0) {
+          lines.push(entity === undefined ? `实体 ${id} 不存在` : `状态机 ${id} 暂无历史版本`)
+        } else {
+          lines.push(...versions.map(version => `${version.id} rev=${version.revision} status=${version.status} time=${version.time}`))
+        }
+        return ok(lines.join('\n'))
       } catch (error) {
         return resultError(error)
       }
@@ -130,6 +191,26 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
           if (input.action === 'archive') await store.archive(input.targetId, input.reason ?? 'manual', 'model')
           else await store.unarchive(input.targetId, input.reason ?? 'manual', 'model')
           return ok(`${input.action === 'archive' ? '已归档' : '已取消归档'} ${input.targetId}`)
+        }
+        if (input.action === 'supersede') {
+          if (input.targetId === undefined) return err({ code: 'invalid-input', message: 'supersede 需要 targetId（旧实体）' })
+          if (input.newId === undefined) return err({ code: 'invalid-input', message: 'supersede 需要 newId（取代者）' })
+          return this.supersede({
+            oldId: input.targetId,
+            newId: input.newId,
+            reason: input.reason ?? 'superseded',
+            actor: 'model',
+            ...(input.effectiveAt !== undefined ? { effectiveAt: input.effectiveAt } : {}),
+          })
+        }
+        if (input.action === 'retract') {
+          if (input.targetId === undefined) return err({ code: 'invalid-input', message: 'retract 需要 targetId' })
+          return this.retract({
+            id: input.targetId,
+            reason: input.reason ?? 'retracted',
+            actor: 'model',
+            ...(input.effectiveAt !== undefined ? { effectiveAt: input.effectiveAt } : {}),
+          })
         }
         if (input.action === 'replay') {
           // 两个筛选条件二选一：都缺省会变成“重放全部 dead”，不能靠默认值猜用户意图。

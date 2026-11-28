@@ -4,6 +4,7 @@ import { attributeValue, scopeOf } from '../../domain/entity-access.js'
 import { OmbFailure, conflict, internal, invalid, notFound } from '../../domain/errors.js'
 import { newId } from '../../domain/ids.js'
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
+import type { EntityLifecycle, RetractResult, SupersedeResult } from '../../domain/lifecycle.js'
 import { deriveReferences, deriveSearchText, deriveTriggers, type NormalizedWrite } from '../../domain/validation.js'
 import type { AuditEntry, RollbackResult } from '../../ports/observability.js'
 import {
@@ -240,6 +241,10 @@ export class AttributeWriter implements CommandWriter {
         return this.archiveEntity(client, command.id, command.reason, meta)
       case 'UnarchiveEntity':
         return this.unarchiveEntity(client, command.id, command.reason, meta)
+      case 'Supersede':
+        return this.supersedeEntity(client, command, meta)
+      case 'RetractEntity':
+        return this.retractEntity(client, command.id, command.reason, command.effectiveAt, command.expectedRevision, meta)
       case 'Link':
         return createLinkCommand(client, command.input, meta)
       case 'Unlink':
@@ -253,12 +258,14 @@ export class AttributeWriter implements CommandWriter {
     const now = nowIso()
     // 内容级幂等（第二层）：同 scope/category/关键属性/时间的内容复用原实体，新证据并入证据集。
     // 并发同内容写入用事务级 advisory lock 串行化（只有 memory 参与；归档行不参与，遗忘后可重写）。
+    // 被取代/被证伪的历史条目也不参与：同一内容重新断言必须落成新的当前事实，不能把证据
+    // 并入旧事实再把历史条目当作本次写入结果返回。
     const contentHash = contentHashOf(input)
     if (contentHash !== null) {
       await client.query('select pg_advisory_xact_lock(hashtext($1))', [`omb:content:${contentHash}`])
       const existing = await client.query<EntityRow>(
         `select * from omb.entity
-          where content_key = $1 and kind = $2 and archived_at is null and is_current
+          where content_key = $1 and kind = $2 and archived_at is null and is_current and lifecycle = 'active'
           order by created_at asc
           limit 1`,
         [contentHash, input.kind],
@@ -313,8 +320,9 @@ export class AttributeWriter implements CommandWriter {
     const archived = archivedAt !== null
     const entityResult = await client.query<EntityRow>(
       `insert into omb.entity (
-         id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason, is_current, content_key
-       ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true,$8)
+         id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason,
+         is_current, content_key, lifecycle, valid_from
+       ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true,$8,'active', now())
        returning *`,
       [input.id, input.kind, meta.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null, contentHash],
     )
@@ -574,31 +582,36 @@ export class AttributeWriter implements CommandWriter {
 
   private async archiveEntity(client: PoolClient, id: string, reason: string, meta: CommandMeta): Promise<CommandOutcome> {
     const expected = meta.expectedRevision
-    const updated = expected === undefined
-      ? await client.query<EntityRow>(
-        `update omb.entity
-         set revision = revision + 1, archived_at = now(), archive_reason = $2, updated_at = now()
-         where id = $1 and archived_at is null
-         returning *`,
-        [id, reason],
-      )
-      : await client.query<EntityRow>(
-        `update omb.entity
-         set revision = revision + 1, archived_at = now(), archive_reason = $2, updated_at = now()
-         where id = $1 and archived_at is null and revision = $3
-         returning *`,
-        [id, reason, expected],
-      )
-    const row = updated.rows[0]
-    if (row === undefined) {
-      const current = await this.currentEntity(client, id)
-      if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
-      // 已归档或版本已前进：带 expectedRevision 的命令返回可恢复冲突；旧路径保持静默 no-op。
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+    const current = currentResult.rows[0]
+    if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
+    if (current.archived_at !== null) {
+      // 已归档：带 expectedRevision 的命令返回可恢复冲突；旧路径保持静默 no-op。
       if (expected === undefined) return noopOutcome(id)
       throw await this.revisionConflictFor(client, current, meta, expected, true)
     }
+    if (expected !== undefined && Number(current.revision) !== expected) {
+      throw revisionConflict(expected, Number(current.revision), {
+        entityId: id,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: [{ field: 'revision', incoming: expected, current: Number(current.revision) }],
+      })
+    }
+    // 归档只覆盖「当前有效」的生命周期：已被取代/证伪的条目保留真值状态，只补 archived_at，
+    // 否则历史会丢掉「它是被取代的」这条事实。
+    const nextLifecycle: EntityLifecycle = current.lifecycle === 'active' ? 'archived' : current.lifecycle
+    const updatedResult = await client.query<EntityRow>(
+      `update omb.entity
+       set revision = revision + 1, archived_at = now(), archive_reason = $2, lifecycle = $3, updated_at = now()
+       where id = $1
+       returning *`,
+      [id, reason, nextLifecycle],
+    )
+    const row = updatedResult.rows[0]
+    if (row === undefined) throw new OmbFailure(internal('归档没有返回行'))
     const revision = Number(row.revision)
-    await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
+    await client.query('update omb.entity_view set archived_at = now(), lifecycle = $2 where entity_id = $1', [id, nextLifecycle])
     // 归档 source 不再作为可刷新依赖方：清掉它的出边与自身待刷新标记（入边保留，
     // 取消归档后继续参与失效传播）。
     await deleteSourceDependencyEdges(client, id)
@@ -608,10 +621,10 @@ export class AttributeWriter implements CommandWriter {
     // 只有 memory/state 参与看板，链/历史版本不为它们白查一次属性行。
     if (row.kind === 'memory' || row.kind === 'state') {
       const attributes = await selectAttributes(asAttributeQuery(client), id)
-      // 传入的是已归档的行；判定要按归档前（archived:false）才能产生删除任务。
-      await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)], { archived: false })
+      // 判定要按归档前（archived:false）才能产生删除任务。
+      await this.enqueueProjections(client, id, revision, [mapEntity(current, attributes)], { archived: false })
     }
-    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, ...dependencyPayload(invalidation) }
+    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, lifecycle: nextLifecycle, ...dependencyPayload(invalidation) }
     const event = await insertEvent(client, {
       meta,
       action: 'archive',
@@ -620,38 +633,42 @@ export class AttributeWriter implements CommandWriter {
       streamVersion: revision,
       targetIds: [id],
       payload,
-      after: toJson({ archived: true, reason }),
-      inverse: toJson({ action: 'unarchive', entityId: id }),
+      after: toJson({ archived: true, reason, lifecycle: nextLifecycle }),
+      inverse: toJson({ action: 'unarchive', entityId: id, previousLifecycle: current.lifecycle }),
     })
     return { events: [event], revision, projectionToken: projectionToken(id, revision, event) }
   }
 
   private async unarchiveEntity(client: PoolClient, id: string, reason: string, meta: CommandMeta): Promise<CommandOutcome> {
     const expected = meta.expectedRevision
-    const updated = expected === undefined
-      ? await client.query<EntityRow>(
-        `update omb.entity
-         set revision = revision + 1, archived_at = null, archive_reason = null, updated_at = now()
-         where id = $1 and archived_at is not null
-         returning *`,
-        [id],
-      )
-      : await client.query<EntityRow>(
-        `update omb.entity
-         set revision = revision + 1, archived_at = null, archive_reason = null, updated_at = now()
-         where id = $1 and archived_at is not null and revision = $2
-         returning *`,
-        [id, expected],
-      )
-    const row = updated.rows[0]
-    if (row === undefined) {
-      const current = await this.currentEntity(client, id)
-      if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+    const current = currentResult.rows[0]
+    if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
+    if (current.archived_at === null) {
       if (expected === undefined) return noopOutcome(id)
       throw await this.revisionConflictFor(client, current, meta, expected, false)
     }
+    if (expected !== undefined && Number(current.revision) !== expected) {
+      throw revisionConflict(expected, Number(current.revision), {
+        entityId: id,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: [{ field: 'revision', incoming: expected, current: Number(current.revision) }],
+      })
+    }
+    // 只把 `archived` 生命周期还原成 `active`；以取代/证伪状态归档的条目取消归档后仍是历史。
+    const nextLifecycle: EntityLifecycle = current.lifecycle === 'archived' ? 'active' : current.lifecycle
+    const updatedResult = await client.query<EntityRow>(
+      `update omb.entity
+       set revision = revision + 1, archived_at = null, archive_reason = null, lifecycle = $2, updated_at = now()
+       where id = $1
+       returning *`,
+      [id, nextLifecycle],
+    )
+    const row = updatedResult.rows[0]
+    if (row === undefined) throw new OmbFailure(internal('取消归档没有返回行'))
     const revision = Number(row.revision)
-    await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
+    await client.query('update omb.entity_view set archived_at = null, lifecycle = $2 where entity_id = $1', [id, nextLifecycle])
     // 取消归档后重新满足看板谓词时入队，projector 重建读模型行（同样只对 memory/state 查属性）。
     const attributes = await selectAttributes(asAttributeQuery(client), id)
     // 归档时删过出边；取消归档要按当前属性/链接重新派生，否则之后上游更新不会失效。
@@ -661,7 +678,7 @@ export class AttributeWriter implements CommandWriter {
     if (row.kind === 'memory' || row.kind === 'state') {
       await this.enqueueProjections(client, id, revision, [mapEntity(row, attributes)])
     }
-    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, ...dependencyPayload(invalidation) }
+    const payload: Record<string, JsonValue> = { entityId: id, kind: row.kind, reason, revision, lifecycle: nextLifecycle, ...dependencyPayload(invalidation) }
     const event = await insertEvent(client, {
       meta,
       action: 'unarchive',
@@ -670,10 +687,320 @@ export class AttributeWriter implements CommandWriter {
       streamVersion: revision,
       targetIds: [id],
       payload,
-      after: toJson({ archived: false, reason }),
+      after: toJson({ archived: false, reason, lifecycle: nextLifecycle }),
       inverse: toJson({ action: 'archive', entityId: id, reason: 'rollback-unarchive' }),
     })
     return { events: [event], revision, projectionToken: projectionToken(id, revision, event) }
+  }
+
+  /**
+   * 取代（first-class）：旧实体 → 新实体，单事务完成确认/创建新实体、`supersedes` 关系、
+   * 旧实体生命周期与有效期、`entity_view`/看板投影、审计与 inverse。
+   *
+   * 幂等/冲突规则（不靠轮询、不靠二次扫描）：
+   * - 旧实体已被同一新实体取代 → 返回 `alreadyApplied`，不再写第二行审计；
+   * - 已被另一个实体取代 → conflict（一个旧实体只能有一个当前 succeeded-by）；
+   * - 新实体必须当前有效；沿 superseded_by 链能回到旧实体 → 拒绝成环；
+   * - 旧实体已归档/已证伪 → 拒绝（归档与证伪不是取代的隐式前提）。
+   */
+  private async supersedeEntity(
+    client: PoolClient,
+    command: {
+      readonly oldId: string
+      readonly newId: string
+      readonly reason: string
+      readonly effectiveAt?: string
+      readonly create?: NormalizedWrite
+      readonly expectedRevision?: number
+    },
+    meta: CommandMeta,
+  ): Promise<CommandOutcome> {
+    const { oldId, reason } = command
+    const targetNewId = command.newId
+    if (oldId === targetNewId) throw new OmbFailure(conflict('不能把实体取代为它自己'))
+    const effectiveAt = command.effectiveAt ?? nowIso()
+    const oldResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [oldId])
+    const old = oldResult.rows[0]
+    if (old === undefined) throw new OmbFailure(notFound(`实体不存在：${oldId}`))
+    if (old.archived_at !== null) throw new OmbFailure({ code: 'archived', message: `实体已归档，不能取代：${oldId}` })
+    if (old.lifecycle === 'superseded') {
+      if (old.superseded_by === targetNewId) {
+        const revision = Number(old.revision)
+        const result: SupersedeResult = {
+          oldId,
+          newId: targetNewId,
+          linkId: '',
+          effectiveAt,
+          created: false,
+          alreadyApplied: true,
+          auditId: 0,
+          revision,
+        }
+        return {
+          events: [],
+          revision,
+          projectionToken: { entityId: oldId, revision, watermark: '' },
+          supersede: result,
+        }
+      }
+      throw new OmbFailure(conflict(`旧实体已被另一条记忆取代：${oldId} → ${old.superseded_by ?? 'unknown'}`))
+    }
+    if (old.lifecycle === 'retracted') {
+      throw new OmbFailure(conflict(`实体已被证伪（retracted），不能用取代覆盖：${oldId}`))
+    }
+    if (command.expectedRevision !== undefined && Number(old.revision) !== command.expectedRevision) {
+      throw revisionConflict(command.expectedRevision, Number(old.revision), {
+        entityId: oldId,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: [{
+          field: 'revision',
+          incoming: command.expectedRevision,
+          current: Number(old.revision),
+        }],
+      })
+    }
+
+    // 新实体：事务内创建（create 归一化输入）或确认已存在；两条路径都在同一事务里。
+    let created = false
+    let newRow: EntityRow | undefined
+    const createdEvents: DomainEvent[] = []
+    let newIdForRow = targetNewId
+    if (command.create !== undefined) {
+      const createdOutcome = await this.createEntity(client, command.create, {
+        ...meta,
+        // 创建事件是独立审计行：command_id 必须不同于取代命令（唯一索引）。
+        commandId: `${meta.commandId}:create`,
+      })
+      const entity = createdOutcome.entity
+      if (entity === undefined) throw new OmbFailure(internal('取代的新实体创建没有返回实体'))
+      created = true
+      createdEvents.push(...createdOutcome.events)
+      newIdForRow = entity.id
+    } else {
+      const newResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [targetNewId])
+      newRow = newResult.rows[0]
+      if (newRow === undefined) throw new OmbFailure(notFound(`取代的新实体不存在：${targetNewId}`))
+      if (newRow.archived_at !== null) throw new OmbFailure({ code: 'archived', message: `取代的新实体已归档：${targetNewId}` })
+    }
+    if (created) {
+      const createdRow = await client.query<EntityRow>('select * from omb.entity where id = $1', [newIdForRow])
+      newRow = createdRow.rows[0]
+    }
+    if (newRow === undefined) throw new OmbFailure(internal('取代的新实体读取失败'))
+    // 成环检查先于“新实体必须当前有效”：反向取代已被取代的实体时，应报环而不是笼统的 not-current。
+    if (await this.supersedeChainReaches(client, newIdForRow, oldId)) {
+      throw new OmbFailure(conflict(`取代关系会形成环：${oldId} ← … ← ${newIdForRow}`))
+    }
+    if (newRow.lifecycle !== 'active') {
+      throw new OmbFailure(conflict(`取代的新实体不是当前有效（lifecycle=${newRow.lifecycle}）：${newIdForRow}`))
+    }
+    const oldValidFrom = iso(old.valid_from)
+    if (oldValidFrom !== undefined && oldValidFrom > effectiveAt) {
+      throw new OmbFailure(conflict(`effectiveAt 早于旧实体的有效期起点 ${oldValidFrom}`))
+    }
+
+    // `supersedes` 关系是生命周期的一部分，必须在同一事务里建立；旧实体生命周期与有效期同步落库。
+    const linkId = newId('link')
+    await client.query(
+      `insert into omb.link (id, from_id, to_id, relation, directed, strength, source, origin)
+       values ($1,$2,$3,'supersedes',true,1.0,$4,$4)`,
+      [linkId, newIdForRow, oldId, meta.origin],
+    )
+    const updatedResult = await client.query<EntityRow>(
+      `update omb.entity
+       set revision = revision + 1,
+           lifecycle = 'superseded',
+           superseded_by = $2,
+           superseded_at = $3,
+           supersede_reason = $4,
+           valid_to = $3,
+           valid_from = coalesce(valid_from, created_at),
+           updated_at = now()
+       where id = $1
+       returning *`,
+      [oldId, newIdForRow, effectiveAt, reason],
+    )
+    const updated = updatedResult.rows[0]
+    if (updated === undefined) throw new OmbFailure(internal('取代没有返回旧实体行'))
+    const revision = Number(updated.revision)
+    await client.query('update omb.entity_view set lifecycle = $2, updated_at = now() where entity_id = $1', [oldId, 'superseded'])
+    // 旧实体原先属于看板时入队删除读模型行（按取代前状态判定，与归档同款）。
+    if (old.kind === 'memory' || old.kind === 'state') {
+      const oldAttributes = await selectAttributes(asAttributeQuery(client), oldId)
+      await this.enqueueProjections(client, oldId, revision, [mapEntity(old, oldAttributes)], { archived: false })
+    }
+    const payload: Record<string, JsonValue> = {
+      entityId: newIdForRow,
+      oldId,
+      newId: newIdForRow,
+      linkId,
+      reason,
+      effectiveAt,
+      revision,
+      created,
+      validFrom: iso(updated.valid_from) ?? null,
+      validTo: effectiveAt,
+    }
+    const event = await insertEvent(client, {
+      meta,
+      action: 'supersede',
+      eventType: 'EntitySuperseded',
+      streamId: oldId,
+      streamVersion: revision,
+      targetIds: [oldId, newIdForRow],
+      payload,
+      before: toJson({
+        lifecycle: old.lifecycle,
+        revision: Number(old.revision),
+        validFrom: iso(old.valid_from) ?? null,
+        validTo: iso(old.valid_to) ?? null,
+        supersededBy: old.superseded_by,
+        supersededAt: iso(old.superseded_at) ?? null,
+      }),
+      after: toJson({
+        lifecycle: 'superseded',
+        revision,
+        validFrom: iso(updated.valid_from) ?? null,
+        validTo: effectiveAt,
+        supersededBy: newIdForRow,
+        supersededAt: effectiveAt,
+      }),
+      inverse: toJson({
+        action: 'unsupersede',
+        oldId,
+        newId: newIdForRow,
+        linkId,
+        previousLifecycle: old.lifecycle,
+        previousValidFrom: iso(old.valid_from) ?? null,
+        previousValidTo: iso(old.valid_to) ?? null,
+      }),
+    })
+    const result: SupersedeResult = {
+      oldId,
+      newId: newIdForRow,
+      linkId,
+      effectiveAt,
+      created,
+      alreadyApplied: false,
+      auditId: Number(event.id),
+      revision,
+    }
+    return {
+      events: [...createdEvents, event],
+      revision,
+      projectionToken: projectionToken(oldId, revision, event),
+      supersede: result,
+    }
+  }
+
+  /** 沿 `superseded_by` 链向上走，判断是否会回到旧实体（环）；有界步数防脏数据死循环。 */
+  private async supersedeChainReaches(client: PoolClient, startId: string, targetId: string): Promise<boolean> {
+    const seen = new Set<string>()
+    let cursor: string | null = startId
+    while (cursor !== null && !seen.has(cursor)) {
+      if (cursor === targetId) return true
+      seen.add(cursor)
+      const result: { rows: { superseded_by: string | null }[] } = await client.query<{ superseded_by: string | null }>(
+        'select superseded_by from omb.entity where id = $1',
+        [cursor],
+      )
+      cursor = result.rows[0]?.superseded_by ?? null
+      if (seen.size > 64) break
+    }
+    return false
+  }
+
+  /**
+   * 证伪（retracted）：与取代不同的生命周期——不是「有更新的说法」，而是「这条说法不成立」。
+   * 同样单事务写审计与 inverse；重复证伪幂等返回，已被取代的实体不能再被证伪。
+   */
+  private async retractEntity(
+    client: PoolClient,
+    id: string,
+    reason: string,
+    effectiveAtInput: string | undefined,
+    expectedRevision: number | undefined,
+    meta: CommandMeta,
+  ): Promise<CommandOutcome> {
+    const effectiveAt = effectiveAtInput ?? nowIso()
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+    const current = currentResult.rows[0]
+    if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
+    if (current.archived_at !== null) throw new OmbFailure({ code: 'archived', message: `实体已归档，不能撤回：${id}` })
+    if (current.lifecycle === 'retracted') {
+      const revision = Number(current.revision)
+      const result: RetractResult = { id, effectiveAt, alreadyApplied: true, auditId: 0, revision }
+      return { events: [], revision, projectionToken: { entityId: id, revision, watermark: '' }, retract: result }
+    }
+    if (current.lifecycle === 'superseded') {
+      throw new OmbFailure(conflict(`实体已被取代（superseded），不能用证伪覆盖：${id}`))
+    }
+    if (expectedRevision !== undefined && Number(current.revision) !== expectedRevision) {
+      throw revisionConflict(expectedRevision, Number(current.revision), {
+        entityId: id,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: [{ field: 'revision', incoming: expectedRevision, current: Number(current.revision) }],
+      })
+    }
+    const currentValidFrom = iso(current.valid_from)
+    if (currentValidFrom !== undefined && currentValidFrom > effectiveAt) {
+      throw new OmbFailure(conflict(`effectiveAt 早于实体的有效期起点 ${currentValidFrom}`))
+    }
+    const updatedResult = await client.query<EntityRow>(
+      `update omb.entity
+       set revision = revision + 1,
+           lifecycle = 'retracted',
+           retracted_at = $2,
+           retracted_reason = $3,
+           valid_to = $2,
+           valid_from = coalesce(valid_from, created_at),
+           updated_at = now()
+       where id = $1
+       returning *`,
+      [id, effectiveAt, reason],
+    )
+    const updated = updatedResult.rows[0]
+    if (updated === undefined) throw new OmbFailure(internal('证伪没有返回实体行'))
+    const revision = Number(updated.revision)
+    await client.query('update omb.entity_view set lifecycle = $2, updated_at = now() where entity_id = $1', [id, 'retracted'])
+    if (current.kind === 'memory' || current.kind === 'state') {
+      const attributes = await selectAttributes(asAttributeQuery(client), id)
+      await this.enqueueProjections(client, id, revision, [mapEntity(current, attributes)], { archived: false })
+    }
+    const payload: Record<string, JsonValue> = { entityId: id, kind: current.kind, reason, effectiveAt, revision }
+    const event = await insertEvent(client, {
+      meta,
+      action: 'retract',
+      eventType: 'EntityRetracted',
+      streamId: id,
+      streamVersion: revision,
+      targetIds: [id],
+      payload,
+      before: toJson({
+        lifecycle: current.lifecycle,
+        revision: Number(current.revision),
+        validFrom: iso(current.valid_from) ?? null,
+        validTo: iso(current.valid_to) ?? null,
+      }),
+      after: toJson({
+        lifecycle: 'retracted',
+        revision,
+        retractedAt: effectiveAt,
+        reason,
+        validTo: effectiveAt,
+      }),
+      inverse: toJson({
+        action: 'unretract',
+        entityId: id,
+        previousLifecycle: current.lifecycle,
+        previousValidFrom: iso(current.valid_from) ?? null,
+        previousValidTo: iso(current.valid_to) ?? null,
+      }),
+    })
+    const result: RetractResult = { id, effectiveAt, alreadyApplied: false, auditId: Number(event.id), revision }
+    return { events: [event], revision, projectionToken: projectionToken(id, revision, event), retract: result }
   }
 
   /**

@@ -59,6 +59,7 @@ describe('RetrievalPlan 编译（纯函数）', () => {
       projectKey: 'D:/repo',
       includeArchived: false,
       includeHistory: false,
+      includeSuperseded: false,
     })
     expect(plan.query).toBe('TS2304 handleFix /src/main.ts 昨天')
     expect(plan.normalizedQuery).toBe(plan.query.toLowerCase())

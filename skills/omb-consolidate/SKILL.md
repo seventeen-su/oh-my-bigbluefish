@@ -63,12 +63,18 @@ reaction 一律用 `singletonKey` 合并同一实体的事件风暴；任务执�
 ## 后台会做什么（语义不变的部分）
 
 - 抽取：`goal/*` → 状态机；`team/*`/`task/*` → 状态机；`subagent/*`/`job/*` → 线索记忆。
-- 去重：全文/向量近邻（向量原始分 ≥0.9），文本相似度 ≥0.82 或属性重叠，数字不一致不合并；
-  保留较早 canonical，归档较新 duplicate，写双向 `merged_into`/`merged_from`。
-- 冲突：属性值矛盾时写双向 `possible_conflict`；`omb_link unlinkId=...` 取消后写抑制表。
+- 去重：只看最近 30 条非置顶、当前有效（`lifecycle=active`）的记忆；全文/向量近邻（向量原始分 ≥0.9），
+  文本相似度 ≥0.82 或属性重叠，数字不一致不合并；保留较早 canonical，归档较新 duplicate，
+  写双向 `merged_into`/`merged_from`。
+- 冲突：只比较最近 30 条当前有效的事实类记忆；属性值矛盾时写双向 `possible_conflict`；
+  `omb_link unlinkId=...` 取消后写抑制表。
 - 链接建议：共同召回 ≥2 次写 `co_recalled`（强度 = min(1, 次数/5)）；连通组 ≥3 条建链。
-- 遗忘：显著度低于 0.35 归档；`pinned` 与偏好标签豁免。
-- 属性名归并：只对 ASCII 属性名可比；改名后逐实体重建视图/引用。
+- 遗忘：显著度低于 0.35 归档（新近度 + utilityConfidence 证据 + 置信度 + 分类）；`pinned` 与偏好标签豁免。
+- 属性名归并：只对 ASCII 属性名可比（pg_trgm 对中文恒 0），中文同义名不会自动归并；
+  改名后逐实体重建视图/引用。
+- 向量补齐与动态刷新（含 `statusRule` 自动推进状态）。
+- 生命周期：被取代（`superseded`）、被证伪（`retracted`）、已归档的条目都不参与去重/冲突/线索晋升/
+  成组/遗忘/向量补齐——它们是历史证据，后台不能把它们改写成当前事实。
 
 ## 什么时候看审计
 
@@ -85,8 +91,9 @@ reaction 一律用 `singletonKey` 合并同一实体的事件风暴；任务执�
 
 ## 回滚边界
 
-- 支持：写入撤销（归档该实体）、归档/取消归档、建链/取消链接、patch 恢复旧属性与 revision；
+- 支持：写入撤销（归档该实体）、归档/取消归档、建链/取消链接、patch 恢复旧属性与 revision、取代回滚（`unsupersede`：恢复旧条目当前有效并归档取代链接）、证伪回滚（`unretract`）；
 - 一次只回滚一条审计；复杂合并按审计记录逐条处理；
 - 证据并入（`EvidenceAdded`）没有 inverse，不随 rollback 删除；回滚不是「时间旅行」，
   后续写入不会被自动撤销；不要声称回滚了整个会话。
-
+- 取代（`unsupersede`）/证伪（`unretract`）都是可回滚审计；`supersedes` 关系不能单独
+  `unlinkId` 取消（会破坏生命周期一致性）。

@@ -40,6 +40,7 @@ function entityOf(overrides: Partial<Entity> & { readonly kind?: EntityKind } = 
     accessCount: 0,
     adoptionCount: 0,
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
     attributes: [],

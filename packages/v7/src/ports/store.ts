@@ -11,6 +11,7 @@ import type { DependencyAttributeRef, DependencyStaleMark } from '../domain/depe
 import type { EvidenceInput } from '../domain/evidence.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
+import type { RetractInput, RetractResult, SupersedeInput, SupersedeResult } from '../domain/lifecycle.js'
 import type { ProjectIdentity } from '../domain/project-identity.js'
 import type { NormalizedWrite } from '../domain/validation.js'
 import type {
@@ -148,6 +149,17 @@ export interface Store {
    */
   archive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
   unarchive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
+  /**
+   * 取代一个旧实体：同一事务创建/确认新实体、建 `supersedes` 关系、把旧实体标成
+   * `superseded`（写 valid_to/superseded_*）、更新 entity_view 与看板投影、写审计+inverse。
+   * 旧实体已由同一个新实体取代时幂等返回 `alreadyApplied`；由另一个实体取代则 conflict。
+   */
+  supersede(input: SupersedeInput): Promise<SupersedeResult>
+  /**
+   * 证伪一条事实（不是取代）：`lifecycle='retracted'`、写 retracted_at/valid_to、审计可回滚。
+   * 证伪与取代是两种不同生命周期，不能互相覆盖。
+   */
+  retract(input: RetractInput): Promise<RetractResult>
   link(input: LinkInput): Promise<LinkResult>
   unlink(id: string, actor: string): Promise<void>
   history(stateId: string, limit: number): Promise<StateVersion[]>

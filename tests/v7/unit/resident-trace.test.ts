@@ -21,6 +21,7 @@ const stateHit: RecallHit = {
   rawScores: { state_board: 1 },
   chainSiblings: [],
   historyCount: 0,
+  lifecycle: 'active',
 }
 
 function stateResult(): RecallResult {
@@ -46,6 +47,7 @@ const preference: EntitySummary = {
   snippet: '偏好摘要'.repeat(20),
   archived: false,
   isCurrent: true,
+  lifecycle: 'active',
   updatedAt: '2026-11-23T00:00:00.000Z',
   historyCount: 0,
 }

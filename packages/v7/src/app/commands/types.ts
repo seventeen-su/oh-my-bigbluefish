@@ -8,6 +8,7 @@ import type { OmbError } from '../../domain/errors.js'
 import type { EvidenceInput } from '../../domain/evidence.js'
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
 import type { Link, LinkInput } from '../../domain/link.js'
+import type { RetractResult, SupersedeResult } from '../../domain/lifecycle.js'
 import type { NormalizedWrite } from '../../domain/validation.js'
 
 /**
@@ -50,6 +51,8 @@ export type DomainEventType =
   | 'EntityPatched'
   | 'EntityArchived'
   | 'EntityUnarchived'
+  | 'EntitySuperseded'
+  | 'EntityRetracted'
   | 'LinkCreated'
   | 'LinkUnlinked'
   | 'AttributeRenamed'
@@ -92,6 +95,22 @@ export type Command =
   | { readonly type: 'PatchEntity'; readonly input: PatchEntityInput }
   | { readonly type: 'ArchiveEntity'; readonly id: string; readonly reason: string }
   | { readonly type: 'UnarchiveEntity'; readonly id: string; readonly reason: string }
+  | {
+    readonly type: 'Supersede'
+    readonly oldId: string
+    readonly newId: string
+    readonly reason: string
+    readonly effectiveAt?: string
+    readonly create?: WriteEntityInput
+    readonly expectedRevision?: number
+  }
+  | {
+    readonly type: 'RetractEntity'
+    readonly id: string
+    readonly reason: string
+    readonly effectiveAt?: string
+    readonly expectedRevision?: number
+  }
   | { readonly type: 'Link'; readonly input: LinkInput }
   | { readonly type: 'Unlink'; readonly linkId: string }
   | { readonly type: 'RenameAttribute'; readonly from: string; readonly to: string; readonly reason: string }
@@ -102,6 +121,22 @@ export type PreparedCommand =
   | { readonly type: 'PatchEntity'; readonly input: NormalizedWrite; readonly patch: PatchEntityInput }
   | { readonly type: 'ArchiveEntity'; readonly id: string; readonly reason: string }
   | { readonly type: 'UnarchiveEntity'; readonly id: string; readonly reason: string }
+  | {
+    readonly type: 'Supersede'
+    readonly oldId: string
+    readonly newId: string
+    readonly reason: string
+    readonly effectiveAt?: string
+    readonly create?: NormalizedWrite
+    readonly expectedRevision?: number
+  }
+  | {
+    readonly type: 'RetractEntity'
+    readonly id: string
+    readonly reason: string
+    readonly effectiveAt?: string
+    readonly expectedRevision?: number
+  }
   | { readonly type: 'Link'; readonly input: LinkInput }
   | { readonly type: 'Unlink'; readonly linkId: string }
   | {
@@ -137,6 +172,9 @@ export interface CommandOutcome {
    * - `command`：同一 commandId 已执行过，返回首次结果（Store 层补标记）。
    */
   readonly deduped?: 'content' | 'command'
+  /** supersede/retract 的事务结果（Store 直接用，不经过 CommandBus 的公开结果形状）。 */
+  readonly supersede?: SupersedeResult
+  readonly retract?: RetractResult
 }
 
 /** AttributeWriter 的端口：唯一能写业务表的事务入口。 */

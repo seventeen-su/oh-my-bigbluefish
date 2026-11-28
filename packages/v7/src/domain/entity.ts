@@ -1,4 +1,5 @@
 import type { AttributeValue, RawAttributeValue } from './dynamic-spec.js'
+import type { EntityLifecycle } from './lifecycle.js'
 
 /**
  * 实体聚合的稳定契约：kind/category/status 词表、scope、属性与实体形状、写入输入。
@@ -65,6 +66,22 @@ export interface Entity {
   readonly lastAccessedAt?: string
   readonly archivedAt?: string
   readonly archiveReason?: string
+  /**
+   * 内容真值状态（active/superseded/retracted/archived）。与 `archivedAt` 语义分开：
+   * 归档只影响可见性/保留，取代与证伪是内容生命周期；`validFrom`/`validTo` 是有效期。
+   */
+  readonly lifecycle: EntityLifecycle
+  /** 当前取代者（旧事实被它取代）；只有 `lifecycle='superseded'` 时存在。 */
+  readonly supersededBy?: string
+  readonly supersededAt?: string
+  readonly supersedeReason?: string
+  /** 被证伪的时间与原因；只有 `lifecycle='retracted'` 时存在。 */
+  readonly retractedAt?: string
+  readonly retractedReason?: string
+  /** 有效期起点（创建时写入；回填旧数据为 created_at）。 */
+  readonly validFrom?: string
+  /** 有效期终点（取代/证伪生效时间）；仍在生效时缺省。 */
+  readonly validTo?: string
   readonly versionOf?: string
   readonly isCurrent: boolean
   readonly createdAt: string

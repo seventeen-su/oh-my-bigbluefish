@@ -34,6 +34,7 @@ const OUTBOX_DEAD_MIGRATION = '010_outbox_dead.sql'
 const LEGACY_CONTRACT_MIGRATION = '011_contract_legacy_columns.sql'
 const PROJECT_IDENTITY_MIGRATION = '012_project_identity.sql'
 const STATE_CONCURRENCY_MIGRATION = '014_state_concurrency.sql'
+const SUPERSESSION_MIGRATION = '017_supersession.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -773,13 +774,14 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await client?.end()
   })
 
-  it('给定空库当跑全量迁移则应用全部迁移且第二次不再重复应用', () => {
+  it('给定空库当跑全量迁移则应用 001-017 且第二次不再重复应用', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
     expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
     expect(emptyFirst.applied).toContain(CONTRACT_MIGRATION)
     expect(emptyFirst.applied).toContain(PROJECT_IDENTITY_MIGRATION)
     expect(emptyFirst.applied).toContain(STATE_CONCURRENCY_MIGRATION)
+    expect(emptyFirst.applied).toContain(SUPERSESSION_MIGRATION)
     expect(emptyFirst.applied.at(-1)).toBe(migrationFiles().at(-1))
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
@@ -853,6 +855,9 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
 
   it('给定已有 007 库当跑迁移则应用 008+ 及后续迁移且旧审计行与新列可空性符合预期', () => {
     expect(legacyReport.applied).toEqual(migrationFiles().filter(name => name >= EXPAND_MIGRATION))
+    expect(legacyReport.applied).toContain(SUPERSESSION_MIGRATION)
+    expect(legacyReport.applied).toContain(OUTBOX_DEAD_MIGRATION)
+    expect(legacyReport.applied).toContain(LEGACY_CONTRACT_MIGRATION)
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])
     expect(legacyAuditAfter).toEqual(legacyAuditBefore)
@@ -866,9 +871,23 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
 
   it('给定已有库迁移后则旧表列定义只保留 P0/P2，audit_log 事件列保留且 011 旧列消失', () => {
     const legacyTables = Object.keys(legacyColumnsBefore)
+    // entity/entity_view 由 017 受控新增生命周期列：旧列不变，新增列在下面单独断言。
     for (const table of legacyTables) {
-      if (['audit_log', 'entity_view', 'chain_member', 'attr_registry', 'recall_event'].includes(table)) continue
+      if (['audit_log', 'entity_view', 'chain_member', 'attr_registry', 'recall_event', 'entity'].includes(table)) continue
       expect(legacyColumnsAfter[table], `${table} 的列定义不应变化`).toEqual(legacyColumnsBefore[table])
+    }
+    const migratedEntityNames = (legacyColumnsAfter.entity ?? []).map(columnNameOf)
+    expect(migratedEntityNames).toEqual(expect.arrayContaining([
+      'lifecycle', 'superseded_by', 'superseded_at', 'supersede_reason',
+      'retracted_at', 'retracted_reason', 'valid_from', 'valid_to',
+    ]))
+    // 旧列（001 起就存在的列）类型/可空性不能被 017 改变。
+    const legacyEntityNames = new Set((legacyColumnsBefore.entity ?? []).map(columnNameOf))
+    const migratedEntityByName = new Map((legacyColumnsAfter.entity ?? []).map(signature => [columnNameOf(signature), signature]))
+    for (const signature of legacyColumnsBefore.entity ?? []) {
+      const name = columnNameOf(signature)
+      if (!legacyEntityNames.has(name)) continue
+      expect(migratedEntityByName.get(name), `entity.${name} 旧列定义不应变化`).toBe(signature)
     }
     const legacyAuditColumns = legacyColumnsBefore.audit_log ?? []
     const migratedAuditColumns = legacyColumnsAfter.audit_log ?? []

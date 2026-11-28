@@ -120,6 +120,7 @@ function requestViewOf(plan: RetrievalPlan): RecallRequest {
     ...(plan.filters.status === undefined ? {} : { status: plan.filters.status }),
     ...(plan.filters.includeArchived ? { includeArchived: true } : {}),
     ...(plan.filters.includeHistory ? { includeHistory: true } : {}),
+    ...(plan.filters.includeSuperseded ? { includeSuperseded: true } : {}),
     ...(plan.time.explicit === undefined ? {} : { timeWindow: plan.time.explicit }),
     now: plan.time.now,
   }
@@ -367,6 +368,17 @@ export class RecallEngine {
         filteredReasons.push(explainFiltered('history', candidate.entityId))
         continue
       }
+      // 生命周期：默认只返回当前有效；历史检索才允许被取代/被证伪的条目，且必须带标记。
+      // 纯归档行由 includeArchived 控制（archived_at 过滤已在前一条分支处理），这里放行 lifecycle=archived。
+      const lifecycleAllowed = summary.lifecycle === 'active'
+        || (summary.lifecycle === 'archived' && filters.includeArchived)
+      if (!filters.includeSuperseded && !lifecycleAllowed) {
+        filteredOut += 1
+        const code = summary.lifecycle === 'retracted' ? 'retracted' : 'superseded'
+        const at = summary.lifecycle === 'retracted' ? summary.retractedAt : summary.supersededAt
+        filteredReasons.push(explainFiltered(code, candidate.entityId, `lifecycle=${summary.lifecycle}${at === undefined ? '' : ` at=${at}`}`))
+        continue
+      }
       if (filters.kind !== undefined && summary.kind !== filters.kind) {
         filteredOut += 1
         filteredReasons.push(explainFiltered('kind', candidate.entityId, `kind=${summary.kind} expected=${filters.kind}`))
@@ -483,6 +495,12 @@ export class RecallEngine {
         ...(item.summary.status === undefined ? {} : { status: item.summary.status }),
         scope: item.summary.scope,
         updatedAt: item.summary.updatedAt,
+        lifecycle: item.summary.lifecycle,
+        ...(item.summary.supersededAt === undefined ? {} : { supersededAt: item.summary.supersededAt }),
+        ...(item.summary.supersededBy === undefined ? {} : { supersededBy: item.summary.supersededBy }),
+        ...(item.summary.retractedAt === undefined ? {} : { retractedAt: item.summary.retractedAt }),
+        ...(item.summary.validFrom === undefined ? {} : { validFrom: item.summary.validFrom }),
+        ...(item.summary.validTo === undefined ? {} : { validTo: item.summary.validTo }),
         score: item.score,
         fusedScore: candidate.fused,
         why: explainHit({ candidate, prior: item.prior, score: item.score }),
@@ -495,8 +513,9 @@ export class RecallEngine {
     })
 
     await this.recordRecall(input, hits, warnings)
-    // 访问计数用于采用率先验与遗忘；失败不影响本次召回结果。
-    if (hits.length > 0) await this.store.markAccessed?.(hits.map(hit => hit.entityId)).catch(() => {})
+    // 访问计数只记当前有效条目：历史条目的访问不该反过来影响当前重排/遗忘。
+    const currentHits = hits.filter(hit => hit.lifecycle === 'active').map(hit => hit.entityId)
+    if (currentHits.length > 0) await this.store.markAccessed?.(currentHits).catch(() => {})
 
     return {
       traceId: input.traceId,

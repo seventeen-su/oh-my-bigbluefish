@@ -28,6 +28,8 @@ function runtimeWith(update: (input: unknown) => Promise<Result<string>>): ToolR
     history: unused,
     status: unused,
     admin: unused,
+    supersede: unused,
+    retract: unused,
   }
 }
 

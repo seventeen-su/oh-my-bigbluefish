@@ -44,6 +44,7 @@ function entity(kind: Entity['kind'], attributes: Attribute[], overrides: Partia
     accessCount: 0,
     adoptionCount: 0,
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: '2026-11-27T00:00:00.000Z',
     updatedAt: '2026-11-27T00:00:00.000Z',
     attributes,

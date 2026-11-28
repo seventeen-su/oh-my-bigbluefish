@@ -49,6 +49,11 @@ function hasPreferenceTag(features: EntityPriorFeatures): boolean {
  * 重排先验（SPEC §7.2）：分类、置信度、时间衰减、作用域匹配、历史采用率、
  * 链接强度、来源。每个先验只在有证据时乘上去，最后整体夹到 [0.5, 1.5]。
  *
+ * 生命周期：`active` 之外的命中只可能在显式历史检索里出现。它们先吃一个 ≤1 的
+ * `superseded` 降权，并且**不参与**任何“当前事实”信号（置顶、偏好标签、采用率、
+ * 历史版本数、图扩展强度）的加分——旧事实的 adoptionCount 不能继续影响当前重排。
+ * 分类/置信度/时间/作用域这些客观属性照常参与，保证历史证据内部仍可排序。
+ *
  * 所有乘数都来自 `config.scenarios[scenario].priors`，不写死在代码里。
  * 分两级使用同一函数：
  * - 初排（全部候选）只给 `summary`：分类/新近度/作用域/历史/链路，全部廉价可得；
@@ -63,6 +68,11 @@ export function rerankPrior(context: PriorContext): PriorResult {
     if (!Number.isFinite(multiplier) || multiplier === 1) return
     factor *= multiplier
     reasons.push(`prior:${label}=×${format(multiplier)}`)
+  }
+  const isCurrent = summary.lifecycle === 'active'
+
+  if (!isCurrent) {
+    apply(`lifecycle:${summary.lifecycle}`, scenario.priors.superseded)
   }
 
   if (summary.category !== undefined) {
@@ -84,15 +94,16 @@ export function rerankPrior(context: PriorContext): PriorResult {
     apply('scope:project', scenario.priors.projectScope)
   }
 
-  if (summary.historyCount > 0) {
+  // 以下是“当前事实”信号：历史条目即使被显式检索出来也不加分。
+  if (isCurrent && summary.historyCount > 0) {
     apply(`history:${summary.historyCount}`, scenario.priors.history)
   }
 
-  if (features?.pinned === true) {
+  if (isCurrent && features?.pinned === true) {
     apply('pinned', scenario.priors.pinned)
   }
 
-  if (features !== undefined && hasPreferenceTag(features)) {
+  if (isCurrent && features !== undefined && hasPreferenceTag(features)) {
     apply('tag:偏好', scenario.priors.preferenceTag)
   }
 
@@ -100,13 +111,14 @@ export function rerankPrior(context: PriorContext): PriorResult {
   // - Reference/Utilization/Validation 按受控权重进入，Validation 最强；
   // - 单纯 Exposure/accessCount 不在这里加分，避免“检索自己→更容易被检索”的正反馈；
   // - 旧的 adoptionCount/accessCount 字符串命中口径已从重排移除；
-  // - 无有效证据时保持中性（不乘任何因子）。
-  const utility = features?.utilityConfidence ?? 0
+  // - 无有效证据时保持中性（不乘任何因子）；
+  // - 历史条目（superseded/retracted）不吃使用证据：旧 adoption 不能再给旧事实加分。
+  const utility = isCurrent ? features?.utilityConfidence ?? 0 : 0
   if (features !== undefined && utility > 0) {
     apply(`utility:${format(utility)}`, 1 + (scenario.priors.adopted - 1) * utility)
   }
   // 负向证据：只在实际存在 refutation 时降权，且乘数下限仍由全局 clamp 保护。
-  const refutation = features?.refutationRate ?? 0
+  const refutation = isCurrent ? features?.refutationRate ?? 0 : 0
   if (features !== undefined && refutation > 0) {
     apply(`refuted:${format(refutation)}`, 1 - (1 - scenario.priors.refuted) * refutation)
   }
@@ -115,7 +127,7 @@ export function rerankPrior(context: PriorContext): PriorResult {
     apply(`origin:${features.origin}`, scenario.priors.jobOrigin)
   }
 
-  if (context.linkStrength > 0) {
+  if (isCurrent && context.linkStrength > 0) {
     const strength = clamp01(context.linkStrength)
     apply(`link:${format(strength)}`, 1 + (scenario.priors.linkStrength - 1) * strength)
   }

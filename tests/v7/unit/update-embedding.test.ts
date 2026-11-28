@@ -38,6 +38,7 @@ function memoryEntity(id: string, body: string, options: { readonly pinned?: boo
     accessCount: 0,
     adoptionCount: 0,
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: FIXED_AT,
     updatedAt: FIXED_AT,
     attributes: [
@@ -60,6 +61,7 @@ function stateEntity(id: string, status: StateStatus): Entity {
     accessCount: 0,
     adoptionCount: 0,
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: FIXED_AT,
     updatedAt: FIXED_AT,
     attributes: [

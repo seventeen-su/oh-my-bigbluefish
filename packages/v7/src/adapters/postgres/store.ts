@@ -5,7 +5,9 @@ import { titleOf } from '../../domain/entity-access.js'
 import { OmbFailure, internal } from '../../domain/errors.js'
 import type { JsonValue } from '../../domain/json.js'
 import type { Expansion } from '../../domain/link.js'
-import { decodeRegexTriggerKey, type NormalizedWrite } from '../../domain/validation.js'
+import type { RetractInput, RetractResult, SupersedeInput, SupersedeResult } from '../../domain/lifecycle.js'
+import { normalizeWrite, decodeRegexTriggerKey, type NormalizedWrite } from '../../domain/validation.js'
+import { validationError } from '../../domain/validation-result.js'
 import { defaultRegexService } from '../../security/regex.js'
 import { REGEX_TIMEOUT_MS } from '../../security/regex-limits.js'
 import type { RegexCandidate } from '../../security/regex-types.js'
@@ -286,6 +288,66 @@ export class PostgresStore implements Store {
     })
   }
 
+  /**
+   * 取代（first-class 生命周期）：单事务确认/创建新实体、建 supersedes、标记旧实体、审计。
+   * `create` 的内容在这里归一化（唯一校验入口），新实体 id 固定为 newId。
+   */
+  async supersede(input: SupersedeInput): Promise<SupersedeResult> {
+    return this.run(async () => {
+      const create = this.normalizeCreate(input.newId, input.create)
+      const outcome = await this.writer.execute(
+        {
+          type: 'Supersede',
+          oldId: input.oldId,
+          newId: input.newId,
+          reason: input.reason,
+          ...(input.effectiveAt === undefined ? {} : { effectiveAt: input.effectiveAt }),
+          ...(create === undefined ? {} : { create }),
+          ...(input.expectedRevision === undefined ? {} : { expectedRevision: input.expectedRevision }),
+        },
+        this.metaFor(input.actor, input.commandId),
+      )
+      const result = outcome.supersede
+      if (result === undefined) throw new OmbFailure(internal('取代没有返回结果'))
+      return result
+    })
+  }
+
+  /** 证伪（retracted）：与取代不同的生命周期，同样单事务审计可回滚。 */
+  async retract(input: RetractInput): Promise<RetractResult> {
+    return this.run(async () => {
+      const outcome = await this.writer.execute(
+        {
+          type: 'RetractEntity',
+          id: input.id,
+          reason: input.reason,
+          ...(input.effectiveAt === undefined ? {} : { effectiveAt: input.effectiveAt }),
+          ...(input.expectedRevision === undefined ? {} : { expectedRevision: input.expectedRevision }),
+        },
+        this.metaFor(input.actor, input.commandId),
+      )
+      const result = outcome.retract
+      if (result === undefined) throw new OmbFailure(internal('证伪没有返回结果'))
+      return result
+    })
+  }
+
+  /** 外部幂等键只覆盖 commandId；actor/origin 仍由 actor 推导。 */
+  private metaFor(actor: string, commandId: string | undefined): ReturnType<typeof systemCommandMeta> {
+    const meta = systemCommandMeta(actor)
+    return commandId === undefined ? meta : { ...meta, commandId }
+  }
+
+  private normalizeCreate(newId: string, input: SupersedeInput['create']): NormalizedWrite | undefined {
+    if (input === undefined) return undefined
+    if (input.id !== undefined && input.id !== newId) {
+      throw new OmbFailure({ code: 'invalid-input', message: 'create.id 必须等于 newId' })
+    }
+    const normalized = normalizeWrite({ ...input, id: newId })
+    if (!normalized.ok) throw new OmbFailure(validationError(normalized.errors))
+    return normalized.value
+  }
+
   async link(input: {
     fromId: string
     toId: string
@@ -322,7 +384,8 @@ export class PostgresStore implements Store {
         `select e.id
          from omb.entity e
          join omb.attribute a on a.entity_id = e.id
-         where e.archived_at is null and a.name = $1 and a.value = $2::jsonb ${kindClause}
+         where e.archived_at is null and e.lifecycle = 'active'
+           and a.name = $1 and a.value = $2::jsonb ${kindClause}
          order by e.updated_at desc
          limit 1`,
         params,
@@ -419,6 +482,7 @@ export class PostgresStore implements Store {
                   w.path || n.next_id
            from walk w
            join omb.link l on l.archived_at is null
+             and l.relation <> 'supersedes'
              and (l.from_id = w.id or (not l.directed and l.to_id = w.id))
            cross join lateral (
              select case when l.from_id = w.id then l.to_id else l.from_id end as next_id
@@ -482,7 +546,8 @@ export class PostgresStore implements Store {
       if (options.includeArchived !== true && byId.size > 0) {
         const ids = [...byId.keys()]
         const active = await this.db.query<{ entity_id: string }>(
-          'select entity_id from omb.entity_view where entity_id = any($1::text[]) and archived_at is null',
+          `select entity_id from omb.entity_view
+           where entity_id = any($1::text[]) and archived_at is null and lifecycle = 'active'`,
           [ids],
         )
         const activeIds = new Set(active.rows.map(row => row.entity_id))
@@ -495,9 +560,18 @@ export class PostgresStore implements Store {
   async summaries(ids: readonly string[]): Promise<EntitySummary[]> {
     if (ids.length === 0) return []
     return this.run(async () => {
-      const rows = await this.db.query<ViewRow & { history_count: number }>(
-        `select v.*, (select count(*)::int from omb.entity h where h.version_of = v.entity_id) as history_count
+      const rows = await this.db.query<ViewRow & {
+        history_count: number
+        superseded_by: string | null
+        superseded_at: Date | string | null
+        retracted_at: Date | string | null
+        valid_from: Date | string | null
+        valid_to: Date | string | null
+      }>(
+        `select v.*, e.superseded_by, e.superseded_at, e.retracted_at, e.valid_from, e.valid_to,
+                (select count(*)::int from omb.entity h where h.version_of = v.entity_id) as history_count
          from omb.entity_view v
+         join omb.entity e on e.id = v.entity_id
          where v.entity_id = any($1::text[])`,
         [ids],
       )
@@ -511,6 +585,12 @@ export class PostgresStore implements Store {
         snippet: row.snippet,
         archived: row.archived_at !== null,
         isCurrent: row.is_current,
+        lifecycle: row.lifecycle,
+        ...(row.superseded_by !== null ? { supersededBy: row.superseded_by } : {}),
+        ...(iso(row.superseded_at) !== undefined ? { supersededAt: iso(row.superseded_at) as string } : {}),
+        ...(iso(row.retracted_at) !== undefined ? { retractedAt: iso(row.retracted_at) as string } : {}),
+        ...(iso(row.valid_from) !== undefined ? { validFrom: iso(row.valid_from) as string } : {}),
+        ...(iso(row.valid_to) !== undefined ? { validTo: iso(row.valid_to) as string } : {}),
         ...(row.event_time === null ? {} : { eventTime: iso(row.event_time) as string }),
         updatedAt: iso(row.updated_at) as string,
         historyCount: Number(row.history_count),
@@ -583,7 +663,7 @@ export class PostgresStore implements Store {
          from omb.entity_view v
          join omb.entity e on e.id = v.entity_id
          where v.kind = 'memory' and v.scope = 'global'
-           and v.archived_at is null and v.is_current
+           and v.archived_at is null and v.is_current and v.lifecycle = 'active'
            and (v.attrs @> '{"tags":["偏好"]}'::jsonb or v.attrs->>'标签' = '偏好')
          order by e.salience desc, v.updated_at desc
          limit $1`,
@@ -599,6 +679,7 @@ export class PostgresStore implements Store {
         snippet: row.snippet,
         archived: false,
         isCurrent: true,
+        lifecycle: 'active' as const,
         ...(row.event_time === null ? {} : { eventTime: iso(row.event_time) as string }),
         updatedAt: iso(row.updated_at) as string,
         historyCount: 0,
@@ -749,11 +830,13 @@ export class PostgresStore implements Store {
   async markAccessed(ids: readonly string[]): Promise<void> {
     if (ids.length === 0) return
     await this.run(async () => {
+      // 只给当前有效条目记访问：历史条目（superseded/retracted/archived）的访问不该参与
+      // 当前重排/遗忘的证据。
       // check:ignore-next-line sec-sql-concat -- id 列表走 $1::text[] 参数，模板无外部片段
       await this.db.query(
         `update omb.entity
          set access_count = access_count + 1, last_accessed_at = now()
-         where id = any($1::text[])`,
+         where id = any($1::text[]) and lifecycle = 'active' and archived_at is null`,
         [ids],
       )
     })
@@ -1015,8 +1098,14 @@ export class PostgresStore implements Store {
           [traceId, entityId, kind],
         )
         if (updated.rowCount !== null && updated.rowCount > 0) {
+          // 采用率只累计当前有效条目：历史条目的旧计数保留，但不再被新召回放大。
           // check:ignore-next-line sec-sql-concat -- entityId 走 $1 参数，模板是常量 SQL
-          await client.query('update omb.entity set adoption_count = adoption_count + 1 where id = $1', [entityId])
+          await client.query(
+            `update omb.entity
+             set adoption_count = adoption_count + 1
+             where id = $1 and lifecycle = 'active' and archived_at is null`,
+            [entityId],
+          )
         }
       })
     })
@@ -1216,6 +1305,9 @@ export class PostgresStore implements Store {
     const clauses: string[] = []
     if (spec.includeHistory !== true) clauses.push('v.is_current = true')
     if (spec.includeArchived !== true) clauses.push('v.archived_at is null')
+    // 当前召回排除 superseded/retracted；归档由 includeArchived 单独控制（lifecycle='archived'
+    // 的行只有显式 includeArchived 才能出现）。历史检索（includeSuperseded）放开全部四种状态。
+    if (spec.includeSuperseded !== true) clauses.push(`v.lifecycle in ('active', 'archived')`)
     if (spec.kind !== undefined) {
       params.push(spec.kind)
       clauses.push(`v.kind = $${params.length}`)

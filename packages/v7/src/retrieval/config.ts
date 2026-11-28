@@ -66,6 +66,11 @@ export interface RerankPriors {
   readonly history: number
   /** 实体置信度触发的乘数上限。 */
   readonly confidence: number
+  /**
+   * 历史条目（superseded/retracted）的降权乘数：只在显式历史检索里出现，
+   * 但绝不能因为被召回就当成当前事实加分；≤1，缺省 0.6。
+   */
+  readonly superseded: number
 }
 
 export interface ScenarioConfig {
@@ -136,6 +141,7 @@ function priors(overrides: Partial<RerankPriors> = {}): RerankPriors {
     linkStrength: 1,
     history: 1,
     confidence: 1,
+    superseded: 0.6,
     ...overrides,
   }
 }
@@ -263,6 +269,7 @@ export interface RerankPriorOverrides {
   readonly linkStrength?: number
   readonly history?: number
   readonly confidence?: number
+  readonly superseded?: number
 }
 
 export interface ScenarioConfigOverrides {
@@ -308,6 +315,7 @@ function mergePriors(base: RerankPriors, override?: RerankPriorOverrides): Reran
     ...(override.linkStrength === undefined ? {} : { linkStrength: override.linkStrength }),
     ...(override.history === undefined ? {} : { history: override.history }),
     ...(override.confidence === undefined ? {} : { confidence: override.confidence }),
+    ...(override.superseded === undefined ? {} : { superseded: override.superseded }),
   }
 }
 

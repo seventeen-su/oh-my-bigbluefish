@@ -319,7 +319,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       expect(text).toContain('projection=ok')
       expect(text).toContain('outbox=ok')
       expect(text).toContain('outboxLagMs=0 outboxPending=0 outboxClaimed=0 outboxDead=0')
-      expect(text).toContain('outboxTopics=AttributeRenamed,EntityArchived,EntityCreated,EntityPatched,EntityUnarchived,EvidenceAdded,LinkCreated,LinkUnlinked')
+      expect(text).toContain('outboxTopics=AttributeRenamed,EntityArchived,EntityCreated,EntityPatched,EntityRetracted,EntitySuperseded,EntityUnarchived,EvidenceAdded,LinkCreated,LinkUnlinked')
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('timer=ok')
       // 业务 timer（workflow wake）空闲；consolidation 的 durable schedule 是合法 pending。

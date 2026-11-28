@@ -69,6 +69,8 @@ export const EVIDENCE_REACTION_TOPICS: readonly string[] = ['EvidenceAdded']
  * - `EntityArchived`/`EntityUnarchived`：归档列、`entity_view` 同步与看板投影任务都在
  *   writer 的同一事务里完成；它们不参与嵌入，但可能带 `payload.dependency`，由 refresh
  *   reaction 触发一次定向依赖刷新。
+ * - `EntitySuperseded`/`EntityRetracted`：生命周期列、`entity_view.lifecycle`、看板删除任务
+ *   与审计 inverse 都在取代/证伪事务里完成；旧实体不该再产生嵌入/刷新任务。
  * - `AttributeRenamed`：属性改名会 bump 受影响实体版本、重建 view/引用/触发键并重新入队
  *   看板投影（同样在写事务里）；`deriveSearchText` 不含属性名，嵌入文本不变。
  *
@@ -79,6 +81,9 @@ export const EVIDENCE_REACTION_TOPICS: readonly string[] = ['EvidenceAdded']
 export const WRITE_SIDE_EFFECT_TOPICS: readonly string[] = [
   'EntityArchived',
   'EntityUnarchived',
+  'EntitySuperseded',
+  'EntityRetracted',
+  'AttributeRenamed',
 ]
 
 /** ack 的进程内计数；`omb_status` 用它证明合法 topic 被明确处理而不是 dead。 */

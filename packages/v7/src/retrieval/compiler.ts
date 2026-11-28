@@ -69,6 +69,8 @@ interface PlanFilters {
   readonly status?: readonly StateStatus[]
   readonly includeArchived: boolean
   readonly includeHistory: boolean
+  /** 历史检索开关：false 时只允许 lifecycle=active（默认）。 */
+  readonly includeSuperseded: boolean
 }
 
 interface PlanTime {
@@ -299,6 +301,7 @@ function compileFilters(request: RecallRequest): PlanFilters {
     ...(request.status === undefined ? {} : { status: [...request.status] }),
     includeArchived: request.includeArchived === true,
     includeHistory: request.includeHistory === true,
+    includeSuperseded: request.includeSuperseded === true,
   }
 }
 

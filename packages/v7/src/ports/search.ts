@@ -1,5 +1,6 @@
 import type { Category, EntityKind, Scope, StateStatus } from '../domain/entity.js'
 import type { JsonValue } from '../domain/json.js'
+import type { EntityLifecycle } from '../domain/lifecycle.js'
 
 /**
  * 检索通道的端口契约：六个通道（fulltext/triggers/singleChar/vector/time/stateBoard）
@@ -17,6 +18,11 @@ export interface SearchBase {
   readonly status?: readonly StateStatus[]
   readonly includeArchived?: boolean
   readonly includeHistory?: boolean
+  /**
+   * 历史检索开关：默认只返回 `lifecycle='active'`；显式打开后才允许 superseded/retracted。
+   * 归档仍由 `includeArchived` 单独控制，两者不互相隐含。
+   */
+  readonly includeSuperseded?: boolean
   readonly limit: number
 }
 
@@ -62,6 +68,16 @@ export interface EntitySummary {
   readonly snippet: string
   readonly archived: boolean
   readonly isCurrent: boolean
+  /** 内容真值状态；`active` 之外的条目只能在历史检索里出现，必须带生命周期标记。 */
+  readonly lifecycle: EntityLifecycle
+  /** 被取代的时间与取代者（历史条目标记用）。 */
+  readonly supersededAt?: string
+  readonly supersededBy?: string
+  /** 被证伪时间（历史条目标记用）。 */
+  readonly retractedAt?: string
+  /** 有效期窗口；`validTo` 缺省表示仍在生效。 */
+  readonly validFrom?: string
+  readonly validTo?: string
   /** 实体事件时间（ISO 8601）；只有带 time 属性的实体（状态机等）才有，缺省表示未知。 */
   readonly eventTime?: string
   readonly updatedAt: string

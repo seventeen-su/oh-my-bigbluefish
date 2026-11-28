@@ -213,6 +213,7 @@ describe('shadow compare 汇总与退出码（纯函数）', () => {
       rawScores: { fulltext: 0.5 },
       chainSiblings: [],
       historyCount: 0,
+      lifecycle: 'active',
     }, {
       entityId: 'mem_b',
       kind: 'memory',
@@ -226,6 +227,7 @@ describe('shadow compare 汇总与退出码（纯函数）', () => {
       rawScores: { fulltext: 0.4 },
       chainSiblings: [],
       historyCount: 0,
+      lifecycle: 'active',
     }] satisfies RecallHit[]
     const direct: RecallResult = {
       traceId: 'trc_direct',
@@ -273,6 +275,7 @@ describe('shadow compare 汇总与退出码（纯函数）', () => {
         rawScores: { fulltext: 0.5, vector: 0.8 },
         chainSiblings: [],
         historyCount: 0,
+        lifecycle: 'active',
       }],
       channels: [
         { channel: 'fulltext', status: 'ok', hitCount: 1 },

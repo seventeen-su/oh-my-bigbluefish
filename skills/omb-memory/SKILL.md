@@ -48,8 +48,9 @@ user-invocable: false
 
 1. 同内容已存在 → 不重复写，改用 `omb_link` 建关系；
 2. 近似但数字/条件不同 → 写成新条目，用 `omb_link` 链接 `related_to` 或 `possible_conflict`；
-3. 旧结论被推翻 → 新条目 + `omb_link` 到旧条目 `supersedes`。`supersedes` 只是普通关系标记：旧条目照常参与检索，不会被自动归档或降权；要让它退出普通检索，再 `omb_admin action=archive targetId=...`；
-4. 已归档条目要恢复 → 先 `omb_admin action=unarchive targetId=...`；`omb_update` 不能直接改已归档条目。
+3. 旧结论被推翻、有了新说法 → 新条目 + `omb_link from=新条目 to=旧条目 relation=supersedes`（或 `omb_admin action=supersede targetId=旧 newId=新 [reason] [effectiveAt]`）。这是**取代**，不是普通关系边：同一事务里旧条目变成 `superseded`、写 `valid_to`、退出普通召回/图扩展/采用率重排，但历史检索和 `omb_history` 仍能看到它并标注「已于某时被谁取代」。取代不是归档，**不要再 archive**；撤销取代用 `omb_admin rollback auditId=...`；
+4. 旧结论不是被替代，而是**被证伪**（实验失败、事实错误）→ `omb_admin action=retract targetId=旧 [reason]`，它与取代是两种状态，不能互相覆盖；
+5. 已归档条目要恢复 → 先 `omb_admin action=unarchive targetId=...`；`omb_update` 不能直接改已归档条目。
 
 ## 关系与组
 

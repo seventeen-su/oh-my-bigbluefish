@@ -4,6 +4,7 @@ import type { PatchEntityInput, WriteEntityInput } from '../../domain/entity.js'
 import type { RawAttributeValue } from '../../domain/dynamic-spec.js'
 import type { OmbError, Result } from '../../domain/errors.js'
 import { isPlainObject } from '../../domain/json.js'
+import type { RetractInput, SupersedeInput } from '../../domain/lifecycle.js'
 import { MAX_TITLE } from '../../domain/validation.js'
 import type { Logger } from '../../ports/jobs.js'
 import type { HostContextLike, HostToolDefinition, HostToolsLike, ToolContext } from './host.js'
@@ -60,6 +61,7 @@ const recallSchema = z.object({
   status: z.array(statusValue).max(MAX_STATUS_ITEMS).optional(),
   includeArchived: z.boolean().optional(),
   includeHistory: z.boolean().optional(),
+  includeSuperseded: z.boolean().optional().describe('历史检索：允许已被取代/已被证伪的旧事实进入结果（带生命周期标记）'),
   expand: z.enum(['none', 'links', 'chain', 'both']).optional(),
   hops: z.union([z.literal(1), z.literal(2)]).optional(),
   limit: z.number().int().min(1).max(50).optional(),
@@ -81,12 +83,14 @@ const updateSchema = z.object({
 })
 
 const linkSchema = z.object({
-  from: idText.optional(),
-  to: idText.optional(),
+  from: idText.optional().describe('关系起点；relation=supersedes 时是取代者（新结论）'),
+  to: idText.optional().describe('关系终点；relation=supersedes 时是被取代者（旧结论）'),
   relation: z.string().min(1).max(64).optional(),
   directed: z.boolean().optional(),
   strength: z.number().min(0).max(1).optional(),
   allowArchived: z.boolean().optional(),
+  reason: z.string().min(1).max(200).optional().describe('relation=supersedes 时的取代原因'),
+  effectiveAt: z.string().max(MAX_TIME_CHARS).optional().describe('relation=supersedes 时的生效时间（ISO 8601，可回溯）'),
   unlinkId: idText.optional(),
 }).refine(value => value.unlinkId !== undefined || (value.from !== undefined && value.to !== undefined && value.relation !== undefined), {
   message: '要么给 unlinkId，要么给 from/to/relation',
@@ -98,9 +102,11 @@ const historySchema = z.object({
 })
 
 const adminSchema = z.object({
-  action: z.enum(['audit', 'rollback', 'archive', 'unarchive', 'replay']),
+  action: z.enum(['audit', 'rollback', 'archive', 'unarchive', 'supersede', 'retract', 'replay']),
   auditId: z.number().int().positive().optional(),
-  targetId: idText.optional(),
+  targetId: idText.optional().describe('archive/unarchive/supersede/retract 的目标实体；supersede 时是被取代的旧实体'),
+  newId: idText.optional().describe('supersede 用：取代者（新实体）id'),
+  effectiveAt: z.string().max(MAX_TIME_CHARS).optional().describe('supersede/retract 的生效时间（ISO 8601）'),
   topic: z.string().min(1).max(MAX_ID_CHARS).optional().describe('replay 用：按 outbox topic 重放 dead 行'),
   outboxId: z.number().int().positive().optional().describe('replay 用：按 omb.outbox.id 重放单条 dead 行'),
   reason: z.string().min(1).max(200).optional(),
@@ -117,6 +123,8 @@ export interface ToolRuntime {
   update(input: PatchEntityInput, context: ToolContext): Promise<Result<string>>
   link(input: LinkInput, context: ToolContext): Promise<Result<string>>
   unlink(id: string, context: ToolContext): Promise<Result<string>>
+  supersede(input: SupersedeInput): Promise<Result<string>>
+  retract(input: RetractInput): Promise<Result<string>>
   history(id: string, limit: number): Promise<Result<string>>
   status(): Promise<Result<string>>
   admin(input: AdminToolArgs): Promise<Result<string>>
@@ -318,7 +326,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_recall',
-    '用户提到“上次/之前/原来的决定”，或当前任务需要项目状态、旧结论、错误签名、相关链接时调用。默认只返回未归档；沿链接/思维链展开用 expand。',
+    '用户提到“上次/之前/原来的决定”，或当前任务需要项目状态、旧结论、错误签名、相关链接时调用。默认只返回当前有效（active）条目；问“去年/迁移之前是什么”时给 timeFrom/timeTo 或 includeSuperseded=true 查历史，结果会标注“已被取代/已被证伪”，不能当当前事实。沿链接/思维链展开用 expand；旧事实改用 includeSuperseded。',
     toolParameters(recallSchema),
     async (rawArgs, exec) => {
       const parsed = parseToolArgs(recallSchema, rawArgs, RECALL_ARRAY_LIMITS)
@@ -357,7 +365,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_link',
-    '两个实体之间存在依赖/来源/冲突/合并自等关系时调用；relation 用短英文。需要建组用 omb_remember(kind=chain)。',
+    '两个实体之间存在依赖/来源/冲突/合并自等关系时调用；relation 用短英文。relation=supersedes 是生命周期操作：from 是取代者（新结论）、to 是被取代者（旧结论），旧条目会在同一事务里变成 superseded 并退出普通召回（不需要再 archive）；reason/effectiveAt 可选。需要建组用 omb_remember(kind=chain)。',
     toolParameters(linkSchema),
     async (rawArgs, exec) => {
       const parsed = parseToolArgs(linkSchema, rawArgs)
@@ -365,6 +373,15 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
       const context = await runtime.context(exec)
       if (context === undefined) return { ok: false, text: 'missing-session: 无法确定会话/项目' }
       if (parsed.data.unlinkId !== undefined) return resultOf(await runtime.unlink(parsed.data.unlinkId, context))
+      if (parsed.data.relation === 'supersedes') {
+        return resultOf(await runtime.supersede({
+          oldId: parsed.data.to as string,
+          newId: parsed.data.from as string,
+          reason: parsed.data.reason ?? 'superseded',
+          actor: 'model',
+          ...(parsed.data.effectiveAt !== undefined ? { effectiveAt: parsed.data.effectiveAt } : {}),
+        }))
+      }
       const input: LinkInput = {
         fromId: parsed.data.from as string,
         toId: parsed.data.to as string,
@@ -379,7 +396,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_history',
-    '需要查看状态机的历史版本时调用；历史不可回滚，只返回快照与时间。',
+    '需要查看状态机历史版本，或确认一条记忆是否已被取代/被谁取代、有效期从何时到何时时调用；历史不可回滚，只返回快照与生命周期事实。',
     toolParameters(historySchema),
     async (rawArgs) => {
       const parsed = parseToolArgs(historySchema, rawArgs)
@@ -397,7 +414,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
 
   add(
     'omb_admin',
-    '需要查看审计、回滚某次后台操作、手工归档/取消归档，或重放 dead outbox 事件时调用；rollback 只支持有 inverse 的审计记录；replay 用 outboxId 或 topic 二选一（都缺省会被拒绝），把 dead 行重置为 pending 并写一条 outbox-replay 审计。',
+    '需要查看审计、回滚某次后台操作、手工归档/取消归档、取代/证伪一条记忆，或重放 dead outbox 事件时调用；supersede 需要 targetId（旧）+ newId（新），retract 需要 targetId（被证伪）；rollback 只支持有 inverse 的审计记录；replay 用 outboxId 或 topic 二选一（都缺省会被拒绝），把 dead 行重置为 pending 并写一条 outbox-replay 审计。',
     toolParameters(adminSchema),
     async rawArgs => {
       const parsed = parseToolArgs(adminSchema, rawArgs)

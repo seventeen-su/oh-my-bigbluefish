@@ -16,6 +16,8 @@ import type { ChannelReport, EmptyReason, EmptyReasonCode } from './types.js'
 export type FilterCode =
   | 'archived'
   | 'history'
+  | 'superseded'
+  | 'retracted'
   | 'kind'
   | 'category'
   | 'status'
@@ -201,7 +203,7 @@ function baseEmptyReason(input: EmptyExplanationInput): EmptyReasonBase {
     }
     return {
       code: 'no-stage-one-hits',
-      message: '六个通道均无命中：检查查询词、作用域、归档/历史开关是否把目标排除在外。',
+      message: '六个通道均无命中：检查查询词、作用域、归档/历史/取代开关是否把目标排除在外。',
       details: { channels: input.reports.map(report => `${report.channel}:${report.status}`) },
     }
   }
@@ -227,7 +229,7 @@ function baseEmptyReason(input: EmptyExplanationInput): EmptyReasonBase {
   }
   return {
     code: 'filtered-out',
-    message: `有 ${input.gate.passed.length} 条候选通过门控，但都被归档/历史/类型/状态/时间窗过滤排除。`,
+    message: `有 ${input.gate.passed.length} 条候选通过门控，但都被归档/历史/取代/证伪/类型/状态/时间窗过滤排除。`,
     details: {
       filteredOut: input.filteredOut,
       ...(input.timeFiltered === undefined || input.timeFiltered === 0 ? {} : { timeFiltered: input.timeFiltered }),

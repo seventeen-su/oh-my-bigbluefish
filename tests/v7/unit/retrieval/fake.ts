@@ -36,6 +36,12 @@ import type {
   VectorSearchSpec,
 } from '../../../../packages/v7/src/ports/search.js'
 import type { PatchEntityInput } from '../../../../packages/v7/src/domain/entity.js'
+import type {
+  RetractInput,
+  RetractResult,
+  SupersedeInput,
+  SupersedeResult,
+} from '../../../../packages/v7/src/domain/lifecycle.js'
 import type { StageOneChannel } from '../../../../packages/v7/src/retrieval/types.js'
 import { RecallEngine } from '../../../../packages/v7/src/retrieval/engine.js'
 import type { RetrievalConfig } from '../../../../packages/v7/src/retrieval/config.js'
@@ -53,6 +59,7 @@ export function summary(overrides: Partial<EntitySummary> & { id: string }): Ent
     scope: { kind: 'global' },
     archived: false,
     isCurrent: true,
+    lifecycle: 'active',
     updatedAt: FIXED_NOW,
     historyCount: 0,
     ...overrides,
@@ -101,6 +108,7 @@ export function entity(input: FakeEntityInput): Entity {
     ...(input.utilityConfidence === undefined ? {} : { utilityConfidence: input.utilityConfidence }),
     ...(input.refutationRate === undefined ? {} : { refutationRate: input.refutationRate }),
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: FIXED_NOW,
     updatedAt: FIXED_NOW,
     attributes,
@@ -347,6 +355,14 @@ export class FakeStore implements Store {
 
   async unarchive(_id: string, _reason: string, _actor: string): Promise<void> {
     throw new Error('fake store 未实现 unarchive')
+  }
+
+  async supersede(_input: SupersedeInput): Promise<SupersedeResult> {
+    throw new Error('fake store 未实现 supersede')
+  }
+
+  async retract(_input: RetractInput): Promise<RetractResult> {
+    throw new Error('fake store 未实现 retract')
   }
 
   async link(_input: LinkInput): Promise<LinkResult> {

@@ -7,15 +7,19 @@ import type { ConsolidationDeps } from './consolidate.js'
 import {
   handleAttrAlias,
   handleCluePromote,
+  handleCluePromoteFor,
   handleConflict,
+  handleConflictFor,
   handleDedupe,
+  handleDedupeFor,
   handleEmbedSweep,
   handleExtract,
+  handleExtractArtifact,
   handleForget,
   handleLinkSuggest,
   handleRefresh,
   handleReferenceRot,
-  type RefreshJobOptions,
+  handleReferenceRotForTarget,
 } from './consolidate.js'
 
 /**
@@ -286,13 +290,39 @@ export interface ConsolidationJobOptions {
  * 传了 `scheduler` 时，只有**调度驱动**的任务（载荷带触发标记）执行完才在 finally 里
  * rearm 下一期；rearm 失败只记日志，不影响本次任务结果。
  */
-function refreshJobOptionsOf(payload: unknown): RefreshJobOptions {
+/**
+ * job 载荷里的定向参数。
+ *
+ * reaction 把「哪个实体/artifact 变了」放进载荷（`entityId`/`targetEntityId`/`artifactId`），
+ * 调度驱动的周期兜底载荷只有 `{trigger, job}`；handler 按字段是否存在决定走定向还是全量，
+ * 这样事件路径不会为了一个实体扫描整库，周期兜底仍能补漏。
+ */
+interface ConsolidationJobPayload {
+  readonly limit?: number
+  readonly entityId?: string
+  readonly targetEntityId?: string
+  readonly artifactId?: string
+  readonly dependencyRoot?: string
+}
+
+function nonEmptyStringOf(payload: Record<string, unknown>, key: string): string | undefined {
+  const value = payload[key]
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function jobOptionsOf(payload: unknown): ConsolidationJobPayload {
   if (!isPlainObject(payload)) return {}
-  const options: { limit?: number; entityId?: string; dependencyRoot?: string } = {}
-  const entityId = payload['entityId']
-  if (typeof entityId === 'string' && entityId.length > 0) options.entityId = entityId
-  const dependencyRoot = payload['dependencyRoot']
-  if (typeof dependencyRoot === 'string' && dependencyRoot.length > 0) options.dependencyRoot = dependencyRoot
+  const options: { -readonly [K in keyof ConsolidationJobPayload]: ConsolidationJobPayload[K] } = {}
+  const entityId = nonEmptyStringOf(payload, 'entityId')
+  if (entityId !== undefined) options.entityId = entityId
+  const targetEntityId = nonEmptyStringOf(payload, 'targetEntityId')
+  if (targetEntityId !== undefined) options.targetEntityId = targetEntityId
+  const artifactId = nonEmptyStringOf(payload, 'artifactId')
+  if (artifactId !== undefined) options.artifactId = artifactId
+  const dependencyRoot = nonEmptyStringOf(payload, 'dependencyRoot')
+  if (dependencyRoot !== undefined) options.dependencyRoot = dependencyRoot
+  const limit = payload['limit']
+  if (typeof limit === 'number' && Number.isInteger(limit) && limit > 0) options.limit = limit
   return options
 }
 
@@ -318,16 +348,40 @@ export async function registerConsolidationJobs(
     })
     registered.push(job)
   }
-  await work('omb.extract', () => handleExtract(deps).then(() => undefined))
-  await work('omb.dedupe', () => handleDedupe(deps).then(() => undefined))
-  await work('omb.conflict', () => handleConflict(deps).then(() => undefined))
-  await work('omb.clue-promote', () => handleCluePromote(deps).then(() => undefined))
+  // 载荷带实体/artifact 时只处理那一个（事件驱动主路径）；不带才是周期兜底的全量扫描。
+  await work('omb.extract', payload => {
+    const options = jobOptionsOf(payload)
+    return (options.artifactId === undefined ? handleExtract(deps, options.limit) : handleExtractArtifact(deps, options.artifactId))
+      .then(() => undefined)
+  })
+  await work('omb.dedupe', payload => {
+    const options = jobOptionsOf(payload)
+    return (options.entityId === undefined ? handleDedupe(deps, options.limit) : handleDedupeFor(deps, options.entityId))
+      .then(() => undefined)
+  })
+  await work('omb.conflict', payload => {
+    const options = jobOptionsOf(payload)
+    return (options.entityId === undefined ? handleConflict(deps, options.limit) : handleConflictFor(deps, options.entityId))
+      .then(() => undefined)
+  })
+  await work('omb.clue-promote', payload => {
+    // 线索晋升前必须先看它自己的引用腐化；定向入口内部会做这件事。
+    const options = jobOptionsOf(payload)
+    return (options.entityId === undefined ? handleCluePromote(deps, options.limit) : handleCluePromoteFor(deps, options.entityId))
+      .then(() => undefined)
+  })
   await work('omb.link-suggest', () => handleLinkSuggest(deps).then(() => undefined))
   await work('omb.forget', () => handleForget(deps).then(() => undefined))
   await work('omb.attr-alias', () => handleAttrAlias(deps).then(() => undefined))
-  await work('omb.reference-rot', () => handleReferenceRot(deps).then(() => undefined))
+  await work('omb.reference-rot', payload => {
+    // 事件载荷用 targetEntityId 指“被改的实体”，只检查指向它的引用。
+    const options = jobOptionsOf(payload)
+    const target = options.targetEntityId ?? options.entityId
+    return (target === undefined ? handleReferenceRot(deps, options.limit) : handleReferenceRotForTarget(deps, target))
+      .then(() => undefined)
+  })
   if (deps.dynamic !== undefined) {
-    await work('omb.refresh', payload => handleRefresh(deps, refreshJobOptionsOf(payload)).then(() => undefined))
+    await work('omb.refresh', payload => handleRefresh(deps, jobOptionsOf(payload)).then(() => undefined))
   }
   if (deps.embedder !== undefined) {
     await work('omb.embed-sweep', () => handleEmbedSweep(deps).then(() => undefined))

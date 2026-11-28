@@ -1,7 +1,8 @@
 import type { Category, StateStatus } from '../domain/entity.js'
 import { err, ok, type Result } from '../domain/errors.js'
+import { LIFECYCLE_LABELS } from '../domain/lifecycle.js'
 import type { RecallEngine } from '../retrieval/engine.js'
-import type { RecallRequest, RecallResult, RecallScenario } from '../retrieval/types.js'
+import type { RecallHit, RecallRequest, RecallResult, RecallScenario } from '../retrieval/types.js'
 import type { RuntimeContext } from '../ports/context.js'
 import type { DynamicService } from './dynamic.js'
 
@@ -12,11 +13,33 @@ export interface RecallToolInput {
   readonly status?: readonly StateStatus[]
   readonly includeArchived?: boolean
   readonly includeHistory?: boolean
+  /** 历史检索：允许被取代/被证伪的旧事实进入结果（带生命周期标记）。 */
+  readonly includeSuperseded?: boolean
   readonly expand?: 'none' | 'links' | 'chain' | 'both'
   readonly hops?: 1 | 2
   readonly limit?: number
   readonly timeFrom?: string
   readonly timeTo?: string
+}
+
+/**
+ * 历史命中的标记：旧事实可以检索出来，但必须清楚说明「已于某时被谁取代」或「已被证伪」，
+ * 不能让它看起来还是当前有效。
+ */
+function lifecycleNote(hit: RecallHit): string | undefined {
+  if (hit.lifecycle === 'active') return undefined
+  const parts = [LIFECYCLE_LABELS[hit.lifecycle]]
+  if (hit.lifecycle === 'superseded') {
+    if (hit.supersededAt !== undefined) {
+      parts.push(`已于 ${hit.supersededAt} 被 ${hit.supersededBy ?? '未知条目'} 取代`)
+    }
+  } else if (hit.lifecycle === 'retracted' && hit.retractedAt !== undefined) {
+    parts.push(`已于 ${hit.retractedAt} 证伪`)
+  }
+  if (hit.validFrom !== undefined || hit.validTo !== undefined) {
+    parts.push(`有效期 ${hit.validFrom ?? '未知'} ~ ${hit.validTo ?? '现在'}`)
+  }
+  return parts.join('；')
 }
 
 function formatHit(index: number, hit: RecallResult['hits'][number]): string {
@@ -28,6 +51,8 @@ function formatHit(index: number, hit: RecallResult['hits'][number]): string {
   if (hit.why.length > 0) lines.push(`   依据：${hit.why.slice(0, 4).join('；')}`)
   if (hit.chainSiblings.length > 0) lines.push(`   同组：${hit.chainSiblings.join('、')}`)
   if (hit.historyCount > 0) lines.push(`   历史：${hit.historyCount} 个版本`)
+  const note = lifecycleNote(hit)
+  if (note !== undefined) lines.push(`   生命周期：${note}（历史证据，不是当前有效）`)
   return lines.join('\n')
 }
 
@@ -41,7 +66,10 @@ export function formatRecall(result: RecallResult, extraWarnings: readonly strin
   const body = result.hits.map((hit, index) => formatHit(index, hit)).join('\n')
   const warnings = [...result.warnings, ...extraWarnings]
   const warningText = warnings.length > 0 ? `\n注意：${warnings.join('；')}` : ''
-  return `${header}\n${body}${warningText}`
+  const historical = result.hits.some(hit => hit.lifecycle !== 'active')
+    ? '\n含历史条目：标注「已被取代/已被证伪」的条目只作旧事实证据，不能当作当前有效。'
+    : ''
+  return `${header}\n${body}${historical}${warningText}`
 }
 
 export interface RecallInjection {
@@ -89,6 +117,13 @@ export class RecallService {
       ...(input.status !== undefined ? { status: input.status } : {}),
       ...(input.includeArchived !== undefined ? { includeArchived: input.includeArchived } : {}),
       ...(input.includeHistory !== undefined ? { includeHistory: input.includeHistory } : {}),
+      // 显式时间窗就是历史问题（“去年/上次迁移之前”）：默认放开旧事实，但仍带生命周期标记。
+      // 显式 includeSuperseded 优先，不受时间窗隐含默认影响。
+      ...(input.includeSuperseded !== undefined
+        ? { includeSuperseded: input.includeSuperseded }
+        : timeWindow !== undefined
+          ? { includeSuperseded: true }
+          : {}),
       ...(input.hops !== undefined ? { hops: input.hops } : {}),
       ...(input.expand !== undefined ? { expand: input.expand } : {}),
       ...(input.limit !== undefined ? { limit: input.limit } : {}),

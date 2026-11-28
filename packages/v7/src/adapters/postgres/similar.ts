@@ -110,6 +110,9 @@ export function similarCandidateQuery(input: SimilarInput): SimilarQuery | undef
         where v.entity_id <> $1
           and v.kind = $2
           and v.search_tsv @@ to_tsquery('simple', $3)
+          -- 当前相似建议只提 active 候选；已有归档候选保留（写前查重需要看归档冲突），
+          -- 被取代/被证伪的历史条目不作为“相似记忆”建议，避免把旧事实当参考。
+          and (v.lifecycle = 'active' or v.archived_at is not null)
         limit $4
       ),
       matched as materialized (

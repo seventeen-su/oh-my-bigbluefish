@@ -235,8 +235,10 @@ describe('outbox PostgreSQL 适配器', () => {
         throw new Error('boom')
       },
     })
+    // 退避窗口要显著大于一次 DB 往返：窗口太小时「同一行在退避期内不可 claim」的断言
+    // 会在整库跑全量套件的负载下抖（不是实现问题，是测试自己的时间预算）。
     const relay = relayOf(registry, undefined, {
-      retry: { maxAttempts: 3, baseDelayMs: 200, factor: 2, maxDelayMs: 1_000 },
+      retry: { maxAttempts: 3, baseDelayMs: 2_000, factor: 2, maxDelayMs: 10_000 },
     })
 
     const first = await relay.tick()

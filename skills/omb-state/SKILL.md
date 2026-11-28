@@ -31,9 +31,10 @@ user-invocable: false
 
 ## 历史
 
-`omb_history(id)` 返回快照列表（`rev=` 是当时的版本号，不是当前版本），历史版本可被 `omb_link` 链接、被动态 `ref` 引用、加入思维链组；普通检索只显示当前版本并标 `历史：N 个版本`。
+`omb_history(id)` 返回生命周期事实（当前有效/已被谁于何时取代/有效期）与状态机快照列表（`rev=` 是当时的版本号，不是当前版本），历史版本可被 `omb_link` 链接、被动态 `ref` 引用、加入思维链组；普通检索只显示当前版本并标 `历史：N 个版本`，`includeSuperseded` 才返回被取代/被证伪的旧条目。
 
 ## 链接
 
-- 用 `omb_link` 建关系：`depends_on` 依赖、`derived_from` 来源、`supersedes` 取代（普通关系标记，不自动归档/降权）、`possible_conflict` 冲突（双向；手工 `unlinkId` 取消后不再自动标记）、`merged_into`/`merged_from` 合并。
+- 用 `omb_link` 建关系：`depends_on` 依赖、`derived_from` 来源、`possible_conflict` 冲突（双向；手工 `unlinkId` 取消后不再自动标记）、`merged_into`/`merged_from` 合并。
+- `supersedes` 是生命周期操作，不是普通边：`omb_link from=新条目 to=旧条目 relation=supersedes`（或 `omb_admin action=supersede targetId=旧 newId=新`）。同一事务里旧条目变成 `superseded`、写有效期并退出普通召回；不要再 archive，撤销取代用 `omb_admin rollback`，不能单独 `unlinkId` 取消。旧结论是被证伪而不是被替代时用 `omb_admin action=retract targetId=...`。
 - `directed` 缺省 true；已有链接端点归档后仍能解析，但不能再建新链接（除非 `allowArchived=true`）。

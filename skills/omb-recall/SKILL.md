@@ -21,7 +21,12 @@ user-invocable: false
 - 中文全文是应用层 bigram；全文零命中且查询长度 ≤2 时才走单字回退，单字通道更慢也更粗。
 - 不传 `scope` 时全局与项目都参与；`scope=global` 只看全局，`scope=project` 只看当前项目（没有项目键会报错）。
 - 需要时间范围时给 `timeFrom`/`timeTo`；用户说「上次」时优先看最近时间窗。
-- 默认只返回未归档当前条目；确实需要历史时显式 `includeArchived`/`includeHistory`。
+- 默认只返回**当前有效**（`active`、未归档）条目；被取代/被证伪/已归档的旧事实不会出现在普通结果里。
+- 需要旧事实（问「去年/迁移之前是什么」、确认某结论是否已被推翻）：
+  - 给 `timeFrom`/`timeTo` 历史时间窗（会自动放开旧事实），或显式 `includeSuperseded=true`；
+  - 结果里带「生命周期：已被取代/已被证伪」与「已于某时被谁取代」、有效期 `from ~ to`，这些只是**历史证据**，不能当作当前有效；
+  - 还要看已归档条目时再配 `includeArchived=true`。
+- `omb_history(id)` 也能给出一条记忆的生命周期事实（当前有效/已被谁取代/有效期）与状态机历史版本。
 - 原始分低于通道下限的候选会被门控丢掉（宁可不返回），查询越具体越容易过门控。
 
 ## 展开
@@ -38,9 +43,10 @@ user-invocable: false
 结果带 `trace`、场景、扩展种子数；每条命中带通道、重排后分数、依据（`why`）、同组标题和历史版本数。优先看：
 
 1. 通道是否合理（只有单字回退命中时要警惕）；
-2. `历史：N 个版本` 是否提示还有旧版本；
-3. 同组标题是否给出上下文；
-4. 空结果的原因（`no-stage-one-hits`/`below-threshold`/`filtered-out`/`all-channels-failed`/`summaries-failed`/`empty-query`），不要把它当成「库里没有」。
+2. `生命周期：` 行：被取代/被证伪的条目只能当旧事实引用，不能当当前结论；
+3. `历史：N 个版本` 是否提示还有旧版本；
+4. 同组标题是否给出上下文；
+5. 空结果的原因（`no-stage-one-hits`/`below-threshold`/`filtered-out`/`all-channels-failed`/`summaries-failed`/`empty-query`），不要把它当成「库里没有」。
 
 ## 采用
 

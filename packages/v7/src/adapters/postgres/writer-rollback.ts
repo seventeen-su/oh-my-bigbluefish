@@ -79,6 +79,14 @@ async function assertRollbackSnapshotCas(
       if (expected === undefined) continue
       await assertEntityRevision(client, entityId, expected, actor)
     }
+    return
+  }
+  // 取代/证伪回滚会改写生命周期列：必须证明当前仍是审计时的版本，避免把后续写覆盖掉。
+  if (action === 'unsupersede' || action === 'unretract') {
+    const entityId = action === 'unsupersede' ? asString(inverse['oldId']) : asString(inverse['entityId'])
+    const expected = row.stream_version === null ? undefined : Number(row.stream_version)
+    if (entityId === undefined || expected === undefined || row.stream_id !== entityId) return
+    await assertEntityRevision(client, entityId, expected, actor)
   }
 }
 
@@ -121,8 +129,10 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
   if (action === 'unarchive') {
     const id = asString(inverse['entityId'])
     if (id === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
-    await client.query('update omb.entity set archived_at = null, archive_reason = null where id = $1', [id])
-    await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
+    // 归档前的真值状态由 inverse 记录：历史审计没有该字段时按旧语义还原为 active。
+    const lifecycle = asString(inverse['previousLifecycle']) ?? 'active'
+    await client.query('update omb.entity set archived_at = null, archive_reason = null, lifecycle = $2 where id = $1', [id, lifecycle])
+    await client.query('update omb.entity_view set archived_at = null, lifecycle = $2 where entity_id = $1', [id, lifecycle])
     // 原 archive 删过出边：回滚恢复可读性时按当前属性/链接重建，之后上游更新仍能失效。
     const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
     const current = currentResult.rows[0]
@@ -135,11 +145,69 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
   } else if (action === 'archive') {
     const id = asString(inverse['entityId'])
     if (id === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
-    await client.query('update omb.entity set archived_at = now(), archive_reason = $2 where id = $1', [id, asString(inverse['reason']) ?? 'rollback'])
-    await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
+    await client.query(
+      `update omb.entity
+       set archived_at = now(), archive_reason = $2,
+           lifecycle = case when lifecycle = 'active' then 'archived' else lifecycle end
+       where id = $1`,
+      [id, asString(inverse['reason']) ?? 'rollback'],
+    )
+    await client.query(
+      `update omb.entity_view
+       set archived_at = now(),
+           lifecycle = case when lifecycle = 'active' then 'archived' else lifecycle end
+       where entity_id = $1`,
+      [id],
+    )
     await deleteSourceDependencyEdges(client, id)
     await invalidateDependencies(client, id, 'archive')
     applied.push(`archive:${id}`)
+  } else if (action === 'unsupersede') {
+    const oldId = asString(inverse['oldId'])
+    const linkId = asString(inverse['linkId'])
+    if (oldId === undefined) throw new OmbFailure(internal('unsupersede inverse 缺少 oldId'))
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [oldId])
+    const current = currentResult.rows[0]
+    if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${oldId}`))
+    if (current.lifecycle !== 'superseded') {
+      throw new OmbFailure(conflict(`实体已不是被取代状态（${current.lifecycle}），拒绝回滚取代`))
+    }
+    const lifecycle = asString(inverse['previousLifecycle']) ?? 'active'
+    const previousValidFrom = inverse['previousValidFrom'] === null ? null : asString(inverse['previousValidFrom']) ?? null
+    const previousValidTo = inverse['previousValidTo'] === null ? null : asString(inverse['previousValidTo']) ?? null
+    await client.query(
+      `update omb.entity
+       set revision = revision + 1, lifecycle = $2, superseded_by = null, superseded_at = null,
+           supersede_reason = null, valid_from = $3, valid_to = $4, updated_at = now()
+       where id = $1`,
+      [oldId, lifecycle, previousValidFrom, previousValidTo],
+    )
+    await client.query('update omb.entity_view set lifecycle = $2, updated_at = now() where entity_id = $1', [oldId, lifecycle])
+    if (linkId !== undefined) {
+      await client.query('update omb.link set archived_at = now() where id = $1 and archived_at is null', [linkId])
+    }
+    applied.push(`unsupersede:${oldId}`)
+  } else if (action === 'unretract') {
+    const id = asString(inverse['entityId'])
+    if (id === undefined) throw new OmbFailure(internal('unretract inverse 缺少 entityId'))
+    const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [id])
+    const current = currentResult.rows[0]
+    if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
+    if (current.lifecycle !== 'retracted') {
+      throw new OmbFailure(conflict(`实体已不是证伪状态（${current.lifecycle}），拒绝回滚证伪`))
+    }
+    const lifecycle = asString(inverse['previousLifecycle']) ?? 'active'
+    const previousValidFrom = inverse['previousValidFrom'] === null ? null : asString(inverse['previousValidFrom']) ?? null
+    const previousValidTo = inverse['previousValidTo'] === null ? null : asString(inverse['previousValidTo']) ?? null
+    await client.query(
+      `update omb.entity
+       set revision = revision + 1, lifecycle = $2, retracted_at = null, retracted_reason = null,
+           valid_from = $3, valid_to = $4, updated_at = now()
+       where id = $1`,
+      [id, lifecycle, previousValidFrom, previousValidTo],
+    )
+    await client.query('update omb.entity_view set lifecycle = $2, updated_at = now() where entity_id = $1', [id, lifecycle])
+    applied.push(`unretract:${id}`)
   } else if (action === 'unlink') {
     const linkId = asString(inverse['linkId'])
     if (linkId === undefined) throw new OmbFailure(internal('inverse 缺少 linkId'))
@@ -177,8 +245,20 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
   } else if (action === 'remove_written') {
     const entityId = asString(inverse['entityId'])
     if (entityId === undefined) throw new OmbFailure(internal('inverse 缺少 entityId'))
-    await client.query("update omb.entity set archived_at = now(), archive_reason = 'rollback-write' where id = $1", [entityId])
-    await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [entityId])
+    await client.query(
+      `update omb.entity
+       set archived_at = now(), archive_reason = 'rollback-write',
+           lifecycle = case when lifecycle = 'active' then 'archived' else lifecycle end
+       where id = $1`,
+      [entityId],
+    )
+    await client.query(
+      `update omb.entity_view
+       set archived_at = now(),
+           lifecycle = case when lifecycle = 'active' then 'archived' else lifecycle end
+       where entity_id = $1`,
+      [entityId],
+    )
     await deleteSourceDependencyEdges(client, entityId)
     await invalidateDependencies(client, entityId, 'archive')
     applied.push(`remove_written:${entityId}`)
@@ -241,6 +321,7 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
       now: nowIso(),
       isCurrent: current.is_current,
       archivedAt,
+      lifecycle: current.lifecycle,
       kindOverride: current.kind,
     })
     // check:ignore-next-line sec-sql-concat -- 所有值走 $2..$7 参数，模板是常量 SQL
@@ -344,6 +425,7 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
         now: nowIso(),
         isCurrent: current.is_current,
         archivedAt: current.archived_at === null ? null : iso(current.archived_at) ?? null,
+        lifecycle: current.lifecycle,
         kindOverride: current.kind,
       })
       await client.query('delete from omb.trigger_key where entity_id = $1', [entityId])

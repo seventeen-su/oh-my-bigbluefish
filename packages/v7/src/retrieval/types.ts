@@ -1,6 +1,7 @@
 import type { Category, EntityKind, Scope, StateStatus } from '../domain/entity.js'
 import type { OmbErrorCode } from '../domain/errors.js'
 import type { JsonValue } from '../domain/json.js'
+import type { EntityLifecycle } from '../domain/lifecycle.js'
 import type {
   EXPANSION_MODES,
   RECALL_CHANNELS,
@@ -30,6 +31,11 @@ export interface RecallRequest {
   readonly status?: readonly StateStatus[]
   readonly includeArchived?: boolean
   readonly includeHistory?: boolean
+  /**
+   * 历史检索：默认 false（只返回 lifecycle=active）。打开后 superseded/retracted 条目可被召回，
+   * 但它们只是历史证据，不能当作当前有效；归档仍由 `includeArchived` 单独控制。
+   */
+  readonly includeSuperseded?: boolean
   readonly limit?: number
   readonly hops?: 1 | 2
   /** 显式时间窗；缺省时按场景的 timeWindowDays 从 now 回推。 */
@@ -88,6 +94,16 @@ export interface RecallHit {
   readonly status?: StateStatus
   readonly scope: Scope
   readonly updatedAt: string
+  /** 内容真值状态：active 之外的命中只在历史检索里出现，必须标明「不是当前有效」。 */
+  readonly lifecycle: EntityLifecycle
+  /** 被取代的时间与取代者（历史条目标记）。 */
+  readonly supersededAt?: string
+  readonly supersededBy?: string
+  /** 被证伪时间（历史条目标记）。 */
+  readonly retractedAt?: string
+  /** 有效期窗口；`validTo` 缺省表示仍在生效。 */
+  readonly validFrom?: string
+  readonly validTo?: string
   /** 最终分：融合分 × 重排先验（先验乘数限制在 [0.5, 1.5]）。 */
   readonly score: number
   /** RRF 融合分（门控用），便于审计「为什么这条排在这里」。 */

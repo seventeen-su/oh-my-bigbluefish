@@ -49,6 +49,10 @@ export async function createLinkCommand(client: PoolClient, input: LinkInput, me
   if (input.fromId === input.toId) throw new OmbFailure(conflict('不能链接到自己'))
   const relation = input.relation.trim()
   if (relation.length === 0 || relation.length > 64) throw new OmbFailure(conflict('relation 必须是 1-64 字符'))
+  // `supersedes` 是生命周期关系，不是普通边：创建、旧实体标记与有效期必须在同一个取代事务里。
+  if (relation === 'supersedes') {
+    throw new OmbFailure(conflict('supersedes 必须通过取代（omb_link relation=supersedes / omb_admin action=supersede）建立'))
+  }
   const endpoints = await client.query<EntityRow>(
     'select * from omb.entity where id = any($1::text[])',
     [[input.fromId, input.toId]],
@@ -130,21 +134,38 @@ export async function createLinkCommand(client: PoolClient, input: LinkInput, me
 }
 
 export async function unlinkCommand(client: PoolClient, id: string, meta: CommandMeta): Promise<CommandOutcome> {
+  const current = await client.query<LinkRow>('select * from omb.link where id = $1 for update', [id])
+  const row = current.rows[0]
+  if (row === undefined || row.archived_at !== null) return noopOutcome('')
+  // 仍在生效的取代边不能单独摘掉：那会让旧实体停在 superseded 却没有 succeeded-by。
+  // 撤销取代要走审计回滚（unsupersede），它同时恢复生命周期与有效期。
+  if (row.relation === 'supersedes') {
+    const target = await client.query<{ lifecycle: string; superseded_by: string | null }>(
+      'select lifecycle, superseded_by from omb.entity where id = $1',
+      [row.to_id],
+    )
+    const old = target.rows[0]
+    if (old !== undefined && old.lifecycle === 'superseded' && old.superseded_by === row.from_id) {
+      throw new OmbFailure(conflict('取代关系由生命周期管理：用 omb_admin rollback 撤销取代，不能单独 unlink'))
+    }
+  }
   const result = await client.query<LinkRow>(
     'update omb.link set archived_at = now(), updated_at = now() where id = $1 and archived_at is null returning *',
     [id],
   )
-  const row = result.rows[0]
-  if (row === undefined) return noopOutcome('')
+  const archivedRow = result.rows[0]
+  if (archivedRow === undefined) return noopOutcome('')
   // link 软归档 → 依赖边同步删除；restore_link 回滚会重新插入。
   await deleteLinkDependencyEdges(client, {
-    fromId: row.from_id,
-    toId: row.to_id,
-    relation: row.relation,
-    directed: row.directed,
+    fromId: archivedRow.from_id,
+    toId: archivedRow.to_id,
+    relation: archivedRow.relation,
+    directed: archivedRow.directed,
   })
-  if (row.relation === 'possible_conflict') {
-    const [left, right] = row.from_id < row.to_id ? [row.from_id, row.to_id] : [row.to_id, row.from_id]
+  if (archivedRow.relation === 'possible_conflict') {
+    const [left, right] = archivedRow.from_id < archivedRow.to_id
+      ? [archivedRow.from_id, archivedRow.to_id]
+      : [archivedRow.to_id, archivedRow.from_id]
     // check:ignore-next-line sec-sql-concat -- pair_key 走 $1 参数，reason 是常量字面量
     await client.query(
       `insert into omb.conflict_suppression (pair_key, reason)
@@ -153,24 +174,24 @@ export async function unlinkCommand(client: PoolClient, id: string, meta: Comman
     )
   }
   const payload: Record<string, JsonValue> = {
-    entityId: row.from_id,
-    linkId: row.id,
-    fromId: row.from_id,
-    toId: row.to_id,
-    relation: row.relation,
+    entityId: archivedRow.from_id,
+    linkId: archivedRow.id,
+    fromId: archivedRow.from_id,
+    toId: archivedRow.to_id,
+    relation: archivedRow.relation,
   }
   // `link` 是独立聚合：unlink 在 link 行锁内取 max+1，rollback 后再次 unlink 也不会撞 stream 唯一索引。
-  const streamVersion = await nextStreamVersion(client, row.id)
+  const streamVersion = await nextStreamVersion(client, archivedRow.id)
   const event = await insertEvent(client, {
     meta,
     action: 'unlink',
     eventType: 'LinkUnlinked',
-    streamId: row.id,
+    streamId: archivedRow.id,
     streamVersion,
-    targetIds: [row.from_id, row.to_id],
+    targetIds: [archivedRow.from_id, archivedRow.to_id],
     payload,
     after: toJson({ linkId: id, archived: true }),
     inverse: toJson({ action: 'restore_link', linkId: id }),
   })
-  return { events: [event], revision: streamVersion, projectionToken: projectionToken(row.from_id, streamVersion, event) }
+  return { events: [event], revision: streamVersion, projectionToken: projectionToken(archivedRow.from_id, streamVersion, event) }
 }

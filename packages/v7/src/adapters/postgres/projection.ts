@@ -106,7 +106,9 @@ export function boardProjectionsFor(
   options: { readonly archived?: boolean } = {},
 ): readonly ProjectionName[] {
   const archived = options.archived ?? isArchived(entity)
-  if (!entity.isCurrent || archived) return []
+  // 生命周期不是 active（被取代/被证伪/已归档）的实体不属于当前看板；归档命令传 archived:false
+  // 时仍按归档前的 active 状态判定，才能产生“删除读模型行”的任务。
+  if (!entity.isCurrent || archived || entity.lifecycle !== 'active') return []
   const projections: ProjectionName[] = []
   const scope = scopeOf(entity)
   if (entity.kind === 'memory' && scope.kind === 'global' && hasPreferenceTag(entity)) {
@@ -431,7 +433,7 @@ select e.id as entity_id,
   ) t on true
   left join omb.entity_view v on v.entity_id = e.id
  where e.kind = 'memory'
-   and e.archived_at is null and e.is_current
+   and e.archived_at is null and e.is_current and e.lifecycle = 'active'
    and sc.value->>'kind' = 'global'
    and (
      exists (
@@ -489,7 +491,7 @@ select e.id as entity_id,
      order by a.ordinal limit 1
   ) tm on true
  where e.kind = 'state'
-   and e.archived_at is null and e.is_current
+   and e.archived_at is null and e.is_current and e.lifecycle = 'active'
    and sc.value->>'kind' = 'project'
    and coalesce(sc.value->>'projectKey', '') <> ''
    and (case when jsonb_typeof(st.value) = 'string' then st.value #>> '{}' end)

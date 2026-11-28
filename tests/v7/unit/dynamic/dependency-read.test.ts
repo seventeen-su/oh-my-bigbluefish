@@ -48,6 +48,7 @@ function entityOf(attributes: Attribute[]): Entity {
     accessCount: 0,
     adoptionCount: 0,
     isCurrent: true,
+    lifecycle: 'active',
     createdAt: NOW,
     updatedAt: NOW,
     attributes,

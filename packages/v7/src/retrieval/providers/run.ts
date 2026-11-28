@@ -64,6 +64,7 @@ export function searchBase(plan: RetrievalPlan, limit: number): SearchBase {
     ...(plan.filters.status === undefined ? {} : { status: plan.filters.status }),
     ...(plan.filters.includeArchived ? { includeArchived: true } : {}),
     ...(plan.filters.includeHistory ? { includeHistory: true } : {}),
+    ...(plan.filters.includeSuperseded ? { includeSuperseded: true } : {}),
     limit,
   }
 }

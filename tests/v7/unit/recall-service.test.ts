@@ -66,6 +66,7 @@ describe('RecallService 场景选择', () => {
       rawScores: { fulltext: 0.1 },
       chainSiblings: [],
       historyCount: 0,
+      lifecycle: 'active',
     }))
     const text = formatRecall({
       traceId: 'trc_test',

@@ -11,6 +11,7 @@ import type {
 import { isCategory, isStateStatus } from '../../domain/entity.js'
 import type { JsonValue } from '../../domain/json.js'
 import { isPlainObject } from '../../domain/json.js'
+import type { EntityLifecycle } from '../../domain/lifecycle.js'
 import { searchText as tokenizeForSearch } from '../../domain/text.js'
 import { deriveSearchText, shouldAutoArchive, type NormalizedWrite } from '../../domain/validation.js'
 import type { DerivedWrite } from '../../ports/store.js'
@@ -32,6 +33,14 @@ export interface EntityRow {
   last_accessed_at: Date | string | null
   archived_at: Date | string | null
   archive_reason: string | null
+  lifecycle: EntityLifecycle
+  superseded_by: string | null
+  superseded_at: Date | string | null
+  supersede_reason: string | null
+  retracted_at: Date | string | null
+  retracted_reason: string | null
+  valid_from: Date | string | null
+  valid_to: Date | string | null
   version_of: string | null
   is_current: boolean
   created_at: Date | string
@@ -69,6 +78,7 @@ export interface ViewRow {
   chars: string[]
   is_current: boolean
   archived_at: Date | string | null
+  lifecycle: EntityLifecycle
   updated_at: Date | string
 }
 
@@ -87,6 +97,7 @@ export interface ViewValues {
   chars: string[]
   isCurrent: boolean
   archivedAt: string | null
+  lifecycle: EntityLifecycle
   updatedAt: string
 }
 
@@ -132,6 +143,14 @@ export function mapEntity(row: EntityRow, attributes: readonly Attribute[], hist
     ...(iso(row.last_accessed_at) !== undefined ? { lastAccessedAt: iso(row.last_accessed_at) as string } : {}),
     ...(iso(row.archived_at) !== undefined ? { archivedAt: iso(row.archived_at) as string } : {}),
     ...(row.archive_reason !== null ? { archiveReason: row.archive_reason } : {}),
+    lifecycle: row.lifecycle,
+    ...(row.superseded_by !== null ? { supersededBy: row.superseded_by } : {}),
+    ...(iso(row.superseded_at) !== undefined ? { supersededAt: iso(row.superseded_at) as string } : {}),
+    ...(row.supersede_reason !== null ? { supersedeReason: row.supersede_reason } : {}),
+    ...(iso(row.retracted_at) !== undefined ? { retractedAt: iso(row.retracted_at) as string } : {}),
+    ...(row.retracted_reason !== null ? { retractedReason: row.retracted_reason } : {}),
+    ...(iso(row.valid_from) !== undefined ? { validFrom: iso(row.valid_from) as string } : {}),
+    ...(iso(row.valid_to) !== undefined ? { validTo: iso(row.valid_to) as string } : {}),
     ...(row.version_of !== null ? { versionOf: row.version_of } : {}),
     isCurrent: row.is_current,
     createdAt: iso(row.created_at) as string,
@@ -213,6 +232,8 @@ export function buildViewValues(
     attributes?: readonly Attribute[]
     isCurrent?: boolean
     archivedAt?: string | null
+    /** 视图生命周期；缺省 `active`。patch 必须从 entity 行显式传入，避免把历史条目重置成当前。 */
+    lifecycle?: EntityLifecycle
     kindOverride?: EntityKind
   },
 ): ViewValues {
@@ -261,6 +282,7 @@ export function buildViewValues(
     chars: charSet(`${preview} ${derivedText}`),
     isCurrent: options.isCurrent ?? true,
     archivedAt,
+    lifecycle: options.lifecycle ?? 'active',
     updatedAt: options.now,
   }
 }

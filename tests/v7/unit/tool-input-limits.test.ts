@@ -41,6 +41,14 @@ function stubRuntime(): Stub {
       calls.push('unlink')
       return { ok: true, value: 'unlinked' }
     },
+    supersede: async () => {
+      calls.push('supersede')
+      return { ok: true, value: 'superseded' }
+    },
+    retract: async () => {
+      calls.push('retract')
+      return { ok: true, value: 'retracted' }
+    },
     history: async () => {
       calls.push('history')
       return { ok: true, value: 'history' }

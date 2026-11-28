@@ -230,6 +230,7 @@ export function buildViewFromRows(
       isCurrent: row.is_current,
       kindOverride: row.kind,
       archivedAt,
+      lifecycle: row.lifecycle,
     },
   )
   return { view, triggers, references }
@@ -254,9 +255,9 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
   await client.query(
     `insert into omb.entity_view (
        entity_id, kind, category, scope, project_key, title, status, event_time, attrs,
-       search_text, snippet, chars, is_current, archived_at, updated_at
+       search_text, snippet, chars, is_current, archived_at, updated_at, lifecycle
      ) values (
-       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::text[],$13,$14,$15
+       $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::text[],$13,$14,$15,$16
      )
      on conflict (entity_id) do update set
        kind = excluded.kind,
@@ -272,7 +273,8 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
        chars = excluded.chars,
        is_current = excluded.is_current,
        archived_at = excluded.archived_at,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       lifecycle = excluded.lifecycle`,
     [
       view.entityId,
       view.kind,
@@ -289,6 +291,7 @@ export async function upsertView(client: PoolClient, view: ViewValues): Promise<
       view.isCurrent,
       view.archivedAt,
       view.updatedAt,
+      view.lifecycle,
     ],
   )
 }

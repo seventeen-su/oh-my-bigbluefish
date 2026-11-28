@@ -152,7 +152,8 @@ function groupableMembers(sourceId: string, similar: readonly SimilarEntity[]): 
  * 组是候选中心的：候选 + 相似成员；重复处理同一候选时靠 autoGroupKey 短路。
  */
 async function autoGroupSimilar(deps: ConsolidationDeps, source: Entity, similar: readonly SimilarEntity[]): Promise<boolean> {
-  if (source.archivedAt !== undefined) return false
+  // 只有当前有效条目参与自动成组；被取代/被证伪/归档的条目不再是当前事实。
+  if (source.archivedAt !== undefined || source.lifecycle !== 'active') return false
   const members = groupableMembers(source.id, similar)
   if (members.length < AUTO_GROUP_MIN) return false
   // 以候选为中心的组键：同一个候选重复抽取（写入后又被更新）不会建第二条自动链。
@@ -245,6 +246,7 @@ async function recordSkippedAudit(
 /** `patch` 不返回相似实体快照，用全文近邻取同类活跃实体补出成员。 */
 async function similarAfterUpdate(deps: ConsolidationDeps, source: Entity): Promise<SimilarEntity[]> {
   if (source.kind !== 'memory' && source.kind !== 'state') return []
+  if (source.lifecycle !== 'active') return []
   // 全文查询是 AND 语义，标题比“标题+正文”更可能命中同主题的其它实体。
   const title = attributeValue(source, 'title')
   const text = typeof title === 'string' && title.trim().length > 0 ? title : combinedText(source)
@@ -254,7 +256,7 @@ async function similarAfterUpdate(deps: ConsolidationDeps, source: Entity): Prom
   for (const hit of hits) {
     if (hit.entityId === source.id) continue
     const other = await deps.store.get(hit.entityId)
-    if (other === undefined || other.archivedAt !== undefined || !GROUPABLE_KINDS.has(other.kind)) continue
+    if (other === undefined || other.archivedAt !== undefined || other.lifecycle !== 'active' || !GROUPABLE_KINDS.has(other.kind)) continue
     const title = attributeValue(other, 'title')
     similar.push({
       id: other.id,
@@ -482,7 +484,7 @@ function attributeOverlap(left: Entity, right: Entity): boolean {
  * 返回是否真的合并了一个 duplicate。
  */
 async function dedupeEntity(deps: ConsolidationDeps, entity: Entity, snippet = ''): Promise<boolean> {
-  if (entity.kind !== 'memory' || entity.pinned || entity.archivedAt !== undefined) return false
+  if (entity.kind !== 'memory' || entity.pinned || entity.archivedAt !== undefined || entity.lifecycle !== 'active') return false
   const text = combinedText(entity, snippet)
   const tokens = tokenize(text, 32)
   if (tokens.length < 3) return false
@@ -506,7 +508,7 @@ async function dedupeEntity(deps: ConsolidationDeps, entity: Entity, snippet = '
   for (const { hit, vector } of candidates.values()) {
     if (hit.entityId === entity.id) continue
     const other = await deps.store.get(hit.entityId)
-    if (other === undefined || other.archivedAt !== undefined) continue
+    if (other === undefined || other.archivedAt !== undefined || other.lifecycle !== 'active') continue
     const otherText = combinedText(other)
     const textSimilar = jaccard(tokens, tokenize(otherText, 32)) >= 0.82
     if (!textSimilar && !vector && !attributeOverlap(entity, other)) continue
@@ -572,7 +574,7 @@ function conflictingAttributes(left: Entity, right: Entity): boolean {
 
 /** 单实体冲突检测（事件驱动入口）：只和该实体的全文近邻比较，不扫最近 30 条。 */
 async function conflictForEntity(deps: ConsolidationDeps, entity: Entity): Promise<number> {
-  if (entity.kind !== 'memory') return 0
+  if (entity.kind !== 'memory' || entity.lifecycle !== 'active') return 0
   const title = attributeValue(entity, 'title')
   const text = typeof title === 'string' && title.trim().length > 0 ? title : combinedText(entity)
   if (text.trim().length === 0) return 0
@@ -582,7 +584,7 @@ async function conflictForEntity(deps: ConsolidationDeps, entity: Entity): Promi
     if (hit.entityId === entity.id) continue
     if (await deps.queries.conflictSuppressed(entity.id, hit.entityId)) continue
     const other = await deps.store.get(hit.entityId)
-    if (other === undefined) continue
+    if (other === undefined || other.lifecycle !== 'active') continue
     if (!conflictingAttributes(entity, other)) continue
     const result = await deps.store.link({
       fromId: entity.id,
@@ -627,7 +629,7 @@ export async function handleConflictFor(deps: ConsolidationDeps, entityId: strin
  * - 旧 `evidence: ['session:a','session:b']` 属性不再作为晋升依据（没有系统写入者）。
  */
 async function promoteClueEntity(deps: ConsolidationDeps, entity: Entity): Promise<boolean> {
-  if (entity.kind !== 'memory' || entity.archivedAt !== undefined) return false
+  if (entity.kind !== 'memory' || entity.archivedAt !== undefined || entity.lifecycle !== 'active') return false
   if (attributeValue(entity, 'category') !== 'clue') return false
   await handleReferenceRotForSource(deps, entity.id)
   const read = await deps.queries.evidenceFor(entity.id)
@@ -831,7 +833,7 @@ export async function handleEmbedSweep(deps: ConsolidationDeps, limit = 20): Pro
   for (const id of ids) {
     try {
       const entity = await deps.store.get(id, { includeArchived: true })
-      if (entity === undefined) continue
+      if (entity === undefined || entity.lifecycle !== 'active') continue
       const text = deriveSearchText(entity.attributes)
       if (text.trim().length === 0) continue
       const vectors = await deps.embedder.embed([text])

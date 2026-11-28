@@ -2,7 +2,7 @@ import { validationError } from '../../domain/validation-result.js'
 import { OmbFailure, err, invalid, notFound, ok, type OmbError } from '../../domain/errors.js'
 import { isPlainObject } from '../../domain/json.js'
 import type { Store } from '../../ports/store.js'
-import { normalizeWrite } from '../../domain/validation.js'
+import { normalizeWrite, type NormalizedWrite } from '../../domain/validation.js'
 import {
   duplicateCommandIdOf,
   validateCommandMeta,
@@ -87,6 +87,49 @@ export class DefaultCommandBus implements CommandBus {
         return { type: 'ArchiveEntity', id: requireId(command.id, 'id'), reason: command.reason }
       case 'UnarchiveEntity':
         return { type: 'UnarchiveEntity', id: requireId(command.id, 'id'), reason: command.reason }
+      case 'Supersede': {
+        const oldId = requireId(command.oldId, 'oldId')
+        const newId = requireId(command.newId, 'newId')
+        if (oldId === newId) throw new OmbFailure(invalid('不能把实体取代为它自己'))
+        const reason = command.reason.trim()
+        if (reason.length === 0) throw new OmbFailure(invalid('supersede 必须给出 reason'))
+        const effectiveAt = normalizeEffectiveAt(command.effectiveAt)
+        let create: NormalizedWrite | undefined
+        if (command.create !== undefined) {
+          if (command.create.id !== undefined && command.create.id !== newId) {
+            throw new OmbFailure(invalid('create.id 必须等于 newId'))
+          }
+          const normalized = normalizeWrite({ ...command.create, id: newId })
+          if (!normalized.ok) throw new OmbFailure(validationError(normalized.errors))
+          create = normalized.value
+        }
+        return {
+          type: 'Supersede',
+          oldId,
+          newId,
+          reason,
+          ...(effectiveAt === undefined ? {} : { effectiveAt }),
+          ...(create === undefined ? {} : { create }),
+          ...((command.expectedRevision ?? meta.expectedRevision) === undefined
+            ? {}
+            : { expectedRevision: command.expectedRevision ?? meta.expectedRevision }),
+        }
+      }
+      case 'RetractEntity': {
+        const id = requireId(command.id, 'id')
+        const reason = command.reason.trim()
+        if (reason.length === 0) throw new OmbFailure(invalid('retract 必须给出 reason'))
+        const effectiveAt = normalizeEffectiveAt(command.effectiveAt)
+        return {
+          type: 'RetractEntity',
+          id,
+          reason,
+          ...(effectiveAt === undefined ? {} : { effectiveAt }),
+          ...((command.expectedRevision ?? meta.expectedRevision) === undefined
+            ? {}
+            : { expectedRevision: command.expectedRevision ?? meta.expectedRevision }),
+        }
+      }
       case 'Link':
         return { type: 'Link', input: command.input }
       case 'Unlink':
@@ -116,6 +159,13 @@ function requireId(value: string, field: string): string {
   return value
 }
 
+/** 生效时间：合法 ISO 时刻归一成 UTC；缺省由 writer 用事务墙钟，不能自己造一个未来时间。 */
+function normalizeEffectiveAt(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const parsed = Date.parse(value)
+  if (!Number.isFinite(parsed)) throw new OmbFailure(invalid('effectiveAt 必须是合法 ISO 8601 时间'))
+  return new Date(parsed).toISOString()
+}
 type CommandError = OmbError & { readonly currentRevision?: number }
 
 function toCommandError(error: OmbError): CommandError {

@@ -46,7 +46,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       `select distinct a.entity_id
        from omb.attribute a
        join omb.entity e on e.id = a.entity_id
-       where a.value_kind = 'dynamic' and e.archived_at is null
+       where a.value_kind = 'dynamic' and e.archived_at is null and e.lifecycle = 'active'
          and (a.cached_at is null
               or a.last_error is not null
               or a.cached_at + (coalesce(a.stale_after_ms, 300000) * interval '1 millisecond') <= now())
@@ -66,7 +66,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       `select v.entity_id
        from omb.entity_view v
        left join omb.embedding e on e.entity_id = v.entity_id
-       where v.archived_at is null and v.is_current and e.entity_id is null
+       where v.archived_at is null and v.is_current and v.lifecycle = 'active' and e.entity_id is null
        order by v.updated_at desc
        limit $1`,
       [Math.max(1, Math.min(200, limit))],
@@ -80,7 +80,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
               e.origin, e.confidence, e.pinned, e.salience, e.adoption_count, e.access_count, v.updated_at
        from omb.entity_view v
        join omb.entity e on e.id = v.entity_id
-       where v.archived_at is null and v.is_current
+       where v.archived_at is null and v.is_current and v.lifecycle = 'active'
        order by v.updated_at desc
        limit $1`,
       [Math.max(1, Math.min(200, limit))],
@@ -109,8 +109,8 @@ export class PostgresMaintenance implements MaintenanceQueries {
        from omb.recall_event a
        join omb.recall_event b
          on a.trace_id = b.trace_id and a.entity_id < b.entity_id
-       join omb.entity_view av on av.entity_id = a.entity_id and av.archived_at is null and av.is_current
-       join omb.entity_view bv on bv.entity_id = b.entity_id and bv.archived_at is null and bv.is_current
+       join omb.entity_view av on av.entity_id = a.entity_id and av.archived_at is null and av.is_current and av.lifecycle = 'active'
+       join omb.entity_view bv on bv.entity_id = b.entity_id and bv.archived_at is null and bv.is_current and bv.lifecycle = 'active'
        where a.adopted_at is not null and b.adopted_at is not null
          and av.kind in ('memory', 'state', 'state_version')
          and bv.kind in ('memory', 'state', 'state_version')
@@ -138,6 +138,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       //   “从没被验证”额外惩罚）；
       // - refutation 是负向证据：0.10 * (1 + utility - refutationRate)，最低 0。
       // - 因此 access_count 单独变化不会提高显著度或降低遗忘概率；只有证据会。
+      // - 只遗忘当前有效的条目：superseded/retracted 是历史证据，不能因为“久未使用”被删掉。
       `with evidence as (
          select v.entity_id, v.category, v.kind, e.confidence, e.pinned, v.updated_at,
                 e.revision,
@@ -154,7 +155,8 @@ export class PostgresMaintenance implements MaintenanceQueries {
            from omb.entity_view v
            join omb.entity e on e.id = v.entity_id
            left join omb.adoption_metric m on m.entity_id = v.entity_id
-          where v.kind = 'memory' and v.archived_at is null and v.is_current and e.pinned = false
+          where v.kind = 'memory' and v.archived_at is null and v.is_current
+            and v.lifecycle = 'active' and e.pinned = false
             and not (v.attrs @> '{"tags":["偏好"]}'::jsonb)
             and coalesce(v.attrs->>'标签', '') <> '偏好'
        ), scored as (
