@@ -393,6 +393,24 @@ describe('审计 actor/source 与越权收紧（真实 PostgreSQL + 工具运行
       source: 'tool:omb_link',
     })
 
+    // 同一工具的 supersedes 生命周期操作也必须记录真实来源（tool:omb_link），
+    // 不能因为内部走 omb_admin 的共用实现就张冠李戴。
+    const oldFact = await rememberProject('session-a', '旧结论')
+    const newFact = await rememberProject('session-a', '新结论')
+    const superseded = await okText('omb_link', {
+      from: newFact,
+      to: oldFact,
+      relation: 'supersedes',
+      reason: '结论更新',
+    }, 'session-a')
+    expect(superseded).toContain('取代')
+    const supersedeAudits = await auditRowsWhere('supersede')
+    expect(supersedeAudits[0]).toMatchObject({
+      actor: 'assistant:session-a',
+      actor_kind: 'assistant',
+      source: 'tool:omb_link',
+    })
+
     expect((await call('omb_history', { id: left }, 'session-b')).ok).toBe(false)
     expect((await call('omb_link', { from: left, to: right, relation: 'related_to' }, 'session-b')).ok).toBe(false)
 

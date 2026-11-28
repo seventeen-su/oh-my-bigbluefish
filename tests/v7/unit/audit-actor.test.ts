@@ -133,8 +133,9 @@ describe('租户作用域与回滚权限', () => {
       .toMatchObject({ allowed: false, reason: 'unverifiable-target' })
     const foreign = entityAccessDecision(TENANT_B, [owned])
     expect(foreign.allowed).toBe(false)
-    expect(rollbackAccessDecision({ facts: FACTS, targets: [owned], tenant: TENANT_B }))
-      .toMatchObject({ allowed: false, reason: 'cross-project' })
+    const foreignRollback = rollbackAccessDecision({ facts: FACTS, targets: [owned], tenant: TENANT_B })
+    expect(foreignRollback).toMatchObject({ allowed: false, reason: 'cross-project' })
+    expect(foreignRollback.allowed ? '' : foreignRollback.message).not.toContain('mem_')
     // 缺 tenant 时项目实体 fail-closed；global 仍允许（共享语义）。
     expect(rollbackAccessDecision({ facts: FACTS, targets: [owned], tenant: undefined }))
       .toMatchObject({ allowed: false, reason: 'unknown-tenant' })

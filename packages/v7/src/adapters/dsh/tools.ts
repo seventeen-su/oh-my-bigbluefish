@@ -127,8 +127,13 @@ export interface ToolRuntime {
   /**
    * 生命周期操作不带 actor/source：身份由工具运行时从宿主上下文派生。
    * 工具定义层只提交业务字段，防止模型用 `actor` 参数伪造审计身份。
+   * `operation` 只用于审计 source（`omb_link` 的 supersedes 关系 vs `omb_admin`）。
    */
-  supersede(input: Omit<SupersedeInput, 'actor' | 'source'>, context: ToolContext): Promise<Result<string>>
+  supersede(
+    input: Omit<SupersedeInput, 'actor' | 'source'>,
+    context: ToolContext,
+    operation?: 'omb_link' | 'omb_admin',
+  ): Promise<Result<string>>
   retract(input: Omit<RetractInput, 'actor' | 'source'>, context: ToolContext): Promise<Result<string>>
   history(id: string, limit: number, context: ToolContext): Promise<Result<string>>
   status(): Promise<Result<string>>
@@ -384,7 +389,7 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
           newId: parsed.data.from as string,
           reason: parsed.data.reason ?? 'superseded',
           ...(parsed.data.effectiveAt !== undefined ? { effectiveAt: parsed.data.effectiveAt } : {}),
-        }, context))
+        }, context, 'omb_link'))
       }
       const input: LinkInput = {
         fromId: parsed.data.from as string,

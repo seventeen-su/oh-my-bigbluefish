@@ -372,11 +372,12 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
     async supersede(
       input: Omit<SupersedeInput, 'actor' | 'source'>,
       context: ToolContext,
+      operation: 'omb_link' | 'omb_admin' = 'omb_admin',
     ): Promise<Result<string>> {
       const unavailable = await requireReady()
       if (unavailable !== undefined) return unavailable
       try {
-        const principal = principalOf(context, 'omb_admin')
+        const principal = principalOf(context, operation)
         const ids = input.create === undefined ? [input.oldId, input.newId] : [input.oldId]
         const access = deniedOf(await requireEntityAccess(store, principal, 'supersede', ids))
         if (access.denied !== undefined) return err(access.denied)

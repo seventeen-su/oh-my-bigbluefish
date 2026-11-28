@@ -242,7 +242,14 @@ export function rollbackAccessDecision(input: {
   }
   const scoped = new Map(input.targets.map(target => [target.id, target.scope]))
   const facts: EntityScopeFact[] = input.facts.targetIds.map(id => ({ id, scope: scoped.get(id) }))
-  return entityAccessDecision(input.tenant, facts)
+  const decision = entityAccessDecision(input.tenant, facts)
+  if (decision.allowed) return decision
+  // 回滚目标是审计行内部数据：错误文本不回传具体 target id，避免拿任意 auditId
+  // 探测其他项目实体是否存在；details.targetIds 仍保留给服务端排查。
+  return {
+    ...decision,
+    message: '越权回滚被拒绝：审计目标不在当前项目作用域内或无法验证归属',
+  }
 }
 
 /** 审计里用于回溯授权的来源前缀；工具来源必须是 `tool:*`，后台是 `job:*`/`system:*`。 */
