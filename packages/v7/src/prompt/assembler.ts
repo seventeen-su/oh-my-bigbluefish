@@ -80,6 +80,36 @@ export interface BlockReceipt {
   readonly reason?: 'duplicate' | 'budget' | 'empty'
 }
 
+/**
+ * 逐实体注入证据的状态：
+ * - `kept`：实体内容真的进入了本次注入文本（块 kept 且未被隔离）；
+ * - `quarantined`：只注入了隔离说明，实体原文没有进入提示词。
+ *
+ * 被预算丢弃/截断到不可见、或块整体被丢弃的实体不产生条目——未展示就不记。
+ */
+export type EntityReceiptState = 'kept' | 'quarantined'
+
+/**
+ * 一次注入里**一个实体**的展示证据（逐实体 receipt）。
+ *
+ * 块级 receipt 只说明「这一段进没进」；T0 的偏好/状态段会把多个实体塞进一个块，
+ * 所以块级 `kept` 无法回答「这个实体到底有没有被展示」。由 recall 层在装配后填充
+ * （`withEntityReceipts`），装配器本身不产出；adoption/审计只以这里的 `state` 为准。
+ */
+export interface EntityReceipt {
+  /** 与所属注入 trace 相同，便于按 trace 对账。 */
+  readonly traceId: string
+  readonly entityId: string
+  /** 内容段名：T0 为 preferences/states/index，T1 为 event-recall。 */
+  readonly section: string
+  readonly state: EntityReceiptState
+  /** 承载该实体的块 id：T0 为 `resident:<name>[:n]`，T1 就是实体 id。 */
+  readonly blockId: string
+  /** 实体标题；仅 `kept` 记录（隔离时原文与标题都没进提示词）。 */
+  readonly title?: string
+  readonly updatedAt?: string
+}
+
 export interface InjectionReceipt {
   readonly receiptId: string
   readonly traceId?: string
@@ -94,6 +124,11 @@ export interface InjectionReceipt {
   readonly truncatedIds: readonly string[]
   readonly quarantinedIds: readonly string[]
   readonly demotedIds: readonly string[]
+  /**
+   * 逐实体证据（可选字段：旧 receipt 没有）。T0/T1 装配后由 recall 层写入，
+   * 每个实际展示或隔离的实体一条；未展示的实体不出现。
+   */
+  readonly entities?: readonly EntityReceipt[]
 }
 
 export interface AssembledPrompt {

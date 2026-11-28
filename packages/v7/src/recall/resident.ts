@@ -1,11 +1,17 @@
 import { newId } from '../domain/ids.js'
 import type { StateStatus } from '../domain/entity.js'
 import { estimateTokens } from '../domain/text.js'
-import { CONTEXT_HEADER, createPromptAssembler, type InjectionReceipt } from '../prompt/assembler.js'
-import { dataBlock } from '../prompt/blocks.js'
+import {
+  CONTEXT_HEADER,
+  createPromptAssembler,
+  type EntityReceipt,
+  type InjectionReceipt,
+} from '../prompt/assembler.js'
+import { dataBlock, type ContextBlock } from '../prompt/blocks.js'
 import type { RecallEngine } from '../retrieval/engine.js'
 import type { RecallHit, RecallResult, RecallScenario } from '../retrieval/types.js'
 import type { RuntimeContext } from '../ports/context.js'
+import { keptEntityIds, withEntityReceipts } from './receipts.js'
 import type {
   EntitySummary,
 } from '../ports/search.js'
@@ -138,11 +144,15 @@ export interface ResidentBuild {
 interface ResidentCandidate {
   readonly name: string
   readonly text: string
-  readonly entityIds: readonly string[]
+  /** 本段里实际被展示的实体；逐实体 receipt 与采用判定都从这里派生。 */
+  readonly entities: readonly ResidentHit[]
   readonly source?: ResidentSectionSource
   readonly fallbackReason?: string
-  /** 本条候选里可登记为注入命中的条目（偏好/状态）。 */
-  readonly hits?: readonly ResidentHit[]
+}
+
+/** 候选段里的实体 id 列表；块 refs/段 trace 仍用 id 数组（兼容旧读取方）。 */
+function candidateEntityIds(candidate: ResidentCandidate): readonly string[] {
+  return candidate.entities.map(entity => entity.id)
 }
 
 interface BoardsReadOutcome {
@@ -234,33 +244,46 @@ function compactHit(hit: RecallHit): string {
   return `${label.length > 0 ? `[${label}] ` : ''}${head}（${hit.entityId}）`
 }
 
+/** 一个会被展示的实体（id + 可辨识标题/更新时间）；逐实体 receipt 的最小来源。 */
+function residentEntity(id: string, title?: string, updatedAt?: string): ResidentHit {
+  const trimmed = title?.trim()
+  return {
+    id,
+    ...(trimmed !== undefined && trimmed.length > 0 ? { title: trimmed } : {}),
+    ...(updatedAt === undefined ? {} : { updatedAt }),
+  }
+}
+
 function compactSummaries(items: readonly EntitySummary[], prefix: string, max: number): ResidentCandidate | undefined {
   if (items.length === 0) return undefined
   const kept = items.slice(0, max)
   return {
     name: 'preferences',
     text: `${prefix}${kept.map(item => `${item.title ?? item.snippet}（${item.id}）`).join('；')}`,
-    entityIds: kept.map(item => item.id),
+    entities: kept.map(item => residentEntity(item.id, item.title, item.updatedAt)),
   }
 }
 
 function compactHits(result: RecallResult | undefined, prefix: string, max: number): ResidentCandidate | undefined {
   if (result === undefined || result.hits.length === 0) return undefined
-  const kept: { readonly text: string; readonly id: string }[] = []
+  const kept: { readonly text: string; readonly hit: ResidentHit }[] = []
   const seen = new Set<string>()
   for (const hit of result.hits) {
     if (seen.has(hit.entityId)) continue
     const text = compactHit(hit)
     if (text.length === 0) continue
     seen.add(hit.entityId)
-    kept.push({ text, id: hit.entityId })
+    kept.push({
+      text,
+      hit: residentEntity(hit.entityId, hit.title, hit.updatedAt),
+    })
     if (kept.length >= max) break
   }
   if (kept.length === 0) return undefined
   return {
     name: 'states',
     text: `${prefix}${kept.map(item => item.text).join('；')}`,
-    entityIds: kept.map(item => item.id),
+    entities: kept.map(item => item.hit),
   }
 }
 
@@ -292,8 +315,7 @@ function compactBoardSummaries(
   return {
     name: 'preferences',
     text: `${prefix}${parts.join('；')}`,
-    entityIds: kept.map(hit => hit.id),
-    hits: kept,
+    entities: kept,
   }
 }
 
@@ -321,8 +343,7 @@ function compactBoardStates(
   return {
     name: 'states',
     text: `${prefix}${kept.map(item => item.text).join('；')}`,
-    entityIds: kept.map(item => item.id),
-    hits: kept.map(item => ({ id: item.id, ...(item.title !== undefined ? { title: item.title } : {}) })),
+    entities: kept.map(item => residentEntity(item.id, item.title)),
   }
 }
 
@@ -411,34 +432,34 @@ function indexCandidates(index: StoreStats | undefined): ResidentCandidate[] {
   const candidates: ResidentCandidate[] = [{
     name: 'index',
     text: `库索引：memory ${index.memory}、state ${index.state}、chain ${index.chain}、archived ${index.archived}`,
-    entityIds: [],
+    entities: [],
   }]
   if (index.categories !== undefined) {
     candidates.push({
       name: 'index',
       text: `分类：fact ${index.categories.fact}、clue ${index.categories.clue}、event ${index.categories.event}`,
-      entityIds: [],
+      entities: [],
     })
   }
   if (index.scopes !== undefined) {
     candidates.push({
       name: 'index',
       text: `作用域：global ${index.scopes.global}、project ${index.scopes.project}`,
-      entityIds: [],
+      entities: [],
     })
   }
   if (index.recentStates !== undefined && index.recentStates.length > 0) {
     candidates.push({
       name: 'index',
       text: `最近状态：${index.recentStates.map(item => `${item.title ?? item.id}(${item.status})`).join('；')}`,
-      entityIds: index.recentStates.map(item => item.id),
+      entities: index.recentStates.map(item => residentEntity(item.id, item.title)),
     })
   }
   if (index.attrNames.length > 0) {
     candidates.push({
       name: 'index',
       text: `常用属性：${index.attrNames.slice(0, 8).join('、')}`,
-      entityIds: [],
+      entities: [],
     })
   }
   return candidates
@@ -450,10 +471,46 @@ function toTraceSection(candidate: ResidentCandidate, kept: boolean, tokens: num
     tokens,
     kept,
     text: candidate.text,
-    entityIds: candidate.entityIds,
+    entityIds: candidateEntityIds(candidate),
     ...(candidate.source === undefined ? {} : { source: candidate.source }),
     ...(candidate.fallbackReason === undefined ? {} : { fallbackReason: candidate.fallbackReason }),
   }
+}
+
+/**
+ * T0 逐实体 receipt：块 kept 且未被隔离 → `kept`；块 kept 但被隔离 → `quarantined`。
+ *
+ * 被预算丢弃的段（`kept:false`）、没有实体的索引行/工具提示、以及被隔离块的原文
+ * 都不产生 `kept` 条目；未实际展示的实体不记。同一实体在一次注入里由
+ * `withEntityReceipts` 再去重（kept 优先）。
+ */
+function residentEntityReceipts(
+  traceId: string,
+  candidates: readonly ResidentCandidate[],
+  blocks: readonly ContextBlock[],
+  receipt: InjectionReceipt,
+): EntityReceipt[] {
+  const receiptById = new Map(receipt.blocks.map(item => [item.id, item]))
+  const items: EntityReceipt[] = []
+  candidates.forEach((candidate, index) => {
+    const block = blocks[index]
+    if (block === undefined) return
+    const blockReceipt = receiptById.get(block.id)
+    if (blockReceipt === undefined || !blockReceipt.kept) return
+    const state: EntityReceipt['state'] = blockReceipt.quarantined ? 'quarantined' : 'kept'
+    for (const entity of candidate.entities) {
+      items.push({
+        traceId,
+        entityId: entity.id,
+        section: candidate.name,
+        state,
+        blockId: block.id,
+        ...(state === 'kept' && entity.title !== undefined ? { title: entity.title } : {}),
+        ...(state === 'kept' && entity.updatedAt !== undefined ? { updatedAt: entity.updatedAt } : {}),
+      })
+    }
+  })
+  return items
 }
 
 /**
@@ -480,16 +537,13 @@ export async function buildResident(
   const toolHint: ResidentCandidate = {
     name: 'tool-hint',
     text: '需要细节用 omb_recall；长期结论用 omb_remember；状态更新用 omb_update。',
-    entityIds: [],
+    entities: [],
   }
 
   let candidates: ResidentCandidate[]
   let recalledStates: RecallResult | undefined
   let fallbackReason: string | undefined
   let usedBoards = false
-  let boardPreferenceHits: readonly ResidentHit[] = []
-  let boardStateHits: readonly ResidentHit[] = []
-  let fallbackPreferences: readonly EntitySummary[] | undefined
 
   const boardOutcome = boards === undefined
     ? undefined
@@ -523,8 +577,6 @@ export async function buildResident(
       '当前状态：',
       RESIDENT_STATE_LIMIT,
     )
-    boardPreferenceHits = preferenceCandidate?.hits ?? []
-    boardStateHits = stateCandidate?.hits ?? []
     // 读模型路径不查 stats：T0 的 SQL 预算就是两块看板各一条。
     candidates = [
       ...(preferenceCandidate === undefined ? [] : [{ ...preferenceCandidate, source: 'read-model' as const }]),
@@ -549,7 +601,6 @@ export async function buildResident(
       stats === undefined ? Promise.resolve(undefined) : stats().catch(() => undefined),
     ])
     recalledStates = states
-    fallbackPreferences = preferenceItems
     candidates = [
       ...(preferenceItems === undefined ? [] : [compactSummaries(preferenceItems, '偏好：', RESIDENT_PREFERENCE_LIMIT)]),
       compactHits(states, '当前状态：', RESIDENT_STATE_LIMIT),
@@ -573,15 +624,18 @@ export async function buildResident(
   const headerTokens = estimateTokens(headerText)
   // 候选段先变成 ContextBlock：trust/risk 由 security/trust 分类，装配器只负责
   // 预算/去重/隔离/转义。常驻层是“整段要么进、要么不进”，所以 truncateBlocks=false。
-  const blocks = candidates.map((candidate, index) => dataBlock({
-    id: residentBlockId(candidate, index),
-    text: candidate.text,
-    source: candidateSource(candidate),
-    origin: candidateOrigin(candidate),
-    entityIds: candidate.entityIds,
-    refs: candidate.entityIds,
-    scope: { kind: 'global' },
-  }))
+  const blocks = candidates.map((candidate, index) => {
+    const entityIds = candidateEntityIds(candidate)
+    return dataBlock({
+      id: residentBlockId(candidate, index),
+      text: candidate.text,
+      source: candidateSource(candidate),
+      origin: candidateOrigin(candidate),
+      entityIds,
+      refs: entityIds,
+      scope: { kind: 'global' },
+    })
+  })
   const assembled = promptAssembler.assemble(blocks, {
     budgetTokens,
     traceId,
@@ -591,10 +645,13 @@ export async function buildResident(
     truncateBlocks: false,
     maxBlockTokens: budgetTokens,
   })
-  const receipt = assembled.receipt
+  // 块级 receipt 之后补逐实体 receipt：同一段里有多个实体时，块级 kept 无法回答
+  // “这个实体到底有没有被展示”。未展示/被丢弃的实体不产生条目。
+  const entityReceipts = residentEntityReceipts(traceId, candidates, blocks, assembled.receipt)
+  const receipt = withEntityReceipts(assembled.receipt, entityReceipts)
   const receiptById = new Map(receipt.blocks.map(item => [item.id, item]))
   const sections: ResidentTraceSectionDetail[] = [toTraceSection(
-    { name: 'header', text: headerText, entityIds: [] },
+    { name: 'header', text: headerText, entities: [] },
     receipt.injected,
     headerTokens,
   )]
@@ -613,11 +670,9 @@ export async function buildResident(
     if (!kept) droppedSections.push(candidate.name)
   })
   // receipt 与 trace 同行落库（resident_trace.sections 是现有的注入证据通道）。
-  // 同时记录真正进入文本的实体 id，供逐实体对账；receipt 里的块 id 仍保留在 text。
-  const receiptEntityIds = [...new Set(candidates.flatMap((candidate, index) => {
-    const blockId = residentBlockId(candidate, index)
-    return keptBlockIds.has(blockId) ? candidate.entityIds : []
-  }))]
+  // 段级 entityIds 只列真正进入文本的实体；被隔离的实体在 receipt.entities 里标
+  // quarantined，adoption 不会把它们当成已展示。
+  const receiptEntityIds = keptEntityIds(receipt)
   sections.push({
     name: 'injection-receipt',
     tokens: receipt.usedTokens,
@@ -638,16 +693,15 @@ export async function buildResident(
   // 没有 engine trace，由 plugin 用 build 结果里的 stateHits 写 recall_event。
   if (recalledStates !== undefined && blockVisible(stateBlockId)) notify(recalledStates, onRecall)
 
-  const preferenceHits = blockVisible(preferenceBlockId)
-    ? usedBoards
-      ? boardPreferenceHits
-      : (fallbackPreferences ?? []).slice(0, RESIDENT_PREFERENCE_LIMIT).map(item => ({
-          id: item.id,
-          ...(item.title !== undefined && item.title.length > 0 ? { title: item.title } : {}),
-          ...(item.updatedAt === undefined ? {} : { updatedAt: item.updatedAt }),
-        }))
+  // 命中列表与逐实体 receipt 同源：段 kept 且未被隔离时，段里的实体都真的在文本里。
+  const preferenceCandidate = preferenceBlock < 0 ? undefined : candidates[preferenceBlock]
+  const stateCandidate = stateBlock < 0 ? undefined : candidates[stateBlock]
+  const preferenceHits = blockVisible(preferenceBlockId) && preferenceCandidate !== undefined
+    ? preferenceCandidate.entities
     : []
-  const stateHits = usedBoards && blockVisible(stateBlockId) ? boardStateHits : []
+  const stateHits = usedBoards && blockVisible(stateBlockId) && stateCandidate !== undefined
+    ? stateCandidate.entities
+    : []
 
   return {
     text: assembled.text,
@@ -683,6 +737,8 @@ export async function buildResidentText(
 const EVENT_RECALL_HEADER = '[OMB 事件召回]'
 const EVENT_RECALL_PREFIX = '相关：'
 const EVENT_RECALL_MAX_HITS = 3
+/** T1 逐实体 receipt 的 section 名；T0 用 preferences/states/index。 */
+export const EVENT_RECALL_SECTION = 'event-recall'
 
 /**
  * T1 事件驱动层：把每条召回命中变成 ContextBlock，再经 PromptAssembler 装配。
@@ -690,7 +746,8 @@ const EVENT_RECALL_MAX_HITS = 3
  * 对外格式保持既有可见头与单行正文：`[OMB 事件召回]`、`[OMB 记忆上下文…]`、
  * `相关：…`；预算、按 entityId 去重、header-only 不注入（RET-15）都由装配器保证。
  * 区别是：高风险命中只留隔离说明、adoption 只认 receipt 里 kept、未被隔离且最终
- * 文本仍能看到 entityId 的命中（未被预算截掉的才登记）。
+ * 文本仍能看到 entityId 的命中（未被预算截掉的才登记）。receipt 同时带逐实体
+ * `entities`（kept/quarantined），与 T0 共用同一份读取契约。
  */
 export async function buildEventRecallText(
   engine: RecallEngine,
@@ -736,7 +793,12 @@ export async function buildEventRecallText(
   })
   const text = assembled.text
   if (text.length === 0) return ''
-  const { receipt } = assembled
+  // T1 的每个块就是一个实体；逐实体证据与 T0 共用同一份 receipt 形状，
+  // adoption 不再需要特判“T1 块 id 恰好是实体 id”。
+  const receipt = withEntityReceipts(
+    assembled.receipt,
+    eventRecallEntityReceipts(result.traceId, compacted, assembled.receipt, text),
+  )
   const kept = new Set(receipt.keptIds)
   const quarantined = new Set(receipt.quarantinedIds)
   // 空字符串代表本次不注入；只登记最终文本里仍可见的命中，避免预算截断/隔离后
@@ -746,6 +808,48 @@ export async function buildEventRecallText(
     .filter(hit => kept.has(hit.entityId) && !quarantined.has(hit.entityId) && text.includes(hit.entityId))
   notifyHits(result.traceId, visible, onRecall, receipt, text)
   return text
+}
+
+/**
+ * T1 逐实体 receipt：块 id 就是实体 id，`kept` 且文本里仍能看到 id 才算展示。
+ *
+ * 被隔离的块只注入了隔离说明，记 `quarantined`（原文没有进入提示词）；被预算丢弃
+ * 或截断到看不到实体 id 的命中不记——与 visible/notify 的口径一致。
+ */
+function eventRecallEntityReceipts(
+  traceId: string,
+  compacted: readonly CompactedEventRecallHit[],
+  receipt: InjectionReceipt,
+  text: string,
+): EntityReceipt[] {
+  const receiptById = new Map(receipt.blocks.map(item => [item.id, item]))
+  const items: EntityReceipt[] = []
+  for (const entry of compacted) {
+    const blockReceipt = receiptById.get(entry.hit.entityId)
+    if (blockReceipt === undefined || !blockReceipt.kept) continue
+    if (blockReceipt.quarantined) {
+      items.push({
+        traceId,
+        entityId: entry.hit.entityId,
+        section: EVENT_RECALL_SECTION,
+        state: 'quarantined',
+        blockId: entry.hit.entityId,
+      })
+      continue
+    }
+    if (!text.includes(entry.hit.entityId)) continue
+    const title = entry.hit.title?.trim()
+    items.push({
+      traceId,
+      entityId: entry.hit.entityId,
+      section: EVENT_RECALL_SECTION,
+      state: 'kept',
+      blockId: entry.hit.entityId,
+      ...(title !== undefined && title.length > 0 ? { title } : {}),
+      ...(entry.hit.updatedAt === undefined ? {} : { updatedAt: entry.hit.updatedAt }),
+    })
+  }
+  return items
 }
 
 interface CompactedEventRecallHit {
