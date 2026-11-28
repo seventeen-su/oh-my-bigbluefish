@@ -41,8 +41,10 @@ import {
  */
 const DATABASE_URL = process.env.OMB_SHADOW_TEST_DATABASE_URL
   ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_test_shadow'
+// 每次运行用全新可抛弃库：迁移 checksum 是“文件变了就拒绝”，复用旧库会把
+// 正常迁移演进误报成失败；这里让 E2E 真正拥有自己的库，而不是依赖上一次残留。
 const E2E_DATABASE_URL = process.env.OMB_SHADOW_E2E_DATABASE_URL
-  ?? 'postgres://omb:omb@127.0.0.1:5432/omb_v7_test_shadow_e2e'
+  ?? `postgres://omb:omb@127.0.0.1:5432/omb_v7_test_shadow_e2e_${randomUUID().replaceAll('-', '').slice(0, 12)}`
 const PROJECT_KEY = DEFAULT_SHADOW_PROJECT_KEY
 
 // 两个库名都含 test 段（可抛弃）；显式声明破坏性用途，生产库名即使有 flag 也会被拒。
