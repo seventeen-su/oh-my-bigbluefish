@@ -53,7 +53,7 @@ describe('召回事件写入与 co-recall 归因（RET-08 / RET-14，真实 Post
     return written.entity.id
   }
 
-  it('给定同一 trace 多通道多实体当写 recall_event 则逐行保留通道，Retrieved 只按 (trace, entity) 计一次', async () => {
+  it('给定同一 trace 多通道多实体当写 recall_event 则逐行保留通道，但不直接写 adoption', async () => {
     const a = await writeMemory('co-recall 甲')
     const b = await writeMemory('co-recall 乙')
     const channels = ['fulltext', 'vector', 'state_board']
@@ -79,16 +79,11 @@ describe('召回事件写入与 co-recall 归因（RET-08 / RET-14，真实 Post
          from omb.recall_event where trace_id = 'trc_batch_1' order by entity_id, channel`,
     )
     expect(rows.rows).toHaveLength(6)
-    expect(rows.rows.every(row => row.injected && row.injected_at !== null && row.retrieved_counted)).toBe(true)
+    expect(rows.rows.every(row => row.injected && row.injected_at !== null)).toBe(true)
 
-    const metric = await db.db.query<{ entity_id: string; retrieved_count: string }>(
-      'select entity_id, retrieved_count::text from omb.adoption_metric',
-    )
-    const retrievedById = new Map(metric.rows.map(row => [row.entity_id, row.retrieved_count]))
-    // 两条实体 × 3 通道 = 6 行，但 Retrieved 每个实体只 +1；批量写不得放大采用计数。
-    expect(metric.rows).toHaveLength(2)
-    expect(retrievedById.get(a)).toBe('1')
-    expect(retrievedById.get(b)).toBe('1')
+    // 只写事件审计；adoption 只能由注入 receipt（019）派生，不能由 recall_event 伪造。
+    const metric = await db.db.query<{ entity_id: string }>('select entity_id from omb.adoption_metric')
+    expect(metric.rows).toHaveLength(0)
   })
 
   it('给定两条 trace 且每条都多通道当 coRecallPairs 则按 trace 去重，不按通道行放大', async () => {
@@ -173,3 +168,4 @@ describe('召回事件写入与 co-recall 归因（RET-08 / RET-14，真实 Post
     expect(alive.rows[0]?.ok).toBe(1)
   })
 })
+
