@@ -30,6 +30,8 @@ export interface Forgettable {
   readonly category?: Category
   readonly pinned: boolean
   readonly updatedAt: string
+  /** 选择时的 revision：归档必须用它做 CAS，不能把之后的新状态归档。 */
+  readonly revision: number
 }
 
 export interface AttrAliasCandidate {

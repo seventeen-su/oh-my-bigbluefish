@@ -2,7 +2,8 @@ import { z } from 'zod'
 import type { LinkInput } from '../../domain/link.js'
 import type { PatchEntityInput, WriteEntityInput } from '../../domain/entity.js'
 import type { RawAttributeValue } from '../../domain/dynamic-spec.js'
-import type { Result } from '../../domain/errors.js'
+import type { OmbError, Result } from '../../domain/errors.js'
+import { isPlainObject } from '../../domain/json.js'
 import { MAX_TITLE } from '../../domain/validation.js'
 import type { Logger } from '../../ports/jobs.js'
 import type { HostContextLike, HostToolDefinition, HostToolsLike, ToolContext } from './host.js'
@@ -128,8 +129,58 @@ function toolParameters(schema: z.ZodType): object {
   return copy
 }
 
+/**
+ * 工具错误体的可读文本。冲突必须带完整差异（两侧 revision、当前状态/标题、冲突字段、
+ * actor/source），否则调用方只能看到“版本已变化”却不知道谁改了什么；细节有长度上限，
+ * 不会把大对象回灌模型。其他错误保持 `code: message`。
+ */
+function formatError(error: OmbError): string {
+  const head = `${error.code}: ${error.message}`
+  if (error.code !== 'conflict' || !isPlainObject(error.details)) return head
+  const details = error.details
+  const scalar = (key: string): string | undefined => {
+    const value = details[key]
+    return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+      ? String(value)
+      : undefined
+  }
+  const lines = [head]
+  const expected = scalar('expectedRevision')
+  const current = scalar('currentRevision')
+  if (expected !== undefined || current !== undefined) {
+    lines.push(`expectedRevision=${expected ?? '?'} currentRevision=${current ?? '?'}`)
+  }
+  for (const [key, label] of [
+    ['currentStatus', 'currentStatus'],
+    ['currentTitle', 'currentTitle'],
+    ['currentTime', 'currentTime'],
+    ['source', 'source'],
+  ] as const) {
+    const value = scalar(key)
+    if (value !== undefined) lines.push(`${label}=${value}`)
+  }
+  const actor = isPlainObject(details['actor']) ? details['actor'] : undefined
+  if (actor !== undefined) lines.push(`actor=${String(actor['id'] ?? '?')}(${String(actor['kind'] ?? '?')})`)
+  const fields = details['conflictingFields']
+  const total = scalar('conflictingFieldCount')
+  if (total !== undefined) lines.push(`conflictingFieldCount=${total}`)
+  if (Array.isArray(fields) && fields.length > 0) {
+    const clip = (value: unknown): string => {
+      const text = JSON.stringify(value) ?? 'null'
+      return text.length <= 120 ? text : `${text.slice(0, 120)}…`
+    }
+    const rendered = fields.slice(0, 10).map(item => {
+      if (!isPlainObject(item)) return ''
+      return `${String(item['field'])}: incoming=${clip(item['incoming'])} current=${clip(item['current'])}`
+    }).filter(part => part.length > 0)
+    if (rendered.length > 0) lines.push(`conflictingFields=${rendered.join('; ')}`)
+  }
+  const text = lines.join('\n')
+  return text.length <= MAX_ERROR_CHARS * 2 ? text : `${text.slice(0, MAX_ERROR_CHARS * 2)}…`
+}
+
 function resultOf(result: Result<string>): { ok: boolean; text: string } {
-  return result.ok ? { ok: true, text: result.value } : { ok: false, text: `${result.error.code}: ${result.error.message}` }
+  return result.ok ? { ok: true, text: result.value } : { ok: false, text: formatError(result.error) }
 }
 
 interface ArrayLimit {

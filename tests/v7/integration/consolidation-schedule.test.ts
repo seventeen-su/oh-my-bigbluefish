@@ -758,7 +758,8 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
 
 describe('巩固调度源码（静态）', () => {
   it('给定巩固调度实现当静态检查则没有 setInterval，也没有旧 loop 入口', async () => {
-    const jobsSource = await readFile(new URL('../../../packages/v7/src/jobs/consolidate.ts', import.meta.url), 'utf8')
+    const handlersSource = await readFile(new URL('../../../packages/v7/src/jobs/consolidate.ts', import.meta.url), 'utf8')
+    const scheduleSource = await readFile(new URL('../../../packages/v7/src/jobs/schedule.ts', import.meta.url), 'utf8')
     const jobsIndex = await readFile(new URL('../../../packages/v7/src/jobs/index.ts', import.meta.url), 'utf8')
     const pluginSource = await readFile(new URL('../../../plugin/v7/index.ts', import.meta.url), 'utf8')
 
@@ -766,19 +767,24 @@ describe('巩固调度源码（静态）', () => {
     // check:ignore-next-line test-sleep
     const forbiddenInterval = 'setInterval('
     const forbiddenLoop = 'startConsolidationLoop'
-    for (const [name, source] of [['jobs/consolidate.ts', jobsSource], ['jobs/index.ts', jobsIndex], ['plugin/v7/index.ts', pluginSource]] as const) {
+    for (const [name, source] of [
+      ['jobs/consolidate.ts', handlersSource],
+      ['jobs/schedule.ts', scheduleSource],
+      ['jobs/index.ts', jobsIndex],
+      ['plugin/v7/index.ts', pluginSource],
+    ] as const) {
       expect(source.includes(forbiddenInterval), `${name} 不允许有 setInterval`).toBe(false)
       expect(source.includes(forbiddenLoop), `${name} 不允许保留旧 loop 入口`).toBe(false)
     }
     // 调度必须真的走 timer 表：dedupeKey 稳定、topic 固定、任务名是载荷。
-    expect(jobsSource).toContain("const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'")
-    expect(jobsSource).toContain('dedupeKey: `consolidation:${job}`')
-    expect(jobsSource).toContain('payload: { job: schedule.job, period: periodOf(dueAt, schedule.intervalMs) }')
+    expect(scheduleSource).toContain("const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'")
+    expect(scheduleSource).toContain('dedupeKey: `consolidation:${job}`')
+    expect(scheduleSource).toContain('payload: { job: schedule.job, period: periodOf(dueAt, schedule.intervalMs) }')
   })
 
   it('给定 forget 改成 workflow 执行当静态检查则定义有真实 step、调度只 start，续期不在 handler 里', async () => {
     const business = await readFile(new URL('../../../packages/v7/src/app/workflow/business.ts', import.meta.url), 'utf8')
-    const jobsSource = await readFile(new URL('../../../packages/v7/src/jobs/consolidate.ts', import.meta.url), 'utf8')
+    const scheduleSource = await readFile(new URL('../../../packages/v7/src/jobs/schedule.ts', import.meta.url), 'utf8')
     const pluginConsolidation = await readFile(new URL('../../../plugin/v7/consolidation.ts', import.meta.url), 'utf8')
 
     // 定义是真实业务步骤（不是空壳）：step 名固定，命令幂等键与时钟来自 ctx。
@@ -790,6 +796,6 @@ describe('巩固调度源码（静态）', () => {
     expect(pluginConsolidation).toContain('runForget(')
     expect(pluginConsolidation).toContain('rearm: () => scheduler.rearm(FORGET_JOB)')
     // timer 到期在 workflow 路径下只 start：不得同时入队 pg-boss（双跑）。
-    expect(jobsSource).toContain('await dispatch.start(dispatch.workflow')
+    expect(scheduleSource).toContain('await dispatch.start(dispatch.workflow')
   })
 })

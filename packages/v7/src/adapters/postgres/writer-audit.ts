@@ -32,6 +32,16 @@ export interface AuditChainEntry {
   readonly correlationId?: string | null
   readonly causationId?: string | null
   readonly actorKind?: string | null
+  /**
+   * 来源/授权方与条件更新的两侧版本。
+   *
+   * 这三列不参与 `auditChainPayload`：014 之前的审计行没有它们，加进哈希载荷会让
+   * 历史行无法重新验链（链是 append-only 的历史承诺）。它们仍是同事务写入的审计事实，
+   * 只是不改变既有链的哈希输入。
+   */
+  readonly source?: string | null
+  readonly expectedRevision?: number | null
+  readonly currentRevision?: number | null
 }
 
 /**
@@ -90,9 +100,10 @@ async function appendAuditRow(client: PoolClient, entry: AuditChainEntry): Promi
     `insert into omb.audit_log (
        actor, action, target_ids, before, after, inverse, job_id,
        command_id, stream_id, stream_version, event_type, revision,
-       correlation_id, causation_id, actor_kind, prev_hash, hash
+       correlation_id, causation_id, actor_kind, source, expected_revision, current_revision,
+       prev_hash, hash
      ) values ($1,$2,$3::text[],$4::jsonb,$5::jsonb,$6::jsonb,$7,
-       $8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
      returning id, created_at`,
     [
       entry.actor,
@@ -110,6 +121,9 @@ async function appendAuditRow(client: PoolClient, entry: AuditChainEntry): Promi
       entry.correlationId ?? null,
       entry.causationId ?? null,
       entry.actorKind ?? null,
+      entry.source ?? null,
+      entry.expectedRevision ?? null,
+      entry.currentRevision ?? null,
       prevHash,
       hash,
     ],
@@ -128,6 +142,10 @@ export async function insertAudit(client: PoolClient, entry: AuditEntry): Promis
     ...(entry.after === undefined ? {} : { after: entry.after }),
     ...(entry.inverse === undefined ? {} : { inverse: entry.inverse }),
     jobId: entry.jobId ?? null,
+    actorKind: entry.actorKind ?? null,
+    source: entry.source ?? null,
+    expectedRevision: entry.expectedRevision ?? null,
+    currentRevision: entry.currentRevision ?? null,
   })
   return inserted.id
 }
@@ -165,6 +183,8 @@ export async function insertEvent(client: PoolClient, input: EventInput): Promis
     correlationId: input.meta.correlationId,
     causationId: input.meta.causationId ?? null,
     actorKind: input.meta.actor.kind,
+    source: input.meta.origin,
+    expectedRevision: input.meta.expectedRevision ?? null,
   })
   const id = inserted.id
   const event: DomainEvent = {

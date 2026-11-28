@@ -5,6 +5,7 @@ import { OmbFailure, conflict, internal, notFound } from '../../domain/errors.js
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
 import { deriveReferences, deriveSearchText, deriveTriggers, type NormalizedWrite } from '../../domain/validation.js'
 import type { RollbackResult } from '../../ports/observability.js'
+import { actorKindOf } from '../../app/commands/index.js'
 import { asNumber, asString, iso } from './db.js'
 import { buildViewValues, mapEntity, type EntityRow } from './rows.js'
 import { insertAudit } from './writer-audit.js'
@@ -51,13 +52,14 @@ async function assertRollbackSnapshotCas(
   client: PoolClient,
   row: RollbackAuditRow,
   inverse: Record<string, JsonValue>,
+  actor: string,
 ): Promise<void> {
   const action = asString(inverse['action'])
   if (action === 'restore') {
     const entityId = asString(inverse['entityId'])
     const expected = row.stream_version === null ? undefined : Number(row.stream_version)
     if (entityId === undefined || expected === undefined || row.stream_id !== entityId) return
-    await assertEntityRevision(client, entityId, expected)
+    await assertEntityRevision(client, entityId, expected, actor)
     return
   }
   if (action === 'restore_attr_rows') {
@@ -66,12 +68,12 @@ async function assertRollbackSnapshotCas(
     for (const [entityId, raw] of Object.entries(revisions)) {
       const expected = asNumber(raw)
       if (expected === undefined) continue
-      await assertEntityRevision(client, entityId, expected)
+      await assertEntityRevision(client, entityId, expected, actor)
     }
   }
 }
 
-async function assertEntityRevision(client: PoolClient, entityId: string, expected: number): Promise<void> {
+async function assertEntityRevision(client: PoolClient, entityId: string, expected: number, actor: string): Promise<void> {
   // 行锁 + 重新读取：并发回滚/写入在 READ COMMITTED 下等锁后会看到最新版本。
   const result = await client.query<{ revision: string }>(
     'select revision from omb.entity where id = $1 for update',
@@ -80,7 +82,14 @@ async function assertEntityRevision(client: PoolClient, entityId: string, expect
   const row = result.rows[0]
   if (row === undefined) throw new OmbFailure(notFound(`实体不存在：${entityId}`))
   const currentRevision = Number(row.revision)
-  if (currentRevision !== expected) throw revisionConflict(expected, currentRevision)
+  if (currentRevision !== expected) {
+    throw revisionConflict(expected, currentRevision, {
+      entityId,
+      actor: { id: actor, kind: actorKindOf(actor) },
+      source: actor,
+      conflictingFields: [{ field: 'revision', incoming: expected, current: currentRevision }],
+    })
+  }
 }
 
 export async function rollbackAudit(client: PoolClient, auditId: number, actor: string): Promise<RollbackResult> {
@@ -97,7 +106,7 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
   }
   const inverse = row.inverse as Record<string, JsonValue>
   // 先进 CAS 再动数据：旧快照覆盖新修改时整笔回滚失败，不留半写。
-  await assertRollbackSnapshotCas(client, row, inverse)
+  await assertRollbackSnapshotCas(client, row, inverse, actor)
   const action = asString(inverse['action'])
   const applied: string[] = []
   if (action === 'unarchive') {

@@ -175,7 +175,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchResult = { entity: { ...before, revision: 2, attributes: before.attributes.map(item => item.name === 'body' ? attr(item.ordinal, 'body', NEW_BODY) : item) } }
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('queued')
@@ -202,7 +202,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchResult = { entity: { ...before, revision: 2 } }
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: OLD_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: OLD_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()
@@ -219,7 +219,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchResult = { entity: { ...before, revision: 2, pinned: true } }
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, pinned: true })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, pinned: true })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()
@@ -246,7 +246,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     }
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: STATE_ID, status: 'blocked', time: '2026-11-23T08:00:00.000Z' })
+    const result = await service.update({ id: STATE_ID, expectedRevision: 1, status: 'blocked', time: '2026-11-23T08:00:00.000Z' })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()
@@ -261,7 +261,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchError = new OmbFailure(conflict('实体版本已变化'))
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(false)
     expect(path.events).toEqual([])
@@ -278,7 +278,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     path.enqueueError = new Error('queue down')
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('done')
@@ -298,7 +298,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchResult = { entity: { ...before, revision: 2, attributes: before.attributes.map(item => item.name === 'body' ? attr(item.ordinal, 'body', NEW_BODY) : item) } }
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('unavailable')
@@ -321,7 +321,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.patchResult = { entity: { ...before, revision: 2, attributes: before.attributes.map(item => item.name === 'body' ? attr(item.ordinal, 'body', NEW_BODY) : item) } }
     const service = updateService(store, path, { embedder, invalidateError: new Error('db blip') })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     // 删除失败只降级：更新已经落库，不能因此把 update 改判成失败。
     expect(result.ok).toBe(true)
@@ -342,7 +342,7 @@ describe('UpdateService 嵌入失效与重建', () => {
     store.refreshReadError = new Error('db blip')
     const service = updateService(store, path, { embedder })
 
-    const result = await service.update({ id: MEMORY_ID, attrs: { body: NEW_BODY } })
+    const result = await service.update({ id: MEMORY_ID, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()

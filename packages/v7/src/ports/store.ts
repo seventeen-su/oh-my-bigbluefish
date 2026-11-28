@@ -23,6 +23,7 @@ import type {
 import type {
   ArtifactInput,
   ArtifactRecord,
+  AuditEntry,
   AuditRecord,
   RecallEventInput,
   ResidentTraceInput,
@@ -92,12 +93,34 @@ export interface LinkResult {
   readonly created: boolean
 }
 
+/**
+ * 一次写入的执行上下文（乐观锁之外的身份信息）。
+ *
+ * - `actor`：真正执行写入的实体（user/model/job:extract/system:refresh），写进
+ *   `audit_log.actor`/`actor_kind`；
+ * - `source`：授权/来源（user/model/job:extract/system:refresh），写进 `audit_log.source`，
+ *   与实体自身的 `origin` 分开：后台刷新可以 actor=system、source=system:refresh，而
+ *   `entity.origin` 仍保留为 `job`（检索先验据此降权）。
+ *
+ * `expectedRevision` 不在这里：更新必须显式带在 `PatchEntityInput` 上，适配器对缺失直接
+ * 拒绝，不提供“默认无条件覆盖”的兼容路径。
+ */
+export interface WriteContext {
+  readonly actor?: string
+  readonly source?: string
+}
+
 export interface Store {
   write(input: NormalizedWrite, derived: DerivedWrite): Promise<WriteResult>
   get(id: string, options?: ReadOptions): Promise<Entity | undefined>
-  patch(input: NormalizedWrite, patch: PatchEntityInput, derived: DerivedWrite): Promise<PatchResult>
-  archive(id: string, reason: string, actor: string): Promise<void>
-  unarchive(id: string, reason: string, actor: string): Promise<void>
+  /** `patch.expectedRevision` 必填；缺失由适配器拒绝（invalid-input）。 */
+  patch(input: NormalizedWrite, patch: PatchEntityInput, derived: DerivedWrite, context?: WriteContext): Promise<PatchResult>
+  /**
+   * 归档。`expectedRevision` 用于自动归档/遗忘的 CAS：调用方用选择时读到的版本，
+   * 新更新先提交时归档失败而不是把新状态归档。缺省只用于人工显式归档。
+   */
+  archive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
+  unarchive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
   link(input: LinkInput): Promise<LinkResult>
   unlink(id: string, actor: string): Promise<void>
   history(stateId: string, limit: number): Promise<StateVersion[]>
@@ -134,6 +157,11 @@ export interface Store {
   findByAttribute?(name: string, value: JsonValue, kind?: EntityKind): Promise<string | undefined>
   markAdopted(traceId: string, entityId: string, kind: string): Promise<void>
   listAudit(limit: number, targetId?: string): Promise<AuditRecord[]>
+  /**
+   * 追加一条运维审计（自动刷新/遗忘的 skipped/conflict）。不改业务行、不 bump revision；
+   * 可选：内存 fake 或只读场景可以不实现，调用方必须允许“审计降级但业务不失败”。
+   */
+  recordAudit?(entry: AuditEntry): Promise<number>
   rollback(auditId: number, actor: string): Promise<RollbackResult>
   recordArtifact(input: ArtifactInput): Promise<void>
   listArtifacts(limit: number): Promise<ArtifactRecord[]>

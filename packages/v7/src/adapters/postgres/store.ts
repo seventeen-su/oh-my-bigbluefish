@@ -20,11 +20,13 @@ import type {
   PatchResult,
   ReadOptions,
   Store,
+  WriteContext,
   WriteResult,
 } from '../../ports/store.js'
 import type {
   ArtifactInput,
   ArtifactRecord,
+  AuditEntry,
   AuditRecord,
   RecallEventInput,
   ResidentTraceInput,
@@ -168,11 +170,16 @@ export class PostgresStore implements Store {
     })
   }
 
-  async patch(input: NormalizedWrite, patch: PatchEntityInput, _derived: DerivedWrite): Promise<PatchResult> {
+  async patch(input: NormalizedWrite, patch: PatchEntityInput, _derived: DerivedWrite, context: WriteContext = {}): Promise<PatchResult> {
     return this.run(async () => {
+      const actor = context.actor ?? input.origin
+      const source = context.source ?? input.origin
       const outcome = await this.writer.execute(
         { type: 'PatchEntity', input, patch },
-        systemCommandMeta(input.origin),
+        {
+          ...systemCommandMeta(actor, source),
+          ...(patch.expectedRevision === undefined ? {} : { expectedRevision: patch.expectedRevision }),
+        },
       )
       const entity = outcome.entity
       if (entity === undefined) throw new OmbFailure(internal('更新没有返回实体'))
@@ -180,15 +187,27 @@ export class PostgresStore implements Store {
     })
   }
 
-  async archive(id: string, reason: string, actor: string): Promise<void> {
+  async archive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void> {
     await this.run(async () => {
-      await this.writer.execute({ type: 'ArchiveEntity', id, reason }, systemCommandMeta(actor))
+      await this.writer.execute(
+        { type: 'ArchiveEntity', id, reason },
+        {
+          ...systemCommandMeta(actor),
+          ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        },
+      )
     })
   }
 
-  async unarchive(id: string, reason: string, actor: string): Promise<void> {
+  async unarchive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void> {
     await this.run(async () => {
-      await this.writer.execute({ type: 'UnarchiveEntity', id, reason }, systemCommandMeta(actor))
+      await this.writer.execute(
+        { type: 'UnarchiveEntity', id, reason },
+        {
+          ...systemCommandMeta(actor),
+          ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        },
+      )
     })
   }
 
@@ -687,8 +706,13 @@ export class PostgresStore implements Store {
         inverse: JsonValue | null
         created_at: Date | string
         rolled_back_at: Date | string | null
+        actor_kind: string | null
+        source: string | null
+        expected_revision: string | null
+        current_revision: string | null
       }>(
-        `select id, actor, action, target_ids, inverse, created_at, rolled_back_at
+        `select id, actor, action, target_ids, inverse, created_at, rolled_back_at,
+                actor_kind, source, expected_revision, current_revision
          from omb.audit_log
          where ($2::text is null or $2 = any(target_ids))
          order by id desc limit $1`,
@@ -702,8 +726,17 @@ export class PostgresStore implements Store {
         ...(row.inverse !== null ? { inverse: row.inverse } : {}),
         createdAt: iso(row.created_at) as string,
         ...(iso(row.rolled_back_at) !== undefined ? { rolledBackAt: iso(row.rolled_back_at) as string } : {}),
+        ...(row.actor_kind === null ? {} : { actorKind: row.actor_kind }),
+        ...(row.source === null ? {} : { source: row.source }),
+        ...(row.expected_revision === null ? {} : { expectedRevision: Number(row.expected_revision) }),
+        ...(row.current_revision === null ? {} : { currentRevision: Number(row.current_revision) }),
       }))
     })
+  }
+
+  /** 运维审计（自动刷新/遗忘的 skipped/conflict）：与业务写共用 hash chain 入口。 */
+  async recordAudit(entry: AuditEntry): Promise<number> {
+    return this.run(() => this.writer.recordAudit(entry))
   }
 
   async rollback(auditId: number, actor: string): Promise<RollbackResult> {

@@ -2,6 +2,8 @@ import { type Attribute, type Category, type Entity, type PatchEntityInput, type
 import { attributeValue, scopeOf } from '../../domain/entity-access.js'
 import type { RawAttributeValue } from '../../domain/dynamic-spec.js'
 import { OmbFailure } from '../../domain/errors.js'
+import type { RevisionConflictField } from '../../domain/conflict.js'
+import { jsonEqual, type JsonValue } from '../../domain/json.js'
 
 /**
  * `PatchEntity` 命令的纯合并逻辑：把当前实体 + 补丁合成一次完整写入输入。
@@ -97,4 +99,50 @@ export function preparePatchWrite(entity: Entity, patch: PatchEntityInput): Writ
     }
   }
   throw new OmbFailure({ code: 'invalid-input', message: '历史版本不能直接更新' })
+}
+
+/**
+ * 冲突差异的纯计算：本次补丁**想写**的字段 vs 数据库**当前**值，只保留真正不同的字段。
+ *
+ * 补丁是「字段级意图」，所以不需要调用方提供旧快照：CAS 失败时当前值就是权威值；
+ * 把 incoming/current 成对返回，人/AI 能直接判断要重读覆盖还是放弃。
+ */
+export function patchConflictFields(entity: Entity, patch: PatchEntityInput): RevisionConflictField[] {
+  const fields: RevisionConflictField[] = []
+  const consider = (field: string, incoming: JsonValue | undefined): void => {
+    if (incoming === undefined) return
+    const current = attributeValue(entity, field)
+    if (jsonEqual(incoming, current)) return
+    fields.push({ field, incoming, current: current ?? null })
+  }
+  // 只比较该 kind 真正会写的必填字段：避免把“补丁里给了但合并逻辑忽略”的字段报成冲突。
+  if (entity.kind === 'memory') consider('category', patch.category)
+  if (entity.kind === 'state') {
+    consider('title', patch.title)
+    consider('status', patch.status)
+    consider('time', patch.time)
+  }
+  if (entity.kind === 'chain') {
+    consider('title', patch.title)
+    consider('group', patch.group as JsonValue | undefined)
+  }
+  // pinned/confidence 是实体行字段，不是属性行：不能拿 attributeValue 比较。
+  if (patch.pinned !== undefined && patch.pinned !== entity.pinned) {
+    fields.push({ field: 'pinned', incoming: patch.pinned, current: entity.pinned })
+  }
+  if (patch.confidence !== undefined) {
+    const current = entity.confidence ?? null
+    if (!jsonEqual(patch.confidence, current)) {
+      fields.push({ field: 'confidence', incoming: patch.confidence, current })
+    }
+  }
+  for (const [name, value] of Object.entries(patch.attrs ?? {})) {
+    // null 是「删除该可选属性」：当前本来就没有就不算冲突。
+    consider(name, value === null ? undefined : value as JsonValue)
+    if (value === null) {
+      const current = attributeValue(entity, name)
+      if (current !== undefined) fields.push({ field: name, incoming: null, current })
+    }
+  }
+  return fields
 }

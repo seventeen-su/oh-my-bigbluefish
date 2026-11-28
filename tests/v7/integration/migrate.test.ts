@@ -33,6 +33,7 @@ const CONTRACT_MIGRATION = '009_contract.sql'
 const OUTBOX_DEAD_MIGRATION = '010_outbox_dead.sql'
 const LEGACY_CONTRACT_MIGRATION = '011_contract_legacy_columns.sql'
 const PROJECT_IDENTITY_MIGRATION = '012_project_identity.sql'
+const STATE_CONCURRENCY_MIGRATION = '014_state_concurrency.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -728,13 +729,13 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await client?.end()
   })
 
-  it('给定空库当跑全量迁移则应用 001-012 且第二次不再重复应用', () => {
+  it('给定空库当跑全量迁移则应用全部迁移且第二次不再重复应用', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
     expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
     expect(emptyFirst.applied).toContain(CONTRACT_MIGRATION)
     expect(emptyFirst.applied).toContain(PROJECT_IDENTITY_MIGRATION)
-    expect(emptyFirst.applied.at(-1)).toBe(PROJECT_IDENTITY_MIGRATION)
+    expect(emptyFirst.applied).toContain(STATE_CONCURRENCY_MIGRATION)
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
   })
@@ -770,13 +771,34 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(await snapshotColumnNames(client, 'audit_log')).not.toContain('rollback_of')
   })
 
-  it('给定已有 007 库当跑迁移则应用 008-012 且旧审计行与新列可空性符合预期', () => {
+  it('给定 014 已应用当查 audit_log 则并发审计列可空、索引存在且重跑幂等', async () => {
+    const columns = legacyContract.columns.audit_log ?? []
+    expect(columns).toEqual(expect.arrayContaining(['source', 'expected_revision', 'current_revision']))
+    expect(legacyContract.indexes.has('audit_log_source_created')).toBe(true)
+    expect(legacyContract.indexes.has('audit_log_concurrency_skipped')).toBe(true)
+    const sql = readFileSync(join(MIGRATIONS_DIR, STATE_CONCURRENCY_MIGRATION), 'utf8')
+    await expect(client.query(sql)).resolves.toBeDefined()
+    await expect(client.query(sql)).resolves.toBeDefined()
+    const nullability = await client.query<{ column_name: string; is_nullable: string }>(
+      `select column_name, is_nullable
+         from information_schema.columns
+        where table_schema = 'omb' and table_name = 'audit_log'
+          and column_name = any($1::text[])`,
+      [['source', 'expected_revision', 'current_revision']],
+    )
+    expect(nullability.rows.map(row => row.column_name).sort())
+      .toEqual(['current_revision', 'expected_revision', 'source'])
+    for (const row of nullability.rows) expect(row.is_nullable).toBe('YES')
+  })
+
+  it('给定已有 007 库当跑迁移则应用 008-014 且旧审计行与新列可空性符合预期', () => {
     expect(legacyReport.applied).toEqual([
       EXPAND_MIGRATION,
       CONTRACT_MIGRATION,
       OUTBOX_DEAD_MIGRATION,
       LEGACY_CONTRACT_MIGRATION,
       PROJECT_IDENTITY_MIGRATION,
+      STATE_CONCURRENCY_MIGRATION,
     ])
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])

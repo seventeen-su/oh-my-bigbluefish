@@ -50,6 +50,13 @@ export interface AuditEntry {
   readonly after?: JsonValue
   readonly inverse?: JsonValue
   readonly jobId?: string
+  /** 执行者类别（user/model/job/system/external）；业务事件由 CommandMeta 自动填。 */
+  readonly actorKind?: string
+  /** 来源/授权方（user/model/job:extract/system:refresh）；与实体 origin 分开。 */
+  readonly source?: string
+  /** 条件更新两侧版本：冲突/跳过审计用它证明“为什么没写”。 */
+  readonly expectedRevision?: number
+  readonly currentRevision?: number
 }
 
 export interface AuditRecord {
@@ -60,6 +67,10 @@ export interface AuditRecord {
   readonly inverse?: JsonValue
   readonly createdAt: string
   readonly rolledBackAt?: string
+  readonly actorKind?: string
+  readonly source?: string
+  readonly expectedRevision?: number
+  readonly currentRevision?: number
 }
 
 export interface RollbackResult {

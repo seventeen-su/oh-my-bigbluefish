@@ -120,6 +120,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       category: Category | null
       pinned: boolean
       updated_at: Date | string
+      revision: string
     }>(
       `select v.entity_id,
               (0.45 * exp(-extract(epoch from (now() - v.updated_at)) / 86400.0 / 30.0)
@@ -127,7 +128,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
                + 0.15 * coalesce(e.confidence, 0.5)
                + 0.10 * (case v.category when 'fact' then 0.9 when 'clue' then 0.6 else 0.3 end)
                + 0.10 * (case v.kind when 'state' then 0.8 else 0.5 end)) as salience,
-              v.category, e.pinned, v.updated_at
+              v.category, e.pinned, v.updated_at, e.revision
        from omb.entity_view v
        join omb.entity e on e.id = v.entity_id
        where v.kind = 'memory' and v.archived_at is null and v.is_current and e.pinned = false
@@ -148,6 +149,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       ...(row.category !== null ? { category: row.category } : {}),
       pinned: row.pinned,
       updatedAt: iso(row.updated_at) as string,
+      revision: Number(row.revision),
     }))
   }
 

@@ -102,7 +102,10 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
         if (input.action === 'audit') {
           const rows = await store.listAudit(input.limit ?? 20)
           if (rows.length === 0) return ok('暂无审计记录')
-          return ok(rows.map(row => `${row.id} ${row.action} by=${row.actor} at=${row.createdAt} rolled=${row.rolledBackAt ?? 'no'}`).join('\n'))
+          return ok(rows.map(row => (
+            `${row.id} ${row.action} by=${row.actor} kind=${row.actorKind ?? 'unknown'} source=${row.source ?? 'unknown'}` +
+            ` at=${row.createdAt} rolled=${row.rolledBackAt ?? 'no'}`
+          )).join('\n'))
         }
         if (input.action === 'archive' || input.action === 'unarchive') {
           if (input.targetId === undefined) return err({ code: 'invalid-input', message: `${input.action} 需要 targetId` })

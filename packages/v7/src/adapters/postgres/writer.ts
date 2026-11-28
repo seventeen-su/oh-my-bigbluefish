@@ -1,13 +1,14 @@
 import type { PoolClient } from 'pg'
 import type { Attribute, Entity, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
-import { scopeOf } from '../../domain/entity-access.js'
-import { OmbFailure, conflict, internal, notFound } from '../../domain/errors.js'
+import { attributeValue, scopeOf } from '../../domain/entity-access.js'
+import { OmbFailure, conflict, internal, invalid, notFound } from '../../domain/errors.js'
 import { newId } from '../../domain/ids.js'
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
 import { deriveReferences, deriveSearchText, deriveTriggers, type NormalizedWrite } from '../../domain/validation.js'
-import type { RollbackResult } from '../../ports/observability.js'
+import type { AuditEntry, RollbackResult } from '../../ports/observability.js'
 import {
   duplicateCommandFailure,
+  patchConflictFields,
   type CommandMeta,
   type CommandOutcome,
   type CommandWriter,
@@ -19,7 +20,7 @@ import type { ProjectionTaskStore } from '../../app/projections/tasks.js'
 import { iso, PostgresDb } from './db.js'
 import { boardProjectionsFor, boardProjectionsForRename, PostgresProjectionTaskStore } from './projection.js'
 import { autoArchivedAt, buildViewValues, mapEntity, type EntityRow } from './rows.js'
-import { insertEvent, nextStreamVersion } from './writer-audit.js'
+import { insertAudit, insertEvent, nextStreamVersion } from './writer-audit.js'
 import { createLinkCommand, unlinkCommand } from './writer-links.js'
 import { rollbackAudit } from './writer-rollback.js'
 import {
@@ -56,6 +57,12 @@ function isDuplicateCommandFailure(error: unknown): boolean {
 function isDuplicateCommandViolation(error: unknown): boolean {
   const record = typeof error === 'object' && error !== null ? error as Record<string, unknown> : {}
   return record['code'] === '23505' && record['constraint'] === 'audit_log_command_unique'
+}
+
+/** 关键属性的字符串视图：冲突差异只带可读值，非字符串（如数字）不参与“当前状态”字段。 */
+function textAttribute(entity: Entity, name: string): string | undefined {
+  const value = attributeValue(entity, name)
+  return typeof value === 'string' ? value : undefined
 }
 
 /**
@@ -266,11 +273,29 @@ export class AttributeWriter implements CommandWriter {
     if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${input.id}`))
     if (current.archived_at !== null) throw new OmbFailure({ code: 'archived', message: `实体已归档：${input.id}` })
     if (current.kind !== input.kind) throw new OmbFailure(conflict(`实体类型不能从 ${current.kind} 改为 ${input.kind}`))
-    if (patch.expectedRevision !== undefined && Number(current.revision) !== patch.expectedRevision) {
-      throw revisionConflict(patch.expectedRevision, Number(current.revision))
+    // 条件更新：缺失 expectedRevision 直接拒绝，绝不回退到“写最新版本”。
+    if (patch.expectedRevision === undefined) {
+      throw new OmbFailure(invalid('PatchEntity 必须携带 expectedRevision（禁止无条件覆盖）'))
     }
     const oldAttributes = await selectAttributes(asAttributeQuery(client), input.id)
     const oldEntity = mapEntity(current, oldAttributes)
+    if (Number(current.revision) !== patch.expectedRevision) {
+      // 冲突差异在行锁内计算：oldAttributes 是当前已提交状态，与 incoming 成对返回。
+      const currentStatus = textAttribute(oldEntity, 'status')
+      const currentTitle = textAttribute(oldEntity, 'title')
+      const currentTime = textAttribute(oldEntity, 'time')
+      const currentCategory = textAttribute(oldEntity, 'category')
+      throw revisionConflict(patch.expectedRevision, Number(current.revision), {
+        entityId: input.id,
+        actor: meta.actor,
+        source: meta.origin,
+        ...(currentStatus === undefined ? {} : { currentStatus }),
+        ...(currentTitle === undefined ? {} : { currentTitle }),
+        ...(currentTime === undefined ? {} : { currentTime }),
+        ...(currentCategory === undefined ? {} : { currentCategory }),
+        conflictingFields: patchConflictFields(oldEntity, patch),
+      })
+    }
     const oldScope = scopeOf(oldEntity)
     const scopeChanged = oldScope.kind !== input.scope.kind
       || (oldScope.kind === 'project' && input.scope.kind === 'project' && oldScope.projectKey !== input.scope.projectKey)
@@ -303,7 +328,7 @@ export class AttributeWriter implements CommandWriter {
            archive_reason = $5,
            origin = $6,
            updated_at = now()
-       where id = $1
+       where id = $1 and revision = $7
        returning *`,
       [
         input.id,
@@ -312,10 +337,19 @@ export class AttributeWriter implements CommandWriter {
         archivedAt,
         archivedAt === null ? null : 'auto-status',
         meta.origin,
+        patch.expectedRevision,
       ],
     )
     const updated = updatedResult.rows[0]
-    if (updated === undefined) throw new OmbFailure(internal('实体更新没有返回行'))
+    if (updated === undefined) {
+      // 行锁 + 上面的版本比较已经覆盖正常路径；这里兜底 CAS（条件更新）语义。
+      throw revisionConflict(patch.expectedRevision, Number(current.revision), {
+        entityId: input.id,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: patchConflictFields(oldEntity, patch),
+      })
+    }
     const { view } = buildViewFromRows(updated, persisted, now, archivedAt)
     await upsertView(client, view)
     const revision = Number(updated.revision)
@@ -328,7 +362,8 @@ export class AttributeWriter implements CommandWriter {
       attributes: persisted.filter(item => !item.required).map(item => item.name),
     }
     const event = await insertEvent(client, {
-      meta,
+      // 审计的 expected_revision 记录“这次补丁是基于哪个版本提交的”，便于事后复现 CAS。
+      meta: { ...meta, expectedRevision: patch.expectedRevision },
       action: 'patch',
       eventType: 'EntityPatched',
       streamId: input.id,
@@ -449,7 +484,7 @@ export class AttributeWriter implements CommandWriter {
       if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
       // 已归档或版本已前进：带 expectedRevision 的命令返回可恢复冲突；旧路径保持静默 no-op。
       if (expected === undefined) return noopOutcome(id)
-      throw revisionConflict(expected, Number(current.revision))
+      throw await this.revisionConflictFor(client, current, meta, expected, true)
     }
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = now() where entity_id = $1', [id])
@@ -497,7 +532,7 @@ export class AttributeWriter implements CommandWriter {
       const current = await this.currentEntity(client, id)
       if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${id}`))
       if (expected === undefined) return noopOutcome(id)
-      throw revisionConflict(expected, Number(current.revision))
+      throw await this.revisionConflictFor(client, current, meta, expected, false)
     }
     const revision = Number(row.revision)
     await client.query('update omb.entity_view set archived_at = null where entity_id = $1', [id])
@@ -639,6 +674,42 @@ export class AttributeWriter implements CommandWriter {
   private async currentEntity(client: PoolClient, id: string): Promise<EntityRow | undefined> {
     const result = await client.query<EntityRow>('select * from omb.entity where id = $1', [id])
     return result.rows[0]
+  }
+
+  /**
+   * 归档/取消归档的冲突上下文：只在冲突路径多读一次属性行，正常写路径没有额外查询。
+   * `incomingArchived` 让调用方看到“我想改成什么 vs 当前是什么”。
+   */
+  private async revisionConflictFor(
+    client: PoolClient,
+    row: EntityRow,
+    meta: CommandMeta,
+    expected: number,
+    incomingArchived: boolean,
+  ): Promise<OmbFailure> {
+    const attributes = row.kind === 'memory' || row.kind === 'state'
+      ? await selectAttributes(asAttributeQuery(client), row.id)
+      : []
+    const entity = mapEntity(row, attributes)
+    const currentStatus = textAttribute(entity, 'status')
+    const currentTitle = textAttribute(entity, 'title')
+    return revisionConflict(expected, Number(row.revision), {
+      entityId: row.id,
+      actor: meta.actor,
+      source: meta.origin,
+      ...(currentStatus === undefined ? {} : { currentStatus }),
+      ...(currentTitle === undefined ? {} : { currentTitle }),
+      conflictingFields: [{ field: 'archivedAt', incoming: incomingArchived, current: row.archived_at !== null }],
+    })
+  }
+
+  /** 运维审计入口（自动刷新/遗忘的 skipped/conflict）：不写业务行、不 bump revision。 */
+  async recordAudit(entry: AuditEntry): Promise<number> {
+    try {
+      return await this.db.transaction(client => insertAudit(client, entry))
+    } catch (error) {
+      throw mapPgError(error)
+    }
   }
 
   /** 动态缓存写回（`setAttributeCache`）：属性行 + view/触发键同事务。 */

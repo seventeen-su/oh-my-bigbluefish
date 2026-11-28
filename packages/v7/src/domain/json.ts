@@ -26,3 +26,22 @@ export function isNonEmptyJson(value: JsonValue): boolean {
 export function jsonSize(value: JsonValue): number {
   return new TextEncoder().encode(JSON.stringify(value)).length
 }
+
+/**
+ * 规范 JSON 字符串：对象键递归排序、数组保持顺序。
+ *
+ * 用于比较“同一份配置/属性值是否变化”。`jsonb` 会按 key 长度重排对象键，
+ * 不能依赖 `JSON.stringify` 的插入顺序（否则同 spec 在库内往返后被当成变化）。
+ */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/** 语义相等：按规范 JSON 比较（对象键顺序不敏感）。 */
+export function jsonEqual(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right)
+}

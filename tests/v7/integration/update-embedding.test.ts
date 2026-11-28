@@ -159,7 +159,7 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     expect(await embeddingCount(id)).toBe(1)
     expect((await db.vector({ embedding: oldVector, limit: 10 })).map(hit => hit.entityId)).toContain(id)
 
-    const result = await service.update({ id, attrs: { title: NEW_TITLE, body: NEW_BODY } })
+    const result = await service.update({ id, expectedRevision: 1, attrs: { title: NEW_TITLE, body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('queued')
@@ -195,7 +195,7 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     await db.upsertEmbedding(id, embedder.model, embedder.dims, oldVector)
     expect(await embeddingCount(id)).toBe(1)
 
-    const result = await serviceFor(new UnavailableEmbedder()).update({ id, attrs: { body: NEW_BODY } })
+    const result = await serviceFor(new UnavailableEmbedder()).update({ id, expectedRevision: 1, attrs: { body: NEW_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : undefined).toBe('unavailable')
@@ -211,7 +211,7 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     const oldVector = hashEmbed(deriveSearchText(before?.attributes ?? []))
     await db.upsertEmbedding(id, embedder.model, embedder.dims, oldVector)
 
-    const result = await service.update({ id, attrs: { title: OLD_TITLE, body: OLD_BODY } })
+    const result = await service.update({ id, expectedRevision: 1, attrs: { title: OLD_TITLE, body: OLD_BODY } })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()
@@ -235,7 +235,7 @@ describe('update 后嵌入失效与重建（真实 PostgreSQL）', () => {
     const oldVector = hashEmbed(deriveSearchText(before?.attributes ?? []))
     await db.upsertEmbedding(id, embedder.model, embedder.dims, oldVector)
 
-    const result = await service.update({ id, status: 'blocked', time: '2026-11-23T08:00:00.000Z' })
+    const result = await service.update({ id, expectedRevision: 1, status: 'blocked', time: '2026-11-23T08:00:00.000Z' })
 
     expect(result.ok).toBe(true)
     expect(result.ok ? result.value.embedding : 'expected-none').toBeUndefined()

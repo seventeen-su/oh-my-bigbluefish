@@ -59,7 +59,14 @@ export async function createLinkCommand(client: PoolClient, input: LinkInput, me
   if (meta.expectedRevision !== undefined) {
     const from = endpoints.rows.find(row => row.id === input.fromId)
     if (from === undefined) throw new OmbFailure(notFound(`链接端点不存在：${input.fromId}`))
-    if (Number(from.revision) !== meta.expectedRevision) throw revisionConflict(meta.expectedRevision, Number(from.revision))
+    if (Number(from.revision) !== meta.expectedRevision) {
+      throw revisionConflict(meta.expectedRevision, Number(from.revision), {
+        entityId: from.id,
+        actor: meta.actor,
+        source: meta.origin,
+        conflictingFields: [{ field: 'revision', incoming: meta.expectedRevision, current: Number(from.revision) }],
+      })
+    }
   }
   const directed = input.directed ?? true
   const existing = await client.query<LinkRow>(
