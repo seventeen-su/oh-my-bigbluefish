@@ -24,6 +24,7 @@
  */
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { connect } from 'node:net'
 
@@ -35,12 +36,12 @@ const APPLY = process.argv.includes('--apply')
 const SKIP_PROFILE = process.argv.includes('--skip-profile')
 const KEEP_PRESET = process.argv.includes('--keep-preset')
 const SKIP_DSH_CHECK = process.argv.includes('--skip-dsh-check')
-const sessionsDir = resolve(process.env.OMB_SESSIONS_DIR ?? 'C:\\Users\\<user>\\.dsh\\sessions')
+const sessionsDir = resolve(process.env.OMB_SESSIONS_DIR ?? join(homedir(), '.dsh', 'sessions'))
 const cacheDir = resolve(
-  process.env.OMB_CACHE_DIR ?? 'C:\\Users\\<user>\\.dsh\\storages\\session_projcache\\sessions',
+  process.env.OMB_CACHE_DIR ?? join(homedir(), '.dsh', 'storages', 'session_projcache', 'sessions'),
 )
 const profilePatch = resolve(
-  process.env.OMB_PROFILE_PATCH ?? 'C:\\Users\\<user>\\.dsh\\profiles\\web\\cordis.patch.yml',
+  process.env.OMB_PROFILE_PATCH ?? join(homedir(), '.dsh', 'profiles', 'web', 'cordis.patch.yml'),
 )
 
 function log(message) {

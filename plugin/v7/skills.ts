@@ -6,7 +6,7 @@
  * （deploy 只复制 4 个目录），`register()` 要求加载期就给出完整 content；只有
  * provider 的 `list`/`get` 才能惰性读盘，满足「加载期不碰磁盘」。
  *
- * DSH 契约（<DSH_CHECKOUT>\packages\skill\skill\src\index.ts）：
+ * DSH 契约（DSH checkout 的 `packages/skill/skill/src/index.ts`）：
  * - `registerProvider(create)`：apply 期同步注册，create 返回 `{ name, list, get }`（:393）；
  * - `list(options)`：返回候选数组或 `{ candidates, complete }`；`complete=false`
  *   会让注册表跳过缓存、下次重新发现（:250-262、:543-549、:606-620）；

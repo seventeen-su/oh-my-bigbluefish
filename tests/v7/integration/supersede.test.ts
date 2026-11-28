@@ -18,7 +18,7 @@ const FIXED_NOW = '2026-11-29T00:00:00.000Z'
  * 断言一律用这个常量比较，不依赖运行时刻。
  */
 const EFFECTIVE_AT = new Date(Date.now() + 60_000).toISOString()
-const PROJECT = '<workspace>/omb-worktrees/supersede'
+const PROJECT = 'test/supersede-project'
 
 const clock: Clock = { now: () => new Date(FIXED_NOW), iso: () => FIXED_NOW }
 

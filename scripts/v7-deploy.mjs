@@ -12,6 +12,7 @@
  * `--force` 或 `OMB_DEPLOY_ALLOW_RUNNING=1` 才放行。dry-run 不探测也不写盘。
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -19,7 +20,7 @@ import { describeDenied, ensureDeployAllowed } from './lib/deploy-guard.mjs'
 import { pruneStaleSkills } from './lib/skill-cleanup.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const PROFILE = process.env.OMB_PROFILE_DIR ?? 'C:\\Users\\<user>\\.dsh\\profiles\\web'
+const PROFILE = process.env.OMB_PROFILE_DIR ?? join(homedir(), '.dsh', 'profiles', 'web')
 const TARGET = join(PROFILE, 'node_modules', 'oh-my-bigbluefish')
 const APPLY = process.argv.includes('--apply')
 const FORCE = process.argv.includes('--force')
