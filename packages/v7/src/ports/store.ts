@@ -8,6 +8,7 @@ import type {
   StateVersion,
 } from '../domain/entity.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../domain/dependency.js'
+import type { AuditAuthorization } from '../domain/audit.js'
 import type { EvidenceInput } from '../domain/evidence.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
@@ -148,9 +149,10 @@ export interface Store {
   /**
    * 归档。`expectedRevision` 用于自动归档/遗忘的 CAS：调用方用选择时读到的版本，
    * 新更新先提交时归档失败而不是把新状态归档。缺省只用于人工显式归档。
+   * `authorization` 是工具路径的审计来源；提供 tenant 时适配器也会做越权校验。
    */
-  archive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
-  unarchive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void>
+  archive(id: string, reason: string, actor: string, expectedRevision?: number, authorization?: AuditAuthorization): Promise<void>
+  unarchive(id: string, reason: string, actor: string, expectedRevision?: number, authorization?: AuditAuthorization): Promise<void>
   /**
    * 取代一个旧实体：同一事务创建/确认新实体、建 `supersedes` 关系、把旧实体标成
    * `superseded`（写 valid_to/superseded_*）、更新 entity_view 与看板投影、写审计+inverse。
@@ -163,7 +165,7 @@ export interface Store {
    */
   retract(input: RetractInput): Promise<RetractResult>
   link(input: LinkInput): Promise<LinkResult>
-  unlink(id: string, actor: string): Promise<void>
+  unlink(id: string, actor: string, source?: string): Promise<void>
   history(stateId: string, limit: number): Promise<StateVersion[]>
   expand(seeds: readonly string[], hops: 1 | 2, options?: { includeArchived?: boolean }): Promise<Expansion[]>
   fulltext(spec: TextSearchSpec): Promise<ChannelHit[]>
@@ -242,7 +244,11 @@ export interface Store {
    * 可选：内存 fake 或只读场景可以不实现，调用方必须允许“审计降级但业务不失败”。
    */
   recordAudit?(entry: AuditEntry): Promise<number>
-  rollback(auditId: number, actor: string): Promise<RollbackResult>
+  /**
+   * 回滚单条审计。`authorization.tenant` 提供时按审计 target_ids 的实体作用域
+   * 做越权校验（项目外/无法证明归属一律拒绝）；缺省保持旧调用语义。
+   */
+  rollback(auditId: number, actor: string, authorization?: AuditAuthorization): Promise<RollbackResult>
   recordArtifact(input: ArtifactInput): Promise<void>
   listArtifacts(limit: number, options?: { readonly id?: string }): Promise<ArtifactRecord[]>
   markArtifactProcessed(id: string): Promise<void>

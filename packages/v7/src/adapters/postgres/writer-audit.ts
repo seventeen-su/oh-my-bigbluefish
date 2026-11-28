@@ -1,8 +1,16 @@
 import { createHash } from 'node:crypto'
-import type { PoolClient } from 'pg'
+import type { PoolClient, QueryResultRow } from 'pg'
 import type { JsonValue } from '../../domain/json.js'
-import { OmbFailure, internal } from '../../domain/errors.js'
-import type { AuditEntry } from '../../ports/observability.js'
+import type { Scope } from '../../domain/entity.js'
+import {
+  AUDIT_DENIED_ACTION,
+  rollbackAccessDecision,
+  type AuditRollbackFacts,
+  type AuditTenant,
+  type EntityScopeFact,
+} from '../../domain/audit.js'
+import { OmbFailure, forbidden, internal } from '../../domain/errors.js'
+import type { AuditEntry, AuditRecord } from '../../ports/observability.js'
 import type { CommandMeta, DomainEvent, DomainEventType } from '../../app/commands/index.js'
 import { iso } from './db.js'
 import { notifyOutbox } from './outbox.js'
@@ -220,4 +228,226 @@ export async function nextStreamVersion(client: PoolClient, streamId: string): P
     [streamId],
   )
   return Number(result.rows[0]?.next ?? 1)
+}
+
+// ---------------------------------------------------------------------------
+// 越权检查的只读事实（与审计同源；工具路径把这里的结果交给 domain/audit 判定）
+// ---------------------------------------------------------------------------
+
+/**
+ * 只读查询能力：PostgresDb 与事务内 PoolClient 都能提供，避免把整只连接池类型
+ * 拖进审计辅助函数（也让测试可以用最小 fake）。
+ */
+export interface AuditQueryable {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: T[] }>
+}
+
+/** 审计行里做授权判定所需的列；不回传 before/after（可能含正文）。 */
+export interface AuditAccessRow {
+  readonly id: number
+  readonly action: string
+  readonly actor: string
+  readonly actorKind: string | null
+  readonly source: string | null
+  readonly targetIds: readonly string[]
+  readonly rolledBackAt: string | null
+}
+
+interface AuditAccessDbRow {
+  readonly id: string
+  readonly action: string
+  readonly actor: string
+  readonly actor_kind: string | null
+  readonly source: string | null
+  readonly target_ids: string[]
+  readonly rolled_back_at: Date | string | null
+}
+
+/** 读取单条审计的授权事实；不存在返回 undefined（调用方转 not-found）。 */
+export async function readAuditAccessRow(db: AuditQueryable, auditId: number): Promise<AuditAccessRow | undefined> {
+  const result = await db.query<AuditAccessDbRow>(
+    `select id::text as id, action, actor, actor_kind, source, target_ids, rolled_back_at
+       from omb.audit_log
+      where id = $1`,
+    [auditId],
+  )
+  return result.rows[0] === undefined ? undefined : auditAccessOf(result.rows[0])
+}
+
+function auditAccessOf(row: AuditAccessDbRow): AuditAccessRow {
+  return {
+    id: Number(row.id),
+    action: row.action,
+    actor: row.actor,
+    actorKind: row.actor_kind,
+    source: row.source,
+    targetIds: row.target_ids,
+    rolledBackAt: iso(row.rolled_back_at) ?? null,
+  }
+}
+
+export function rollbackFactsOf(row: AuditAccessRow): AuditRollbackFacts {
+  return {
+    id: row.id,
+    action: row.action,
+    actor: row.actor,
+    actorKind: row.actorKind,
+    source: row.source,
+    targetIds: row.targetIds,
+  }
+}
+
+/**
+ * 批量读取实体作用域（entity_view 是写入事务内派生的读模型，含归档行）。
+ * 缺失的 id 不返回：调用方必须把“查不到作用域”当成不可证明归属并拒绝。
+ */
+export async function readEntityScopes(
+  db: AuditQueryable,
+  ids: readonly string[],
+): Promise<ReadonlyMap<string, Scope>> {
+  const unique = [...new Set(ids.filter(id => id.length > 0))]
+  if (unique.length === 0) return new Map()
+  const result = await db.query<{ entity_id: string; scope: string; project_key: string }>(
+    `select entity_id, scope, project_key
+       from omb.entity_view
+      where entity_id = any($1::text[])`,
+    [unique],
+  )
+  const scopes = new Map<string, Scope>()
+  for (const row of result.rows) {
+    scopes.set(
+      row.entity_id,
+      row.scope === 'project' && row.project_key.length > 0
+        ? { kind: 'project', projectKey: row.project_key }
+        : { kind: 'global' },
+    )
+  }
+  return scopes
+}
+
+/** 把 id 列表映射成作用域事实；查不到作用域的 id 带 `scope: undefined`（fail-closed）。 */
+export async function readAuthorizationTargets(
+  db: AuditQueryable,
+  ids: readonly string[],
+): Promise<readonly EntityScopeFact[]> {
+  const scopes = await readEntityScopes(db, ids)
+  return ids.map(id => {
+    const scope = scopes.get(id)
+    return scope === undefined ? { id } : { id, scope }
+  })
+}
+
+/** 链接端点的实体 id；越权检查必须同时看两端（任一在项目外都拒绝）。 */
+export async function readLinkEndpoints(
+  db: AuditQueryable,
+  linkId: string,
+): Promise<{ readonly fromId: string; readonly toId: string } | undefined> {
+  const result = await db.query<{ from_id: string; to_id: string }>(
+    'select from_id, to_id from omb.link where id = $1',
+    [linkId],
+  )
+  const row = result.rows[0]
+  return row === undefined ? undefined : { fromId: row.from_id, toId: row.to_id }
+}
+
+/**
+ * 回滚的适配器层越权校验：只在调用方提供 tenant 时生效（旧测试/后台入口保持旧语义）。
+ * 事务内已经 `for update` 锁住审计行，这里再读 target 作用域，避免 TOCTOU 下把
+ * 项目外实体回滚掉。
+ */
+export async function assertRollbackTenantAllowed(
+  client: PoolClient,
+  facts: AuditRollbackFacts,
+  tenant: AuditTenant | undefined,
+): Promise<void> {
+  if (tenant === undefined) return
+  const targets = await readAuthorizationTargets(client, facts.targetIds)
+  const decision = rollbackAccessDecision({ facts, targets, tenant })
+  if (!decision.allowed) {
+    throw new OmbFailure(forbidden(decision.message, {
+      auditId: facts.id,
+      reason: decision.reason,
+      targetIds: decision.targetIds,
+    }))
+  }
+}
+
+interface AuditListRow {
+  readonly id: string
+  readonly actor: string
+  readonly action: string
+  readonly target_ids: string[]
+  readonly inverse: JsonValue | null
+  readonly created_at: Date | string
+  readonly rolled_back_at: Date | string | null
+  readonly actor_kind: string | null
+  readonly source: string | null
+  readonly expected_revision: string | null
+  readonly current_revision: string | null
+}
+
+/**
+ * 按租户列出审计：只有当审计的**全部** target 都是 global 或当前项目时可见。
+ *
+ * 越权拒绝行（action='denied'）的目标可能在项目外，用 `after.tenantProjectKey`
+ * 证明它是本租户的拒绝记录；返回时清空 target_ids，避免把外项目 id 带进工具输出。
+ * 目标无法解析/为空的行默认不展示（不猜归属）。
+ */
+export async function listAuditWithinTenant(
+  db: AuditQueryable,
+  options: { readonly limit: number; readonly tenant?: AuditTenant; readonly actor?: string },
+): Promise<readonly AuditRecord[]> {
+  const limit = Math.max(1, Math.min(200, Math.trunc(options.limit)))
+  const aliases = options.tenant?.aliases ?? []
+  const result = await db.query<AuditListRow>(
+    `select a.id::text as id, a.actor, a.action, a.target_ids, a.inverse, a.created_at,
+            a.rolled_back_at, a.actor_kind, a.source, a.expected_revision, a.current_revision
+       from omb.audit_log a
+      where (
+        a.action = $3
+        and coalesce(a.after->>'tenantProjectKey', '') = any($2::text[])
+      ) or (
+        a.action <> $3
+        and (
+          coalesce((
+            select bool_and(v.scope = 'global' or v.project_key = any($2::text[]))
+              from unnest(a.target_ids) as target(entity_id)
+              left join omb.entity_view v on v.entity_id = target.entity_id
+          ), false)
+          or (cardinality(a.target_ids) = 0 and a.actor = $4)
+        )
+      )
+      order by a.id desc
+      limit $1`,
+    [limit, aliases, AUDIT_DENIED_ACTION, options.actor ?? ''],
+  )
+  return result.rows.map(row => ({
+    id: Number(row.id),
+    actor: row.actor,
+    action: row.action,
+    targetIds: row.action === AUDIT_DENIED_ACTION ? [] : row.target_ids,
+    ...(row.inverse === null ? {} : { inverse: row.inverse }),
+    createdAt: iso(row.created_at) as string,
+    ...(iso(row.rolled_back_at) !== undefined ? { rolledBackAt: iso(row.rolled_back_at) as string } : {}),
+    ...(row.actor_kind === null ? {} : { actorKind: row.actor_kind }),
+    ...(row.source === null ? {} : { source: row.source }),
+    ...(row.expected_revision === null ? {} : { expectedRevision: Number(row.expected_revision) }),
+    ...(row.current_revision === null ? {} : { currentRevision: Number(row.current_revision) }),
+  }))
+}
+
+/** 当前租户的越权拒绝次数（`omb_admin audit` 报出，便于发现探测/注入尝试）。 */
+export async function countDeniedWithinTenant(db: AuditQueryable, tenant: AuditTenant | undefined): Promise<number> {
+  const aliases = tenant?.aliases ?? []
+  const result = await db.query<{ count: string }>(
+    `select count(*)::text as count
+       from omb.audit_log
+      where action = $1
+        and coalesce(after->>'tenantProjectKey', '') = any($2::text[])`,
+    [AUDIT_DENIED_ACTION, aliases],
+  )
+  return Number(result.rows[0]?.count ?? 0)
 }

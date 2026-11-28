@@ -44,6 +44,11 @@ export interface SupersedeInput {
   readonly newId: string
   readonly reason: string
   readonly actor: string
+  /**
+   * 授权/调用来源（写进 `audit_log.source`，如 `tool:omb_admin`）；缺省时退回 actor。
+   * 与实体 origin 分开：工具调用不改变被取代条目的内容出处。
+   */
+  readonly source?: string
   readonly effectiveAt?: string
   readonly create?: WriteEntityInput
   readonly commandId?: string
@@ -69,6 +74,8 @@ export interface RetractInput {
   readonly id: string
   readonly reason: string
   readonly actor: string
+  /** 授权/调用来源（写进 `audit_log.source`）；缺省时退回 actor。 */
+  readonly source?: string
   /** 证伪生效时间（ISO 8601）；缺省用事务墙钟。 */
   readonly effectiveAt?: string
   readonly commandId?: string

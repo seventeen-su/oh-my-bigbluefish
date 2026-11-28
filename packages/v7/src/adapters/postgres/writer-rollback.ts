@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import type { Attribute } from '../../domain/entity.js'
+import type { AuditAuthorization } from '../../domain/audit.js'
 import { scopeOf } from '../../domain/entity-access.js'
 import { OmbFailure, conflict, internal, notFound } from '../../domain/errors.js'
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
@@ -17,7 +18,7 @@ import {
   replaceReferenceDependencyEdges,
 } from './dependency.js'
 import { buildViewValues, mapEntity, type EntityRow } from './rows.js'
-import { insertAudit } from './writer-audit.js'
+import { assertRollbackTenantAllowed, insertAudit, rollbackFactsOf } from './writer-audit.js'
 import {
   asAttributeQuery,
   assertChainMemberKinds,
@@ -39,6 +40,10 @@ import { nowIso, revisionConflict, toJson } from './writer-support.js'
 
 interface RollbackAuditRow {
   readonly id: string
+  readonly action: string
+  readonly actor: string
+  readonly actor_kind: string | null
+  readonly source: string | null
   readonly inverse: JsonValue | null
   readonly target_ids: string[]
   readonly rolled_back_at: Date | string | null
@@ -109,10 +114,16 @@ async function assertEntityRevision(client: PoolClient, entityId: string, expect
   }
 }
 
-export async function rollbackAudit(client: PoolClient, auditId: number, actor: string): Promise<RollbackResult> {
+export async function rollbackAudit(
+  client: PoolClient,
+  auditId: number,
+  actor: string,
+  authorization?: AuditAuthorization,
+): Promise<RollbackResult> {
   const result = await client.query<RollbackAuditRow>(
-    `select id, inverse, target_ids, rolled_back_at, stream_id, stream_version
-     from omb.audit_log where id = $1 for update`,
+    `select id::text as id, action, actor, actor_kind, source, inverse, target_ids, rolled_back_at,
+            stream_id, stream_version
+       from omb.audit_log where id = $1 for update`,
     [auditId],
   )
   const row = result.rows[0]
@@ -122,6 +133,20 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
     throw new OmbFailure(internal(`审计记录没有可执行 inverse：${auditId}`))
   }
   const inverse = row.inverse as Record<string, JsonValue>
+  // 越权校验先于 CAS/写数据：跨项目回滚不允许尝试“先改再看结果”。
+  await assertRollbackTenantAllowed(
+    client,
+    rollbackFactsOf({
+      id: auditId,
+      action: row.action,
+      actor: row.actor,
+      actorKind: row.actor_kind,
+      source: row.source,
+      targetIds: row.target_ids,
+      rolledBackAt: null,
+    }),
+    authorization?.tenant,
+  )
   // 先进 CAS 再动数据：旧快照覆盖新修改时整笔回滚失败，不留半写。
   await assertRollbackSnapshotCas(client, row, inverse, actor)
   const action = asString(inverse['action'])
@@ -443,6 +468,8 @@ export async function rollbackAudit(client: PoolClient, auditId: number, actor: 
   await client.query('update omb.audit_log set rolled_back_at = now() where id = $1', [auditId])
   const rollbackAuditId = await insertAudit(client, {
     actor,
+    actorKind: actorKindOf(actor),
+    ...(authorization?.source === undefined ? {} : { source: authorization.source }),
     action: 'rollback',
     targetIds: [...row.target_ids],
     before: toJson({ auditId }),

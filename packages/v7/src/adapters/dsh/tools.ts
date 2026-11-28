@@ -51,7 +51,8 @@ const rememberSchema = z.object({
   attrs: z.record(z.string(), JSON_VALUE).optional().describe('可选属性；普通值是静态，{"$dynamic":{...}} 是动态'),
   confidence: z.number().min(0).max(1).optional(),
   pinned: z.boolean().optional(),
-  origin: z.string().max(MAX_ORIGIN_CHARS).optional(),
+  origin: z.string().max(MAX_ORIGIN_CHARS).optional()
+    .describe('已废弃：来源/actor 由宿主会话派生，传入会被覆盖并记录越权审计'),
 })
 
 const recallSchema = z.object({
@@ -123,11 +124,15 @@ export interface ToolRuntime {
   update(input: PatchEntityInput, context: ToolContext): Promise<Result<string>>
   link(input: LinkInput, context: ToolContext): Promise<Result<string>>
   unlink(id: string, context: ToolContext): Promise<Result<string>>
-  supersede(input: SupersedeInput): Promise<Result<string>>
-  retract(input: RetractInput): Promise<Result<string>>
-  history(id: string, limit: number): Promise<Result<string>>
+  /**
+   * 生命周期操作不带 actor/source：身份由工具运行时从宿主上下文派生。
+   * 工具定义层只提交业务字段，防止模型用 `actor` 参数伪造审计身份。
+   */
+  supersede(input: Omit<SupersedeInput, 'actor' | 'source'>, context: ToolContext): Promise<Result<string>>
+  retract(input: Omit<RetractInput, 'actor' | 'source'>, context: ToolContext): Promise<Result<string>>
+  history(id: string, limit: number, context: ToolContext): Promise<Result<string>>
   status(): Promise<Result<string>>
-  admin(input: AdminToolArgs): Promise<Result<string>>
+  admin(input: AdminToolArgs, context: ToolContext): Promise<Result<string>>
 }
 
 function toolParameters(schema: z.ZodType): object {
@@ -378,9 +383,8 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
           oldId: parsed.data.to as string,
           newId: parsed.data.from as string,
           reason: parsed.data.reason ?? 'superseded',
-          actor: 'model',
           ...(parsed.data.effectiveAt !== undefined ? { effectiveAt: parsed.data.effectiveAt } : {}),
-        }))
+        }, context))
       }
       const input: LinkInput = {
         fromId: parsed.data.from as string,
@@ -398,10 +402,12 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
     'omb_history',
     '需要查看状态机历史版本，或确认一条记忆是否已被取代/被谁取代、有效期从何时到何时时调用；历史不可回滚，只返回快照与生命周期事实。',
     toolParameters(historySchema),
-    async (rawArgs) => {
+    async (rawArgs, exec) => {
       const parsed = parseToolArgs(historySchema, rawArgs)
       if (!parsed.ok) return { ok: false, text: parsed.text }
-      return resultOf(await runtime.history(parsed.data.id, parsed.data.limit ?? 20))
+      const context = await runtime.context(exec)
+      if (context === undefined) return { ok: false, text: 'missing-session: 无法确定会话/项目' }
+      return resultOf(await runtime.history(parsed.data.id, parsed.data.limit ?? 20, context))
     },
   )
 
@@ -416,10 +422,12 @@ export function createToolDefinitions(runtime: ToolRuntime): HostToolDefinition[
     'omb_admin',
     '需要查看审计、回滚某次后台操作、手工归档/取消归档、取代/证伪一条记忆，或重放 dead outbox 事件时调用；supersede 需要 targetId（旧）+ newId（新），retract 需要 targetId（被证伪）；rollback 只支持有 inverse 的审计记录；replay 用 outboxId 或 topic 二选一（都缺省会被拒绝），把 dead 行重置为 pending 并写一条 outbox-replay 审计。',
     toolParameters(adminSchema),
-    async rawArgs => {
+    async (rawArgs, exec) => {
       const parsed = parseToolArgs(adminSchema, rawArgs)
       if (!parsed.ok) return { ok: false, text: parsed.text }
-      return resultOf(await runtime.admin(parsed.data))
+      const context = await runtime.context(exec)
+      if (context === undefined) return { ok: false, text: 'missing-session: 无法确定会话/项目' }
+      return resultOf(await runtime.admin(parsed.data, context))
     },
   )
 

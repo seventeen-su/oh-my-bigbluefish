@@ -4,6 +4,7 @@ import type {
   StateVersion,
   WriteEntityInput,
 } from '../../domain/entity.js'
+import { AUDIT_ACTOR_KINDS, auditActorKindOf, type AuditActorKind } from '../../domain/audit.js'
 import type { OmbError } from '../../domain/errors.js'
 import type { EvidenceInput } from '../../domain/evidence.js'
 import { isPlainObject, type JsonValue } from '../../domain/json.js'
@@ -18,14 +19,15 @@ import type { NormalizedWrite } from '../../domain/validation.js'
  * `CommandWriter`，命令的合并/校验等纯逻辑留在 app 层，事务与 SQL 留在适配器。
  */
 
-type ActorKind = 'user' | 'model' | 'job' | 'system' | 'external'
+/** actor 类别与审计模块共用同一词表：7.2.4 起显式包含 assistant/tool。 */
+export type ActorKind = AuditActorKind
 
 interface Actor {
   readonly id: string
   readonly kind: ActorKind
 }
 
-const ACTOR_KINDS: readonly ActorKind[] = ['user', 'model', 'job', 'system', 'external']
+const ACTOR_KINDS: readonly ActorKind[] = AUDIT_ACTOR_KINDS
 
 export interface CommandMeta {
   /** 幂等键：同一 commandId 只生效一次，重复提交返回首次结果（audit_log.command_id unique）。 */
@@ -227,12 +229,7 @@ export function systemCommandMeta(actor: string, origin?: string, options: Syste
 }
 
 export function actorKindOf(actor: string): ActorKind {
-  const normalized = actor.toLowerCase()
-  if (normalized === 'user' || normalized.startsWith('user:')) return 'user'
-  if (normalized === 'job' || normalized.startsWith('job:')) return 'job'
-  if (normalized === 'system' || normalized.startsWith('system:')) return 'system'
-  if (normalized === 'external' || normalized.startsWith('external:')) return 'external'
-  return 'model'
+  return auditActorKindOf(actor)
 }
 
 /** 命令元数据校验；返回第一个错误（与 CommandBus 的错误体同一形状）。 */

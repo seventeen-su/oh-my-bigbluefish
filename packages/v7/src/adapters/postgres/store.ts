@@ -1,4 +1,5 @@
 import type { Attribute, Entity, EntityKind, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
+import type { AuditAuthorization } from '../../domain/audit.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../../domain/dependency.js'
 import { titleOf } from '../../domain/entity-access.js'
 import { OmbFailure, internal } from '../../domain/errors.js'
@@ -195,7 +196,11 @@ export class PostgresStore implements Store {
 
   async write(input: NormalizedWrite, _derived: DerivedWrite, options: WriteOptions = {}): Promise<WriteResult> {
     return this.run(async () => {
-      const meta = systemCommandMeta(input.origin, undefined, options)
+      // actor/source 与实体 origin 分开：工具写入由宿主派生 assistant:<session> + tool:*；
+      // 缺省仍沿用旧行为（actor/origin 都取 input.origin），后台/旧调用语义不变。
+      const actor = options.actor ?? input.origin
+      const source = options.source ?? input.origin
+      const meta = systemCommandMeta(actor, source, options)
       let outcome: CommandOutcome
       try {
         outcome = await this.writer.execute({ type: 'CreateEntity', input }, meta)
@@ -248,24 +253,36 @@ export class PostgresStore implements Store {
     })
   }
 
-  async archive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void> {
+  async archive(
+    id: string,
+    reason: string,
+    actor: string,
+    expectedRevision?: number,
+    authorization?: AuditAuthorization,
+  ): Promise<void> {
     await this.run(async () => {
       await this.writer.execute(
         { type: 'ArchiveEntity', id, reason },
         {
-          ...systemCommandMeta(actor),
+          ...systemCommandMeta(actor, authorization?.source ?? actor),
           ...(expectedRevision === undefined ? {} : { expectedRevision }),
         },
       )
     })
   }
 
-  async unarchive(id: string, reason: string, actor: string, expectedRevision?: number): Promise<void> {
+  async unarchive(
+    id: string,
+    reason: string,
+    actor: string,
+    expectedRevision?: number,
+    authorization?: AuditAuthorization,
+  ): Promise<void> {
     await this.run(async () => {
       await this.writer.execute(
         { type: 'UnarchiveEntity', id, reason },
         {
-          ...systemCommandMeta(actor),
+          ...systemCommandMeta(actor, authorization?.source ?? actor),
           ...(expectedRevision === undefined ? {} : { expectedRevision }),
         },
       )
@@ -289,7 +306,7 @@ export class PostgresStore implements Store {
           ...(create === undefined ? {} : { create }),
           ...(input.expectedRevision === undefined ? {} : { expectedRevision: input.expectedRevision }),
         },
-        this.metaFor(input.actor, input.commandId),
+        this.metaFor(input.actor, input.commandId, input.source),
       )
       const result = outcome.supersede
       if (result === undefined) throw new OmbFailure(internal('取代没有返回结果'))
@@ -308,7 +325,7 @@ export class PostgresStore implements Store {
           ...(input.effectiveAt === undefined ? {} : { effectiveAt: input.effectiveAt }),
           ...(input.expectedRevision === undefined ? {} : { expectedRevision: input.expectedRevision }),
         },
-        this.metaFor(input.actor, input.commandId),
+        this.metaFor(input.actor, input.commandId, input.source),
       )
       const result = outcome.retract
       if (result === undefined) throw new OmbFailure(internal('证伪没有返回结果'))
@@ -316,9 +333,9 @@ export class PostgresStore implements Store {
     })
   }
 
-  /** 外部幂等键只覆盖 commandId；actor/origin 仍由 actor 推导。 */
-  private metaFor(actor: string, commandId: string | undefined): ReturnType<typeof systemCommandMeta> {
-    const meta = systemCommandMeta(actor)
+  /** 外部幂等键只覆盖 commandId；actor/origin 仍由 actor/source 推导。 */
+  private metaFor(actor: string, commandId: string | undefined, source?: string): ReturnType<typeof systemCommandMeta> {
+    const meta = systemCommandMeta(actor, source ?? actor)
     return commandId === undefined ? meta : { ...meta, commandId }
   }
 
@@ -345,7 +362,9 @@ export class PostgresStore implements Store {
     return this.run(async () => {
       const outcome = await this.writer.execute(
         { type: 'Link', input },
-        systemCommandMeta(input.origin ?? 'model'),
+        // actor 取 input.origin（工具路径是 assistant:<session>），审计 source 取 input.source
+        // （工具路径是 tool:omb_link）；缺省都退回 'model'，与 7.1 行为一致。
+        systemCommandMeta(input.origin ?? 'model', input.source ?? input.origin ?? 'model'),
       )
       const link = outcome.link
       if (link === undefined) throw new OmbFailure(internal('链接写入没有返回链接'))
@@ -353,9 +372,9 @@ export class PostgresStore implements Store {
     })
   }
 
-  async unlink(id: string, actor: string): Promise<void> {
+  async unlink(id: string, actor: string, source?: string): Promise<void> {
     await this.run(async () => {
-      await this.writer.execute({ type: 'Unlink', linkId: id }, systemCommandMeta(actor))
+      await this.writer.execute({ type: 'Unlink', linkId: id }, systemCommandMeta(actor, source ?? actor))
     })
   }
 
@@ -998,8 +1017,8 @@ export class PostgresStore implements Store {
     return this.run(() => this.writer.recordAudit(entry))
   }
 
-  async rollback(auditId: number, actor: string): Promise<RollbackResult> {
-    return this.run(() => this.writer.rollback(auditId, actor))
+  async rollback(auditId: number, actor: string, authorization?: AuditAuthorization): Promise<RollbackResult> {
+    return this.run(() => this.writer.rollback(auditId, actor, authorization))
   }
 
   // 检索通道由本类的独立查询实现，避免把图/融合逻辑塞进 Store。

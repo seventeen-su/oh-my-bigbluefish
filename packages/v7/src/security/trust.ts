@@ -1,4 +1,5 @@
 import type { Entity, Scope } from '../domain/entity.js'
+import { auditActorKindOf, type AuditActorKind } from '../domain/audit.js'
 import { scopeOf, titleOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
 
@@ -20,8 +21,13 @@ import type { JsonValue } from '../domain/json.js'
 /** 内容来源类别。 */
 export type ContextSource = 'memory' | 'artifact' | 'tool' | 'external' | 'system'
 
-/** 写入者类别（与 `AuditEntry.actor` / `entity.origin` 的命名空间一致）。 */
-type TrustActorKind = 'user' | 'model' | 'job' | 'system' | 'external'
+/**
+ * 写入者类别（与 `AuditEntry.actor` / `entity.origin` 的命名空间一致）。
+ *
+ * 7.2.4 起工具写入的 actor 是 `assistant`、外部/工具内容来源是 `tool`；`model` 与
+ * `external` 是 7.1 及以前的历史别名，继续按同分处理，避免旧记忆升级后信任跳变。
+ */
+type TrustActorKind = AuditActorKind
 
 /** 注入风险等级；`high` 的块默认被隔离，原文不注入。 */
 export type InjectionRisk = 'low' | 'medium' | 'high'
@@ -29,7 +35,9 @@ export type InjectionRisk = 'low' | 'medium' | 'high'
 /** 默认写入者信任分（与 ARCHITECTURE-PLAN §4.8 一致）。 */
 export const DEFAULT_TRUST_LEVELS: Readonly<Record<TrustActorKind, number>> = Object.freeze({
   user: 1,
+  assistant: 0.8,
   model: 0.8,
+  tool: 0.4,
   job: 0.6,
   external: 0.3,
   system: 1,
@@ -192,12 +200,7 @@ function clamp01(value: number): number {
 
 /** 写入者/来源字符串 → actor 类别；未知来源按 model 处理（不让内容自称提权）。 */
 export function actorKindOfOrigin(origin: string | undefined): TrustActorKind {
-  const normalized = (origin ?? '').trim().toLowerCase()
-  if (normalized === 'user' || normalized.startsWith('user:')) return 'user'
-  if (normalized === 'job' || normalized.startsWith('job:')) return 'job'
-  if (normalized === 'system' || normalized.startsWith('system:')) return 'system'
-  if (normalized === 'external' || normalized.startsWith('external:')) return 'external'
-  return 'model'
+  return auditActorKindOf(origin)
 }
 
 function defaultOriginOf(source: ContextSource): string {

@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import type { Attribute, Entity, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
+import type { AuditAuthorization } from '../../domain/audit.js'
 import { attributeValue, scopeOf } from '../../domain/entity-access.js'
 import { OmbFailure, conflict, internal, invalid, notFound } from '../../domain/errors.js'
 import { newId } from '../../domain/ids.js'
@@ -318,13 +319,15 @@ export class AttributeWriter implements CommandWriter {
     // attribute 有 entity 外键，entity 必须先插入；归档时间只由属性行里的 status 决定。
     const archivedAt = autoArchivedAt(input.kind, input.attributes, now)
     const archived = archivedAt !== null
+    // 实体 origin 是内容出处（trust/检索先验），审计 source 是本次授权来源：
+    // 两者必须分开——后台刷新（source=system:refresh）不能把实体出处从 job 改成 system。
     const entityResult = await client.query<EntityRow>(
       `insert into omb.entity (
          id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason,
          is_current, content_key, lifecycle, valid_from
        ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true,$8,'active', now())
        returning *`,
-      [input.id, input.kind, meta.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null, contentHash],
+      [input.id, input.kind, input.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null, contentHash],
     )
     const entityRow = entityResult.rows[0]
     if (entityRow === undefined) throw new OmbFailure(internal('实体写入没有返回行'))
@@ -448,7 +451,7 @@ export class AttributeWriter implements CommandWriter {
         input.pinned,
         archivedAt,
         archivedAt === null ? null : 'auto-status',
-        meta.origin,
+        input.origin,
         contentHash,
         patch.expectedRevision,
       ],
@@ -1217,9 +1220,9 @@ export class AttributeWriter implements CommandWriter {
   }
 
   /** 审计回滚（维护入口）：委托 writer-rollback，事务边界与错误映射留在本类。 */
-  async rollback(auditId: number, actor: string): Promise<RollbackResult> {
+  async rollback(auditId: number, actor: string, authorization?: AuditAuthorization): Promise<RollbackResult> {
     try {
-      return await this.db.transaction(client => rollbackAudit(client, auditId, actor))
+      return await this.db.transaction(client => rollbackAudit(client, auditId, actor, authorization))
     } catch (error) {
       throw mapPgError(error)
     }

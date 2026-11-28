@@ -2,6 +2,7 @@ export type OmbErrorCode =
   | 'invalid-input'
   | 'not-found'
   | 'conflict'
+  | 'forbidden'
   | 'archived'
   | 'db-unavailable'
   | 'sandbox-timeout'
@@ -39,6 +40,11 @@ export function notFound(message: string, details?: unknown): OmbError {
 
 export function conflict(message: string, details?: unknown): OmbError {
   return { code: 'conflict', message, details }
+}
+
+/** 越权/授权失败：调用方已通过参数校验，但当前 actor/租户对目标没有权限。 */
+export function forbidden(message: string, details?: unknown): OmbError {
+  return { code: 'forbidden', message, details, retryable: false }
 }
 
 export function internal(message: string, details?: unknown): OmbError {
