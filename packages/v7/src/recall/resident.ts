@@ -602,13 +602,17 @@ export async function buildResident(
     if (!kept) droppedSections.push(candidate.name)
   })
   // receipt 与 trace 同行落库（resident_trace.sections 是现有的注入证据通道）。
-  // entityIds 置空：receipt 里的 id 是常驻段块 id（resident:preferences 等），不是实体 id。
+  // 同时记录真正进入文本的实体 id，供逐实体对账；receipt 里的块 id 仍保留在 text。
+  const receiptEntityIds = [...new Set(candidates.flatMap((candidate, index) => {
+    const blockId = residentBlockId(candidate, index)
+    return keptBlockIds.has(blockId) ? candidate.entityIds : []
+  }))]
   sections.push({
     name: 'injection-receipt',
     tokens: receipt.usedTokens,
     kept: receipt.injected,
     text: JSON.stringify(receipt),
-    entityIds: [],
+    entityIds: receiptEntityIds,
   })
 
   const preferenceBlock = candidates.findIndex(candidate => candidate.name === 'preferences')

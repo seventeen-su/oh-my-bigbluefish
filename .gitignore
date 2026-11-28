@@ -3,7 +3,6 @@ node_modules/
 /lib/
 dist/
 *.tsbuildinfo
-lib-gen/
 
 # 运行时数据与日志
 .omb/
@@ -11,8 +10,8 @@ lib-gen/
 .omb-heartbeat.jsonl
 test-results/
 
-# BGE 权重约 24MB；不进 git，用 `node scripts/v7-fetch-model.mjs` 获取
-models/
+# BGE 权重随包分发，GitHub 安装不依赖额外下载脚本。
+# 若仓库过大，可改用 release 资产并在 README 说明手动放置模型。
 
 # 本地临时探针
 .tmp/

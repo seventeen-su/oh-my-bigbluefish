@@ -1,0 +1,11 @@
+{
+  "generation": 55,
+  "outDir": "v7-g55",
+  "entry": "plugin/v7/index.ts",
+  "artifact": "plugin/v7/index.js",
+  "bytes": 1317218,
+  "sha256": "82fd68d6571a6b521e23c96d85a18894674dd6ea9aa6cf906e0b5bed87e332d9",
+  "version": "7.0.0",
+  "node": "v24.21.0",
+  "builtAt": "2026-11-28T10:46:12.507Z"
+}

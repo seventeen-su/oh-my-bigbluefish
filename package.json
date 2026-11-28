@@ -7,7 +7,7 @@
   },
   "type": "module",
   "icon": "./icon.svg",
-  "description": "OMB v7：DSH 的单库属性化认知增强插件（PostgreSQL + pgvector）。",
+  "description": "基于 DSH 的记忆增强插件。",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.v7.yml"
@@ -16,8 +16,10 @@
   "exports": {
     "./package.json": "./package.json",
     "./icon.svg": "./icon.svg",
-    "./v7": "./lib-gen/v7-g53/plugin/v7/index.js",
-    "./v7/icon": "./icon.svg"
+    "./locale/*.json": "./locale/*.json",
+    "./v7": "./lib-gen/v7-g55/plugin/v7/index.js",
+    "./v7/icon": "./icon.svg",
+    "./v7/locale/*.json": "./locale/v7/*.json"
   },
   "scripts": {
     "test": "vitest run --config vitest.v7.config.ts",
@@ -63,13 +65,14 @@
     "vitest": "^3.2.7"
   },
   "files": [
+    "README.md",
     "lib-gen",
-    "packages/v7",
-    "plugin/v7",
+    "locale",
     "skills",
     "icon.svg",
     "cordis.patch.v7.yml",
-    "models"
+    "models",
+    "version-manifest.json"
   ],
-  "main": "./lib-gen/v7-g53/plugin/v7/index.js"
+  "main": "./lib-gen/v7-g55/plugin/v7/index.js"
 }

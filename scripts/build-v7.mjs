@@ -6,7 +6,7 @@
  */
 import { build } from 'esbuild'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -153,6 +153,12 @@ function publish({ built, version, manifestText, record }) {
     rmSync(stage, { recursive: true, force: true })
     mkdirSync(join(stage, 'plugin', 'v7'), { recursive: true })
     writeFileSync(join(stage, ARTIFACT), built.text, 'utf8')
+    // 把迁移放在产物旁边：GitHub/npm 安装没有仓库源码，启动时仍能直接找到 001–010。
+    cpSync(
+      join(ROOT, 'packages/v7/src/adapters/postgres/migrations'),
+      join(stage, 'plugin', 'v7', 'migrations'),
+      { recursive: true },
+    )
     if (existsSync(target)) rmSync(target, { recursive: true, force: true })
     renameSync(stage, target)
     writeJsonAtomic(GENERATION_FILE, {
