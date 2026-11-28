@@ -34,7 +34,9 @@ interface PendingSignal extends DurableSignal {
 }
 
 interface ShownCheckpoint {
-  readonly key: string
+  /** 只由待记录信号决定；级别变化（new/stale/missed）不重置同轮次数。 */
+  readonly signature: string
+  readonly count: number
   readonly turn?: number
   readonly step?: number
 }
@@ -50,8 +52,10 @@ interface SessionMemory {
 
 const SESSION_LIMIT = 256
 const PENDING_LIMIT = 4
-/** 同一轮首次显示后，连续这么多步仍未写就再提醒一次。 */
-const STALE_STEPS = 3
+/** 同一轮首次显示后，至少隔这么多步仍未写才再提醒；避免长工具循环每 3 步刷屏。 */
+const SAME_TURN_REPEAT_STEPS = 12
+/** 同一轮最多显示两次：首次 + 一次升级；跨轮会重新从首次开始。 */
+const MAX_SAME_TURN_SHOWN = 2
 const MAX_EXCERPT = 140
 
 function compact(input: string): string {
@@ -90,7 +94,10 @@ export class MemoryCheckpointLedger {
     if (state.lastUserHash === digest && state.lastUserTurn === position.turn) return
     state.lastUserHash = digest
     state.lastUserTurn = position.turn
+    // 只提醒 strong 信号。weak 结果保留给诊断，但不能进入检查点；
+    // 否则“默认”“必须完成这个任务”这类当前指令会被当成长期偏好。
     const signals = detectDurableSignals(trimmed, PENDING_LIMIT)
+      .filter(signal => signal.strength === 'strong')
     if (signals.length === 0) return
     for (const signal of signals) {
       if (state.pending.some(item => item.text === signal.text && item.kind === signal.kind)) continue
@@ -123,7 +130,8 @@ export class MemoryCheckpointLedger {
   /**
    * 生成本次 pre-step 的检查点文本；空串表示不显示，并应覆盖写空以清掉旧文本。
    *
-   * 显示策略：首次/信号变化/跨轮立即显示；同一轮同一信号只在连续 3 步未销账时再显示。
+   * 显示策略：首次/信号变化/跨轮立即显示；同一轮最多两次，第二次至少隔 12 步。
+   * 这样既不会等到 Timeline 的 24 步才提醒，也不会在长工具循环里每 3 步刷屏。
    */
   render(sessionId: string, position: MemoryPosition = {}): string {
     const state = this.sessions.get(sessionId)
@@ -140,21 +148,23 @@ export class MemoryCheckpointLedger {
       item.turn !== undefined && position.turn !== undefined && item.turn < position.turn
     ))
     const stale = state.pending.some(item => (
-      item.step !== undefined && position.step !== undefined && position.step - item.step >= STALE_STEPS
+      item.step !== undefined && position.step !== undefined && position.step - item.step >= SAME_TURN_REPEAT_STEPS
     ))
     const signature = state.pending.map(item => `${item.kind}:${item.text}`).join('\u0000')
-    const level = missed ? 'missed' : stale ? 'stale' : 'new'
-    const key = `${signature}\u0000${level}`
     const shown = state.shown
     const sameTurn = shown !== undefined && shown.turn === position.turn
-    const recentlyShown = sameTurn
-      && shown.step !== undefined
-      && position.step !== undefined
-      && position.step - shown.step < STALE_STEPS
-    // 同一轮已经显示过，且还没到升级步数：不重复占用提示预算。
-    if (shown !== undefined && shown.key === key && recentlyShown) return ''
+    if (shown !== undefined && shown.signature === signature && sameTurn) {
+      // 同一轮同一批信号：最多显示两次，第二次只在隔够步数后出现。
+      if (shown.count >= MAX_SAME_TURN_SHOWN) return ''
+      if (shown.step === undefined || position.step === undefined) return ''
+      if (position.step - shown.step < SAME_TURN_REPEAT_STEPS) return ''
+    }
+    const count = shown !== undefined && shown.signature === signature && sameTurn
+      ? shown.count + 1
+      : 1
     state.shown = {
-      key,
+      signature,
+      count,
       ...(position.turn === undefined ? {} : { turn: position.turn }),
       ...(position.step === undefined ? {} : { step: position.step }),
     }

@@ -27,6 +27,13 @@ describe('主动记忆信号识别', () => {
     expect(detectDurableSignals('不是 A，而是 B')[0]).toMatchObject({ kind: 'correction', strength: 'strong' })
   })
 
+  it('弱约束只返回 weak，供上层过滤掉，不主动提醒', () => {
+    expect(detectDurableSignals('确保提醒机制和频率合理，时间线默认的是每24步')[0]).toMatchObject({
+      strength: 'weak',
+      kind: 'constraint',
+    })
+  })
+
   it('普通请求、代码修改指令和一次性任务细节不触发', () => {
     expect(detectDurableSignals('帮我看下这个报错')).toEqual([])
     expect(detectDurableSignals('这个函数要改成 async')).toEqual([])

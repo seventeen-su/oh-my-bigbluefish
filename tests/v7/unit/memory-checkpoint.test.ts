@@ -13,13 +13,25 @@ describe('主动记忆检查点账本', () => {
     expect(text).toContain('不要只说“我会记住”')
   })
 
-  it('同一轮已经显示后在升级步数之前不重复显示', () => {
+  it('同一轮最多显示两次，第二次至少隔 12 步', () => {
     const ledger = new MemoryCheckpointLedger()
     ledger.observeUserMessage('s1', '我们决定采用方案 B', { turn: 1, step: 1 })
     expect(ledger.render('s1', { turn: 1, step: 1 })).not.toBe('')
     expect(ledger.render('s1', { turn: 1, step: 2 })).toBe('')
-    expect(ledger.render('s1', { turn: 1, step: 3 })).toBe('')
-    expect(ledger.render('s1', { turn: 1, step: 4 })).toContain('已连续多步未记录')
+    expect(ledger.render('s1', { turn: 1, step: 12 })).toBe('')
+    expect(ledger.render('s1', { turn: 1, step: 13 })).toContain('已连续多步未记录')
+    expect(ledger.render('s1', { turn: 1, step: 24 })).toBe('')
+  })
+
+  it('给定 weak 信号当观察用户消息则不进入检查点，避免误报', () => {
+    const ledger = new MemoryCheckpointLedger()
+    ledger.observeUserMessage('s1', '确保提醒机制和频率合理，时间线默认的是每24步，我们当前是怎样', {
+      turn: 1,
+      step: 1,
+    })
+
+    expect(ledger.pendingCount('s1')).toBe(0)
+    expect(ledger.render('s1', { turn: 1, step: 1 })).toBe('')
   })
 
   it('跨轮仍未写则升级为上一轮未记录', () => {
