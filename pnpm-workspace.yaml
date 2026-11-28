@@ -4,6 +4,10 @@ packages:
 # 宿主 peer 不物理装入本仓库：v7 只通过结构化 ctx.get 访问宿主。
 autoInstallPeers: false
 
+overrides:
+  # eslint 9 的 minimatch@3 仍依赖 1.x；只修 1.x 的 brace-expansion，升级到已修复补丁。
+  brace-expansion@1: 1.1.21
+
 allowBuilds:
   esbuild: true
   onnxruntime-node: false
