@@ -3,7 +3,7 @@
  *
  * 为什么需要自检：DSH 运行期改写 profile 触发 HMR recompose 后，插件可能
  * 「enabled 但无 fiber」，7 个 omb_* 工具静默消失，宿主 loader 不给 diagnostic
- * （docs/v7/review/audit/02-runtime-host.md §0）。所以插件必须自己记下
+ * （历史运行审查结论）。所以插件必须自己记下
  * 「准备注册 7 个工具、接线 4 个钩子」，并让 `omb_status` 报真实读数。
  *
  * 自检只在两类时机发生，不做周期性轮询：
@@ -386,3 +386,4 @@ export async function valueWithin<T>(work: Promise<T> | (() => Promise<T>), time
     if (timer !== undefined) clearTimeout(timer)
   }
 }
+

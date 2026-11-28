@@ -172,7 +172,7 @@ describe('项目身份注册表与旧 projectKey 兼容匹配（真实 PostgreSQ
         note: {
           $dynamic: {
             kind: 'file',
-            path: 'docs/v7/REQUIREMENTS.md',
+            path: 'tests/fixtures/dynamic.md',
             extract: { kind: 'text' },
           },
         },
@@ -196,7 +196,7 @@ describe('项目身份注册表与旧 projectKey 兼容匹配（真实 PostgreSQ
 
     const note = refreshed === undefined ? undefined : attributeValue(refreshed, 'note')
     expect(typeof note).toBe('string')
-    expect(note).toContain('v7 需求原文')
+    expect(note).toContain('OMB dynamic fixture')
     await db.close()
   })
 
@@ -208,7 +208,7 @@ describe('项目身份注册表与旧 projectKey 兼容匹配（真实 PostgreSQ
       scope: { kind: 'project', projectKey: UNREGISTERED_PROJECT_ID },
       attrs: {
         title: '无锚点文件动态值',
-        note: { $dynamic: { kind: 'file', path: 'docs/v7/REQUIREMENTS.md', extract: { kind: 'text' } } },
+        note: { $dynamic: { kind: 'file', path: 'tests/fixtures/dynamic.md', extract: { kind: 'text' } } },
       },
     })
     const dynamic = new DynamicService({
@@ -224,3 +224,4 @@ describe('项目身份注册表与旧 projectKey 兼容匹配（真实 PostgreSQ
     await db.close()
   })
 })
+

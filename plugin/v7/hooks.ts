@@ -317,7 +317,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
    * 汇总本步的 T1 准备结果（只计算 + 写 T0），不碰 decision：
    * - T0（常驻）仍写 `systemPrompt.context` provider（promptSink）；空 T0 也覆盖写空串（RUN-04）；
    * - T1（事件召回）不再写 promptSink：provider 是装配期快照，逐步骤高频 T1 会退化成
-   *   整段重装配（docs/v7/review/RESEARCH.md §8 #2）。T1 的注入口是 pre-step 的
+   *   整段重装配（历史审查结论）。T1 的注入口是 pre-step 的
    *   `decision.messages`（packages/core/agent/src/runtime-types.ts:139-146）：追加一条
    *   producer-owned user message，宿主准入时落成 durable `user/message`
    *   （time-context 同款：packages/context/time-context/src/index.ts:199-242）。
@@ -536,3 +536,4 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     },
   }
 }
+

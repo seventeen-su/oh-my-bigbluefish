@@ -1,6 +1,6 @@
 -- OMB v7.x contract：删除已确认零运行时读取的旧列/派生冗余列。
 --
--- 依据：docs/v7/review/legacy-columns.md（只读审计）与用户 2026-11-28 的直接删除授权。
+-- 依据：历史旧字段审计与用户 2026-11-28 的直接删除授权。
 -- 约束：
 -- * 本迁移与代码同批发布：`entity_view` 的 8 个派生列已从 writer/rows 停写，
 --   `chain_member.source` 已从写路径移除；旧进程（g55 之前）不能与 011 同时运行。
@@ -40,3 +40,4 @@ alter table omb.entity_view
   drop column if exists attr_names;
 
 alter table omb.chain_member drop column if exists source;
+

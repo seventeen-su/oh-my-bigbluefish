@@ -3,7 +3,7 @@
  *
  * 背景：DSH 正在运行时改写 profile 会触发 HMR recompose；实测一次运行期
  * profile 改写让 `include:omb-v7` 变成「enabled 但无 fiber」，7 个 omb_* 工具
- * 静默消失，loader 也不给 diagnostic（docs/v7/review/audit/02-runtime-host.md §0）。
+ * 静默消失，loader 也不给 diagnostic（历史运行审查结论）。
  * 所以「运行中热写 profile」必须默认拒绝，只有显式 `--force` 或
  * `OMB_DEPLOY_ALLOW_RUNNING=1` 才放行。
  *
@@ -114,3 +114,4 @@ export function describeDenied(result) {
     '请先关闭 DSH 再部署。确实需要热写时显式加 --force，或设置 OMB_DEPLOY_ALLOW_RUNNING=1。',
   ].join('\n')
 }
+

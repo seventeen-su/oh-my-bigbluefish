@@ -120,7 +120,7 @@ describe('T1 pre-step 闸门', () => {
   })
 
   it('给定用户消息含路径当判断 pre-step 召回则为 true', () => {
-    expect(shouldRecallOnPreStep({ pending: false, text: '看下 docs/v7/SPEC.md' })).toBe(true)
+    expect(shouldRecallOnPreStep({ pending: false, text: '看下 docs/ARCHITECTURE.md' })).toBe(true)
   })
 
   it('给定普通用户消息当判断 pre-step 召回则为 false', () => {
@@ -154,3 +154,4 @@ describe('T1 工具结果闸门', () => {
     expect(shouldRecallToolResult({ failed: false, argumentsText: 'ls', resultText: 'total 0' })).toBe(false)
   })
 })
+

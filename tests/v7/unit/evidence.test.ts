@@ -45,17 +45,17 @@ describe('normalizeEvidence（边界归一化）', () => {
     expect(normalizeEvidence({ sourceType: 'session', sourceId: 'session:a', observedAt: 'not-a-time' })).toBeUndefined()
     const normalized = normalizeEvidence({
       sourceType: 'file',
-      sourceId: 'file:docs/v7/SPEC.md',
+      sourceId: 'file:docs/ARCHITECTURE.md',
       observedAt: NOW,
       confidence: 7,
       verificationStatus: 'bogus' as never,
-      subjectKey: 'file:docs/v7/SPEC.md',
+      subjectKey: 'file:docs/ARCHITECTURE.md',
     })
     expect(normalized).toMatchObject({
       sourceType: 'file',
       confidence: 1,
       verificationStatus: 'unverified',
-      subjectKey: 'file:docs/v7/SPEC.md',
+      subjectKey: 'file:docs/ARCHITECTURE.md',
     })
   })
 })
@@ -76,13 +76,13 @@ describe('独立来源判定（不再只数 session:<id>）', () => {
 
   it('两个会话引用同一文件只算一份独立验证；不同文件才算两份', () => {
     const sameFile = summarizeEvidence([
-      record({ sourceType: 'file', sourceId: 'file:docs/v7/SPEC.md', subjectKey: 'file:docs/v7/SPEC.md' }),
-      record({ sourceType: 'file', sourceId: 'file:docs/v7/SPEC.md', subjectKey: 'file:docs/v7/SPEC.md' }),
+      record({ sourceType: 'file', sourceId: 'file:docs/ARCHITECTURE.md', subjectKey: 'file:docs/ARCHITECTURE.md' }),
+      record({ sourceType: 'file', sourceId: 'file:docs/ARCHITECTURE.md', subjectKey: 'file:docs/ARCHITECTURE.md' }),
     ])
     expect(sameFile.independent).toBe(1)
     const differentFiles = summarizeEvidence([
-      record({ sourceType: 'file', sourceId: 'file:docs/v7/SPEC.md', subjectKey: 'file:docs/v7/SPEC.md' }),
-      record({ sourceType: 'file', sourceId: 'file:docs/v7/PLAN.md', subjectKey: 'file:docs/v7/PLAN.md' }),
+      record({ sourceType: 'file', sourceId: 'file:docs/ARCHITECTURE.md', subjectKey: 'file:docs/ARCHITECTURE.md' }),
+      record({ sourceType: 'file', sourceId: 'file:docs/CONTRIBUTING.md', subjectKey: 'file:docs/CONTRIBUTING.md' }),
     ])
     expect(differentFiles.independent).toBe(2)
   })
@@ -135,7 +135,7 @@ describe('证据生产者（system/tool/file/session）', () => {
   it('文件引用只产生 file 证据：同一文件的多个会话不会成为多份验证', () => {
     const input = clue({
       title: '接口超时结论',
-      body: '按 docs/v7/SPEC.md 与 packages/v7/src/app/recall.ts 的说明，超时来自重试。',
+      body: '按 docs/ARCHITECTURE.md 与 packages/v7/src/app/recall.ts 的说明，超时来自重试。',
     })
     const first = evidenceForWrite(input, { sessionId: 'session:a', tool: 'omb_remember', now: NOW })
     const second = evidenceForWrite(input, { sessionId: 'session:b', tool: 'omb_remember', now: NOW })
@@ -178,3 +178,4 @@ describe('证据生产者（system/tool/file/session）', () => {
     expect(verificationEvidence({ entityId: 'mem_x', now: NOW, verified: false, detail: 'no' }).verificationStatus).toBe('refuted')
   })
 })
+

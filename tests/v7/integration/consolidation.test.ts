@@ -64,7 +64,7 @@ describe('background consolidation', () => {
       scope: { kind: 'project', projectKey: PROJECT },
       attrs: {
         title: '文件动态值',
-        note: { $dynamic: { kind: 'file' as const, path: 'docs/v7/REQUIREMENTS.md', extract: { kind: 'text' as const } } },      },
+        note: { $dynamic: { kind: 'file' as const, path: 'tests/fixtures/dynamic.md', extract: { kind: 'text' as const } } },      },
     })
     const dynamic = new DynamicService({
       store: db,
@@ -77,7 +77,7 @@ describe('background consolidation', () => {
     const loaded = await db.get(entity.entity.id)
     const note = loaded === undefined ? undefined : attributeValue(loaded, 'note')
     expect(typeof note).toBe('string')
-    expect(note).toContain('v7 需求原文')
+    expect(note).toContain('OMB dynamic fixture')
     await db.close()
   })
 
@@ -526,3 +526,4 @@ describe('background consolidation', () => {
     await db.close()
   })
 })
+

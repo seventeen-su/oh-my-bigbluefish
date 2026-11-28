@@ -108,7 +108,7 @@ describe('线索晋升必须有真实证据（Evidence 账本）', () => {
   it('两个会话引用同一文件只算一份独立验证 → 不晋升', async () => {
     const attrs = {
       title: '构建失败原因',
-      body: '根据 docs/v7/SPEC.md 的预算表，失败原因是内存超限。',
+      body: '根据 docs/ARCHITECTURE.md 的预算表，失败原因是内存超限。',
     }
     // 用真实证据生产者：内容里出现文件路径时只产生 file 证据（同一文件同一 subjectKey）。
     const first = await writeClue(attrs, 'f1', evidenceForWrite(clue(attrs), { sessionId: 'session-a', tool: 'omb_remember', now: NOW }))
@@ -178,3 +178,4 @@ describe('线索晋升必须有真实证据（Evidence 账本）', () => {
     expect(attributeValue((await db.get(written.entity.id))!, 'category')).toBe('clue')
   })
 })
+
