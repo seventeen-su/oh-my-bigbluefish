@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件给维护者和 AI agent 使用。当前版本：**OMB 7.1.18**。当前架构见 `docs/ARCHITECTURE.md`，参与开发见 `docs/CONTRIBUTING.md`，安全边界见 `docs/SECURITY.md`。
+本文件给维护者和 AI agent 使用。当前版本：**OMB 7.2.4**。当前架构见 `docs/ARCHITECTURE.md`，参与开发见 `docs/CONTRIBUTING.md`，安全边界见 `docs/SECURITY.md`。
 
 ## 命令
 
@@ -46,13 +46,17 @@ domain <- ports <- app/retrieval/recall/jobs <- adapters <- plugin/v7
 11. 后台任务用事件、timer、CAS 和 outbox，不新增固定轮询。
 12. `dispose` 必须等待后台任务、LISTEN、连接池和宿主钩子收尾。
 13. 数据库迁移一旦发布不再修改；校验和变化会被拒绝。
-14. 生产数据库、profile 和真实用户会话不得用于实验。
+14. 10 个巩固任务必须保留真实 workflow definition；timer 只 startRun，step 与队列共用同一个 runner。
+15. T0/T1/T2 必须写逐实体 receipt；adoption 只能从 receipt 的 kept/quarantined 派生，不能从 recall_event 推断。
+16. 审计 actor/source 必须由宿主上下文派生；项目是授权边界，回滚要在工具层和事务层双检。
+17. 生产数据库、profile 和真实用户会话不得用于实验。
 
 ## 文档与提交
 
 - 只维护当前文档：`README.md`、`docs/ARCHITECTURE.md`、`docs/CONTRIBUTING.md`、`docs/SECURITY.md`、`AGENTS.md`、`THIRD_PARTY_NOTICES.md`。
 - 不提交历史计划、审查快照、个人工作记录、本机绝对路径、会话日志、数据库转储或凭据。
-- 提交信息使用 `type: subject`，空行后编号正文；正文必须真实换行，不能出现字面量 `\n`。
+- 提交信息使用 `type: subject`，空行后编号正文；正文必须真实换行，不能出现字面量 `
+`。
 - 作者/提交者统一为 `苏拾柒 <seventeen_su@proton.me>`。
 - 维护者可直接 push `main`；第三方走 PR，维护者审核后用 Merge commit 合并，保留 PR 作者与提交信息。
 - 发布用 annotated tag + GitHub Release，首行标注当前 DSH 适配版本。
@@ -67,4 +71,8 @@ pnpm v7:test:pg
 pnpm v7:build
 ```
 
+7.2.4 闸门：76 文件 / 864 unit、39 文件 / 421 PG；构建 g67 / 1,568,936 bytes。
+
 没有跑过的检查写“未验证”，不要写成“已完成”。
+
+

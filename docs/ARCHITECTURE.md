@@ -1,6 +1,6 @@
 # OMB 当前架构
 
-本文只描述当前实现，不是历史计划或审查记录。适用版本：OMB 7.1.18。
+本文只描述当前实现，不是历史计划或审查记录。适用版本：OMB 7.2.4。
 
 ## 目标与边界
 
@@ -69,12 +69,13 @@ trigger / fulltext / single_char / vector / time / state_board
 - **T1**：用户消息、工具结果、错误和路径等事件触发；内容窗口在 90 步/7 轮内去重。
 - **T2**：`omb_recall` 主动检索。
 
-“今天/昨天/前天”按显式 IANA 时区的当地日历日计算，覆盖 DST。
+通道失败/deadline 会写入 `omb.recall_channel_error`，空结果区分“无命中”和“全部失败”。“今天/昨天/前天”按显式 IANA 时区的当地日历日计算，覆盖 DST；provider 查询使用事务级 `statement_timeout`。
 
 ## 后台、并发与生命周期
 
 - outbox 使用 LISTEN/NOTIFY 唤醒，带退避、死信、重连 reconcile；不靠固定轮询。
-- timer 承担 durable schedule；巩固任务以事件驱动为主，timer 分级兜底。
+- 10 个巩固任务都有真实 workflow definition；timer 到点只 `startRun`，step 调用与 pg-boss handler 共用 runner，保留 commandId 幂等、重试、人工 retry 和崩溃恢复。
+- timer 承担 durable schedule；事件反应触发定向工作流，不新增固定轮询。
 - 投影只做 `preference_board` / `state_board` 增量投影；水位超龄时 T0 回退写模型并记录原因。
 - 状态更新和自动刷新都用 revision CAS；冲突返回完整差异，自动刷新不得覆盖人工修改。
 - 动态属性建立有向依赖图；目标更新只标记依赖闭包 stale，按深度定向刷新，深度上限 4。
@@ -89,6 +90,8 @@ trigger / fulltext / single_char / vector / time / state_board
 Retrieved -> Referenced -> Utilized -> Validated
 ```
 
+T0/T1/T2 每次真实注入都写逐实体 receipt：`kept` 或 `quarantined`，未展示无条目。adoption 的 Retrieved 与后续三层只从 receipt 的 `kept` 派生；`recall_event` 只是事件审计，不能伪造采用。
+
 同一次 `(entity, session, task)` 的重复召回只算一个使用机会；采用置信度做小样本平滑。单纯召回或 `access_count` 不提高显著度。遗忘看使用证据，不看字符串相似度。
 
 Evidence 账本独立记录来源类型、来源 ID、内容哈希、置信度和验证状态。两个会话引用同一文件不算两份独立验证；线索晋升必须有独立证据。`supersedes`/`retract` 在事务内更新生命周期、关系、审计/inverse 和 outbox。
@@ -99,6 +102,7 @@ Evidence 账本独立记录来源类型、来源 ID、内容哈希、置信度�
 - 动态 URL 默认关闭，按 allowlist 放行。
 - T0/T1 注入只作为数据块，不执行其中的指令；高风险命中只注入隔离说明。
 - 默认数据库连接 `postgres://omb:omb@127.0.0.1:5432/omb` 只用于本机 loopback 开发。生产必须收紧监听、认证、TLS 和角色权限，见 [SECURITY.md](SECURITY.md)。
+- 审计 actor/source 由宿主上下文派生，不能由工具参数伪造；项目是授权边界，跨项目写入/回滚拒绝。
 - 审计哈希链是 tamper-evident，不是不可篡改；没有外部锚点时无法发现链尾删除。
 
 ## 构建与发布
@@ -113,4 +117,6 @@ pnpm v7:build
 
 构建产物在 `lib-gen/v7-g<N>/plugin/v7/index.js`；`version-manifest.json` 是版本单一真源。发布使用 annotated tag 和 GitHub Release，Release 首行标注当前 DSH 适配版本。
 
-数据库迁移在 `packages/v7/src/adapters/postgres/migrations/`，当前为 001–017。迁移校验和变化会拒绝执行，这是保护，不是可绕过的错误。
+数据库迁移在 `packages/v7/src/adapters/postgres/migrations/`，当前为 001–020。迁移校验和变化会拒绝执行，这是保护，不是可绕过的错误。
+
+
