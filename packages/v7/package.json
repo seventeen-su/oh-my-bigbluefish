@@ -1,6 +1,6 @@
 {
   "name": "@omb/v7",
-  "version": "7.1.18",
+  "version": "7.2.4",
   "private": true,
   "type": "module",
   "description": "OMB v7 core: single PostgreSQL attribute store, two-stage retrieval, recall, consolidation.",

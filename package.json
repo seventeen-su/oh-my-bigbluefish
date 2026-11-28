@@ -1,6 +1,6 @@
 {
   "name": "oh-my-bigbluefish",
-  "version": "7.1.18",
+  "version": "7.2.4",
   "private": true,
   "author": "苏拾柒",
   "license": "GPL-3.0-only",
@@ -19,7 +19,7 @@
     "./package.json": "./package.json",
     "./icon.svg": "./icon.svg",
     "./locale/*.json": "./locale/*.json",
-    "./v7": "./lib-gen/v7-g66/plugin/v7/index.js",
+    "./v7": "./lib-gen/v7-g67/plugin/v7/index.js",
     "./v7/icon": "./icon.svg",
     "./v7/locale/*.json": "./locale/v7/*.json"
   },
@@ -80,5 +80,5 @@
     "models",
     "version-manifest.json"
   ],
-  "main": "./lib-gen/v7-g66/plugin/v7/index.js"
+  "main": "./lib-gen/v7-g67/plugin/v7/index.js"
 }

@@ -780,8 +780,8 @@ export class PostgresStore implements Store {
    * 召回事件批量写入（RET-14）。
    *
    * 旧实现每个 (hit, channel) 一行 INSERT：一次 limit=10 的召回最多 30 次往返。
-   * 现在一次 unnest 批量插入，再对本次涉及的全部 trace 做**一条**聚合更新；
-   * `retrieved_count` 仍按 distinct (trace, entity) 计数，多通道路径不会重复累计。
+   * 现在一次 unnest 批量插入；adoption 的 retrieved_count 由注入 receipt 派生，
+   * 不在 recall_event 层累加，避免多通道/伪造事件放大。
    */
   async recordRecall(events: readonly RecallEventInput[]): Promise<void> {
     if (events.length === 0) return
@@ -827,7 +827,6 @@ export class PostgresStore implements Store {
       )
       // recall_event 只是事件级审计：Retrieved/使用机会/采用层级全部由
       // `recordAdoptionReceipt` 的 kept/quarantined 派生（019）。
-    }))
     }))
   }
 

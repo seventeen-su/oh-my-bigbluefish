@@ -55,8 +55,7 @@ domain <- ports <- app/retrieval/recall/jobs <- adapters <- plugin/v7
 
 - 只维护当前文档：`README.md`、`docs/ARCHITECTURE.md`、`docs/CONTRIBUTING.md`、`docs/SECURITY.md`、`AGENTS.md`、`THIRD_PARTY_NOTICES.md`。
 - 不提交历史计划、审查快照、个人工作记录、本机绝对路径、会话日志、数据库转储或凭据。
-- 提交信息使用 `type: subject`，空行后编号正文；正文必须真实换行，不能出现字面量 `
-`。
+- 提交信息使用 `type: subject`，空行后编号正文；正文必须真实换行，不能出现字面量 `\n`。
 - 作者/提交者统一为 `苏拾柒 <seventeen_su@proton.me>`。
 - 维护者可直接 push `main`；第三方走 PR，维护者审核后用 Merge commit 合并，保留 PR 作者与提交信息。
 - 发布用 annotated tag + GitHub Release，首行标注当前 DSH 适配版本。

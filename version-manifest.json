@@ -1,6 +1,6 @@
 {
   "major": 7,
-  "description": "OMB 7.1.18 = 在 7.1 主动记忆基础上，修复热开关与生命周期、项目身份、状态并发、动态依赖、采用证据、巩固幂等、检索门控/时区与 supersedes 生命周期，并补齐审计链与数据库安全规范。",
+  "description": "OMB 7.2.4 = 在 7.1.18 基础上，把 10 个巩固任务迁为真实 workflow，补 T0 逐实体 receipt、receipt 派生的 adoption、审计 actor/项目授权边界，并收口检索 RET-05/08/10/11/14。",
   "features": [
     {
       "id": "v7-single-store",
@@ -51,7 +51,27 @@
         "连续断连、重复装配与 dispose 清理",
         "审计哈希链边界与数据库默认安全"
       ]
+    },
+    {
+      "id": "receipt-workflow-auth",
+      "name": "真实工作流、逐实体 receipt 与授权边界",
+      "since": "7.2",
+      "subfeatures": [
+        "10 个巩固任务全部有真实 workflow definition",
+        "timer 只 startRun，step 与 pg-boss handler 共用 runner",
+        "T0 逐实体 receipt：kept/quarantined 与 section",
+        "T1/T2 receipt 与 T0 共存",
+        "adoption 只从 T0/T1/T2 receipt 派生",
+        "伪造 recall_event 不影响采用",
+        "审计 actor/source 由宿主上下文派生",
+        "项目边界与越权写入/回滚拒绝",
+        "回滚 target 归属工具层与事务层双检",
+        "通道错误持久化与空原因区分",
+        "PG 事务级 statement_timeout 与 deadline 取消",
+        "RET-05 图扩展归因、RET-11 最小 state_board、RET-14 批量召回事件",
+        "迁移 019 adoption_receipt 与 020 recall_channel_error"
+      ]
     }
   ],
-  "version": "7.1.18"
+  "version": "7.2.4"
 }

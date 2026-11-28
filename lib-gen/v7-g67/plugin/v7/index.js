@@ -1,4 +1,4 @@
-/*! oh-my-bigbluefish v7.1.18 — OMB v7 服务端产物（scripts/build-v7.mjs 生成，勿手改）。入口 plugin/v7/index.ts */
+/*! oh-my-bigbluefish v7.2.4 — OMB v7 服务端产物（scripts/build-v7.mjs 生成，勿手改）。入口 plugin/v7/index.ts */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -28,6 +28,9 @@ function notFound(message, details) {
 }
 function conflict(message, details) {
   return { code: "conflict", message, details };
+}
+function forbidden(message, details) {
+  return { code: "forbidden", message, details, retryable: false };
 }
 function internal(message, details) {
   return { code: "internal", message, details };
@@ -2935,6 +2938,271 @@ var RegexService = class {
 };
 var defaultRegexService = new RegexService();
 
+// packages/v7/src/app/adoption.ts
+function entityReceiptsOf(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return void 0;
+  const entities = value["entities"];
+  if (entities === void 0) return void 0;
+  if (!Array.isArray(entities)) return [];
+  const byId = /* @__PURE__ */ new Map();
+  for (const item of entities) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const record2 = item;
+    const entityId = typeof record2["entityId"] === "string" ? record2["entityId"].trim() : "";
+    if (entityId.length === 0) continue;
+    const rawState = record2["state"];
+    if (rawState !== "kept" && rawState !== "quarantined") continue;
+    const state = rawState;
+    const previous = byId.get(entityId);
+    if (previous !== void 0 && (previous.state === "kept" || state === "quarantined")) continue;
+    byId.set(entityId, {
+      entityId,
+      state,
+      ...typeof record2["section"] === "string" && record2["section"].length > 0 ? { section: record2["section"] } : {},
+      ...typeof record2["blockId"] === "string" && record2["blockId"].length > 0 ? { blockId: record2["blockId"] } : {},
+      ...typeof record2["title"] === "string" && record2["title"].trim().length > 0 ? { title: record2["title"] } : {},
+      ...typeof record2["updatedAt"] === "string" && record2["updatedAt"].length > 0 ? { updatedAt: record2["updatedAt"] } : {}
+    });
+  }
+  return [...byId.values()];
+}
+function adoptionFieldsFromEntities(entities) {
+  const kept = entities.filter((entity) => entity.state === "kept");
+  const quarantined = entities.filter((entity) => entity.state === "quarantined");
+  return {
+    keptIds: kept.map((entity) => entity.entityId),
+    quarantinedIds: quarantined.map((entity) => entity.entityId),
+    droppedIds: [],
+    hits: [...kept, ...quarantined].map((entity, index) => ({
+      entityId: entity.entityId,
+      ...entity.title === void 0 ? {} : { title: entity.title },
+      ...entity.updatedAt === void 0 ? {} : { updatedAt: entity.updatedAt },
+      rank: index + 1
+    }))
+  };
+}
+function trimmedIds(ids) {
+  if (ids === void 0) return [];
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const raw of ids) {
+    const id = typeof raw === "string" ? raw.trim() : "";
+    if (id.length === 0 || seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+function adoptionReceiptHits(input2) {
+  const quarantined = new Set(trimmedIds(input2.quarantinedIds));
+  const dropped = new Set(trimmedIds(input2.droppedIds));
+  const kept = new Set(trimmedIds(input2.keptIds));
+  const hits = input2.hits ?? [];
+  const entities = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (id) => {
+    if (id.length === 0 || seen.has(id)) return;
+    seen.add(id);
+    entities.push(id);
+  };
+  for (const hit of hits) push(hit.entityId.trim());
+  for (const id of kept) push(id);
+  for (const id of quarantined) push(id);
+  for (const id of dropped) push(id);
+  const meta3 = /* @__PURE__ */ new Map();
+  for (const hit of hits) {
+    const id = hit.entityId.trim();
+    if (id.length === 0 || meta3.has(id)) continue;
+    meta3.set(id, hit);
+  }
+  return entities.map((entityId) => {
+    const hit = meta3.get(entityId);
+    const disposition = quarantined.has(entityId) ? "quarantined" : dropped.has(entityId) ? "dropped" : kept.has(entityId) || hit !== void 0 ? "kept" : "dropped";
+    return {
+      entityId,
+      disposition,
+      ...hit?.title === void 0 ? {} : { title: hit.title },
+      ...hit?.updatedAt === void 0 ? {} : { updatedAt: hit.updatedAt },
+      ...hit?.rank === void 0 ? {} : { rank: hit.rank }
+    };
+  });
+}
+function parseEmbeddedReceipt(text2) {
+  if (text2 === void 0 || !text2.trimStart().startsWith("{")) return void 0;
+  let parsed;
+  try {
+    parsed = JSON.parse(text2);
+  } catch {
+    return void 0;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return void 0;
+  const record2 = parsed;
+  const ids = (value) => Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
+  const entities = entityReceiptsOf(record2);
+  return {
+    ...typeof record2["injected"] === "boolean" ? { injected: record2["injected"] } : {},
+    ...typeof record2["budgetTokens"] === "number" ? { budgetTokens: record2["budgetTokens"] } : {},
+    ...typeof record2["usedTokens"] === "number" ? { usedTokens: record2["usedTokens"] } : {},
+    ...typeof record2["textHash"] === "string" ? { textHash: record2["textHash"] } : {},
+    keptIds: ids(record2["keptIds"]),
+    quarantinedIds: ids(record2["quarantinedIds"]),
+    droppedIds: ids(record2["droppedIds"]),
+    ...entities === void 0 ? {} : { entities }
+  };
+}
+function sectionFlag(section, name) {
+  const value = section[name];
+  return value === true;
+}
+var NON_HIT_SECTIONS = /* @__PURE__ */ new Set(["header", "index", "tool-hint", "injection-receipt"]);
+function adoptionReceiptFromResidentTrace(trace) {
+  const sections = trace.sections;
+  const first = sections[0];
+  const receiptSection = sections.find((section) => section.name === "injection-receipt");
+  const embedded = receiptSection === void 0 ? void 0 : parseEmbeddedReceipt(receiptSection.text);
+  const t1Trace = sections.length === 1 && first?.name === "injection-receipt";
+  const common = {
+    traceId: trace.traceId,
+    ...trace.sessionId === void 0 ? {} : { sessionId: trace.sessionId },
+    ...trace.turnId === void 0 ? {} : { turnId: trace.turnId },
+    budgetTokens: embedded?.budgetTokens ?? trace.budgetTokens,
+    usedTokens: embedded?.usedTokens ?? trace.usedTokens,
+    injected: embedded?.injected ?? receiptSection?.kept ?? first?.kept ?? false,
+    ...embedded?.textHash === void 0 ? {} : { textHash: embedded.textHash },
+    text: trace.text,
+    source: "resident-trace"
+  };
+  if (embedded?.entities !== void 0) {
+    return {
+      ...common,
+      kind: t1Trace ? "t1" : "t0",
+      ...adoptionFieldsFromEntities(embedded.entities)
+    };
+  }
+  if (t1Trace && first !== void 0) {
+    return {
+      ...common,
+      kind: "t1",
+      keptIds: embedded?.keptIds ?? first.entityIds,
+      quarantinedIds: embedded?.quarantinedIds ?? [],
+      droppedIds: embedded?.droppedIds ?? []
+    };
+  }
+  const rank = /* @__PURE__ */ new Map();
+  const mark = (entityId, value) => {
+    const id = entityId.trim();
+    if (id.length === 0) return;
+    const previous = rank.get(id) ?? 0;
+    if (value > previous) rank.set(id, value);
+  };
+  for (const section of sections) {
+    if (NON_HIT_SECTIONS.has(section.name) || section.entityIds.length === 0) continue;
+    const value = sectionFlag(section, "quarantined") ? 2 : section.kept ? 3 : 1;
+    for (const entityId of section.entityIds) mark(entityId, value);
+  }
+  const kept = [];
+  const quarantined = [];
+  const dropped = [];
+  for (const [entityId, value] of rank) {
+    if (value === 3) kept.push(entityId);
+    else if (value === 2) quarantined.push(entityId);
+    else dropped.push(entityId);
+  }
+  return {
+    ...common,
+    kind: "t0",
+    injected: kept.length > 0,
+    keptIds: kept,
+    quarantinedIds: quarantined,
+    droppedIds: dropped
+  };
+}
+
+// packages/v7/src/domain/audit.ts
+var ACTOR_ID_MAX = 160;
+var UNSAFE_ACTOR_CHARS = /[^\w.:@+-]+/gu;
+function sanitizeActorId(value, fallback = "unknown") {
+  const normalized = value.trim().replace(UNSAFE_ACTOR_CHARS, "-").replace(/^-+|-+$/gu, "");
+  const bounded = normalized.length > ACTOR_ID_MAX ? normalized.slice(0, ACTOR_ID_MAX) : normalized;
+  return bounded.length > 0 ? bounded : fallback;
+}
+function auditActorKindOf(value) {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "user" || normalized.startsWith("user:") || normalized.startsWith("user/")) return "user";
+  if (normalized === "assistant" || normalized.startsWith("assistant:") || normalized.startsWith("assistant/")) {
+    return "assistant";
+  }
+  if (normalized === "tool" || normalized.startsWith("tool:") || normalized.startsWith("tool/")) return "tool";
+  if (normalized === "job" || normalized.startsWith("job:") || normalized.startsWith("job/")) return "job";
+  if (normalized === "system" || normalized.startsWith("system:") || normalized.startsWith("system/")) return "system";
+  if (normalized === "external" || normalized.startsWith("external:")) return "external";
+  if (normalized === "model" || normalized.startsWith("model:") || normalized.startsWith("model/")) return "model";
+  return "model";
+}
+function auditTenantOf(input2) {
+  const canonical2 = (input2.projectKey ?? input2.projectIdentity?.projectId ?? "").trim();
+  if (canonical2.length === 0) return void 0;
+  const aliases = /* @__PURE__ */ new Set([canonical2]);
+  for (const key of input2.projectIdentity?.legacyProjectKeys ?? []) {
+    const normalized = key.trim();
+    if (normalized.length > 0) aliases.add(normalized);
+  }
+  return { projectKey: canonical2, aliases: [...aliases].sort() };
+}
+var ALLOWED = { allowed: true };
+function deny(reason, message, targetIds) {
+  return { allowed: false, reason, message, targetIds };
+}
+function scopeAccessOf(scope, tenant) {
+  if (scope.kind === "global") return "global";
+  if (tenant === void 0) return "foreign";
+  return tenant.aliases.includes(scope.projectKey) ? "tenant" : "foreign";
+}
+function entityAccessDecision(tenant, targets) {
+  const foreign = [];
+  const unknown2 = [];
+  for (const target of targets) {
+    if (target.scope === void 0) {
+      unknown2.push(target.id);
+      continue;
+    }
+    if (scopeAccessOf(target.scope, tenant) === "foreign") foreign.push(target.id);
+  }
+  if (foreign.length > 0) {
+    const scope = tenant === void 0 ? "当前会话未解析出项目作用域" : `当前会话项目 ${tenant.projectKey}`;
+    return deny(
+      tenant === void 0 ? "unknown-tenant" : "cross-project",
+      `越权操作被拒绝：${foreign.join(", ")} 不在${scope}的作用域内`,
+      foreign
+    );
+  }
+  if (unknown2.length > 0) {
+    return deny(
+      "unknown-target",
+      `越权操作被拒绝：无法证明目标实体 ${unknown2.join(", ")} 的归属作用域`,
+      unknown2
+    );
+  }
+  return ALLOWED;
+}
+function rollbackAccessDecision(input2) {
+  if (input2.facts.action === "denied") {
+    return deny("denied-audit", "越权拒绝记录不可回滚（会抹掉拒绝证据）", [...input2.facts.targetIds]);
+  }
+  if (input2.facts.targetIds.length === 0) {
+    return deny("unverifiable-target", "越权回滚被拒绝：审计没有可验证的目标实体", []);
+  }
+  const scoped = new Map(input2.targets.map((target) => [target.id, target.scope]));
+  const facts = input2.facts.targetIds.map((id) => ({ id, scope: scoped.get(id) }));
+  const decision = entityAccessDecision(input2.tenant, facts);
+  if (decision.allowed) return decision;
+  return {
+    ...decision,
+    message: "越权回滚被拒绝：审计目标不在当前项目作用域内或无法验证归属"
+  };
+}
+var AUDIT_DENIED_ACTION = "denied";
+
 // packages/v7/src/app/commands/types.ts
 function duplicateCommandFailure(commandId) {
   return {
@@ -2962,12 +3230,7 @@ function systemCommandMeta(actor, origin, options = {}) {
   };
 }
 function actorKindOf(actor) {
-  const normalized = actor.toLowerCase();
-  if (normalized === "user" || normalized.startsWith("user:")) return "user";
-  if (normalized === "job" || normalized.startsWith("job:")) return "job";
-  if (normalized === "system" || normalized.startsWith("system:")) return "system";
-  if (normalized === "external" || normalized.startsWith("external:")) return "external";
-  return "model";
+  return auditActorKindOf(actor);
 }
 
 // packages/v7/src/app/commands/patch.ts
@@ -3117,6 +3380,24 @@ var PostgresDb = class {
       client.release();
     }
   }
+  /**
+   * 事务内执行并给本次事务设置 `statement_timeout`。
+   *
+   * 为什么不是 `pool.query({ signal })`：node-postgres 目前没有 query 级 AbortSignal；
+   * 只 race 放弃等待会留下仍在跑的查询占住连接。事务级 `set_config(..., true)` 是
+   * PostgreSQL 的服务端取消，超时后语句被取消、事务回滚、连接归还连接池（RET-10）。
+   */
+  async transactionWithin(timeoutMs, work) {
+    const safe = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 1;
+    return this.transaction(async (client) => {
+      await client.query("select set_config('statement_timeout', $1, true)", [String(safe)]);
+      return work(client);
+    });
+  }
+  /** 单条语句的服务端超时（内部开事务设置 local statement_timeout）。 */
+  async queryWithin(timeoutMs, text2, values = []) {
+    return this.transactionWithin(timeoutMs, (client) => client.query(text2, values));
+  }
   async close() {
     await this.pool.end();
   }
@@ -3132,6 +3413,385 @@ function asNumber(value) {
 }
 function asString(value) {
   return typeof value === "string" ? value : void 0;
+}
+
+// packages/v7/src/adapters/postgres/adoption.ts
+var RECEIPT_KINDS = /* @__PURE__ */ new Set(["t0", "t1", "t2"]);
+var EVIDENCE_LEVELS = /* @__PURE__ */ new Set(["reference", "utilization", "validation", "refutation"]);
+function nonNegativeInteger(value, fallback) {
+  if (value === void 0 || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.trunc(value));
+}
+function trimOrUndefined(value) {
+  const trimmed = value?.trim();
+  return trimmed === void 0 || trimmed.length === 0 ? void 0 : trimmed;
+}
+function mergeDisposition(previous, candidate) {
+  if (previous === void 0) return candidate;
+  if (previous === "quarantined" || candidate === "quarantined") return "quarantined";
+  return previous;
+}
+async function bumpRetrieved(client, entityId, delta) {
+  await client.query(
+    `insert into omb.adoption_metric as metric (entity_id, retrieved_count, last_retrieved_at, updated_at)
+     values ($1, $2::bigint, case when $2::bigint > 0 then now() end, now())
+     on conflict (entity_id) do update
+       set retrieved_count = greatest(metric.retrieved_count + $2::bigint, 0),
+           last_retrieved_at = case when $2::bigint > 0 then now() else metric.last_retrieved_at end,
+           updated_at = now()`,
+    [entityId, delta]
+  );
+}
+async function writeAdoptionReceipt(client, input2) {
+  const traceId = input2.traceId.trim();
+  if (traceId.length === 0 || !RECEIPT_KINDS.has(input2.kind)) return [];
+  const usedTokens = nonNegativeInteger(input2.usedTokens, 0);
+  const budgetTokens = input2.budgetTokens === void 0 ? null : nonNegativeInteger(input2.budgetTokens, 0);
+  const resolvedHits = adoptionReceiptHits({ ...input2, traceId });
+  const entityIds = [...new Set(resolvedHits.map((hit) => hit.entityId))];
+  const present = /* @__PURE__ */ new Set();
+  if (entityIds.length > 0) {
+    const rows = await client.query(
+      "select id from omb.entity where id = any($1::text[])",
+      [entityIds]
+    );
+    for (const row of rows.rows) present.add(row.id);
+  }
+  const hits = resolvedHits.filter((hit) => present.has(hit.entityId));
+  await client.query(
+    `insert into omb.adoption_receipt (
+       trace_id, receipt_id, kind, session_id, turn_id, task_id, scenario, source,
+       budget_tokens, used_tokens, injected, text_hash, text
+     ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     on conflict (trace_id) do update
+       set session_id = coalesce(adoption_receipt.session_id, excluded.session_id),
+           turn_id = coalesce(adoption_receipt.turn_id, excluded.turn_id),
+           task_id = coalesce(adoption_receipt.task_id, excluded.task_id),
+           scenario = coalesce(adoption_receipt.scenario, excluded.scenario),
+           source = coalesce(adoption_receipt.source, excluded.source),
+           budget_tokens = coalesce(adoption_receipt.budget_tokens, excluded.budget_tokens),
+           used_tokens = greatest(adoption_receipt.used_tokens, excluded.used_tokens),
+           injected = adoption_receipt.injected or excluded.injected,
+           text_hash = coalesce(adoption_receipt.text_hash, excluded.text_hash),
+           text = case when excluded.text <> '' then excluded.text else adoption_receipt.text end,
+           updated_at = now()`,
+    [
+      traceId,
+      trimOrUndefined(input2.receiptId) ?? null,
+      input2.kind,
+      trimOrUndefined(input2.sessionId) ?? null,
+      trimOrUndefined(input2.turnId) ?? null,
+      trimOrUndefined(input2.taskId) ?? null,
+      trimOrUndefined(input2.scenario) ?? null,
+      trimOrUndefined(input2.source) ?? null,
+      budgetTokens,
+      usedTokens,
+      input2.injected,
+      trimOrUndefined(input2.textHash) ?? null,
+      input2.text ?? ""
+    ]
+  );
+  const existing = await client.query(
+    "select entity_id, disposition from omb.adoption_receipt_hit where trace_id = $1",
+    [traceId]
+  );
+  const current = new Map(existing.rows.map((row) => [row.entity_id, row.disposition]));
+  const kept = [];
+  for (const hit of hits) {
+    const previous = current.get(hit.entityId);
+    const resolved = mergeDisposition(previous, hit.disposition);
+    const metadata = [hit.title ?? null, hit.updatedAt ?? null, hit.rank ?? null];
+    if (previous === void 0) {
+      const inserted = await client.query(
+        `insert into omb.adoption_receipt_hit (
+           trace_id, entity_id, disposition, title, updated_at, rank, source
+         ) values ($1,$2,$3,$4,$5,$6,$7)
+         on conflict (trace_id, entity_id) do nothing
+         returning entity_id`,
+        [traceId, hit.entityId, resolved, ...metadata, input2.source ?? "receipt"]
+      );
+      if ((inserted.rowCount ?? 0) > 0 && resolved === "kept") await bumpRetrieved(client, hit.entityId, 1);
+    } else if (previous === resolved) {
+      await client.query(
+        `update omb.adoption_receipt_hit
+            set title = coalesce(title, $3),
+                updated_at = coalesce(updated_at, $4),
+                rank = coalesce(rank, $5)
+          where trace_id = $1 and entity_id = $2`,
+        [traceId, hit.entityId, ...metadata]
+      );
+    } else {
+      await client.query(
+        `update omb.adoption_receipt_hit
+            set disposition = $3,
+                title = coalesce(title, $4),
+                updated_at = coalesce(updated_at, $5),
+                rank = coalesce(rank, $6)
+          where trace_id = $1 and entity_id = $2`,
+        [traceId, hit.entityId, resolved, ...metadata]
+      );
+      if (previous === "kept" && resolved !== "kept") await bumpRetrieved(client, hit.entityId, -1);
+      if (previous !== "kept" && resolved === "kept") await bumpRetrieved(client, hit.entityId, 1);
+    }
+    if (resolved === "kept") kept.push({ ...hit, disposition: "kept" });
+  }
+  return kept;
+}
+async function recordAdoptionReceipt(db, input2) {
+  return db.transaction((client) => writeAdoptionReceipt(client, input2));
+}
+async function hasKeptReceipt(client, entityId, sessionId, traceId, taskId) {
+  const result = await client.query(
+    `select 1
+       from omb.adoption_receipt_hit h
+       join omb.adoption_receipt r on r.trace_id = h.trace_id
+      where h.entity_id = $1
+        and h.disposition = 'kept'
+        and (r.session_id = $2 or (r.session_id is null and $3::text is not null and h.trace_id = $3))
+        and ($3::text is null or h.trace_id = $3)
+        and ($4::text is null or r.task_id is null or r.task_id = $4)
+      limit 1`,
+    [entityId, sessionId, traceId ?? null, taskId ?? null]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+async function recordReceiptExposure(db, input2) {
+  const entityId = input2.entityId.trim();
+  const sessionId = input2.sessionId.trim();
+  const taskId = trimOrUndefined(input2.taskId) ?? "session";
+  if (entityId.length === 0 || sessionId.length === 0) return;
+  const traceId = trimOrUndefined(input2.traceId);
+  await db.transaction(async (client) => {
+    if (!await hasKeptReceipt(client, entityId, sessionId, traceId, taskId)) return;
+    if (traceId !== void 0) {
+      const seen = await client.query(
+        `insert into omb.adoption_exposure (trace_id, entity_id, session_id, task_id)
+         values ($1,$2,$3,$4)
+         on conflict (trace_id, entity_id) do nothing
+         returning trace_id`,
+        [traceId, entityId, sessionId, taskId]
+      );
+      if ((seen.rowCount ?? 0) === 0) return;
+    }
+    const opportunity = await client.query(
+      `insert into omb.usage_opportunity (
+         entity_id, session_id, task_id, exposures, exposed_at, last_trace_id, updated_at
+       ) values ($1, $2, $3, 1, now(), $4, now())
+       on conflict (entity_id, session_id, task_id) do nothing
+       returning entity_id`,
+      [entityId, sessionId, taskId, traceId ?? null]
+    );
+    if ((opportunity.rowCount ?? 0) > 0) {
+      await client.query(
+        `insert into omb.adoption_metric as metric (entity_id, opportunities, updated_at)
+         values ($1, 1, now())
+         on conflict (entity_id) do update
+           set opportunities = metric.opportunities + 1,
+               updated_at = now()`,
+        [entityId]
+      );
+      return;
+    }
+    await client.query(
+      `update omb.usage_opportunity
+          set exposures = exposures + 1,
+              last_trace_id = coalesce($4, last_trace_id),
+              updated_at = now()
+        where entity_id = $1 and session_id = $2 and task_id = $3`,
+      [entityId, sessionId, taskId, traceId ?? null]
+    );
+  });
+}
+async function markRecallInjectedAudit(db, traceId) {
+  const id = traceId.trim();
+  if (id.length === 0) return;
+  await db.query(
+    `update omb.recall_event
+        set injected = true,
+            injected_at = coalesce(injected_at, now())
+      where trace_id = $1 and not injected`,
+    [id]
+  );
+}
+async function recordUsageEvidence(db, level, input2) {
+  const sessionId = input2.sessionId.trim();
+  const entityId = input2.entityId.trim();
+  if (sessionId.length === 0 || entityId.length === 0 || !EVIDENCE_LEVELS.has(level)) return;
+  const requestedTaskId = trimOrUndefined(input2.taskId);
+  const traceId = trimOrUndefined(input2.traceId);
+  await db.transaction(async (client) => {
+    if (!await hasKeptReceipt(client, entityId, sessionId, traceId, requestedTaskId)) return;
+    let opportunity = await selectOpportunity(client, entityId, sessionId, requestedTaskId);
+    let opportunitiesBump = 0;
+    if (opportunity === void 0) {
+      const taskId = requestedTaskId ?? "session";
+      const inserted = await client.query(
+        `insert into omb.usage_opportunity (
+           entity_id, session_id, task_id, exposures, exposed_at, updated_at
+         ) values ($1, $2, $3, 0, now(), now())
+         on conflict (entity_id, session_id, task_id) do nothing
+         returning *`,
+        [entityId, sessionId, taskId]
+      );
+      opportunity = inserted.rows[0] ?? await selectOpportunity(client, entityId, sessionId, taskId);
+      if (opportunity === void 0) throw new OmbFailure(internal("使用机会写入后读不到"));
+      opportunitiesBump = inserted.rows[0] === void 0 ? 0 : 1;
+    }
+    const referenceTransition = level !== "refutation" && opportunity.referenced_at === null;
+    const utilizationTransition = level === "utilization" && opportunity.utilized_at === null;
+    const validationTransition = level === "validation" && opportunity.validated_at === null;
+    const refutationTransition = level === "refutation" && opportunity.refuted_at === null;
+    const candidateKind = level === "utilization" ? "entity-id" : input2.kind;
+    const referenceKind = opportunity.reference_kind === "entity-id" || candidateKind === "entity-id" ? "entity-id" : opportunity.reference_kind ?? candidateKind;
+    await client.query(
+      `update omb.usage_opportunity
+          set updated_at = now(),
+              last_trace_id = coalesce($4, last_trace_id),
+              referenced_at = coalesce(referenced_at, case when $5 then now() end),
+              reference_kind = case when $5 then coalesce($6, reference_kind) else reference_kind end,
+              reference_source = coalesce(reference_source, case when $5 then $9 end),
+              utilized_at = coalesce(utilized_at, case when $8 then now() end),
+              utilization_kind = coalesce(utilization_kind, case when $8 then $7 end),
+              utilization_source = coalesce(utilization_source, case when $8 then $9 end),
+              validated_at = coalesce(validated_at, case when $10 then now() end),
+              validation_kind = coalesce(validation_kind, case when $10 then $7 end),
+              validation_source = coalesce(validation_source, case when $10 then $9 end),
+              validation_evidence = coalesce(validation_evidence, case when $10 then $11::jsonb end),
+              refuted_at = coalesce(refuted_at, case when $12 then now() end),
+              refutation_kind = coalesce(refutation_kind, case when $12 then $7 end),
+              refutation_source = coalesce(refutation_source, case when $12 then $9 end),
+              refutation_evidence = coalesce(refutation_evidence, case when $12 then $11::jsonb end)
+        where entity_id = $1 and session_id = $2 and task_id = $3`,
+      [
+        entityId,
+        sessionId,
+        opportunity.task_id,
+        traceId ?? null,
+        referenceTransition,
+        referenceKind,
+        input2.kind,
+        utilizationTransition,
+        input2.source,
+        validationTransition,
+        input2.evidence === void 0 ? null : JSON.stringify(input2.evidence),
+        refutationTransition
+      ]
+    );
+    if (traceId !== void 0) {
+      await writeRecallEvidence(client, level, { ...input2, traceId });
+    }
+    const referencedBump = referenceTransition ? 1 : 0;
+    const utilizedBump = utilizationTransition ? 1 : 0;
+    const validatedBump = validationTransition ? 1 : 0;
+    const refutedBump = refutationTransition ? 1 : 0;
+    if (opportunitiesBump + referencedBump + utilizedBump + validatedBump + refutedBump === 0) return;
+    await client.query(
+      `insert into omb.adoption_metric as metric (
+         entity_id, opportunities, referenced_count, utilized_count, validated_count, refuted_count,
+         last_referenced_at, last_utilized_at, last_validated_at, last_refuted_at, updated_at
+       ) values (
+         $1, $2::bigint, $3::bigint, $4::bigint, $5::bigint, $6::bigint,
+         case when $3 > 0 then now() end,
+         case when $4 > 0 then now() end,
+         case when $5 > 0 then now() end,
+         case when $6 > 0 then now() end,
+         now()
+       )
+       on conflict (entity_id) do update
+         set opportunities = metric.opportunities + excluded.opportunities,
+             referenced_count = metric.referenced_count + excluded.referenced_count,
+             utilized_count = metric.utilized_count + excluded.utilized_count,
+             validated_count = metric.validated_count + excluded.validated_count,
+             refuted_count = metric.refuted_count + excluded.refuted_count,
+             last_referenced_at = coalesce(excluded.last_referenced_at, metric.last_referenced_at),
+             last_utilized_at = coalesce(excluded.last_utilized_at, metric.last_utilized_at),
+             last_validated_at = coalesce(excluded.last_validated_at, metric.last_validated_at),
+             last_refuted_at = coalesce(excluded.last_refuted_at, metric.last_refuted_at),
+             updated_at = now()`,
+      [
+        entityId,
+        opportunitiesBump,
+        referencedBump,
+        utilizedBump,
+        validatedBump,
+        refutedBump
+      ]
+    );
+    if (validatedBump > 0) {
+      await client.query("update omb.entity set adoption_count = adoption_count + 1 where id = $1", [entityId]);
+    }
+  });
+}
+async function selectOpportunity(client, entityId, sessionId, taskId) {
+  const result = await client.query(
+    `select *
+       from omb.usage_opportunity
+      where entity_id = $1 and session_id = $2
+        and ($3::text is null or task_id = $3)
+      order by updated_at desc
+      limit 1
+      for update`,
+    [entityId, sessionId, taskId ?? null]
+  );
+  return result.rows[0];
+}
+async function writeRecallEvidence(client, level, input2) {
+  const traceId = input2.traceId;
+  const evidence = input2.evidence === void 0 ? null : JSON.stringify(input2.evidence);
+  if (level === "reference") {
+    await client.query(
+      `update omb.recall_event
+          set referenced_at = coalesce(referenced_at, now()),
+              reference_kind = coalesce(reference_kind, $3),
+              reference_source = coalesce(reference_source, $4)
+        where trace_id = $1 and entity_id = $2`,
+      [traceId, input2.entityId, input2.kind, input2.source]
+    );
+    return;
+  }
+  if (level === "utilization") {
+    await client.query(
+      `update omb.recall_event
+          set referenced_at = coalesce(referenced_at, now()),
+              reference_kind = coalesce(reference_kind, 'entity-id'),
+              reference_source = coalesce(reference_source, $4),
+              utilized_at = coalesce(utilized_at, now()),
+              utilization_kind = coalesce(utilization_kind, $3),
+              utilization_source = coalesce(utilization_source, $4)
+        where trace_id = $1 and entity_id = $2`,
+      [traceId, input2.entityId, input2.kind, input2.source]
+    );
+    return;
+  }
+  if (level === "validation") {
+    await client.query(
+      `update omb.recall_event
+          set referenced_at = coalesce(referenced_at, now()),
+              reference_kind = coalesce(reference_kind, $3),
+              reference_source = coalesce(reference_source, $4),
+              validated_at = coalesce(validated_at, now()),
+              validation_kind = coalesce(validation_kind, $3),
+              validation_source = coalesce(validation_source, $4),
+              validation_evidence = coalesce(validation_evidence, $5::jsonb),
+              adopted_at = coalesce(adopted_at, now()),
+              adoption_kind = coalesce(adoption_kind, 'validated:' || $3)
+        where trace_id = $1 and entity_id = $2`,
+      [traceId, input2.entityId, input2.kind, input2.source, evidence]
+    );
+    return;
+  }
+  await client.query(
+    `update omb.recall_event
+        set referenced_at = coalesce(referenced_at, now()),
+            reference_kind = coalesce(reference_kind, $3),
+            reference_source = coalesce(reference_source, $4),
+            refuted_at = coalesce(refuted_at, now()),
+            refutation_kind = coalesce(refutation_kind, $3),
+            refutation_source = coalesce(refutation_source, $4),
+            refutation_evidence = coalesce(refutation_evidence, $5::jsonb)
+      where trace_id = $1 and entity_id = $2`,
+    [traceId, input2.entityId, input2.kind, input2.source, evidence]
+  );
 }
 
 // packages/v7/src/adapters/postgres/identity-store.ts
@@ -6339,6 +6999,131 @@ async function nextStreamVersion(client, streamId) {
   );
   return Number(result.rows[0]?.next ?? 1);
 }
+async function readAuditAccessRow(db, auditId) {
+  const result = await db.query(
+    `select id::text as id, action, actor, actor_kind, source, target_ids, rolled_back_at
+       from omb.audit_log
+      where id = $1`,
+    [auditId]
+  );
+  return result.rows[0] === void 0 ? void 0 : auditAccessOf(result.rows[0]);
+}
+function auditAccessOf(row) {
+  return {
+    id: Number(row.id),
+    action: row.action,
+    actor: row.actor,
+    actorKind: row.actor_kind,
+    source: row.source,
+    targetIds: row.target_ids,
+    rolledBackAt: iso(row.rolled_back_at) ?? null
+  };
+}
+function rollbackFactsOf(row) {
+  return {
+    id: row.id,
+    action: row.action,
+    actor: row.actor,
+    actorKind: row.actorKind,
+    source: row.source,
+    targetIds: row.targetIds
+  };
+}
+async function readEntityScopes(db, ids) {
+  const unique = [...new Set(ids.filter((id) => id.length > 0))];
+  if (unique.length === 0) return /* @__PURE__ */ new Map();
+  const result = await db.query(
+    `select entity_id, scope, project_key
+       from omb.entity_view
+      where entity_id = any($1::text[])`,
+    [unique]
+  );
+  const scopes = /* @__PURE__ */ new Map();
+  for (const row of result.rows) {
+    scopes.set(
+      row.entity_id,
+      row.scope === "project" && row.project_key.length > 0 ? { kind: "project", projectKey: row.project_key } : { kind: "global" }
+    );
+  }
+  return scopes;
+}
+async function readAuthorizationTargets(db, ids) {
+  const scopes = await readEntityScopes(db, ids);
+  return ids.map((id) => {
+    const scope = scopes.get(id);
+    return scope === void 0 ? { id } : { id, scope };
+  });
+}
+async function readLinkEndpoints(db, linkId) {
+  const result = await db.query(
+    "select from_id, to_id from omb.link where id = $1",
+    [linkId]
+  );
+  const row = result.rows[0];
+  return row === void 0 ? void 0 : { fromId: row.from_id, toId: row.to_id };
+}
+async function assertRollbackTenantAllowed(client, facts, tenant) {
+  if (tenant === void 0) return;
+  const targets = await readAuthorizationTargets(client, facts.targetIds);
+  const decision = rollbackAccessDecision({ facts, targets, tenant });
+  if (!decision.allowed) {
+    throw new OmbFailure(forbidden(decision.message, {
+      auditId: facts.id,
+      reason: decision.reason,
+      targetIds: decision.targetIds
+    }));
+  }
+}
+async function listAuditWithinTenant(db, options) {
+  const limit = Math.max(1, Math.min(200, Math.trunc(options.limit)));
+  const aliases = options.tenant?.aliases ?? [];
+  const result = await db.query(
+    `select a.id::text as id, a.actor, a.action, a.target_ids, a.inverse, a.created_at,
+            a.rolled_back_at, a.actor_kind, a.source, a.expected_revision, a.current_revision
+       from omb.audit_log a
+      where (
+        a.action = $3
+        and coalesce(a.after->>'tenantProjectKey', '') = any($2::text[])
+      ) or (
+        a.action <> $3
+        and (
+          coalesce((
+            select bool_and(v.scope = 'global' or v.project_key = any($2::text[]))
+              from unnest(a.target_ids) as target(entity_id)
+              left join omb.entity_view v on v.entity_id = target.entity_id
+          ), false)
+          or (cardinality(a.target_ids) = 0 and a.actor = $4)
+        )
+      )
+      order by a.id desc
+      limit $1`,
+    [limit, aliases, AUDIT_DENIED_ACTION, options.actor ?? ""]
+  );
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    actor: row.actor,
+    action: row.action,
+    targetIds: row.action === AUDIT_DENIED_ACTION ? [] : row.target_ids,
+    ...row.inverse === null ? {} : { inverse: row.inverse },
+    createdAt: iso(row.created_at),
+    ...iso(row.rolled_back_at) !== void 0 ? { rolledBackAt: iso(row.rolled_back_at) } : {},
+    ...row.actor_kind === null ? {} : { actorKind: row.actor_kind },
+    ...row.source === null ? {} : { source: row.source },
+    ...row.expected_revision === null ? {} : { expectedRevision: Number(row.expected_revision) },
+    ...row.current_revision === null ? {} : { currentRevision: Number(row.current_revision) }
+  }));
+}
+async function countDeniedWithinTenant(db, tenant) {
+  const aliases = tenant?.aliases ?? [];
+  const result = await db.query(
+    `select count(*)::text as count
+       from omb.audit_log
+      where action = $1
+        and coalesce(after->>'tenantProjectKey', '') = any($2::text[])`,
+    [AUDIT_DENIED_ACTION, aliases]
+  );
+  return Number(result.rows[0]?.count ?? 0);
+}
 
 // packages/v7/src/adapters/postgres/writer-evidence.ts
 import { createHash as createHash2 } from "node:crypto";
@@ -6685,10 +7470,11 @@ async function assertEntityRevision(client, entityId, expected, actor) {
     });
   }
 }
-async function rollbackAudit(client, auditId, actor) {
+async function rollbackAudit(client, auditId, actor, authorization) {
   const result = await client.query(
-    `select id, inverse, target_ids, rolled_back_at, stream_id, stream_version
-     from omb.audit_log where id = $1 for update`,
+    `select id::text as id, action, actor, actor_kind, source, inverse, target_ids, rolled_back_at,
+            stream_id, stream_version
+       from omb.audit_log where id = $1 for update`,
     [auditId]
   );
   const row = result.rows[0];
@@ -6698,6 +7484,19 @@ async function rollbackAudit(client, auditId, actor) {
     throw new OmbFailure(internal(`审计记录没有可执行 inverse：${auditId}`));
   }
   const inverse = row.inverse;
+  await assertRollbackTenantAllowed(
+    client,
+    rollbackFactsOf({
+      id: auditId,
+      action: row.action,
+      actor: row.actor,
+      actorKind: row.actor_kind,
+      source: row.source,
+      targetIds: row.target_ids,
+      rolledBackAt: null
+    }),
+    authorization?.tenant
+  );
   await assertRollbackSnapshotCas(client, row, inverse, actor);
   const action = asString(inverse["action"]);
   const applied = [];
@@ -7004,6 +7803,8 @@ async function rollbackAudit(client, auditId, actor) {
   await client.query("update omb.audit_log set rolled_back_at = now() where id = $1", [auditId]);
   const rollbackAuditId = await insertAudit(client, {
     actor,
+    actorKind: actorKindOf(actor),
+    ...authorization?.source === void 0 ? {} : { source: authorization.source },
     action: "rollback",
     targetIds: [...row.target_ids],
     before: toJson({ auditId }),
@@ -7209,7 +8010,7 @@ var AttributeWriter = class {
          is_current, content_key, lifecycle, valid_from
        ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true,$8,'active', now())
        returning *`,
-      [input2.id, input2.kind, meta3.origin, input2.confidence ?? null, input2.pinned, archivedAt, archived ? "auto-status" : null, contentHash]
+      [input2.id, input2.kind, input2.origin, input2.confidence ?? null, input2.pinned, archivedAt, archived ? "auto-status" : null, contentHash]
     );
     const entityRow = entityResult.rows[0];
     if (entityRow === void 0) throw new OmbFailure(internal("实体写入没有返回行"));
@@ -7316,7 +8117,7 @@ var AttributeWriter = class {
         input2.pinned,
         archivedAt,
         archivedAt === null ? null : "auto-status",
-        meta3.origin,
+        input2.origin,
         contentHash,
         patch.expectedRevision
       ]
@@ -7995,9 +8796,9 @@ var AttributeWriter = class {
     }
   }
   /** 审计回滚（维护入口）：委托 writer-rollback，事务边界与错误映射留在本类。 */
-  async rollback(auditId, actor) {
+  async rollback(auditId, actor, authorization) {
     try {
-      return await this.db.transaction((client) => rollbackAudit(client, auditId, actor));
+      return await this.db.transaction((client) => rollbackAudit(client, auditId, actor, authorization));
     } catch (error62) {
       throw mapPgError(error62);
     }
@@ -8074,6 +8875,24 @@ var PostgresStore = class {
     }
   }
   /**
+   * 带剩余执行预算的检索查询（RET-10）：把 `timeoutMs` 变成 PostgreSQL 事务级
+   * `statement_timeout`，超时由服务端取消语句并回滚事务，连接可继续复用。
+   * 多语句查询共享同一个 `startedAtMs`，后一条只拿到剩余预算，不会重新拿满。
+   */
+  async searchQuery(spec, text2, values, startedAtMs) {
+    const budgetMs = spec.timeoutMs;
+    if (budgetMs === void 0) return this.db.query(text2, values);
+    const remaining = Math.max(1, Math.floor(budgetMs - (Date.now() - startedAtMs)));
+    return this.db.queryWithin(remaining, text2, values);
+  }
+  /** 已有事务内设置服务端超时（fulltext/vector 需要与 `set local` 共用同一事务）。 */
+  async applyStatementTimeout(client, timeoutMs) {
+    if (timeoutMs === void 0) return;
+    await client.query("select set_config('statement_timeout', $1, true)", [
+      String(Math.max(1, Math.floor(timeoutMs)))
+    ]);
+  }
+  /**
    * 稳定 commandId 的重复提交：返回首次实体并标 `deduped:'command'`，不重复写审计/实体。
    * writer 只抛内部重复信号，这里把它翻译成写路径结果（工具重试语义）。
    */
@@ -8084,7 +8903,9 @@ var PostgresStore = class {
   }
   async write(input2, _derived, options = {}) {
     return this.run(async () => {
-      const meta3 = systemCommandMeta(input2.origin, void 0, options);
+      const actor = options.actor ?? input2.origin;
+      const source = options.source ?? input2.origin;
+      const meta3 = systemCommandMeta(actor, source, options);
       let outcome;
       try {
         outcome = await this.writer.execute({ type: "CreateEntity", input: input2 }, meta3);
@@ -8131,23 +8952,23 @@ var PostgresStore = class {
       };
     });
   }
-  async archive(id, reason, actor, expectedRevision) {
+  async archive(id, reason, actor, expectedRevision, authorization) {
     await this.run(async () => {
       await this.writer.execute(
         { type: "ArchiveEntity", id, reason },
         {
-          ...systemCommandMeta(actor),
+          ...systemCommandMeta(actor, authorization?.source ?? actor),
           ...expectedRevision === void 0 ? {} : { expectedRevision }
         }
       );
     });
   }
-  async unarchive(id, reason, actor, expectedRevision) {
+  async unarchive(id, reason, actor, expectedRevision, authorization) {
     await this.run(async () => {
       await this.writer.execute(
         { type: "UnarchiveEntity", id, reason },
         {
-          ...systemCommandMeta(actor),
+          ...systemCommandMeta(actor, authorization?.source ?? actor),
           ...expectedRevision === void 0 ? {} : { expectedRevision }
         }
       );
@@ -8170,7 +8991,7 @@ var PostgresStore = class {
           ...create === void 0 ? {} : { create },
           ...input2.expectedRevision === void 0 ? {} : { expectedRevision: input2.expectedRevision }
         },
-        this.metaFor(input2.actor, input2.commandId)
+        this.metaFor(input2.actor, input2.commandId, input2.source)
       );
       const result = outcome.supersede;
       if (result === void 0) throw new OmbFailure(internal("取代没有返回结果"));
@@ -8188,16 +9009,16 @@ var PostgresStore = class {
           ...input2.effectiveAt === void 0 ? {} : { effectiveAt: input2.effectiveAt },
           ...input2.expectedRevision === void 0 ? {} : { expectedRevision: input2.expectedRevision }
         },
-        this.metaFor(input2.actor, input2.commandId)
+        this.metaFor(input2.actor, input2.commandId, input2.source)
       );
       const result = outcome.retract;
       if (result === void 0) throw new OmbFailure(internal("证伪没有返回结果"));
       return result;
     });
   }
-  /** 外部幂等键只覆盖 commandId；actor/origin 仍由 actor 推导。 */
-  metaFor(actor, commandId) {
-    const meta3 = systemCommandMeta(actor);
+  /** 外部幂等键只覆盖 commandId；actor/origin 仍由 actor/source 推导。 */
+  metaFor(actor, commandId, source) {
+    const meta3 = systemCommandMeta(actor, source ?? actor);
     return commandId === void 0 ? meta3 : { ...meta3, commandId };
   }
   normalizeCreate(newId2, input2) {
@@ -8213,16 +9034,18 @@ var PostgresStore = class {
     return this.run(async () => {
       const outcome = await this.writer.execute(
         { type: "Link", input: input2 },
-        systemCommandMeta(input2.origin ?? "model")
+        // actor 取 input.origin（工具路径是 assistant:<session>），审计 source 取 input.source
+        // （工具路径是 tool:omb_link）；缺省都退回 'model'，与 7.1 行为一致。
+        systemCommandMeta(input2.origin ?? "model", input2.source ?? input2.origin ?? "model")
       );
       const link = outcome.link;
       if (link === void 0) throw new OmbFailure(internal("链接写入没有返回链接"));
       return { link, created: outcome.linkCreated === true };
     });
   }
-  async unlink(id, actor) {
+  async unlink(id, actor, source) {
     await this.run(async () => {
-      await this.writer.execute({ type: "Unlink", linkId: id }, systemCommandMeta(actor));
+      await this.writer.execute({ type: "Unlink", linkId: id }, systemCommandMeta(actor, source ?? actor));
     });
   }
   async findByAttribute(name, value, kind) {
@@ -8303,7 +9126,9 @@ var PostgresStore = class {
   async expand(seeds, hops, options = {}) {
     if (seeds.length === 0) return [];
     return this.run(async () => {
-      const linkRows = await this.db.query(
+      const startedAt = Date.now();
+      const linkRows = await this.searchQuery(
+        options,
         `with recursive walk (id, hop, score, via_link_id, from_id, relation, path) as (
            select seed, 0, 1.0, null::text, null::text, null::text, array[seed]
            from unnest($1::text[]) as seed
@@ -8333,9 +9158,11 @@ var PostgresStore = class {
          group by id
          order by score desc
          limit 100`,
-        [seeds, hops]
+        [seeds, hops],
+        startedAt
       );
-      const chainRows = await this.db.query(
+      const chainRows = await this.searchQuery(
+        options,
         `with target_chains as (
            select chain_id from omb.chain_member where member_id = any($1::text[])
            union
@@ -8345,7 +9172,8 @@ var PostgresStore = class {
          from omb.chain_member cm
          join target_chains tc on tc.chain_id = cm.chain_id
          where not (cm.member_id = any($1::text[]))`,
-        [seeds]
+        [seeds],
+        startedAt
       );
       const byId = /* @__PURE__ */ new Map();
       for (const row of linkRows.rows) {
@@ -8378,10 +9206,12 @@ var PostgresStore = class {
       }
       if (options.includeArchived !== true && byId.size > 0) {
         const ids = [...byId.keys()];
-        const active = await this.db.query(
+        const active = await this.searchQuery(
+          options,
           `select entity_id from omb.entity_view
            where entity_id = any($1::text[]) and archived_at is null and lifecycle = 'active'`,
-          [ids]
+          [ids],
+          startedAt
         );
         const activeIds = new Set(active.rows.map((row) => row.entity_id));
         for (const id of ids) if (!activeIds.has(id)) byId.delete(id);
@@ -8523,78 +9353,86 @@ var PostgresStore = class {
     await this.run(() => this.writer.rebuildView(id));
   }
   async markRecallInjected(traceId) {
-    if (traceId.trim().length === 0) return;
+    await this.run(() => markRecallInjectedAudit(this.db, traceId));
+  }
+  /**
+   * 召回事件批量写入（RET-14）。
+   *
+   * 旧实现每个 (hit, channel) 一行 INSERT：一次 limit=10 的召回最多 30 次往返。
+   * 现在一次 unnest 批量插入；adoption 的 retrieved_count 由注入 receipt 派生，
+   * 不在 recall_event 层累加，避免多通道/伪造事件放大。
+   */
+  async recordRecall(events) {
+    if (events.length === 0) return;
+    const rows = {
+      traceId: events.map((event) => event.traceId),
+      sessionId: events.map((event) => event.sessionId ?? null),
+      turnId: events.map((event) => event.turnId ?? null),
+      query: events.map((event) => event.query ?? null),
+      trigger: events.map((event) => event.trigger ?? null),
+      entityId: events.map((event) => event.entityId),
+      channel: events.map((event) => event.channel),
+      rank: events.map((event) => event.rank),
+      rawScore: events.map((event) => event.rawScore ?? null),
+      fusedScore: events.map((event) => event.fusedScore ?? null),
+      injected: events.map((event) => event.injected)
+    };
     await this.run(() => this.db.transaction(async (client) => {
       await client.query(
-        `with counted as (
-           update omb.recall_event
-              set injected = true,
-                  injected_at = coalesce(injected_at, now()),
-                  retrieved_counted = true
-            where trace_id = $1
-              and (not injected or not retrieved_counted)
-           returning entity_id
+        `insert into omb.recall_event (
+           trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank,
+           raw_score, fused_score, injected, injected_at
          )
-         insert into omb.adoption_metric as metric (entity_id, retrieved_count, last_retrieved_at, updated_at)
-         select entity_id, 1, now(), now()
-           from (select distinct entity_id from counted) entities
-         on conflict (entity_id) do update
-           set retrieved_count = metric.retrieved_count + 1,
-               last_retrieved_at = now(),
-               updated_at = now()`,
-        [traceId]
+         select t.trace_id, t.session_id, t.turn_id, t.query, t.trigger, t.entity_id, t.channel, t.rank,
+                t.raw_score, t.fused_score, t.injected,
+                case when t.injected then now() else null end
+           from unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+             $6::text[], $7::text[], $8::int[], $9::real[], $10::real[], $11::boolean[]
+           ) as t(trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank, raw_score, fused_score, injected)`,
+        [
+          rows.traceId,
+          rows.sessionId,
+          rows.turnId,
+          rows.query,
+          rows.trigger,
+          rows.entityId,
+          rows.channel,
+          rows.rank,
+          rows.rawScore,
+          rows.fusedScore,
+          rows.injected
+        ]
       );
     }));
   }
-  async recordRecall(events) {
-    if (events.length === 0) return;
-    const traceIds = [...new Set(events.filter((event) => event.injected).map((event) => event.traceId))];
-    await this.run(() => this.db.transaction(async (client) => {
-      for (const event of events) {
-        await client.query(
-          `insert into omb.recall_event (
-             trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank,
-             raw_score, fused_score, injected, injected_at
-           ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-                     case when $11 then now() else null end)`,
-          [
-            event.traceId,
-            event.sessionId ?? null,
-            event.turnId ?? null,
-            event.query ?? null,
-            event.trigger ?? null,
-            event.entityId,
-            event.channel,
-            event.rank,
-            event.rawScore ?? null,
-            event.fusedScore ?? null,
-            event.injected
-          ]
-        );
-      }
-      for (const traceId of traceIds) {
-        await client.query(
-          `with counted as (
-             update omb.recall_event
-                set retrieved_counted = true
-              where trace_id = $1 and injected and not retrieved_counted
-             returning entity_id
-           )
-           insert into omb.adoption_metric as metric (entity_id, retrieved_count, last_retrieved_at, updated_at)
-           select entity_id, 1, now(), now()
-             from (select distinct entity_id from counted) entities
-           on conflict (entity_id) do update
-             set retrieved_count = metric.retrieved_count + 1,
-                 last_retrieved_at = now(),
-                 updated_at = now()`,
-          [traceId]
-        );
-      }
-    }));
-  }
-  async recordResidentTrace(trace) {
+  /** 通道失败/deadline 审计（RET-08）：一次 unnest 批量插入，不逐行往返。 */
+  async recordRecallChannelErrors(errors) {
+    if (errors.length === 0) return;
     await this.run(async () => {
       await this.db.query(
+        `insert into omb.recall_channel_error (
+           trace_id, session_id, query, channel, code, message, retryable
+         )
+         select t.trace_id, t.session_id, t.query, t.channel, t.code, t.message, t.retryable
+           from unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::boolean[]
+           ) as t(trace_id, session_id, query, channel, code, message, retryable)`,
+        [
+          errors.map((error62) => error62.traceId),
+          errors.map((error62) => error62.sessionId ?? null),
+          errors.map((error62) => error62.query ?? null),
+          errors.map((error62) => error62.channel),
+          errors.map((error62) => error62.code),
+          errors.map((error62) => error62.message),
+          errors.map((error62) => error62.retryable)
+        ]
+      );
+    });
+  }
+  async recordResidentTrace(trace) {
+    await this.run(() => this.db.transaction(async (client) => {
+      await client.query(
         `insert into omb.resident_trace (
            trace_id, session_id, turn_id, budget_tokens, used_tokens, text, sections, dropped_sections
          ) values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::text[])
@@ -8610,7 +9448,15 @@ var PostgresStore = class {
           [...trace.droppedSections]
         ]
       );
-    });
+      await writeAdoptionReceipt(client, adoptionReceiptFromResidentTrace(trace));
+    }));
+  }
+  /**
+   * 记录一次真实注入的 receipt（T0/T1/T2）。receipt 的 kept/quarantined 是采用证据的
+   * 唯一来源；`recordExposure`/`recordUsage` 会先验证这里写下的 kept 行。
+   */
+  async recordAdoptionReceipt(input2) {
+    return this.run(() => recordAdoptionReceipt(this.db, input2));
   }
   async markAccessed(ids) {
     if (ids.length === 0) return;
@@ -8624,227 +9470,18 @@ var PostgresStore = class {
     });
   }
   /**
-   * 记录一次曝光（Exposure）：只创建/累加使用机会，不给任何显著度。
-   * 同一 `(entity, session, task)` 的重复召回只增加 exposures；opportunities 只加一次。
+   * 记录一次曝光（Exposure）：必须已有 kept receipt（019），否则忽略。
+   * 同一 `(entity, session, task)` 只创建一个使用机会；同一 receipt 只登记一次 exposures。
    */
   async recordExposure(input2) {
-    const sessionId = input2.sessionId.trim();
-    const taskId = input2.taskId.trim().length === 0 ? "session" : input2.taskId.trim();
-    if (input2.entityId.trim().length === 0 || sessionId.length === 0) return;
-    await this.run(() => this.db.transaction(async (client) => {
-      const inserted = await client.query(
-        `insert into omb.usage_opportunity (
-           entity_id, session_id, task_id, exposures, exposed_at, last_trace_id, updated_at
-         ) values ($1, $2, $3, 1, now(), $4, now())
-         on conflict (entity_id, session_id, task_id) do nothing
-         returning entity_id`,
-        [input2.entityId, sessionId, taskId, input2.traceId ?? null]
-      );
-      if ((inserted.rowCount ?? 0) > 0) {
-        await client.query(
-          `insert into omb.adoption_metric as metric (entity_id, opportunities, updated_at)
-           values ($1, 1, now())
-           on conflict (entity_id) do update
-             set opportunities = metric.opportunities + 1,
-                 updated_at = now()`,
-          [input2.entityId]
-        );
-        return;
-      }
-      await client.query(
-        `update omb.usage_opportunity
-            set exposures = exposures + 1,
-                last_trace_id = coalesce($4, last_trace_id),
-                updated_at = now()
-          where entity_id = $1 and session_id = $2 and task_id = $3`,
-        [input2.entityId, sessionId, taskId, input2.traceId ?? null]
-      );
-    }));
+    await this.run(() => recordReceiptExposure(this.db, input2));
   }
   /**
-   * 记录一条使用证据。机会级状态只升级一次，指标按机会计数：同一任务里的
-   * 重复引用/使用/验证不会重复累计成功次数。
-   *
-   * 只写参考/使用/验证/证伪；`Exposure` 由 `recordExposure` 独立记录。
+   * 记录一条使用证据：必须已有 kept receipt，否则忽略（伪造 recall_event 不会增加采用）。
+   * 机会级状态只升级一次，指标按机会计数；同一任务里重复引用/验证不会重复累计。
    */
   async recordUsage(level, input2) {
-    const sessionId = input2.sessionId.trim();
-    const entityId = input2.entityId.trim();
-    if (sessionId.length === 0 || entityId.length === 0) return;
-    const requestedTaskId = input2.taskId?.trim();
-    await this.run(() => this.db.transaction(async (client) => {
-      let opportunity = await this.selectOpportunity(client, entityId, sessionId, requestedTaskId);
-      let opportunitiesBump = 0;
-      if (opportunity === void 0) {
-        const taskId = requestedTaskId === void 0 || requestedTaskId.length === 0 ? "session" : requestedTaskId;
-        const inserted = await client.query(
-          `insert into omb.usage_opportunity (
-             entity_id, session_id, task_id, exposures, exposed_at, updated_at
-           ) values ($1, $2, $3, 0, now(), now())
-           on conflict (entity_id, session_id, task_id) do nothing
-           returning *`,
-          [entityId, sessionId, taskId]
-        );
-        opportunity = inserted.rows[0] ?? await this.selectOpportunity(client, entityId, sessionId, taskId);
-        if (opportunity === void 0) throw new OmbFailure(internal("使用机会写入后读不到"));
-        opportunitiesBump = inserted.rows[0] === void 0 ? 0 : 1;
-      }
-      const referenceTransition = level !== "refutation" && opportunity.referenced_at === null;
-      const utilizationTransition = level === "utilization" && opportunity.utilized_at === null;
-      const validationTransition = level === "validation" && opportunity.validated_at === null;
-      const refutationTransition = level === "refutation" && opportunity.refuted_at === null;
-      const candidateKind = level === "utilization" ? "entity-id" : input2.kind;
-      const referenceKind = opportunity.reference_kind === "entity-id" || candidateKind === "entity-id" ? "entity-id" : opportunity.reference_kind ?? candidateKind;
-      await client.query(
-        `update omb.usage_opportunity
-            set updated_at = now(),
-                last_trace_id = coalesce($4, last_trace_id),
-                referenced_at = coalesce(referenced_at, case when $5 then now() end),
-                reference_kind = case when $5 then coalesce($6, reference_kind) else reference_kind end,
-                reference_source = coalesce(reference_source, case when $5 then $9 end),
-                utilized_at = coalesce(utilized_at, case when $8 then now() end),
-                utilization_kind = coalesce(utilization_kind, case when $8 then $7 end),
-                utilization_source = coalesce(utilization_source, case when $8 then $9 end),
-                validated_at = coalesce(validated_at, case when $10 then now() end),
-                validation_kind = coalesce(validation_kind, case when $10 then $7 end),
-                validation_source = coalesce(validation_source, case when $10 then $9 end),
-                validation_evidence = coalesce(validation_evidence, case when $10 then $11::jsonb end),
-                refuted_at = coalesce(refuted_at, case when $12 then now() end),
-                refutation_kind = coalesce(refutation_kind, case when $12 then $7 end),
-                refutation_source = coalesce(refutation_source, case when $12 then $9 end),
-                refutation_evidence = coalesce(refutation_evidence, case when $12 then $11::jsonb end)
-          where entity_id = $1 and session_id = $2 and task_id = $3`,
-        [
-          entityId,
-          sessionId,
-          opportunity.task_id,
-          input2.traceId ?? null,
-          referenceTransition,
-          referenceKind,
-          input2.kind,
-          utilizationTransition,
-          input2.source,
-          validationTransition,
-          input2.evidence === void 0 ? null : JSON.stringify(input2.evidence),
-          refutationTransition
-        ]
-      );
-      if (input2.traceId !== void 0 && input2.traceId.trim().length > 0) {
-        await this.writeRecallEvidence(client, level, input2);
-      }
-      const referencedBump = referenceTransition ? 1 : 0;
-      const utilizedBump = utilizationTransition ? 1 : 0;
-      const validatedBump = validationTransition ? 1 : 0;
-      const refutedBump = refutationTransition ? 1 : 0;
-      if (opportunitiesBump + referencedBump + utilizedBump + validatedBump + refutedBump === 0) return;
-      await client.query(
-        `insert into omb.adoption_metric as metric (
-           entity_id, opportunities, referenced_count, utilized_count, validated_count, refuted_count,
-           last_referenced_at, last_utilized_at, last_validated_at, last_refuted_at, updated_at
-         ) values (
-           $1, $2::bigint, $3::bigint, $4::bigint, $5::bigint, $6::bigint,
-           case when $3 > 0 then now() end,
-           case when $4 > 0 then now() end,
-           case when $5 > 0 then now() end,
-           case when $6 > 0 then now() end,
-           now()
-         )
-         on conflict (entity_id) do update
-           set opportunities = metric.opportunities + excluded.opportunities,
-               referenced_count = metric.referenced_count + excluded.referenced_count,
-               utilized_count = metric.utilized_count + excluded.utilized_count,
-               validated_count = metric.validated_count + excluded.validated_count,
-               refuted_count = metric.refuted_count + excluded.refuted_count,
-               last_referenced_at = coalesce(excluded.last_referenced_at, metric.last_referenced_at),
-               last_utilized_at = coalesce(excluded.last_utilized_at, metric.last_utilized_at),
-               last_validated_at = coalesce(excluded.last_validated_at, metric.last_validated_at),
-               last_refuted_at = coalesce(excluded.last_refuted_at, metric.last_refuted_at),
-               updated_at = now()`,
-        [
-          entityId,
-          opportunitiesBump,
-          referencedBump,
-          utilizedBump,
-          validatedBump,
-          refutedBump
-        ]
-      );
-      if (validatedBump > 0) {
-        await client.query("update omb.entity set adoption_count = adoption_count + 1 where id = $1", [entityId]);
-      }
-    }));
-  }
-  async selectOpportunity(client, entityId, sessionId, taskId) {
-    const result = await client.query(
-      `select *
-         from omb.usage_opportunity
-        where entity_id = $1 and session_id = $2
-          and ($3::text is null or task_id = $3)
-        order by updated_at desc
-        limit 1
-        for update`,
-      [entityId, sessionId, taskId === void 0 || taskId.length === 0 ? null : taskId]
-    );
-    return result.rows[0];
-  }
-  /** 事件级证据列只写第一次；与机会级指标分开，便于按 trace 审计。 */
-  async writeRecallEvidence(client, level, input2) {
-    const traceId = input2.traceId;
-    const evidence = input2.evidence === void 0 ? null : JSON.stringify(input2.evidence);
-    if (level === "reference") {
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, $3),
-                reference_source = coalesce(reference_source, $4)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input2.entityId, input2.kind, input2.source]
-      );
-      return;
-    }
-    if (level === "utilization") {
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, 'entity-id'),
-                reference_source = coalesce(reference_source, $4),
-                utilized_at = coalesce(utilized_at, now()),
-                utilization_kind = coalesce(utilization_kind, $3),
-                utilization_source = coalesce(utilization_source, $4)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input2.entityId, input2.kind, input2.source]
-      );
-      return;
-    }
-    if (level === "validation") {
-      await client.query(
-        `update omb.recall_event
-            set referenced_at = coalesce(referenced_at, now()),
-                reference_kind = coalesce(reference_kind, $3),
-                reference_source = coalesce(reference_source, $4),
-                validated_at = coalesce(validated_at, now()),
-                validation_kind = coalesce(validation_kind, $3),
-                validation_source = coalesce(validation_source, $4),
-                validation_evidence = coalesce(validation_evidence, $5::jsonb),
-                adopted_at = coalesce(adopted_at, now()),
-                adoption_kind = coalesce(adoption_kind, 'validated:' || $3)
-          where trace_id = $1 and entity_id = $2`,
-        [traceId, input2.entityId, input2.kind, input2.source, evidence]
-      );
-      return;
-    }
-    await client.query(
-      `update omb.recall_event
-          set referenced_at = coalesce(referenced_at, now()),
-              reference_kind = coalesce(reference_kind, $3),
-              reference_source = coalesce(reference_source, $4),
-              refuted_at = coalesce(refuted_at, now()),
-              refutation_kind = coalesce(refutation_kind, $3),
-              refutation_source = coalesce(refutation_source, $4),
-              refutation_evidence = coalesce(refutation_evidence, $5::jsonb)
-        where trace_id = $1 and entity_id = $2`,
-      [traceId, input2.entityId, input2.kind, input2.source, evidence]
-    );
+    await this.run(() => recordUsageEvidence(this.db, level, input2));
   }
   async markAdopted(traceId, entityId, kind) {
     await this.run(async () => {
@@ -8990,8 +9627,8 @@ var PostgresStore = class {
   async recordAudit(entry) {
     return this.run(() => this.writer.recordAudit(entry));
   }
-  async rollback(auditId, actor) {
-    return this.run(() => this.writer.rollback(auditId, actor));
+  async rollback(auditId, actor, authorization) {
+    return this.run(() => this.writer.rollback(auditId, actor, authorization));
   }
   // 检索通道由本类的独立查询实现，避免把图/融合逻辑塞进 Store。
   async fulltext(spec) {
@@ -9076,6 +9713,7 @@ var PostgresStore = class {
        limit $${params.length}`;
     const rows = await this.db.transaction(async (client) => {
       await client.query("set local max_parallel_workers_per_gather = 0");
+      await this.applyStatementTimeout(client, spec.timeoutMs);
       return client.query(sql, params);
     });
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: "fulltext" }));
@@ -9085,7 +9723,8 @@ var PostgresStore = class {
     const params = [spec.query.trim()];
     const filter = this.scopeClause(spec, params);
     params.push(Math.max(1, Math.min(20, spec.limit)));
-    const rows = await this.db.query(
+    const rows = await this.searchQuery(
+      spec,
       // datctype=C 的库里 similarity('中文','中') 恒为 0，不能拿它当 rawScore；
       // chars GIN 给出覆盖全文的候选（不再用 240 字 snippet 复核，否则尾部字符必漏，RET-01）；
       // search_text 是 tokenize 后以空格分隔的词，去空格近似原文，用于给连续子串更高 raw。
@@ -9095,7 +9734,8 @@ var PostgresStore = class {
        where v.chars @> string_to_array($1, NULL) ${filter}
        order by raw desc, v.updated_at desc, v.entity_id asc
        limit $${params.length}`,
-      params
+      params,
+      Date.now()
     );
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: "single_char" }));
   }
@@ -9106,6 +9746,7 @@ var PostgresStore = class {
     params.push(Math.max(1, Math.min(100, spec.limit)));
     return this.db.transaction(async (client) => {
       await client.query("set local hnsw.iterative_scan = 'relaxed_order'");
+      await this.applyStatementTimeout(client, spec.timeoutMs);
       const rows = await client.query(
         `select v.entity_id, 1 - (e.embedding <=> $1::vector) as raw
          from omb.embedding e
@@ -9122,14 +9763,16 @@ var PostgresStore = class {
     const params = [spec.from, spec.to, spec.now];
     const filter = this.scopeClause(spec, params);
     params.push(Math.max(1, Math.min(100, spec.limit)));
-    const rows = await this.db.query(
+    const rows = await this.searchQuery(
+      spec,
       `select v.entity_id,
               1.0 / (1.0 + greatest(0, extract(epoch from ($3::timestamptz - v.event_time)) / 86400.0 / 30.0)) as raw
        from omb.entity_view v
        where v.event_time >= $1::timestamptz and v.event_time <= $2::timestamptz ${filter}
        order by v.event_time desc
        limit $${params.length}`,
-      params
+      params,
+      Date.now()
     );
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: "time" }));
   }
@@ -9137,7 +9780,8 @@ var PostgresStore = class {
     const params = [spec.now];
     const filter = this.scopeClause(spec, params);
     params.push(Math.max(1, Math.min(50, spec.limit)));
-    const rows = await this.db.query(
+    const rows = await this.searchQuery(
+      spec,
       `select v.entity_id,
               case v.status when 'blocked' then 1.0 when 'in_progress' then 0.9 when 'waiting' then 0.7 else 0.5 end
               + 0.1 / (1.0 + greatest(0, extract(epoch from ($1::timestamptz - v.event_time)) / 86400.0 / 30.0)) as raw
@@ -9145,16 +9789,19 @@ var PostgresStore = class {
        where v.kind = 'state' and v.status in ('in_progress','blocked','waiting') ${filter}
        order by raw desc, v.updated_at desc
        limit $${params.length}`,
-      params
+      params,
+      Date.now()
     );
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: "state_board" }));
   }
   async searchTriggers(spec) {
     const scores = /* @__PURE__ */ new Map();
+    const startedAt = Date.now();
     if (spec.keys.length > 0) {
       const params = [spec.keys];
       const filter = this.scopeClause(spec, params);
-      const rows = await this.db.query(
+      const rows = await this.searchQuery(
+        spec,
         `select t.entity_id, sum(t.weight) as raw
          from (select distinct key from unnest($1::text[]) as input(key)) as cand
          cross join (values ('path'),('tool'),('error'),('entity'),('text')) as k(kind)
@@ -9164,21 +9811,24 @@ var PostgresStore = class {
          group by t.entity_id
          order by raw desc
          limit 50`,
-        params
+        params,
+        startedAt
       );
       for (const row of rows.rows) scores.set(row.entity_id, Math.max(scores.get(row.entity_id) ?? 0, Number(row.raw)));
     }
     if (spec.regexText !== void 0 && spec.regexText.trim().length > 0) {
       const filterParams = [];
       const filter = this.scopeClause(spec, filterParams);
-      const rows = await this.db.query(
+      const rows = await this.searchQuery(
+        spec,
         `select t.entity_id, t.key, t.weight
          from omb.trigger_key t
          join omb.entity_view v on v.entity_id = t.entity_id
          where t.kind = 'regex' ${filter}
          order by t.entity_id asc, t.key asc
          limit ${TRIGGER_REGEX_CANDIDATE_LIMIT}`,
-        filterParams
+        filterParams,
+        startedAt
       );
       if (rows.rows.length > 0) {
         const entries = rows.rows.map((row, index) => {
@@ -9282,14 +9932,24 @@ var PostgresMaintenance = class {
   }
   async coRecallPairs(limit) {
     const rows = await this.db.query(
-      `select a.entity_id as a, b.entity_id as b, count(*)::text as count
-       from omb.recall_event a
-       join omb.recall_event b
+      // RET-14：recall_event 每个 (entity, channel) 一行，直接 join 会把同一 trace 的
+      // 通道组合放大成 N×M 对（3 通道 × 3 通道 = 9），把“共同召回 2 次”虚报成 18 次。
+      // 先按 distinct (trace_id, entity_id) 收敛成“这一次召回看到了哪些实体”，再按 pair 计数：
+      // count = 两个实体被同一次召回、且都产生采用证据的 trace 数。
+      `with adopted as (
+         select distinct trace_id, entity_id
+           from omb.recall_event
+          where adopted_at is not null
+       )
+       select a.entity_id as a, b.entity_id as b, count(*)::text as count
+       from adopted a
+       join adopted b
          on a.trace_id = b.trace_id and a.entity_id < b.entity_id
-       join omb.entity_view av on av.entity_id = a.entity_id and av.archived_at is null and av.is_current and av.lifecycle = 'active'
-       join omb.entity_view bv on bv.entity_id = b.entity_id and bv.archived_at is null and bv.is_current and bv.lifecycle = 'active'
-       where a.adopted_at is not null and b.adopted_at is not null
-         and av.kind in ('memory', 'state', 'state_version')
+       join omb.entity_view av on av.entity_id = a.entity_id
+         and av.archived_at is null and av.is_current and av.lifecycle = 'active'
+       join omb.entity_view bv on bv.entity_id = b.entity_id
+         and bv.archived_at is null and bv.is_current and bv.lifecycle = 'active'
+       where av.kind in ('memory', 'state', 'state_version')
          and bv.kind in ('memory', 'state', 'state_version')
        group by a.entity_id, b.entity_id
        order by count(*) desc
@@ -10579,7 +11239,7 @@ function createDshTaskReader(ctx) {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/external.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
   $brand: () => $brand,
@@ -10842,7 +11502,7 @@ __export(external_exports, {
   xor: () => xor
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/index.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/index.js
 var core_exports2 = {};
 __export(core_exports2, {
   $ZodAny: () => $ZodAny,
@@ -11159,7 +11819,7 @@ __export(core_exports2, {
   withParser: () => withParser
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 var util_exports = {};
 __export(util_exports, {
   BIGINT_FORMAT_RANGES: () => BIGINT_FORMAT_RANGES,
@@ -12015,7 +12675,7 @@ function constantCatch(value) {
   return fn;
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/core.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/core.js
 var _a;
 var NEVER = /* @__PURE__ */ Object.freeze({
   status: "aborted"
@@ -12137,7 +12797,7 @@ function config(newConfig) {
   return globalConfig;
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/errors.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/errors.js
 function _getMessage() {
   const internals = this._zod;
   internals.message ?? (internals.message = JSON.stringify(internals.def, jsonStringifyReplacer, 2));
@@ -12329,7 +12989,7 @@ function prettifyError(error62) {
   return lines.join("\n");
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/parse.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/parse.js
 function finalizeParams(callee, params) {
   return { callee: params?.callee ?? callee, Err: params?.Err };
 }
@@ -12489,7 +13149,7 @@ var _safeDecodeAsync = (_Err) => async (schema, value, _ctx) => {
 };
 var safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync($ZodRealError);
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/regexes.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/regexes.js
 var regexes_exports = {};
 __export(regexes_exports, {
   anyString: () => anyString,
@@ -12661,7 +13321,7 @@ var sha512_hex = /^[0-9a-fA-F]{128}$/;
 var sha512_base64 = /* @__PURE__ */ fixedBase64(86, "==");
 var sha512_base64url = /* @__PURE__ */ fixedBase64url(86);
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/checks.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/checks.js
 var $ZodCheck = /* @__PURE__ */ $constructor("$ZodCheck", (inst, def) => {
   var _a3;
   inst._zod ?? (inst._zod = {});
@@ -13137,7 +13797,7 @@ var $ZodCheckOverwrite = /* @__PURE__ */ $constructor("$ZodCheckOverwrite", (ins
   };
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/doc.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/doc.js
 var Doc = class {
   constructor(args = [], closed = {}) {
     this.content = [];
@@ -13178,14 +13838,14 @@ ${content.join("\n")}
   }
 };
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/versions.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/versions.js
 var version = {
   major: 4,
   minor: 6,
   patch: 7
 };
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/schemas.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/schemas.js
 var $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
   var _a3;
   inst ?? (inst = {});
@@ -15627,7 +16287,7 @@ function handleRefineResult(result, payload, input2, inst) {
   }
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/memoizer.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/memoizer.js
 var $ZodCyclicError = class extends Error {
   constructor() {
     super(`Cannot parse a reference cycle that closes through a transform`);
@@ -15904,7 +16564,7 @@ function isBackEdge(ctx, value) {
   return backEdges !== void 0 && isRef(value) && backEdges.has(value);
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/index.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/index.js
 var locales_exports = {};
 __export(locales_exports, {
   ar: () => ar_default,
@@ -15972,7 +16632,7 @@ __export(locales_exports, {
   zhTW: () => zh_TW_default
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ar.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ar.js
 var error = () => {
   const Sizable = {
     string: { unit: "حرف", verb: "أن يحوي" },
@@ -16084,7 +16744,7 @@ function ar_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/az.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/az.js
 var error2 = () => {
   const Sizable = {
     string: { unit: "simvol", verb: "olmalıdır" },
@@ -16195,7 +16855,7 @@ function az_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/be.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/be.js
 function getBelarusianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -16364,7 +17024,7 @@ function be_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/bg.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/bg.js
 var error4 = () => {
   const Sizable = {
     string: { unit: "символа", verb: "да съдържа" },
@@ -16490,7 +17150,7 @@ function bg_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/bn.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/bn.js
 var error5 = () => {
   const Sizable = {
     string: { unit: "অক্ষর", verb: "থাকতে হবে" },
@@ -16604,7 +17264,7 @@ function bn_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ca.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ca.js
 var error6 = () => {
   const Sizable = {
     string: { unit: "caràcters", verb: "contenir" },
@@ -16718,7 +17378,7 @@ function ca_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ckb.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ckb.js
 var error7 = () => {
   const Sizable = {
     string: { unit: "پیت", verb: "بێت" },
@@ -16851,7 +17511,7 @@ function ckb_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/cs.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/cs.js
 var error8 = () => {
   const Sizable = {
     string: { unit: "znaků", verb: "mít" },
@@ -16968,7 +17628,7 @@ function cs_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/da.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/da.js
 var error9 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "havde" },
@@ -17089,7 +17749,7 @@ function da_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/de.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/de.js
 var error10 = () => {
   const Sizable = {
     string: { unit: "Zeichen", verb: "zu haben" },
@@ -17203,7 +17863,7 @@ function de_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/el.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/el.js
 var error11 = () => {
   const Sizable = {
     string: { unit: "χαρακτήρες", verb: "να έχει" },
@@ -17316,7 +17976,7 @@ function el_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/en.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/en.js
 var error12 = () => {
   const Sizable = {
     string: { unit: "characters", verb: "to have" },
@@ -17441,7 +18101,7 @@ function en_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/eo.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/eo.js
 var error13 = () => {
   const Sizable = {
     string: { unit: "karaktrojn", verb: "havi" },
@@ -17556,7 +18216,7 @@ function eo_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/es.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/es.js
 var error14 = () => {
   const Sizable = {
     string: { unit: "caracteres", verb: "tener" },
@@ -17693,7 +18353,7 @@ function es_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fa.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fa.js
 var error15 = () => {
   const Sizable = {
     string: { unit: "کاراکتر", verb: "داشته باشد" },
@@ -17813,7 +18473,7 @@ function fa_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fi.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fi.js
 var error16 = () => {
   const Sizable = {
     string: { unit: "merkkiä", subject: "merkkijonon" },
@@ -17931,7 +18591,7 @@ function fi_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fr.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fr.js
 var error17 = () => {
   const Sizable = {
     string: { unit: "caractères", verb: "avoir" },
@@ -18061,7 +18721,7 @@ function fr_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fr-CA.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/fr-CA.js
 var error18 = () => {
   const Sizable = {
     string: { unit: "caractères", verb: "avoir" },
@@ -18174,7 +18834,7 @@ function fr_CA_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/gu.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/gu.js
 var error19 = () => {
   const Sizable = {
     string: { unit: "અક્ષર", verb: "હોવા જોઈએ" },
@@ -18288,7 +18948,7 @@ function gu_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/he.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/he.js
 var error20 = () => {
   const TypeNames = {
     string: { label: "מחרוזת", gender: "f" },
@@ -18490,7 +19150,7 @@ function he_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hi.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hi.js
 var error21 = () => {
   const Sizable = {
     string: { unit: "अक्षर", verb: "रखने के लिए" },
@@ -18602,7 +19262,7 @@ function hi_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hr.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hr.js
 var error22 = () => {
   const Sizable = {
     string: { unit: "znakova", verb: "imati" },
@@ -18729,7 +19389,7 @@ function hr_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hu.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hu.js
 var error23 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "legyen" },
@@ -18843,7 +19503,7 @@ function hu_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hy.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/hy.js
 function getArmenianPlural(count, one, many) {
   return Math.abs(count) === 1 ? one : many;
 }
@@ -19002,7 +19662,7 @@ function hy_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/id.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/id.js
 var error25 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "memiliki" },
@@ -19114,7 +19774,7 @@ function id_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/is.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/is.js
 var error26 = () => {
   const Sizable = {
     string: { unit: "stafi", verb: "að hafa" },
@@ -19229,7 +19889,7 @@ function is_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/it.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/it.js
 var error27 = () => {
   const Sizable = {
     string: { unit: "caratteri", verb: "avere" },
@@ -19343,7 +20003,7 @@ function it_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ja.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ja.js
 var error28 = () => {
   const Sizable = {
     string: { unit: "文字", verb: "である" },
@@ -19456,7 +20116,7 @@ function ja_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ka.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ka.js
 var error29 = () => {
   const Sizable = {
     string: { unit: "სიმბოლო", verb: "უნდა შეიცავდეს" },
@@ -19574,7 +20234,7 @@ function ka_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/km.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/km.js
 var error30 = () => {
   const Sizable = {
     string: { unit: "តួអក្សរ", verb: "គួរមាន" },
@@ -19690,12 +20350,12 @@ function km_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/kh.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/kh.js
 function kh_default() {
   return km_default();
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/kn.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/kn.js
 var error31 = () => {
   const Sizable = {
     string: { unit: "ಅಕ್ಷರಗಳು", verb: "ಹೊಂದಲು" },
@@ -19811,7 +20471,7 @@ function kn_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ko.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ko.js
 var error32 = () => {
   const Sizable = {
     string: { unit: "문자", verb: "to have" },
@@ -19928,7 +20588,7 @@ function ko_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/lt.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/lt.js
 var capitalizeFirstCharacter = (text2) => {
   return text2.charAt(0).toUpperCase() + text2.slice(1);
 };
@@ -20136,7 +20796,7 @@ function lt_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/mk.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/mk.js
 var error34 = () => {
   const Sizable = {
     string: { unit: "знаци", verb: "да имаат" },
@@ -20251,7 +20911,7 @@ function mk_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ms.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ms.js
 var error35 = () => {
   const Sizable = {
     string: { unit: "aksara", verb: "mempunyai" },
@@ -20364,7 +21024,7 @@ function ms_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ne.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ne.js
 var error36 = () => {
   const Sizable = {
     string: { unit: "अक्षर", verb: "हुनुपर्छ" },
@@ -20476,7 +21136,7 @@ function ne_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/nl.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/nl.js
 var error37 = () => {
   const Sizable = {
     string: { unit: "tekens", verb: "heeft" },
@@ -20592,7 +21252,7 @@ function nl_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/nn.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/nn.js
 var error38 = () => {
   const Sizable = {
     string: { unit: "teikn", verb: "å ha" },
@@ -20706,7 +21366,7 @@ function nn_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/no.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/no.js
 var error39 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "å ha" },
@@ -20820,7 +21480,7 @@ function no_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ota.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ota.js
 var error40 = () => {
   const Sizable = {
     string: { unit: "harf", verb: "olmalıdır" },
@@ -20935,7 +21595,7 @@ function ota_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ps.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ps.js
 var error41 = () => {
   const Sizable = {
     string: { unit: "توکي", verb: "ولري" },
@@ -21055,7 +21715,7 @@ function ps_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pl.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pl.js
 var error42 = () => {
   const Sizable = {
     string: { unit: "znaków", verb: "mieć" },
@@ -21170,7 +21830,7 @@ function pl_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pt.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pt.js
 var error43 = () => {
   const Sizable = {
     string: { unit: "caracteres" },
@@ -21314,7 +21974,7 @@ function pt_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pt-BR.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/pt-BR.js
 var error44 = () => {
   const Sizable = {
     string: { unit: "caracteres" },
@@ -21459,7 +22119,7 @@ function pt_BR_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ro.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ro.js
 var error45 = () => {
   const Sizable = {
     string: { unit: "caractere", verb: "să aibă" },
@@ -21582,7 +22242,7 @@ function ro_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ru.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ru.js
 function getRussianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -21751,7 +22411,7 @@ function ru_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sk.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sk.js
 var error47 = () => {
   const Sizable = {
     string: { unit: "znakov", verb: "mať" },
@@ -21868,7 +22528,7 @@ function sk_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sl.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sl.js
 var error48 = () => {
   const Sizable = {
     string: { unit: "znakov", verb: "imeti" },
@@ -21983,7 +22643,7 @@ function sl_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sv.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/sv.js
 var error49 = () => {
   const Sizable = {
     string: { unit: "tecken", verb: "att ha" },
@@ -22099,7 +22759,7 @@ function sv_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ta.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ta.js
 var error50 = () => {
   const Sizable = {
     string: { unit: "எழுத்துக்கள்", verb: "கொண்டிருக்க வேண்டும்" },
@@ -22215,7 +22875,7 @@ function ta_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tg.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tg.js
 var error51 = () => {
   const Sizable = {
     string: { unit: "аломат", verb: "дошта бошад" },
@@ -22332,7 +22992,7 @@ function tg_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/th.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/th.js
 var error52 = () => {
   const Sizable = {
     string: { unit: "ตัวอักษร", verb: "ควรมี" },
@@ -22448,7 +23108,7 @@ function th_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tk.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tk.js
 var error53 = () => {
   const Sizable = {
     string: { unit: "simwol", verb: "bolmaly" },
@@ -22556,7 +23216,7 @@ function tk_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tr.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/tr.js
 var error54 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "olmalı" },
@@ -22667,7 +23327,7 @@ function tr_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/uk.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/uk.js
 var error55 = () => {
   const Sizable = {
     string: { unit: "символів", verb: "матиме" },
@@ -22781,12 +23441,12 @@ function uk_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ua.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ua.js
 function ua_default() {
   return uk_default();
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ur.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/ur.js
 var error56 = () => {
   const Sizable = {
     string: { unit: "حروف", verb: "ہونا" },
@@ -22902,7 +23562,7 @@ function ur_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/uz.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/uz.js
 var error57 = () => {
   const Sizable = {
     string: { unit: "belgi", verb: "bo‘lishi kerak" },
@@ -23016,7 +23676,7 @@ function uz_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/vi.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/vi.js
 var error58 = () => {
   const Sizable = {
     string: { unit: "ký tự", verb: "có" },
@@ -23130,7 +23790,7 @@ function vi_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/zh-CN.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/zh-CN.js
 var error59 = () => {
   const Sizable = {
     string: { unit: "字符", verb: "包含" },
@@ -23245,7 +23905,7 @@ function zh_CN_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/zh-TW.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/zh-TW.js
 var error60 = () => {
   const Sizable = {
     string: { unit: "字元", verb: "擁有" },
@@ -23358,7 +24018,7 @@ function zh_TW_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/yo.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/locales/yo.js
 var error61 = () => {
   const Sizable = {
     string: { unit: "àmi", verb: "ní" },
@@ -23471,7 +24131,7 @@ function yo_default() {
   };
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/registries.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/registries.js
 var _a2;
 var $output = /* @__PURE__ */ Symbol("ZodOutput");
 var $input = /* @__PURE__ */ Symbol("ZodInput");
@@ -23521,7 +24181,7 @@ function registry() {
 (_a2 = globalThis).__zod_globalRegistry ?? (_a2.__zod_globalRegistry = registry());
 var globalRegistry = globalThis.__zod_globalRegistry;
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/compile.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/compile.js
 var INVALID = Symbol.for("zod.compile.invalid");
 var FALLBACK_FLAG = Symbol.for("zod.compile.fallback");
 var ZodCompileAsyncError = class extends Error {
@@ -25131,7 +25791,7 @@ function generateTransformCheck(doc, ctx, schema, accessor) {
   return accessor;
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/api.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/api.js
 function snapshotChecks(def) {
   if (def.checks)
     def.checks = [...def.checks];
@@ -26190,7 +26850,7 @@ function _stringFormat(Class2, format2, fnOrRegex, _params = {}) {
   return inst;
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/to-json-schema.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/to-json-schema.js
 function assignProps(target, ...sources) {
   for (const source of sources) {
     for (const key of Reflect.ownKeys(source)) {
@@ -26720,7 +27380,7 @@ var createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params) =
   return finalize(ctx, schema);
 };
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-processors.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-processors.js
 var narrowMin = (agg, key, value) => {
   if (agg[key] === void 0 || value > agg[key])
     agg[key] = value;
@@ -27468,7 +28128,7 @@ function toJSONSchema(input2, params) {
   return finalize(ctx, input2);
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-generator.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema-generator.js
 var JSONSchemaGenerator = class {
   /** @deprecated Access via ctx instead */
   get metadataRegistry() {
@@ -27546,10 +28206,10 @@ var JSONSchemaGenerator = class {
   }
 };
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/json-schema.js
 var json_schema_exports = {};
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
 var schemas_exports2 = {};
 __export(schemas_exports2, {
   ZodAny: () => ZodAny,
@@ -27730,7 +28390,7 @@ __export(schemas_exports2, {
   xor: () => xor
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/checks.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/checks.js
 var checks_exports2 = {};
 __export(checks_exports2, {
   endsWith: () => _endsWith,
@@ -27765,7 +28425,7 @@ __export(checks_exports2, {
   uppercase: () => _uppercase
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/errors.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/errors.js
 var _installedErrorProtos = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
 function _lazyMethod(proto, key, make) {
   Object.defineProperty(proto, key, {
@@ -27811,7 +28471,7 @@ var ZodRealError = /* @__PURE__ */ $constructor("ZodError", initializer2, void 0
   Parent: Error
 });
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
 var parse2 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync2 = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse2 = /* @__PURE__ */ _safeParse(ZodRealError);
@@ -27825,7 +28485,7 @@ var safeDecode2 = /* @__PURE__ */ _safeDecode(ZodRealError);
 var safeEncodeAsync2 = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
 var safeDecodeAsync2 = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
 function _ensureDefaultLocale() {
   if (!globalConfig.localeError)
     config(en_default());
@@ -29290,7 +29950,7 @@ function preprocess(fn, schema) {
   });
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/compat.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/compat.js
 var ZodIssueCode = {
   invalid_type: "invalid_type",
   too_big: "too_big",
@@ -29316,7 +29976,7 @@ var ZodFirstPartyTypeKind;
 /* @__PURE__ */ (function(ZodFirstPartyTypeKind2) {
 })(ZodFirstPartyTypeKind || (ZodFirstPartyTypeKind = {}));
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/iso.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/iso.js
 var iso_exports = {};
 __export(iso_exports, {
   ZodISODate: () => ZodISODate,
@@ -29341,7 +30001,7 @@ function duration2(params) {
   return _isoDuration(ZodISODuration, params);
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/from-json-schema.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/from-json-schema.js
 var z = {
   ...schemas_exports2,
   ...checks_exports2,
@@ -30074,7 +30734,7 @@ function fromJSONSchema(schema, params) {
   return convertSchema(normalized, ctx);
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/visit.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/visit.js
 var RESOLVING = Symbol("z.visit/resolving");
 function visit(schema, fnOrHandlers) {
   const fn = typeof fnOrHandlers === "function" ? fnOrHandlers : (node2, rewritten) => {
@@ -30229,7 +30889,7 @@ function visit(schema, fnOrHandlers) {
   return run2(schema);
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/deep-partial.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/deep-partial.js
 function deepPartial(schema) {
   return visit(schema, {
     object: (s) => s.partial(),
@@ -30241,7 +30901,7 @@ function deepPartial(schema) {
   });
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/in-out.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/in-out.js
 function withChecks(side, checks) {
   if (!checks?.length)
     return side;
@@ -30271,7 +30931,7 @@ function output(schema) {
   });
 }
 
-// node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/coerce.js
+// ../../Oh-My-BigBlueFish/node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/coerce.js
 var coerce_exports = {};
 __export(coerce_exports, {
   bigint: () => bigint3,
@@ -30592,7 +31252,7 @@ var rememberSchema = external_exports.object({
   attrs: external_exports.record(external_exports.string(), JSON_VALUE).optional().describe('可选属性；普通值是静态，{"$dynamic":{...}} 是动态'),
   confidence: external_exports.number().min(0).max(1).optional(),
   pinned: external_exports.boolean().optional(),
-  origin: external_exports.string().max(MAX_ORIGIN_CHARS).optional()
+  origin: external_exports.string().max(MAX_ORIGIN_CHARS).optional().describe("已废弃：来源/actor 由宿主会话派生，传入会被覆盖并记录越权审计")
 });
 var recallSchema = external_exports.object({
   query: external_exports.string().min(1).max(MAX_QUERY_CHARS),
@@ -30849,9 +31509,8 @@ function createToolDefinitions(runtime) {
           oldId: parsed.data.to,
           newId: parsed.data.from,
           reason: parsed.data.reason ?? "superseded",
-          actor: "model",
           ...parsed.data.effectiveAt !== void 0 ? { effectiveAt: parsed.data.effectiveAt } : {}
-        }));
+        }, context, "omb_link"));
       }
       const input2 = {
         fromId: parsed.data.from,
@@ -30868,10 +31527,12 @@ function createToolDefinitions(runtime) {
     "omb_history",
     "需要查看状态机历史版本，或确认一条记忆是否已被取代/被谁取代、有效期从何时到何时时调用；历史不可回滚，只返回快照与生命周期事实。",
     toolParameters(historySchema),
-    async (rawArgs) => {
+    async (rawArgs, exec) => {
       const parsed = parseToolArgs(historySchema, rawArgs);
       if (!parsed.ok) return { ok: false, text: parsed.text };
-      return resultOf(await runtime.history(parsed.data.id, parsed.data.limit ?? 20));
+      const context = await runtime.context(exec);
+      if (context === void 0) return { ok: false, text: "missing-session: 无法确定会话/项目" };
+      return resultOf(await runtime.history(parsed.data.id, parsed.data.limit ?? 20, context));
     }
   );
   add(
@@ -30884,10 +31545,12 @@ function createToolDefinitions(runtime) {
     "omb_admin",
     "需要查看审计、回滚某次后台操作、手工归档/取消归档、取代/证伪一条记忆，或重放 dead outbox 事件时调用；supersede 需要 targetId（旧）+ newId（新），retract 需要 targetId（被证伪）；rollback 只支持有 inverse 的审计记录；replay 用 outboxId 或 topic 二选一（都缺省会被拒绝），把 dead 行重置为 pending 并写一条 outbox-replay 审计。",
     toolParameters(adminSchema),
-    async (rawArgs) => {
+    async (rawArgs, exec) => {
       const parsed = parseToolArgs(adminSchema, rawArgs);
       if (!parsed.ok) return { ok: false, text: parsed.text };
-      return resultOf(await runtime.admin(parsed.data));
+      const context = await runtime.context(exec);
+      if (context === void 0) return { ok: false, text: "missing-session: 无法确定会话/项目" };
+      return resultOf(await runtime.admin(parsed.data, context));
     }
   );
   return definitions;
@@ -31579,11 +32242,23 @@ function compileFilters(request) {
     includeSuperseded: request.includeSuperseded === true
   };
 }
-function compileProviders(config2, expand, timeoutMs) {
+function resolveChannels(channels) {
+  if (channels === void 0) return void 0;
+  if (channels.length === 0) fail(invalid("channels 不能是空数组"));
+  const unique = [];
+  for (const channel of channels) {
+    if (!STAGE_ONE_CHANNELS.includes(channel)) {
+      fail(invalid(`channels 只允许阶段一通道（${STAGE_ONE_CHANNELS.join("/")}），实际：${String(channel)}`));
+    }
+    if (!unique.includes(channel)) unique.push(channel);
+  }
+  return unique;
+}
+function compileProviders(config2, expand, timeoutMs, channels) {
+  const narrowed = channels === void 0 ? void 0 : new Set(channels);
   return PROVIDER_CHANNELS.map((channel) => ({
     channel,
-    // links/expand 只在计划要求图扩展时启用；其余通道恒启用，跳过条件由 provider 自己判断。
-    enabled: channel === "links" || channel === "expand" ? expand !== "none" : true,
+    enabled: narrowed !== void 0 ? narrowed.has(channel) : channel === "links" || channel === "expand" ? expand !== "none" : true,
     limit: config2.channelLimit,
     timeoutMs
   }));
@@ -31643,7 +32318,8 @@ function compileRetrievalPlan(request, context) {
   const termBudget = Math.max(1, Math.floor(context.termBudget ?? DEFAULT_QUERY_TERM_BUDGET));
   const signals = compileSignals(request.query);
   const phrases = extractPhrases(request.query);
-  const expand = request.expand ?? "both";
+  const channels = resolveChannels(request.channels);
+  const expand = channels === void 0 ? request.expand ?? "both" : "none";
   const timeZone = resolveTimeZone(request, context);
   const body = {
     schema: PLAN_SCHEMA,
@@ -31658,7 +32334,7 @@ function compileRetrievalPlan(request, context) {
     signals,
     phrases,
     terms: compileTerms(request.query, signals, phrases, termBudget),
-    providers: compileProviders(context.config, expand, providerTimeoutMs),
+    providers: compileProviders(context.config, expand, providerTimeoutMs, channels),
     limit: resolveLimit(request, context.config),
     budget: {
       terms: termBudget,
@@ -31749,15 +32425,6 @@ function bestSeedForEntity(seedSet, entityId) {
   if (refs === void 0 || refs.length === 0) return void 0;
   return refs.reduce(betterSeed);
 }
-function bestSeedOverall(seedSet) {
-  let best;
-  for (const entityId of seedSet.entityIds) {
-    const seed = bestSeedForEntity(seedSet, entityId);
-    if (seed === void 0) continue;
-    best = best === void 0 ? seed : betterSeed(best, seed);
-  }
-  return best;
-}
 function bestSeedForChain(seedSet, chain) {
   let best;
   for (const memberId of chain.members) {
@@ -31773,15 +32440,35 @@ function filterExpansions(expansions, mode) {
   if (mode === "chain") return expansions.filter((expansion) => expansion.chainId !== void 0);
   return [...expansions];
 }
-function resolveExpansionSeed(expansion, seedSet, chains, fallback) {
-  if (expansion.chainId !== void 0) {
-    const chain = chains.get(expansion.chainId);
-    if (chain !== void 0) {
-      const seed = bestSeedForChain(seedSet, chain);
-      if (seed !== void 0) return seed;
+function resolveExpansionProvenance(expansions, seedSet, chains) {
+  const ordered = [...expansions].sort((left, right) => left.hop - right.hop || (left.entityId < right.entityId ? -1 : left.entityId > right.entityId ? 1 : 0));
+  const resolved = /* @__PURE__ */ new Map();
+  for (const expansion of ordered) {
+    if (resolved.has(expansion.entityId)) continue;
+    if (expansion.chainId !== void 0) {
+      const chain = chains.get(expansion.chainId);
+      const chainSeed = chain === void 0 ? void 0 : bestSeedForChain(seedSet, chain);
+      if (chainSeed !== void 0) {
+        resolved.set(expansion.entityId, { seed: chainSeed, source: "chain" });
+        continue;
+      }
+      const directSeed2 = bestSeedForEntity(seedSet, expansion.fromId);
+      resolved.set(expansion.entityId, directSeed2 === void 0 ? { source: "unknown" } : { seed: directSeed2, source: "direct" });
+      continue;
     }
+    const directSeed = bestSeedForEntity(seedSet, expansion.fromId);
+    if (directSeed !== void 0) {
+      resolved.set(expansion.entityId, { seed: directSeed, source: "direct" });
+      continue;
+    }
+    const ancestor = expansion.hop > 1 ? resolved.get(expansion.fromId) : void 0;
+    if (ancestor?.seed !== void 0) {
+      resolved.set(expansion.entityId, { seed: ancestor.seed, source: "ancestor" });
+      continue;
+    }
+    resolved.set(expansion.entityId, { source: "unknown" });
   }
-  return bestSeedForEntity(seedSet, expansion.fromId) ?? fallback;
+  return resolved;
 }
 
 // packages/v7/src/retrieval/providers/run.ts
@@ -31797,7 +32484,7 @@ function providerLimit(plan, channel) {
   const config2 = plan.providers.find((entry) => entry.channel === channel);
   return config2?.limit ?? plan.budget.candidates;
 }
-function searchBase(plan, limit) {
+function searchBase(plan, limit, timeoutMs) {
   return {
     ...plan.filters.scope === void 0 ? {} : { scope: plan.filters.scope },
     ...plan.filters.projectKey === void 0 ? {} : { projectKey: plan.filters.projectKey },
@@ -31807,6 +32494,7 @@ function searchBase(plan, limit) {
     ...plan.filters.includeArchived ? { includeArchived: true } : {},
     ...plan.filters.includeHistory ? { includeHistory: true } : {},
     ...plan.filters.includeSuperseded ? { includeSuperseded: true } : {},
+    ...timeoutMs === void 0 ? {} : { timeoutMs },
     limit
   };
 }
@@ -31871,6 +32559,7 @@ async function runProvider(provider, plan, services, options) {
     embedder: services.embedder,
     now: plan.time.now,
     signal: controller.signal,
+    timeoutMs,
     previous: options.previous ?? /* @__PURE__ */ new Map(),
     seeds: options.seeds ?? [],
     expansions: options.expansions ?? []
@@ -31941,7 +32630,10 @@ var ExpandProvider = class {
     const expansions = await context.store.expand(
       context.seeds,
       plan.hops,
-      plan.filters.includeArchived ? { includeArchived: true } : {}
+      {
+        ...plan.filters.includeArchived ? { includeArchived: true } : {},
+        timeoutMs: context.timeoutMs
+      }
     );
     return { status: "ok", expansions };
   }
@@ -32058,7 +32750,7 @@ var TriggerProvider = class {
     if (keys.length === 0 && regexText === void 0) {
       return skipped2("查询为空，没有可匹配的触发键或正则文本");
     }
-    const base = searchBase(plan, providerLimit(plan, "trigger"));
+    const base = searchBase(plan, providerLimit(plan, "trigger"), context.timeoutMs);
     try {
       const hits = await context.store.triggers({
         ...base,
@@ -32083,7 +32775,7 @@ var FulltextProvider = class {
   async search(plan, context) {
     if (plan.terms.length === 0) return skipped2("查询为空，没有全文词");
     const hits = await context.store.fulltext({
-      ...searchBase(plan, providerLimit(plan, "fulltext")),
+      ...searchBase(plan, providerLimit(plan, "fulltext"), context.timeoutMs),
       query: plan.query,
       tokens: plan.terms.map((term) => term.term)
     });
@@ -32102,7 +32794,7 @@ var SingleCharProvider = class {
       return skipped2(`查询长度 ${plan.normalizedQuery.length} > ${maxLength}，不做单字回退`);
     }
     const hits = await context.store.singleChar({
-      ...searchBase(plan, providerLimit(plan, "single_char")),
+      ...searchBase(plan, providerLimit(plan, "single_char"), context.timeoutMs),
       query: plan.normalizedQuery,
       tokens: plan.terms.map((term) => term.term)
     });
@@ -32139,7 +32831,7 @@ var VectorProvider = class {
     } catch (error62) {
       return { status: "unavailable", reason: "嵌入失败", issues: [issueOf2(error62)] };
     }
-    const hits = await context.store.vector({ ...searchBase(plan, providerLimit(plan, "vector")), embedding });
+    const hits = await context.store.vector({ ...searchBase(plan, providerLimit(plan, "vector"), context.timeoutMs), embedding });
     return { status: "ok", hits };
   }
 };
@@ -32147,7 +32839,7 @@ var TimeProvider = class {
   channel = "time";
   async search(plan, context) {
     const hits = await context.store.time({
-      ...searchBase(plan, providerLimit(plan, "time")),
+      ...searchBase(plan, providerLimit(plan, "time"), context.timeoutMs),
       from: plan.time.lookback.from,
       to: plan.time.lookback.to,
       now: plan.time.now
@@ -32159,7 +32851,7 @@ var StateBoardProvider = class {
   channel = "state_board";
   async search(plan, context) {
     const narrowToProject = plan.filters.scope === void 0 && plan.filters.projectKey !== void 0;
-    const base = searchBase(plan, providerLimit(plan, "state_board"));
+    const base = searchBase(plan, providerLimit(plan, "state_board"), context.timeoutMs);
     const boardBase = narrowToProject ? { ...base, scope: "project", projectKey: plan.filters.projectKey } : base;
     const hits = await context.store.stateBoard({ ...boardBase, now: plan.time.now });
     return { status: "ok", hits };
@@ -32185,7 +32877,8 @@ function reportStatus(status) {
 }
 function reportOf(outcome, channel) {
   if (outcome === void 0) return { channel, status: "failed", hitCount: 0, reason: "通道没有执行结果" };
-  const reason = outcome.status === "deadline" ? `deadline: ${outcome.reason ?? "超出计划 deadline"}` : outcome.reason;
+  const configured = outcome.status === "deadline" ? `deadline: ${outcome.reason ?? "超出计划 deadline"}` : outcome.reason;
+  const reason = configured !== void 0 && configured.trim().length > 0 ? configured : outcome.status === "failed" || outcome.status === "deadline" ? `通道 ${channel} ${outcome.status === "deadline" ? "在 deadline 内未完成" : "执行失败"}（provider 未给出原因）` : void 0;
   return {
     channel,
     status: reportStatus(outcome.status),
@@ -32224,7 +32917,13 @@ async function runStageOnePlan(deps, plan, options = {}) {
       warnings.push(`通道 ${outcome.channel} 在 deadline 内未完成：${outcome.reason ?? "未知原因"}`);
     }
     for (const issue3 of outcome.issues) {
-      errors.push({ channel: outcome.channel, code: issue3.code, message: issue3.message, retryable: issue3.retryable });
+      errors.push({
+        channel: outcome.channel,
+        code: issue3.code,
+        // RET-08：空错误文本会让“失败”退化成无法诊断；这里补一条最小可读原因。
+        message: issue3.message.trim().length > 0 ? issue3.message : `通道 ${outcome.channel} 失败但没有给出错误详情`,
+        retryable: issue3.retryable
+      });
     }
   }
   const reports = STAGE_ONE_CHANNELS.map((channel) => reportOf(byChannel.get(channel), channel));
@@ -32494,13 +33193,17 @@ function seedRawScore(seedSet, seedId, fallback) {
   return refs.reduce((best, ref) => Math.max(best, ref.rawScore), Number.NEGATIVE_INFINITY);
 }
 function applyExpansions(candidates, expansions, seedSet, chains, weights, config2) {
-  const fallbackSeed = bestSeedOverall(seedSet);
+  const provenance = resolveExpansionProvenance(expansions, seedSet, chains);
   const bestByEntity = /* @__PURE__ */ new Map();
+  let unresolved = 0;
   for (const expansion of expansions) {
     const decay = decayForHop(expansion.hop, config2);
     if (decay === void 0) continue;
-    const seed = resolveExpansionSeed(expansion, seedSet, chains, fallbackSeed);
-    if (seed === void 0) continue;
+    const seed = provenance.get(expansion.entityId)?.seed;
+    if (seed === void 0) {
+      unresolved += 1;
+      continue;
+    }
     const evidence = {
       seedId: seed.entityId,
       hop: expansion.hop,
@@ -32526,6 +33229,7 @@ function applyExpansions(candidates, expansions, seedSet, chains, weights, confi
     candidate.rawByChannel.set("links", previousRaw === void 0 ? evidence.rawScore : Math.max(previousRaw, evidence.rawScore));
     candidate.link = evidence;
   }
+  return { applied: bestByEntity.size, unresolved };
 }
 function sortChannels(channels) {
   const present = new Set(channels);
@@ -32607,11 +33311,12 @@ function explainWhyNot(input2) {
       return [{ code: "empty-query", message: "empty-query 归一化后查询为空" }];
     }
     const attempted = input2.reports.filter((report) => report.status !== "skipped");
-    if (attempted.length > 0 && attempted.every((report) => report.status === "failed")) {
+    const completed = attempted.some((report) => report.status === "ok" || report.status === "empty");
+    if (attempted.length > 0 && !completed) {
       return [
         {
           code: "all-channels-failed",
-          message: `all-channels-failed channels=${attempted.map((report) => report.channel).join(",")}`
+          message: `all-channels-failed channels=${attempted.map((report) => `${report.channel}:${report.status}`).join(",")}：没有可用通道，不代表库里没有相关内容`
         }
       ];
     }
@@ -32639,11 +33344,12 @@ function baseEmptyReason(input2) {
       };
     }
     const attempted = input2.reports.filter((report) => report.status !== "skipped");
-    if (attempted.length > 0 && attempted.every((report) => report.status === "failed")) {
+    const completed = attempted.some((report) => report.status === "ok" || report.status === "empty");
+    if (attempted.length > 0 && !completed) {
       return {
         code: "all-channels-failed",
-        message: "六个通道全部失败：这是存储或嵌入不可用，不代表库里没有相关内容。",
-        details: { channels: attempted.map((report) => report.channel) }
+        message: "被尝试的通道全部失败或不可用：这是存储或嵌入不可用，不代表库里没有相关内容。",
+        details: { channels: attempted.map((report) => `${report.channel}:${report.status}`) }
       };
     }
     return {
@@ -33046,6 +33752,7 @@ var RecallEngine = class {
     const stageOneMs = performance.now() - startedAt;
     warnings.push(...stageOne.warnings);
     const stageOneHitCount = [...stageOne.hitsByChannel.values()].reduce((sum, hits2) => sum + hits2.length, 0);
+    await this.recordChannelFailures(input2, stageOne, warnings);
     const seedConfig = plan.budget.seeds === this.config.seedLimit ? this.config : { ...this.config, seedLimit: plan.budget.seeds };
     const seedSet = collectSeeds(stageOne.hitsByChannel, seedConfig);
     const expansionAnchorMs = this.executionAnchorMs() + (performance.now() - startedAt);
@@ -33057,7 +33764,12 @@ var RecallEngine = class {
     };
     const candidates = fuseStageOne(stageOne.hitsByChannel, scenario.weights, this.config.rrfK);
     if (expansion.expansions.length > 0) {
-      applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config);
+      const applied = applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config);
+      if (applied.unresolved > 0) {
+        warnings.push(
+          `图扩展有 ${applied.unresolved} 条路径无法归因到阶段一种子（2 跳截断或思维链组超出上限），已跳过：不伪造全局最强种子。`
+        );
+      }
     }
     const gate = gateCandidates([...candidates.values()], {
       ...this.config,
@@ -33324,6 +34036,52 @@ var RecallEngine = class {
       warnings.push(`批量富化只返回 ${features.size}/${ids.length} 条，其余按中性先验处理`);
     }
     return features;
+  }
+  /**
+   * 通道失败证据落库（RET-08）。输入有两部分：
+   * - provider 报告的问题（`stageOne.errors`，含 code/retryable）；
+   * - 只有报告没有 issue 的失败（例如计划 deadline 已过期时 runner 不启动查询），
+   *   按报告 reason 补一条审计行，避免“通道 failed 但错误表为空”。
+   *
+   * 没有 store 方法时静默跳过（旧 fake 存储）；写失败只加 warning。
+   */
+  async recordChannelFailures(execution, stageOne, warnings) {
+    const record2 = this.store.recordRecallChannelErrors;
+    if (record2 === void 0) return;
+    const base = {
+      traceId: execution.traceId,
+      ...execution.sessionId === void 0 ? {} : { sessionId: execution.sessionId },
+      ...execution.plan.query.length === 0 ? {} : { query: execution.plan.query }
+    };
+    const entries = [];
+    const covered = /* @__PURE__ */ new Set();
+    for (const issue3 of stageOne.errors) {
+      covered.add(issue3.channel);
+      entries.push({
+        ...base,
+        channel: issue3.channel,
+        code: issue3.code,
+        message: issue3.message.trim().length > 0 ? issue3.message : `通道 ${issue3.channel} 失败但没有给出错误详情`,
+        retryable: issue3.retryable
+      });
+    }
+    for (const report of stageOne.reports) {
+      if (report.status !== "failed" || covered.has(report.channel)) continue;
+      const deadline = report.reason?.startsWith("deadline:") === true;
+      entries.push({
+        ...base,
+        channel: report.channel,
+        code: deadline ? "timeout" : "internal",
+        message: report.reason !== void 0 && report.reason.trim().length > 0 ? report.reason : `通道 ${report.channel} 失败但没有给出原因`,
+        retryable: deadline
+      });
+    }
+    if (entries.length === 0) return;
+    try {
+      await record2.call(this.store, entries);
+    } catch (error62) {
+      warnings.push(`通道错误审计写入失败（召回结果不受影响）：${toOmbError(error62).message}`);
+    }
   }
   async recordRecall(execution, hits, warnings) {
     const events = [];
@@ -33979,7 +34737,9 @@ import pg3 from "pg";
 // packages/v7/src/security/trust.ts
 var DEFAULT_TRUST_LEVELS = Object.freeze({
   user: 1,
+  assistant: 0.8,
   model: 0.8,
+  tool: 0.4,
   job: 0.6,
   external: 0.3,
   system: 1
@@ -34066,12 +34826,7 @@ function clamp012(value) {
   return Math.max(0, Math.min(1, value));
 }
 function actorKindOfOrigin(origin) {
-  const normalized = (origin ?? "").trim().toLowerCase();
-  if (normalized === "user" || normalized.startsWith("user:")) return "user";
-  if (normalized === "job" || normalized.startsWith("job:")) return "job";
-  if (normalized === "system" || normalized.startsWith("system:")) return "system";
-  if (normalized === "external" || normalized.startsWith("external:")) return "external";
-  return "model";
+  return auditActorKindOf(origin);
 }
 function defaultOriginOf(source) {
   if (source === "external") return "external";
@@ -35171,7 +35926,7 @@ async function handleReferenceRotForSource(deps, entityId) {
   return { marked: await markBrokenReferences(deps, await deps.queries.brokenReferencesForSource(entityId, 50)) };
 }
 
-// packages/v7/src/jobs/schedule.ts
+// packages/v7/src/jobs/names.ts
 var CONSOLIDATION_JOBS = [
   "omb.extract",
   "omb.reference-rot",
@@ -35184,6 +35939,140 @@ var CONSOLIDATION_JOBS = [
   "omb.refresh",
   "omb.embed-sweep"
 ];
+
+// packages/v7/src/jobs/runners.ts
+function nonEmptyStringOf(payload, key) {
+  const value = payload[key];
+  return typeof value === "string" && value.length > 0 ? value : void 0;
+}
+function consolidationJobPayloadOf(payload) {
+  if (!isPlainObject(payload)) return {};
+  const options = {};
+  const entityId = nonEmptyStringOf(payload, "entityId");
+  if (entityId !== void 0) options.entityId = entityId;
+  const targetEntityId = nonEmptyStringOf(payload, "targetEntityId");
+  if (targetEntityId !== void 0) options.targetEntityId = targetEntityId;
+  const artifactId = nonEmptyStringOf(payload, "artifactId");
+  if (artifactId !== void 0) options.artifactId = artifactId;
+  const dependencyRoot = nonEmptyStringOf(payload, "dependencyRoot");
+  if (dependencyRoot !== void 0) options.dependencyRoot = dependencyRoot;
+  const limit = payload["limit"];
+  if (typeof limit === "number" && Number.isInteger(limit) && limit > 0) options.limit = limit;
+  return options;
+}
+function createConsolidationJobRunners(deps) {
+  return {
+    "omb.extract": async (payload) => {
+      const options = consolidationJobPayloadOf(payload);
+      const result = options.artifactId === void 0 ? await handleExtract(deps, options.limit) : await handleExtractArtifact(deps, options.artifactId);
+      return { written: result.written, skipped: result.skipped, grouped: result.grouped };
+    },
+    "omb.reference-rot": async (payload) => {
+      const options = consolidationJobPayloadOf(payload);
+      const target = options.targetEntityId ?? options.entityId;
+      const result = target === void 0 ? await handleReferenceRot(deps, options.limit) : await handleReferenceRotForTarget(deps, target);
+      return { marked: result.marked };
+    },
+    "omb.clue-promote": async (payload) => {
+      const options = consolidationJobPayloadOf(payload);
+      const result = options.entityId === void 0 ? await handleCluePromote(deps, options.limit) : await handleCluePromoteFor(deps, options.entityId);
+      return { promoted: result.promoted };
+    },
+    "omb.dedupe": async (payload) => {
+      const options = consolidationJobPayloadOf(payload);
+      const result = options.entityId === void 0 ? await handleDedupe(deps, options.limit) : await handleDedupeFor(deps, options.entityId);
+      return { merged: result.merged };
+    },
+    "omb.conflict": async (payload) => {
+      const options = consolidationJobPayloadOf(payload);
+      const result = options.entityId === void 0 ? await handleConflict(deps, options.limit) : await handleConflictFor(deps, options.entityId);
+      return { linked: result.linked };
+    },
+    "omb.link-suggest": async () => {
+      const result = await handleLinkSuggest(deps);
+      return { linked: result.linked, grouped: result.grouped };
+    },
+    "omb.forget": async () => {
+      const result = await handleForget(deps);
+      return { archived: result.archived, skipped: result.skipped };
+    },
+    "omb.attr-alias": async () => {
+      const result = await handleAttrAlias(deps);
+      return { renamed: result.renamed };
+    },
+    "omb.refresh": async (payload) => {
+      const result = await handleRefresh(deps, consolidationJobPayloadOf(payload));
+      return { refreshed: result.refreshed, statusUpdated: result.statusUpdated, skipped: result.skipped };
+    },
+    "omb.embed-sweep": async () => {
+      const result = await handleEmbedSweep(deps);
+      return { embedded: result.embedded };
+    }
+  };
+}
+
+// packages/v7/src/jobs/workflows.ts
+var CONSOLIDATION_WORKFLOW_VERSION = 1;
+var CONSOLIDATION_WORKFLOW_SPECS = [
+  { job: "omb.extract", workflow: "extract", step: "extract" },
+  { job: "omb.reference-rot", workflow: "reference-rot", step: "scan" },
+  { job: "omb.clue-promote", workflow: "clue-promote", step: "promote" },
+  { job: "omb.dedupe", workflow: "dedupe", step: "dedupe" },
+  { job: "omb.conflict", workflow: "conflict", step: "detect" },
+  { job: "omb.link-suggest", workflow: "link-suggest", step: "suggest" },
+  { job: "omb.attr-alias", workflow: "attr-alias", step: "rename" },
+  { job: "omb.refresh", workflow: "refresh", step: "refresh" },
+  { job: "omb.embed-sweep", workflow: "embed-sweep", step: "embed" }
+];
+function createConsolidationWorkflows(deps) {
+  return CONSOLIDATION_WORKFLOW_SPECS.map((spec) => createDefinition(spec, deps));
+}
+function createDefinition(spec, deps) {
+  return {
+    name: spec.workflow,
+    version: CONSOLIDATION_WORKFLOW_VERSION,
+    initial: { target: spec.workflow, job: spec.job },
+    steps: [
+      {
+        name: spec.step,
+        async run(state, ctx) {
+          try {
+            const result = await deps.runners[spec.job](void 0, {
+              commandId: ctx.commandId,
+              now: ctx.now,
+              signal: ctx.signal
+            });
+            return {
+              state: {
+                ...carriedState(state),
+                job: spec.job,
+                commandId: ctx.commandId,
+                at: ctx.now.toISOString(),
+                ...jsonFieldsOf(result)
+              },
+              next: null
+            };
+          } finally {
+            await deps.rearm(spec.job);
+          }
+        }
+      }
+    ]
+  };
+}
+function carriedState(state) {
+  if (!isPlainObject(state)) return {};
+  const carried = {};
+  for (const [key, value] of Object.entries(state)) {
+    if (isJsonValue(value)) carried[key] = value;
+  }
+  return carried;
+}
+function jsonFieldsOf(result) {
+  return isPlainObject(result) ? carriedState(result) : { result };
+}
+
+// packages/v7/src/jobs/schedule.ts
 var CONSOLIDATION_TIMER_TOPIC = "omb.consolidation";
 var CONSOLIDATION_TRIGGER = "omb.consolidation";
 var MINUTE_MS = 60 * 1e3;
@@ -35260,6 +36149,11 @@ function isTriggered(payload) {
 }
 function createConsolidationScheduler(deps) {
   const schedules = CONSOLIDATION_SCHEDULES;
+  const dispatches = /* @__PURE__ */ new Map();
+  for (const dispatch of deps.workflows ?? []) {
+    if (dispatches.has(dispatch.job)) throw new Error(`巩固任务 ${dispatch.job} 配置了多个 workflow dispatch`);
+    dispatches.set(dispatch.job, dispatch);
+  }
   return {
     schedules,
     async ensure(jobs) {
@@ -35282,8 +36176,8 @@ function createConsolidationScheduler(deps) {
       async run(task, ctx) {
         const job = jobOfPayload(task.payload);
         const schedule = scheduleOf(job);
-        const dispatch = deps.workflow;
-        if (dispatch !== void 0 && dispatch.job === job) {
+        const dispatch = dispatches.get(job);
+        if (dispatch !== void 0) {
           const period = periodOfPayload(task.payload, schedule.intervalMs, ctx.now);
           await dispatch.start(dispatch.workflow, `${schedule.dedupeKey}:${period}`);
           deps.logger?.debug("巩固任务已交给 workflow 执行", {
@@ -35302,31 +36196,17 @@ function createConsolidationScheduler(deps) {
     }
   };
 }
-function nonEmptyStringOf(payload, key) {
-  const value = payload[key];
-  return typeof value === "string" && value.length > 0 ? value : void 0;
-}
-function jobOptionsOf(payload) {
-  if (!isPlainObject(payload)) return {};
-  const options = {};
-  const entityId = nonEmptyStringOf(payload, "entityId");
-  if (entityId !== void 0) options.entityId = entityId;
-  const targetEntityId = nonEmptyStringOf(payload, "targetEntityId");
-  if (targetEntityId !== void 0) options.targetEntityId = targetEntityId;
-  const artifactId = nonEmptyStringOf(payload, "artifactId");
-  if (artifactId !== void 0) options.artifactId = artifactId;
-  const dependencyRoot = nonEmptyStringOf(payload, "dependencyRoot");
-  if (dependencyRoot !== void 0) options.dependencyRoot = dependencyRoot;
-  const limit = payload["limit"];
-  if (typeof limit === "number" && Number.isInteger(limit) && limit > 0) options.limit = limit;
-  return options;
-}
 async function registerConsolidationJobs(queue, deps, options = {}) {
+  const runners = createConsolidationJobRunners(deps);
   const registered = [];
-  const work = async (job, run2) => {
+  const work = async (job) => {
     await queue.work(job, async (payload) => {
       try {
-        await run2(payload);
+        const context = {
+          now: deps.clock.now(),
+          signal: new AbortController().signal
+        };
+        await runners[job](payload, context);
       } finally {
         if (isTriggered(payload) && options.scheduler !== void 0) {
           try {
@@ -35339,35 +36219,10 @@ async function registerConsolidationJobs(queue, deps, options = {}) {
     });
     registered.push(job);
   };
-  await work("omb.extract", (payload) => {
-    const options2 = jobOptionsOf(payload);
-    return (options2.artifactId === void 0 ? handleExtract(deps, options2.limit) : handleExtractArtifact(deps, options2.artifactId)).then(() => void 0);
-  });
-  await work("omb.dedupe", (payload) => {
-    const options2 = jobOptionsOf(payload);
-    return (options2.entityId === void 0 ? handleDedupe(deps, options2.limit) : handleDedupeFor(deps, options2.entityId)).then(() => void 0);
-  });
-  await work("omb.conflict", (payload) => {
-    const options2 = jobOptionsOf(payload);
-    return (options2.entityId === void 0 ? handleConflict(deps, options2.limit) : handleConflictFor(deps, options2.entityId)).then(() => void 0);
-  });
-  await work("omb.clue-promote", (payload) => {
-    const options2 = jobOptionsOf(payload);
-    return (options2.entityId === void 0 ? handleCluePromote(deps, options2.limit) : handleCluePromoteFor(deps, options2.entityId)).then(() => void 0);
-  });
-  await work("omb.link-suggest", () => handleLinkSuggest(deps).then(() => void 0));
-  await work("omb.forget", () => handleForget(deps).then(() => void 0));
-  await work("omb.attr-alias", () => handleAttrAlias(deps).then(() => void 0));
-  await work("omb.reference-rot", (payload) => {
-    const options2 = jobOptionsOf(payload);
-    const target = options2.targetEntityId ?? options2.entityId;
-    return (target === void 0 ? handleReferenceRot(deps, options2.limit) : handleReferenceRotForTarget(deps, target)).then(() => void 0);
-  });
-  if (deps.dynamic !== void 0) {
-    await work("omb.refresh", (payload) => handleRefresh(deps, jobOptionsOf(payload)).then(() => void 0));
-  }
-  if (deps.embedder !== void 0) {
-    await work("omb.embed-sweep", () => handleEmbedSweep(deps).then(() => void 0));
+  for (const job of CONSOLIDATION_JOBS) {
+    if (job === "omb.refresh" && deps.dynamic === void 0) continue;
+    if (job === "omb.embed-sweep" && deps.embedder === void 0) continue;
+    await work(job);
   }
   return registered;
 }
@@ -35659,7 +36514,7 @@ function createForgetWorkflow(deps) {
               signal: ctx.signal
             });
             const nextState = {
-              ...carriedState(state),
+              ...carriedState2(state),
               archived: result.archived,
               commandId: result.commandId,
               at: result.at
@@ -35673,7 +36528,7 @@ function createForgetWorkflow(deps) {
     ]
   };
 }
-function carriedState(state) {
+function carriedState2(state) {
   if (!isPlainObject(state)) return {};
   const carried = {};
   for (const [key, value] of Object.entries(state)) {
@@ -35710,6 +36565,35 @@ function createConsolidationRuntime(deps) {
   function bindWorkflowStart(start) {
     workflowStart = start;
   }
+  const jobDeps = {
+    store,
+    queries: deps.queries,
+    updateService: deps.updateService,
+    clock,
+    logger,
+    ...deps.dynamic === void 0 ? {} : { dynamic: deps.dynamic },
+    ...deps.embedder === void 0 ? {} : { embedder: deps.embedder }
+  };
+  const jobWorkflows = createConsolidationWorkflows({
+    runners: createConsolidationJobRunners(jobDeps),
+    rearm: (job) => scheduler.rearm(job)
+  });
+  const boundStart = async (name, idempotencyKey) => {
+    const start = workflowStart;
+    if (start === void 0) throw new Error(`workflow runtime 尚未就绪：${name} 不能降级为空转`);
+    return await start(name, idempotencyKey);
+  };
+  const workflowDispatches = [
+    { job: FORGET_JOB, workflow: forgetWorkflow.name, start: boundStart },
+    ...CONSOLIDATION_WORKFLOW_SPECS.map((spec) => ({
+      job: spec.job,
+      workflow: spec.workflow,
+      start: boundStart
+    }))
+  ];
+  const dispatchByJob = new Map(
+    workflowDispatches.map((dispatch) => [dispatch.job, dispatch])
+  );
   const scheduler = createConsolidationScheduler({
     timers: {
       schedule: (input2) => deps.timerStore.schedule(input2),
@@ -35718,17 +36602,7 @@ function createConsolidationRuntime(deps) {
     queue: deps.queue,
     clock,
     logger,
-    // 调度侧看到的 forget：到期只 start 一个 run。`start` 延迟绑定——workflow runtime
-    // 在 event-runtime 里构造，晚于本模块；未绑定时明确抛错让 timer 退避，不静默空转。
-    workflow: {
-      job: FORGET_JOB,
-      workflow: forgetWorkflow.name,
-      start: async (name, idempotencyKey) => {
-        const start = workflowStart;
-        if (start === void 0) throw new Error("workflow runtime 尚未就绪：omb.forget 不能降级为空转");
-        return await start(name, idempotencyKey);
-      }
-    }
+    workflows: workflowDispatches
   });
   function schedules() {
     return scheduler.schedules.filter((schedule) => consolidationJobs.includes(schedule.job));
@@ -35790,6 +36664,19 @@ function createConsolidationRuntime(deps) {
     for (const row of result.rows) total += row.queued;
     return { total, names: new Set(result.rows.map((row) => row.name)) };
   }
+  async function readActiveWorkflowRuns(names) {
+    if (names.length === 0) return /* @__PURE__ */ new Set();
+    const result = await store.db.query(
+      `select distinct name
+         from omb.workflow_run
+        where name = any($1::text[]) and status in ('pending', 'running', 'waiting')`,
+      [names]
+    );
+    return new Set(result.rows.map((row) => row.name));
+  }
+  function workflowNameOf(job) {
+    return dispatchByJob.get(job)?.workflow;
+  }
   async function statusLines() {
     if (!consolidationStarted) {
       return ["consolidation=unknown", `consolidationReason=${deps.startupError() ?? "not-started"}`];
@@ -35803,22 +36690,38 @@ function createConsolidationRuntime(deps) {
       });
       let repaired = false;
       if (queued !== void 0) {
-        const missing = selected.filter((schedule) => !armed.has(schedule.dedupeKey) && !queued.names.has(schedule.job));
-        if (missing.length > 0) {
-          const ensured = await scheduler.ensure(missing.map((schedule) => schedule.job));
-          if (ensured.scheduled.length > 0) {
-            logger.warn("巩固任务的 timer 链路缺失，已按 durable schedule 补排", { jobs: ensured.scheduled });
-            repaired = true;
+        const activeWorkflows = await readActiveWorkflowRuns(
+          selected.map((schedule) => workflowNameOf(schedule.job)).filter((name) => name !== void 0)
+        ).catch((error62) => {
+          logger.warn("巩固任务 workflow 在途计数失败", messageOf8(error62));
+          return void 0;
+        });
+        if (activeWorkflows !== void 0) {
+          const missing = selected.filter((schedule) => {
+            const workflow = workflowNameOf(schedule.job);
+            return !armed.has(schedule.dedupeKey) && !queued.names.has(schedule.job) && (workflow === void 0 || !activeWorkflows.has(workflow));
+          });
+          if (missing.length > 0) {
+            const ensured = await scheduler.ensure(missing.map((schedule) => schedule.job));
+            if (ensured.scheduled.length > 0) {
+              logger.warn("巩固任务的 timer 链路缺失，已按 durable schedule 补排", { jobs: ensured.scheduled });
+              repaired = true;
+            }
           }
         }
       }
       const snapshot = await readConsolidationTimers();
       const queuedAfter = repaired ? await readConsolidationQueued(selected).catch(() => void 0) : queued;
       const nextDueMs = snapshot.nextDueAt === void 0 ? "none" : String(Math.max(0, Date.parse(snapshot.nextDueAt) - clock.now().getTime()));
+      const drivers = selected.map((schedule) => {
+        const workflow = workflowNameOf(schedule.job);
+        return `${schedule.job}:${workflow === void 0 ? "queue" : `workflow/${workflow}`}`;
+      }).join(",") || "none";
       return [
         "consolidation=ok",
         `consolidationJobs=${selected.map((schedule) => schedule.job).join(",") || "none"}`,
         `consolidationModes=${selected.map((schedule) => `${schedule.job}:${schedule.mode}`).join(",") || "none"}`,
+        `consolidationDrivers=${drivers}`,
         `consolidationPending=${snapshot.pending} consolidationClaimed=${snapshot.claimed} consolidationDone=${snapshot.done} consolidationDead=${snapshot.dead}`,
         `consolidationDueAgeMs=${snapshot.dueAgeMs} consolidationNextDueMs=${nextDueMs} consolidationQueued=${queuedAfter?.total ?? "unknown"}`
       ];
@@ -35829,7 +36732,8 @@ function createConsolidationRuntime(deps) {
   return {
     scheduler,
     timerHandler: scheduler.timerHandler,
-    workflows: [forgetWorkflow],
+    // forget 放第一位：status 的 workflowDefinitions 以它开头（历史断言与阅读习惯）。
+    workflows: [forgetWorkflow, ...jobWorkflows],
     bindWorkflowStart,
     schedules,
     setRegisteredJobs,
@@ -38058,12 +38962,38 @@ function dataBlock(input2) {
   };
 }
 
+// packages/v7/src/recall/receipts.ts
+function dedupeEntityReceipts(items) {
+  const byId = /* @__PURE__ */ new Map();
+  for (const item of items) {
+    const previous = byId.get(item.entityId);
+    if (previous === void 0 || previous.state === "quarantined" && item.state === "kept") {
+      byId.set(item.entityId, item);
+    }
+  }
+  return [...byId.values()];
+}
+function withEntityReceipts(receipt, entities) {
+  const traceId = receipt.traceId;
+  const normalized = traceId === void 0 ? entities : entities.map((item) => item.traceId === traceId ? item : { ...item, traceId });
+  return { ...receipt, entities: dedupeEntityReceipts(normalized) };
+}
+function entityReceiptsOf2(receipt) {
+  return receipt?.entities ?? [];
+}
+function keptEntityIds(receipt) {
+  return entityReceiptsOf2(receipt).filter((item) => item.state === "kept").map((item) => item.entityId);
+}
+
 // packages/v7/src/recall/resident.ts
 var DEFAULT_RESIDENT_BUDGET = 600;
 var DEFAULT_RESIDENT_BOARDS_TIMEOUT_MS = 250;
 var DEFAULT_BOARDS_WATERMARK_MAX_AGE_MS = 3e4;
 var RESIDENT_PREFERENCE_LIMIT = 5;
 var RESIDENT_STATE_LIMIT = 5;
+function candidateEntityIds(candidate) {
+  return candidate.entities.map((entity) => entity.id);
+}
 var RESIDENT_HEADER = "[OMB 常驻]";
 function injectionHeader(visible) {
   return `${visible}
@@ -38115,13 +39045,21 @@ function compactHit(hit) {
   if (head.length === 0) return "";
   return `${label.length > 0 ? `[${label}] ` : ""}${head}（${hit.entityId}）`;
 }
+function residentEntity(id, title, updatedAt) {
+  const trimmed = title?.trim();
+  return {
+    id,
+    ...trimmed !== void 0 && trimmed.length > 0 ? { title: trimmed } : {},
+    ...updatedAt === void 0 ? {} : { updatedAt }
+  };
+}
 function compactSummaries(items, prefix, max) {
   if (items.length === 0) return void 0;
   const kept = items.slice(0, max);
   return {
     name: "preferences",
     text: `${prefix}${kept.map((item) => `${item.title ?? item.snippet}（${item.id}）`).join("；")}`,
-    entityIds: kept.map((item) => item.id)
+    entities: kept.map((item) => residentEntity(item.id, item.title, item.updatedAt))
   };
 }
 function compactHits(result, prefix, max) {
@@ -38133,14 +39071,17 @@ function compactHits(result, prefix, max) {
     const text2 = compactHit(hit);
     if (text2.length === 0) continue;
     seen.add(hit.entityId);
-    kept.push({ text: text2, id: hit.entityId });
+    kept.push({
+      text: text2,
+      hit: residentEntity(hit.entityId, hit.title, hit.updatedAt)
+    });
     if (kept.length >= max) break;
   }
   if (kept.length === 0) return void 0;
   return {
     name: "states",
     text: `${prefix}${kept.map((item) => item.text).join("；")}`,
-    entityIds: kept.map((item) => item.id)
+    entities: kept.map((item) => item.hit)
   };
 }
 function compactBoardSummaries(items, prefix, max) {
@@ -38165,8 +39106,7 @@ function compactBoardSummaries(items, prefix, max) {
   return {
     name: "preferences",
     text: `${prefix}${parts.join("；")}`,
-    entityIds: kept.map((hit) => hit.id),
-    hits: kept
+    entities: kept
   };
 }
 function compactBoardStates(items, prefix, max) {
@@ -38187,8 +39127,7 @@ function compactBoardStates(items, prefix, max) {
   return {
     name: "states",
     text: `${prefix}${kept.map((item) => item.text).join("；")}`,
-    entityIds: kept.map((item) => item.id),
-    hits: kept.map((item) => ({ id: item.id, ...item.title !== void 0 ? { title: item.title } : {} }))
+    entities: kept.map((item) => residentEntity(item.id, item.title))
   };
 }
 function errorText5(error62) {
@@ -38248,34 +39187,34 @@ function indexCandidates(index) {
   const candidates = [{
     name: "index",
     text: `库索引：memory ${index.memory}、state ${index.state}、chain ${index.chain}、archived ${index.archived}`,
-    entityIds: []
+    entities: []
   }];
   if (index.categories !== void 0) {
     candidates.push({
       name: "index",
       text: `分类：fact ${index.categories.fact}、clue ${index.categories.clue}、event ${index.categories.event}`,
-      entityIds: []
+      entities: []
     });
   }
   if (index.scopes !== void 0) {
     candidates.push({
       name: "index",
       text: `作用域：global ${index.scopes.global}、project ${index.scopes.project}`,
-      entityIds: []
+      entities: []
     });
   }
   if (index.recentStates !== void 0 && index.recentStates.length > 0) {
     candidates.push({
       name: "index",
       text: `最近状态：${index.recentStates.map((item) => `${item.title ?? item.id}(${item.status})`).join("；")}`,
-      entityIds: index.recentStates.map((item) => item.id)
+      entities: index.recentStates.map((item) => residentEntity(item.id, item.title))
     });
   }
   if (index.attrNames.length > 0) {
     candidates.push({
       name: "index",
       text: `常用属性：${index.attrNames.slice(0, 8).join("、")}`,
-      entityIds: []
+      entities: []
     });
   }
   return candidates;
@@ -38286,25 +39225,45 @@ function toTraceSection(candidate, kept, tokens) {
     tokens,
     kept,
     text: candidate.text,
-    entityIds: candidate.entityIds,
+    entityIds: candidateEntityIds(candidate),
     ...candidate.source === void 0 ? {} : { source: candidate.source },
     ...candidate.fallbackReason === void 0 ? {} : { fallbackReason: candidate.fallbackReason }
   };
+}
+function residentEntityReceipts(traceId, candidates, blocks, receipt) {
+  const receiptById = new Map(receipt.blocks.map((item) => [item.id, item]));
+  const items = [];
+  candidates.forEach((candidate, index) => {
+    const block = blocks[index];
+    if (block === void 0) return;
+    const blockReceipt = receiptById.get(block.id);
+    if (blockReceipt === void 0 || !blockReceipt.kept) return;
+    const state = blockReceipt.quarantined ? "quarantined" : "kept";
+    for (const entity of candidate.entities) {
+      items.push({
+        traceId,
+        entityId: entity.id,
+        section: candidate.name,
+        state,
+        blockId: block.id,
+        ...state === "kept" && entity.title !== void 0 ? { title: entity.title } : {},
+        ...state === "kept" && entity.updatedAt !== void 0 ? { updatedAt: entity.updatedAt } : {}
+      });
+    }
+  });
+  return items;
 }
 async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BUDGET, stats, onRecall, preferences, boards) {
   const projectKey = context.projectKey ?? context.cwd;
   const toolHint = {
     name: "tool-hint",
     text: "需要细节用 omb_recall；长期结论用 omb_remember；状态更新用 omb_update。",
-    entityIds: []
+    entities: []
   };
   let candidates;
   let recalledStates;
   let fallbackReason;
   let usedBoards = false;
-  let boardPreferenceHits = [];
-  let boardStateHits = [];
-  let fallbackPreferences;
   const boardOutcome = boards === void 0 ? void 0 : await readBoardsWithTimeout(
     boards.reader,
     {
@@ -38320,21 +39279,19 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
   );
   if (boardOutcome?.snapshot !== void 0 && staleReason === void 0) {
     usedBoards = true;
-    const preferenceCandidate = compactBoardSummaries(
+    const preferenceCandidate2 = compactBoardSummaries(
       boardOutcome.snapshot.preference,
       "偏好：",
       RESIDENT_PREFERENCE_LIMIT
     );
-    const stateCandidate = compactBoardStates(
+    const stateCandidate2 = compactBoardStates(
       boardOutcome.snapshot.state,
       "当前状态：",
       RESIDENT_STATE_LIMIT
     );
-    boardPreferenceHits = preferenceCandidate?.hits ?? [];
-    boardStateHits = stateCandidate?.hits ?? [];
     candidates = [
-      ...preferenceCandidate === void 0 ? [] : [{ ...preferenceCandidate, source: "read-model" }],
-      ...stateCandidate === void 0 ? [] : [{ ...stateCandidate, source: "read-model" }],
+      ...preferenceCandidate2 === void 0 ? [] : [{ ...preferenceCandidate2, source: "read-model" }],
+      ...stateCandidate2 === void 0 ? [] : [{ ...stateCandidate2, source: "read-model" }],
       toolHint
     ];
   } else {
@@ -38349,13 +39306,16 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
         kind: "state",
         status: ["in_progress", "blocked"],
         limit: RESIDENT_STATE_LIMIT,
+        // RET-11：状态看板只需要 state_board 一条通道；不能为 5 条状态跑完整六通道 +
+        // 图扩展 + 重排富化。计划里的 providers.enabled 会记录这次限定，可审计。
+        channels: ["state_board"],
+        expand: "none",
         sessionId: context.sessionId,
         injected: true
       }).catch(() => void 0),
       stats === void 0 ? Promise.resolve(void 0) : stats().catch(() => void 0)
     ]);
     recalledStates = states;
-    fallbackPreferences = preferenceItems;
     candidates = [
       ...preferenceItems === void 0 ? [] : [compactSummaries(preferenceItems, "偏好：", RESIDENT_PREFERENCE_LIMIT)],
       compactHits(states, "当前状态：", RESIDENT_STATE_LIMIT),
@@ -38370,15 +39330,18 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
   const traceId = newId("trace");
   const headerText = injectionHeader(RESIDENT_HEADER);
   const headerTokens = estimateTokens(headerText);
-  const blocks = candidates.map((candidate, index) => dataBlock({
-    id: residentBlockId(candidate, index),
-    text: candidate.text,
-    source: candidateSource(candidate),
-    origin: candidateOrigin(candidate),
-    entityIds: candidate.entityIds,
-    refs: candidate.entityIds,
-    scope: { kind: "global" }
-  }));
+  const blocks = candidates.map((candidate, index) => {
+    const entityIds = candidateEntityIds(candidate);
+    return dataBlock({
+      id: residentBlockId(candidate, index),
+      text: candidate.text,
+      source: candidateSource(candidate),
+      origin: candidateOrigin(candidate),
+      entityIds,
+      refs: entityIds,
+      scope: { kind: "global" }
+    });
+  });
   const assembled = promptAssembler.assemble(blocks, {
     budgetTokens,
     traceId,
@@ -38388,10 +39351,11 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
     truncateBlocks: false,
     maxBlockTokens: budgetTokens
   });
-  const receipt = assembled.receipt;
+  const entityReceipts = residentEntityReceipts(traceId, candidates, blocks, assembled.receipt);
+  const receipt = withEntityReceipts(assembled.receipt, entityReceipts);
   const receiptById = new Map(receipt.blocks.map((item) => [item.id, item]));
   const sections = [toTraceSection(
-    { name: "header", text: headerText, entityIds: [] },
+    { name: "header", text: headerText, entities: [] },
     receipt.injected,
     headerTokens
   )];
@@ -38409,10 +39373,7 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
     });
     if (!kept) droppedSections.push(candidate.name);
   });
-  const receiptEntityIds = [...new Set(candidates.flatMap((candidate, index) => {
-    const blockId = residentBlockId(candidate, index);
-    return keptBlockIds.has(blockId) ? candidate.entityIds : [];
-  }))];
+  const receiptEntityIds = keptEntityIds(receipt);
   sections.push({
     name: "injection-receipt",
     tokens: receipt.usedTokens,
@@ -38426,12 +39387,10 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
   const stateBlockId = stateBlock < 0 ? void 0 : residentBlockId(candidates[stateBlock], stateBlock);
   const blockVisible = (blockId) => blockId !== void 0 && keptBlockIds.has(blockId) && !receipt.quarantinedIds.includes(blockId);
   if (recalledStates !== void 0 && blockVisible(stateBlockId)) notify(recalledStates, onRecall);
-  const preferenceHits = blockVisible(preferenceBlockId) ? usedBoards ? boardPreferenceHits : (fallbackPreferences ?? []).slice(0, RESIDENT_PREFERENCE_LIMIT).map((item) => ({
-    id: item.id,
-    ...item.title !== void 0 && item.title.length > 0 ? { title: item.title } : {},
-    ...item.updatedAt === void 0 ? {} : { updatedAt: item.updatedAt }
-  })) : [];
-  const stateHits = usedBoards && blockVisible(stateBlockId) ? boardStateHits : [];
+  const preferenceCandidate = preferenceBlock < 0 ? void 0 : candidates[preferenceBlock];
+  const stateCandidate = stateBlock < 0 ? void 0 : candidates[stateBlock];
+  const preferenceHits = blockVisible(preferenceBlockId) && preferenceCandidate !== void 0 ? preferenceCandidate.entities : [];
+  const stateHits = usedBoards && blockVisible(stateBlockId) && stateCandidate !== void 0 ? stateCandidate.entities : [];
   return {
     text: assembled.text,
     trace: {
@@ -38452,6 +39411,7 @@ async function buildResident(engine, context, budgetTokens = DEFAULT_RESIDENT_BU
 var EVENT_RECALL_HEADER = "[OMB 事件召回]";
 var EVENT_RECALL_PREFIX = "相关：";
 var EVENT_RECALL_MAX_HITS = 3;
+var EVENT_RECALL_SECTION = "event-recall";
 async function buildEventRecallText(engine, context, query, scenario, budgetTokens = 400, onRecall, excludeEntityIds) {
   if (query.trim().length === 0) return "";
   const projectKey = context.projectKey ?? context.cwd;
@@ -38488,12 +39448,45 @@ async function buildEventRecallText(engine, context, query, scenario, budgetToke
   });
   const text2 = assembled.text;
   if (text2.length === 0) return "";
-  const { receipt } = assembled;
+  const receipt = withEntityReceipts(
+    assembled.receipt,
+    eventRecallEntityReceipts(result.traceId, compacted, assembled.receipt, text2)
+  );
   const kept = new Set(receipt.keptIds);
   const quarantined = new Set(receipt.quarantinedIds);
   const visible = compacted.map((entry) => entry.hit).filter((hit) => kept.has(hit.entityId) && !quarantined.has(hit.entityId) && text2.includes(hit.entityId));
   notifyHits(result.traceId, visible, onRecall, receipt, text2);
   return text2;
+}
+function eventRecallEntityReceipts(traceId, compacted, receipt, text2) {
+  const receiptById = new Map(receipt.blocks.map((item) => [item.id, item]));
+  const items = [];
+  for (const entry of compacted) {
+    const blockReceipt = receiptById.get(entry.hit.entityId);
+    if (blockReceipt === void 0 || !blockReceipt.kept) continue;
+    if (blockReceipt.quarantined) {
+      items.push({
+        traceId,
+        entityId: entry.hit.entityId,
+        section: EVENT_RECALL_SECTION,
+        state: "quarantined",
+        blockId: entry.hit.entityId
+      });
+      continue;
+    }
+    if (!text2.includes(entry.hit.entityId)) continue;
+    const title = entry.hit.title?.trim();
+    items.push({
+      traceId,
+      entityId: entry.hit.entityId,
+      section: EVENT_RECALL_SECTION,
+      state: "kept",
+      blockId: entry.hit.entityId,
+      ...title !== void 0 && title.length > 0 ? { title } : {},
+      ...entry.hit.updatedAt === void 0 ? {} : { updatedAt: entry.hit.updatedAt }
+    });
+  }
+  return items;
 }
 function compact(result, max, excludeEntityIds) {
   const seen = /* @__PURE__ */ new Set();
@@ -38727,6 +39720,17 @@ function shouldRecallToolResult(input2) {
 }
 
 // plugin/v7/adoption-evidence.ts
+function receiptVisibleHits(hits, receipt) {
+  if (receipt === void 0) return [...hits];
+  const entities = entityReceiptsOf(receipt);
+  if (entities !== void 0) {
+    const kept2 = new Set(entities.filter((entity) => entity.state === "kept").map((entity) => entity.entityId));
+    return hits.filter((hit) => kept2.has(hit.id));
+  }
+  const kept = new Set(receipt.keptIds);
+  const quarantined = new Set(receipt.quarantinedIds ?? []);
+  return hits.filter((hit) => kept.has(hit.id) && !quarantined.has(hit.id));
+}
 var MIN_TITLE_LENGTH = 4;
 var ASCII_WORD = /[A-Za-z0-9_.-]/;
 function isAsciiWord(char) {
@@ -39111,6 +40115,14 @@ function rememberSessionState(map2, sessionId, value) {
     map2.delete(oldest);
   }
 }
+function receiptHitInputs(hits) {
+  return hits.map((hit, index) => ({
+    entityId: hit.id,
+    ...hit.title === void 0 ? {} : { title: hit.title },
+    ...hit.updatedAt === void 0 ? {} : { updatedAt: hit.updatedAt },
+    rank: index + 1
+  }));
+}
 function createT1Session(deps) {
   const { store, logger } = deps;
   const pendingRecall = /* @__PURE__ */ new Map();
@@ -39197,11 +40209,16 @@ function createT1Session(deps) {
     });
     return next;
   }
-  function scheduleExposure(sessionId, taskId, traceId, hits) {
-    if (hits.length === 0) return;
+  function scheduleReceipt(sessionId, taskId, input2) {
     void enqueue(exposureQueues, sessionId, async () => {
-      for (const hit of hits) {
-        await store.recordExposure({ entityId: hit.id, sessionId, taskId, traceId });
+      const kept = await store.recordAdoptionReceipt(input2);
+      for (const hit of kept) {
+        await store.recordExposure({
+          entityId: hit.entityId,
+          sessionId,
+          taskId,
+          traceId: input2.traceId
+        });
       }
     });
   }
@@ -39364,16 +40381,27 @@ function createT1Session(deps) {
     }
   }
   function rememberPendingRecall(injection) {
-    sequence += 1;
     const taskId = currentTaskId(injection.sessionId);
+    const hits = injection.hits;
+    scheduleReceipt(injection.sessionId, taskId, {
+      traceId: injection.traceId,
+      kind: "t2",
+      sessionId: injection.sessionId,
+      taskId,
+      source: "omb_recall",
+      injected: true,
+      keptIds: hits.map((hit) => hit.id),
+      hits: receiptHitInputs(hits)
+    });
+    if (hits.length === 0) return;
+    sequence += 1;
     rememberPending(injection.sessionId, {
       sessionId: injection.sessionId,
       traceId: injection.traceId,
       taskId,
-      hits: injection.hits,
+      hits,
       seq: sequence
     });
-    scheduleExposure(injection.sessionId, taskId, injection.traceId, injection.hits);
   }
   function persistInjectionReceipt(notice) {
     const receipt = notice.receipt;
@@ -39395,20 +40423,47 @@ function createT1Session(deps) {
       logger.warn("T1 注入 receipt 写入失败", messageOf8(error62));
     });
   }
-  function rememberInjection(sessionId, notice) {
+  function rememberInjection(sessionId, notice, meta3 = {}) {
     persistInjectionReceipt(notice);
-    if (notice.hits.length === 0) return;
+    const receipt = notice.receipt;
+    const taskId = meta3.taskId ?? currentTaskId(sessionId);
+    const visibleHits = receiptVisibleHits(notice.hits, receipt);
+    const injected = receipt?.injected ?? visibleHits.length > 0;
+    const traceText = meta3.text ?? notice.text;
+    const entities = entityReceiptsOf(receipt);
+    const fields = entities === void 0 ? {
+      keptIds: receipt === void 0 ? visibleHits.map((hit) => hit.id) : receipt.keptIds,
+      quarantinedIds: receipt?.quarantinedIds ?? [],
+      droppedIds: receipt?.droppedIds ?? [],
+      hits: receiptHitInputs(notice.hits)
+    } : adoptionFieldsFromEntities(entities);
+    scheduleReceipt(sessionId, taskId, {
+      traceId: notice.traceId,
+      kind: receipt === void 0 ? "t0" : "t1",
+      sessionId,
+      taskId,
+      ...meta3.turnId === void 0 ? {} : { turnId: meta3.turnId },
+      source: meta3.source ?? "agent/pre-step",
+      ...receipt === void 0 ? {} : {
+        receiptId: receipt.receiptId,
+        budgetTokens: receipt.budgetTokens,
+        usedTokens: receipt.usedTokens,
+        textHash: receipt.textHash
+      },
+      injected,
+      ...traceText === void 0 ? {} : { text: traceText },
+      ...fields
+    });
+    if (visibleHits.length === 0) return;
     sequence += 1;
-    const taskId = currentTaskId(sessionId);
     rememberPending(sessionId, {
       sessionId,
       traceId: notice.traceId,
       taskId,
-      hits: notice.hits,
-      ...notice.receipt === void 0 ? {} : { receipt: notice.receipt },
+      hits: visibleHits,
+      ...receipt === void 0 ? {} : { receipt },
       seq: sequence
     });
-    scheduleExposure(sessionId, taskId, notice.traceId, notice.hits);
   }
   async function recordResidentHits(sessionId, turn, traceId, query, hits) {
     if (hits.length === 0) return;
@@ -39424,10 +40479,14 @@ function createT1Session(deps) {
         rank: index + 1,
         injected: true
       })));
-      rememberInjection(sessionId, { traceId, hits });
     } catch (error62) {
-      logger.warn("T0 常驻 recall_event 写入失败", messageOf8(error62));
+      logger.warn("T0 常驻 recall_event 审计写入失败", messageOf8(error62));
     }
+    rememberInjection(sessionId, { traceId, hits }, {
+      ...turn === void 0 ? {} : { turnId: String(turn) },
+      source: "t0-resident",
+      text: query
+    });
   }
   function observeTaskState(sessionId, taskId, status) {
     if (taskId === void 0 || taskId.length === 0) return;
@@ -40139,6 +41198,24 @@ async function createStatusTool(deps) {
   }
 }
 
+// packages/v7/src/security/audit.ts
+function deriveToolPrincipal(context, operation) {
+  const sessionId = sanitizeActorId(context.sessionId, "unknown");
+  const tenant = auditTenantOf(context);
+  return {
+    actor: { id: `assistant:${sessionId}`, kind: "assistant" },
+    source: `tool:${operation}`,
+    sessionId,
+    ...tenant === void 0 ? {} : { tenant }
+  };
+}
+function claimedProvenance(value) {
+  if (typeof value !== "string") return void 0;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return void 0;
+  return trimmed.length > 80 ? trimmed.slice(0, 80) : trimmed;
+}
+
 // plugin/v7/tool-command.ts
 import { createHash as createHash9 } from "node:crypto";
 function canonical(value) {
@@ -40172,26 +41249,138 @@ function lifecycleLines(entity) {
   }
   return [`生命周期：${label}${detail}${window}`];
 }
+var DENY_REASON_TEXT = {
+  "cross-project": "目标实体不在当前项目作用域内",
+  "unknown-tenant": "当前会话没有可证明的项目作用域",
+  "unknown-target": "无法证明目标实体的归属作用域",
+  "denied-audit": "越权拒绝记录不可回滚",
+  "unverifiable-target": "审计没有可验证的目标实体"
+};
+async function denyWithAudit(store, principal, operation, reason, targetIds, claimed) {
+  let auditId;
+  try {
+    auditId = await store.recordAudit({
+      actor: principal.actor.id,
+      actorKind: principal.actor.kind,
+      source: principal.source,
+      action: AUDIT_DENIED_ACTION,
+      targetIds: [...targetIds],
+      after: {
+        operation,
+        reason,
+        sessionId: principal.sessionId,
+        tenantProjectKey: principal.tenant?.projectKey ?? "",
+        ...claimed === void 0 ? {} : { claimed }
+      }
+    });
+  } catch {
+  }
+  const message = reason === "forged-actor" ? `越权操作被拒绝：工具参数不能声明 actor/source（已忽略 ${claimed ?? "未知值"} 并记审计）` : `越权操作被拒绝：${DENY_REASON_TEXT[reason]}`;
+  return forbidden(message, {
+    operation,
+    reason,
+    targetIds: [...targetIds],
+    ...claimed === void 0 ? {} : { claimed },
+    ...auditId === void 0 ? {} : { auditId }
+  });
+}
+async function requireEntityAccess(store, principal, operation, ids) {
+  const targets = await readAuthorizationTargets(store.db, ids);
+  const missing = targets.filter((target) => target.scope === void 0).map((target) => target.id);
+  if (missing.length > 0) return notFound(`实体不存在：${missing.join(", ")}`);
+  const decision = entityAccessDecision(principal.tenant, targets);
+  if (decision.allowed) return void 0;
+  return denyWithAudit(store, principal, operation, decision.reason, decision.targetIds);
+}
+async function recordForgedProvenance(store, principal, operation, claimed, targetIds = []) {
+  const value = claimedProvenance(claimed);
+  if (value === void 0) return;
+  await denyWithAudit(store, principal, operation, "forged-actor", targetIds, value);
+}
+async function requireWriteScope(store, principal, operation, scope) {
+  if (scopeAccessOf(scope, principal.tenant) !== "foreign") return void 0;
+  return denyWithAudit(
+    store,
+    principal,
+    operation,
+    principal.tenant === void 0 ? "unknown-tenant" : "cross-project",
+    []
+  );
+}
+var ENTITY_ID_PATTERN = /^(?:mem|st|sv|ch)_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+function entityIdsInPayload(value, out, depth = 0) {
+  if (value === void 0 || value === null || depth > 8) return;
+  if (typeof value === "string") {
+    if (ENTITY_ID_PATTERN.test(value)) out.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) entityIdsInPayload(item, out, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    for (const item of Object.values(value)) entityIdsInPayload(item, out, depth + 1);
+  }
+}
+async function requireReplayAccess(store, principal, input2) {
+  if (input2.outboxId === void 0 && input2.topic === void 0) return void 0;
+  const limit = Math.min(input2.limit ?? 20, 100);
+  const rows = await store.db.query(
+    `select payload from omb.outbox
+      where status = 'dead'
+        and ($1::bigint is null or id = $1)
+        and ($2::text is null or topic = $2)
+      order by id asc
+      limit $3`,
+    [input2.outboxId ?? null, input2.topic ?? null, limit]
+  );
+  if (rows.rows.length === 0) return void 0;
+  const entityIds = /* @__PURE__ */ new Set();
+  for (const row of rows.rows) entityIdsInPayload(row.payload, entityIds);
+  if (entityIds.size === 0) {
+    return denyWithAudit(store, principal, "replay", "unverifiable-target", []);
+  }
+  return requireEntityAccess(store, principal, "replay", [...entityIds]);
+}
+async function requireRollbackAccess(store, principal, auditId) {
+  const row = await readAuditAccessRow(store.db, auditId);
+  if (row === void 0) return notFound(`审计记录不存在：${auditId}`);
+  const facts = rollbackFactsOf(row);
+  const targets = await readAuthorizationTargets(store.db, facts.targetIds);
+  const decision = rollbackAccessDecision({ facts, targets, tenant: principal.tenant });
+  if (decision.allowed) return void 0;
+  return denyWithAudit(store, principal, "rollback", decision.reason, decision.targetIds);
+}
+function deniedOf(error62) {
+  return error62 === void 0 ? {} : { denied: error62 };
+}
 function createToolRuntime(deps) {
   const { requireReady, rememberService, updateService, recallService, store, clock, status } = deps;
   const outbox = new PostgresOutboxStore(store.db);
+  const principalOf = (context, operation) => deriveToolPrincipal(context, operation);
   return {
     context: deps.resolveContext,
     async remember(input2, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        const commandId = toolCommandId("omb_remember", context, input2);
-        const evidence = evidenceForWrite(input2, {
+        const principal = principalOf(context, "omb_remember");
+        const { origin: claimedOrigin, ...rest } = input2;
+        await recordForgedProvenance(store, principal, "remember", claimedOrigin);
+        const scopeDenied = await requireWriteScope(store, principal, "remember", rest.scope);
+        if (scopeDenied !== void 0) return err(scopeDenied);
+        const commandId = toolCommandId("omb_remember", context, rest);
+        const evidence = evidenceForWrite(rest, {
           sessionId: context.sessionId,
           ...context.callId !== void 0 ? { callId: context.callId } : {},
           tool: "omb_remember",
-          ...input2.origin !== void 0 ? { origin: input2.origin } : {},
           now: clock.iso()
         });
-        const result = await rememberService.remember(input2, {
+        const result = await rememberService.remember(rest, {
           commandId,
-          ...evidence.length > 0 ? { evidence } : {}
+          ...evidence.length > 0 ? { evidence } : {},
+          actor: principal.actor.id,
+          source: principal.source
         });
         return result.ok ? ok(formatWrite(result)) : result;
       } catch (error62) {
@@ -40207,37 +41396,72 @@ function createToolRuntime(deps) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        const result = await updateService.update(input2, { commandId: toolCommandId("omb_update", context, input2) });
+        const principal = principalOf(context, "omb_update");
+        const { origin: claimedOrigin, ...rest } = input2;
+        await recordForgedProvenance(store, principal, "update", claimedOrigin, [rest.id]);
+        const access = deniedOf(await requireEntityAccess(store, principal, "update", [rest.id]));
+        if (access.denied !== void 0) return err(access.denied);
+        const result = await updateService.update(rest, {
+          commandId: toolCommandId("omb_update", context, rest),
+          actor: principal.actor.id,
+          source: principal.source
+        });
         return result.ok ? ok(formatPatch(result)) : result;
       } catch (error62) {
         return resultError(error62);
       }
     },
-    async link(input2) {
+    async link(input2, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        const result = await store.link(input2);
+        const principal = principalOf(context, "omb_link");
+        const access = deniedOf(await requireEntityAccess(store, principal, "link", [input2.fromId, input2.toId]));
+        if (access.denied !== void 0) return err(access.denied);
+        const result = await store.link({
+          ...input2,
+          origin: principal.actor.id,
+          source: principal.source
+        });
         return ok(`${result.created ? "已建立" : "已存在"}链接 ${result.link.fromId} -[${result.link.relation}]-> ${result.link.toId}`);
       } catch (error62) {
         return resultError(error62);
       }
     },
-    async unlink(id) {
+    async unlink(id, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        await store.unlink(id, "model");
+        const principal = principalOf(context, "omb_link");
+        const endpoints = await readLinkEndpoints(store.db, id);
+        if (endpoints !== void 0) {
+          const access = deniedOf(await requireEntityAccess(
+            store,
+            principal,
+            "unlink",
+            [endpoints.fromId, endpoints.toId]
+          ));
+          if (access.denied !== void 0) return err(access.denied);
+        }
+        await store.unlink(id, principal.actor.id, principal.source);
         return ok(`已归档链接 ${id}`);
       } catch (error62) {
         return resultError(error62);
       }
     },
-    async supersede(input2) {
+    async supersede(input2, context, operation = "omb_admin") {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        const result = await store.supersede(input2);
+        const principal = principalOf(context, operation);
+        const ids = input2.create === void 0 ? [input2.oldId, input2.newId] : [input2.oldId];
+        const access = deniedOf(await requireEntityAccess(store, principal, "supersede", ids));
+        if (access.denied !== void 0) return err(access.denied);
+        const result = await store.supersede({
+          ...input2,
+          actor: principal.actor.id,
+          source: principal.source
+        });
         if (result.alreadyApplied) {
           return ok(`已确认：${result.oldId} 早已被 ${result.newId} 取代（幂等，无新写入）`);
         }
@@ -40250,11 +41474,18 @@ function createToolRuntime(deps) {
         return resultError(error62);
       }
     },
-    async retract(input2) {
+    async retract(input2, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
-        const result = await store.retract(input2);
+        const principal = principalOf(context, "omb_admin");
+        const access = deniedOf(await requireEntityAccess(store, principal, "retract", [input2.id]));
+        if (access.denied !== void 0) return err(access.denied);
+        const result = await store.retract({
+          ...input2,
+          actor: principal.actor.id,
+          source: principal.source
+        });
         if (result.alreadyApplied) return ok(`已确认：${result.id} 早已被证伪（幂等，无新写入）`);
         return ok([
           `已将 ${result.id} 标记为被证伪（retracted，生效 ${result.effectiveAt}）`,
@@ -40264,10 +41495,13 @@ function createToolRuntime(deps) {
         return resultError(error62);
       }
     },
-    async history(id, limit) {
+    async history(id, limit, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
+        const principal = principalOf(context, "omb_history");
+        const access = deniedOf(await requireEntityAccess(store, principal, "history", [id]));
+        if (access.denied !== void 0) return err(access.denied);
         const [entity, versions] = await Promise.all([
           store.get(id, { includeArchived: true }),
           store.history(id, limit)
@@ -40285,19 +41519,41 @@ function createToolRuntime(deps) {
       }
     },
     status,
-    async admin(input2) {
+    async admin(input2, context) {
       const unavailable = await requireReady();
       if (unavailable !== void 0) return unavailable;
       try {
+        const principal = principalOf(context, "omb_admin");
         if (input2.action === "audit") {
-          const rows = await store.listAudit(input2.limit ?? 20);
-          if (rows.length === 0) return ok("暂无审计记录");
-          return ok(rows.map((row) => `${row.id} ${row.action} by=${row.actor} kind=${row.actorKind ?? "unknown"} source=${row.source ?? "unknown"} at=${row.createdAt} rolled=${row.rolledBackAt ?? "no"}`).join("\n"));
+          const limit = input2.limit ?? 20;
+          const [rows, deniedCount] = await Promise.all([
+            listAuditWithinTenant(store.db, {
+              limit,
+              actor: principal.actor.id,
+              ...principal.tenant === void 0 ? {} : { tenant: principal.tenant }
+            }),
+            countDeniedWithinTenant(store.db, principal.tenant)
+          ]);
+          if (rows.length === 0) return ok(`暂无审计记录（越权拒绝累计 ${deniedCount} 条）`);
+          return ok([
+            `审计记录 ${rows.length} 条（越权拒绝累计 ${deniedCount} 条；只展示当前项目/global 目标）`,
+            ...rows.map((row) => `${row.id} ${row.action} by=${row.actor} kind=${row.actorKind ?? "unknown"} source=${row.source ?? "unknown"} at=${row.createdAt} rolled=${row.rolledBackAt ?? "no"}`)
+          ].join("\n"));
         }
         if (input2.action === "archive" || input2.action === "unarchive") {
           if (input2.targetId === void 0) return err({ code: "invalid-input", message: `${input2.action} 需要 targetId` });
-          if (input2.action === "archive") await store.archive(input2.targetId, input2.reason ?? "manual", "model");
-          else await store.unarchive(input2.targetId, input2.reason ?? "manual", "model");
+          const operation = input2.action === "archive" ? "archive" : "unarchive";
+          const access = deniedOf(await requireEntityAccess(store, principal, operation, [input2.targetId]));
+          if (access.denied !== void 0) return err(access.denied);
+          if (input2.action === "archive") {
+            await store.archive(input2.targetId, input2.reason ?? "manual", principal.actor.id, void 0, {
+              source: principal.source
+            });
+          } else {
+            await store.unarchive(input2.targetId, input2.reason ?? "manual", principal.actor.id, void 0, {
+              source: principal.source
+            });
+          }
           return ok(`${input2.action === "archive" ? "已归档" : "已取消归档"} ${input2.targetId}`);
         }
         if (input2.action === "supersede") {
@@ -40307,45 +41563,66 @@ function createToolRuntime(deps) {
             oldId: input2.targetId,
             newId: input2.newId,
             reason: input2.reason ?? "superseded",
-            actor: "model",
             ...input2.effectiveAt !== void 0 ? { effectiveAt: input2.effectiveAt } : {}
-          });
+          }, context);
         }
         if (input2.action === "retract") {
           if (input2.targetId === void 0) return err({ code: "invalid-input", message: "retract 需要 targetId" });
           return this.retract({
             id: input2.targetId,
             reason: input2.reason ?? "retracted",
-            actor: "model",
             ...input2.effectiveAt !== void 0 ? { effectiveAt: input2.effectiveAt } : {}
-          });
+          }, context);
         }
         if (input2.action === "replay") {
           if (input2.outboxId === void 0 === (input2.topic === void 0)) {
             return err({ code: "invalid-input", message: "replay 需要 outboxId 或 topic 二选一" });
           }
+          const replayDenied = deniedOf(await requireReplayAccess(store, principal, input2));
+          if (replayDenied.denied !== void 0) return err(replayDenied.denied);
           const limit = input2.limit ?? 20;
-          const result2 = await outbox.replayDead({
+          const result = await outbox.replayDead({
             ...input2.outboxId !== void 0 ? { id: input2.outboxId } : {},
             ...input2.topic !== void 0 ? { topic: input2.topic } : {},
             limit,
-            actor: "model",
+            actor: principal.actor.id,
             ...input2.reason !== void 0 ? { reason: input2.reason } : {}
           });
-          if (result2.replayed.length === 0) {
+          if (result.replayed.length === 0) {
             return ok("没有匹配的 dead outbox 行（已重放、topic/outboxId 不匹配或已被其它 worker 处理）");
           }
-          const rows = result2.replayed.map((row) => `${row.id} ${row.topic} attempts=${row.attempts} lastError=${row.lastError.length > 0 ? row.lastError : "none"}`);
-          const remaining = result2.remaining > 0 ? [`剩余 ${result2.remaining} 行 dead 未重放（本次 limit=${limit}），可再次 replay`] : [];
+          const rows = result.replayed.map((row) => `${row.id} ${row.topic} attempts=${row.attempts} lastError=${row.lastError.length > 0 ? row.lastError : "none"}`);
+          const remaining = result.remaining > 0 ? [`剩余 ${result.remaining} 行 dead 未重放（本次 limit=${limit}），可再次 replay`] : [];
           return ok([
-            `已重放 ${result2.replayed.length} 行 dead → pending（attempts/available_at 已重置）`,
+            `已重放 ${result.replayed.length} 行 dead → pending（attempts/available_at 已重置）`,
             ...rows,
             ...remaining
           ].join("\n"));
         }
         if (input2.auditId === void 0) return err({ code: "invalid-input", message: "rollback 需要 auditId" });
-        const result = await store.rollback(input2.auditId, "model");
-        return ok(`已回滚审计 ${result.auditId}；新审计 ${result.rollbackAuditId}；动作 ${result.applied.join(", ")}`);
+        const rollbackDenied = deniedOf(await requireRollbackAccess(store, principal, input2.auditId));
+        if (rollbackDenied.denied !== void 0) return err(rollbackDenied.denied);
+        try {
+          const result = await store.rollback(input2.auditId, principal.actor.id, {
+            source: principal.source,
+            ...principal.tenant === void 0 ? {} : { tenant: principal.tenant }
+          });
+          return ok(`已回滚审计 ${result.auditId}；新审计 ${result.rollbackAuditId}；动作 ${result.applied.join(", ")}`);
+        } catch (error62) {
+          if (error62 instanceof OmbFailure && error62.error.code === "forbidden") {
+            const details = error62.error.details;
+            const reason = typeof details === "object" && details !== null && "reason" in details ? details.reason : void 0;
+            const audited = await denyWithAudit(
+              store,
+              principal,
+              "rollback",
+              reason ?? "cross-project",
+              []
+            );
+            return err(audited);
+          }
+          throw error62;
+        }
       } catch (error62) {
         return resultError(error62);
       }
@@ -40420,7 +41697,18 @@ function apply(ctx, rawConfig) {
   const timerStore = new PostgresTimerStore(store.db);
   const startupRef = {};
   const startupError = () => startupRef.current?.error;
-  const consolidation = createConsolidationRuntime({ store, queue, clock, logger, timerStore, queries: maintenance, startupError });
+  const consolidation = createConsolidationRuntime({
+    store,
+    queue,
+    clock,
+    logger,
+    timerStore,
+    queries: maintenance,
+    updateService,
+    dynamic: dynamicService,
+    embedder,
+    startupError
+  });
   const handles = {};
   const projection = createProjectionRuntime({
     databaseUrl: config2.databaseUrl,
@@ -40439,7 +41727,7 @@ function apply(ctx, rawConfig) {
     clock,
     logger,
     timerStore,
-    // 真实业务 workflow 定义（forget）；绑定后 timer 到期才有地方 start run。
+    // 真实业务 workflow 定义（forget + 9 个巩固任务）；绑定后 timer 到期才有地方 start run。
     workflowDefinitions: consolidation.workflows,
     bindConsolidationWorkflow: consolidation.bindWorkflowStart,
     consolidationTimerHandler: consolidation.timerHandler,

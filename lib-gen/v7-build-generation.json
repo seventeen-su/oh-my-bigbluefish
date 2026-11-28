@@ -1,11 +1,11 @@
 {
-  "generation": 66,
-  "outDir": "v7-g66",
+  "generation": 67,
+  "outDir": "v7-g67",
   "entry": "plugin/v7/index.ts",
   "artifact": "plugin/v7/index.js",
-  "bytes": 1513488,
-  "sha256": "14093a1b45fa205d5fdbc28d4b223028cc3ac4c89ebf8bcb8b898ec9678c2cfa",
-  "version": "7.1.18",
+  "bytes": 1568936,
+  "sha256": "a1fb9a3e56c470d20f8bbde692aec748e2c1899e858f56f463352b3abc177d72",
+  "version": "7.2.4",
   "node": "v24.21.0",
-  "builtAt": "2026-11-28T17:39:11.491Z"
+  "builtAt": "2026-11-28T19:55:56.400Z"
 }
