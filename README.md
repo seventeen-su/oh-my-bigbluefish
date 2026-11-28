@@ -71,7 +71,7 @@ T0 注入长期偏好、当前状态和库索引。T1 在用户消息、工具�
 
 ## 配置
 
-默认连接 `postgres://omb:omb@127.0.0.1:5432/omb` 只是本机 loopback 开发默认，不是生产安全配置：口令公开、没有 TLS，且 `v7:db:setup` 会让连接串里的角色成为 schema/表 owner。生产或共享环境必须覆盖 `databaseUrl` 与口令，并按 `docs/v7/SPEC.md` §6.2 收紧监听、认证、TLS 和角色权限。在插件配置中修改 `databaseUrl` 可以连接其他数据库。
+默认连接 `postgres://omb:omb@127.0.0.1:5432/omb` 只是本机 loopback 开发默认，不是生产安全配置：口令公开、没有 TLS，且 `v7:db:setup` 会让连接串里的角色成为 schema/表 owner。生产或共享环境必须覆盖 `databaseUrl` 与口令，并按 [docs/SECURITY.md](docs/SECURITY.md#数据库连接) 收紧监听、认证、TLS 和角色权限。在插件配置中修改 `databaseUrl` 可以连接其他数据库。
 
 常用配置：
 
@@ -122,10 +122,9 @@ node scripts/v7-db-security-check.mjs --url $env:OMB_DATABASE_URL
 
 ## 文档
 
-- `docs/v7/REQUIREMENTS.md`：需求和验收标准。
-- `docs/v7/SPEC.md`：实现规格（审计链见 §6.1，数据库连接与部署安全见 §6.2）。
-- `docs/v7/adr/`、`docs/v7/review/adr/`：架构决策记录。
-
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：当前架构、数据流、检索与生命周期。
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)：环境、PR 规则、提交前检查。
+- [docs/SECURITY.md](docs/SECURITY.md)：数据库连接、凭据与漏洞报告。
 ## 许可证
 
 Copyright (C) 2026 苏拾柒
@@ -133,3 +132,4 @@ Copyright (C) 2026 苏拾柒
 本项目使用 GNU General Public License version 3 only，SPDX 标识为 `GPL-3.0-only`。完整许可证文本见 `LICENSE`。
 
 插件依赖和随包分发的 BGE-small-zh-v1.5 嵌入模型使用各自的许可证。依赖清单、模型归属和许可证文本见 `THIRD_PARTY_NOTICES.md` 与 `licenses/`。
+
