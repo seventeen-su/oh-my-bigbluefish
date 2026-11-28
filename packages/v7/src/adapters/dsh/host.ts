@@ -84,7 +84,20 @@ export function sessionFromExec(exec: unknown): ToolContext | undefined {
   const header = asRecord(session?.['header'])
   const cwd = typeof header?.['cwd'] === 'string' && header['cwd'].trim().length > 0 ? header['cwd'] : undefined
   const agentPath = typeof agent?.['name'] === 'string' && agent['name'].trim().length > 0 ? agent['name'] : undefined
-  return { sessionId, ...(cwd !== undefined ? { cwd } : {}), ...(agentPath !== undefined ? { agentPath } : {}) }
+  // 工具调用的稳定身份（DSH ToolExecution.callId）：写路径用它合成重试复用的 commandId。
+  const callId = typeof record?.['callId'] === 'string' && record['callId'].trim().length > 0
+    ? record['callId']
+    : undefined
+  const turn = typeof record?.['turn'] === 'number' && Number.isSafeInteger(record['turn']) ? record['turn'] : undefined
+  const step = typeof record?.['step'] === 'number' && Number.isSafeInteger(record['step']) ? record['step'] : undefined
+  return {
+    sessionId,
+    ...(cwd !== undefined ? { cwd } : {}),
+    ...(agentPath !== undefined ? { agentPath } : {}),
+    ...(callId !== undefined ? { callId } : {}),
+    ...(turn !== undefined ? { turn } : {}),
+    ...(step !== undefined ? { step } : {}),
+  }
 }
 
 export function createLogger(ctx: HostContextLike | undefined): Logger {

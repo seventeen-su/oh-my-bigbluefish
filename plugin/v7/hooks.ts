@@ -21,6 +21,7 @@ import { buildEventRecallText, buildResident } from '../../packages/v7/src/recal
 import { recallScenarioForQuery } from '../../packages/v7/src/app/recall.js'
 import { extractQuerySignals } from '../../packages/v7/src/domain/text.js'
 import type { Logger } from '../../packages/v7/src/ports/jobs.js'
+import type { JobQueue } from '../../packages/v7/src/ports/jobs.js'
 import { wireHostHook, type Supervisor } from './supervisor.js'
 import { appendT1Message, isEnterDecisionLike } from './t1-message.js'
 import {
@@ -72,6 +73,8 @@ export interface HostHooksDeps {
   readonly logger: Logger
   readonly config: V7Config
   readonly store: PostgresStore
+  /** 事件捕获后立即入队定向抽取；jobs=false/未启动时缺省，抽取退回周期兜底。 */
+  readonly queue?: JobQueue
   readonly engine: RecallEngine
   readonly promptSink: PromptSink
   /** 主动记忆检查点通道；与 T0 分开，避免被“仅数据”头压成数据。 */
@@ -149,6 +152,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     logger,
     onEvent: observeEvent,
     resolveIdentity: deps.resolveIdentity,
+    ...(deps.queue !== undefined ? { queue: deps.queue } : {}),
   })
 
   /** 在工具派发前启动 T1 召回；不阻塞 dispatch，结果由 post-execute 复用。 */

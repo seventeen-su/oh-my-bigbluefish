@@ -100,7 +100,12 @@ export function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<
 export function formatWrite(result: Awaited<ReturnType<RememberService['remember']>>): string {
   if (!result.ok) return ''
   const written = result.value
-  const lines = [`已写入 ${written.entity.kind} ${written.entity.id}（revision ${written.entity.revision}，嵌入 ${written.embedding}）`]
+  const reused = written.deduped === 'content'
+    ? '；内容相同，已复用原实体并并入新证据'
+    : written.deduped === 'command'
+      ? '；同一调用重试，已返回首次写入结果'
+      : ''
+  const lines = [`已写入 ${written.entity.kind} ${written.entity.id}（revision ${written.entity.revision}，嵌入 ${written.embedding}${reused}）`]
   if (written.similarAttributes.length > 0) {
     lines.push(`相似属性：${written.similarAttributes.slice(0, 8).map(item => `${item.name}(${item.usageCount})`).join('、')}`)
   }

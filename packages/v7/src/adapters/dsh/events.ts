@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Store } from '../../ports/store.js'
-import type { Logger } from '../../ports/jobs.js'
+import type { JobQueue, Logger } from '../../ports/jobs.js'
 import type { ProjectIdentity } from '../../domain/project-identity.js'
 import { projectIdentityResolver } from '../git/identity.js'
 import type { HostContextLike } from './host.js'
@@ -39,6 +39,13 @@ export function createEventCapture(options: {
    * 一个（仍然每个 cwd 只解析一次，绝不轮询）。
    */
   resolveIdentity?: (cwd: string, sessionId: string) => Promise<ProjectIdentity | undefined>
+  /**
+   * artifact 落库成功后的定向触发：只告诉下游“这个 artifact 可以抽取了”，
+   * 不让后台等下一格 15 分钟兜底。失败只记日志，兜底 timer 仍会补跑。
+   */
+  onArtifact?: (artifact: { readonly id: string; readonly kind: string; readonly sessionId?: string }) => void
+  /** onArtifact 需要入队时用它；缺省只做本地观察。 */
+  readonly queue?: JobQueue
 }): EventCaptureHandle {
   let events = 0
   let captured = 0
@@ -109,6 +116,19 @@ export function createEventCapture(options: {
           ...(raw.length > MAX_CONTENT ? { truncated: true, length: raw.length } : {}),
         },
       })
+      const artifactId = eventId(sessionId, seq)
+      try {
+        options.onArtifact?.({ id: artifactId, kind: type, sessionId })
+        if (options.onArtifact !== undefined && options.queue !== undefined) {
+          await options.queue.enqueue(
+            'omb.extract',
+            { trigger: 'artifact-event', artifactId },
+            { singletonKey: 'extract:artifact', retryLimit: 3 },
+          )
+        }
+      } catch (error) {
+        options.logger?.warn('artifact 抽取事件入队失败，等周期兜底', error instanceof Error ? error.message : String(error))
+      }
     })().then(() => {
       captured += 1
     }).catch(error => {

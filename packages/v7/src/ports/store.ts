@@ -8,6 +8,7 @@ import type {
   StateVersion,
 } from '../domain/entity.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../domain/dependency.js'
+import type { EvidenceInput } from '../domain/evidence.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
 import type { ProjectIdentity } from '../domain/project-identity.js'
@@ -80,11 +81,32 @@ export interface WriteResult {
   readonly similarAttributes: readonly SimilarAttribute[]
   readonly similarEntities: readonly SimilarEntity[]
   readonly archivedMatches: readonly SimilarEntity[]
+  /**
+   * 没有产生新实体时的复用原因：
+   * - `command`：同一 commandId 已执行过（工具调用重试）；
+   * - `content`：同 scope/category/关键属性/时间的内容已存在（新证据已并入原实体）。
+   */
+  readonly deduped?: 'command' | 'content'
 }
 
 export interface PatchResult {
   readonly entity: Entity
   readonly history?: StateVersion
+  /** 同一 commandId 已执行过时返回首次结果，不重复 bump revision。 */
+  readonly deduped?: 'command'
+}
+
+/**
+ * 写命令的可选幂等/证据参数（`Store.write/patch` 用）：
+ * - `commandId`：工具调用/重试的稳定幂等键；缺省合成一次性 UUID；
+ * - `evidence`：本次写入的来源证据；写事务内落证据账本，内容去重时并入原实体。
+ */
+export interface WriteOptions {
+  readonly commandId?: string
+  readonly correlationId?: string
+  readonly evidence?: readonly EvidenceInput[]
+  readonly actor?: string
+  readonly source?: string
 }
 
 export interface ReadOptions {
@@ -115,10 +137,10 @@ export interface WriteContext {
 }
 
 export interface Store {
-  write(input: NormalizedWrite, derived: DerivedWrite): Promise<WriteResult>
+  write(input: NormalizedWrite, derived: DerivedWrite, options?: WriteOptions): Promise<WriteResult>
   get(id: string, options?: ReadOptions): Promise<Entity | undefined>
   /** `patch.expectedRevision` 必填；缺失由适配器拒绝（invalid-input）。 */
-  patch(input: NormalizedWrite, patch: PatchEntityInput, derived: DerivedWrite, context?: WriteContext): Promise<PatchResult>
+  patch(input: NormalizedWrite, patch: PatchEntityInput, derived: DerivedWrite, options?: WriteOptions): Promise<PatchResult>
   /**
    * 归档。`expectedRevision` 用于自动归档/遗忘的 CAS：调用方用选择时读到的版本，
    * 新更新先提交时归档失败而不是把新状态归档。缺省只用于人工显式归档。
@@ -189,7 +211,7 @@ export interface Store {
   recordAudit?(entry: AuditEntry): Promise<number>
   rollback(auditId: number, actor: string): Promise<RollbackResult>
   recordArtifact(input: ArtifactInput): Promise<void>
-  listArtifacts(limit: number): Promise<ArtifactRecord[]>
+  listArtifacts(limit: number, options?: { readonly id?: string }): Promise<ArtifactRecord[]>
   markArtifactProcessed(id: string): Promise<void>
   /**
    * 登记项目身份映射（旧 fake 可不实现）。每个 workspace 一行：legacy_keys 取并集，

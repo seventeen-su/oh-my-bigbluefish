@@ -33,12 +33,18 @@ import type { TimerHandler, WorkflowDefinition } from '../../packages/v7/src/app
 import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import type { JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import {
+  ATTRIBUTE_RENAME_REACTION_TOPICS,
+  CONSOLIDATION_REACTION_TOPICS,
   EMBED_REACTION_TOPICS,
+  EVIDENCE_REACTION_TOPICS,
   LINK_REACTION_TOPICS,
   REFRESH_REACTION_TOPICS,
   WRITE_SIDE_EFFECT_TOPICS,
   createAckReaction,
+  createAttributeRenameReaction,
+  createConsolidationReaction,
   createEmbedReaction,
+  createEvidenceAddedReaction,
   createLinkSuggestReaction,
   createReactionAckMetrics,
   createRefreshReaction,
@@ -300,6 +306,14 @@ export function createEventRuntime(deps: EventRuntimeDeps): EventRuntime {
       for (const topic of EMBED_REACTION_TOPICS) registry.register(topic, embedReaction)
       const refreshReaction: Reaction = createRefreshReaction({ store, queue, logger })
       for (const topic of REFRESH_REACTION_TOPICS) registry.register(topic, refreshReaction)
+      // 事件驱动为主：实体写入/属性改名后立即入队定向 dedupe/conflict/clue-promote/reference-rot。
+      const consolidationReaction: Reaction = createConsolidationReaction({ store, queue, logger })
+      for (const topic of CONSOLIDATION_REACTION_TOPICS) registry.register(topic, consolidationReaction)
+      const renameReaction: Reaction = createAttributeRenameReaction({ queue })
+      for (const topic of ATTRIBUTE_RENAME_REACTION_TOPICS) registry.register(topic, renameReaction)
+      // 内容去重命中（实体未变、证据新增）→ 立即重评估线索晋升。
+      const evidenceReaction: Reaction = createEvidenceAddedReaction({ queue })
+      for (const topic of EVIDENCE_REACTION_TOPICS) registry.register(topic, evidenceReaction)
       // 链接变化 → link-suggest；写事务已完成的副作用 topic 只 ack 并计数（不进死信）。
       const linkReaction: Reaction = createLinkSuggestReaction({ queue })
       for (const topic of LINK_REACTION_TOPICS) registry.register(topic, linkReaction)

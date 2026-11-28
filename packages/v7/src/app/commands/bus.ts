@@ -4,6 +4,7 @@ import { isPlainObject } from '../../domain/json.js'
 import type { Store } from '../../ports/store.js'
 import { normalizeWrite } from '../../domain/validation.js'
 import {
+  duplicateCommandIdOf,
   validateCommandMeta,
   type Command,
   type CommandBus,
@@ -43,7 +44,7 @@ export class DefaultCommandBus implements CommandBus {
       const outcome = await this.deps.writer.execute(prepared, meta)
       return ok(toCommandResult(outcome))
     } catch (error) {
-      const duplicate = duplicateCommandId(error)
+      const duplicate = duplicateCommandIdOf(error)
       if (duplicate !== undefined) {
         const replay = await this.deps.writer.result(duplicate)
         if (replay === undefined) {
@@ -113,14 +114,6 @@ function requireId(value: string, field: string): string {
     throw new OmbFailure(invalid(`${field} 必须是非空字符串`))
   }
   return value
-}
-
-function duplicateCommandId(error: unknown): string | undefined {
-  if (!(error instanceof OmbFailure)) return undefined
-  const details = error.error.details
-  if (!isPlainObject(details) || details['duplicateCommand'] !== true) return undefined
-  const commandId = details['commandId']
-  return typeof commandId === 'string' ? commandId : undefined
 }
 
 type CommandError = OmbError & { readonly currentRevision?: number }

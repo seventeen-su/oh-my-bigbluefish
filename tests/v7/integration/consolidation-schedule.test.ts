@@ -39,7 +39,39 @@ const CONSOLIDATION_JOB_NAMES = [
 ] as const
 const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'
 const CONSOLIDATION_TRIGGER = 'omb.consolidation'
-const CONSOLIDATION_INTERVAL_MS = 10 * 60 * 1000
+/**
+ * 事件驱动为主、周期兜底为辅：周期不再是统一的 10 分钟。
+ * 这里独立写死期望值（不从被测实现推导），改分类必须同时改测试与文档。
+ */
+const EVENT_FALLBACK_MS = 2 * 60 * 60 * 1000
+const EXTRACT_FALLBACK_MS = 15 * 60 * 1000
+const PERIODIC_FALLBACK_MS = 6 * 60 * 60 * 1000
+const REFRESH_INTERVAL_MS = 10 * 60 * 1000
+const EMBED_SWEEP_INTERVAL_MS = 30 * 60 * 1000
+const INTERVAL_BY_JOB: Readonly<Record<(typeof CONSOLIDATION_JOB_NAMES)[number], number>> = {
+  'omb.extract': EXTRACT_FALLBACK_MS,
+  'omb.reference-rot': EVENT_FALLBACK_MS,
+  'omb.clue-promote': EVENT_FALLBACK_MS,
+  'omb.dedupe': EVENT_FALLBACK_MS,
+  'omb.conflict': EVENT_FALLBACK_MS,
+  'omb.link-suggest': EVENT_FALLBACK_MS,
+  'omb.forget': PERIODIC_FALLBACK_MS,
+  'omb.attr-alias': PERIODIC_FALLBACK_MS,
+  'omb.refresh': REFRESH_INTERVAL_MS,
+  'omb.embed-sweep': EMBED_SWEEP_INTERVAL_MS,
+}
+const MODE_BY_JOB: Readonly<Record<(typeof CONSOLIDATION_JOB_NAMES)[number], 'event' | 'time' | 'fallback'>> = {
+  'omb.extract': 'event',
+  'omb.reference-rot': 'event',
+  'omb.clue-promote': 'event',
+  'omb.dedupe': 'event',
+  'omb.conflict': 'event',
+  'omb.link-suggest': 'event',
+  'omb.forget': 'fallback',
+  'omb.attr-alias': 'fallback',
+  'omb.refresh': 'time',
+  'omb.embed-sweep': 'time',
+}
 const consolidationDedupeKeys = CONSOLIDATION_JOB_NAMES.map(job => `consolidation:${job}`)
 
 // 显式声明破坏性用途：只有库名命中 test/bench 段才设置；truncateAll 在连接前仍会拒绝生产库。
@@ -300,7 +332,11 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
     const scheduler = schedulerFor()
     expect(scheduler.schedules.map(schedule => schedule.job)).toEqual([...CONSOLIDATION_JOB_NAMES])
     expect(scheduler.schedules.map(schedule => schedule.dedupeKey)).toEqual(consolidationDedupeKeys)
-    expect(scheduler.schedules.every(schedule => schedule.intervalMs === CONSOLIDATION_INTERVAL_MS)).toBe(true)
+    // 调度分类与周期：事件驱动任务的 timer 只是漏事件兜底，周期兜底/时间驱动单独分类。
+    expect(scheduler.schedules.map(schedule => schedule.intervalMs))
+      .toEqual(CONSOLIDATION_JOB_NAMES.map(job => INTERVAL_BY_JOB[job]))
+    expect(scheduler.schedules.map(schedule => schedule.mode))
+      .toEqual(CONSOLIDATION_JOB_NAMES.map(job => MODE_BY_JOB[job]))
 
     const ensured = await scheduler.ensure()
 
@@ -352,10 +388,11 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
     expect(row.id).toBe(consolidationTimerRow(before, forgetKey).id)
     expect(row.status).toBe('pending')
     const dueAt = new Date(row.due_at).getTime()
-    // 下一期是严格未来的网格点，且在 (now, now + interval] 内。
+    // 下一期是严格未来的网格点，且在 (now, now + interval] 内；遗忘按 6 小时低频兜底。
+    const forgetInterval = INTERVAL_BY_JOB['omb.forget']
     expect(dueAt).toBeGreaterThan(now)
-    expect(dueAt - now).toBeLessThanOrEqual(CONSOLIDATION_INTERVAL_MS)
-    expect(dueAt % CONSOLIDATION_INTERVAL_MS).toBe(0)
+    expect(dueAt - now).toBeLessThanOrEqual(forgetInterval)
+    expect(dueAt % forgetInterval).toBe(0)
 
     // 重复 rearm 幂等：同一期网格内再排一次不改行 id / due_at，也不新增行
     // （workflow step 重试/恢复都会再调一次 rearm）。
@@ -420,7 +457,7 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
       const singletonKey = jobs.rows[0]?.singleton_key ?? ''
       expect(singletonKey).toMatch(/^omb\.dedupe:\d+$/)
       const bucket = Number(singletonKey.slice('omb.dedupe:'.length))
-      expect(Math.abs(bucket - Math.floor(Date.now() / CONSOLIDATION_INTERVAL_MS))).toBeLessThanOrEqual(1)
+      expect(Math.abs(bucket - Math.floor(Date.now() / INTERVAL_BY_JOB['omb.dedupe']))).toBeLessThanOrEqual(1)
       // 载荷带调度触发标记：只有它执行完才续期，事件 reaction 的提前触发不会移动 schedule。
       expect(jobs.rows[0]?.data).toMatchObject({ trigger: CONSOLIDATION_TRIGGER, job: 'omb.dedupe' })
       // timer 行已经 done：再来一轮不该重复入队（没有第二行 timer 可领）。
@@ -469,7 +506,7 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
     const timers = new PostgresTimerStore(db.db)
     // 排期时就把期号写进载荷：重试同一条 timer 不会换幂等键。
     const dueAt = new Date(Date.now() - 1_000)
-    const period = Math.floor(dueAt.getTime() / CONSOLIDATION_INTERVAL_MS)
+    const period = Math.floor(dueAt.getTime() / INTERVAL_BY_JOB['omb.forget'])
     await timers.schedule({
       topic: CONSOLIDATION_TIMER_TOPIC,
       payload: { job: 'omb.forget', period },
@@ -517,7 +554,7 @@ describe('巩固任务的 durable schedule（真实 PostgreSQL）', () => {
     const key = starts[0]?.key ?? ''
     expect(key).toMatch(/^consolidation:omb\.forget:\d+$/)
     const period = Number(key.slice('consolidation:omb.forget:'.length))
-    expect(Math.abs(period - Math.floor(Date.now() / CONSOLIDATION_INTERVAL_MS))).toBeLessThanOrEqual(1)
+    expect(Math.abs(period - Math.floor(Date.now() / INTERVAL_BY_JOB['omb.forget']))).toBeLessThanOrEqual(1)
   })
 
   it('给定未配置 workflow dispatch 当 forget timer 到期则走 pg-boss 入队（兼容路径，与 workflow 互斥）', async () => {
@@ -574,13 +611,21 @@ describe('plugin：loop 删除后的巩固调度（真实 PostgreSQL + pg-boss�
       expect(rows.map(row => row.dedupe_key)).toEqual([...consolidationDedupeKeys].sort())
       expect(rows.every(row => row.status === 'pending')).toBe(true)
 
-      // 每个任务都真的被 timer 到期驱动过**恰好一次**：`timerFired` 只在 handler 成功
-      // （入队完成）后累加，而一条 timer 行 complete 后不可能再被 claim；这里没有 workflow
-      // wake timer，所以 fired 必须等于任务数——多一次就是重复派发。
+      // 每个任务都真的被 timer 到期驱动过：`timerFired` 只在 handler 成功后累加。
+      // 不写死绝对次数：本文件前面的调度用例会留下自己的 TimerWorker/计时行，
+      // 跨用例的时钟对齐不属于本断言要证明的东西；用 pg-boss 的调度触发行证明“恰好入队一次”。
       const fired = await statusText(plugin)
-      expect(metric(fired, 'timerFired')).toBe(CONSOLIDATION_JOB_NAMES.length)
+      expect(metric(fired, 'timerFired')).toBeGreaterThanOrEqual(CONSOLIDATION_JOB_NAMES.length)
       expect(metric(fired, 'timerRetried')).toBe(0)
       expect(metric(fired, 'timerDead')).toBe(0)
+      const triggered = await db.db.query<{ name: string; count: string }>(
+        `select name, count(*)::text as count from pgboss.job
+          where data->>'trigger' = $1 group by name order by name`,
+        [CONSOLIDATION_TRIGGER],
+      )
+      // forget 走 workflow dispatch（startRun 落 workflow 表），其余 9 个任务各入队一次。
+      expect(triggered.rows.map(row => row.name)).toEqual([...CONSOLIDATION_JOB_NAMES].filter(job => job !== 'omb.forget').sort())
+      expect(triggered.rows.every(row => row.count === '1')).toBe(true)
     } finally {
       await plugin.stop()
     }
@@ -782,6 +827,30 @@ describe('巩固调度源码（静态）', () => {
     expect(scheduleSource).toContain('payload: { job: schedule.job, period: periodOf(dueAt, schedule.intervalMs) }')
   })
 
+  it('给定事件驱动改造当静态检查则 reaction 注册定向任务，且没有全表扫描的固定节拍', async () => {
+    const reactions = await readFile(new URL('../../../plugin/v7/reactions.ts', import.meta.url), 'utf8')
+    const eventRuntime = await readFile(new URL('../../../plugin/v7/event-runtime.ts', import.meta.url), 'utf8')
+    const jobsSource = await readFile(new URL('../../../packages/v7/src/jobs/consolidate.ts', import.meta.url), 'utf8')
+
+    // outbox reaction 是主路径：Created/Patched → 定向 dedupe/conflict/reference-rot/clue-promote。
+    expect(reactions).toContain("'omb.dedupe'")
+    expect(reactions).toContain("'omb.conflict'")
+    expect(reactions).toContain("'omb.clue-promote'")
+    expect(reactions).toContain("'omb.reference-rot'")
+    expect(reactions).toContain('CONSOLIDATION_REACTION_TOPICS')
+    expect(reactions).toContain('ATTRIBUTE_RENAME_REACTION_TOPICS')
+    expect(reactions).toContain('EVIDENCE_REACTION_TOPICS')
+    expect(eventRuntime).toContain('createConsolidationReaction')
+    expect(eventRuntime).toContain('createAttributeRenameReaction')
+    expect(eventRuntime).toContain('createEvidenceAddedReaction')
+    // 定向 handler：带 entityId 的载荷只处理目标实体，不调用 recent(全量兜底)。
+    expect(jobsSource).toContain('export async function handleDedupeFor')
+    expect(jobsSource).toContain('export async function handleConflictFor')
+    expect(jobsSource).toContain('export async function handleCluePromoteFor')
+    expect(jobsSource).toContain('export async function handleReferenceRotForTarget')
+    expect(jobsSource).toContain('export async function handleExtractArtifact')
+  })
+
   it('给定 forget 改成 workflow 执行当静态检查则定义有真实 step、调度只 start，续期不在 handler 里', async () => {
     const business = await readFile(new URL('../../../packages/v7/src/app/workflow/business.ts', import.meta.url), 'utf8')
     const scheduleSource = await readFile(new URL('../../../packages/v7/src/jobs/schedule.ts', import.meta.url), 'utf8')
@@ -799,3 +868,4 @@ describe('巩固调度源码（静态）', () => {
     expect(scheduleSource).toContain('await dispatch.start(dispatch.workflow')
   })
 })
+

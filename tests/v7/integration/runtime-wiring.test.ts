@@ -319,7 +319,7 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
       expect(text).toContain('projection=ok')
       expect(text).toContain('outbox=ok')
       expect(text).toContain('outboxLagMs=0 outboxPending=0 outboxClaimed=0 outboxDead=0')
-      expect(text).toContain('outboxTopics=AttributeRenamed,EntityArchived,EntityCreated,EntityPatched,EntityUnarchived,LinkCreated,LinkUnlinked')
+      expect(text).toContain('outboxTopics=AttributeRenamed,EntityArchived,EntityCreated,EntityPatched,EntityUnarchived,EvidenceAdded,LinkCreated,LinkUnlinked')
       expect(text).toContain('outboxUnknownTopic=dead')
       expect(text).toContain('timer=ok')
       // 业务 timer（workflow wake）空闲；consolidation 的 durable schedule 是合法 pending。
@@ -446,11 +446,11 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
     }
   })
 
-  it('给定 AttributeRenamed 事件当 relay 投递则 ack 而不是进死信（改名副作用已在写事务完成）', async () => {
+  it('给定 AttributeRenamed 事件当 relay 投递则入队定向 reference-rot（不再是只 ack 的副作用）', async () => {
     const runtime = startRuntime()
     try {
       await statusText(runtime)
-      const id = await createEntityOnBus('改名 ack 验证')
+      const id = await createEntityOnBus('改名引用检查')
       const bus = busOn(store)
       const patched = await bus.execute(
         { type: 'PatchEntity', input: { id, expectedRevision: 1, attrs: { oldTag: 'x' } } },
@@ -468,10 +468,23 @@ describe('Phase 3 运行时接线（真实 PostgreSQL）', () => {
           const row = await outboxRowOfStream('attr:oldTag->newTag', 'AttributeRenamed')
           return row?.status === 'done' ? row : undefined
         },
-        'AttributeRenamed 被 ack',
+        'AttributeRenamed 被 relay 投递',
       )
+      // 真实消费：改名事件必须触发受影响实体的定向引用腐化检查（不是只 ack）。
+      const jobs = await waitFor(
+        async () => {
+          const rows = await store.db.query<{ singleton_key: string | null; data: { topic?: string; entityId?: string } }>(
+            `select singleton_key, data from pgboss.job
+              where name = 'omb.reference-rot' and data->>'topic' = 'AttributeRenamed'
+              order by created_on desc`,
+          )
+          return rows.rows.length > 0 ? rows.rows : undefined
+        },
+        'AttributeRenamed 入队 omb.reference-rot',
+      )
+      expect(jobs[0]?.data.entityId).toBe(id)
+      expect(jobs[0]?.singleton_key).toBe(`reference-rot:${id}`)
       const text = await statusText(runtime)
-      expect(text).toContain('outboxAckedByTopic=AttributeRenamed:1')
       expect(text).toContain('outboxDeadRows=0')
       expect(text).not.toContain('outboxDeadRecent=')
     } finally {

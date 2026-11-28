@@ -1,5 +1,5 @@
 import type { Clock } from '../ports/clock.js'
-import type { WriteResult } from '../ports/store.js'
+import type { WriteOptions, WriteResult } from '../ports/store.js'
 import type { WriteEntityInput } from '../domain/entity.js'
 import { validationError } from '../domain/validation-result.js'
 import { err, ok, type Result, type OmbError } from '../domain/errors.js'
@@ -16,10 +16,16 @@ export interface RememberDeps extends EmbeddingDeps {
   readonly clock: Clock
 }
 
+/**
+ * 写入的幂等/证据参数：`commandId` 由工具运行时按调用身份生成（同一调用重试复用）；
+ * `evidence` 是本次观察的来源证据（写事务内落证据账本，内容去重时并入原实体）。
+ */
+export type RememberOptions = Pick<WriteOptions, 'commandId' | 'correlationId' | 'evidence'>
+
 export class RememberService {
   constructor(private readonly deps: RememberDeps) {}
 
-  async remember(input: WriteEntityInput): Promise<Result<RememberOutput>> {
+  async remember(input: WriteEntityInput, options: RememberOptions = {}): Promise<Result<RememberOutput>> {
     const normalized = normalizeWrite(input)
     if (!normalized.ok) return err(validationError(normalized.errors))
     const derived = {
@@ -27,8 +33,11 @@ export class RememberService {
       triggers: deriveTriggers(normalized.value.attributes),
       references: deriveReferences(normalized.value.attributes),
     }
-    const written = await this.deps.store.write(normalized.value, derived)
-    const embedding = await populateEmbedding(this.deps, normalized.value.id, derived.searchText)
+    const written = await this.deps.store.write(normalized.value, derived, options)
+    // 内容复用没有新文本/新实体：原实体已有向量，不重复入队嵌入。
+    const embedding: EmbeddingStatus = written.deduped !== undefined
+      ? 'reused'
+      : await populateEmbedding(this.deps, normalized.value.id, derived.searchText)
     return ok({ ...written, embedding })
   }
 }

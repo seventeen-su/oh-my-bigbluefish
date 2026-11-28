@@ -8,6 +8,8 @@ import { DynamicService } from '../../../packages/v7/src/app/dynamic.js'
 import { UpdateService } from '../../../packages/v7/src/app/update.js'
 import type { WriteEntityInput } from '../../../packages/v7/src/domain/entity.js'
 import { attributeValue } from '../../../packages/v7/src/domain/entity-access.js'
+import type { EvidenceInput } from '../../../packages/v7/src/domain/evidence.js'
+import type { WriteOptions } from '../../../packages/v7/src/ports/store.js'
 import {
   handleAttrAlias,
   handleCluePromote,
@@ -46,8 +48,12 @@ describe('background consolidation', () => {
     }
   }
 
-  async function write(db: ReturnType<typeof store>, input: WriteEntityInput) {
-    return db.write(normalized(input), derived(input))
+  async function write(
+    db: ReturnType<typeof store>,
+    input: WriteEntityInput,
+    options: WriteOptions & { readonly evidence?: readonly EvidenceInput[] } = {},
+  ) {
+    return db.write(normalized(input), derived(input), options)
   }
 
   it('后台 refresh 用实体 projectKey 解析文件动态值', async () => {
@@ -251,10 +257,13 @@ describe('background consolidation', () => {
       kind: 'memory', category: 'fact', scope: { kind: 'global' },
       attrs: { title: 'Postgres 配置', body: '连接串与迁移说明' },
     })
+    // 内容幂等只合并“完全相同”的内容；这里用标点差异制造相似但不同的第二条，
+    // 由后台 dedupe 合并（文本相似度仍 ≥0.82）。
     const second = await write(db, {
       kind: 'memory', category: 'fact', scope: { kind: 'global' },
-      attrs: { title: 'Postgres 配置', body: '连接串与迁移说明' },
+      attrs: { title: 'Postgres 配置', body: '连接串与迁移说明。' },
     })
+    expect(second.entity.id).not.toBe(first.entity.id)
     const result = await handleDedupe(context)
     expect(result.merged).toBeGreaterThan(0)
     const active = await db.db.query<{ entity_id: string }>('select entity_id from omb.entity_view where archived_at is null and kind = $1', ['memory'])
@@ -285,23 +294,37 @@ describe('background consolidation', () => {
     await db.close()
   })
 
-  it('线索满足证据阈值后转为事实', async () => {
+  it('线索满足证据阈值后转为事实（只认 Evidence 账本，不再数 attributes.evidence 字符串）', async () => {
     const { db, deps: context } = await deps()
+    const session = (id: string): EvidenceInput[] => [{
+      sourceType: 'session',
+      sourceId: `session:${id}`,
+      observedAt: '2026-11-29T00:00:00.000Z',
+      subjectKey: `session:${id}`,
+      confidence: 0.6,
+    }]
     const single = await write(db, {
       kind: 'memory', category: 'clue', scope: { kind: 'global' },
       attrs: { title: '单会话线索', body: '同一会话重复三次', evidence: ['session:a', 'session:a', 'session:a'] },
-    })
+    }, { commandId: 'clue-single', evidence: session('a') })
     expect((await handleCluePromote(context)).promoted).toBe(0)
     expect(attributeValue((await db.get(single.entity.id))!, 'category')).toBe('clue')
 
-    const clue = await write(db, {
+    // 同一内容、第二个独立会话：内容幂等复用原实体，证据集 +1，独立来源达到 2 → 晋升。
+    const second = await write(db, {
       kind: 'memory', category: 'clue', scope: { kind: 'global' },
-      attrs: { title: '候选结论', body: '可能是这样', evidence: ['session:a', 'session:b'] },
-    })
+      attrs: { title: '单会话线索', body: '同一会话重复三次', evidence: ['session:a', 'session:a', 'session:a'] },
+    }, { commandId: 'clue-second', evidence: session('b') })
+    expect(second.entity.id).toBe(single.entity.id)
     const result = await handleCluePromote(context)
     expect(result.promoted).toBe(1)
-    const loaded = await db.get(clue.entity.id)
+    const loaded = await db.get(single.entity.id)
     expect(attributeValue(loaded!, 'category')).toBe('fact')
+    const verification = await db.db.query<{ count: string }>(
+      "select count(*)::text as count from omb.evidence where entity_id = $1 and source_type = 'verification'",
+      [single.entity.id],
+    )
+    expect(Number(verification.rows[0]?.count)).toBe(1)
     await db.close()
   })
 

@@ -16,10 +16,13 @@ import type { ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
 import type { RecallService } from '../../packages/v7/src/app/recall.js'
 import type { RememberService } from '../../packages/v7/src/app/remember.js'
 import type { UpdateService } from '../../packages/v7/src/app/update.js'
+import { evidenceForWrite } from '../../packages/v7/src/app/evidence.js'
 import { err, ok, type Result } from '../../packages/v7/src/domain/errors.js'
 import type { PatchEntityInput, WriteEntityInput } from '../../packages/v7/src/domain/entity.js'
 import type { LinkInput } from '../../packages/v7/src/domain/link.js'
+import type { Clock } from '../../packages/v7/src/ports/clock.js'
 import { formatPatch, formatWrite, resultError } from './messages.js'
+import { toolCommandId } from './tool-command.js'
 
 export interface ToolRuntimeDeps {
   readonly requireReady: () => Promise<Result<never> | undefined>
@@ -27,22 +30,36 @@ export interface ToolRuntimeDeps {
   readonly updateService: UpdateService
   readonly recallService: RecallService
   readonly store: PostgresStore
+  readonly clock: Clock
   readonly status: () => Promise<Result<string>>
   /** 运行时上下文解析（组合根注入：稳定 projectId + 身份注册）。 */
   readonly resolveContext: (exec: unknown) => Promise<ToolContext | undefined>
 }
 
 export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
-  const { requireReady, rememberService, updateService, recallService, store, status } = deps
+  const { requireReady, rememberService, updateService, recallService, store, clock, status } = deps
   // 死信重放与 relay 共用同一个适配器实现（无状态、不额外建连接池）。
   const outbox = new PostgresOutboxStore(store.db)
   return {
     context: deps.resolveContext,
-    async remember(input: WriteEntityInput): Promise<Result<string>> {
+    async remember(input: WriteEntityInput, context: ToolContext): Promise<Result<string>> {
       const unavailable = await requireReady()
       if (unavailable !== undefined) return unavailable
       try {
-        const result = await rememberService.remember(input)
+        // 第一层幂等：同一工具调用（callId）重试复用同一 commandId；
+        // 第二层内容幂等由写事务按 scope/category/关键属性/时间判定。
+        const commandId = toolCommandId('omb_remember', context, input)
+        const evidence = evidenceForWrite(input, {
+          sessionId: context.sessionId,
+          ...(context.callId !== undefined ? { callId: context.callId } : {}),
+          tool: 'omb_remember',
+          ...(input.origin !== undefined ? { origin: input.origin } : {}),
+          now: clock.iso(),
+        })
+        const result = await rememberService.remember(input, {
+          commandId,
+          ...(evidence.length > 0 ? { evidence } : {}),
+        })
         return result.ok ? ok(formatWrite(result)) : result
       } catch (error) {
         return resultError(error)
@@ -53,11 +70,12 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
       if (unavailable !== undefined) return unavailable
       return recallService.recall(input, context)
     },
-    async update(input: PatchEntityInput): Promise<Result<string>> {
+    async update(input: PatchEntityInput, context: ToolContext): Promise<Result<string>> {
       const unavailable = await requireReady()
       if (unavailable !== undefined) return unavailable
       try {
-        const result = await updateService.update(input)
+        // 更新同样有稳定 commandId：工具重试不会重复 bump revision/写第二条审计。
+        const result = await updateService.update(input, { commandId: toolCommandId('omb_update', context, input) })
         return result.ok ? ok(formatPatch(result)) : result
       } catch (error) {
         return resultError(error)

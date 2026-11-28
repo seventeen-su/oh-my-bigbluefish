@@ -15,7 +15,7 @@ import type {
   PatchResult,
   ReadOptions,
   Store,
-  WriteContext,
+  WriteOptions,
   WriteResult,
 } from '../../ports/store.js'
 import type {
@@ -39,7 +39,7 @@ import type {
   TriggerSearchSpec,
   VectorSearchSpec,
 } from '../../ports/search.js'
-import { systemCommandMeta } from '../../app/commands/index.js'
+import { duplicateCommandIdOf, systemCommandMeta, type CommandOutcome } from '../../app/commands/index.js'
 import type { ProjectIdentity } from '../../domain/project-identity.js'
 import { iso, PostgresDb } from './db.js'
 import { projectRootRow, recordProjectIdentityRow } from './identity-store.js'
@@ -179,39 +179,68 @@ export class PostgresStore implements Store {
     }
   }
 
-  async write(input: NormalizedWrite, _derived: DerivedWrite): Promise<WriteResult> {
+  /**
+   * 稳定 commandId 的重复提交：返回首次实体并标 `deduped:'command'`，不重复写审计/实体。
+   * writer 只抛内部重复信号，这里把它翻译成写路径结果（工具重试语义）。
+   */
+  private async replayDuplicate(commandId: string): Promise<CommandOutcome> {
+    const replay = await this.writer.result(commandId)
+    if (replay === undefined) throw new OmbFailure(internal(`重复命令 ${commandId} 找不到首次结果`))
+    return replay
+  }
+
+  async write(input: NormalizedWrite, _derived: DerivedWrite, options: WriteOptions = {}): Promise<WriteResult> {
     return this.run(async () => {
-      const outcome = await this.writer.execute(
-        { type: 'CreateEntity', input },
-        systemCommandMeta(input.origin),
-      )
+      const meta = systemCommandMeta(input.origin, undefined, options)
+      let outcome: CommandOutcome
+      try {
+        outcome = await this.writer.execute({ type: 'CreateEntity', input }, meta)
+      } catch (error) {
+        // 第一层幂等：工具调用重试复用的稳定 commandId 命中审计唯一索引 → 返回首次结果。
+        const duplicate = duplicateCommandIdOf(error)
+        if (duplicate === undefined) throw error
+        outcome = await this.replayDuplicate(duplicate)
+        outcome = { ...outcome, deduped: 'command' }
+      }
       const entity = outcome.entity
       if (entity === undefined) throw new OmbFailure(internal('写入没有返回实体'))
-      // 相似建议在写事务之外读（事务内禁止相似查询）；有界候选窗口见 similar.ts。
-      const similar = await findSimilar(this.db, {
-        entityId: entity.id,
-        kind: input.kind,
-        attributes: entity.attributes,
-        title: titleOf(entity)?.trim() ?? null,
-      })
-      return { entity, ...similar }
+      // 内容去重没有产生新实体，相似建议对调用方仍可参考，但不必为一个未变化实体重复查相似。
+      const similar = outcome.deduped === 'content'
+        ? { similarAttributes: [], similarEntities: [], archivedMatches: [] }
+        : await findSimilar(this.db, {
+          entityId: entity.id,
+          kind: input.kind,
+          attributes: entity.attributes,
+          title: titleOf(entity)?.trim() ?? null,
+        })
+      return {
+        entity,
+        ...similar,
+        ...(outcome.deduped !== undefined ? { deduped: outcome.deduped } : {}),
+      }
     })
   }
 
-  async patch(input: NormalizedWrite, patch: PatchEntityInput, _derived: DerivedWrite, context: WriteContext = {}): Promise<PatchResult> {
+  async patch(input: NormalizedWrite, patch: PatchEntityInput, _derived: DerivedWrite, options: WriteOptions = {}): Promise<PatchResult> {
     return this.run(async () => {
-      const actor = context.actor ?? input.origin
-      const source = context.source ?? input.origin
-      const outcome = await this.writer.execute(
-        { type: 'PatchEntity', input, patch },
-        {
-          ...systemCommandMeta(actor, source),
-          ...(patch.expectedRevision === undefined ? {} : { expectedRevision: patch.expectedRevision }),
-        },
-      )
+      const actor = options.actor ?? input.origin
+      const source = options.source ?? input.origin
+      const meta = systemCommandMeta(actor, source, options)
+      let outcome: CommandOutcome
+      try {
+        outcome = await this.writer.execute({ type: 'PatchEntity', input, patch }, meta)
+      } catch (error) {
+        const duplicate = duplicateCommandIdOf(error)
+        if (duplicate === undefined) throw error
+        outcome = { ...await this.replayDuplicate(duplicate), deduped: 'command' }
+      }
       const entity = outcome.entity
       if (entity === undefined) throw new OmbFailure(internal('更新没有返回实体'))
-      return { entity, ...(outcome.history !== undefined ? { history: outcome.history } : {}) }
+      return {
+        entity,
+        ...(outcome.history !== undefined ? { history: outcome.history } : {}),
+        ...(outcome.deduped === 'command' ? { deduped: 'command' as const } : {}),
+      }
     })
   }
 
@@ -935,7 +964,7 @@ export class PostgresStore implements Store {
     })
   }
 
-  async listArtifacts(limit: number): Promise<ArtifactRecord[]> {
+  async listArtifacts(limit: number, options: { readonly id?: string } = {}): Promise<ArtifactRecord[]> {
     return this.run(async () => {
       const rows = await this.db.query<{
         id: string
@@ -948,8 +977,9 @@ export class PostgresStore implements Store {
       }>(
         `select id, session_id, kind, content, source, metadata, created_at
          from omb.artifact where processed_at is null
+           and ($2::text is null or id = $2)
          order by created_at asc limit $1`,
-        [Math.max(1, Math.min(200, limit))],
+        [Math.max(1, Math.min(200, limit)), options.id ?? null],
       )
       return rows.rows.map(row => ({
         id: row.id,

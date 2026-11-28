@@ -61,20 +61,56 @@ export interface ConsolidationWorkflowDispatch {
 }
 
 const CONSOLIDATION_TIMER_TOPIC = 'omb.consolidation'
-const CONSOLIDATION_INTERVAL_MS = 10 * 60 * 1000
 /** timer 入队时写入的触发标记：只有调度驱动的执行才续期。 */
 const CONSOLIDATION_TRIGGER = 'omb.consolidation'
+
+export type ConsolidationMode = 'event' | 'time' | 'fallback'
 
 export interface ConsolidationSchedule {
   readonly job: ConsolidationJobName
   readonly dedupeKey: string
   readonly intervalMs: number
+  readonly mode: ConsolidationMode
+}
+
+const MINUTE_MS = 60 * 1000
+const EVENT_FALLBACK_MS = 2 * 60 * MINUTE_MS
+const EXTRACT_FALLBACK_MS = 15 * MINUTE_MS
+const REFRESH_INTERVAL_MS = 10 * MINUTE_MS
+const EMBED_SWEEP_INTERVAL_MS = 30 * MINUTE_MS
+const LOW_FREQUENCY_MS = 6 * 60 * MINUTE_MS
+
+const CONSOLIDATION_MODES: Readonly<Record<ConsolidationJobName, ConsolidationMode>> = {
+  'omb.extract': 'event',
+  'omb.reference-rot': 'event',
+  'omb.clue-promote': 'event',
+  'omb.dedupe': 'event',
+  'omb.conflict': 'event',
+  'omb.link-suggest': 'event',
+  'omb.refresh': 'time',
+  'omb.embed-sweep': 'time',
+  'omb.forget': 'fallback',
+  'omb.attr-alias': 'fallback',
+}
+
+const CONSOLIDATION_INTERVALS: Readonly<Record<ConsolidationJobName, number>> = {
+  'omb.extract': EXTRACT_FALLBACK_MS,
+  'omb.reference-rot': EVENT_FALLBACK_MS,
+  'omb.clue-promote': EVENT_FALLBACK_MS,
+  'omb.dedupe': EVENT_FALLBACK_MS,
+  'omb.conflict': EVENT_FALLBACK_MS,
+  'omb.link-suggest': EVENT_FALLBACK_MS,
+  'omb.refresh': REFRESH_INTERVAL_MS,
+  'omb.embed-sweep': EMBED_SWEEP_INTERVAL_MS,
+  'omb.forget': LOW_FREQUENCY_MS,
+  'omb.attr-alias': LOW_FREQUENCY_MS,
 }
 
 const CONSOLIDATION_SCHEDULES: readonly ConsolidationSchedule[] = CONSOLIDATION_JOBS.map(job => ({
   job,
   dedupeKey: `consolidation:${job}`,
-  intervalMs: CONSOLIDATION_INTERVAL_MS,
+  intervalMs: CONSOLIDATION_INTERVALS[job],
+  mode: CONSOLIDATION_MODES[job],
 }))
 
 /** 组合根注入的 timer 能力（不 import pg、不认识表结构）。 */

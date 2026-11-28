@@ -1,6 +1,7 @@
 import type { Entity, EntityKind, StateStatus, WriteEntityInput } from '../domain/entity.js'
 import type { RawAttributeValue } from '../domain/dynamic-spec.js'
 import { attributeValue, scopeOf } from '../domain/entity-access.js'
+import { summarizeEvidence, shouldPromoteClue, type EvidenceRecord } from '../domain/evidence.js'
 import type { JsonValue } from '../domain/json.js'
 import { isPlainObject } from '../domain/json.js'
 import { OmbFailure, type OmbError } from '../domain/errors.js'
@@ -10,7 +11,8 @@ import type { Clock } from '../ports/clock.js'
 import type { Logger } from '../ports/jobs.js'
 import type { MaintenanceQueries } from '../ports/maintenance.js'
 import type { AuditEntry } from '../ports/observability.js'
-import type { SimilarEntity, Store, WriteResult } from '../ports/store.js'
+import type { SimilarEntity, Store, WriteOptions, WriteResult } from '../ports/store.js'
+import { evidenceForArtifact, verificationEvidence } from '../app/evidence.js'
 import { UpdateService } from '../app/update.js'
 import { actorKindOf } from '../app/commands/index.js'
 import type { DynamicRefreshOptions } from '../app/dynamic.js'
@@ -94,7 +96,11 @@ function optionalAttrs(entity: Entity): Record<string, RawAttributeValue> {
   return attrs
 }
 
-async function writeCandidate(store: Store, input: WriteEntityInput): Promise<WriteResult | undefined> {
+async function writeCandidate(
+  store: Store,
+  input: WriteEntityInput,
+  options: WriteOptions = {},
+): Promise<WriteResult | undefined> {
   const normalized = normalizeWrite(input)
   if (!normalized.ok) return undefined
   const derived = {
@@ -102,7 +108,7 @@ async function writeCandidate(store: Store, input: WriteEntityInput): Promise<Wr
     triggers: deriveTriggers(normalized.value.attributes),
     references: deriveReferences(normalized.value.attributes),
   }
-  return await store.write(normalized.value, derived)
+  return await store.write(normalized.value, derived, options)
 }
 
 async function linkSimilar(deps: ConsolidationDeps, sourceId: string, similar: WriteResult['similarEntities']): Promise<number> {
@@ -355,6 +361,80 @@ function candidateFromArtifact(artifact: { id: string; source: string; kind: str
   return undefined
 }
 
+interface ArtifactOutcome {
+  readonly written: number
+  readonly skipped: number
+  readonly grouped: number
+  readonly entityId?: string
+}
+
+/**
+ * 单个 artifact 的抽取（事件驱动入口与周期兜底共用）：
+ * - 写入候选时附带 `evidenceForArtifact` 的证据（session/文件主题），线索晋升才有真实来源；
+ * - 候选写失败不标记 processed，让队列重试；
+ * - 结束后不再跑 conflict（定向 conflict 由 EntityCreated/Patched reaction 触发；
+ *   周期兜底由 handleExtract 在整批结束后跑一次）。
+ */
+async function processArtifact(
+  deps: ConsolidationDeps,
+  artifact: { id: string; source: string; kind: string; content: string; metadata: JsonValue; sessionId?: string },
+  now: string,
+): Promise<ArtifactOutcome> {
+  const candidate = candidateFromArtifact(artifact, now)
+  if (candidate === undefined) {
+    await deps.store.markArtifactProcessed(artifact.id)
+    return { written: 0, skipped: 1, grouped: 0 }
+  }
+  try {
+    const attrs = candidate.attrs ?? {}
+    const goalId = typeof attrs.goalId === 'string' ? attrs.goalId : undefined
+    const taskId = typeof attrs.taskId === 'string' ? attrs.taskId : undefined
+    const convergeName = goalId !== undefined ? 'goalId' : taskId !== undefined ? 'taskId' : undefined
+    const convergeValue = goalId ?? taskId
+    const existing = convergeName !== undefined && convergeValue !== undefined
+      ? await deps.store.findByAttribute?.(convergeName, convergeValue, 'state')
+      : undefined
+    if (existing !== undefined) {
+      const existingEntity = await deps.store.get(existing, { includeArchived: false })
+      if (existingEntity === undefined) return { written: 0, skipped: 1, grouped: 0 }
+      const patch = candidate.kind === 'state'
+        ? {
+            id: existing,
+            expectedRevision: existingEntity.revision,
+            title: candidate.title,
+            status: candidate.status,
+            time: candidate.time,
+            attrs,
+            origin: 'job',
+          }
+        : { id: existing, expectedRevision: existingEntity.revision, attrs, origin: 'job' }
+      const patched = await deps.updateService.update(patch, { actor: JOB_EXTRACT, source: JOB_EXTRACT })
+      if (!patched.ok) return { written: 0, skipped: 1, grouped: 0 }
+      const grouped = await autoGroupAfterUpdate(deps, patched.value.entity) ? 1 : 0
+      await deps.store.markArtifactProcessed(artifact.id)
+      return { written: 1, skipped: 0, grouped, entityId: existing }
+    }
+    const evidence = evidenceForArtifact(candidate, {
+      id: artifact.id,
+      kind: artifact.kind,
+      ...(artifact.sessionId !== undefined ? { sessionId: artifact.sessionId } : {}),
+    }, now)
+    const writtenResult = await writeCandidate(deps.store, candidate, { evidence })
+    if (writtenResult === undefined) {
+      await deps.store.markArtifactProcessed(artifact.id)
+      return { written: 0, skipped: 1, grouped: 0 }
+    }
+    await linkSimilar(deps, writtenResult.entity.id, writtenResult.similarEntities)
+    const grouped = await autoGroupSimilar(deps, writtenResult.entity, writtenResult.similarEntities) ? 1 : 0
+    await deps.store.markArtifactProcessed(artifact.id)
+    return { written: 1, skipped: 0, grouped, entityId: writtenResult.entity.id }
+  } catch (error) {
+    // 写失败不能标记 processed：让队列重试，否则候选会永久丢失。
+    deps.logger?.warn(`抽取候选写入失败：${artifact.id}`, error)
+    throw error
+  }
+}
+
 export async function handleExtract(deps: ConsolidationDeps, limit = 20): Promise<{ written: number; skipped: number; grouped: number }> {
   const artifacts = await deps.store.listArtifacts(limit)
   let written = 0
@@ -362,63 +442,23 @@ export async function handleExtract(deps: ConsolidationDeps, limit = 20): Promis
   let grouped = 0
   const now = deps.clock.iso()
   for (const artifact of artifacts) {
-    const candidate = candidateFromArtifact(artifact, now)
-    if (candidate === undefined) {
-      skipped += 1
-      await deps.store.markArtifactProcessed(artifact.id)
-      continue
-    }
-    try {
-      const attrs = candidate.attrs ?? {}
-      const goalId = typeof attrs.goalId === 'string' ? attrs.goalId : undefined
-      const taskId = typeof attrs.taskId === 'string' ? attrs.taskId : undefined
-      const convergeName = goalId !== undefined ? 'goalId' : taskId !== undefined ? 'taskId' : undefined
-      const convergeValue = goalId ?? taskId
-      const existing = convergeName !== undefined && convergeValue !== undefined
-        ? await deps.store.findByAttribute?.(convergeName, convergeValue, 'state')
-        : undefined
-      if (existing !== undefined) {
-        const existingEntity = await deps.store.get(existing, { includeArchived: false })
-        if (existingEntity === undefined) {
-          skipped += 1
-          continue
-        }
-        const patch = candidate.kind === 'state'
-          ? {
-              id: existing,
-              expectedRevision: existingEntity.revision,
-              title: candidate.title,
-              status: candidate.status,
-              time: candidate.time,
-              attrs,
-              origin: 'job',
-            }
-          : { id: existing, expectedRevision: existingEntity.revision, attrs, origin: 'job' }
-        const patched = await deps.updateService.update(patch, { actor: JOB_EXTRACT, source: JOB_EXTRACT })
-        if (patched.ok) {
-          written += 1
-          if (await autoGroupAfterUpdate(deps, patched.value.entity)) grouped += 1
-        } else skipped += 1
-      } else {
-        const writtenResult = await writeCandidate(deps.store, candidate)
-        if (writtenResult === undefined) skipped += 1
-        else {
-          written += 1
-          await linkSimilar(deps, writtenResult.entity.id, writtenResult.similarEntities)
-          if (await autoGroupSimilar(deps, writtenResult.entity, writtenResult.similarEntities)) grouped += 1
-        }
-      }
-    } catch (error) {
-      skipped += 1
-      // 写失败不能标记 processed：让队列重试，否则候选会永久丢失。
-      deps.logger?.warn(`抽取候选写入失败：${artifact.id}`, error)
-      throw error
-    }
-    await deps.store.markArtifactProcessed(artifact.id)
+    const outcome = await processArtifact(deps, artifact, now)
+    written += outcome.written
+    skipped += outcome.skipped
+    grouped += outcome.grouped
   }
-  // 抽取完成后再跑冲突检测；共同召回成组仍由 link-suggest 继续补。
+  // 抽取完成后再跑冲突检测；定向冲突已由写入事件触发，这里是周期兜底。
   await handleConflict(deps)
   return { written, skipped, grouped }
+}
+
+/** 事件驱动的定向抽取：只处理一个 artifact，不扫整表。 */
+export async function handleExtractArtifact(deps: ConsolidationDeps, artifactId: string): Promise<{ written: number; skipped: number; grouped: number }> {
+  const artifacts = await deps.store.listArtifacts(1, { id: artifactId })
+  const artifact = artifacts[0]
+  if (artifact === undefined) return { written: 0, skipped: 1, grouped: 0 }
+  const outcome = await processArtifact(deps, artifact, deps.clock.iso())
+  return { written: outcome.written, skipped: outcome.skipped, grouped: outcome.grouped }
 }
 
 function attributeOverlap(left: Entity, right: Entity): boolean {
@@ -437,6 +477,58 @@ function attributeOverlap(left: Entity, right: Entity): boolean {
   return same >= 2
 }
 
+/**
+ * 单实体的去重（事件驱动入口）：只对该实体做近邻/属性判断，不扫最近 30 条。
+ * 返回是否真的合并了一个 duplicate。
+ */
+async function dedupeEntity(deps: ConsolidationDeps, entity: Entity, snippet = ''): Promise<boolean> {
+  if (entity.kind !== 'memory' || entity.pinned || entity.archivedAt !== undefined) return false
+  const text = combinedText(entity, snippet)
+  const tokens = tokenize(text, 32)
+  if (tokens.length < 3) return false
+  const hits = await deps.store.fulltext({ query: text, tokens, limit: 5, kind: 'memory' })
+  const candidates = new Map(hits.map(hit => [hit.entityId, { hit, vector: false }]))
+  if (deps.embedder !== undefined) {
+    try {
+      const vectors = await deps.embedder.embed([text])
+      const embedding = vectors[0]
+      if (embedding !== undefined) {
+        const vectorHits = await deps.store.vector({ embedding, kind: 'memory', limit: 5 })
+        for (const hit of vectorHits) {
+          if (hit.rawScore < 0.9) continue
+          candidates.set(hit.entityId, { hit, vector: true })
+        }
+      }
+    } catch (error) {
+      deps.logger?.warn('dedupe 向量近邻失败，退回全文/属性判断', error)
+    }
+  }
+  for (const { hit, vector } of candidates.values()) {
+    if (hit.entityId === entity.id) continue
+    const other = await deps.store.get(hit.entityId)
+    if (other === undefined || other.archivedAt !== undefined) continue
+    const otherText = combinedText(other)
+    const textSimilar = jaccard(tokens, tokenize(otherText, 32)) >= 0.82
+    if (!textSimilar && !vector && !attributeOverlap(entity, other)) continue
+    if (numbersOf(text).join(',') !== numbersOf(otherText).join(',')) continue
+    const canonical = entity.createdAt <= other.createdAt ? entity : other
+    const duplicate = canonical.id === entity.id ? other : entity
+    const mergedAttrs = { ...optionalAttrs(duplicate), ...optionalAttrs(canonical) }
+    const patched = await deps.updateService.update({
+      id: canonical.id,
+      expectedRevision: canonical.revision,
+      attrs: mergedAttrs,
+      origin: 'job',
+    }, { actor: JOB_DEDUPE, source: JOB_DEDUPE })
+    if (!patched.ok) continue
+    await deps.store.link({ fromId: duplicate.id, toId: canonical.id, relation: 'merged_into', source: 'job', origin: 'job' })
+    await deps.store.link({ fromId: canonical.id, toId: duplicate.id, relation: 'merged_from', source: 'job', origin: 'job' })
+    await deps.store.archive(duplicate.id, 'merged', 'job:dedupe')
+    return true
+  }
+  return false
+}
+
 export async function handleDedupe(deps: ConsolidationDeps, limit = 30): Promise<{ merged: number }> {
   const recent = await deps.queries.recent(limit)
   const memories = recent.filter(item => item.kind === 'memory' && !item.pinned)
@@ -444,59 +536,16 @@ export async function handleDedupe(deps: ConsolidationDeps, limit = 30): Promise
   for (const item of memories) {
     const entity = await deps.store.get(item.id)
     if (entity === undefined || entity.archivedAt !== undefined) continue
-    const text = combinedText(entity, item.snippet)
-    const tokens = tokenize(text, 32)
-    if (tokens.length < 3) continue
-    const hits = await deps.store.fulltext({ query: text, tokens, limit: 5, kind: 'memory' })
-    const candidates = new Map(hits.map(hit => [hit.entityId, { hit, vector: false }]))
-    if (deps.embedder !== undefined) {
-      try {
-        const vectors = await deps.embedder.embed([text])
-        const embedding = vectors[0]
-        if (embedding !== undefined) {
-          const vectorHits = await deps.store.vector({ embedding, kind: 'memory', limit: 5 })
-          for (const hit of vectorHits) {
-            if (hit.rawScore < 0.9) continue
-            candidates.set(hit.entityId, { hit, vector: true })
-          }
-        }
-      } catch (error) {
-        deps.logger?.warn('dedupe 向量近邻失败，退回全文/属性判断', error)
-      }
-    }
-    for (const { hit, vector } of candidates.values()) {
-      if (hit.entityId === item.id) continue
-      const other = await deps.store.get(hit.entityId)
-      if (other === undefined || other.archivedAt !== undefined) continue
-      const otherText = combinedText(other)
-      const textSimilar = jaccard(tokens, tokenize(otherText, 32)) >= 0.82
-      if (!textSimilar && !vector && !attributeOverlap(entity, other)) continue
-      if (numbersOf(text).join(',') !== numbersOf(otherText).join(',')) continue
-      const canonical = entity.createdAt <= other.createdAt ? entity : other
-      const duplicate = canonical.id === entity.id ? other : entity
-      const mergedAttrs = { ...optionalAttrs(duplicate), ...optionalAttrs(canonical) }
-      const patched = await deps.updateService.update({
-        id: canonical.id,
-        expectedRevision: canonical.revision,
-        attrs: mergedAttrs,
-        origin: 'job',
-      }, { actor: JOB_DEDUPE, source: JOB_DEDUPE })
-      if (!patched.ok) continue
-      await deps.store.link({ fromId: duplicate.id, toId: canonical.id, relation: 'merged_into', source: 'job', origin: 'job' })
-      await deps.store.link({ fromId: canonical.id, toId: duplicate.id, relation: 'merged_from', source: 'job', origin: 'job' })
-      // 合并归档同样带 CAS：候选在读取后被用户改过时不能把新状态归档。
-      try {
-        await deps.store.archive(duplicate.id, 'merged', JOB_DEDUPE, duplicate.revision)
-      } catch (error) {
-        if (!(error instanceof OmbFailure) || (error.error.code !== 'conflict' && error.error.code !== 'archived')) throw error
-        deps.logger?.warn(`合并归档因并发修改被跳过：${duplicate.id}`, error)
-        continue
-      }
-      merged += 1
-      break
-    }
+    if (await dedupeEntity(deps, entity, item.snippet)) merged += 1
   }
   return { merged }
+}
+
+/** 事件驱动的定向去重：只处理刚写入/更新的实体。 */
+export async function handleDedupeFor(deps: ConsolidationDeps, entityId: string): Promise<{ merged: number }> {
+  const entity = await deps.store.get(entityId)
+  if (entity === undefined) return { merged: 0 }
+  return { merged: await dedupeEntity(deps, entity) ? 1 : 0 }
 }
 
 function conflictingAttributes(left: Entity, right: Entity): boolean {
@@ -521,6 +570,33 @@ function conflictingAttributes(left: Entity, right: Entity): boolean {
   return false
 }
 
+/** 单实体冲突检测（事件驱动入口）：只和该实体的全文近邻比较，不扫最近 30 条。 */
+async function conflictForEntity(deps: ConsolidationDeps, entity: Entity): Promise<number> {
+  if (entity.kind !== 'memory') return 0
+  const title = attributeValue(entity, 'title')
+  const text = typeof title === 'string' && title.trim().length > 0 ? title : combinedText(entity)
+  if (text.trim().length === 0) return 0
+  const hits = await deps.store.fulltext({ query: text, tokens: tokenize(text, 32), limit: 5, kind: 'memory', category: 'fact' })
+  let linked = 0
+  for (const hit of hits) {
+    if (hit.entityId === entity.id) continue
+    if (await deps.queries.conflictSuppressed(entity.id, hit.entityId)) continue
+    const other = await deps.store.get(hit.entityId)
+    if (other === undefined) continue
+    if (!conflictingAttributes(entity, other)) continue
+    const result = await deps.store.link({
+      fromId: entity.id,
+      toId: other.id,
+      relation: 'possible_conflict',
+      directed: false,
+      source: 'job',
+      origin: 'job',
+    })
+    if (result.created) linked += 1
+  }
+  return linked
+}
+
 export async function handleConflict(deps: ConsolidationDeps, limit = 30): Promise<{ linked: number }> {
   const recent = await deps.queries.recent(limit)
   const facts = recent.filter(item => item.kind === 'memory')
@@ -528,43 +604,56 @@ export async function handleConflict(deps: ConsolidationDeps, limit = 30): Promi
   for (const item of facts) {
     const entity = await deps.store.get(item.id)
     if (entity === undefined) continue
-    const title = attributeValue(entity, 'title')
-    const text = typeof title === 'string' && title.trim().length > 0 ? title : combinedText(entity, item.snippet)
-    const hits = await deps.store.fulltext({ query: text, tokens: tokenize(text, 32), limit: 5, kind: 'memory', category: 'fact' })
-    for (const hit of hits) {
-      if (hit.entityId === item.id) continue
-      if (await deps.queries.conflictSuppressed(item.id, hit.entityId)) continue
-      const other = await deps.store.get(hit.entityId)
-      if (other === undefined) continue
-      if (!conflictingAttributes(entity, other)) continue
-      const result = await deps.store.link({
-        fromId: item.id,
-        toId: other.id,
-        relation: 'possible_conflict',
-        directed: false,
-        source: 'job',
-        origin: 'job',
-      })
-      if (result.created) linked += 1
-    }
+    linked += await conflictForEntity(deps, entity)
   }
   return { linked }
 }
 
-function clueEvidence(entity: Entity): { sessions: Set<string>; confirmed: boolean; verified: boolean } {
-  const evidence = attributeValue(entity, 'evidence')
-  const sessions = new Set<string>()
-  if (Array.isArray(evidence)) {
-    for (const item of evidence) {
-      if (typeof item === 'string' && item.startsWith('session:')) sessions.add(item.slice('session:'.length))
-      else if (isPlainObject(item) && typeof item['sessionId'] === 'string') sessions.add(item['sessionId'])
-    }
-  }
-  return {
-    sessions,
-    confirmed: attributeValue(entity, 'userConfirmed') === true || attributeValue(entity, 'assertedBy') === 'user',
-    verified: attributeValue(entity, 'verified') === true,
-  }
+/** 事件驱动的定向冲突检测。 */
+export async function handleConflictFor(deps: ConsolidationDeps, entityId: string): Promise<{ linked: number }> {
+  const entity = await deps.store.get(entityId)
+  if (entity === undefined) return { linked: 0 }
+  return { linked: await conflictForEntity(deps, entity) }
+}
+
+/**
+ * 线索晋升的单实体判定（事件驱动入口）。
+ *
+ * 证据只来自 `omb.evidence`：
+ * - 先检查线索自己的动态引用是否已腐化（避免把已失效引用固化为事实）；
+ * - 只统计当前 `contentHash` 上的证据（内容改过之后旧证据不再为新内容背书）；
+ * - 独立来源按 `subjectKey` 去重：两个 session 引用同一文件只算一份；
+ * - 晋升本身写一条 system verification 证据（verified），让审计能回答“为什么转成事实”；
+ * - 旧 `evidence: ['session:a','session:b']` 属性不再作为晋升依据（没有系统写入者）。
+ */
+async function promoteClueEntity(deps: ConsolidationDeps, entity: Entity): Promise<boolean> {
+  if (entity.kind !== 'memory' || entity.archivedAt !== undefined) return false
+  if (attributeValue(entity, 'category') !== 'clue') return false
+  await handleReferenceRotForSource(deps, entity.id)
+  const read = await deps.queries.evidenceFor(entity.id)
+  const records: readonly EvidenceRecord[] = read.contentHash === undefined
+    ? read.evidence
+    : read.evidence.filter(record => record.contentHash === read.contentHash)
+  const summary = summarizeEvidence(records)
+  if (!shouldPromoteClue(summary)) return false
+  const now = deps.clock.iso()
+  const detail = summary.verified
+    ? `verified by system evidence (${summary.sources.join(', ') || 'none'})`
+    : summary.userConfirmed
+      ? `user-confirmed evidence (${summary.sources.join(', ') || 'none'})`
+      : `independent sources=${summary.independent} (${summary.sources.join(', ') || 'none'})`
+  const result = await deps.updateService.update({
+    id: entity.id,
+    expectedRevision: entity.revision,
+    category: 'fact',
+    attrs: { promotedFrom: 'clue', promotedAt: now },
+    origin: 'job',
+  }, {
+    actor: JOB_CLUE_PROMOTE,
+    source: JOB_CLUE_PROMOTE,
+    evidence: [verificationEvidence({ entityId: entity.id, now, verified: true, detail })],
+  })
+  return result.ok
 }
 
 export async function handleCluePromote(deps: ConsolidationDeps, limit = 30): Promise<{ promoted: number }> {
@@ -576,18 +665,16 @@ export async function handleCluePromote(deps: ConsolidationDeps, limit = 30): Pr
   for (const item of clues) {
     const entity = await deps.store.get(item.id)
     if (entity === undefined) continue
-    const evidence = clueEvidence(entity)
-    if (!evidence.confirmed && !evidence.verified && evidence.sessions.size < 2) continue
-    const result = await deps.updateService.update({
-      id: entity.id,
-      expectedRevision: entity.revision,
-      category: 'fact',
-      attrs: { promotedFrom: 'clue', promotedAt: deps.clock.iso() },
-      origin: 'job',
-    }, { actor: JOB_CLUE_PROMOTE, source: JOB_CLUE_PROMOTE })
-    if (result.ok) promoted += 1
+    if (await promoteClueEntity(deps, entity)) promoted += 1
   }
   return { promoted }
+}
+
+/** 事件驱动的定向线索晋升：只处理刚写入/更新的一条线索。 */
+export async function handleCluePromoteFor(deps: ConsolidationDeps, entityId: string): Promise<{ promoted: number }> {
+  const entity = await deps.store.get(entityId)
+  if (entity === undefined) return { promoted: 0 }
+  return { promoted: await promoteClueEntity(deps, entity) ? 1 : 0 }
 }
 
 export async function handleLinkSuggest(deps: ConsolidationDeps, limit = 50): Promise<{ linked: number; grouped: number }> {
@@ -881,8 +968,10 @@ export async function handleAttrAlias(deps: ConsolidationDeps, limit = 10): Prom
   return { renamed }
 }
 
-export async function handleReferenceRot(deps: ConsolidationDeps, limit = 50): Promise<{ marked: number }> {
-  const broken = await deps.queries.brokenReferences(limit)
+async function markBrokenReferences(
+  deps: ConsolidationDeps,
+  broken: readonly { sourceId: string; sourceAttr: string; sourceOrdinal: number; targetId: string; targetAttr: string }[],
+): Promise<number> {
   const now = deps.clock.iso()
   let marked = 0
   for (const reference of broken) {
@@ -896,5 +985,20 @@ export async function handleReferenceRot(deps: ConsolidationDeps, limit = 50): P
     )
     marked += 1
   }
-  return { marked }
+  return marked
 }
+
+export async function handleReferenceRot(deps: ConsolidationDeps, limit = 50): Promise<{ marked: number }> {
+  return { marked: await markBrokenReferences(deps, await deps.queries.brokenReferences(limit)) }
+}
+
+/** 事件驱动：实体被 patch/属性改名后，只检查指向它的引用。 */
+export async function handleReferenceRotForTarget(deps: ConsolidationDeps, entityId: string): Promise<{ marked: number }> {
+  return { marked: await markBrokenReferences(deps, await deps.queries.brokenReferencesForTarget(entityId, 50)) }
+}
+
+/** 事件驱动：线索晋升前，只检查它自己作为源头的引用。 */
+export async function handleReferenceRotForSource(deps: ConsolidationDeps, entityId: string): Promise<{ marked: number }> {
+  return { marked: await markBrokenReferences(deps, await deps.queries.brokenReferencesForSource(entityId, 50)) }
+}
+

@@ -11,6 +11,7 @@ import type { PostgresStore } from '../../packages/v7/src/adapters/postgres/stor
 import type { OnnxEmbedder } from '../../packages/v7/src/adapters/embedding/index.js'
 import type { JobQueue, Logger } from '../../packages/v7/src/ports/jobs.js'
 import type { JsonValue } from '../../packages/v7/src/domain/json.js'
+import { attributeValue } from '../../packages/v7/src/domain/entity-access.js'
 import type { Reaction } from '../../packages/v7/src/app/outbox/index.js'
 import { dependencyRefreshKey } from '../../packages/v7/src/app/dependency.js'
 import { asRecord } from '../../packages/v7/src/adapters/dsh/host.js'
@@ -42,6 +43,27 @@ export const REFRESH_REACTION_TOPICS: readonly string[] = [
 export const LINK_REACTION_TOPICS: readonly string[] = ['LinkCreated', 'LinkUnlinked']
 
 /**
+ * 巩固任务的事件触发（事件驱动为主）：
+ * - `EntityCreated`/`EntityPatched` 的 memory → 定向 dedupe/conflict；线索 → 定向 clue-promote；
+ * - `EntityPatched`（任意 kind）→ 定向 reference-rot（只看指向该实体的引用）；
+ * - `AttributeRenamed` → 对受影响实体逐个定向 reference-rot（见下方独立 reaction）。
+ *
+ * 这些任务在周期 timer 里仍保留低频兜底（漏事件/首次启动），但正常路径由本 reaction 即时
+ * 入队：不会等下一格轮询，也不会为一条新记忆扫描整库。
+ */
+export const CONSOLIDATION_REACTION_TOPICS: readonly string[] = ['EntityCreated', 'EntityPatched']
+
+/** 属性改名影响引用目标列名：受影响实体必须立即做定向引用腐化检查。 */
+export const ATTRIBUTE_RENAME_REACTION_TOPICS: readonly string[] = ['AttributeRenamed']
+
+/**
+ * 内容相同、证据新增（第二层内容幂等命中）→ 立即重新评估线索晋升。
+ * 证据变化不 bump 实体 revision，因此不会触发 EntityPatched 的 dedupe/conflict；
+ * 只有 clue-promote 关心“同一内容又出现了一个来源”。
+ */
+export const EVIDENCE_REACTION_TOPICS: readonly string[] = ['EvidenceAdded']
+
+/**
  * 合法但不需要 outbox 再做一次下游动作的 topic。
  *
  * - `EntityArchived`/`EntityUnarchived`：归档列、`entity_view` 同步与看板投影任务都在
@@ -52,12 +74,11 @@ export const LINK_REACTION_TOPICS: readonly string[] = ['LinkCreated', 'LinkUnli
  *
  * 这些 topic 由 `createAckReaction` 明确 ack 并计数，而不是交给 unknownTopic 策略进死信：
  * “写事务已经处理”与“没人注册消费者”是两种不同状态，status 里必须能区分。
- * 如果哪天写事务不再产生某个副作用，应由测试发现，而不是让事件永远躺在死信里。
+ * `AttributeRenamed` 已由定向 reference-rot reaction 消费，不再只是 ack。
  */
 export const WRITE_SIDE_EFFECT_TOPICS: readonly string[] = [
   'EntityArchived',
   'EntityUnarchived',
-  'AttributeRenamed',
 ]
 
 /** ack 的进程内计数；`omb_status` 用它证明合法 topic 被明确处理而不是 dead。 */
@@ -220,6 +241,120 @@ export function createLinkSuggestReaction(deps: { readonly queue: JobQueue }): R
         'omb.link-suggest',
         { trigger: 'outbox-link', topic: event.topic, linkId, eventId: event.eventId },
         { singletonKey: 'link-suggest:event', retryLimit: 3 },
+      )
+    },
+  }
+}
+
+/** 从 payload 读 `payload.entityIds`（AttributeRenamed 事件）；缺了就是损坏事件。 */
+function entityIdsFromOutboxPayload(payload: JsonValue): string[] | undefined {
+  const event = asRecord(payload)
+  const data = asRecord(event?.['payload'])
+  const value = data?.['entityIds']
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0)
+}
+
+/**
+ * EntityCreated / EntityPatched → 定向巩固任务（事件驱动为主）。
+ *
+ * 只做“把这件事告诉对应的定向 handler”，不在这里做近邻计算：
+ * - memory → `omb.dedupe` / `omb.conflict`（singletonKey 按实体，避免事件风暴放大）；
+ * - clue → 追加 `omb.clue-promote`；
+ * - 任意 EntityPatched → `omb.reference-rot`（targetEntityId = 被改实体）。
+ *
+ * 载荷缺 entityId 时抛错让 relay 退避/死信（status 可见），不静默丢弃。
+ * 周期 timer 仍有低频兜底；本 reaction 让正常路径不等下一格。
+ */
+export function createConsolidationReaction(deps: {
+  readonly store: PostgresStore
+  readonly queue: JobQueue
+  readonly logger: Logger
+}): Reaction {
+  return {
+    name: 'enqueue-consolidation',
+    async run(event): Promise<void> {
+      const entityId = entityIdFromOutboxPayload(event.payload)
+      if (entityId === undefined) {
+        throw new Error(`outbox ${event.topic} 事件缺少 entityId（event_id=${event.eventId}）`)
+      }
+      const entity = await deps.store.get(entityId, { includeArchived: true })
+      // 已归档实体不再需要收敛/晋升；写入事务已处理看板，这里直接返回。
+      if (entity === undefined || entity.archivedAt !== undefined) return
+      if (entity.kind === 'memory') {
+        await deps.queue.enqueue(
+          'omb.dedupe',
+          { trigger: 'entity-event', topic: event.topic, entityId, eventId: event.eventId },
+          { singletonKey: `dedupe:${entityId}`, retryLimit: 3 },
+        )
+        await deps.queue.enqueue(
+          'omb.conflict',
+          { trigger: 'entity-event', topic: event.topic, entityId, eventId: event.eventId },
+          { singletonKey: `conflict:${entityId}`, retryLimit: 3 },
+        )
+        if (attributeValue(entity, 'category') === 'clue') {
+          await deps.queue.enqueue(
+            'omb.clue-promote',
+            { trigger: 'entity-event', topic: event.topic, entityId, eventId: event.eventId },
+            { singletonKey: `clue-promote:${entityId}`, retryLimit: 3 },
+          )
+        }
+      }
+      // 只有 patch 可能删除/改名属性，从而让指向本实体的引用腐化。
+      if (event.topic === 'EntityPatched') {
+        await deps.queue.enqueue(
+          'omb.reference-rot',
+          { trigger: 'entity-event', topic: event.topic, entityId, targetEntityId: entityId, eventId: event.eventId },
+          { singletonKey: `reference-rot:${entityId}`, retryLimit: 3 },
+        )
+      }
+    },
+  }
+}
+
+/**
+ * AttributeRenamed → 对每个受影响实体定向检查引用腐化。
+ *
+ * 改名在同一事务里更新了属性行/引用/视图；但引用行的 `target_attr_name` 可能还指向旧名，
+ * 这是唯一能在改名前就存在的腐化来源。逐个实体入队，singletonKey 按实体合并事件风暴。
+ */
+export function createAttributeRenameReaction(deps: { readonly queue: JobQueue }): Reaction {
+  return {
+    name: 'enqueue-reference-rot-on-rename',
+    async run(event): Promise<void> {
+      const entityIds = entityIdsFromOutboxPayload(event.payload)
+      if (entityIds === undefined || entityIds.length === 0) {
+        throw new Error(`outbox ${event.topic} 事件缺少 entityIds（event_id=${event.eventId}）`)
+      }
+      for (const entityId of entityIds) {
+        await deps.queue.enqueue(
+          'omb.reference-rot',
+          { trigger: 'attribute-renamed', topic: event.topic, entityId, targetEntityId: entityId, eventId: event.eventId },
+          { singletonKey: `reference-rot:${entityId}`, retryLimit: 3 },
+        )
+      }
+    },
+  }
+}
+
+/**
+ * EvidenceAdded → 定向重评估线索晋升。
+ *
+ * 内容去重命中时实体 revision 不变（写事务只追加 evidence + 一条 EvidenceAdded 事件）；
+ * 这里按 singletonKey 合并同一实体的证据风暴，让晋升在下一轮后台立即发生，不等 2h 兜底。
+ */
+export function createEvidenceAddedReaction(deps: { readonly queue: JobQueue }): Reaction {
+  return {
+    name: 'enqueue-clue-promote-on-evidence',
+    async run(event): Promise<void> {
+      const entityId = entityIdFromOutboxPayload(event.payload)
+      if (entityId === undefined) {
+        throw new Error(`outbox ${event.topic} 事件缺少 entityId（event_id=${event.eventId}）`)
+      }
+      await deps.queue.enqueue(
+        'omb.clue-promote',
+        { trigger: 'evidence-event', topic: event.topic, entityId, eventId: event.eventId },
+        { singletonKey: `clue-promote:${entityId}`, retryLimit: 3 },
       )
     },
   }

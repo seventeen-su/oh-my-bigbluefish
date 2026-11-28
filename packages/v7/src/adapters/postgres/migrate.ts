@@ -159,6 +159,7 @@ export async function truncateAll(connectionString: string): Promise<void> {
         omb.embedding,
         omb.attribute,
         omb.entity_view,
+        omb.evidence,
         omb.entity,
         omb.attr_registry,
         omb.artifact,

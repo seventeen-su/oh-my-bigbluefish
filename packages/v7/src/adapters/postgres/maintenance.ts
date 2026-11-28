@@ -1,10 +1,12 @@
 import type { Category, EntityKind, StateStatus } from '../../domain/entity.js'
+import { isEvidenceSourceType, isEvidenceVerificationStatus, type EvidenceRecord } from '../../domain/evidence.js'
 import type { JsonValue } from '../../domain/json.js'
 import { systemCommandMeta } from '../../app/commands/index.js'
 import type {
   AttrAliasCandidate,
   BrokenReference,
   CoRecallPair,
+  EntityEvidence,
   Forgettable,
   MaintenanceQueries,
   RecentEntity,
@@ -208,6 +210,21 @@ export class PostgresMaintenance implements MaintenanceQueries {
   }
 
   async brokenReferences(limit: number): Promise<BrokenReference[]> {
+    return this.brokenReferencesWhere('', [], limit)
+  }
+
+  /** 定向：只查指向该实体属性的引用（EntityPatched / AttributeRenamed 事件用）。 */
+  async brokenReferencesForTarget(entityId: string, limit: number): Promise<BrokenReference[]> {
+    return this.brokenReferencesWhere('and r.target_entity_id = $2', [entityId], limit)
+  }
+
+  /** 定向：只查该实体自己作为源头的引用（线索晋升前检查）。 */
+  async brokenReferencesForSource(entityId: string, limit: number): Promise<BrokenReference[]> {
+    return this.brokenReferencesWhere('and r.source_entity_id = $2', [entityId], limit)
+  }
+
+  private async brokenReferencesWhere(extra: string, extraParams: readonly string[], limit: number): Promise<BrokenReference[]> {
+    const params: unknown[] = [Math.max(1, Math.min(500, limit)), ...extraParams]
     const rows = await this.db.query<{
       source_entity_id: string
       source_attr_name: string
@@ -216,6 +233,7 @@ export class PostgresMaintenance implements MaintenanceQueries {
       target_attr_name: string
       kind: string
     }>(
+      // check:ignore-next-line sec-sql-concat -- extra 是内部常量片段（''/target/source 三种），不是外部输入
       `select r.source_entity_id, r.source_attr_name, r.source_ordinal,
               r.target_entity_id, r.target_attr_name, r.kind
        from omb.reference r
@@ -223,9 +241,9 @@ export class PostgresMaintenance implements MaintenanceQueries {
        where r.target_attr_name <> '' and not exists (
                select 1 from omb.attribute a
                where a.entity_id = r.target_entity_id and a.name = r.target_attr_name
-             )
+             ) ${extra}
        limit $1`,
-      [Math.max(1, Math.min(500, limit))],
+      params,
     )
     return rows.rows.map(row => ({
       sourceId: row.source_entity_id,
@@ -242,6 +260,56 @@ export class PostgresMaintenance implements MaintenanceQueries {
     // check:ignore-next-line sec-sql-concat -- 值走 $1；模板只拼 pair_key 参数值，不是 SQL 片段
     const rows = await this.db.query('select 1 from omb.conflict_suppression where pair_key = $1', [`${left}|${right}`])
     return rows.rowCount !== 0
+  }
+
+  async evidenceFor(entityId: string): Promise<EntityEvidence> {
+    const entity = await this.db.query<{ content_key: string | null }>(
+      'select content_key from omb.entity where id = $1',
+      [entityId],
+    )
+    const records = await this.db.query<{
+      id: string
+      entity_id: string
+      source_type: string
+      source_id: string
+      observed_at: Date | string
+      content_hash: string
+      confidence: number
+      verification_status: string
+      subject_key: string
+      detail: string | null
+      created_at: Date | string
+    }>(
+      `select id, entity_id, source_type, source_id, observed_at, content_hash,
+              confidence, verification_status, subject_key, detail, created_at
+       from omb.evidence
+       where entity_id = $1
+       order by observed_at asc, id asc
+       limit 200`,
+      [entityId],
+    )
+    const evidence: EvidenceRecord[] = []
+    for (const row of records.rows) {
+      if (!isEvidenceSourceType(row.source_type) || !isEvidenceVerificationStatus(row.verification_status)) continue
+      evidence.push({
+        id: row.id,
+        entityId: row.entity_id,
+        sourceType: row.source_type,
+        sourceId: row.source_id,
+        observedAt: iso(row.observed_at) as string,
+        contentHash: row.content_hash,
+        confidence: row.confidence,
+        verificationStatus: row.verification_status,
+        subjectKey: row.subject_key,
+        ...(row.detail !== null && row.detail.length > 0 ? { detail: row.detail } : {}),
+        createdAt: iso(row.created_at) as string,
+      })
+    }
+    const contentHash = entity.rows[0]?.content_key ?? undefined
+    return {
+      ...(contentHash !== null && contentHash !== undefined ? { contentHash } : {}),
+      evidence,
+    }
   }
 
   /**

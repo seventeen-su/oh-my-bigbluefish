@@ -5,7 +5,7 @@ import type { JobQueue, Logger } from '../ports/jobs.js'
 import type { Store } from '../ports/store.js'
 
 /** 一次嵌入刷新/重建的结果；`unavailable` 表示嵌入器不可用或文本为空，不是失败。 */
-export type EmbeddingStatus = 'done' | 'queued' | 'unavailable' | 'failed'
+export type EmbeddingStatus = 'done' | 'queued' | 'unavailable' | 'failed' | 'reused'
 
 export interface EmbeddingDeps {
   readonly store: Store

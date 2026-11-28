@@ -204,6 +204,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     updateService,
     recallService,
     store,
+    clock,
     status,
     resolveContext: identities.resolveContext,
   })
@@ -229,6 +230,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     logger,
     config,
     store,
+    ...(config.jobs ? { queue } : {}),
     engine,
     promptSink,
     checkpointSink,

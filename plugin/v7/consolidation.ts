@@ -259,6 +259,7 @@ export function createConsolidationRuntime(deps: ConsolidationRuntimeDeps): Cons
       return [
         'consolidation=ok',
         `consolidationJobs=${selected.map(schedule => schedule.job).join(',') || 'none'}`,
+        `consolidationModes=${selected.map(schedule => `${schedule.job}:${schedule.mode}`).join(',') || 'none'}`,
         `consolidationPending=${snapshot.pending} consolidationClaimed=${snapshot.claimed} consolidationDone=${snapshot.done} consolidationDead=${snapshot.dead}`,
         `consolidationDueAgeMs=${snapshot.dueAgeMs} consolidationNextDueMs=${nextDueMs} consolidationQueued=${queuedAfter?.total ?? 'unknown'}`,
       ]

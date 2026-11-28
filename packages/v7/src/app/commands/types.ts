@@ -5,7 +5,8 @@ import type {
   WriteEntityInput,
 } from '../../domain/entity.js'
 import type { OmbError } from '../../domain/errors.js'
-import type { JsonValue } from '../../domain/json.js'
+import type { EvidenceInput } from '../../domain/evidence.js'
+import { isPlainObject, type JsonValue } from '../../domain/json.js'
 import type { Link, LinkInput } from '../../domain/link.js'
 import type { NormalizedWrite } from '../../domain/validation.js'
 
@@ -37,6 +38,11 @@ export interface CommandMeta {
   readonly expectedRevision?: number
   /** 命令截止时间（epoch ms）。 */
   readonly deadline?: number
+  /**
+   * 本次写入附带的证据：写事务内落 `omb.evidence`；内容去重复用原实体时并入原实体证据集。
+   * contentHash 由 writer 按内容指纹补齐，调用方只给来源/主题。
+   */
+  readonly evidence?: readonly EvidenceInput[]
 }
 
 export type DomainEventType =
@@ -47,6 +53,8 @@ export type DomainEventType =
   | 'LinkCreated'
   | 'LinkUnlinked'
   | 'AttributeRenamed'
+  /** 内容去重复用原实体时，新证据并入证据集（实体本身未变，revision 不 bump）。 */
+  | 'EvidenceAdded'
 
 /** 域事件；`id` 就是 audit_log.id（event_id 稳定，重放不会变）。 */
 export interface DomainEvent {
@@ -123,6 +131,12 @@ export interface CommandOutcome {
   readonly link?: Link
   readonly linkCreated?: boolean
   readonly entityIds?: readonly string[]
+  /**
+   * 写事务没有产生新事件时的复用标记：
+   * - `content`：同 scope/category/关键属性/时间的内容已存在，证据并入原实体；
+   * - `command`：同一 commandId 已执行过，返回首次结果（Store 层补标记）。
+   */
+  readonly deduped?: 'content' | 'command'
 }
 
 /** AttributeWriter 的端口：唯一能写业务表的事务入口。 */
@@ -145,13 +159,32 @@ export function duplicateCommandFailure(commandId: string): OmbError {
   }
 }
 
-/** 旧写入路径（Store.write/patch/...）没有 commandId，按 actor 合成一个一次性幂等键。 */
-export function systemCommandMeta(actor: string, origin?: string): CommandMeta {
+/** 从重复命令信号里取回 commandId；不是该信号时返回 undefined。 */
+export function duplicateCommandIdOf(error: unknown): string | undefined {
+  if (error === undefined || error === null) return undefined
+  const errorRecord = error as { readonly error?: unknown }
+  const candidate = errorRecord.error ?? error
+  const details = (candidate as { readonly details?: unknown }).details
+  if (!isPlainObject(details) || details['duplicateCommand'] !== true) return undefined
+  const commandId = details['commandId']
+  return typeof commandId === 'string' && commandId.length > 0 ? commandId : undefined
+}
+
+export interface SystemCommandOptions {
+  /** 稳定幂等键（工具调用/重试复用）；缺省合成一次性 UUID，保持旧写入语义。 */
+  readonly commandId?: string
+  readonly correlationId?: string
+  readonly evidence?: readonly EvidenceInput[]
+}
+
+/** 旧写入路径（Store.write/patch/...）的 command meta：有稳定键时用它，否则合成一次性键。 */
+export function systemCommandMeta(actor: string, origin?: string, options: SystemCommandOptions = {}): CommandMeta {
   return {
-    commandId: crypto.randomUUID(),
+    commandId: options.commandId ?? crypto.randomUUID(),
     actor: { id: actor, kind: actorKindOf(actor) },
     origin: origin ?? actor,
-    correlationId: crypto.randomUUID(),
+    correlationId: options.correlationId ?? crypto.randomUUID(),
+    ...(options.evidence !== undefined && options.evidence.length > 0 ? { evidence: options.evidence } : {}),
   }
 }
 

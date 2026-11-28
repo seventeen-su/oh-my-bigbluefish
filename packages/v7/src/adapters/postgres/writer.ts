@@ -29,6 +29,7 @@ import {
 import { boardProjectionsFor, boardProjectionsForRename, PostgresProjectionTaskStore } from './projection.js'
 import { autoArchivedAt, buildViewValues, mapEntity, type EntityRow } from './rows.js'
 import { insertAudit, insertEvent, nextStreamVersion } from './writer-audit.js'
+import { contentHashOf, insertEvidence } from './writer-evidence.js'
 import { createLinkCommand, unlinkCommand } from './writer-links.js'
 import { rollbackAudit } from './writer-rollback.js'
 import {
@@ -207,10 +208,22 @@ export class AttributeWriter implements CommandWriter {
       const payload = isPlainObject(row.payload) ? row.payload as Record<string, JsonValue> : undefined
       const entityId = payload === undefined ? row.stream_id ?? '' : payloadEntityId(payload, row.stream_id ?? '')
       const events: DomainEvent[] = payload === undefined ? [] : [payload as unknown as DomainEvent]
+      // 写路径的重复命令需要返回首次实体（工具重试不能只拿 revision 而丢实体）。
+      // 实体 id 优先取 payload.entityId：EvidenceAdded 的 streamId 是 `evidence:<id>`。
+      let entity: CommandOutcome['entity']
+      if (entityId.length > 0) {
+        const entityRow = await this.db.query<EntityRow>('select * from omb.entity where id = $1', [entityId])
+        const current = entityRow.rows[0]
+        if (current !== undefined) {
+          const attributes = await selectAttributes(asAttributeQuery(this.db as unknown as PoolClient), entityId)
+          entity = mapEntity(current, attributes)
+        }
+      }
       return {
         events,
         revision,
         projectionToken: { entityId, revision, watermark: row.id },
+        ...(entity !== undefined ? { entity } : {}),
       }
     } catch (error) {
       throw mapPgError(error)
@@ -238,19 +251,77 @@ export class AttributeWriter implements CommandWriter {
 
   private async createEntity(client: PoolClient, input: NormalizedWrite, meta: CommandMeta): Promise<CommandOutcome> {
     const now = nowIso()
+    // 内容级幂等（第二层）：同 scope/category/关键属性/时间的内容复用原实体，新证据并入证据集。
+    // 并发同内容写入用事务级 advisory lock 串行化（只有 memory 参与；归档行不参与，遗忘后可重写）。
+    const contentHash = contentHashOf(input)
+    if (contentHash !== null) {
+      await client.query('select pg_advisory_xact_lock(hashtext($1))', [`omb:content:${contentHash}`])
+      const existing = await client.query<EntityRow>(
+        `select * from omb.entity
+          where content_key = $1 and kind = $2 and archived_at is null and is_current
+          order by created_at asc
+          limit 1`,
+        [contentHash, input.kind],
+      )
+      const row = existing.rows[0]
+      if (row !== undefined) {
+        await insertEvidence(client, row.id, meta.evidence, contentHash)
+        const attributes = await selectAttributes(asAttributeQuery(client), row.id)
+        const revision = Number(row.revision)
+        // 没有新证据（系统写回同内容）时不产生事件：只有“证据集真的可能变化”才通知反应器。
+        if (meta.evidence === undefined || meta.evidence.length === 0) {
+          return {
+            events: [],
+            revision,
+            projectionToken: { entityId: row.id, revision, watermark: '' },
+            entity: mapEntity(row, attributes),
+            deduped: 'content',
+          }
+        }
+        // 证据并入也需要可审计、可触发的事件：实体 revision/stream version 不变
+        // （实体后续 patch 还要用它的版本号），证据事件单独走 `evidence:<id>` 流。
+        const streamId = `evidence:${row.id}`
+        const streamVersion = await nextStreamVersion(client, streamId)
+        const payload: Record<string, JsonValue> = {
+          entityId: row.id,
+          entityKind: row.kind,
+          revision,
+          evidence: meta.evidence?.length ?? 0,
+          contentHash,
+        }
+        const event = await insertEvent(client, {
+          meta,
+          action: 'evidence',
+          eventType: 'EvidenceAdded',
+          streamId,
+          streamVersion,
+          targetIds: [row.id],
+          payload,
+          after: toJson({ evidence: meta.evidence?.length ?? 0, deduped: 'content' }),
+        })
+        return {
+          events: [event],
+          revision,
+          projectionToken: projectionToken(row.id, revision, event),
+          entity: mapEntity(row, attributes),
+          deduped: 'content',
+        }
+      }
+    }
     // attribute 有 entity 外键，entity 必须先插入；归档时间只由属性行里的 status 决定。
     const archivedAt = autoArchivedAt(input.kind, input.attributes, now)
     const archived = archivedAt !== null
     const entityResult = await client.query<EntityRow>(
       `insert into omb.entity (
-         id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason, is_current
-       ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true)
+         id, kind, revision, origin, confidence, pinned, salience, archived_at, archive_reason, is_current, content_key
+       ) values ($1,$2,1,$3,$4,$5,0.5,$6,$7,true,$8)
        returning *`,
-      [input.id, input.kind, meta.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null],
+      [input.id, input.kind, meta.origin, input.confidence ?? null, input.pinned, archivedAt, archived ? 'auto-status' : null, contentHash],
     )
     const entityRow = entityResult.rows[0]
     if (entityRow === undefined) throw new OmbFailure(internal('实体写入没有返回行'))
     await insertAttributes(client, input.id, input.attributes)
+    await insertEvidence(client, input.id, meta.evidence, contentHash)
     await upsertRegistry(client, input.attributes)
     // trigger_key/reference/entity_view 都从同一事务内读回的属性行派生（唯一真源）。
     const persisted = await selectAttributes(asAttributeQuery(client), input.id)
@@ -295,6 +366,7 @@ export class AttributeWriter implements CommandWriter {
     meta: CommandMeta,
   ): Promise<CommandOutcome> {
     const now = nowIso()
+    const contentHash = contentHashOf(input)
     const currentResult = await client.query<EntityRow>('select * from omb.entity where id = $1 for update', [input.id])
     const current = currentResult.rows[0]
     if (current === undefined) throw new OmbFailure(notFound(`实体不存在：${input.id}`))
@@ -358,8 +430,9 @@ export class AttributeWriter implements CommandWriter {
            archived_at = $4,
            archive_reason = $5,
            origin = $6,
+           content_key = $7,
            updated_at = now()
-       where id = $1 and revision = $7
+       where id = $1 and revision = $8
        returning *`,
       [
         input.id,
@@ -368,6 +441,7 @@ export class AttributeWriter implements CommandWriter {
         archivedAt,
         archivedAt === null ? null : 'auto-status',
         meta.origin,
+        contentHash,
         patch.expectedRevision,
       ],
     )
@@ -385,6 +459,9 @@ export class AttributeWriter implements CommandWriter {
     await upsertView(client, view)
     // 引用依赖失效：只沿 target 入边标记直接依赖并做有界级联，与本次写入同事务。
     const invalidation = await invalidateDependencies(client, input.id, 'patch')
+    // 更新也可以携带证据（如晋升时的系统验证结论）；内容哈希按更新后的属性重算，
+    // 旧内容上的证据不会被新内容冒用。
+    await insertEvidence(client, input.id, meta.evidence, contentHash)
     const revision = Number(updated.revision)
     // 写前/写后都传：之前属于看板、之后不属于时要让 projector 收到 revision 去删旧行。
     await this.enqueueProjections(client, input.id, revision, [oldEntity, mapEntity(updated, persisted)])

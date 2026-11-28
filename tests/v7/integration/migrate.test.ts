@@ -52,6 +52,7 @@ const NEW_TABLES = [
   'adoption_metric',
   'adoption_stat',
   'co_recall_pair',
+  'evidence',
   'outbox',
   'preference_board',
   'projection_task',
@@ -1213,3 +1214,4 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(archivedDigest.similar_cache).toEqual(seededDigestSecond.similar_cache)
   })
 })
+

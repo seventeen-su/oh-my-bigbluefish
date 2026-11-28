@@ -6,7 +6,7 @@ import { deriveReferences, deriveSearchText, deriveTriggers, normalizeWrite } fr
 import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
 import type { JobQueue, Logger } from '../ports/jobs.js'
-import type { Store, WriteContext } from '../ports/store.js'
+import type { Store, WriteOptions } from '../ports/store.js'
 import type { PatchResult } from '../ports/store.js'
 import { preparePatchWrite } from './commands/patch.js'
 import { embeddingBody, embeddingText, populateEmbedding, type EmbeddingStatus } from './embedding.js'
@@ -32,6 +32,9 @@ export interface UpdateServiceDeps {
   readonly invalidateEmbedding?: (entityId: string) => Promise<void>
 }
 
+/** 更新的幂等/证据与执行者参数；`commandId` 让工具重试不重复 bump revision。 */
+export type UpdateOptions = WriteOptions
+
 export class UpdateService {
   constructor(private readonly deps: UpdateServiceDeps) {}
 
@@ -39,10 +42,10 @@ export class UpdateService {
    * 更新实体。`patch.expectedRevision` 必填：调用方必须先在读路径（recall/history）
    * 拿到版本再提交；缺失时直接拒绝，不提供“默认覆盖最新版本”的兼容路径。
    *
-   * `context` 是执行者/来源（默认 model），写进审计与冲突差异；它与补丁字段分开，
-   * 避免把身份信息混进属性校验，也让自动刷新可以用 `system:refresh` 而不改实体 origin。
+   * `options` 既是幂等/证据参数，也携带 actor/source（默认 model），写进审计与冲突差异；
+   * 它与补丁字段分开，避免把身份信息混进属性校验。
    */
-  async update(patch: PatchEntityInput, context: WriteContext = {}): Promise<Result<UpdateOutput>> {
+  async update(patch: PatchEntityInput, options: UpdateOptions = {}): Promise<Result<UpdateOutput>> {
     try {
       if (patch.expectedRevision === undefined) {
         return err(invalid(
@@ -65,7 +68,9 @@ export class UpdateService {
         triggers: deriveTriggers(normalized.value.attributes),
         references: deriveReferences(normalized.value.attributes),
       }
-      const result = await this.deps.store.patch(normalized.value, patch, derived, context)
+      const result = await this.deps.store.patch(normalized.value, patch, derived, options)
+      // 重复命令返回首次结果：没有发生新写入，不能重建向量/改判失败。
+      if (result.deduped !== undefined) return ok(result)
       // 只有写入成功之后才可能失效/入队：失败路径不能留下 stale 标记或队列任务。
       const embedding = await this.refreshEmbedding(entity.kind, normalized.value.id, bodyBefore)
       return ok(embedding === undefined ? result : { ...result, embedding })
