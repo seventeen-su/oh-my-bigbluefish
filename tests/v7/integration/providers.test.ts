@@ -7,6 +7,10 @@ import type { Clock } from '../../../packages/v7/src/ports/clock.js'
 import type { Embedder } from '../../../packages/v7/src/ports/embedding.js'
 import type { Store } from '../../../packages/v7/src/ports/store.js'
 import { runStageOnePlan } from '../../../packages/v7/src/retrieval/channels.js'
+import { collectSeeds } from '../../../packages/v7/src/retrieval/expand.js'
+import { applyExpansions, fuseStageOne } from '../../../packages/v7/src/retrieval/fuse.js'
+import type { StageOneChannel } from '../../../packages/v7/src/retrieval/types.js'
+import type { ChannelHit } from '../../../packages/v7/src/ports/search.js'
 import {
   compileRetrievalPlan,
   parseRetrievalPlan,
@@ -333,5 +337,84 @@ describe('QueryCompiler + Providers（真实 PostgreSQL）', () => {
     expect(replayed.hits[0]?.fusedScore).toBeCloseTo(direct.hits[0]?.fusedScore ?? 0, 12)
     expect(replayed.channels).toEqual(direct.channels)
     expect(replayed.expansion).toEqual(direct.expansion)
+  })
+
+  it('给定 channels 只含 state_board 当引擎召回则只查看板通道，事件也只记 state_board（RET-11）', async () => {
+    const input: WriteEntityInput = {
+      kind: 'state',
+      scope: { kind: 'project', projectKey: 'D:/repo' },
+      title: 'T0 看板状态',
+      status: 'in_progress',
+      time: '2026-11-20T00:00:00.000Z',
+      attrs: { body: 'T0 状态只应走 state_board' },
+    }
+    const stateId = (await db.write(normalized(input), derived(input))).entity.id
+    const engine = new RecallEngine({ store: db, embedder: noVector, clock })
+
+    const result = await engine.recall({
+      query: '当前项目 进行中 阻塞中',
+      scenario: 'session-start',
+      scope: 'project',
+      projectKey: 'D:/repo',
+      kind: 'state',
+      status: ['in_progress', 'blocked'],
+      channels: ['state_board'],
+      limit: 5,
+      now: FIXED_NOW,
+    })
+
+    expect(result.hits.map(entry => entry.entityId)).toContain(stateId)
+    expect(result.channels.filter(report => report.status !== 'skipped').map(report => report.channel)).toEqual(['state_board'])
+    expect(result.expansion).toEqual({ seeds: 1, expanded: 0, chains: 0 })
+    const channels = await db.db.query<{ channel: string }>(
+      'select distinct channel from omb.recall_event where trace_id = $1 order by channel',
+      [result.traceId],
+    )
+    expect(channels.rows.map(row => row.channel)).toEqual(['state_board'])
+  })
+
+  it('给定查询 timeoutMs 当走真实 PostgreSQL 则事务级 statement_timeout 不改变结果', async () => {
+    const id = await writeMemory({ title: '带超时预算的检索', body: 'timeoutMs 只约束执行时间，不改变出分。' })
+    const tokens = tokenize('带超时预算的检索')
+
+    const plain = await db.fulltext({ query: '带超时预算的检索', tokens, limit: 10 })
+    const bounded = await db.fulltext({ query: '带超时预算的检索', tokens, limit: 10, timeoutMs: 1000 })
+
+    expect(bounded.map(entry => entry.entityId)).toEqual(plain.map(entry => entry.entityId))
+    expect(bounded.map(entry => entry.rawScore)).toEqual(plain.map(entry => entry.rawScore))
+    expect(bounded.map(entry => entry.entityId)).toContain(id)
+  })
+
+  it('给定真实 2 跳链接当融合则来源种子是 1 跳祖先，而不是全局最强种子（RET-05）', async () => {
+    const top = await writeMemory({ title: '全局最强种子' })
+    const deep = await writeMemory({ title: '深种子' })
+    const mid = await writeMemory({ title: '中间节点' })
+    const far = await writeMemory({ title: '两跳终点' })
+    await db.link({ fromId: deep, toId: mid, relation: 'related', directed: true, strength: 0.5 })
+    await db.link({ fromId: mid, toId: far, relation: 'related', directed: true, strength: 0.5 })
+
+    const expansions = await db.expand([top, deep], 2)
+    const farExpansion = expansions.find(expansion => expansion.entityId === far)
+    // 先证明真实 SQL 的 2 跳行：from_id 是中间节点 mid，而不是种子 deep。
+    expect(farExpansion).toMatchObject({ hop: 2, fromId: mid })
+
+    const stageOne = new Map<StageOneChannel, readonly ChannelHit[]>([['fulltext', [
+      { entityId: top, rank: 1, rawScore: 0.8, channel: 'fulltext' },
+      { entityId: deep, rank: 8, rawScore: 0.2, channel: 'fulltext' },
+    ]]])
+    const config = DEFAULT_RETRIEVAL_CONFIG
+    const candidates = fuseStageOne(stageOne, config.scenarios.manual.weights, config.rrfK)
+    const outcome = applyExpansions(
+      candidates,
+      expansions,
+      collectSeeds(stageOne, config),
+      new Map(),
+      config.scenarios.manual.weights,
+      config,
+    )
+
+    expect(outcome.unresolved).toBe(0)
+    expect(candidates.get(far)?.link?.seedId).toBe(deep)
+    expect(candidates.get(far)?.link?.hop).toBe(2)
   })
 })

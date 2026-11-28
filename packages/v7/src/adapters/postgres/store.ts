@@ -1,3 +1,4 @@
+import type { PoolClient, QueryResult, QueryResultRow } from 'pg'
 import type { Attribute, Entity, EntityKind, PatchEntityInput, StateStatus, StateVersion } from '../../domain/entity.js'
 import type { AuditAuthorization } from '../../domain/audit.js'
 import type { DependencyAttributeRef, DependencyStaleMark } from '../../domain/dependency.js'
@@ -28,6 +29,7 @@ import type {
   ArtifactRecord,
   AuditEntry,
   AuditRecord,
+  RecallChannelErrorInput,
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
@@ -182,6 +184,31 @@ export class PostgresStore implements Store {
     } catch (error) {
       throw mapPgError(error)
     }
+  }
+
+  /**
+   * 带剩余执行预算的检索查询（RET-10）：把 `timeoutMs` 变成 PostgreSQL 事务级
+   * `statement_timeout`，超时由服务端取消语句并回滚事务，连接可继续复用。
+   * 多语句查询共享同一个 `startedAtMs`，后一条只拿到剩余预算，不会重新拿满。
+   */
+  private async searchQuery<T extends QueryResultRow = QueryResultRow>(
+    spec: { readonly timeoutMs?: number },
+    text: string,
+    values: readonly unknown[],
+    startedAtMs: number,
+  ): Promise<QueryResult<T>> {
+    const budgetMs = spec.timeoutMs
+    if (budgetMs === undefined) return this.db.query<T>(text, values)
+    const remaining = Math.max(1, Math.floor(budgetMs - (Date.now() - startedAtMs)))
+    return this.db.queryWithin<T>(remaining, text, values)
+  }
+
+  /** 已有事务内设置服务端超时（fulltext/vector 需要与 `set local` 共用同一事务）。 */
+  private async applyStatementTimeout(client: PoolClient, timeoutMs: number | undefined): Promise<void> {
+    if (timeoutMs === undefined) return
+    await client.query("select set_config('statement_timeout', $1, true)", [
+      String(Math.max(1, Math.floor(timeoutMs))),
+    ])
   }
 
   /**
@@ -461,10 +488,15 @@ export class PostgresStore implements Store {
     }
   }
 
-  async expand(seeds: readonly string[], hops: 1 | 2, options: { includeArchived?: boolean } = {}): Promise<Expansion[]> {
+  async expand(
+    seeds: readonly string[],
+    hops: 1 | 2,
+    options: { includeArchived?: boolean; timeoutMs?: number } = {},
+  ): Promise<Expansion[]> {
     if (seeds.length === 0) return []
     return this.run(async () => {
-      const linkRows = await this.db.query<{
+      const startedAt = Date.now()
+      const linkRows = await this.searchQuery<{
         entity_id: string
         hop: number
         score: number
@@ -472,6 +504,7 @@ export class PostgresStore implements Store {
         from_id: string
         relation: string
       }>(
+        options,
         `with recursive walk (id, hop, score, via_link_id, from_id, relation, path) as (
            select seed, 0, 1.0, null::text, null::text, null::text, array[seed]
            from unnest($1::text[]) as seed
@@ -502,9 +535,11 @@ export class PostgresStore implements Store {
          order by score desc
          limit 100`,
         [seeds, hops],
+        startedAt,
       )
 
-      const chainRows = await this.db.query<{ chain_id: string; member_id: string; seed_id: string; position: number }>(
+      const chainRows = await this.searchQuery<{ chain_id: string; member_id: string; seed_id: string; position: number }>(
+        options,
         `with target_chains as (
            select chain_id from omb.chain_member where member_id = any($1::text[])
            union
@@ -515,6 +550,7 @@ export class PostgresStore implements Store {
          join target_chains tc on tc.chain_id = cm.chain_id
          where not (cm.member_id = any($1::text[]))`,
         [seeds],
+        startedAt,
       )
 
       const byId = new Map<string, Expansion>()
@@ -548,10 +584,12 @@ export class PostgresStore implements Store {
       }
       if (options.includeArchived !== true && byId.size > 0) {
         const ids = [...byId.keys()]
-        const active = await this.db.query<{ entity_id: string }>(
+        const active = await this.searchQuery<{ entity_id: string }>(
+          options,
           `select entity_id from omb.entity_view
            where entity_id = any($1::text[]) and archived_at is null and lifecycle = 'active'`,
           [ids],
+          startedAt,
         )
         const activeIds = new Set(active.rows.map(row => row.entity_id))
         for (const id of ids) if (!activeIds.has(id)) byId.delete(id)
@@ -738,34 +776,84 @@ export class PostgresStore implements Store {
     await this.run(() => markRecallInjectedAudit(this.db, traceId))
   }
 
+  /**
+   * 召回事件批量写入（RET-14）。
+   *
+   * 旧实现每个 (hit, channel) 一行 INSERT：一次 limit=10 的召回最多 30 次往返。
+   * 现在一次 unnest 批量插入，再对本次涉及的全部 trace 做**一条**聚合更新；
+   * `retrieved_count` 仍按 distinct (trace, entity) 计数，多通道路径不会重复累计。
+   */
   async recordRecall(events: readonly RecallEventInput[]): Promise<void> {
     if (events.length === 0) return
+    const rows = {
+      traceId: events.map(event => event.traceId),
+      sessionId: events.map(event => event.sessionId ?? null),
+      turnId: events.map(event => event.turnId ?? null),
+      query: events.map(event => event.query ?? null),
+      trigger: events.map(event => event.trigger ?? null),
+      entityId: events.map(event => event.entityId),
+      channel: events.map(event => event.channel),
+      rank: events.map(event => event.rank),
+      rawScore: events.map(event => event.rawScore ?? null),
+      fusedScore: events.map(event => event.fusedScore ?? null),
+      injected: events.map(event => event.injected),
+    }
     await this.run(() => this.db.transaction(async client => {
-      for (const event of events) {
-        await client.query(
-          `insert into omb.recall_event (
-             trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank,
-             raw_score, fused_score, injected, injected_at
-           ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-                     case when $11 then now() else null end)`,
-          [
-            event.traceId,
-            event.sessionId ?? null,
-            event.turnId ?? null,
-            event.query ?? null,
-            event.trigger ?? null,
-            event.entityId,
-            event.channel,
-            event.rank,
-            event.rawScore ?? null,
-            event.fusedScore ?? null,
-            event.injected,
-          ],
-        )
-      }
+      await client.query(
+        `insert into omb.recall_event (
+           trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank,
+           raw_score, fused_score, injected, injected_at
+         )
+         select t.trace_id, t.session_id, t.turn_id, t.query, t.trigger, t.entity_id, t.channel, t.rank,
+                t.raw_score, t.fused_score, t.injected,
+                case when t.injected then now() else null end
+           from unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+             $6::text[], $7::text[], $8::int[], $9::real[], $10::real[], $11::boolean[]
+           ) as t(trace_id, session_id, turn_id, query, trigger, entity_id, channel, rank, raw_score, fused_score, injected)`,
+        [
+          rows.traceId,
+          rows.sessionId,
+          rows.turnId,
+          rows.query,
+          rows.trigger,
+          rows.entityId,
+          rows.channel,
+          rows.rank,
+          rows.rawScore,
+          rows.fusedScore,
+          rows.injected,
+        ],
+      )
       // recall_event 只是事件级审计：Retrieved/使用机会/采用层级全部由
       // `recordAdoptionReceipt` 的 kept/quarantined 派生（019）。
     }))
+    }))
+  }
+
+  /** 通道失败/deadline 审计（RET-08）：一次 unnest 批量插入，不逐行往返。 */
+  async recordRecallChannelErrors(errors: readonly RecallChannelErrorInput[]): Promise<void> {
+    if (errors.length === 0) return
+    await this.run(async () => {
+      await this.db.query(
+        `insert into omb.recall_channel_error (
+           trace_id, session_id, query, channel, code, message, retryable
+         )
+         select t.trace_id, t.session_id, t.query, t.channel, t.code, t.message, t.retryable
+           from unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::boolean[]
+           ) as t(trace_id, session_id, query, channel, code, message, retryable)`,
+        [
+          errors.map(error => error.traceId),
+          errors.map(error => error.sessionId ?? null),
+          errors.map(error => error.query ?? null),
+          errors.map(error => error.channel),
+          errors.map(error => error.code),
+          errors.map(error => error.message),
+          errors.map(error => error.retryable),
+        ],
+      )
+    })
   }
 
   async recordResidentTrace(trace: ResidentTraceInput): Promise<void> {
@@ -1123,6 +1211,7 @@ export class PostgresStore implements Store {
     // 按 p95 判定，所以固定串行执行，用事务级 `set local` 只影响本语句。
     const rows = await this.db.transaction(async client => {
       await client.query('set local max_parallel_workers_per_gather = 0')
+      await this.applyStatementTimeout(client, spec.timeoutMs)
       return client.query<{ entity_id: string; raw: number }>(sql, params)
     })
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: 'fulltext' }))
@@ -1133,7 +1222,8 @@ export class PostgresStore implements Store {
     const params: unknown[] = [spec.query.trim()]
     const filter = this.scopeClause(spec, params)
     params.push(Math.max(1, Math.min(20, spec.limit)))
-    const rows = await this.db.query<{ entity_id: string; raw: number }>(
+    const rows = await this.searchQuery<{ entity_id: string; raw: number }>(
+      spec,
       // datctype=C 的库里 similarity('中文','中') 恒为 0，不能拿它当 rawScore；
       // chars GIN 给出覆盖全文的候选（不再用 240 字 snippet 复核，否则尾部字符必漏，RET-01）；
       // search_text 是 tokenize 后以空格分隔的词，去空格近似原文，用于给连续子串更高 raw。
@@ -1144,6 +1234,7 @@ export class PostgresStore implements Store {
        order by raw desc, v.updated_at desc, v.entity_id asc
        limit $${params.length}`,
       params,
+      Date.now(),
     )
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: 'single_char' }))
   }
@@ -1156,6 +1247,7 @@ export class PostgresStore implements Store {
     return this.db.transaction(async client => {
       // pgvector 过滤在 HNSW 扫描之后发生；不开迭代扫描会静默少返回。
       await client.query("set local hnsw.iterative_scan = 'relaxed_order'")
+      await this.applyStatementTimeout(client, spec.timeoutMs)
       const rows = await client.query<{ entity_id: string; raw: number }>(
         `select v.entity_id, 1 - (e.embedding <=> $1::vector) as raw
          from omb.embedding e
@@ -1173,7 +1265,8 @@ export class PostgresStore implements Store {
     const params: unknown[] = [spec.from, spec.to, spec.now]
     const filter = this.scopeClause(spec, params)
     params.push(Math.max(1, Math.min(100, spec.limit)))
-    const rows = await this.db.query<{ entity_id: string; raw: number }>(
+    const rows = await this.searchQuery<{ entity_id: string; raw: number }>(
+      spec,
       `select v.entity_id,
               1.0 / (1.0 + greatest(0, extract(epoch from ($3::timestamptz - v.event_time)) / 86400.0 / 30.0)) as raw
        from omb.entity_view v
@@ -1181,6 +1274,7 @@ export class PostgresStore implements Store {
        order by v.event_time desc
        limit $${params.length}`,
       params,
+      Date.now(),
     )
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: 'time' }))
   }
@@ -1189,7 +1283,8 @@ export class PostgresStore implements Store {
     const params: unknown[] = [spec.now]
     const filter = this.scopeClause(spec, params)
     params.push(Math.max(1, Math.min(50, spec.limit)))
-    const rows = await this.db.query<{ entity_id: string; raw: number }>(
+    const rows = await this.searchQuery<{ entity_id: string; raw: number }>(
+      spec,
       `select v.entity_id,
               case v.status when 'blocked' then 1.0 when 'in_progress' then 0.9 when 'waiting' then 0.7 else 0.5 end
               + 0.1 / (1.0 + greatest(0, extract(epoch from ($1::timestamptz - v.event_time)) / 86400.0 / 30.0)) as raw
@@ -1198,19 +1293,22 @@ export class PostgresStore implements Store {
        order by raw desc, v.updated_at desc
        limit $${params.length}`,
       params,
+      Date.now(),
     )
     return rows.rows.map((row, index) => ({ entityId: row.entity_id, rank: index + 1, rawScore: Number(row.raw), channel: 'state_board' }))
   }
 
   private async searchTriggers(spec: TriggerSearchSpec): Promise<ChannelHit[]> {
     const scores = new Map<string, number>()
+    const startedAt = Date.now()
     if (spec.keys.length > 0) {
       const params: unknown[] = [spec.keys]
       const filter = this.scopeClause(spec, params)
       // 不能写成 `where t.key = any($1)`：trigger_key 现有索引是 (kind, key)，
       // 没有 key 前导列时会退化成全表扫描。把候选键展开成 (kind,key) 等值探针后，
       // 走 trigger_key_lookup 索引；仍是单条参数化查询，无 N+1。
-      const rows = await this.db.query<{ entity_id: string; raw: number }>(
+      const rows = await this.searchQuery<{ entity_id: string; raw: number }>(
+        spec,
         `select t.entity_id, sum(t.weight) as raw
          from (select distinct key from unnest($1::text[]) as input(key)) as cand
          cross join (values ('path'),('tool'),('error'),('entity'),('text')) as k(kind)
@@ -1221,6 +1319,7 @@ export class PostgresStore implements Store {
          order by raw desc
          limit 50`,
         params,
+        startedAt,
       )
       for (const row of rows.rows) scores.set(row.entity_id, Math.max(scores.get(row.entity_id) ?? 0, Number(row.raw)))
     }
@@ -1229,7 +1328,8 @@ export class PostgresStore implements Store {
       const filter = this.scopeClause(spec, filterParams)
       // 正则只在应用层执行（SPEC §7.1）；候选先按 trigger_key(kind,key) 索引收窄到 regex 类，
       // 并且只取 scope/kind 过滤后的实体。固定上限 + 确定序，避免无 order by 时按物理顺序静默截断。
-      const rows = await this.db.query<{ entity_id: string; key: string; weight: number }>(
+      const rows = await this.searchQuery<{ entity_id: string; key: string; weight: number }>(
+        spec,
         `select t.entity_id, t.key, t.weight
          from omb.trigger_key t
          join omb.entity_view v on v.entity_id = t.entity_id
@@ -1237,6 +1337,7 @@ export class PostgresStore implements Store {
          order by t.entity_id asc, t.key asc
          limit ${TRIGGER_REGEX_CANDIDATE_LIMIT}`,
         filterParams,
+        startedAt,
       )
       if (rows.rows.length > 0) {
         // 用户正则一律在 QuickJS 沙箱执行：单条 50ms 上限 + 输入/源码/候选上限 + 并发上限。

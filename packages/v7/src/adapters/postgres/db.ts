@@ -47,6 +47,30 @@ export class PostgresDb {
     }
   }
 
+  /**
+   * 事务内执行并给本次事务设置 `statement_timeout`。
+   *
+   * 为什么不是 `pool.query({ signal })`：node-postgres 目前没有 query 级 AbortSignal；
+   * 只 race 放弃等待会留下仍在跑的查询占住连接。事务级 `set_config(..., true)` 是
+   * PostgreSQL 的服务端取消，超时后语句被取消、事务回滚、连接归还连接池（RET-10）。
+   */
+  async transactionWithin<T>(timeoutMs: number, work: (client: PoolClient) => Promise<T>): Promise<T> {
+    const safe = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 1
+    return this.transaction(async client => {
+      await client.query("select set_config('statement_timeout', $1, true)", [String(safe)])
+      return work(client)
+    })
+  }
+
+  /** 单条语句的服务端超时（内部开事务设置 local statement_timeout）。 */
+  async queryWithin<T extends QueryResultRow = QueryResultRow>(
+    timeoutMs: number,
+    text: string,
+    values: readonly unknown[] = [],
+  ): Promise<QueryResult<T>> {
+    return this.transactionWithin(timeoutMs, client => client.query<T>(text, values as unknown[]))
+  }
+
   async close(): Promise<void> {
     await this.pool.end()
   }

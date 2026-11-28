@@ -105,14 +105,24 @@ export class PostgresMaintenance implements MaintenanceQueries {
 
   async coRecallPairs(limit: number): Promise<CoRecallPair[]> {
     const rows = await this.db.query<{ a: string; b: string; count: string }>(
-      `select a.entity_id as a, b.entity_id as b, count(*)::text as count
-       from omb.recall_event a
-       join omb.recall_event b
+      // RET-14：recall_event 每个 (entity, channel) 一行，直接 join 会把同一 trace 的
+      // 通道组合放大成 N×M 对（3 通道 × 3 通道 = 9），把“共同召回 2 次”虚报成 18 次。
+      // 先按 distinct (trace_id, entity_id) 收敛成“这一次召回看到了哪些实体”，再按 pair 计数：
+      // count = 两个实体被同一次召回、且都产生采用证据的 trace 数。
+      `with adopted as (
+         select distinct trace_id, entity_id
+           from omb.recall_event
+          where adopted_at is not null
+       )
+       select a.entity_id as a, b.entity_id as b, count(*)::text as count
+       from adopted a
+       join adopted b
          on a.trace_id = b.trace_id and a.entity_id < b.entity_id
-       join omb.entity_view av on av.entity_id = a.entity_id and av.archived_at is null and av.is_current and av.lifecycle = 'active'
-       join omb.entity_view bv on bv.entity_id = b.entity_id and bv.archived_at is null and bv.is_current and bv.lifecycle = 'active'
-       where a.adopted_at is not null and b.adopted_at is not null
-         and av.kind in ('memory', 'state', 'state_version')
+       join omb.entity_view av on av.entity_id = a.entity_id
+         and av.archived_at is null and av.is_current and av.lifecycle = 'active'
+       join omb.entity_view bv on bv.entity_id = b.entity_id
+         and bv.archived_at is null and bv.is_current and bv.lifecycle = 'active'
+       where av.kind in ('memory', 'state', 'state_version')
          and bv.kind in ('memory', 'state', 'state_version')
        group by a.entity_id, b.entity_id
        order by count(*) desc

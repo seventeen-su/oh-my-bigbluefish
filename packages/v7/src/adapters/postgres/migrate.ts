@@ -143,6 +143,7 @@ export async function truncateAll(connectionString: string): Promise<void> {
     await client.query(`
       truncate table
         omb.recall_event,
+        omb.recall_channel_error,
         omb.resident_trace,
         omb.adoption_receipt,
         omb.adoption_receipt_hit,
