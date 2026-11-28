@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../../../plugin/v7/index.js'
 import { createPromptSink, type HostContextLike, type HostToolDefinition } from '../../../packages/v7/src/adapters/dsh/host.js'
+import { createProjectIdentityResolver } from '../../../packages/v7/src/adapters/git/identity.js'
 import { PostgresStore } from '../../../packages/v7/src/adapters/postgres/store.js'
 import { CONTEXT_HEADER } from '../../../packages/v7/src/prompt/assembler.js'
 import { prepareDatabase, resetDatabase, TEST_DATABASE_URL } from './helpers.js'
@@ -419,7 +420,7 @@ describe('v7 plugin entry', () => {
     dispose()
   })
 
-  it('事件捕获把子目录 cwd 提升为 git root projectKey', async () => {
+  it('事件捕获把子目录 cwd 提升为仓库的稳定 projectId', async () => {
     const host = fakeHost()
     const dispose = apply(host.ctx, {
       databaseUrl: TEST_DATABASE_URL,
@@ -434,16 +435,36 @@ describe('v7 plugin entry', () => {
       { type: 'goal/change', seq: 1, data: { cwd: subdir, goal: { id: 'goal-capture', objective: '捕获项目根' } } },
     )
     const db = new PostgresStore(TEST_DATABASE_URL)
-    let projectKey: string | undefined
-    for (let attempt = 0; attempt < 80 && projectKey === undefined; attempt += 1) {
-      const rows = await db.db.query<{ project_key: string }>(
-        `select metadata->>'projectKey' as project_key from omb.artifact
-         where kind = 'goal/change' order by id desc limit 1`,
+    // 期望值由同一个解析器给出：子目录必须提升到仓库身份，而不是把 cwd 路径写进 scope。
+    const expected = await createProjectIdentityResolver().resolve(PROJECT, 'event-capture-expectation')
+    expect(expected?.projectId).toMatch(/^(git-remote|git-common|workspace):/u)
+    const artifact = await vi.waitFor(async () => {
+      const rows = await db.db.query<{
+        project_key: string | null
+        project_id: string | null
+        workspace_id: string | null
+        branch_id: string | null
+        identity_source: string | null
+      }>(
+        `select metadata->>'projectKey' as project_key,
+                metadata->>'projectId' as project_id,
+                metadata->>'workspaceId' as workspace_id,
+                metadata->>'branchId' as branch_id,
+                metadata->>'identitySource' as identity_source
+           from omb.artifact
+          where kind = 'goal/change' and metadata->>'seq' = '1'
+          order by id desc limit 1`,
       )
-      projectKey = rows.rows[0]?.project_key
-      if (projectKey === undefined) await wait(25)
-    }
-    expect(projectKey).toBe(PROJECT.replaceAll('\\', '/'))
+      const row = rows.rows[0]
+      if (row?.project_key === null || row?.project_key === undefined) throw new Error('事件原文尚未落库')
+      return row
+    }, { timeout: 10_000 })
+    expect(artifact.project_key).toBe(expected?.projectId)
+    expect(artifact.project_id).toBe(expected?.projectId)
+    expect(artifact.workspace_id).toBe(expected?.workspaceId)
+    expect(artifact.identity_source).toBe(expected?.source)
+    // 分支是解析时的分支（不参与 scope，只作来源信息）。
+    expect(artifact.branch_id).toBe(expected?.branchId)
     await db.close()
     dispose()
   })

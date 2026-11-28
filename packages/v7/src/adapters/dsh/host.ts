@@ -1,9 +1,5 @@
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import type { Logger } from '../../ports/jobs.js'
 import type { RuntimeContext } from '../../ports/context.js'
-
-const run = promisify(execFile)
 
 export interface HostContextLike {
   readonly get?: (name: string) => unknown
@@ -89,27 +85,6 @@ export function sessionFromExec(exec: unknown): ToolContext | undefined {
   const cwd = typeof header?.['cwd'] === 'string' && header['cwd'].trim().length > 0 ? header['cwd'] : undefined
   const agentPath = typeof agent?.['name'] === 'string' && agent['name'].trim().length > 0 ? agent['name'] : undefined
   return { sessionId, ...(cwd !== undefined ? { cwd } : {}), ...(agentPath !== undefined ? { agentPath } : {}) }
-}
-
-const projectCache = new Map<string, string>()
-
-/** 项目身份 = git root；非 git 目录退化 cwd。失败绝不抛。 */
-export async function resolveProjectKey(cwd: string | undefined): Promise<string | undefined> {
-  if (cwd === undefined) return undefined
-  const cached = projectCache.get(cwd)
-  if (cached !== undefined) return cached
-  try {
-    const { stdout } = await run('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { timeout: 3_000, windowsHide: true })
-    const root = stdout.trim()
-    if (root.length > 0) {
-      projectCache.set(cwd, root)
-      return root
-    }
-  } catch {
-    // 非 git 目录或 git 不可用：退化 cwd。
-  }
-  projectCache.set(cwd, cwd)
-  return cwd
 }
 
 export function createLogger(ctx: HostContextLike | undefined): Logger {

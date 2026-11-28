@@ -36,6 +36,7 @@ import { createConsolidationRuntime } from './consolidation.js'
 import { createEventRuntime, type EventRuntime } from './event-runtime.js'
 import { createProjectionRuntime } from './projection.js'
 import { createHostHooks } from './hooks.js'
+import { createIdentityWiring } from './identity.js'
 import { createStatusTool, type StatusDeps } from './status.js'
 import { createToolRuntime } from './tool-runtime.js'
 import { createT1Session } from './t1-session.js'
@@ -193,6 +194,10 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
   // 只在 `omb_status` 被真实调用时探测；不在加载期跑状态查询。
   const status = () => createStatusTool(statusDeps)
 
+  // 项目身份解析器是单一实例：工具、pre-step、事件捕获共用同一份缓存，
+  // 不重复跑 git；解析出的身份登记到 omb.project_identity 供旧 projectKey 兼容匹配。
+  const identities = createIdentityWiring({ store, logger })
+
   const runtime = createToolRuntime({
     requireReady: () => boot.requireReady(),
     rememberService,
@@ -200,6 +205,7 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     recallService,
     store,
     status,
+    resolveContext: identities.resolveContext,
   })
 
   const tools = registerTools(ctx, runtime, logger)
@@ -228,6 +234,8 @@ export function apply(ctx: HostContextLike, rawConfig?: unknown): () => Promise<
     checkpointSink,
     session,
     boards: () => projection.residentBoardsOptions(),
+    resolveContext: identities.resolveContext,
+    resolveIdentity: identities.resolveIdentity,
   })
   // 注册期事实落一条摘要日志：工具数/钩子数 + 未接线原因（audit R01）。
   supervisor.logWiringSummary()

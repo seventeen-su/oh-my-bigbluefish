@@ -66,6 +66,10 @@ export class RecallService {
   async recall(input: RecallToolInput, context: RuntimeContext): Promise<Result<string>> {
     if (input.query.trim().length === 0) return err({ code: 'invalid-input', message: 'query 不能为空' })
     const projectKey = context.projectKey ?? context.cwd
+    // path-guard 根是工作区路径，不是 projectId；没有 identity（旧调用/旧测试）时
+    // 退回旧语义——那时 projectKey 就是 git root 路径。
+    const projectRoot = context.projectIdentity?.projectRoot
+      ?? (context.projectIdentity === undefined ? projectKey : undefined)
     if (input.scope !== 'global' && projectKey === undefined) {
       return err({ code: 'invalid-input', message: '缺少项目作用域（session cwd）' })
     }
@@ -96,7 +100,7 @@ export class RecallService {
       if (this.dynamic !== undefined && result.hits.length > 0) {
         await Promise.all(result.hits.slice(0, 5).map(hit =>
           this.dynamic!.refreshById(hit.entityId, {
-            ...(projectKey !== undefined ? { projectRoot: projectKey } : {}),
+            ...(projectRoot !== undefined ? { projectRoot } : {}),
             caller: context.sessionId,
             max: 2,
           }).catch(() => undefined),

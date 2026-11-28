@@ -46,6 +46,7 @@ import {
 } from '../../domain/entity-access.js'
 import { iso, PostgresDb, type PostgresConfig } from './db.js'
 import { PostgresListenNotifier, type ListenNotifierStatus } from './listen.js'
+import { sameProjectClause } from './project-key-sql.js'
 
 /**
  * 投影队列 / 水位 / 看板读模型的 PostgreSQL 适配器（ARCHITECTURE-PLAN §4.4/§5.2/§5.3）。
@@ -344,7 +345,7 @@ select entity_id, title, summary, salience::real as salience, revision::bigint a
 export const STATE_BOARD_READ_SQL = `
 select entity_id, title, status, project_key, event_time, revision::bigint as revision, updated_at
   from omb.state_board
- where project_key = $1
+ where ${sameProjectClause('project_key', '$1')}
  order by (case status when 'in_progress' then 0 when 'blocked' then 1 else 2 end),
           event_time desc nulls last, entity_id asc
  limit $2
@@ -919,7 +920,7 @@ export function boardDerivationSql(
   }
   if (kind === 'state' && filter.projectKey !== undefined) {
     values.push(filter.projectKey)
-    clauses.push(`sc.value->>'projectKey' = $${values.length}`)
+    clauses.push(sameProjectClause(`sc.value->>'projectKey'`, `$${values.length}`))
   }
   let text = kind === 'preference' ? PREFERENCE_DERIVE_SQL : STATE_DERIVE_SQL
   if (clauses.length > 0) text += `\n   and ${clauses.join('\n   and ')}`

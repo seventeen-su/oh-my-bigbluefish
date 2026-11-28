@@ -9,6 +9,7 @@ import type {
 } from '../domain/entity.js'
 import type { JsonValue } from '../domain/json.js'
 import type { Expansion, Link, LinkInput } from '../domain/link.js'
+import type { ProjectIdentity } from '../domain/project-identity.js'
 import type { NormalizedWrite } from '../domain/validation.js'
 import type {
   ChannelHit,
@@ -137,5 +138,15 @@ export interface Store {
   recordArtifact(input: ArtifactInput): Promise<void>
   listArtifacts(limit: number): Promise<ArtifactRecord[]>
   markArtifactProcessed(id: string): Promise<void>
+  /**
+   * 登记项目身份映射（旧 fake 可不实现）。每个 workspace 一行：legacy_keys 取并集，
+   * 让迁移前的旧 projectKey（路径）仍能被新 projectId 命中。
+   */
+  recordProjectIdentity?(identity: ProjectIdentity): Promise<void>
+  /**
+   * 按 projectId 取最近工作区的路径锚点。`projectId` 不是路径，动态文件属性的
+   * path-guard 需要它（后台 refresh 没有调用方传入 projectRoot）。旧 fake 可不实现。
+   */
+  projectRootOf?(projectId: string): Promise<string | undefined>
   stats(): Promise<StoreStats>
 }

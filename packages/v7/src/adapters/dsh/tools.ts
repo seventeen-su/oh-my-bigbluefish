@@ -6,7 +6,8 @@ import type { Result } from '../../domain/errors.js'
 import { MAX_TITLE } from '../../domain/validation.js'
 import type { Logger } from '../../ports/jobs.js'
 import type { HostContextLike, HostToolDefinition, HostToolsLike, ToolContext } from './host.js'
-import { asRecord, readTools, resolveProjectKey, sessionFromExec } from './host.js'
+import { asRecord, readTools, sessionFromExec } from './host.js'
+import { projectIdentityResolver, type ProjectIdentityResolver } from '../git/identity.js'
 
 const OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -399,9 +400,25 @@ export function registerTools(ctx: HostContextLike | undefined, runtime: ToolRun
   }
 }
 
-export async function resolveToolContext(exec: unknown): Promise<ToolContext | undefined> {
+export interface ToolContextResolution {
+  /** 身份解析器由组合根注入（与事件捕获共用同一个缓存）；缺省用进程级共享实例。 */
+  readonly identity?: ProjectIdentityResolver
+}
+
+/**
+ * 由工具执行上下文（或 pre-step 载荷里同形状的 agent.session）解析运行时上下文。
+ *
+ * `projectKey` 仍是兼容别名，但现在等于稳定 `projectId`（不再把 git root 路径当身份）；
+ * 需要路径锚点（动态文件属性）的调用方读 `projectIdentity.projectRoot`。
+ */
+export async function resolveToolContext(exec: unknown, options: ToolContextResolution = {}): Promise<ToolContext | undefined> {
   const base = sessionFromExec(exec)
   if (base === undefined) return undefined
-  const projectKey = await resolveProjectKey(base.cwd)
-  return { ...base, ...(projectKey !== undefined ? { projectKey } : {}) }
+  const projectIdentity = await (options.identity ?? projectIdentityResolver()).resolve(base.cwd, base.sessionId)
+  return {
+    ...base,
+    ...(projectIdentity === undefined
+      ? {}
+      : { projectKey: projectIdentity.projectId, projectIdentity }),
+  }
 }

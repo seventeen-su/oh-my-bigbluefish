@@ -9,8 +9,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import { asRecord, sessionFromExec } from '../../packages/v7/src/adapters/dsh/host.js'
-import type { HostContextLike, PromptSink } from '../../packages/v7/src/adapters/dsh/host.js'
-import { resolveToolContext } from '../../packages/v7/src/adapters/dsh/tools.js'
+import type { HostContextLike, PromptSink, ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
+import type { ProjectIdentity } from '../../packages/v7/src/domain/project-identity.js'
 import { createEventCapture } from '../../packages/v7/src/adapters/dsh/events.js'
 import type { EventCaptureHandle } from '../../packages/v7/src/adapters/dsh/events.js'
 import type { PostgresStore } from '../../packages/v7/src/adapters/postgres/store.js'
@@ -78,6 +78,10 @@ export interface HostHooksDeps {
   readonly session: T1Session
   /** T0 优先读投影看板；投影未启动时返回 undefined（回退写模型路径）。 */
   readonly boards: () => ResidentBoardsOptions | undefined
+  /** 工具/pre-step 上下文解析（与事件捕获共用同一份身份缓存）。 */
+  readonly resolveContext: (exec: unknown) => Promise<ToolContext | undefined>
+  /** 事件捕获的项目身份（写 artifact.metadata，不改变捕获语义）。 */
+  readonly resolveIdentity: (cwd: string, sessionId: string) => Promise<ProjectIdentity | undefined>
 }
 
 export interface HostHooksHandle {
@@ -133,7 +137,13 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
     }
   }
 
-  const capture = createEventCapture({ ctx, store, logger, onEvent: observeEvent })
+  const capture = createEventCapture({
+    ctx,
+    store,
+    logger,
+    onEvent: observeEvent,
+    resolveIdentity: deps.resolveIdentity,
+  })
 
   /** 在工具派发前启动 T1 召回；不阻塞 dispatch，结果由 post-execute 复用。 */
   const prefetchToolRecall = (exec: unknown, sessionId: string | undefined): void => {
@@ -153,7 +163,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       return [raw, ...signals.paths, ...signals.errorCodes, ...signals.identifiers.slice(0, 8)].join(' ')
     })()
     const promise = (async (): Promise<PrefetchedT1> => {
-      const context = await resolveToolContext(exec)
+      const context = await deps.resolveContext(exec)
       if (context === undefined) return { text: '' }
       let notice: RecallNotice | undefined
       const text = await buildEventRecallText(
@@ -207,7 +217,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
       }
       // OMB 自己的工具结果不需要再被 OMB 召回，避免自激。
       if (name.length === 0 || name.startsWith('omb_')) return decision
-      const context = await resolveToolContext(exec)
+      const context = await deps.resolveContext(exec)
       if (context === undefined) return decision
       const sessionId = context.sessionId
       const argumentsText = eventText(execRecord?.['arguments'])
@@ -301,7 +311,7 @@ export function createHostHooks(deps: HostHooksDeps): HostHooksHandle {
    *   （time-context 同款：packages/context/time-context/src/index.ts:199-242）。
    */
   const prepareT1Injection = async (payload: unknown): Promise<PreparedT1Injection | undefined> => {
-    const context = await resolveToolContext(payload)
+    const context = await deps.resolveContext(payload)
     const record = typeof payload === 'object' && payload !== null ? payload as Record<string, unknown> : undefined
     if (context === undefined || record === undefined) return undefined
     const sessionId = context.sessionId

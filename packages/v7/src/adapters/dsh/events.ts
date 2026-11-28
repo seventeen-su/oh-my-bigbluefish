@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import type { Store } from '../../ports/store.js'
 import type { Logger } from '../../ports/jobs.js'
-import { resolveProjectKey } from './host.js'
+import type { ProjectIdentity } from '../../domain/project-identity.js'
+import { projectIdentityResolver } from '../git/identity.js'
 import type { HostContextLike } from './host.js'
 import { asRecord } from './host.js'
 
@@ -33,12 +34,22 @@ export function createEventCapture(options: {
   logger?: Logger
   /** 原始事件观察者：adoption / T1 触发用；不改变 artifact 捕获语义。 */
   onEvent?: (sessionId: string, type: string, data: unknown) => void
+  /**
+   * 项目身份解析。组合根注入与工具上下文共用的解析器/缓存；缺省时捕获器自己建
+   * 一个（仍然每个 cwd 只解析一次，绝不轮询）。
+   */
+  resolveIdentity?: (cwd: string, sessionId: string) => Promise<ProjectIdentity | undefined>
 }): EventCaptureHandle {
   let events = 0
   let captured = 0
   let errors = 0
   let disposed = false
   let off: (() => void) | undefined
+  const fallbackIdentity = options.resolveIdentity === undefined
+    ? projectIdentityResolver()
+    : undefined
+  const resolveIdentity = options.resolveIdentity
+    ?? ((cwd: string, sessionId: string) => fallbackIdentity?.resolve(cwd, sessionId) ?? Promise.resolve(undefined))
 
   const listener = (session: unknown, event: unknown): void => {
     if (disposed) return
@@ -61,9 +72,13 @@ export function createEventCapture(options: {
     const raw = JSON.stringify(record['data'] ?? null)
     const content = raw.length > MAX_CONTENT ? raw.slice(0, MAX_CONTENT) : raw
     void (async () => {
-      // projectKey 必须是 git root，不能把 session cwd 的子目录写进状态作用域；
-      // 否则 T0 的当前项目查询（git root）会漏掉后台抽取出来的状态机。
-      const projectKey = cwd === undefined ? undefined : await resolveProjectKey(cwd)
+      // 身份必须按「最近的」仓库解析（子模块/嵌套仓库不吞并父仓库），并写成稳定
+      // projectId：T0 的当前项目查询和生活周期里的后台抽取都读同一个键。
+      // 解析失败时退回旧语义（cwd），保证事件原文仍可检索。
+      const identity = cwd === undefined
+        ? undefined
+        : await resolveIdentity(cwd, sessionId).catch(() => undefined)
+      const projectKey = identity?.projectId ?? cwd
       await options.store.recordArtifact({
         id: eventId(sessionId, seq),
         sessionId,
@@ -73,7 +88,16 @@ export function createEventCapture(options: {
         metadata: {
           seq,
           ...(cwd !== undefined ? { cwd } : {}),
-          ...(projectKey !== undefined ? { projectKey } : {}),
+          ...(projectKey === undefined ? {} : { projectKey }),
+          ...(identity === undefined
+            ? {}
+            : {
+                projectId: identity.projectId,
+                workspaceId: identity.workspaceId,
+                ...(identity.repositoryId === undefined ? {} : { repositoryId: identity.repositoryId }),
+                ...(identity.branchId === undefined ? {} : { branchId: identity.branchId }),
+                identitySource: identity.source,
+              }),
           ...(typeof record['time'] === 'number' ? { time: record['time'] } : {}),
           ...(raw.length > MAX_CONTENT ? { truncated: true, length: raw.length } : {}),
         },

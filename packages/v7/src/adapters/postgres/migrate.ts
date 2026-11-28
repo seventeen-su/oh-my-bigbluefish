@@ -155,7 +155,8 @@ export async function truncateAll(connectionString: string): Promise<void> {
         omb.entity,
         omb.attr_registry,
         omb.artifact,
-        omb.conflict_suppression
+        omb.conflict_suppression,
+        omb.project_identity
       restart identity cascade
     `)
     // 审计链被清空后重新从空链开始：这条日志只是给误操作留可追溯线索，不写库。

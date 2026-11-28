@@ -13,7 +13,6 @@ import type {
   ToolRuntime,
 } from '../../packages/v7/src/adapters/dsh/tools.js'
 import type { ToolContext } from '../../packages/v7/src/adapters/dsh/host.js'
-import { resolveToolContext } from '../../packages/v7/src/adapters/dsh/tools.js'
 import type { RecallService } from '../../packages/v7/src/app/recall.js'
 import type { RememberService } from '../../packages/v7/src/app/remember.js'
 import type { UpdateService } from '../../packages/v7/src/app/update.js'
@@ -29,6 +28,8 @@ export interface ToolRuntimeDeps {
   readonly recallService: RecallService
   readonly store: PostgresStore
   readonly status: () => Promise<Result<string>>
+  /** 运行时上下文解析（组合根注入：稳定 projectId + 身份注册）。 */
+  readonly resolveContext: (exec: unknown) => Promise<ToolContext | undefined>
 }
 
 export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
@@ -36,7 +37,7 @@ export function createToolRuntime(deps: ToolRuntimeDeps): ToolRuntime {
   // 死信重放与 relay 共用同一个适配器实现（无状态、不额外建连接池）。
   const outbox = new PostgresOutboxStore(store.db)
   return {
-    context: resolveToolContext,
+    context: deps.resolveContext,
     async remember(input: WriteEntityInput): Promise<Result<string>> {
       const unavailable = await requireReady()
       if (unavailable !== undefined) return unavailable

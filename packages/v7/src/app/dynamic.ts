@@ -1,4 +1,4 @@
-import type { Attribute, Entity } from '../domain/entity.js'
+import type { Attribute, Entity, Scope } from '../domain/entity.js'
 import type { DynamicSpec } from '../domain/dynamic-spec.js'
 import { scopeOf } from '../domain/entity-access.js'
 import type { JsonValue } from '../domain/json.js'
@@ -53,9 +53,12 @@ export class DynamicService {
     const dynamic = entity.attributes.filter(attribute => attribute.value.kind === 'dynamic')
     if (dynamic.length === 0) return entity
     const scope = scopeOf(entity)
-    // 后台 refresh 没有调用方传入 projectRoot；项目实体的文件动态值必须回退到实体
-    // 自己的 projectKey，否则 path-guard 会把合法项目文件当成越界。
-    const projectRoot = options.projectRoot ?? (scope.kind === 'project' ? scope.projectKey : undefined)
+    // 后台 refresh 没有调用方传入 projectRoot：projectKey 现在是稳定 projectId（remote URL /
+    // 指纹），**不是路径**。只有 file 动态值需要路径根，所以按需从身份注册表取该项目的
+    // 最近工作区根；查不到时退回旧语义（迁移前的 projectKey 就是 git root 路径），两者都
+    // 没有时 file 动态值被 path-guard 拒绝——宁可不读，也不把 projectId 当路径去猜。
+    const needsProjectRoot = dynamic.some(attribute => attribute.value.kind === 'dynamic' && attribute.value.spec.kind === 'file')
+    const projectRoot = options.projectRoot ?? (needsProjectRoot ? await this.projectRootFor(scope) : undefined)
     const effectiveOptions: DynamicRefreshOptions = {
       ...options,
       ...(projectRoot !== undefined ? { projectRoot } : {}),
@@ -89,6 +92,21 @@ export class DynamicService {
     const entity = await this.deps.store.get(id, { includeArchived: true })
     if (entity === undefined) return undefined
     return this.refreshEntity(entity, options)
+  }
+
+  /** 动态文件属性的 path-guard 根：身份注册表 > 旧 projectKey（迁移前就是路径）。 */
+  private async projectRootFor(scope: Scope): Promise<string | undefined> {
+    if (scope.kind !== 'project') return undefined
+    const lookup = this.deps.store.projectRootOf
+    if (lookup !== undefined) {
+      try {
+        const root = await lookup.call(this.deps.store, scope.projectKey)
+        if (root !== undefined && root.trim().length > 0) return root
+      } catch {
+        // 注册表不可读（未迁移/库抖动）时退回旧语义，不让动态刷新整批失败。
+      }
+    }
+    return scope.projectKey
   }
 
   private contextFor(entityId: string, options: DynamicRefreshOptions): DynamicContext {

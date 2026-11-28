@@ -32,6 +32,7 @@ const EXPAND_MIGRATION = '008_v7_expand.sql'
 const CONTRACT_MIGRATION = '009_contract.sql'
 const OUTBOX_DEAD_MIGRATION = '010_outbox_dead.sql'
 const LEGACY_CONTRACT_MIGRATION = '011_contract_legacy_columns.sql'
+const PROJECT_IDENTITY_MIGRATION = '012_project_identity.sql'
 const EPOCH_ISO = '1970-01-01T00:00:00.000Z'
 const PROJECT_KEY = 'proj-schema-test'
 /** 回填测试固定批大小 1：行数 > 1 的读模型必须分多批，证明回填有界。 */
@@ -727,12 +728,13 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     await client?.end()
   })
 
-  it('给定空库当跑全量迁移则应用 001-009 且第二次不再重复应用', () => {
+  it('给定空库当跑全量迁移则应用 001-012 且第二次不再重复应用', () => {
     expect(emptyFirst.applied).toEqual(migrationFiles())
     expect(emptyFirst.total).toBe(migrationFiles().length)
     expect(emptyFirst.applied).toEqual(expect.arrayContaining([EXPAND_MIGRATION, CONTRACT_MIGRATION]))
     expect(emptyFirst.applied).toContain(CONTRACT_MIGRATION)
-    expect(emptyFirst.applied.at(-1)).toBe(LEGACY_CONTRACT_MIGRATION)
+    expect(emptyFirst.applied).toContain(PROJECT_IDENTITY_MIGRATION)
+    expect(emptyFirst.applied.at(-1)).toBe(PROJECT_IDENTITY_MIGRATION)
     expect(emptySecond.applied).toEqual([])
     expect(emptySecond.total).toBe(migrationFiles().length)
   })
@@ -768,8 +770,14 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
     expect(await snapshotColumnNames(client, 'audit_log')).not.toContain('rollback_of')
   })
 
-  it('给定已有 007 库当跑迁移则应用 008+009 且旧审计行与新列可空性符合预期', () => {
-    expect(legacyReport.applied).toEqual([EXPAND_MIGRATION, CONTRACT_MIGRATION, OUTBOX_DEAD_MIGRATION, LEGACY_CONTRACT_MIGRATION])
+  it('给定已有 007 库当跑迁移则应用 008-012 且旧审计行与新列可空性符合预期', () => {
+    expect(legacyReport.applied).toEqual([
+      EXPAND_MIGRATION,
+      CONTRACT_MIGRATION,
+      OUTBOX_DEAD_MIGRATION,
+      LEGACY_CONTRACT_MIGRATION,
+      PROJECT_IDENTITY_MIGRATION,
+    ])
     expect(legacyReport.total).toBe(migrationFiles().length)
     expect(legacySecond.applied).toEqual([])
     expect(legacyAuditAfter).toEqual(legacyAuditBefore)
@@ -846,6 +854,64 @@ describe('OMB v7.x schema expand 与回填（真实 PostgreSQL）', () => {
         expect(columns, `${label}：P0 ${table}.${column} 必须保留`).toContain(column)
       }
     }
+  })
+
+  it('给定 012 当查表/索引/回填则身份注册表存在且旧 project scope 已登记为别名', async () => {
+    const columns = await client.query<ColumnRow>(
+      `select table_name, column_name, data_type, is_nullable
+         from information_schema.columns
+        where table_schema = 'omb' and table_name = 'project_identity'
+        order by ordinal_position`,
+    )
+    expect(columns.rows.map(row => row.column_name)).toEqual([
+      'workspace_id',
+      'project_id',
+      'repository_id',
+      'branch_id',
+      'project_root',
+      'legacy_keys',
+      'created_at',
+      'last_seen_at',
+    ])
+    const byName = new Map(columns.rows.map(row => [row.column_name, row]))
+    expect(byName.get('workspace_id')?.is_nullable).toBe('NO')
+    expect(byName.get('project_id')?.is_nullable).toBe('NO')
+    expect(byName.get('project_root')?.is_nullable).toBe('NO')
+    expect(byName.get('repository_id')?.is_nullable).toBe('YES')
+    expect(byName.get('branch_id')?.is_nullable).toBe('YES')
+    expect(byName.get('legacy_keys')?.data_type).toBe('ARRAY')
+    expect(byName.get('legacy_keys')?.is_nullable).toBe('NO')
+
+    const indexes = await snapshotIndexes(client)
+    expect(indexes.get('project_identity_project')).toMatch(/\(project_id\)/i)
+
+    const seeded = await client.query<{
+      workspace_id: string
+      project_id: string
+      project_root: string
+      legacy_keys: string[]
+    }>(
+      `select workspace_id, project_id, project_root, legacy_keys
+         from omb.project_identity where project_id = $1`,
+      [PROJECT_KEY],
+    )
+    expect(seeded.rows).toEqual([{
+      workspace_id: `legacy:${createHash('md5').update(PROJECT_KEY).digest('hex')}`,
+      project_id: PROJECT_KEY,
+      project_root: PROJECT_KEY,
+      legacy_keys: [PROJECT_KEY],
+    }])
+  })
+
+  it('给定 012 已应用当直接重跑迁移 SQL 则幂等且不重复登记旧 projectKey', async () => {
+    const sql = readFileSync(join(MIGRATIONS_DIR, PROJECT_IDENTITY_MIGRATION), 'utf8')
+    const before = await client.query<{ count: string }>('select count(*)::text as count from omb.project_identity')
+    await expect(client.query(sql)).resolves.toBeDefined()
+    await expect(client.query(sql)).resolves.toBeDefined()
+    const after = await client.query<{ count: string }>('select count(*)::text as count from omb.project_identity')
+    expect(after.rows[0]?.count).toBe(before.rows[0]?.count)
+    const rows = await client.query<MigrationRow>('select name, checksum from omb.schema_migrations order by name')
+    expect(rows.rows.map(row => row.name)).toEqual(migrationFiles())
   })
 
   it('给定 008-011 已应用当查表/列/索引则新表、可空事件列、部分 due 索引齐全且旧列已删', async () => {

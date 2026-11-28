@@ -40,9 +40,12 @@ import type {
   VectorSearchSpec,
 } from '../../ports/search.js'
 import { systemCommandMeta } from '../../app/commands/index.js'
+import type { ProjectIdentity } from '../../domain/project-identity.js'
 import { iso, PostgresDb } from './db.js'
+import { projectRootRow, recordProjectIdentityRow } from './identity-store.js'
 import { mapEntity, type EntityRow, type ViewRow } from './rows.js'
 import { findSimilar } from './similar.js'
+import { sameProjectClause } from './project-key-sql.js'
 import { AttributeWriter } from './writer.js'
 import { mapPgError } from './writer-support.js'
 import { selectAttributes } from './writer-tables.js'
@@ -609,6 +612,16 @@ export class PostgresStore implements Store {
     })
   }
 
+  /** 项目身份登记（012 注册表）；SQL 与并集语义在 `identity-store.ts`。 */
+  async recordProjectIdentity(identity: ProjectIdentity): Promise<void> {
+    await this.run(() => recordProjectIdentityRow(this.db, identity))
+  }
+
+  /** 后台动态文件属性的 path-guard 根：取该 projectId 最近活跃的工作区路径。 */
+  async projectRootOf(projectId: string): Promise<string | undefined> {
+    return this.run(() => projectRootRow(this.db, projectId))
+  }
+
   async stats(): Promise<{
     memory: number
     state: number
@@ -743,7 +756,9 @@ export class PostgresStore implements Store {
       clauses.push(`v.scope = 'project'`)
       if (spec.projectKey !== undefined) {
         params.push(spec.projectKey)
-        clauses.push(`v.project_key = $${params.length}`)
+        // projectKey 现在是稳定 projectId；旧行仍是迁移前的路径键，用身份注册表的
+        // legacy_keys 展开匹配，避免升级后旧项目记忆整体失效。
+        clauses.push(sameProjectClause('v.project_key', `$${params.length}`))
       }
     }
     return clauses.length > 0 ? `and ${clauses.join(' and ')}` : ''
