@@ -29,7 +29,12 @@ function compile(request: RecallRequest, options: { now?: string; config?: typeo
   })
 }
 
-describe('时区工具：IANA 偏移与当地日历日', () => {
+/**
+ * RET-09 回归：「今天/昨天/前天」是 IANA 时区的当地日历日，不是 UTC 日历日，
+ * 也不是 `now - 24h`（DST 日不是 24 小时）。集成层另有
+ * tests/v7/integration/recall-time-window.test.ts 用真实 PG 验证上海/东京窗口。
+ */
+describe('时区工具：IANA 偏移与当地日历日（RET-09 回归）', () => {
   it('给定 Asia/Shanghai 当求当地日边界则按 +08:00 而不是 UTC 日历日', () => {
     const anchor = Date.parse('2026-11-22T00:30:00.000Z')
 

@@ -356,3 +356,98 @@ describe('RecallEngine 阶段一与融合', () => {
     expect(result.warnings.some(warning => warning.includes('recall boom'))).toBe(true)
   })
 })
+
+describe('通道 deadline 与取消（RET-10）', () => {
+  it('给定通道超过 provider deadline 当召回则只标记该通道 deadline，并把服务端超时预算传给 store', async () => {
+    const store = new FakeStore()
+    store.latencyMs.fulltext = 200
+
+    const result = await makeEngine(store, undefined, new FakeEmbedder(), { providerTimeoutMs: 20 })
+      .recall({ query: 'needle', now: FIXED_NOW })
+
+    const fulltext = result.channels.find(report => report.channel === 'fulltext')
+    expect(fulltext?.status).toBe('failed')
+    expect(fulltext?.reason ?? '').toMatch(/^deadline:/)
+    // provider issue 为空（runner 级 deadline），但审计表仍必须有一行。
+    expect(result.channelErrors).toEqual([])
+    expect(store.recallChannelErrors).toHaveLength(1)
+    expect(store.recallChannelErrors[0]).toMatchObject({
+      traceId: result.traceId,
+      query: 'needle',
+      channel: 'fulltext',
+      code: 'timeout',
+      retryable: true,
+    })
+    expect(store.recallChannelErrors[0]?.message).toContain('deadline')
+    expect(result.warnings.some(warning => warning.includes('在 deadline 内未完成'))).toBe(true)
+    // 取消能力不只停留在 runner：store 拿到的是本 provider 的剩余预算，适配器用它设置 statement_timeout。
+    expect(store.calls.fulltext[0]?.timeoutMs).toBeLessThanOrEqual(20)
+    expect(store.calls.state_board[0]?.timeoutMs).toBeLessThanOrEqual(20)
+    // 其它通道不被连坐：看板/时间等仍然执行。
+    expect(store.calls.state_board).toHaveLength(1)
+    expect(result.emptyReason?.code).toBe('no-stage-one-hits')
+  })
+
+  it('给定通道错误文本为空当召回则 channelErrors 与审计行都有最小可读原因', async () => {
+    const store = new FakeStore()
+    for (const channel of ['trigger', 'fulltext', 'vector', 'time', 'state_board'] as const) {
+      store.failures[channel] = new Error('')
+    }
+
+    const result = await makeEngine(store).recall({ query: 'err', now: FIXED_NOW })
+
+    expect(result.hits).toHaveLength(0)
+    expect(result.emptyReason?.code).toBe('all-channels-failed')
+    expect(result.channelErrors).toHaveLength(5)
+    expect(result.channelErrors.every(error => error.message.trim().length > 0)).toBe(true)
+    expect(result.channelErrors.every(error => error.message.includes('失败但没有给出错误详情'))).toBe(true)
+    expect(store.recallChannelErrors).toHaveLength(5)
+    expect(store.recallChannelErrors.every(error => error.message.trim().length > 0)).toBe(true)
+  })
+
+  it('给定所有被尝试通道都失败或不可用当召回则标全部失败，而不是“没有相关内容”', async () => {
+    const store = new FakeStore()
+    for (const channel of ['trigger', 'fulltext', 'time', 'state_board'] as const) {
+      store.failures[channel] = new Error(`${channel} down`)
+    }
+    const embedder = new FakeEmbedder()
+    embedder.availableResult = false
+
+    const result = await makeEngine(store, undefined, embedder)
+      .recall({ query: 'find the bug in production', now: FIXED_NOW })
+
+    expect(result.hits).toHaveLength(0)
+    expect(result.emptyReason?.code).toBe('all-channels-failed')
+    expect(result.emptyReason?.details).toEqual({
+      channels: ['trigger:failed', 'fulltext:failed', 'vector:unavailable', 'time:failed', 'state_board:failed'],
+    })
+  })
+})
+
+describe('RET-11 最小通道召回（T0 状态看板）', () => {
+  it('给定 channels 只含 state_board 当召回则只打看板通道、不跑图扩展，事件也只记 state_board', async () => {
+    const store = new FakeStore()
+    store.channelHits.fulltext = [hit('mem_a', 1, 0.5, 'fulltext')]
+    store.channelHits.state_board = [hit('st_1', 1, 0.9, 'state_board')]
+    store.summariesById.set('st_1', summary({ id: 'st_1', kind: 'state', status: 'in_progress' }))
+
+    const result = await makeEngine(store).recall({
+      query: '当前项目 进行中 阻塞中',
+      scenario: 'session-start',
+      kind: 'state',
+      status: ['in_progress', 'blocked'],
+      channels: ['state_board'],
+      now: FIXED_NOW,
+    })
+
+    expect(result.hits.map(entry => entry.entityId)).toEqual(['st_1'])
+    expect(store.calls.state_board).toHaveLength(1)
+    expect(store.calls.fulltext).toHaveLength(0)
+    expect(store.calls.trigger).toHaveLength(0)
+    expect(store.calls.vector).toHaveLength(0)
+    expect(store.calls.time).toHaveLength(0)
+    expect(store.expandCalls).toHaveLength(0)
+    expect(store.recallEvents.map(event => event.channel)).toEqual(['state_board'])
+    expect(result.channels.filter(report => report.status !== 'skipped').map(report => report.channel)).toEqual(['state_board'])
+  })
+})

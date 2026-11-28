@@ -4,7 +4,7 @@ import { extractQuerySignals, normalizeText, tokenize } from '../domain/text.js'
 import type { FusionGate, RetrievalConfig, ScenarioConfig } from './config.js'
 import { RECALL_SCENARIOS, STAGE_ONE_CHANNELS } from './constants.js'
 import { isValidTimeZone, localDayStartDaysAgo } from './timezone.js'
-import type { ExpansionMode, RecallRequest, RecallScenario, TimeWindow } from './types.js'
+import type { ExpansionMode, RecallRequest, RecallScenario, StageOneChannel, TimeWindow } from './types.js'
 
 /**
  * QueryCompiler：把一次召回请求编译成**可序列化的检索计划**。
@@ -305,11 +305,39 @@ function compileFilters(request: RecallRequest): PlanFilters {
   }
 }
 
-function compileProviders(config: RetrievalConfig, expand: ExpansionMode, timeoutMs: number): PlanProviderConfig[] {
+/**
+ * `request.channels` 的显式通道限定：只允许阶段一通道，且必须非空。
+ * 空数组会编译出一份“什么都不跑”的计划，属于调用方 bug，直接拒绝而不是静默返回空结果。
+ */
+function resolveChannels(channels: RecallRequest['channels']): readonly StageOneChannel[] | undefined {
+  if (channels === undefined) return undefined
+  if (channels.length === 0) fail(invalid('channels 不能是空数组'))
+  const unique: StageOneChannel[] = []
+  for (const channel of channels) {
+    if (!(STAGE_ONE_CHANNELS as readonly string[]).includes(channel)) {
+      fail(invalid(`channels 只允许阶段一通道（${STAGE_ONE_CHANNELS.join('/')}），实际：${String(channel)}`))
+    }
+    if (!unique.includes(channel)) unique.push(channel)
+  }
+  return unique
+}
+
+/**
+ * provider 开关。显式限定通道时只点亮这些通道且不启用图扩展（T0 状态看板路径）；
+ * 未限定时沿用 `expand` 的既有语义：links/expand 只在计划要求图扩展时启用。
+ */
+function compileProviders(
+  config: RetrievalConfig,
+  expand: ExpansionMode,
+  timeoutMs: number,
+  channels: readonly StageOneChannel[] | undefined,
+): PlanProviderConfig[] {
+  const narrowed = channels === undefined ? undefined : new Set(channels)
   return PROVIDER_CHANNELS.map(channel => ({
     channel,
-    // links/expand 只在计划要求图扩展时启用；其余通道恒启用，跳过条件由 provider 自己判断。
-    enabled: channel === 'links' || channel === 'expand' ? expand !== 'none' : true,
+    enabled: narrowed !== undefined
+      ? narrowed.has(channel as StageOneChannel)
+      : channel === 'links' || channel === 'expand' ? expand !== 'none' : true,
     limit: config.channelLimit,
     timeoutMs,
   }))
@@ -384,7 +412,9 @@ export function compileRetrievalPlan(request: RecallRequest, context: PlanCompil
   const termBudget = Math.max(1, Math.floor(context.termBudget ?? DEFAULT_QUERY_TERM_BUDGET))
   const signals = compileSignals(request.query)
   const phrases = extractPhrases(request.query)
-  const expand: ExpansionMode = request.expand ?? 'both'
+  const channels = resolveChannels(request.channels)
+  // 显式通道限定是“最小召回”语义：不跑图扩展，避免为 T0 状态再打一次 links/expand。
+  const expand: ExpansionMode = channels === undefined ? (request.expand ?? 'both') : 'none'
   const timeZone = resolveTimeZone(request, context)
 
   const body: PlanBody = {
@@ -400,7 +430,7 @@ export function compileRetrievalPlan(request: RecallRequest, context: PlanCompil
     signals,
     phrases,
     terms: compileTerms(request.query, signals, phrases, termBudget),
-    providers: compileProviders(context.config, expand, providerTimeoutMs),
+    providers: compileProviders(context.config, expand, providerTimeoutMs, channels),
     limit: resolveLimit(request, context.config),
     budget: {
       terms: termBudget,

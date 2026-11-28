@@ -22,8 +22,15 @@ export interface TimeWindow {
 export interface RecallRequest {
   readonly query: string
   readonly scenario?: RecallScenario
-  /** 缺省 'both'：链接与思维链成员都做图扩展。 */
+  /** 缺省 'both'：链接与思维链成员都做图扩展；显式 `channels` 时缺省 'none'。 */
   readonly expand?: ExpansionMode
+  /**
+   * 只跑这些阶段一通道（T0 状态看板用它避免为几条状态跑完整六通道）。
+   *
+   * 显式给出时：计划里的 `providers.enabled` 只点亮这些通道，图扩展不执行；
+   * 空数组非法。缺省跑全部六通道，按 `expand` 决定阶段二。
+   */
+  readonly channels?: readonly StageOneChannel[]
   readonly scope?: 'global' | 'project'
   readonly projectKey?: string
   readonly kind?: EntityKind

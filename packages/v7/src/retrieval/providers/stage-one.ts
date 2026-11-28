@@ -51,7 +51,7 @@ export class TriggerProvider implements IndexProvider {
     if (keys.length === 0 && regexText === undefined) {
       return skipped('查询为空，没有可匹配的触发键或正则文本')
     }
-    const base = searchBase(plan, providerLimit(plan, 'trigger'))
+    const base = searchBase(plan, providerLimit(plan, 'trigger'), context.timeoutMs)
     try {
       const hits = await context.store.triggers({
         ...base,
@@ -80,7 +80,7 @@ export class FulltextProvider implements IndexProvider {
   async search(plan: RetrievalPlan, context: ProviderContext): Promise<ProviderResult> {
     if (plan.terms.length === 0) return skipped('查询为空，没有全文词')
     const hits = await context.store.fulltext({
-      ...searchBase(plan, providerLimit(plan, 'fulltext')),
+      ...searchBase(plan, providerLimit(plan, 'fulltext'), context.timeoutMs),
       query: plan.query,
       tokens: plan.terms.map(term => term.term),
     })
@@ -102,7 +102,7 @@ export class SingleCharProvider implements IndexProvider {
       return skipped(`查询长度 ${plan.normalizedQuery.length} > ${maxLength}，不做单字回退`)
     }
     const hits = await context.store.singleChar({
-      ...searchBase(plan, providerLimit(plan, 'single_char')),
+      ...searchBase(plan, providerLimit(plan, 'single_char'), context.timeoutMs),
       query: plan.normalizedQuery,
       tokens: plan.terms.map(term => term.term),
     })
@@ -142,7 +142,7 @@ export class VectorProvider implements IndexProvider {
       return { status: 'unavailable', reason: '嵌入失败', issues: [issueOf(error)] }
     }
     // store 侧仍在事务里 set local hnsw.iterative_scan = 'relaxed_order'（过滤向量不静默少返回）。
-    const hits = await context.store.vector({ ...searchBase(plan, providerLimit(plan, 'vector')), embedding })
+    const hits = await context.store.vector({ ...searchBase(plan, providerLimit(plan, 'vector'), context.timeoutMs), embedding })
     return { status: 'ok', hits }
   }
 }
@@ -152,7 +152,7 @@ export class TimeProvider implements IndexProvider {
 
   async search(plan: RetrievalPlan, context: ProviderContext): Promise<ProviderResult> {
     const hits = await context.store.time({
-      ...searchBase(plan, providerLimit(plan, 'time')),
+      ...searchBase(plan, providerLimit(plan, 'time'), context.timeoutMs),
       from: plan.time.lookback.from,
       to: plan.time.lookback.to,
       now: plan.time.now,
@@ -167,7 +167,7 @@ export class StateBoardProvider implements IndexProvider {
   async search(plan: RetrievalPlan, context: ProviderContext): Promise<ProviderResult> {
     // 当前项目看板：没有显式 scope 但给了项目键时，按项目收窄；显式 global 时看全局。
     const narrowToProject = plan.filters.scope === undefined && plan.filters.projectKey !== undefined
-    const base = searchBase(plan, providerLimit(plan, 'state_board'))
+    const base = searchBase(plan, providerLimit(plan, 'state_board'), context.timeoutMs)
     const boardBase = narrowToProject
       ? { ...base, scope: 'project' as const, projectKey: plan.filters.projectKey }
       : base

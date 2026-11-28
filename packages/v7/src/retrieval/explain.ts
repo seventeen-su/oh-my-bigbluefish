@@ -143,8 +143,12 @@ export interface EmptyExplanationInput {
 
 /**
  * 空结果 whyNot：按引擎的真实分支给出**类别化**的原因明细。
- * 这里只描述当前引擎可观测的状态；deadline 截断依赖 provider 级超时（RET-10 / Task 11），
- * 当前引擎没有 deadline/AbortSignal，不在此伪造该类原因。
+ *
+ * 「全部失败」的判据不是“每个 attempted 通道都 failed”：`unavailable`（例如嵌入不可用）
+ * 同样等于这条通道没有真正完成检索。只有**没有任何通道完成**（ok/empty）时才归因为
+ * all-channels-failed；否则退回 no-stage-one-hits，并在行内列出每通道状态，避免把
+ * 存储/嵌入不可用误报成“没有相关内容”。deadline 由 provider runner 记录在
+ * `ChannelReport.reason` / `channelErrors`，这里只消费不伪造。
  */
 export function explainWhyNot(input: EmptyExplanationInput): readonly WhyNot[] {
   if (input.stageOneHitCount === 0) {
@@ -152,11 +156,12 @@ export function explainWhyNot(input: EmptyExplanationInput): readonly WhyNot[] {
       return [{ code: 'empty-query', message: 'empty-query 归一化后查询为空' }]
     }
     const attempted = input.reports.filter(report => report.status !== 'skipped')
-    if (attempted.length > 0 && attempted.every(report => report.status === 'failed')) {
+    const completed = attempted.some(report => report.status === 'ok' || report.status === 'empty')
+    if (attempted.length > 0 && !completed) {
       return [
         {
           code: 'all-channels-failed',
-          message: `all-channels-failed channels=${attempted.map(report => report.channel).join(',')}`,
+          message: `all-channels-failed channels=${attempted.map(report => `${report.channel}:${report.status}`).join(',')}：没有可用通道，不代表库里没有相关内容`,
         },
       ]
     }
@@ -194,11 +199,12 @@ function baseEmptyReason(input: EmptyExplanationInput): EmptyReasonBase {
       }
     }
     const attempted = input.reports.filter(report => report.status !== 'skipped')
-    if (attempted.length > 0 && attempted.every(report => report.status === 'failed')) {
+    const completed = attempted.some(report => report.status === 'ok' || report.status === 'empty')
+    if (attempted.length > 0 && !completed) {
       return {
         code: 'all-channels-failed',
-        message: '六个通道全部失败：这是存储或嵌入不可用，不代表库里没有相关内容。',
-        details: { channels: attempted.map(report => report.channel) },
+        message: '被尝试的通道全部失败或不可用：这是存储或嵌入不可用，不代表库里没有相关内容。',
+        details: { channels: attempted.map(report => `${report.channel}:${report.status}`) },
       }
     }
     return {

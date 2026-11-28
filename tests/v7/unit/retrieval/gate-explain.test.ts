@@ -287,9 +287,56 @@ describe('空结果解释 whyNot', () => {
     expect(whyNot).toEqual([
       {
         code: 'all-channels-failed',
-        message: 'all-channels-failed channels=trigger,fulltext,vector,time,state_board',
+        message: 'all-channels-failed channels=trigger:failed,fulltext:failed,vector:failed,time:failed,state_board:failed：没有可用通道，不代表库里没有相关内容',
       },
     ])
+  })
+
+  it('给定失败与不可用混合但没有通道完成当解释则仍标 all-channels-failed（不误报无命中）', () => {
+    const whyNot = explainWhyNot({
+      query: 'err',
+      stageOneHitCount: 0,
+      reports: reports(
+        ['trigger', 'failed'],
+        ['fulltext', 'failed'],
+        ['single_char', 'skipped'],
+        ['vector', 'unavailable'],
+        ['time', 'failed'],
+        ['state_board', 'failed'],
+      ),
+      gate: EMPTY_GATE,
+      filteredOut: 0,
+      summariesFailed: false,
+      filteredReasons: [],
+    })
+
+    expect(whyNot).toHaveLength(1)
+    expect(whyNot[0]?.code).toBe('all-channels-failed')
+    expect(whyNot[0]?.message).toContain('vector:unavailable')
+  })
+
+  it('给定有通道完成但零命中、其余失败当解释则标 no-stage-one-hits 而不是全部失败', () => {
+    const whyNot = explainWhyNot({
+      query: 'err',
+      stageOneHitCount: 0,
+      reports: reports(
+        ['trigger', 'failed'],
+        ['fulltext', 'empty'],
+        ['single_char', 'skipped'],
+        ['vector', 'unavailable'],
+        ['time', 'failed'],
+        ['state_board', 'empty'],
+      ),
+      gate: EMPTY_GATE,
+      filteredOut: 0,
+      summariesFailed: false,
+      filteredReasons: [],
+    })
+
+    expect(whyNot[0]?.code).toBe('no-stage-one-hits')
+    expect(whyNot[0]?.message).toBe(
+      'no-stage-one-hits channels=trigger:failed,fulltext:empty,single_char:skipped,vector:unavailable,time:failed,state_board:empty',
+    )
   })
 
   it('给定候选被双门控淘汰当解释则 whyNot 逐条给出通道/原始分/融合分与下限', () => {

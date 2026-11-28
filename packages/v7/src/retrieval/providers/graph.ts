@@ -35,7 +35,10 @@ export class ExpandProvider implements IndexProvider {
     const expansions = await context.store.expand(
       context.seeds,
       plan.hops,
-      plan.filters.includeArchived ? { includeArchived: true } : {},
+      {
+        ...(plan.filters.includeArchived ? { includeArchived: true } : {}),
+        timeoutMs: context.timeoutMs,
+      },
     )
     return { status: 'ok', expansions }
   }

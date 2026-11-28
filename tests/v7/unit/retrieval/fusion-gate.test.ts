@@ -20,7 +20,7 @@ function fuse(hits: ReadonlyMap<StageOneChannel, readonly ChannelHit[]>, config 
   return [...fuseStageOne(hits, config.scenarios.manual.weights, config.rrfK).values()]
 }
 
-describe('融合层门控：绝对 RRF 下限不再承担相关性过滤', () => {
+describe('融合层门控：绝对 RRF 下限不再承担相关性过滤（RET-07 回归）', () => {
   it('给定单通道末位 state_board 当门控则旧的 0.001818 情形不再默认通过', () => {
     const weak = hit('mem_weak', 50, 0.9, 'state_board')
     const strong = hit('mem_strong', 1, 0.5, 'fulltext')

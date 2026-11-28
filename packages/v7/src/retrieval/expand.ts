@@ -77,16 +77,6 @@ export function bestSeedForEntity(seedSet: SeedSet, entityId: string): SeedRef |
   return refs.reduce(betterSeed)
 }
 
-export function bestSeedOverall(seedSet: SeedSet): SeedRef | undefined {
-  let best: SeedRef | undefined
-  for (const entityId of seedSet.entityIds) {
-    const seed = bestSeedForEntity(seedSet, entityId)
-    if (seed === undefined) continue
-    best = best === undefined ? seed : betterSeed(best, seed)
-  }
-  return best
-}
-
 /** 链扩展的种子：优先用「组内成员里排名最好的种子」解释来源。 */
 export function bestSeedForChain(seedSet: SeedSet, chain: ChainInfo): SeedRef | undefined {
   let best: SeedRef | undefined
@@ -182,19 +172,71 @@ export function filterExpansions(expansions: readonly Expansion[], mode: Expansi
   return [...expansions]
 }
 
-/** 扩展来源种子：链扩展用组内最好种子，普通链接扩展用 fromId。 */
-export function resolveExpansionSeed(
-  expansion: Expansion,
+/**
+ * 一条图扩展的归因来源。
+ *
+ * - `chain`：思维链扩展，来源是已解析组成员里排名最好的阶段一种子；
+ * - `direct`：链接扩展的 `fromId` 本身就是阶段一种子；
+ * - `ancestor`：2 跳扩展的 `fromId` 是 1 跳中间节点，来源种子从已解析的 1 跳结果继承；
+ * - `unknown`：路径被 `limit` 截断、思维链组超出 `maxChainGroups` 等，无法证明来源。
+ *
+ * 归因必须诚实：`unknown` 不允许回退到「本轮全局最强种子」。那会把深种子的弱路径
+ * 伪装成 rank 1 的精确路径（融合贡献、links 原始分、why 归因同时被放大）。
+ */
+export type ExpansionProvenanceSource = 'chain' | 'direct' | 'ancestor' | 'unknown'
+
+export interface ExpansionProvenance {
+  readonly seed?: SeedRef
+  readonly source: ExpansionProvenanceSource
+}
+
+/**
+ * 为每个扩展实体解析真实来源种子。
+ *
+ * 只依赖 store.expand 已返回的扩展行：
+ * - 链扩展先按已解析的链成员找种子；
+ * - 链接扩展先看 `fromId` 是否种子，2 跳再看 `fromId` 是否有一条已归因的 1 跳行。
+ *
+ * 结果按实体去重（`store.expand` 本身按实体聚合并取最小跳数，这里再容忍假存储
+ * 返回重复行：低跳优先、同跳保持首条）。
+ */
+export function resolveExpansionProvenance(
+  expansions: readonly Expansion[],
   seedSet: SeedSet,
   chains: ReadonlyMap<string, ChainInfo>,
-  fallback: SeedRef | undefined,
-): SeedRef | undefined {
-  if (expansion.chainId !== undefined) {
-    const chain = chains.get(expansion.chainId)
-    if (chain !== undefined) {
-      const seed = bestSeedForChain(seedSet, chain)
-      if (seed !== undefined) return seed
+): ReadonlyMap<string, ExpansionProvenance> {
+  const ordered = [...expansions].sort((left, right) => left.hop - right.hop
+    || (left.entityId < right.entityId ? -1 : left.entityId > right.entityId ? 1 : 0))
+  const resolved = new Map<string, ExpansionProvenance>()
+  for (const expansion of ordered) {
+    if (resolved.has(expansion.entityId)) continue
+    if (expansion.chainId !== undefined) {
+      const chain = chains.get(expansion.chainId)
+      const chainSeed = chain === undefined ? undefined : bestSeedForChain(seedSet, chain)
+      if (chainSeed !== undefined) {
+        resolved.set(expansion.entityId, { seed: chainSeed, source: 'chain' })
+        continue
+      }
+      // 组没解析成功（超出 maxChainGroups）时，只有链实体自己就是阶段一种子才能证明来源。
+      const directSeed = bestSeedForEntity(seedSet, expansion.fromId)
+      resolved.set(expansion.entityId, directSeed === undefined
+        ? { source: 'unknown' }
+        : { seed: directSeed, source: 'direct' })
+      continue
     }
+    const directSeed = bestSeedForEntity(seedSet, expansion.fromId)
+    if (directSeed !== undefined) {
+      resolved.set(expansion.entityId, { seed: directSeed, source: 'direct' })
+      continue
+    }
+    // 2 跳：fromId 是中间节点；它的 1 跳行已按 hop 升序解析，直接继承真实祖先种子。
+    // 1 跳扩展的 fromId 理应是种子；解析不到说明本次扩展被截断/过滤，按 unknown 处理。
+    const ancestor = expansion.hop > 1 ? resolved.get(expansion.fromId) : undefined
+    if (ancestor?.seed !== undefined) {
+      resolved.set(expansion.entityId, { seed: ancestor.seed, source: 'ancestor' })
+      continue
+    }
+    resolved.set(expansion.entityId, { source: 'unknown' })
   }
-  return bestSeedForEntity(seedSet, expansion.fromId) ?? fallback
+  return resolved
 }

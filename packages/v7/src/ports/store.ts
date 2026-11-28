@@ -32,6 +32,7 @@ import type {
   ArtifactRecord,
   AuditEntry,
   AuditRecord,
+  RecallChannelErrorInput,
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
@@ -167,7 +168,11 @@ export interface Store {
   link(input: LinkInput): Promise<LinkResult>
   unlink(id: string, actor: string, source?: string): Promise<void>
   history(stateId: string, limit: number): Promise<StateVersion[]>
-  expand(seeds: readonly string[], hops: 1 | 2, options?: { includeArchived?: boolean }): Promise<Expansion[]>
+  expand(
+    seeds: readonly string[],
+    hops: 1 | 2,
+    options?: { includeArchived?: boolean; timeoutMs?: number },
+  ): Promise<Expansion[]>
   fulltext(spec: TextSearchSpec): Promise<ChannelHit[]>
   triggers(spec: TriggerSearchSpec): Promise<ChannelHit[]>
   singleChar(spec: TextSearchSpec): Promise<ChannelHit[]>
@@ -203,6 +208,12 @@ export interface Store {
   clearDependencyMarks(entityId: string, attrs?: readonly DependencyAttributeRef[]): Promise<void>
   rebuildView(id: string): Promise<void>
   recordRecall(events: readonly RecallEventInput[]): Promise<void>
+  /**
+   * 通道级失败/deadline 证据落库（RET-08）。召回结果里的 `channelErrors` 只覆盖 provider
+   * 报告的问题；runner 级 deadline 只有报告 reason，这一层负责把两类失败都变成可审计行。
+   * 旧 fake/只读存储可以不实现；调用方必须允许“审计降级但召回不失败”。
+   */
+  recordRecallChannelErrors?(errors: readonly RecallChannelErrorInput[]): Promise<void>
   /**
    * 事件级审计：把该 trace 的 recall_event 标成真正投递（injected=true）。
    * **不再影响采用指标**：Retrieved/机会/采用层级只从 `recordAdoptionReceipt` 派生。

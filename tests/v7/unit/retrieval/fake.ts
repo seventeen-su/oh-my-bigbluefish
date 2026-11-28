@@ -20,6 +20,7 @@ import type {
   ArtifactInput,
   ArtifactRecord,
   AuditRecord,
+  RecallChannelErrorInput,
   RecallEventInput,
   ResidentTraceInput,
   RollbackResult,
@@ -184,7 +185,8 @@ export class FakeStore implements Store {
 
   expansions: Expansion[] = []
   expandError?: Error
-  readonly expandCalls: { seeds: readonly string[]; hops: 1 | 2 }[] = []
+  expandLatencyMs = 0
+  readonly expandCalls: { seeds: readonly string[]; hops: 1 | 2; timeoutMs?: number }[] = []
 
   readonly summariesById = new Map<string, EntitySummary>()
   summariesError?: Error
@@ -201,9 +203,20 @@ export class FakeStore implements Store {
 
   readonly recallEvents: RecallEventInput[] = []
   recallError?: Error
+  readonly recallChannelErrors: RecallChannelErrorInput[] = []
+  recallChannelErrorsError?: Error
 
   readonly artifacts: ArtifactRecord[] = []
   readonly processedArtifacts = new Set<string>()
+
+  /** 单通道延迟模拟：RET-10 的 deadline/取消用。 */
+  readonly latencyMs: Partial<Record<StageOneChannel, number>> = {}
+
+  private async delay(channel: StageOneChannel): Promise<void> {
+    const ms = this.latencyMs[channel]
+    if (ms === undefined || ms <= 0) return
+    await new Promise(resolve => setTimeout(resolve, ms))
+  }
 
   private maybeThrow(channel: StageOneChannel): void {
     const failure = this.failures[channel]
@@ -217,44 +230,55 @@ export class FakeStore implements Store {
     return this.entitiesById.get(id)
   }
 
-  async expand(seeds: readonly string[], hops: 1 | 2, _options?: { includeArchived?: boolean }): Promise<Expansion[]> {
-    this.expandCalls.push({ seeds: [...seeds], hops })
+  async expand(seeds: readonly string[], hops: 1 | 2, options?: { includeArchived?: boolean; timeoutMs?: number }): Promise<Expansion[]> {
+    this.expandCalls.push({
+      seeds: [...seeds],
+      hops,
+      ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    })
+    if (this.expandLatencyMs > 0) await new Promise(resolve => setTimeout(resolve, this.expandLatencyMs))
     if (this.expandError !== undefined) throw this.expandError
     return this.expansions
   }
 
   async fulltext(spec: TextSearchSpec): Promise<ChannelHit[]> {
     this.calls.fulltext.push(spec)
+    await this.delay('fulltext')
     this.maybeThrow('fulltext')
     return this.channelHits.fulltext
   }
 
   async triggers(spec: TriggerSearchSpec): Promise<ChannelHit[]> {
     this.calls.trigger.push(spec)
+    await this.delay('trigger')
     this.maybeThrow('trigger')
     return this.channelHits.trigger
   }
 
   async singleChar(spec: TextSearchSpec): Promise<ChannelHit[]> {
     this.calls.single_char.push(spec)
+    await this.delay('single_char')
     this.maybeThrow('single_char')
     return this.channelHits.single_char
   }
 
   async vector(spec: VectorSearchSpec): Promise<ChannelHit[]> {
     this.calls.vector.push(spec)
+    await this.delay('vector')
     this.maybeThrow('vector')
     return this.channelHits.vector
   }
 
   async time(spec: TimeSearchSpec): Promise<ChannelHit[]> {
     this.calls.time.push(spec)
+    await this.delay('time')
     this.maybeThrow('time')
     return this.channelHits.time
   }
 
   async stateBoard(spec: StateBoardSpec): Promise<ChannelHit[]> {
     this.calls.state_board.push(spec)
+    await this.delay('state_board')
     this.maybeThrow('state_board')
     return this.channelHits.state_board
   }
@@ -282,6 +306,11 @@ export class FakeStore implements Store {
   async recordRecall(events: readonly RecallEventInput[]): Promise<void> {
     if (this.recallError !== undefined) throw this.recallError
     this.recallEvents.push(...events)
+  }
+
+  async recordRecallChannelErrors(errors: readonly RecallChannelErrorInput[]): Promise<void> {
+    if (this.recallChannelErrorsError !== undefined) throw this.recallChannelErrorsError
+    this.recallChannelErrors.push(...errors)
   }
 
   async recordResidentTrace(_trace: ResidentTraceInput): Promise<void> {
@@ -461,6 +490,14 @@ export function makeEngine(
   store: FakeStore,
   config?: RetrievalConfig,
   embedder: FakeEmbedder = new FakeEmbedder(),
+  timeouts: { readonly stageOneBudgetMs?: number; readonly providerTimeoutMs?: number } = {},
 ): RecallEngine {
-  return new RecallEngine({ store, embedder, clock: new FakeClock(), config })
+  return new RecallEngine({
+    store,
+    embedder,
+    clock: new FakeClock(),
+    ...(config === undefined ? {} : { config }),
+    ...(timeouts.stageOneBudgetMs === undefined ? {} : { stageOneBudgetMs: timeouts.stageOneBudgetMs }),
+    ...(timeouts.providerTimeoutMs === undefined ? {} : { providerTimeoutMs: timeouts.providerTimeoutMs }),
+  })
 }

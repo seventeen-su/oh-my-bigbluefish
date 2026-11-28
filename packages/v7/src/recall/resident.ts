@@ -595,6 +595,10 @@ export async function buildResident(
         kind: 'state',
         status: ['in_progress', 'blocked'],
         limit: RESIDENT_STATE_LIMIT,
+        // RET-11：状态看板只需要 state_board 一条通道；不能为 5 条状态跑完整六通道 +
+        // 图扩展 + 重排富化。计划里的 providers.enabled 会记录这次限定，可审计。
+        channels: ['state_board'],
+        expand: 'none',
         sessionId: context.sessionId,
         injected: true,
       }).catch(() => undefined),

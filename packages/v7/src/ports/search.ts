@@ -24,6 +24,11 @@ export interface SearchBase {
    */
   readonly includeSuperseded?: boolean
   readonly limit: number
+  /**
+   * 本次查询的剩余执行预算（ms）。适配器必须**尽力**把它变成服务端取消
+   * （PostgreSQL 用事务级 `statement_timeout`），而不是只放弃等待；缺省用连接默认值。
+   */
+  readonly timeoutMs?: number
 }
 
 export interface TextSearchSpec extends SearchBase {

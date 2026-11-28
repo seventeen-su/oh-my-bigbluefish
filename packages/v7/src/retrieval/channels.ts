@@ -47,9 +47,15 @@ function reportStatus(status: ProviderStatus): ChannelStatus {
 
 function reportOf(outcome: ProviderOutcome | undefined, channel: StageOneChannel): ChannelReport {
   if (outcome === undefined) return { channel, status: 'failed', hitCount: 0, reason: '通道没有执行结果' }
-  const reason = outcome.status === 'deadline'
+  const configured = outcome.status === 'deadline'
     ? `deadline: ${outcome.reason ?? '超出计划 deadline'}`
     : outcome.reason
+  // RET-08：失败/deadline 必须带可审计原因；空原因会让“全部失败”退化成无法解释的空结果。
+  const reason = configured !== undefined && configured.trim().length > 0
+    ? configured
+    : outcome.status === 'failed' || outcome.status === 'deadline'
+      ? `通道 ${channel} ${outcome.status === 'deadline' ? '在 deadline 内未完成' : '执行失败'}（provider 未给出原因）`
+      : undefined
   return {
     channel,
     status: reportStatus(outcome.status),
@@ -105,7 +111,15 @@ export async function runStageOnePlan(
       warnings.push(`通道 ${outcome.channel} 在 deadline 内未完成：${outcome.reason ?? '未知原因'}`)
     }
     for (const issue of outcome.issues) {
-      errors.push({ channel: outcome.channel, code: issue.code, message: issue.message, retryable: issue.retryable })
+      errors.push({
+        channel: outcome.channel,
+        code: issue.code,
+        // RET-08：空错误文本会让“失败”退化成无法诊断；这里补一条最小可读原因。
+        message: issue.message.trim().length > 0
+          ? issue.message
+          : `通道 ${outcome.channel} 失败但没有给出错误详情`,
+        retryable: issue.retryable,
+      })
     }
   }
   const reports = STAGE_ONE_CHANNELS.map(channel => reportOf(byChannel.get(channel), channel))

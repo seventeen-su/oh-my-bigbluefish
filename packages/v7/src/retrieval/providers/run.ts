@@ -19,8 +19,8 @@ import type {
  * 不变量：
  * - 一个 provider 抛错/超时只影响它自己：返回 `failed`/`deadline` 状态，不向上冒泡。
  * - deadline 先看计划是否已过期（不启动新查询），再按 `min(provider.timeoutMs, 剩余预算)` 计时。
- * - store 端口目前没有取消能力（RET-10），超时只能取消“等待”不能取消底层查询；
- *   这里给底层 promise 挂空 catch，避免 deadline 之后它再 reject 变成 unhandled rejection。
+ * - 超时/计划过期都会把 timeoutMs 传进 store；适配器用它做服务端取消
+ *   （PostgreSQL 事务级 statement_timeout），不是只放弃等待 Promise（RET-10）。
  * - 命中归一化（rank 排序、按 entityId 去重、截断到 provider limit）在这里做一次，
  *   与旧 channels.normalizeHits 行为一致，provider 不重复实现。
  */
@@ -55,7 +55,7 @@ export function providerLimit(plan: RetrievalPlan, channel: ProviderChannel): nu
 }
 
 /** 计划过滤条件 → store 的 SearchBase；所有 provider 共用一份映射，避免语义漂移。 */
-export function searchBase(plan: RetrievalPlan, limit: number): SearchBase {
+export function searchBase(plan: RetrievalPlan, limit: number, timeoutMs?: number): SearchBase {
   return {
     ...(plan.filters.scope === undefined ? {} : { scope: plan.filters.scope }),
     ...(plan.filters.projectKey === undefined ? {} : { projectKey: plan.filters.projectKey }),
@@ -65,6 +65,7 @@ export function searchBase(plan: RetrievalPlan, limit: number): SearchBase {
     ...(plan.filters.includeArchived ? { includeArchived: true } : {}),
     ...(plan.filters.includeHistory ? { includeHistory: true } : {}),
     ...(plan.filters.includeSuperseded ? { includeSuperseded: true } : {}),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     limit,
   }
 }
@@ -155,6 +156,7 @@ export async function runProvider(
     embedder: services.embedder,
     now: plan.time.now,
     signal: controller.signal,
+    timeoutMs,
     previous: options.previous ?? new Map(),
     seeds: options.seeds ?? [],
     expansions: options.expansions ?? [],

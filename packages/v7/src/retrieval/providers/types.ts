@@ -47,6 +47,12 @@ export interface ProviderContext {
   readonly now: string
   /** 本 provider 的取消信号；超时后 runner 会 abort，provider 可用它提前放弃。 */
   readonly signal: AbortSignal
+  /**
+   * 本 provider 的剩余执行预算（ms）：runner 已按 `min(provider.timeoutMs, 计划剩余)` 算好。
+   * provider 必须把它传给 store，让适配器用服务端取消（PostgreSQL statement_timeout）
+   * 真正结束仍在跑的查询，而不是只丢弃 Promise（RET-10）。
+   */
+  readonly timeoutMs: number
   /** 阶段一已完成的通道命中（single_char 依赖 fulltext 命中数）。 */
   readonly previous: ReadonlyMap<ProviderChannel, readonly ChannelHit[]>
   /** 阶段二种子（expand provider 使用）。 */

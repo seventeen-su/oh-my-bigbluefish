@@ -2,7 +2,7 @@ import type { Expansion } from '../domain/link.js'
 import type { ChannelHit } from '../ports/search.js'
 import type { RetrievalConfig, ScenarioWeights } from './config.js'
 import type { ChainInfo, SeedSet } from './expand.js'
-import { bestSeedOverall, resolveExpansionSeed } from './expand.js'
+import { resolveExpansionProvenance } from './expand.js'
 import type { RecallChannel, StageOneChannel } from './types.js'
 import { RECALL_CHANNELS, STAGE_ONE_CHANNELS } from './constants.js'
 
@@ -111,9 +111,19 @@ function seedRawScore(seedSet: SeedSet, seedId: string, fallback: number): numbe
   return refs.reduce((best, ref) => Math.max(best, ref.rawScore), Number.NEGATIVE_INFINITY)
 }
 
+/** `applyExpansions` 的归因统计：无法归因的路径跳过，由调用方写 warning（不伪造种子）。 */
+export interface ApplyExpansionsResult {
+  /** 实际并入 candidates 的图扩展路径数（同一实体只算一条）。 */
+  readonly applied: number
+  /** 无法证明来源种子、被跳过的路径数（截断链/截断 2 跳）。 */
+  readonly unresolved: number
+}
+
 /**
  * 把阶段二扩展并入候选：
  * - 1/2 跳衰减来自配置（0.5 / 0.25），融合贡献 = links 权重 × 衰减 / (rrfK + 种子名次)；
+ * - 来源种子按 `resolveExpansionProvenance` 解析：链扩展用组成员里最好的种子，
+ *   2 跳用 1 跳祖先的种子；无法归因的路径**跳过**，不回退到全局最强种子；
  * - 同一实体被多条路径扩展时只保留贡献最高的一条（去重，不重复累加）；
  * - 已在阶段一出现的实体只追加 links 通道，不新增重复结果。
  */
@@ -124,15 +134,19 @@ export function applyExpansions(
   chains: ReadonlyMap<string, ChainInfo>,
   weights: ScenarioWeights,
   config: RetrievalConfig,
-): void {
-  const fallbackSeed = bestSeedOverall(seedSet)
+): ApplyExpansionsResult {
+  const provenance = resolveExpansionProvenance(expansions, seedSet, chains)
 
   const bestByEntity = new Map<string, LinkEvidence>()
+  let unresolved = 0
   for (const expansion of expansions) {
     const decay = decayForHop(expansion.hop, config)
     if (decay === undefined) continue
-    const seed = resolveExpansionSeed(expansion, seedSet, chains, fallbackSeed)
-    if (seed === undefined) continue
+    const seed = provenance.get(expansion.entityId)?.seed
+    if (seed === undefined) {
+      unresolved += 1
+      continue
+    }
     const evidence: LinkEvidence = {
       seedId: seed.entityId,
       hop: expansion.hop,
@@ -159,6 +173,7 @@ export function applyExpansions(
     candidate.rawByChannel.set('links', previousRaw === undefined ? evidence.rawScore : Math.max(previousRaw, evidence.rawScore))
     candidate.link = evidence
   }
+  return { applied: bestByEntity.size, unresolved }
 }
 
 export function sortChannels(channels: Iterable<RecallChannel>): RecallChannel[] {

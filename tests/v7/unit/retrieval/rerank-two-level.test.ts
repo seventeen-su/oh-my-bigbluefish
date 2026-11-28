@@ -30,7 +30,7 @@ function fusedOf(index: number): number {
   return 2 / (60 + index + 1)
 }
 
-describe('两级重排：先全量摘要初排，再批量富化精排', () => {
+describe('两级重排：先全量摘要初排，再批量富化精排（RET-06 回归）', () => {
   it('给定 limit=30 与默认富化窗口 24 当精排则第 25/30 名不被截断位置压低', async () => {
     const store = new FakeStore()
     const ids = seedThirty(store)

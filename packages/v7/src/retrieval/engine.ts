@@ -4,8 +4,8 @@ import type { Clock } from '../ports/clock.js'
 import type { Embedder } from '../ports/embedding.js'
 import type { Store } from '../ports/store.js'
 import type { EntityPriorFeatures, EntitySummary } from '../ports/search.js'
-import type { RecallEventInput } from '../ports/observability.js'
-import { runStageOnePlan } from './channels.js'
+import type { RecallChannelErrorInput, RecallEventInput } from '../ports/observability.js'
+import { runStageOnePlan, type StageOneOutcome } from './channels.js'
 import {
   compileRetrievalPlan,
   parseRetrievalPlan,
@@ -180,11 +180,24 @@ function chainSiblingTitles(
  * 可以重放同一份检索语义；配置版本漂移会在 warnings 里暴露，不静默换口径。
  * 门控阈值与日历日时区都从计划读（计划是权威），重放不受当前配置影响。
  *
- * 两级重排（`rerankEnrichTopK`）：
+ * 图扩展（RET-05）：来源种子按真实路径解析——链扩展取组内最好种子，2 跳继承 1 跳祖先的
+ * 种子；解析不到来源的路径跳过并写 warning，**不**回退到全局最强种子（那会伪造 why 归因、
+ * 放大融合贡献与 links 原始分）。
+ *
+ * 通道失败（RET-08）：阶段一失败/deadline 不只留在 RecallResult，还尽力写入
+ * `omb.recall_channel_error`；写失败只降级为 warning，不影响召回。
+ *
+ * 两级重排（`rerankEnrichTopK`，RET-06）：
  * 1. 初排：**全部**候选只用摘要级特征（分类/新近度/作用域/历史/链路）算分；
  * 2. 精排：对初排前 `max(rerankEnrichTopK, limit)` 名做**一次**批量富化
  *    （`store.priorFeatures`），把置信度/置顶/偏好标签/采用率/来源加进来再排序。
  * 窗口不小于返回条数，所以截断位置不会决定谁拿到实体级乘数；富化缺失按中性处理。
+ *
+ * 融合门控（RET-07）：`fusedFloor` 只做 0/负分的健全性下限；相关性由相对分/通道共识/
+ * 排名共识判断（见 gate.ts）。日历日（RET-09）按计划里的 IANA 时区解析。
+ *
+ * 通道限定（RET-11）：请求可显式给 `channels` 只跑部分阶段一通道（T0 状态看板用它避免
+ * 为 5 条状态跑完整六通道 + 图扩展）；该限定会写进计划的 providers.enabled，可审计。
  */
 export class RecallEngine {
   readonly config: RetrievalConfig
@@ -265,6 +278,8 @@ export class RecallEngine {
     const stageOneMs = performance.now() - startedAt
     warnings.push(...stageOne.warnings)
     const stageOneHitCount = [...stageOne.hitsByChannel.values()].reduce((sum, hits) => sum + hits.length, 0)
+    // RET-08：通道失败/降级证据在返回前尽力落库；写失败不阻塞召回，只降级为 warning。
+    await this.recordChannelFailures(input, stageOne, warnings)
 
     // 计划是权威：种子数按 plan.budget.seeds 取（重放一份旧计划时不能悄悄用当前配置的 seedLimit）。
     const seedConfig: RetrievalConfig = plan.budget.seeds === this.config.seedLimit
@@ -282,7 +297,12 @@ export class RecallEngine {
 
     const candidates = fuseStageOne(stageOne.hitsByChannel, scenario.weights, this.config.rrfK)
     if (expansion.expansions.length > 0) {
-      applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config)
+      const applied = applyExpansions(candidates, expansion.expansions, seedSet, expansion.chains, scenario.weights, this.config)
+      if (applied.unresolved > 0) {
+        warnings.push(
+          `图扩展有 ${applied.unresolved} 条路径无法归因到阶段一种子（2 跳截断或思维链组超出上限），已跳过：不伪造全局最强种子。`,
+        )
+      }
     }
     // 门控阈值以计划为权威：重放一份历史计划时不能悄悄换用当前配置的门控。
     const gate = gateCandidates([...candidates.values()], {
@@ -582,6 +602,59 @@ export class RecallEngine {
       warnings.push(`批量富化只返回 ${features.size}/${ids.length} 条，其余按中性先验处理`)
     }
     return features
+  }
+
+  /**
+   * 通道失败证据落库（RET-08）。输入有两部分：
+   * - provider 报告的问题（`stageOne.errors`，含 code/retryable）；
+   * - 只有报告没有 issue 的失败（例如计划 deadline 已过期时 runner 不启动查询），
+   *   按报告 reason 补一条审计行，避免“通道 failed 但错误表为空”。
+   *
+   * 没有 store 方法时静默跳过（旧 fake 存储）；写失败只加 warning。
+   */
+  private async recordChannelFailures(
+    execution: RecallExecution,
+    stageOne: StageOneOutcome,
+    warnings: string[],
+  ): Promise<void> {
+    const record = this.store.recordRecallChannelErrors
+    if (record === undefined) return
+    const base = {
+      traceId: execution.traceId,
+      ...(execution.sessionId === undefined ? {} : { sessionId: execution.sessionId }),
+      ...(execution.plan.query.length === 0 ? {} : { query: execution.plan.query }),
+    }
+    const entries: RecallChannelErrorInput[] = []
+    const covered = new Set<string>()
+    for (const issue of stageOne.errors) {
+      covered.add(issue.channel)
+      entries.push({
+        ...base,
+        channel: issue.channel,
+        code: issue.code,
+        message: issue.message.trim().length > 0 ? issue.message : `通道 ${issue.channel} 失败但没有给出错误详情`,
+        retryable: issue.retryable,
+      })
+    }
+    for (const report of stageOne.reports) {
+      if (report.status !== 'failed' || covered.has(report.channel)) continue
+      const deadline = report.reason?.startsWith('deadline:') === true
+      entries.push({
+        ...base,
+        channel: report.channel,
+        code: deadline ? 'timeout' : 'internal',
+        message: report.reason !== undefined && report.reason.trim().length > 0
+          ? report.reason
+          : `通道 ${report.channel} 失败但没有给出原因`,
+        retryable: deadline,
+      })
+    }
+    if (entries.length === 0) return
+    try {
+      await record.call(this.store, entries)
+    } catch (error) {
+      warnings.push(`通道错误审计写入失败（召回结果不受影响）：${toOmbError(error).message}`)
+    }
   }
 
   private async recordRecall(

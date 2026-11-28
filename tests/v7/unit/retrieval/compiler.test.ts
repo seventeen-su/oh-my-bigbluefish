@@ -86,6 +86,25 @@ describe('RetrievalPlan 编译（纯函数）', () => {
     assertJsonData(plan)
   })
 
+  it('给定 channels 限定当编译则只启用这些阶段一通道、不启用图扩展且计划可重放', () => {
+    const plan = compileRetrievalPlan({ query: '当前项目 进行中 阻塞中', channels: ['state_board'] }, COMPILE)
+
+    expect(plan.expand).toBe('none')
+    expect(plan.providers.filter(provider => provider.enabled).map(provider => provider.channel)).toEqual(['state_board'])
+    expect(parseRetrievalPlan(JSON.parse(JSON.stringify(plan)))).toEqual(plan)
+
+    const again = compileRetrievalPlan({ query: '当前项目 进行中 阻塞中', channels: ['state_board'] }, COMPILE)
+    expect(again.hash).toBe(plan.hash)
+    // 限定通道是“最小召回”，hash 必须与未限定计划不同，避免审计把两者当成同一份语义。
+    const unrestricted = compileRetrievalPlan({ query: '当前项目 进行中 阻塞中' }, COMPILE)
+    expect(plan.hash).not.toBe(unrestricted.hash)
+  })
+
+  it('给定非法 channels 当编译则拒绝空数组与非阶段一通道', () => {
+    expect(() => compileRetrievalPlan({ query: 'needle', channels: [] }, COMPILE)).toThrow(/不能是空数组/)
+    expect(() => compileRetrievalPlan({ query: 'needle', channels: ['links' as never] }, COMPILE)).toThrow(/只允许阶段一通道/)
+  })
+
   it('给定同一请求当重复编译则 hash 稳定，场景变化则 hash 改变且可复算', () => {
     const first = compileRetrievalPlan({ query: 'needle' }, COMPILE)
     const second = compileRetrievalPlan({ query: 'needle' }, COMPILE)

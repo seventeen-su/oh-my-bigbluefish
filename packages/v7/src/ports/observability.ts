@@ -1,3 +1,4 @@
+import type { OmbErrorCode } from '../domain/errors.js'
 import type { JsonValue } from '../domain/json.js'
 
 /**
@@ -20,6 +21,22 @@ export interface RecallEventInput {
   readonly rawScore?: number
   readonly fusedScore?: number
   readonly injected: boolean
+}
+
+/**
+ * 通道级失败/deadline 审计行（RET-08）：一次召回里某个通道为什么没结果。
+ *
+ * 与 `RecallEventInput` 分开：失败时没有命中实体（recall_event.entity_id 非空且外键），
+ * 但“哪个通道失败、什么错误、是否可重试”必须能事后查询。
+ */
+export interface RecallChannelErrorInput {
+  readonly traceId: string
+  readonly sessionId?: string
+  readonly query?: string
+  readonly channel: string
+  readonly code: OmbErrorCode
+  readonly message: string
+  readonly retryable: boolean
 }
 
 /**

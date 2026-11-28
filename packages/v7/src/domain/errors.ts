@@ -9,6 +9,7 @@ export type OmbErrorCode =
   | 'sandbox-error'
   | 'reference-cycle'
   | 'unsupported'
+  | 'timeout'
   | 'internal'
 
 export interface OmbError {
